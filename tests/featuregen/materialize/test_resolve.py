@@ -22,8 +22,8 @@ import hashlib
 
 import pytest
 from tests.featuregen.materialize.fixtures import (
-    REF_CIF,
     authored_formula,
+    grain_of,
     intent_for,
     raw_proposal,
     seed_materialize_catalog,
@@ -66,9 +66,13 @@ def catalog(db):
 def _expectation(name: str) -> dict:
     """The recipe expectation the work item carries. Its ``grain_key_refs`` are what
     ``recipe_formula_worker`` turns into ``AuthoringIntent.target_grain_keys``, so they must be the
-    fixture intent's, or the reconstruction is not the intent the run was opened for."""
-    return {"final_operation": "identity", "grain_entity": "customer",
-            "grain_key_refs": [REF_CIF], "recipe_id": name}
+    fixture intent's, or the reconstruction is not the intent the run was opened for — which is why
+    both now read the formula's own grain through ``fixtures.grain_of`` instead of naming a ref
+    twice. The three ``hdfc`` features are unchanged by that; the BRIDGED one carries its crm key.
+    """
+    grain = grain_of(name)
+    return {"final_operation": "identity", "grain_entity": grain.entity,
+            "grain_key_refs": list(grain.keys), "recipe_id": name}
 
 
 def _provider_input(intent) -> dict:

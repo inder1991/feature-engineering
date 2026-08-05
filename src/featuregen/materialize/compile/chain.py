@@ -93,7 +93,7 @@ from typing import Protocol, TypeVar
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.admission import AdmittedFeature, admit_artifacts
 from featuregen.materialize.binding import GroupContractBinding, bind_group, plan_revision
-from featuregen.materialize.codes import MaterializationRefused
+from featuregen.materialize.codes import MaterializationRefused, ValidationFindingCode
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
     CadenceDecl,
@@ -721,6 +721,12 @@ def _unproven_detail(report: ValidationReportV1, *, configured: bool) -> str:
     ``error`` prints no findings because it HAS none, and says which of the two silences it is:
     a deployment that configured no interpreter is an operator's act, while an interpreter that did
     not answer is the environment's — different people fix them.
+
+    ``ENGINE_VERSION_MISMATCH`` gets its own sentence, because "this project does not build" would
+    be a claim nobody made: the probe stops at the pin comparison and never attempts the import, so
+    the build is UNPROVEN rather than failed. Telling an operator their project does not build when
+    the actual fault is that L0 was pointed at the wrong environment is the same mis-routing
+    DEFERRED-WORK A.42 exists to eliminate, one layer up.
     """
     if report.status is ValidationStatus.ERROR:
         because = ("no L0 interpreter is configured" if not configured else
@@ -730,6 +736,10 @@ def _unproven_detail(report: ValidationReportV1, *, configured: bool) -> str:
                 f"{because}")
     seen = "; ".join(f"{finding.code.value}({finding.classification.value}) x{finding.count}"
                      for finding in report.findings)
+    if any(finding.code is ValidationFindingCode.ENGINE_VERSION_MISMATCH
+           for finding in report.findings):
+        return (f"L0 did not attempt the build, which is therefore UNPROVEN ({report.report_id}): "
+                f"the interpreter is not the environment this artifact pins itself to — {seen}")
     return f"L0 failed, so this project does not build ({report.report_id}): {seen}"
 
 

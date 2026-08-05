@@ -17,9 +17,14 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   '/gate', '/catalog', '/catalogs', '/ingestion-runs',
   // The data agent's planning surface, and the learning-gap queue.
   '/analysis', '/learning',
-  // Physical connections/bindings + the catalog semantic scope (nginx has proxied this since the
-  // catalog-engine work; the dev proxy fell behind — the pre-existing two-test failure pair).
-  '/data-sources']
+  // The connection/catalog registry (api.ts getDataSourceConnections/getDataSourceCatalogs).
+  // nginx.conf has carried this since the screen shipped; this list did not, so the dev server
+  // answered those calls itself instead of proxying them.
+  '/data-sources',
+  // Phase G's materialization trigger + status. No screen calls it yet — it is here because
+  // nginx.conf and this list must agree, and because a missing prefix answers a POST with 405
+  // from the SPA rather than a 404 anyone would recognise as routing.
+  '/materialization-runs']
 
 export default defineConfig({
   plugins: [react()],

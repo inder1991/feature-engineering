@@ -1,0 +1,4165 @@
+{
+  "collection": {
+    "anchor_catalog_source": "p4_suggestions_join_ftr",
+    "anchor_column_ref": null,
+    "anchor_table_ref": "txn_ledger",
+    "groups": [
+      {
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_acct"
+            ],
+            "value": "account"
+          }
+        ],
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "account",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=account_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "id": "account",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_acct"
+          ]
+        ],
+        "suggestion_ids": [
+          "6b82cdb8383cc208f42763001f952f7d283dcd6d22883e979e98b3ab8f91649b",
+          "7525f65dbf8edacc782426f3229cd87eb6a4e4bd3e922ccb33fbd0a24a7d11f2"
+        ]
+      },
+      {
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "suggestion_ids": [
+          "8cabd3139c011d6bbcfbb70cf9121f54f2600de3ea3c984221ddeb7e88417bcc",
+          "31bb913af10559ebab8642d8f749b1506506cc4f2b08c5f486df8c92fc55034c",
+          "254b74c91b2b9f93ecbfe410ee15aaf1ad797bf31cef2c7ddeb9100c36934d04",
+          "81bc14d8577a968536a99d1806adc09c32870d16d8bf2006a9e04e441e3e6cc0",
+          "353a467af01d8856b3efde66e1a1a02261714d390fc2767b9d54a4719200a8ed",
+          "df77847be44c47f0dbe613d001b961dead2b3d5869693d221cbef9a6b253124b",
+          "c576ca13fbfe44c81ad4d1e6c58eed6a9ba8fe39eab5a86d5b0dca29b9903580",
+          "895088126b14e702471fd8bff2f715046f1317d0e10456c6e00a5b2645e8f0e8"
+        ]
+      }
+    ],
+    "neighbourhood": {
+      "limit_reason": null,
+      "max_hops": 1,
+      "tables_available": 1,
+      "tables_considered": 1,
+      "truncated": false
+    },
+    "omitted_counts": {},
+    "rejections": [
+      {
+        "candidate_name": "authorisation_decline_rate_90d",
+        "code": "NON_NUMERIC",
+        "explanation": "declared type 'varchar' of public.txn_ledger.setl_stat is not numeric",
+        "template_id": "authorisation_decline_rate"
+      },
+      {
+        "candidate_name": "matching_break_rate_90d",
+        "code": "NON_NUMERIC",
+        "explanation": "declared type 'varchar' of public.txn_ledger.setl_stat is not numeric",
+        "template_id": "matching_break_rate"
+      },
+      {
+        "candidate_name": "settlement_fail_rate_90d",
+        "code": "NON_NUMERIC",
+        "explanation": "declared type 'varchar' of public.txn_ledger.setl_stat is not numeric",
+        "template_id": "settlement_fail_rate"
+      }
+    ],
+    "summary": {
+      "design_checked": 10,
+      "groups": 2,
+      "needs_external_validation": 0,
+      "suggested": 10
+    },
+    "table_known": true
+  },
+  "facets": {},
+  "hits": [
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+            ],
+            "value": "'measure=normalized' divides the slope by window-mean balance (scale-free)."
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ],
+          "value": "OLS slope of a customer's balance vs time over a trailing window \u2014 the core deposit-drain / attrition signal."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGHFRJT6XBH110ARHBG",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHJMWDYC8H9BCXH464P",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.bal_amt",
+              "public.cust_master.master_dt",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "unclassified",
+        "discovery_metadata_revision_id": "8431096e1565234bd8f7d29ef200cbb758bd547d81a81dc48fcc417619cc04a9",
+        "display_name": "balance_trend_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ],
+          "value": "bind a monetary_stock (never a flow); single currency \u2014 convert to base first."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": null,
+        "feature_category_derived_from_family_mapping": false,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "4aea2b5771a7b87cc0e70eb1379cd03c581ee837abb68f3e4d2b50c4a7325f31",
+        "keywords": [],
+        "name": "balance_trend_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.bal_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.bal_amt",
+            "recipe_role": "stock_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [
+              "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+            ],
+            "graph_object_ref": "public.cust_master.master_dt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_dt",
+            "recipe_role": "asof",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "trend_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "trend_90d(bal_amt) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Balance Stock",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "id": "balance_stock",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "bal_amt"
+          ],
+          "operation": "trend_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:ba77af20aa008944bddcd505bc672b04954b84775157c9f223ef728d5412d9fd"
+          ],
+          "value": "3-financial-migration"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "8cabd3139c011d6bbcfbb70cf9121f54f2600de3ea3c984221ddeb7e88417bcc",
+        "suggestion_revision_id": "fd065cd7a3e6ad76b54f4cf919953385c98cfb3342aa3deb49c8572e950b1297",
+        "template_id": "balance_trend",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+            ],
+            "value": "borders the churn label \u2014 see the attrition-funnel leakage trap (Part D.9)."
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ],
+          "value": "Days since the customer's last activity: as_of \u2212 max(event_ts)."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.txn_ts",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "partial",
+        "discovery_metadata_revision_id": "7eea5e7ccda6b41f2965d613caf16328e6636005dbf4d1b7bea7f8d38ddad5b3",
+        "display_name": "dormancy_days",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ],
+          "value": "\u26a0 NEAR-LABEL: if churn is defined as 'no activity in N days' this \u2248 the label. The 3-part leakage control must FLAG it (confirm pre-as_of only, and window \u2260 label window)."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": {
+          "basis": "template_authored",
+          "display_name": "Recency & Timing",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "family-feature-category-mapping:10da910476dddd540d15bd1640ae357dcf303d0a385526631ac07c03a6d8086b#family=recency",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "id": "recency",
+          "operational_influence": null,
+          "source_refs": [
+            "discovery-metadata-revision:7eea5e7ccda6b41f2965d613caf16328e6636005dbf4d1b7bea7f8d38ddad5b3"
+          ]
+        },
+        "feature_category_derived_from_family_mapping": true,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "b99cb8a766755744f3ce96b7ca8caaa8cba5d59487d0d9fb422437fb62812382",
+        "keywords": [],
+        "name": "dormancy_days",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "recency",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ],
+          "value": "last event strictly \u2264 as_of. DESIGN-TIME declaration \u2014 no data plane enforces it."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "recency(txn_ts) BY master_cif",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Recency",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "id": "recency",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "txn_ts"
+          ],
+          "operation": "recency",
+          "time": "",
+          "window": ""
+        },
+        "recipe_revision_id": "3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:3f0895ec4eeb3c4f803f92bd68dbba12e44ccf08ac6f5f7ceebdf68e7b03ea3c"
+          ],
+          "value": "baseline"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "31bb913af10559ebab8642d8f749b1506506cc4f2b08c5f486df8c92fc55034c",
+        "suggestion_revision_id": "55c45788fd8620e23fb0ed41ba54b5774a5001276e6729f45facbb315e196cf5",
+        "template_id": "dormancy_days",
+        "time_ref": null,
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "NEAR_LABEL",
+            "detail": "the recipe declares this feature borders the outcome label",
+            "operand_refs": []
+          },
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": null
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+          ],
+          "value": "Is transaction activity decaying? count(events in recent half) / count(prior half); <1 means declining."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.txn_ts",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "partial",
+        "discovery_metadata_revision_id": "4374d63e9993c415342bfe44c81c314a0158f9413bddc0d71e58737ffe637e7f",
+        "display_name": "txn_frequency_trend_90d",
+        "eligibility_note": null,
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": {
+          "basis": "template_authored",
+          "display_name": "Trend & Trajectory",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "family-feature-category-mapping:10da910476dddd540d15bd1640ae357dcf303d0a385526631ac07c03a6d8086b#family=activity_trend",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "id": "trend",
+          "operational_influence": null,
+          "source_refs": [
+            "discovery-metadata-revision:4374d63e9993c415342bfe44c81c314a0158f9413bddc0d71e58737ffe637e7f"
+          ]
+        },
+        "feature_category_derived_from_family_mapping": true,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "b89d2ed67c51e45e8904bc45a8bf5e88488711f8ea552705f9534a1ceba674f5",
+        "keywords": [],
+        "name": "txn_frequency_trend_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "frequency_trend_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "frequency_trend_90d(txn_ts) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Activity Trend",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "id": "activity_trend",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "txn_ts"
+          ],
+          "operation": "frequency_trend_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:da3b05ebd56b1a5d34d76fe47aa5ab634ac50a384eda1a26c55f5c0437371995"
+          ],
+          "value": "2-disengagement"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "254b74c91b2b9f93ecbfe410ee15aaf1ad797bf31cef2c7ddeb9100c36934d04",
+        "suggestion_revision_id": "3c47ee417d8e0b47dcc3818eeb4a7b7bcd90432fb01d17ecd592d701de481de4",
+        "template_id": "txn_frequency_trend",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+            ],
+            "value": "OUTPUT additivity is measure-dependent: measure=net is additive, measure=ratio is non-additive (default carries the ratio case)."
+          }
+        ],
+        "binding_quality": "acceptable",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ],
+          "value": "Debits vs credits in a window \u2014 is the account net-draining? measure=net -> credits\u2212debits."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGCZVASJX62E35XV4EC",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.txn_amt",
+              "public.txn_ledger.txn_ts",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "partial",
+        "discovery_metadata_revision_id": "89871cd1a5bd08e2dabb3bfd5d4f4de66c9b6626b6d5dadc7a8e205389aed637",
+        "display_name": "inflow_outflow_ratio_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ],
+          "value": "single currency \u2014 convert to base first."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": {
+          "basis": "template_authored",
+          "display_name": "Ratio & Share",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "family-feature-category-mapping:10da910476dddd540d15bd1640ae357dcf303d0a385526631ac07c03a6d8086b#family=cashflow_ratio",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "id": "ratio",
+          "operational_influence": null,
+          "source_refs": [
+            "discovery-metadata-revision:89871cd1a5bd08e2dabb3bfd5d4f4de66c9b6626b6d5dadc7a8e205389aed637"
+          ]
+        },
+        "feature_category_derived_from_family_mapping": true,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "9799be8a6702a63a7ec9ee3b6c0a373c69d56ce8c3cbc003b6802bb924c83cf4",
+        "keywords": [],
+        "name": "inflow_outflow_ratio_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_amt",
+            "recipe_role": "flow_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "inflow_outflow_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ],
+          "value": "non_additive"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "inflow_outflow_90d(txn_amt, txn_ts) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Cashflow Ratio",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "id": "cashflow_ratio",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "txn_amt",
+            "txn_ts"
+          ],
+          "operation": "inflow_outflow_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:caa7e2d1eec65a4660db12c7d64915554cb8eeb8f5ee1274b954326c3e88858d"
+          ],
+          "value": "3-financial-migration"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "81bc14d8577a968536a99d1806adc09c32870d16d8bf2006a9e04e441e3e6cc0",
+        "suggestion_revision_id": "f302a0254e0d6f3c0f3d219705f511d52ec5f113e4f28e73ff33aac84837b910",
+        "template_id": "inflow_outflow_ratio",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+            ],
+            "value": "threshold_pct is a percentile of the customer's OWN history; an absolute threshold is also permitted downstream."
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ],
+          "value": "Count of distinct days the balance sat under a floor in the trailing window."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGHFRJT6XBH110ARHBG",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHJMWDYC8H9BCXH464P",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.bal_amt",
+              "public.cust_master.master_dt",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "unclassified",
+        "discovery_metadata_revision_id": "8431096e1565234bd8f7d29ef200cbb758bd547d81a81dc48fcc417619cc04a9",
+        "display_name": "days_below_threshold_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ],
+          "value": "bind a monetary_stock; single currency."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": null,
+        "feature_category_derived_from_family_mapping": false,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "c766bc1dc405dd4b107c3ab88ba93ef2ca260f1ad6095bb9259f3fa3b75fd0e2",
+        "keywords": [],
+        "name": "days_below_threshold_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.bal_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.bal_amt",
+            "recipe_role": "stock_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [
+              "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+            ],
+            "graph_object_ref": "public.cust_master.master_dt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_dt",
+            "recipe_role": "asof",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "days_below_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ],
+          "value": "additive"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "days_below_90d(bal_amt) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Balance Stock",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "id": "balance_stock",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "bal_amt"
+          ],
+          "operation": "days_below_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:037cc42a70bbb98ac0afc43210c8a47eeedf7b4d0b219f7f1ce6164d078a0722"
+          ],
+          "value": "3-financial-migration"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "353a467af01d8856b3efde66e1a1a02261714d390fc2767b9d54a4719200a8ed",
+        "suggestion_revision_id": "9d16b1d3b898dd7cfa96e0226c4696a75ae82d2ccfd90a868dc43934390e6219",
+        "template_id": "days_below_threshold",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+            ],
+            "value": "concept sub: salary tag uses 'category_code' (transactions.type)."
+          }
+        ],
+        "binding_quality": "acceptable",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ],
+          "value": "Over salary-tagged credits: cessation_flag (salary stopped when previously regular) / gap_std (irregularity) / latest_gap (days since last salary)."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGCZVASJX62E35XV4EC",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.txn_amt",
+              "public.txn_ledger.txn_ts",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "unclassified",
+        "discovery_metadata_revision_id": "8431096e1565234bd8f7d29ef200cbb758bd547d81a81dc48fcc417619cc04a9",
+        "display_name": "salary_signal_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ],
+          "value": "income is SENSITIVE \u2014 churn-permitted but flagged."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": null,
+        "feature_category_derived_from_family_mapping": false,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "cc94a880e5da0716c95ac0f6ef883e8f19e0ad1328f85ddf259aa233744f23a1",
+        "keywords": [],
+        "name": "salary_signal_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_amt",
+            "recipe_role": "flow_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "salary_signal_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "salary_signal_90d(txn_amt, txn_ts) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Income Signal",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "id": "income_signal",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "txn_amt",
+            "txn_ts"
+          ],
+          "operation": "salary_signal_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:063c873e066e4a28dafd0baa2cab54ea1e19c769b2ab97ab6e3be50cfb63eaa1"
+          ],
+          "value": "3-financial-migration"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "df77847be44c47f0dbe613d001b961dead2b3d5869693d221cbef9a6b253124b",
+        "suggestion_revision_id": "224b689b8014460b526222c94cf42c1ab42353d4b8ce12449e75f96a97d82807",
+        "template_id": "salary_signal",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ],
+          "value": "Coefficient of variation of balance in the window: std(stock)/mean(stock)."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGHFRJT6XBH110ARHBG",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHJMWDYC8H9BCXH464P",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.bal_amt",
+              "public.cust_master.master_dt",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "unclassified",
+        "discovery_metadata_revision_id": "8431096e1565234bd8f7d29ef200cbb758bd547d81a81dc48fcc417619cc04a9",
+        "display_name": "balance_volatility_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ],
+          "value": "bind a monetary_stock; single currency."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": null,
+        "feature_category_derived_from_family_mapping": false,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "8048cf6ee07499ee218effaa9fd62730b19850735218d3ca08f209e516ab9e19",
+        "keywords": [],
+        "name": "balance_volatility_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.bal_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.bal_amt",
+            "recipe_role": "stock_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [
+              "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+            ],
+            "graph_object_ref": "public.cust_master.master_dt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_dt",
+            "recipe_role": "asof",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "balance_volatility_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "balance_volatility_90d(bal_amt) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Balance Stock",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "id": "balance_stock",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "bal_amt"
+          ],
+          "operation": "balance_volatility_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:f3d7d442af14dcfd5a8577c9f73415f23b2e7fe6d116486bff091501b05efa1c"
+          ],
+          "value": "3-financial-migration"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "c576ca13fbfe44c81ad4d1e6c58eed6a9ba8fe39eab5a86d5b0dca29b9903580",
+        "suggestion_revision_id": "d0552111ce455d5a02fefafab22e5b1306e832274c198c55d8bbbf36881fd880",
+        "template_id": "balance_volatility",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+            ],
+            "value": "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
+          }
+        ],
+        "binding_quality": "strong",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ],
+          "value": "Classic RFM: percentile-binned blend of recency_days, txn_frequency(window) and monetary_sum(window). Components stay inspectable."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZGCZVASJX62E35XV4EC",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZH9BZ51JD4H1TCWV0Z5",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.txn_ts",
+              "public.txn_ledger.txn_amt",
+              "public.cust_master.master_cif"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_cif"
+            ],
+            "value": "customer"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "partial",
+        "discovery_metadata_revision_id": "1c6434ec796eff8ea032ca0bbf3a44ec92bbeb8e7e1823cf9c8680d66ea8bbad",
+        "display_name": "rfm_composite_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ],
+          "value": "single currency for the monetary component."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "customer",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=customer_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "id": "customer",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": {
+          "basis": "template_authored",
+          "display_name": "Composite Score",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "family-feature-category-mapping:10da910476dddd540d15bd1640ae357dcf303d0a385526631ac07c03a6d8086b#family=rfm",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "id": "composite",
+          "operational_influence": null,
+          "source_refs": [
+            "discovery-metadata-revision:1c6434ec796eff8ea032ca0bbf3a44ec92bbeb8e7e1823cf9c8680d66ea8bbad"
+          ]
+        },
+        "feature_category_derived_from_family_mapping": true,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_cif"
+          ]
+        ],
+        "grounding_trace_content_hash": "d0b14973ad524b9bf970ec03d9367f8ca9202e18cf686a391e2cce5375442010",
+        "keywords": [],
+        "name": "rfm_composite_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_amt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_amt",
+            "recipe_role": "flow_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [
+              "evt_01KZ5PYZN0YAK4QCTGH044RNN5"
+            ],
+            "graph_object_ref": "public.cust_master.master_cif",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_cif",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "rfm_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ],
+          "value": "n/a"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ],
+          "value": "trailing window (as_of \u2212 {window}, as_of], values knowable strictly \u2264 as_of; never forward. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "rfm_90d(txn_ts, txn_amt) BY master_cif OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "RFM",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "id": "rfm",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_cif",
+          "measures": [
+            "txn_ts",
+            "txn_amt"
+          ],
+          "operation": "rfm_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:57fd2947a18d474f020e2a5874879b428d7a0ad5a108d62434f1f0dc4204245e"
+          ],
+          "value": "baseline"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "895088126b14e702471fd8bff2f715046f1317d0e10456c6e00a5b2645e8f0e8",
+        "suggestion_revision_id": "ada0028b9edb7b32c1e8dfce0380c262db79211de7ad51e150ce37c3c98855cf",
+        "template_id": "rfm_composite",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+            ],
+            "value": "anchor: 'settlement_status' (custody-distinctive; the failed-status aging, NOT the settlement_fail label) routes this off a churn catalog."
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+            ],
+            "value": "borders/reads the fail outcome (POST-fail) \u2014 like a collections post-charge-off signal; observe strictly on pre-label observations for a prediction model."
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+            ],
+            "value": "OUTPUT additivity is measure-dependent: aged_fail_share is a non-additive ratio; mean_fail_age_days is a duration (n/a) \u2014 the default carries the ratio case."
+          }
+        ],
+        "binding_quality": "acceptable",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ],
+          "value": "Fail-ageing buckets \u2014 how long already-FAILED instructions have been aging (measure=aged_fail_share in buckets, or mean fail_age_days), a POST-fail asset-servicing signal on the fail \u2192 buy-in tail."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZH4MW09B8KKNN8970QE",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZGP6VJFZR0EDF4TV7FK",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHEA84MJYFENFEJ3JAR",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.setl_stat",
+              "public.txn_ledger.txn_ts",
+              "public.cust_master.master_acct"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_acct"
+            ],
+            "value": "account"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "partial",
+        "discovery_metadata_revision_id": "a4c9ec9635ebac3658724211e1d955f6c6226b135ed46ba3af9e6e7b456e40a8",
+        "display_name": "fail_ageing_buckets_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ],
+          "value": "\u26a0 NEAR-LABEL: build the signal from PRE-fail observations STRICTLY before the predicted instruction's settlement outcome (never the settlement_fail label itself \u2014 the engine refuses it; window \u2260 the label window); the 3-part leakage control must FLAG it. fail-ageing is a POST-fail signal (the fail \u2192 buy-in tail) \u2014 for a fail-PREDICTION model observe it on PRIOR/other instructions, never the target instruction's own post-fail age. built from PRE-fail signals (settlement_status pending/failed history, settlement_cycle length), NEVER the settlement_fail outcome (a leakage anchor the engine refuses by construction)."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "account",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=account_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "id": "account",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": {
+          "basis": "template_authored",
+          "display_name": "Duration & Streak",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "family-feature-category-mapping:10da910476dddd540d15bd1640ae357dcf303d0a385526631ac07c03a6d8086b#family=fail_ageing",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "id": "duration",
+          "operational_influence": null,
+          "source_refs": [
+            "discovery-metadata-revision:a4c9ec9635ebac3658724211e1d955f6c6226b135ed46ba3af9e6e7b456e40a8"
+          ]
+        },
+        "feature_category_derived_from_family_mapping": true,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_acct"
+          ]
+        ],
+        "grounding_trace_content_hash": "bd32278a5b61342aa368f8056284e6e9c38487f36213acdb7a4ca279594dd45a",
+        "keywords": [],
+        "name": "fail_ageing_buckets_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.setl_stat",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.setl_stat",
+            "recipe_role": "status_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.txn_ts",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.txn_ts",
+            "recipe_role": "event_ts",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [],
+            "graph_object_ref": "public.cust_master.master_acct",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_acct",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "fail_ageing_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ],
+          "value": "non_additive"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ],
+          "value": "point-in-time custody / settlement STATE observed as-of: the latest status / holding within (as_of \u2212 {window}, as_of], knowable strictly \u2264 as_of, never forward. PIT-CRITICAL: a settlement outcome is not KNOWABLE until T+n (settlement_cycle) \u2014 honour system_time. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "fail_ageing_90d(setl_stat, txn_ts) BY master_acct OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Fail Ageing",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "id": "fail_ageing",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_acct",
+          "measures": [
+            "setl_stat",
+            "txn_ts"
+          ],
+          "operation": "fail_ageing_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:a0bf7b7059db5df49777feb1a15f157a9086630b6fde26239ae807f409072af9"
+          ],
+          "value": "fail-ageing"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "6b82cdb8383cc208f42763001f952f7d283dcd6d22883e979e98b3ab8f91649b",
+        "suggestion_revision_id": "cbd661bcdc5f9571d2be7c082831b379cf7a3f9a10dbc77a879ed1ebe96e358c",
+        "template_id": "fail_ageing_buckets",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "NEAR_LABEL",
+            "detail": "the recipe declares this feature borders the outcome label",
+            "operand_refs": []
+          },
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    },
+    {
+      "projection": null,
+      "provenance": {
+        "dependency_revision_ids": [
+          "evt_01KZ5PYZMNNZEEJ7WEXNHYB8AG",
+          "evt_01KZ5PYZN0YAK4QCTGH044RNN5",
+          "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+        ],
+        "evidence_event_ids": [],
+        "generated_at": null,
+        "metadata_snapshot_ids": [],
+        "producer_commit": null,
+        "refresh_id": null,
+        "relationship_realization_revision_ids": [
+          "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193"
+        ],
+        "scope_set_id": null
+      },
+      "suggestion": {
+        "authoring_notes": [
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+            ],
+            "value": "anchor: 'custody_holding' (custody-distinctive AUC stock, non-structural) routes this off a churn catalog."
+          },
+          {
+            "basis": "template_authored",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "taxonomy",
+                "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+                "strength": "attested"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+            ],
+            "value": "OUTPUT additivity is measure-dependent: a holding level/trend is a semi-additive stock; turnover / concentration_hhi are non-additive \u2014 the default carries the semi-additive holding case."
+          }
+        ],
+        "binding_quality": "acceptable",
+        "business_domains": [],
+        "business_interpretation": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ],
+          "value": "Custody-holding dynamics \u2014 assets-under-custody holding level / trend (measure=holding_trend), turnover (traded value / holdings) or concentration (HHI across holdings); the custody-book stability signal."
+        },
+        "business_value": null,
+        "contextual_domain_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": "fev_01KZ5PYZGZ8YE42YHSZEBA0YRP",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHJMWDYC8H9BCXH464P",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              },
+              {
+                "evidence_id": "fev_01KZ5PYZHEA84MJYFENFEJ3JAR",
+                "lifecycle": "active",
+                "producer": "source",
+                "producer_ref": "ing_01KZ5PYZE1AAFM4T1GQX2TXHY4",
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.txn_ledger.cust_hold",
+              "public.cust_master.master_dt",
+              "public.cust_master.master_acct"
+            ],
+            "value": "Party"
+          }
+        ],
+        "contextual_entity_terms": [
+          {
+            "basis": "catalog_resolved",
+            "evidence": [
+              {
+                "evidence_id": null,
+                "lifecycle": "active",
+                "producer": "legacy",
+                "producer_ref": null,
+                "strength": "proposed"
+              }
+            ],
+            "operational_influence": null,
+            "source_refs": [
+              "public.cust_master.master_acct"
+            ],
+            "value": "account"
+          }
+        ],
+        "dataset_profile_hashes": [],
+        "discovery_disposition": "unclassified",
+        "discovery_metadata_revision_id": "8431096e1565234bd8f7d29ef200cbb758bd547d81a81dc48fcc417619cc04a9",
+        "display_name": "custody_holding_dynamics_90d",
+        "eligibility_note": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ],
+          "value": "single currency; a custody holding is a semi-additive STOCK (sum across accounts, latest over time \u2014 never sum across dates)."
+        },
+        "entity": {
+          "basis": "template_authored",
+          "display_name": "account",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "concept-registry:concepts@2#concept=account_id",
+              "strength": "attested"
+            },
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "id": "account",
+          "operational_influence": null,
+          "source_refs": [
+            "concept-registry:concepts@2"
+          ]
+        },
+        "feature_category": null,
+        "feature_category_derived_from_family_mapping": false,
+        "generation_source": "recipe",
+        "grain_refs": [
+          [
+            "p4_suggestions_join_ftr",
+            "public.cust_master.master_acct"
+          ]
+        ],
+        "grounding_trace_content_hash": "f45229eeddd7b73f0e70d0bc6669f098142e0cd9d41c8794d005f6f772cc6ed8",
+        "keywords": [],
+        "name": "custody_holding_dynamics_90d",
+        "operands": [
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "measure",
+            "evidence_refs": [],
+            "graph_object_ref": "public.txn_ledger.cust_hold",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.txn_ledger.cust_hold",
+            "recipe_role": "holding_col",
+            "table_ref": "txn_ledger",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "time",
+            "evidence_refs": [
+              "evt_01KZ5PYZND1YNQ24EAX2F5T9VR"
+            ],
+            "graph_object_ref": "public.cust_master.master_dt",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_dt",
+            "recipe_role": "asof",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          },
+          {
+            "catalog_source": "p4_suggestions_join_ftr",
+            "classification": "grain",
+            "evidence_refs": [],
+            "graph_object_ref": "public.cust_master.master_acct",
+            "logical_ref": "p4_suggestions_join_ftr::dpl_eib_compliance.cust_master.master_acct",
+            "recipe_role": "entity",
+            "table_ref": "cust_master",
+            "visibility_requires_current": []
+          }
+        ],
+        "operation_kind": "custody_holding_dynamics_90d",
+        "output_additivity": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ],
+          "value": "semi_additive"
+        },
+        "point_in_time_declaration": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ],
+          "value": "point-in-time custody / settlement STATE observed as-of: the latest status / holding within (as_of \u2212 {window}, as_of], knowable strictly \u2264 as_of, never forward. PIT-CRITICAL: a settlement outcome is not KNOWABLE until T+n (settlement_cycle) \u2014 honour system_time. DESIGN-TIME declaration \u2014 no data plane enforces runtime PIT."
+        },
+        "read_scope_rule_content_hashes": [
+          "008fe9aa22de758e66310f9c109d4856576a21c7001bdbba561df3939dcfe74f"
+        ],
+        "recipe": "custody_holding_dynamics_90d(cust_hold) BY master_acct OVER 90d [master_dt]",
+        "recipe_family": {
+          "basis": "template_authored",
+          "display_name": "Custody Holdings",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "id": "custody_holdings",
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ]
+        },
+        "recipe_parts": {
+          "grain": "master_acct",
+          "measures": [
+            "cust_hold"
+          ],
+          "operation": "custody_holding_dynamics_90d",
+          "time": "master_dt",
+          "window": "90d"
+        },
+        "recipe_revision_id": "174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+        "recipe_stage": {
+          "basis": "template_authored",
+          "evidence": [
+            {
+              "evidence_id": null,
+              "lifecycle": "active",
+              "producer": "taxonomy",
+              "producer_ref": "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a",
+              "strength": "attested"
+            }
+          ],
+          "operational_influence": null,
+          "source_refs": [
+            "recipe-revision:174261e3a5434be9af2adbf70d8900cf7e96462b8d7886532cf5ef8ba91db46a"
+          ],
+          "value": "asset-servicing"
+        },
+        "relationship_dependencies": [
+          {
+            "cardinality": "unknown",
+            "from_ref": [
+              "p4_suggestions_join_ftr",
+              "public.cust_master.master_acct"
+            ],
+            "realization_content_hash": "f2600e4ed640ccc2220a1138e5d6e6893d9274df678c3e9b47fba76fbd5e9193",
+            "relationship_kind": "direct_equality",
+            "relationship_ref": "joins:p4_suggestions_join_ftr:public.cust_master.master_acct|public.txn_ledger.ledger_acct",
+            "review_status": "file_declared",
+            "safety_status": "clearing",
+            "to_ref": [
+              "p4_suggestions_join_ftr",
+              "public.txn_ledger.ledger_acct"
+            ]
+          }
+        ],
+        "requirements": [],
+        "schema_version": "feature-suggestion-v2",
+        "semantic_context_hashes": [],
+        "source_datasets": [
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "txn_ledger",
+            "temporal_storage_model": null
+          },
+          {
+            "authority_role": null,
+            "catalog_source": "p4_suggestions_join_ftr",
+            "data_role": null,
+            "dataset_profile_hash": null,
+            "primary_entity": null,
+            "profile_status": "unavailable",
+            "table_ref": "cust_master",
+            "temporal_storage_model": null
+          }
+        ],
+        "suggestion_id": "7525f65dbf8edacc782426f3229cd87eb6a4e4bd3e922ccb33fbd0a24a7d11f2",
+        "suggestion_revision_id": "592a56a6acff0851830accf7c36b55d9f6bf375282aabf0378e594eeed6f4fd5",
+        "template_id": "custody_holding_dynamics",
+        "time_ref": [
+          "p4_suggestions_join_ftr",
+          "public.cust_master.master_dt"
+        ],
+        "use_cases": [],
+        "validation_rule_content_hashes": [
+          "9dbf0ab4e91be722a99e94031ce3dee1e4efeca2046aca6fd4e1a4bad76cd47e",
+          "b877d82d2003a5fcaf21667cf4018641c504c77c58ce4dd26f47ac9bcca74f49",
+          "ecab8e3b492a6addbc03caba3475d714312d46d3bc5ce5354a4e3da84a6467a8"
+        ],
+        "validation_status": "DESIGN_CHECKED",
+        "warnings": [
+          {
+            "code": "RELATIONSHIP_UNCONFIRMED",
+            "detail": "a traversed relationship was declared by an upload and confirmed by nobody",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          },
+          {
+            "code": "DIRECTIONAL_CARDINALITY_UNAVAILABLE",
+            "detail": "a traversed relationship declares no cardinality in the direction travelled",
+            "operand_refs": [
+              [
+                "p4_suggestions_join_ftr",
+                "public.cust_master.master_acct"
+              ],
+              [
+                "p4_suggestions_join_ftr",
+                "public.txn_ledger.ledger_acct"
+              ]
+            ]
+          }
+        ],
+        "window": "90d"
+      }
+    }
+  ],
+  "next_cursor": null,
+  "projection": null,
+  "read_mode": "on_demand",
+  "read_scope_key": "254fd4f5f711d346042bc9a98782fad89fd0d94404f02f8b117988842b4ffde0"
+}

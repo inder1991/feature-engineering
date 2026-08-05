@@ -254,7 +254,7 @@ def assemble(db, revision, cib, ftr, mapping, realization, *, scope=SANDBOX_SCOP
 # ── the bundle assembles from real rows ─────────────────────────────────────────────────────────
 
 def test_a_stored_crosswalk_assembles_into_the_bundle_a_compilation_plans_on(bank):
-    """A.42's closure: definition + measurement + decision + selection + three bindings, from rows."""
+    """A.44's closure (numbered A.42 before the 2026-08-05 main merge renumbering): definition + measurement + decision + selection + three bindings, from rows."""
     db, revision, cib, ftr, mapping, realization = bank
     selection = row_selection()
     record_crosswalk_observation(

@@ -346,7 +346,7 @@ def test_the_zero_is_because_no_candidate_combines_two_declared_measures(overlay
                             mint_test_identity(subject="user:e4a-admin",
                                                role_claims=("platform-admin",)))
     ideas = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(),
-                                 target_ref=None, now=None)[0]
+                                 target_ref=None, now=None).ideas
     mine = [idea for idea in ideas if idea.grain_table == TABLE]
     assert len(mine) == 10, f"re-measure: {len(mine)} candidates"
     for idea in mine:

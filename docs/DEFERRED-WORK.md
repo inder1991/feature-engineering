@@ -715,7 +715,7 @@ this gate.
 | 🟡 **A currency CONVERSION policy** — the third way through `CURRENCY_POLICY_REQUIRED`, beside binding the dimension and declaring the column's currency | The refusal message already offers it as an option, so the wording is forward-compatible, but no store exists. Conversion is not a validator decision: it needs a base currency, a point-in-time FX source and a governed rate, which is a materialization concern (`fx_conversion_rate` is already in the registry with nothing reading it). | The first cross-currency aggregate a customer actually asks for. Fix shape: a governed policy naming base currency + rate source; `_use_gate` clears on its presence, and the requirement rides to materialization rather than being dropped. |
 | 🟡 **`sensitivity="proxy"` concepts (`country_code`, `geographic`, `corridor`, `alternative_data`, `fatca_crs_classification`) are NOT gated** | A proxy is context-dependent in a way the other four classes are not: `country_code` is a national-origin proxy for CREDIT and an ordinary risk dimension for AML, and the platform has no use-case axis to tell them apart. Refusing every proxy would refuse legitimate AML features today; refusing none is the honest state until the axis exists. The registry already flags them, so nothing is lost. | The first credit/pricing use case, or the arrival of a declared model PURPOSE on the feature request. Fix shape: gate proxies on purpose, not on the concept alone. |
 | ⚪ **The refusal FAMILY is server-side only; the wire still carries `{name, reason, code}`** | `FEATURE_REFUSAL_FAMILIES` maps every `RejectCode` to a D5 family and an import-time validator refuses a code without one, but the family is not on the `/features/recommend` payload. Putting it there means adjudicating `GOVERNED_CROSS_CATALOG_PLAN_REQUIRED` — a rejection code `gate1` emits that is NOT a `RejectCode` member — and that code belongs to the cross-catalog stream, not this slice. The actionable wording is in `reason` today, and the frontend labels the four new codes. | The rejections-panel reframe (render the family, not a red "rejected" badge). Fix shape: one `_rejection` factory in `feature_assist`, `gate1`'s two non-`RejectCode` sites adjudicated with it, then the field on the wire and `api.ts`. |
-### A.40 🔴 The migration-1020 authoring lane is orphaned: nothing writes it, and nothing reads it any more (2026-08-03)
+### A.46 🔴 The migration-1020 authoring lane is orphaned: nothing writes it, and nothing reads it any more (2026-08-03)
 
 Found by Phase G T2, which was the first caller ever to try to reach `admit_artifacts` from a
 durable identity. Two complete authoring lanes exist side by side and describe DISJOINT sets of
@@ -750,7 +750,7 @@ which orchestrator is the real one — not a wiring detail.
 |---|---|---|
 | 🔴 **`formula/authoring.py` + `formula/trace.py` + migration 1020 have no writer and no reader** | Ownership: `formula/**` was explicitly out of scope for the session that found this, and the fix is a choice between two whole orchestrators rather than a repair. Both lanes remain individually correct and tested; the defect is that only one of them is connected to anything. | Any decision by whoever owns `formula/` about which authoring orchestrator is authoritative. The two closures are: DELETE the 1020 lane (and mark 1020 obsolete), or REPOINT `recipe_formula_worker` at `formula/authoring.py` — in which case `materialize/authoring_trace.py` must move back to the 1020 store and check 6 narrows to four fields again. Note the 1020 terminal payload carries no `result` material, so the second option also needs a durable authoring result before anything can be resolved. |
 
-### A.41 🟡 L0's probe runs inside `_commit`'s open transaction (2026-08-03)
+### A.47 🟡 L0's probe runs inside `_commit`'s open transaction (2026-08-03)
 
 Found and accepted by Phase G T6, which put §11.2's L0 into `compile/chain.py`. `run_l0` launches a
 separate interpreter and waits up to `L0Interpreter.timeout_seconds` for it; that wait happens
@@ -801,7 +801,20 @@ operator cannot do today is close the old row.
 |---|---|---|
 | 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
 
-### A.36 🟡 The bridged (cross-catalog) chain path is inferred, never run (2026-08-04)
+### A.36 🟡 The bridged (cross-catalog) chain path — chain/lane row CLOSED, `execution_tier` row still OPEN (2026-08-04)
+
+🟡 rather than 🟢 **deliberately**: this entry carries two rows and only the first is done. A reader
+scanning headings must not take A.36 as finished while no triggered run can ask for a SANDBOX-scoped
+realization. The heading turns 🟢 when the second row does.
+
+**CLOSED for the chain/lane row (2026-08-04); the `execution_tier` row below remains OPEN.** The
+durable seed helper is `tests/featuregen/materialize/test_cross_catalog_ir.seed_executable_bridge_realization`
+and the fourth cross-catalog worked feature is `fixtures.BRIDGED_FEATURE_NAME`. A bridged group now
+runs through `compile_feature_group` (`test_chain.py`, five cases) and over HTTP through the worker
+tick (`test_materialization_e2e.py`, two cases), loading its realization from the database in both.
+The seed writes through `bridge_store`'s own writers, so the load exercises
+`executable_bridge_realizations`' full revalidation rather than a SELECT. Everything below is kept
+as the record of what the gap was.
 
 Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
 report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
@@ -827,7 +840,7 @@ graph nodes with a governed logical type.
 
 | Item | Why deferred | Trigger to revisit |
 |---|---|---|
-| 🟡 **No test drives a cross-catalog group through `compile_feature_group`, so the realization LOAD on the chain's own path is unexercised** | It is a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. G-1's acceptance criterion is the same-catalog path, and inventing the seed under acceptance-test pressure would have produced a fixture nobody had reviewed. | The first bridged group anybody triggers, or any change to how `compile_ir` resolves realizations. Closure: the durable seed helper above, then a fifth case in `tests/featuregen/api/test_materialization_e2e.py` driving the bridged group over HTTP — the harness already exists and takes one more fixture. |
+| 🟢 **CLOSED — a cross-catalog group now drives `compile_feature_group` AND the HTTP-triggered lane, loading the realization from the store** | Was a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. | Done as described: `seed_executable_bridge_realization` + `bridged_debit_amount_30d`. The discriminator is the `realization_revision_id`, content-addressed over the exact observation only the durable seed writes, asserted present in the sealed `nodes.py`; the control is a bridged run against an EMPTY store, which must refuse at `compile_ir` with `JOIN_CARDINALITY_UNKNOWN`. |
 | 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
 
 ### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)
@@ -900,7 +913,271 @@ cannot distinguish a rollback to a real past state from that state. Catching it 
 seal or an append-only pointer log. **Trigger:** the first compliance/audit requirement for
 non-repudiable policy history, or any incident involving policy-state disputes.
 
-### A.42 Release C Task 12 — adversarial-review residuals (2026-08-04)
+### A.40 🟡 Phantom-keyed `field_evidence` / `field_decision_event` rows on deployed catalogs (2026-08-03)
+
+Recorded while remediating the final whole-branch review of Release A of the
+suggested-feature semantic-discovery plan (Task 0C minor, carried to the checkpoint).
+Task 0C (`89d78dc4`) changed how `column_authority.logical_ref_of` derives an object's
+logical key: it now reads `kind/schema_name/table_name/column_name` off the canonical
+`graph_node` row instead of guessing from the ref's dot count. Before that change a
+**two-part TABLE ref** — `public.accounts`, which is exactly how `graph.build_graph`
+stores a public-flattened table node — was read positionally as `table="public"`,
+`column="accounts"`, producing the phantom COLUMN key `<src>::public.public.accounts`.
+Any field decision or evidence row written against a table anchor under the old code
+therefore sits under a key nothing resolves to any more: `asset_detail` (`:694`),
+`read_field_cas` (`field_correction.py:196`), `apply_field_correction` (`:272`) and
+`column_readiness` (`:572`) all key off `logical_ref_of`, so they now compute
+`<src>::public.accounts` and find nothing. The rows are not corrupt and not lost —
+they are simply **unreachable from every read path**, and a curator who confirmed a
+table-level field before the fix sees their decision silently gone.
+
+This is invisible in CI and in every test fixture: fixtures are built after the fix, so
+they never write the phantom spelling. It can only exist on a catalog that was
+**deployed and curated before `89d78dc4`** — which today means the kind cluster, if a
+table-anchored field correction was ever issued there.
+
+**How to detect.** The phantom key is a three-part path whose schema and table segments
+are both `public`, with no matching `graph_node` column:
+
+```sql
+SELECT fe.logical_ref, fe.field_name, count(*)
+  FROM field_evidence fe
+ WHERE fe.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+-- and the decision side
+SELECT fde.logical_ref, fde.field_name, count(*)
+  FROM field_decision_event fde
+ WHERE fde.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+```
+
+Every hit is a table-anchored decision mis-keyed as a column. A real column named
+`public` under a schema named `public` would false-positive; confirm against
+`graph_node` (`kind='column' AND table_name='public'`) before treating a row as phantom.
+
+**What a remediation would look like.** A migration that, for each phantom row, derives
+the intended table key (`<src>::public.<parts[-1]>`), verifies a `graph_node` row exists
+with `kind='table'` and that `table_name`, and rewrites `logical_ref` — as a NEW appended
+evidence/decision row citing the original event, never an in-place UPDATE, because
+`field_decision_event` is an append-only audit table (the standing directive's
+"irreversible while deferred" exception does **not** apply: nothing is being overwritten,
+the rows are merely orphaned, so the fix stays available indefinitely). Rows whose derived
+table key has no `graph_node` row are quarantined and reported rather than guessed.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Phantom `public.public.<table>`-keyed field evidence/decisions are unreachable after the Task 0C key fix** | Zero known rows: the defect requires a table-anchored field correction issued on a deployed catalog before `89d78dc4`, and no such correction has been confirmed to exist. Writing a migration for a population that may be empty — against an append-only audit table — costs more than it returns until the population is measured. | Run the two detection queries above against the kind cluster (and any other deployed catalog) at the next deploy. Any non-zero count fires this item; so does the first user report of a confirmed table-level field that "went missing". |
+
+### A.41 🟡 A lagging overlay projection is reported as an authoring failure, and names itself nowhere (2026-08-04)
+
+Found while building A.36's durable bridge seed, and it is not a fixture problem — the fixture is
+only how it was met. The mis-attribution is real in a deployment.
+
+**The mechanism.** `read_operational_value` calls `check_projection_readiness` FIRST, before any read
+is trusted (`overlay/upload/operational_facts.py:441-451`), and that gate compares the overlay
+projection's checkpoint against the GLOBAL event head — `COALESCE(max(global_seq), 0) FROM events`,
+not a per-catalog watermark (`feature_metadata_snapshot.py:145,158-164`). So **any** event appended
+anywhere by anything — an identifier-link proposal, a bridge governance event, a field confirmation
+in an unrelated catalog — puts every governed read in the platform behind the head until the
+projection catches up. That is the correct fail-closed posture and is not the finding.
+
+**The finding is where the verdict surfaces.** `_fail_closed` returns `status="projection_unavailable"`
+carrying the projection's own detail, but nothing downstream keeps it. The authoring lane folds a
+degraded governed read into `NEEDS_AUTHORITY` and the run closes `NEEDS_REVIEW`; the chain's
+resolution seam then reports `NOT_RESOLVED: work item <id> names authoring run <id>, which closed
+NEEDS_REVIEW, not RESOLVED` and stops at `ChainStage.RESOLVE`. **Neither the refusal detail, the
+request row, nor the control plane contains the word `projection_unavailable`, a checkpoint, or a
+head sequence.** An operator holding that refusal is pointed squarely at the LLM authoring layer —
+the model, the critic, the proposal — which is not where the problem is. The problem is that a
+background projection is behind, is probably already catching up, and the run would succeed on
+retry.
+
+Compounded by A.37: a pre-seal refusal has nowhere in the plane to record a stage or a code at all,
+so this diagnosis is not merely absent from the refusal text — it is absent from everything
+queryable.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
+| ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |
+
+### A.42 ✅ CLOSED — L0 proved the build in an interpreter it never compared against the artifact's own pins (raised 2026-08-04, closed 2026-08-04)
+
+**Closed by the engine-version check in L0's build probe.** The row is kept because the reasoning
+below is the design record for `ENGINE_VERSION_MISMATCH`, and because one 🟡 under it is still open.
+
+What landed: `ValidationFindingCode.ENGINE_VERSION_MISMATCH` (§14's finding vocabulary, widened by
+one), classified `GOVERNED_FACT_MISMATCH`. `_BUILD_PROBE` now reads the rendered project's own
+`requirements.lock`, parses every `<distribution>==<version>` pin out of it, and compares each to
+`importlib.metadata` **in the probe's own interpreter** — the one that does the proving — emitting
+one finding per disagreeing distribution, each naming the package, the pin and what is installed. A
+lock that is missing, unreadable or pin-less FAILS CLOSED on the same code: "nothing to compare"
+must not read as "they agree", which is this defect restated.
+
+Three placement decisions carry the fix, and all are asserted by tests rather than described:
+
+* **In the probe, not around it.** A second `subprocess` from `run_l0` asking the same
+  `python_executable` what it has would prove something about a second process merely *believed* to
+  be the one that built — a wrapper script, a re-pointed symlink or an install landing between the
+  two launches makes that belief false, which is this very defect at a smaller scale. It would also
+  need its own "the interpreter never answered" channel beside `_probe_verdict`'s `None`.
+* **First, before `sys.path.insert(0, root + "/src")` and before any import**, so nothing the
+  artifact ships has executed when the pins are read. Short-circuiting is also correct routing: a
+  build that fails *because* the engines are wrong would otherwise be filed
+  `PROJECT_DOES_NOT_BUILD`, a `RENDERER_DEFECT`, sending an operator to fix a renderer that did
+  nothing wrong.
+* **With every `sys.path` entry inside the project REMOVED for the query, and restored before the
+  import.** The first attempt at this fix shipped without it and *reopened the defect it closed* —
+  see below; it is recorded rather than quietly amended, because the reasoning that produced the
+  hole is more instructive than the patch.
+
+**The fix's own regression, found by adversarial review and closed in the same branch.** Ordering
+alone was claimed to be sufficient and is not: `_probe_verdict` launches the probe as `python -c`
+with `cwd=root`, and `python -c` puts the cwd at `sys.path[0]` — so the project root was on the
+metadata search path *before the probe's first statement*. Because `_files_on_disk` deliberately
+skips `*.egg-info` from `generated_project_hash` (an editable install writes one by *using* a
+project, so it is correctly not drift), a root-level `kedro.egg-info/PKG-INFO` was **invisible to
+`PROJECT_HASH_MISMATCH` and authoritative for `importlib.metadata` at the same time**: `run_l0`
+returned `passed` with zero findings for a project pinning `kedro==0.19.9` under an interpreter with
+no kedro. The original test missed it because it only ever forged metadata under `src/`.
+
+The probe now strips every `sys.path` entry resolving inside the project before the query and
+restores the list exactly before the import. In-probe rather than `-P` / `PYTHONSAFEPATH`, on three
+grounds: those close only the cwd door and leave `PYTHONPATH=<root>` open (tested); `-P` is 3.11+
+and would fail the launch of an older L0 interpreter, reported as "the environment did not answer";
+and `PYTHONSAFEPATH=1` in the overlay would silently break `run_l0`'s documented contract that
+`env=None` inherits this process's environment unchanged. The regression test is parametrized over
+four placements — project root `.egg-info`, root `.dist-info`, `src/`, and an arbitrary nested
+directory — plus a `PYTHONPATH`-aimed-at-the-project case, plus a test that the restore is exact
+(a project whose registry imports a module living at the project root still builds).
+
+**And a second one, found by the re-review: the probe's OWN imports ran before its sanitization.**
+The first executable line was `import importlib, importlib.metadata, json, os.path, sys, traceback`,
+executed while `cwd=root` still had the project at `sys.path[0]` — so a tree shipping `<root>/json.py`
+executed arbitrary code with the live verdict nonce in `sys.argv[1]` and forged a passing build
+verdict: `passed`, zero findings, again. Strictly weaker than the first hole, and the row says so
+rather than dramatising it: `json.py` **is** inside `generated_project_hash` (it is not `*.egg-info`),
+so a dropped-in copy is `PROJECT_HASH_MISMATCH` and `_prove_the_build`'s identity check keeps the
+chain safe — the exploit needs an adversary-*sealed* tree, not a hand edit. But it falsified two
+sentences the fix's own comments made, and a false comment is worse than none.
+
+The probe now imports `sys` alone (a built-in: never resolved from `sys.path`, so unshadowable),
+drops the cwd entries with pure `sys` and no import at all, then imports `os.path`, then does the
+`realpath` pass, then imports the rest. Regression test ships a hostile module in a **sealed** tree
+so it exercises the probe's import order rather than the hash check. Reverting the import line kills
+the `json` / `traceback` / `importlib` parameters; the `os` / `encodings` parameters survive it,
+because CPython startup already has those in `sys.modules` — they are defence in depth against the
+import list growing, and the test says which is which.
+
+**And a third, one layer earlier again: `PYTHONPATH` is live during SITE INITIALIZATION.** A sealed
+`<root>/sitecustomize.py` under `PYTHONPATH=<root>` executes before the interpreter runs a line of
+`-c` source — before `import sys`, before any pass the probe could add — and forged `passed []` off
+the nonce in `sys.argv[1]`. Not fixable inside the probe by construction, so it is closed
+parent-side: `_probe_environment` drops `PYTHONPATH` entries resolving inside the project before the
+subprocess is launched (`realpath`, resolved against `root` because that is the child's cwd, so
+`.`, `<root>/./` and `<root>/src/../` all collapse). `-P`/`PYTHONSAFEPATH` do not close it — they
+drop the cwd entry and honour `PYTHONPATH` regardless; `-S` would, by also removing `site-packages`
+and blinding the probe to the engines it exists to check.
+
+This **knowingly amends** `run_l0`'s documented "`env=None` inherits this process's environment
+unchanged" to "unchanged except for project-internal `PYTHONPATH` entries" — the same contract cited
+when rejecting `PYTHONSAFEPATH`, so the amendment is written down at `_probe_environment`, at the
+`env` argument and here. The contract existed so a caller could give the probe what the interpreter
+needs, not so an artifact could be handed a way to execute before it is inspected; an entry pointing
+into the tree under validation is never load-bearing, since the probe puts `<root>/src` on the path
+itself and the cwd still supplies `<root>`. A `PYTHONPATH` pointing OUTSIDE the tree is untouched,
+and a test pins that — it is the mechanism the engine check's own fixtures run on.
+
+It needed two non-default conditions together (an adversary-**sealed** tree, since a dropped-in file
+is `PROJECT_HASH_MISMATCH`, **and** a `PYTHONPATH` naming the root, which nothing in `src/` or
+`deploy/` sets). Fixed rather than documented as an exception, because this row says ✅ CLOSED and a
+known forgery path under that word is the precise failure A.42 exists to stop.
+
+Deliberately NOT stripped: a `sys.path` entry that passes *through* the tree by symlink to a target
+outside it. `realpath` resolves to the target, the target is not the artifact, and a project cannot
+author a `sys.path` entry — only files under its own root. Recorded so it reads as a decision.
+
+**Adversarial-review score across three rounds**, since the shape is the lesson: round 1 shipped the
+check with a false sufficiency claim (root on `sys.path` via cwd); round 2 fixed that and left the
+probe's own import line exposed; round 3 fixed that and left site initialization exposed. Each hole
+was one layer earlier in interpreter startup than the last, and each was found by attacking the
+comment rather than the code. The three are closed by three different mechanisms — in-probe path
+sanitization, import ordering, and parent-side environment filtering — and each has its own mutant
+recorded above.
+
+The classification was contested and settled against the code: `status="error"` cannot carry a
+finding (`ValidationReportV1.__post_init__`), and A.42's whole complaint is that the condition names
+itself nowhere — so the verdict has to be the one that can carry a code.
+
+`tests/featuregen/materialize/l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins`
+is no longer a second implementation of the comparison: it drives a real `run_l0` and asserts the
+PRODUCTION verdict — `PASSED` under `.venv-artifact`, `ENGINE_VERSION_MISMATCH` naming each package
+under `.venv-l0-modern` and under the kind image. It is consequently GREEN in all three, and the red
+it replaces has moved into the product. The gate's three build-proof tests take a
+`the_declared_environment` fixture and SKIP outside the artifact line, naming the disagreement: L0
+refuses to prove a build there, so there is no build verdict for them to assert. That fixture
+decides from **one real session-scoped `run_l0`** over a sealed copy of the golden tree, not from a
+parse — an earlier draft decided it from a second pin parser that stripped neither inline comments,
+extras nor environment markers where the probe strips all three, which is how a gate goes quiet
+instead of red. The gate retains one parser, used ONLY to write an expected-value table; if it
+drifts, the test it feeds fails loudly rather than skipping.
+
+Also corrected here, because A.42 is about claiming more than was true: `chain._unproven_detail` no
+longer tells an operator "this project does not build" on the engine path. The probe stops at the
+pin comparison and never imports, so the build is UNPROVEN, and the detail says which.
+
+---
+
+Found by the adversarial review of `e1d471a7`, which put a kedro/pyspark interpreter into the kind
+backend image so `FEATUREGEN_MATERIALIZE_L0_PYTHON` had something real to point at. The interpreter
+is correct and the image change stands; what the review could not establish is that a PASS from it
+means anything about the artifact that passed.
+
+**Everything from here to the table is the defect AS RAISED**, kept verbatim because it is the
+argument for why the check exists. Line references are to the pre-fix code.
+
+**The mechanism, in one line: `_BUILD_PROBE` never bootstraps the project, so the one thing that
+enforces the declared pin is never consulted.**
+
+The generated project pins itself from the mounted inventory, not from anything in the image:
+`_render_requirements` and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take
+`kedro` / `kedro-datasets` / `pyspark` — and an EXACT `requires-python` — straight from
+`ClusterInventoryV1.engine_versions`. So the artifact declares whatever a human captured from the
+target cluster, while the L0 interpreter's versions were frozen when the image was built
+(`pyspark==3.5.3`, `kedro==1.5.0`, `kedro-datasets[spark]==9.5.0`).
+
+Nothing compares the two. `_BUILD_PROBE` (`materialize/validation.py:430-462`) inserts `<root>/src`
+on `sys.path`, imports the package and calls `register_pipelines()`. It never calls
+`bootstrap_project` and never creates a `KedroSession`, so `kedro_init_version` — the mechanism that
+would refuse a mismatched project — is never reached. `run_l0` (`:548-647`) compares the project hash
+against the lock and nothing else; `codes.py` ships no engine-version finding at all. The result is
+that L0 returns `PASSED`, and the chain records "the build was proven", for a project pinned to
+engines the prover does not have.
+
+**Why this is 🔴 and not 🟡.** It is a false PROOF, not a missing feature. Every other Phase G
+refusal fails closed; this one fails *open* and says the reassuring thing. It is also latent by
+construction rather than by luck: it becomes live the moment a real inventory is mounted, which is
+the single remaining blocker on turning `FEATUREGEN_MATERIALIZE_ENABLED` on
+(`20-backend.yaml:88-91`). Whoever captures that inventory is implicitly deciding whether the image's
+three pins are right, and will get no signal whatsoever if they are not.
+
+Distinct from **A.32**, which is its neighbour and worth reading beside it: A.32 says the lock is
+*incomplete* (kedro-datasets' spark module hard-imports `hdfs`/`s3fs`, which the lock cannot carry),
+so an environment installed FROM the lock cannot construct the catalog. A.42 says nothing ever checks
+the interpreter AGAINST the lock in the first place. A.32 is about the contents of the pins; A.42 is
+about the absence of the comparison. **A.32 remains open**; closing A.42 did not touch it.
+
+| Item | Status | Notes |
+|---|---|---|
+| ✅ **`run_l0` reported `PASSED` for a project whose declared engines the L0 interpreter does not have** | **CLOSED.** `ENGINE_VERSION_MISMATCH` added to `ValidationFindingCode`; the comparison lives in `_BUILD_PROBE`, ahead of the `sys.path` insert and the import, with every path inside the project stripped for the query and restored before it; one finding per disagreeing distribution, naming package, pin and installed version; a missing, unreadable or pin-less lock fails closed on the same code. | Proved by `test_validation.py`'s engine section (agreement → `PASSED`; per-package mismatch; not-installed vs wrong-version; four forgery placements incl. the project root; `PYTHONPATH` aimed at the tree; the path restore; non-UTF-8 lock; the fail-closed degenerate cases) and by the real chain in `test_chain.py::test_the_chain_calls_the_REAL_run_l0_...`, whose finding is now `ENGINE_VERSION_MISMATCH` rather than the mis-routed `PROJECT_DOES_NOT_BUILD`/`RENDERER_DEFECT`. Mutants "the comparison always agrees" and "run the check after the import" kill 8 and 3 tests respectively. |
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`may_regenerate` / `may_regenerate_for` have NO production callers, so a finding's CLASS gates nothing** | Found while closing A.42, and it is why this row says the classification is *declared*. `GOVERNED_FACT_MISMATCH` is documented as blocking regeneration, and `may_regenerate` correctly returns `False` — but the only callers are tests, and the chain's decision is `built = report.status is ValidationStatus.PASSED` (`chain.py`), which never reads a class. Not fixed here because G-1 has no regeneration path to gate: wiring it means deciding when regeneration is attempted at all, which is a governed-authority call and not a review-wave change. | The first code that regenerates a refused artifact — i.e. G-2's re-drive. Closure: route it through `may_regenerate_for(conn, generation_id=…)` so `GOVERNED_FACT_MISMATCH` and `UNCLASSIFIED` actually hold, and the §11.2 asymmetry stops being documentation. Until then, do not write "so it blocks regeneration" anywhere; it does not yet. |
+| ⚪ **The version comparison is exact string equality — false positives only, never false negatives** | Distribution NAMES are normalized (`importlib.metadata`, PEP 503, so `kedro-datasets` == `kedro_datasets`); VERSIONS are not, so a capture writing `kedro: "1.5"` against an installed `1.5.0` is reported as a disagreement though PEP 440 calls them equal, as is `1.5.0RC1` vs `1.5.0rc1`. Deliberate: a pin that is not byte-exact is a pin nobody can reproduce, and importing `packaging` into a stdlib-only probe is the worse trade. Nothing can slip through by being merely equivalent. | An operator confused by `expected kedro==1.5 / observed kedro==1.5.0`. Cheapest closure is validating full versions at capture (`EngineVersions.__post_init__` checks only non-blank today), not loosening the comparison. Documented in the probe. |
+| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because the check above **is now in place**, so a wrong pin is loud instead of silent: L0 refuses with `ENGINE_VERSION_MISMATCH` naming each package rather than reporting a build it proved somewhere else. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run — which is now what would happen, loudly. |
+
+### A.44 Release C Task 12 — adversarial-review residuals (2026-08-04)
 
 Four findings the Task-12 review returned that were RECORDED rather than fixed on that branch. The
 two D11 items are the same shape as the one that WAS fixed there (Gate 2's table anchor, F1) and are
@@ -914,7 +1191,7 @@ anchor conjunctively while every display surface still substitutes.
 | 🟡 **The crosswalk boot refusal is API-process-scoped; the worker performs NO flag-dependency check** | `api/app.py::_startup_crosswalk_flag_refusal` raises on the one illegal combination, and `__main__.py:153`'s worker bootstrap performs neither that check nor Release B's warning (`_startup_flag_dependency_check`). So `FEATUREGEN_CROSSWALK_EXECUTION=1` with the source/temporal feature disabled REFUSES to boot the API and boots the worker silently. Harmless today because the reader fails closed independently (`crosswalk_execution_enabled()` re-reads both flags on every call, and `test_the_flag_being_SET_alone_is_not_enough` pins that a compile refuses in exactly that configuration) — so a worker in the illegal state can compile nothing a correctly-booted one could not. The gap is that the deployment's misconfiguration is INVISIBLE on the process that would actually run the work. | The first worker-side crosswalk consumer — Phase G's lane calling `compile_feature_group` with `crosswalks=(…)`, which is where "the API refused to boot and the worker did not" stops being cosmetic. Closure: call `require_valid_crosswalk_configuration()` from the worker bootstrap beside the migration check, so one function is the refusal on both processes. |
 | ✅ **The two-leg crosswalk path is COMPILED capability, not WIRED capability** (extends A.39) — **HALF CLOSED 2026-08-05 by Release C Task 13** | Stated plainly because "Task 12 is done" reads otherwise. `AdmittedCrosswalkV1` has **no `src/` constructor at all** — every instance in the repo comes from `tests/featuregen/materialize/crosswalk_fixtures.py`, so nothing in production assembles a definition + execution + decision + row-selection + observation + the three bindings into one. And `authorize_execution_realizations` still has **zero `src/` callers** (A.39's tier row records the same fact from the other side), so the pre-run revalidation a crosswalk leg's realization pins is code that no chain reaches. What Task 12 established is that a governed two-leg traversal CAN be planned, authorized, rendered and sealed, proved end to end through the shipped stages by the fixture bank; what does not exist is anything that hands it a real crosswalk. **CLOSURE (assembler half):** `src/featuregen/overlay/upload/crosswalk_assembly.py` is the store-side constructor this row asked for. `assemble_admitted_crosswalk` reads the definition through its CURRENT pointer (1050), the composed measurement for the requested scope (1057), all three physical bindings by the revision ids the pins name (1036), the active-mapping count for the endpoint pair, and revalidates every pinned bridge realization — then RE-DERIVES the admission decision and the execution revision (neither is stored, and neither may be: a persisted verdict outlives the evidence it was read from, which DoD 17 forbids). `AdmittedCrosswalkV1.__post_init__` now runs its cross-checks on real rows, proved by `tests/featuregen/overlay/upload/test_crosswalk_assembly.py` (26 tests against the real stores). **STILL OPEN (the other half):** `authorize_execution_realizations` still has zero `src/` callers. The assembler revalidates a leg's realization against the CURRENT pointer at assembly time (`_legs_currently_executable`, fail-closed), which is the same question from the read side — but the pre-RUN revalidation immediately before run preparation is Phase G's lane to call, and nothing in this task acquired a run to prepare. **WHAT THE ASSEMBLER IS NOT: a WIRED chain.** `assemble_admitted_crosswalk` has **zero `src/` callers**, and so do `record_crosswalk_gaps`, `crosswalk_learning_events` and `reconcile_crosswalk` — every reference to the four outside their own modules is a test or a mutation. This row exists to keep exactly that distinction, so stating the closure without it would repeat the error it was written to prevent: what Task 13 built is a store-side CONSTRUCTOR that works against real rows, not a path any request or worker takes. A caller is Phase G's lane. | Task 13's consumers and Phase G's lane — the two places a real `AdmittedCrosswalkV1` must be built from stored Task-11 artifacts. Closure is a store-side assembler that reads the definition, the current execution revision, the admission decision, the resolved row selection and the three bindings, and constructs the bundle so `__post_init__`'s cross-checks run on real rows rather than on fixture ones. |
 
-### A.43 Release C Task 13 — adversarial-review residuals (2026-08-05)
+### A.45 Release C Task 13 — adversarial-review residuals (2026-08-05)
 
 Two findings the Task-13 review returned that were RECORDED rather than fixed on that branch. Both
 are shapes the branch fixed *as far as it could without a migration or a caller*, and both are here

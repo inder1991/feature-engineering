@@ -24,12 +24,14 @@ import {
   type SemanticDivergence,
   type SemanticSubsection,
   type SemanticVerifiedEdge,
-  type TableSuggestions,
+  SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  type FeatureSuggestionPageV2,
   getAssetDetail,
-  getTableSuggestions,
+  getTableSuggestionsV2,
   postFieldDecision,
 } from '../api'
-import { SuggestionCard } from './SuggestedFeaturesScreen'
+import { useIdentityKey } from '../session'
+import { SuggestionCard } from './SuggestionCard'
 
 // Asset detail: ONE catalog asset opened to its bounded sections (identity + metadata + evidence +
 // relationships + readiness + history + audit), reached via a Details action on a search hit. Every
@@ -680,9 +682,22 @@ function GovernanceSummary({ detail }: { detail: AssetDetail }) {
 }
 
 // ---- suggested features on the column (usage) -----------------------------------------------
-// The P4 per-table suggestions route, filtered to the suggestions that USE the opened column.
+// The per-table suggestions route asked for the v2 DISCOVERY contract, filtered to the suggestions
+// whose bound OPERANDS include the opened column. The card component is the one the table screen
+// renders, so a suggestion carries the same semantic and warning vocabulary on both surfaces.
 // Honesty rules: a 403 renders an access message naming the permission (never an empty section);
-// an empty filter result says whether the TABLE has suggestions that simply don't use this column.
+// an empty filter result says whether the TABLE has suggestions that simply don't use this column;
+// a deployment that does not serve v2 says so rather than showing a stripped card.
+// Exactly one is true at a time, and each is stored WITH the read scope it belongs to. Mirrors the
+// suggestions screen's own outcome union — the two surfaces read the same route under the same
+// scope rules, so they must not disagree about what "no answer yet" looks like.
+type SuggestionsOutcome =
+  | { kind: 'loading' }
+  | { kind: 'ok'; page: FeatureSuggestionPageV2 }
+  | { kind: 'forbidden' }
+  | { kind: 'unsupported' }
+  | { kind: 'error'; detail: string }
+
 function ColumnSuggestions({
   source,
   identity,
@@ -690,69 +705,88 @@ function ColumnSuggestions({
   source: string
   identity: AssetIdentity
 }) {
-  const [data, setData] = useState<TableSuggestions | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [forbidden, setForbidden] = useState(false)
-  const [error, setError] = useState('')
   const table = identity.table
   const objectRef = identity.object_ref
+  // Read scope decides which suggestions exist at all, so a result read under other claims is not
+  // an answer here. Keyed on principal + claims, never on the URL alone.
+  const identityKey = useIdentityKey()
+  // The separator is an escaped NUL: it is the one character that cannot occur in a principal,
+  // a catalog source or a table ref, so no pair of different scopes can collide into the same
+  // key. Written as an ESCAPE, never as a literal byte — a raw NUL in the source makes git treat
+  // the file as binary (diffs vanish) and hides it from every plain grep.
+  const requestKey = `${identityKey}\u0000${source}\u0000${table}`
+  // Stored WITH the key it was read under, and trusted below only while the two still match. An
+  // effect cannot give that guarantee — it runs AFTER the render the session-store update triggers,
+  // so clearing there would paint the previous scope's cards once first.
+  const [result, setResult] = useState<{ key: string; outcome: SuggestionsOutcome }>(
+    { key: requestKey, outcome: { kind: 'loading' } })
+  const outcome: SuggestionsOutcome =
+    result.key === requestKey ? result.outcome : { kind: 'loading' }
 
   useEffect(() => {
     if (!table) return
     let live = true
-    setLoading(true)
-    setError('')
-    setForbidden(false)
-    getTableSuggestions(source, table)
-      .then(body => {
-        if (live) setData(body)
-      })
+    const settle = (o: SuggestionsOutcome) => {
+      if (live) setResult({ key: requestKey, outcome: o })
+    }
+    settle({ kind: 'loading' })
+    getTableSuggestionsV2(source, table)
+      .then(body => settle({ kind: 'ok', page: body }))
       .catch((e: unknown) => {
-        if (!live) return
-        if (e instanceof ApiError && e.status === 403) setForbidden(true)
-        else setError(e instanceof ApiError ? e.detail : String(e))
-        setData(null)
-      })
-      .finally(() => {
-        if (live) setLoading(false)
+        if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })
+        else if (e instanceof ApiError
+          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) settle({ kind: 'unsupported' })
+        else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
       })
     return () => {
       live = false
     }
-  }, [source, table])
+  }, [source, table, requestKey])
 
+  const data = outcome.kind === 'ok' ? outcome.page : null
   const matching = useMemo(() => {
     if (!data) return []
     const ref = objectRef.toLowerCase()
-    return data.groups.flatMap(g =>
-      g.suggestions.filter(s => s.uses.some(u => u.toLowerCase() === ref)),
+    return data.hits.filter(hit =>
+      hit.suggestion.operands.some(o => o.graph_object_ref.toLowerCase() === ref),
     )
   }, [data, objectRef])
 
   return (
     <section className="adg-section" data-testid="column-suggestions">
       <h3 className="micro-label">Suggested features using this column</h3>
-      {loading ? (
+      {outcome.kind === 'loading' ? (
         <p className="hint" role="status">Reading what the catalog can build with this column…</p>
-      ) : forbidden ? (
+      ) : outcome.kind === 'forbidden' ? (
         // Honest access message, never silently swallowed into an empty list.
         <p className="adg-unavailable" role="status">
           You don't have access to feature suggestions. This view needs the{' '}
           <code>catalog:read</code> permission and this session's roles don't carry it.
         </p>
-      ) : error || !data ? (
+      ) : outcome.kind === 'unsupported' ? (
+        <p className="adg-unavailable" role="status">
+          This deployment does not serve the discovery contract this screen asks for, so suggestions
+          cannot be shown here. The server is older than this screen.
+        </p>
+      ) : outcome.kind === 'error' || !data ? (
         <p role="alert" className="error">
-          Could not load suggestions: {error || 'no payload returned'}
+          Could not load suggestions: {outcome.kind === 'error' ? outcome.detail : 'no payload returned'}
         </p>
       ) : matching.length === 0 ? (
         <p className="hint">
-          {data.summary.suggested === 0
+          {data.collection.summary.suggested === 0
             ? 'No suggestions on this table yet.'
-            : `None of the ${data.summary.suggested} suggestions on this table uses this column.`}
+            : `None of the ${data.collection.summary.suggested} suggestions on this table uses `
+              + 'this column.'}
         </p>
       ) : (
         <ul className="rows">
-          {matching.map(s => <SuggestionCard key={s.name} suggestion={s} />)}
+          {matching.map(hit => (
+            <SuggestionCard
+              key={hit.suggestion.suggestion_id} hit={hit} headingLevel={4}
+              omitted={data.collection.omitted_counts}
+            />
+          ))}
         </ul>
       )}
     </section>

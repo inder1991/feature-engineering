@@ -1,4 +1,10 @@
-"""Spec A — the three worked features, hand-authored, and the governed catalog they author over.
+"""Spec A — the four worked features, hand-authored, and the governed catalog they author over.
+
+FOUR, not the spec's three. The fourth (:data:`BRIDGED_FEATURE_NAME`) reduces onto a key in ANOTHER
+catalog, and exists because no durable feature identity in the tree could otherwise drive a
+CROSS-CATALOG compilation (DEFERRED-WORK A.36). Its body is the first feature's byte-for-byte; only
+the grain moves. The three first-slice features are unchanged, and everything below holds for all
+four.
 
 Two halves that MUST agree, and a test that proves they do
 (``test_fixtures.py::test_every_fixture_is_what_child1_really_resolves``):
@@ -99,6 +105,13 @@ REF_DR_CR = f"{TABLE_REF}.dr_cr_flag"
 REF_STATUS = f"{TABLE_REF}.status_cd"
 REF_CROSS_BORDER = f"{TABLE_REF}.cross_border_flag"
 
+#: The OTHER catalog — the customer master a bridged feature reduces onto. It is deliberately not
+#: seeded by :func:`seed_materialize_catalog`: this source has its own upload, and a test that needs
+#: it says so (``test_cross_catalog_ir._seed_crm_catalog``).
+CRM_SOURCE = "crm"
+CRM_TABLE_REF = f"{CRM_SOURCE}::public.customer_master"
+REF_CRM_CUSTOMER = f"{CRM_TABLE_REF}.customer_id"
+
 #: The one column whose ``logical_representation`` is seeded as a GOVERNED decision — the reason a
 #: SUM over it reaches ``external_type_required=False`` and the resolved type ``"numeric"``.
 GOVERNED_TYPE_REFS: tuple[str, ...] = (REF_AMT,)
@@ -110,12 +123,22 @@ ENGINE_VERSIONS = EngineVersions(
     hive="3.1.3", spark="3.5.1", metastore="3.1.3", python="3.11.9", java="11.0.22",
     pyspark="3.5.1", kedro="0.19.9", kedro_datasets="4.1.0")
 
-#: The three worked features of the slice (spec "First-slice bounds").
+#: The three worked features of the slice (spec "First-slice bounds"), plus the BRIDGED fourth.
+#:
+#: The fourth is here for DEFERRED-WORK A.36: every other worked feature reads and reduces inside
+#: ``hdfc``, so no durable feature identity in the tree could ever drive a cross-catalog
+#: compilation. It is a member of this tuple — and therefore of ``test_fixtures.py``'s
+#: forgery check — because a hand-authored formula nothing re-derives is exactly the kind of
+#: fixture that check exists to refuse.
 FEATURE_NAMES: tuple[str, ...] = (
     "total_debit_amount_30d",
     "distinct_merchant_count_90d",
     "cross_border_value_ratio_90d",
+    "bridged_debit_amount_30d",
 )
+
+#: The one worked feature whose compilation CROSSES a catalog, named so a test can say which.
+BRIDGED_FEATURE_NAME = "bridged_debit_amount_30d"
 
 _TIMEZONE = "Asia/Kolkata"
 _DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_EVEN,
@@ -127,6 +150,11 @@ _DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_EVEN,
 _RATIO_DECIMAL = DecimalPolicy(precision=38, scale=6, rounding=RoundingMode.HALF_UP,
                                overflow=OverflowBehavior.ERROR)
 _GRAIN = Grain(entity="customer", keys=(REF_CIF,))
+#: The BRIDGED grain: the same entity, keyed in the OTHER catalog. Grain keys are the only refs an
+#: expression may hold that are not columns of its source relation
+#: (``expression_ir._plan_to_grain``), so this — and nothing about the body — is what makes a
+#: compilation cross a catalog and demand a directional bridge realization.
+_CROSS_CATALOG_GRAIN = Grain(entity="customer", keys=(REF_CRM_CUSTOMER,))
 
 
 # ── the governed catalog ─────────────────────────────────────────────────────────────────────────
@@ -207,13 +235,13 @@ def _cross_border_filter() -> FilterNode:
 
 
 def _formula(body, output: FormulaOutputPolicyV1,
-             decimal: DecimalPolicy = _DECIMAL) -> TypedFormulaV1:
+             decimal: DecimalPolicy = _DECIMAL, grain: Grain = _GRAIN) -> TypedFormulaV1:
     return TypedFormulaV1(
         formula_schema_version=FORMULA_SCHEMA_VERSION,
         operation_grammar_version=OPERATION_GRAMMAR_VERSION,
         output_policy_version=OUTPUT_POLICY_VERSION,
         canonicalization_version=CANONICALIZATION_VERSION,
-        grain=_GRAIN, body=body, parameters=(), decimal=decimal, output=output)
+        grain=grain, body=body, parameters=(), decimal=decimal, output=output)
 
 
 def _total_debit_amount_30d() -> TypedFormulaV1:
@@ -269,16 +297,55 @@ def _cross_border_value_ratio_90d() -> TypedFormulaV1:
         decimal=_RATIO_DECIMAL)
 
 
+def _bridged_debit_amount_30d() -> TypedFormulaV1:
+    """The SAME debit turnover, reduced onto the customer master in the OTHER catalog.
+
+    The BODY is byte-for-byte the ``hdfc`` one — same operand, same filter, same window — and that
+    is the point: nothing about the computation changes, only which population's key the rows land
+    on. So a compilation of this formula differs from ``total_debit_amount_30d``'s in exactly one
+    way, the cross-catalog hop, which is what makes it a usable control for the bridged path.
+
+    VERIFIED output: identical to ``total_debit_amount_30d``'s, because the output policy is
+    resolved from the OPERAND's governed facts (``output_authority``) and the operand is the same
+    governed ``hdfc::public.transactions.txn_amt``. The grain reaches the resolver only through
+    ``grain_facts``, which a plain SUM does not consult at all — a claim
+    ``test_fixtures.py`` re-derives rather than takes on trust.
+    """
+    return _formula(
+        UnaryBody(expr=AggregateExpression(
+            aggregation=AggregateFunction.SUM, operand=REF_AMT,
+            source_relation=SourceRelation(table_ref=TABLE_REF),
+            filter=_posted_debit_filter(), window=_window(30))),
+        FormulaOutputPolicyV1(
+            output_type="numeric", unit=None, currency=None,
+            output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False),
+        grain=_CROSS_CATALOG_GRAIN)
+
+
 _FORMULAS = {
     "total_debit_amount_30d": _total_debit_amount_30d,
     "distinct_merchant_count_90d": _distinct_merchant_count_90d,
     "cross_border_value_ratio_90d": _cross_border_value_ratio_90d,
+    BRIDGED_FEATURE_NAME: _bridged_debit_amount_30d,
 }
 
 
 def authored_formula(name: str) -> TypedFormulaV1:
     """The hand-authored ``TypedFormulaV1`` for one worked feature."""
     return _FORMULAS[name]()
+
+
+def grain_of(name: str) -> Grain:
+    """The grain one worked feature is authored at — the ONE place that answers it.
+
+    ``AuthoringIntent.target_grain_keys`` and the work item's ``recipe_expectation.grain_key_refs``
+    both have to be the formula's own grain, or Gate 1's intent-hash check is comparing a
+    reconstruction against an intent the run was never opened for. Deriving both from here is what
+    keeps the bridged feature's crm key from having to be repeated (and disagreed about) in three
+    files. An unknown name gets the default grain: several tests build LOOK-ALIKE intents for names
+    no formula exists for, and they are asserting on names rather than on grains.
+    """
+    return _FORMULAS[name]().grain if name in _FORMULAS else _GRAIN
 
 
 # ── the raw proposals that produce them through the REAL authoring path ──────────────────────────
@@ -301,11 +368,12 @@ def _raw_equal(left: str, literal_type: str, value: str) -> dict[str, Any]:
             "right_literal": {"type": literal_type, "value": value}}
 
 
-def _raw_proposal(body: dict[str, Any], *, rounding: str = "half_even") -> dict[str, Any]:
+def _raw_proposal(body: dict[str, Any], *, rounding: str = "half_even",
+                  grain: Grain = _GRAIN) -> dict[str, Any]:
     return {"formula_schema_version": FORMULA_SCHEMA_VERSION,
             "operation_grammar_version": OPERATION_GRAMMAR_VERSION,
             "canonicalization_version": CANONICALIZATION_VERSION,
-            "grain": {"entity": "customer", "keys": [REF_CIF]},
+            "grain": {"entity": grain.entity, "keys": list(grain.keys)},
             "body": body,
             "parameters": [],
             "decimal": {"precision": 38, "scale": 6, "rounding": rounding,
@@ -332,6 +400,13 @@ _RAW_PROPOSALS: dict[str, dict[str, Any]] = {
                                filter_node=_raw_equal(REF_CROSS_BORDER, "boolean", "true")),
         "denominator": _raw_expr("sum", REF_AMT, length=90),
         "zero_denominator": "null"}, rounding="half_up"),
+    BRIDGED_FEATURE_NAME: _raw_proposal({
+        "final_operation": "identity",
+        "expr": _raw_expr("sum", REF_AMT, length=30, filter_node={
+            "kind": "bool", "op": "and", "children": [
+                _raw_equal(REF_DR_CR, "string", "D"),
+                _raw_equal(REF_STATUS, "string", "posted"),
+            ]})}, grain=_CROSS_CATALOG_GRAIN),
 }
 
 
@@ -358,6 +433,8 @@ _HYPOTHESES = {
         "Merchant breadth over 90 days separates transactors from revolvers.",
     "cross_border_value_ratio_90d":
         "A rising cross-border value share flags remittance-driven accounts.",
+    BRIDGED_FEATURE_NAME:
+        "Debit turnover keyed on the crm customer master predicts short-term credit risk.",
 }
 
 
@@ -367,10 +444,15 @@ def intent_for(name: str, *, hypothesis: str | None = None,
 
     ``name`` IS the feature name — ``AuthoringResult`` carries none (reference §6). ``hypothesis``
     is overridable so a test can build a LOOK-ALIKE intent that hashes differently, which is the
-    only thing separating ``INTENT_HASH_MISMATCH`` from a pass."""
+    only thing separating ``INTENT_HASH_MISMATCH`` from a pass.
+
+    ``target_grain_keys`` is READ OFF the formula (:func:`grain_of`) rather than stated here. The
+    three ``hdfc`` features get exactly the value this used to hard-code; the bridged fourth gets
+    its crm key, and cannot silently disagree with the formula it is the intent for."""
+    grain = grain_of(name)
     return AuthoringIntent(
         name=name,
         hypothesis=hypothesis if hypothesis is not None else _HYPOTHESES.get(name, name),
-        target_entity="customer",
-        target_grain_keys=(REF_CIF,),
+        target_entity=grain.entity,
+        target_grain_keys=grain.keys,
         recipe_authoring_context=recipe_authoring_context)

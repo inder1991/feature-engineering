@@ -1,61 +1,35 @@
 import { useEffect, useState } from 'react'
 import {
   ApiError,
-  type FeatureSuggestion,
+  type FeatureSuggestionHit,
+  type FeatureSuggestionPageV2,
   type JoinNeighbourhood,
-  type SuggestionGroup,
-  type SuggestionRequirement,
-  type TableSuggestions,
-  getTableSuggestions,
+  SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  type SuggestionGroupV2,
+  type SuggestionOmittedCounts,
+  getTableSuggestionsV2,
 } from '../api'
+import { useIdentityKey } from '../session'
+import { SuggestionCard, TermChip, TruncationNotes } from './SuggestionCard'
+import { bounded, columnOf } from './suggestionText'
 
 // Suggested features: what the deterministic engine can already build on ONE table — no hypothesis,
-// no intent, no LLM. STRICTLY READ-ONLY: there is deliberately no accept / edit / dismiss control,
-// because v1 writes nothing. Two honesty rules the mockup does not get to override:
-//   * no relevance percentage — no percentage scorer exists in this system, so the only signal shown
-//     is the engine's own `binding_quality` string;
-//   * an empty or all-needs-review screen names its CAUSE. A bare "0 suggested" reads as broken; the
-//     measured causes (no such table / no business concepts / no confirmed as-of / undeclared
-//     unit-currency) each get their own sentence pointing at the surface that fixes it. "No such
-//     table" comes FIRST and stands alone: a table the catalog does not hold returns exactly the
-//     same zero payload as one with no concepts, and diagnosing the columns of a table that does not
-//     exist is a confident falsehood.
+// no intent, no LLM. The CARD and its drawer live in `./SuggestionCard`, which the column dossier
+// imports too; this module owns only what is page-level — the summary, the cause callouts, the
+// bounded-neighbourhood note and the per-entity grouping.
+//
+// STRICTLY READ-ONLY: the route writes nothing, and the only control on the surface is the card's
+// disclosure toggle.
+//
+// Honesty rules the mockup does not get to override:
+//   * an empty or all-unvalidated screen names its CAUSE, and names what is MISSING rather than
+//     instructing the user to approve something that is not a gate. A proposal from enrichment or
+//     from the source file is usable context; the absence here is an absent PROPOSAL, not an absent
+//     approval;
+//   * Release A serves `read_mode=on_demand` with `projection: null`. Nothing here invents a
+//     "current" badge out of an absent projection.
 
-// The closed requirement vocabulary in plain words. A card says what is missing, not an enum; the
-// code still renders beside it so it stays traceable to the gauntlet. An unknown code (a newer
-// backend) degrades to its de-underscored words rather than disappearing.
-const REQUIREMENT_WORDS: Record<string, string> = {
-  TYPE_IS_NUMERIC: 'needs a confirmed numeric type',
-  GRAIN_IS_UNIQUE: 'needs a confirmed unique grain',
-  TEMPORAL_IS_POPULATED: 'needs a populated as-of column',
-  TEMPORAL_LAG_BOUNDED: 'needs a bounded as-of lag',
-  JOIN_CONNECTIVITY: 'needs a confirmed join path',
-  UNIT_CONSISTENT: 'needs a declared unit',
-  CURRENCY_CONSISTENT: 'needs a declared currency',
-  ADDITIVITY_SUPPORTS_OPERATION: 'needs additivity that supports this operation',
-}
-
-function requirementWords(code: string): string {
-  return REQUIREMENT_WORDS[code] ?? code.replaceAll('_', ' ').toLowerCase()
-}
-
-const STATUS_LABEL: Record<string, string> = {
-  DESIGN_CHECKED: 'clean & ready',
-  NEEDS_EXTERNAL_VALIDATION: 'needs review',
-}
-
-// clean & ready reads as governed-solid; needs review as partial (warn) — never as rejected. A card
-// that needs a declared fact is honest output, not a failure.
-const STATUS_TONE: Record<string, string> = {
-  DESIGN_CHECKED: 'gj-verified',
-  NEEDS_EXTERNAL_VALIDATION: 'gj-partial',
-}
-
-// The column name — the ref's last segment. A full schema.table.column ref is unreadable on a card,
-// and the page is already scoped to one table, so the short name is unambiguous here.
-function columnOf(ref: string): string {
-  return ref.split('.').pop() ?? ref
-}
+// ── page-level notes ────────────────────────────────────────────────────────────────────────────
 
 // WHICH bound dropped the tables that were dropped, in words. Named rather than numbered on purpose:
 // the numbers live in ONE place (join_path.MAX_NEIGHBOUR_TABLES / MAX_COLUMNS_CONSIDERED, quoted in
@@ -73,7 +47,19 @@ const LIMIT_WORDS: Record<string, string> = {
 // every empty state on this screen into a claim the page never actually checked ("nothing else is
 // buildable here" when the truth is "we did not look"). So the limit is stated ALWAYS, truncated or
 // not: deeper join paths exist, and they were deliberately not loaded.
-function NeighbourhoodNote({ n }: { n: JoinNeighbourhood }) {
+function NeighbourhoodNote({ n }: { n: JoinNeighbourhood | null }) {
+  // A null neighbourhood is an ABSENT fact, not a licence to omit the note. Dropping the whole
+  // paragraph would silently turn every empty state on this page back into the claim this note
+  // exists to prevent — "nothing else is buildable here" when the truth is "we did not look".
+  if (n === null) {
+    return (
+      <p className="hint sug-neighbourhood" data-testid="neighbourhood">
+        <span className="sfc-absent">The join neighbourhood was not reported.</span> This page does
+        not know how many joined tables it considered, so treat the list below as grounded on this
+        table alone and not as a statement about what deeper join paths could build.
+      </p>
+    )
+  }
   const joins = n.max_hops === 1 ? '1 join' : `${n.max_hops} joins`
   const because = n.limit_reason ? LIMIT_WORDS[n.limit_reason] : ''
   return (
@@ -99,40 +85,60 @@ function NeighbourhoodNote({ n }: { n: JoinNeighbourhood }) {
   )
 }
 
+// ── the screen ──────────────────────────────────────────────────────────────────────────────────
+
+// Exactly one of these is true at a time, so the screen cannot render a permission message and a
+// payload at once — and, more importantly, each is stored WITH the read scope it belongs to.
+type Outcome =
+  | { kind: 'loading' }
+  | { kind: 'ok'; page: FeatureSuggestionPageV2 }
+  | { kind: 'forbidden' }
+  | { kind: 'unsupported' }
+  | { kind: 'error'; detail: string }
+
 export function SuggestedFeaturesScreen({ source, table }: { source: string; table: string }) {
-  const [data, setData] = useState<TableSuggestions | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState('')
-  // A 403 is not a failure to report as one: the route is gated on catalog:read and this session's
-  // roles do not carry it. Named separately so the screen can say WHICH permission is missing
-  // instead of leaking the server's detail string into a red alert.
-  const [forbidden, setForbidden] = useState(false)
+  // Read scope decides which columns ground and which suggestions exist at all, so a result read
+  // under one identity is not an answer for another. Keyed on principal + claims, NOT on the URL.
+  const identity = useIdentityKey()
+  // The separator is an escaped NUL: it is the one character that cannot occur in a principal,
+  // a catalog source or a table ref, so no pair of different scopes can collide into the same
+  // key. Written as an ESCAPE, never as a literal byte — a raw NUL in the source makes git treat
+  // the file as binary (diffs vanish) and hides it from every plain grep.
+  const requestKey = `${identity}\u0000${source}\u0000${table}`
+  // The outcome is stored WITH the key it was read under, and the render below trusts it only when
+  // the two still match. An effect cannot give that guarantee: `setData(null)` runs AFTER the render
+  // triggered by the session store's update, so a version that only cleared in the effect would
+  // paint the previous scope's cards once before clearing them. Here a stale key simply is not an
+  // answer, so the previous scope's rows can never reach the DOM.
+  const [result, setResult] = useState<{ key: string; outcome: Outcome }>(
+    { key: requestKey, outcome: { kind: 'loading' } })
+  const outcome: Outcome = result.key === requestKey ? result.outcome : { kind: 'loading' }
 
   useEffect(() => {
     let live = true
-    setLoading(true)
-    setError('')
-    setForbidden(false)
-    getTableSuggestions(source, table)
-      .then(body => {
-        if (!live) return
-        setData(body)
-      })
+    const settle = (o: Outcome) => {
+      if (live) setResult({ key: requestKey, outcome: o })
+    }
+    settle({ kind: 'loading' })
+    getTableSuggestionsV2(source, table)
+      .then(body => settle({ kind: 'ok', page: body }))
       .catch((e: unknown) => {
-        if (!live) return
-        if (e instanceof ApiError && e.status === 403) setForbidden(true)
-        else setError(e instanceof ApiError ? e.detail : String(e))
-        setData(null)
-      })
-      .finally(() => {
-        if (live) setLoading(false)
+        // A 403 is not a failure to report as one: the route is gated on catalog:read and this
+        // session's roles do not carry it. Kept a distinct outcome so the screen can say WHICH
+        // permission is missing instead of leaking the server's detail string into a red alert.
+        if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })
+        // The deployment does not serve the discovery contract this client asks for. Also distinct:
+        // it is not a broken page and not a permission problem.
+        else if (e instanceof ApiError
+          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) settle({ kind: 'unsupported' })
+        else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
       })
     return () => {
       live = false
     }
-  }, [source, table])
+  }, [source, table, requestKey])
 
-  if (loading) {
+  if (outcome.kind === 'loading') {
     return (
       <section className="sug">
         <p role="status" className="hint">
@@ -144,7 +150,7 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
 
   // Read-only and permission-gated: the honest answer is which permission is missing, not a red
   // "could not load". Deliberately no fix-it control — the role model is not this screen's to change.
-  if (forbidden) {
+  if (outcome.kind === 'forbidden') {
     return (
       <section className="sug">
         <div className="callout callout--warn">
@@ -162,28 +168,51 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
     )
   }
 
-  if (error || !data) {
+  if (outcome.kind === 'unsupported') {
+    return (
+      <section className="sug">
+        <div className="callout callout--warn">
+          <div className="callout-body">
+            <p role="status">
+              <strong>This deployment does not serve the discovery contract.</strong> The screen
+              asked for suggestion contract version 2 and the server refused it.
+            </p>
+            <p className="hint">
+              The server is older than this screen. Nothing is wrong with the catalog or with your
+              permissions.
+            </p>
+          </div>
+        </div>
+      </section>
+    )
+  }
+
+  if (outcome.kind === 'error') {
     return (
       <section className="sug">
         <p role="alert" className="error">
-          Could not load suggestions: {error || 'no payload returned'}
+          Could not load suggestions: {outcome.detail || 'no payload returned'}
         </p>
       </section>
     )
   }
 
+  const data = outcome.page
+  const { collection } = data
+  const { summary, groups, rejections } = collection
+
   // Cause #0: there is no such table. Stands alone — every count below would be a claim about a
   // table this catalog does not hold.
-  if (!data.table_known) {
+  if (collection.table_known === false) {
     return (
       <section className="sug">
         <div className="callout callout--warn">
           <div className="callout-body">
             <p role="status">
               <strong>No such table in this catalog.</strong>{' '}
-              <span className="mono">{data.catalog_source}</span> holds no table called{' '}
-              <span className="mono">{data.table}</span>, so there is nothing to suggest on — and
-              nothing here is a statement about its columns.
+              <span className="mono">{collection.anchor_catalog_source}</span> holds no table called{' '}
+              <span className="mono">{collection.anchor_table_ref}</span>, so there is nothing to
+              suggest on — and nothing here is a statement about its columns.
             </p>
             <p className="hint">
               Check the catalog and the table name (the bare name, e.g. <code>comp_fin_tran</code>,
@@ -196,42 +225,63 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
     )
   }
 
-  const { summary, groups, rejections } = data
+  const byId = new Map(data.hits.map(hit => [hit.suggestion.suggestion_id, hit]))
   const noPointInTime = rejections.filter(r => r.code === 'NO_POINT_IN_TIME')
-  const hasCards = groups.some(g => g.suggestions.length > 0)
+  const hasCards = data.hits.length > 0
 
   return (
     <section className="sug">
       <p className="hint sug-scope">
-        <span className="mono">{data.table}</span> · <span className="mono">{data.catalog_source}</span>
+        <span className="mono">{collection.anchor_table_ref}</span> ·{' '}
+        <span className="mono">{collection.anchor_catalog_source}</span>
       </p>
 
       <div className="stats" role="group" aria-label="Suggestion summary">
         <Stat n={summary.suggested} label="suggested" />
-        {/* deliberately untoned: 0 clean & ready is an honest state, never an error */}
-        <Stat n={summary.clean_ready} label="clean & ready" />
-        <Stat n={summary.needs_review} label="need review" />
-        <Stat n={summary.entities} label="entities" />
+        {/* deliberately untoned: 0 design checked is an honest state, never an error */}
+        <Stat n={summary.design_checked} label="design checked" />
+        <Stat n={summary.needs_external_validation} label="need external validation" />
+        <Stat n={summary.groups} label="entities" />
       </div>
 
-      <p className="hint sug-readonly">
-        This view is read-only. These are proposals the catalog can already ground — accepting or
-        dismissing one is not offered here, and nothing on this screen changes the catalog.
+      <p className="hint sug-note">
+        Design checked means the inputs pass the catalog’s design rules. It is not proof that a
+        feature predicts anything, and not proof that it can run in production.
       </p>
 
-      <NeighbourhoodNote n={data.neighbourhood} />
+      {/* Read-only posture and page currentness in one statement: both are facts about THIS view,
+          and Release A has no stored projection, so no badge here may claim to be current. */}
+      <p className="hint sug-readonly" data-testid="currentness">
+        These are suggestions, not registered features. A governed recipe grounded each one against
+        this catalog; none of them is in the feature registry, and this view is read-only.{' '}
+        {data.read_mode === 'on_demand' && data.projection === null ? (
+          <>
+            Nothing here is stored: the page was computed for this request, so no card claims to be
+            current or stale.
+          </>
+        ) : (
+          <>Served from a stored projection, state {data.projection?.state ?? 'unknown'}.</>
+        )}
+      </p>
 
-      {/* Cause #1: nothing to suggest and nothing blocked — the columns carry no business concepts. */}
+      <NeighbourhoodNote n={collection.neighbourhood} />
+
+      {/* Cause #1: nothing to suggest and nothing blocked — no column carries the meaning a recipe
+          needs. The copy names what is MISSING, never an approval the user is told to perform: a
+          proposal from enrichment or from the upload is already usable context. */}
       {summary.suggested === 0 && rejections.length === 0 && (
         <div className="callout callout--accent">
           <div className="callout-body">
             <p>
-              <strong>No suggestions yet</strong> — this table’s columns don’t carry business
-              concepts, so no template can ground on it.
+              <strong>No suggestions yet.</strong> No column on this table carries the business
+              meaning a recipe needs: an entity to compute per, a quantity to measure, and an as-of
+              date to compute at.
             </p>
             <p className="hint">
-              Concepts arrive from enrichment and are confirmed on the Semantics screen. Give the
-              columns their meaning (entity, unit, currency, additivity) and suggestions appear here.
+              A meaning proposed by enrichment or declared in the upload is enough to ground on. It
+              does not have to be confirmed first, so nothing here is waiting on an approval. What is
+              missing is a proposal. Run enrichment on this source, or declare the columns&apos;
+              meaning in the next upload.
             </p>
           </div>
         </div>
@@ -257,18 +307,27 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
         </div>
       )}
 
-      {/* Cause #3: cards exist but none is clean — the honest NORMAL state, not a failure. */}
-      {summary.clean_ready === 0 && hasCards && (
+      {/* Cause #3: cards exist but none is design checked — the honest NORMAL state, not a failure. */}
+      {summary.design_checked === 0 && hasCards && (
         <p className="hint sug-note">
-          Nothing is clean &amp; ready yet: every suggestion below needs one more declared fact
-          before its numbers can be trusted. Each card names the fact it is waiting on.
+          Nothing is design checked yet: every suggestion below needs one more declared fact before
+          its inputs pass the catalog’s design rules. Each card names the fact it is waiting on.
         </p>
       )}
 
       {groups.map(group => (
-        // entity_ref is unique across groups (the backend keys them on it), so it IS the key.
-        <EntityGroup key={group.entity_ref || 'unlabelled'} group={group} />
+        <EntityGroup
+          key={group.grain_refs[0]?.join(':') ?? 'unlabelled'}
+          group={group} byId={byId} omitted={collection.omitted_counts}
+        />
       ))}
+
+      {Object.values(collection.omitted_counts).some(n => (n ?? 0) > 0) && (
+        <section className="panel sug-omitted" data-testid="page-truncation">
+          <h2>What this page left out</h2>
+          <TruncationNotes omitted={collection.omitted_counts} />
+        </section>
+      )}
 
       {rejections.length > noPointInTime.length && (
         <section className="panel sug-rejections">
@@ -277,9 +336,9 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
             {rejections
               .filter(r => r.code !== 'NO_POINT_IN_TIME')
               .map(r => (
-                <li className="row" key={`${r.code}:${r.name}`}>
-                  <span className="mono">{r.name}</span>{' '}
-                  <span className="hint">{r.reason}</span>
+                <li className="row" key={`${r.code}:${r.candidate_name}`}>
+                  <span className="mono">{r.candidate_name}</span>{' '}
+                  <span className="hint">{r.explanation}</span>
                 </li>
               ))}
           </ul>
@@ -298,59 +357,39 @@ function Stat({ n, label }: { n: number; label: string }) {
   )
 }
 
-// One entity's features. The heading is the ENTITY (entity_label, e.g. 'account'); the suffix is the
-// COLUMN it is computed per (entity_ref). A group bound to a column the catalog could not NAME an
+// One entity's features. The heading is the ENTITY (entity.display_name, e.g. 'account'); the
+// suffix is the COLUMN it is computed per. A group bound to a column the catalog could not NAME an
 // entity for shows only that column — a heading built from the column would read "cif_id features"
 // beside "customer features", claiming an entity the catalog never attested.
-function EntityGroup({ group }: { group: SuggestionGroup }) {
+function EntityGroup({
+  group,
+  byId,
+  omitted,
+}: {
+  group: SuggestionGroupV2
+  byId: Map<string, FeatureSuggestionHit>
+  omitted: SuggestionOmittedCounts
+}) {
+  const grain = group.grain_refs.map(r => columnOf(r[1])).join(', ')
   return (
     <section className="sug-group">
-      {group.entity_ref && (
+      {grain && (
         <div className="sug-group-head">
-          {group.entity_label && <h2 className="sug-group-title">{group.entity_label} features</h2>}
-          <span className="hint mono" title={group.entity_ref}>
-            per entity {columnOf(group.entity_ref)}
+          {group.entity && <h2 className="sug-group-title">{group.entity.display_name} features</h2>}
+          <span className="hint mono" title={bounded(group.grain_refs.map(r => r[1]).join(', '))}>
+            per entity {grain}
           </span>
+          {group.contextual_entity_terms.map(t => <TermChip key={t.value} text={t} />)}
         </div>
       )}
       <ul className="rows">
-        {group.suggestions.map(s => <SuggestionCard key={s.name} suggestion={s} />)}
+        {group.suggestion_ids.map(id => {
+          const hit = byId.get(id)
+          return hit
+            ? <SuggestionCard key={id} hit={hit} omitted={omitted} />
+            : null
+        })}
       </ul>
     </section>
-  )
-}
-
-// Exported for the asset-detail column dossier (Task 3C), which renders the SAME card for the
-// suggestions that use the opened column — one visual vocabulary for a suggestion everywhere.
-export function SuggestionCard({ suggestion }: { suggestion: FeatureSuggestion }) {
-  const status = suggestion.validation_status
-  return (
-    <li className="row q-item sug-card">
-      <div className="q-head">
-        <span className="gj-kind sug-name">{suggestion.name}</span>
-        <span className={`badge ${STATUS_TONE[status] ?? 'gj-none'}`}>
-          {STATUS_LABEL[status] ?? status}
-        </span>
-        {suggestion.binding_quality && (
-          <span className="gj-score">binding {suggestion.binding_quality}</span>
-        )}
-      </div>
-      <p className="sug-desc">{suggestion.description}</p>
-      <p className="mono sug-recipe">{suggestion.recipe}</p>
-      {suggestion.uses.length > 0 && (
-        <p className="hint sug-uses">uses {suggestion.uses.map(columnOf).join(', ')}</p>
-      )}
-      {suggestion.requirements.length > 0 && (
-        <ul className="adg-reqs sug-reqs">
-          {suggestion.requirements.map((req: SuggestionRequirement) => (
-            <li key={`${req.code}:${req.operand.join(':')}`}>
-              {requirementWords(req.code)}{' '}
-              <span className="mono">{columnOf(req.operand[req.operand.length - 1] ?? '')}</span>{' '}
-              <span className="hint">{req.detail || req.code}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </li>
   )
 }

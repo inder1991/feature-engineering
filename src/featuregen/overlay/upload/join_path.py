@@ -11,6 +11,15 @@ from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from featuregen.overlay.upload.grounding_trace import (
+    CARDINALITY_UNKNOWN,
+    REVIEW_FILE_DECLARED,
+    SAFETY_CLEARING,
+    SAFETY_UNVERIFIED,
+    SuggestionRelationshipDependencyV1,
+    join_edge_evidence,
+    relationship_leg,
+)
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
@@ -398,6 +407,63 @@ def classify_join_path(conn, catalog_source: str, from_table: str, to_table: str
                           if (s.from_ref, s.to_ref) in denied_pairs)
         return JoinOutcome(kind=JoinOutcome.DENIED, endpoints=endpoints)
     return JoinOutcome(kind=JoinOutcome.NO_PATH)
+
+
+#: The only relationship kind a ``graph_edge`` of kind ``joins`` can express: an equality between
+#: two columns. ``crosswalk`` / ``transformed`` / ``semantic_only`` (freeze D3) belong to the
+#: cross-catalog bridge and semantic-link surfaces, which are NOT this planner's edges.
+_JOIN_RELATIONSHIP_KIND = "direct_equality"
+
+
+def _relationship_ref(catalog_source: str, step: JoinStep) -> str:
+    """The DIRECTION-FREE identity of the relationship this leg realizes. Endpoints are sorted, so
+    a hop and its reverse name the same relationship — the direction lives in ``from_ref``/
+    ``to_ref`` and in the realization hash, never smuggled into the relationship's own name."""
+    left, right = sorted((step.from_ref, step.to_ref))
+    return f"joins:{catalog_source}:{left}|{right}"
+
+
+def join_outcome_relationship_path(outcome: JoinOutcome, *, catalog_source: str
+                                   ) -> tuple[SuggestionRelationshipDependencyV1, ...]:
+    """The ordered relationship legs of an ALREADY-SELECTED path (freeze 0F-7 P2).
+
+    This is a projection of :attr:`JoinOutcome.steps`, made HERE — at the seam that planned the
+    path — and never a second walk of the graph. The steps are already oriented to the direction of
+    travel and already carry the fact key, its folded status and the edge authority that permitted
+    the hop, so the leg states per-leg safety by the same rule :func:`_classified_edges` used to
+    traverse it: declared (no fact) or governed-VERIFIED clears; a fact-linked edge that is not
+    VERIFIED is authorized but unverified.
+
+    An outcome with no steps (``NO_PATH``, ``DENIED``, or a same-table ``OPERATIONAL``) yields no
+    legs: there is no traversal to describe, and inventing one would be the reconstruction this
+    whole contract exists to forbid.
+    """
+    legs: list[SuggestionRelationshipDependencyV1] = []
+    for step in outcome.steps:
+        cleared = step.approved_join_fact_key is None or step.approved_join_status == "VERIFIED"
+        legs.append(relationship_leg(
+            relationship_ref=_relationship_ref(catalog_source, step),
+            relationship_kind=_JOIN_RELATIONSHIP_KIND,
+            from_ref=(catalog_source, step.from_ref),
+            to_ref=(catalog_source, step.to_ref),
+            # The SELECTED directional realization's content: the traversed direction and the
+            # cardinality AS TRAVERSED (a reverse N:1 hop is 1:N), plus the fact that governed it.
+            realization_content={
+                "catalog_source": catalog_source,
+                "from_object_ref": step.from_ref,
+                "to_object_ref": step.to_ref,
+                "cardinality": step.cardinality,
+                "approved_join_fact_key": step.approved_join_fact_key,
+                "approved_join_status": step.approved_join_status,
+                "edge_authority": step.authority,
+            },
+            cardinality=step.cardinality or CARDINALITY_UNKNOWN,
+            safety_status=SAFETY_CLEARING if cleared else SAFETY_UNVERIFIED,
+            review_status=step.approved_join_status or REVIEW_FILE_DECLARED,
+            evidence=join_edge_evidence(
+                approved_join_fact_key=step.approved_join_fact_key,
+                approved_join_status=step.approved_join_status)))
+    return tuple(legs)
 
 
 def find_join_path(conn, catalog_source: str, from_table: str,

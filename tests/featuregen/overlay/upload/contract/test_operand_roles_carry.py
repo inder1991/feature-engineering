@@ -131,8 +131,8 @@ def test_surviving_template_candidate_keeps_its_operand_roles(db, monkeypatch):
     monkeypatch.setattr(
         gate1, "ground_all_outcomes",
         lambda *a, **k: [GroundingOutcome("sum_balance", GroundingStatus.GROUNDED, _GF)])
-    ideas, *_rest = _template_candidates(
-        db, catalog_source="ftr", roles=(), target_ref=None, now=NOW, templates=(_TMPL,))
+    ideas = _template_candidates(
+        db, catalog_source="ftr", roles=(), target_ref=None, now=NOW, templates=(_TMPL,)).ideas
     assert ideas
     assert ideas[0].operand_roles == (
         ("public.loans.balance", "stock_col"),
@@ -147,8 +147,9 @@ def test_carrying_the_role_changes_no_disposition(db, monkeypatch):
     monkeypatch.setattr(
         gate1, "ground_all_outcomes",
         lambda *a, **k: [GroundingOutcome("sum_balance", GroundingStatus.GROUNDED, _GF)])
-    ideas, rejections, *_rest = _template_candidates(
+    result = _template_candidates(
         db, catalog_source="ftr", roles=(), target_ref=None, now=NOW, templates=(_TMPL,))
+    ideas, rejections = result.ideas, result.rejections
     raw = {"name": "sum_balance", "description": _TMPL.intent,
            "derives_from": ["public.loans.balance"], "aggregation": "sum",
            "grain_table": None, "rationale": f"template sum_balance: {_TMPL.intent}"}

@@ -5,6 +5,8 @@ Asserts the governed-vs-hint authority boundary: authority comes from the DECISI
 the VALUE always comes from the flat graph_node column (the decision log stores only a HASH, so
 no test — and no reader — ever dereferences a decision's load_bearing_value).
 """
+import pytest
+
 from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.column_authority import (
@@ -12,16 +14,27 @@ from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
     read_column_facts,
 )
-from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
 _SRC = "bank"
 _OBJ = "public.accounts.balance"
 _REF = normalize_ref(_SRC, "public", "accounts", "balance")   # "bank::public.accounts.balance"
+_TBL_OBJ = "public.accounts"                                  # the TABLE node's graph object_ref
 
 
 def _col(db, **cols):
     keys = ["catalog_source", "object_ref", "kind", "table_name", "column_name"]
     vals = [_SRC, _OBJ, "column", "accounts", "balance"]
+    for k, v in cols.items():
+        keys.append(k)
+        vals.append(v)
+    placeholders = ", ".join(["%s"] * len(vals))
+    db.execute(f"INSERT INTO graph_node ({', '.join(keys)}) VALUES ({placeholders})", vals)
+
+
+def _table_node(db, source=_SRC, object_ref=_TBL_OBJ, table_name="accounts", **cols):
+    keys = ["catalog_source", "object_ref", "kind", "table_name", "column_name"]
+    vals = [source, object_ref, "table", table_name, None]
     for k, v in cols.items():
         keys.append(k)
         vals.append(v)
@@ -67,32 +80,64 @@ def test_logical_ref_of_falls_back_to_public_when_no_graph_node_row_exists(db):
     assert logical_ref_of(db, _SRC, _OBJ) == _REF
 
 
-def _table_node(db, **cols):
-    keys = ["catalog_source", "object_ref", "kind", "table_name"]
-    vals = [_SRC, "public.accounts", "table", "accounts"]
-    for k, v in cols.items():
-        keys.append(k)
-        vals.append(v)
-    placeholders = ", ".join(["%s"] * len(vals))
-    db.execute(f"INSERT INTO graph_node ({', '.join(keys)}) VALUES ({placeholders})", vals)
+# ── Task 0C defect 1: object kind/schema come from the canonical graph row, not from positional
+# guessing over the dot-count of the ref. The two-part TABLE ref `public.accounts` used to be read
+# as table="public", column="accounts" and so became the phantom COLUMN ref
+# `bank::public.public.accounts` — a table-anchored field decision then keyed under a column that
+# does not exist. ────────────────────────────────────────────────────────────────────────────────
 
 
-def test_logical_ref_of_maps_a_table_graph_ref_to_a_table_logical_ref(db):
-    """The bug: a 2-part graph ref (`public.accounts` — ALWAYS a TABLE node, graph refs are
-    public-flattened) used to parse as (table='public', column='accounts'), yielding the phantom
-    COLUMN ref 'bank::public.public.accounts' — so evidence/decisions landed where no reader or
-    projection ever looks. A table graph ref must map to the TABLE logical ref (column=None)."""
+def test_logical_ref_of_resolves_a_table_node_as_a_table_ref_not_a_phantom_column(db):
+    """The table-anchor field-decision fixture: the ref that keys a TABLE's evidence/decisions must
+    be the schema-preserving TABLE ref. Positional guessing turned it into a phantom column."""
     _table_node(db)
-    assert logical_ref_of(db, _SRC, "public.accounts") == normalize_ref(_SRC, "public", "accounts")
+    ref = logical_ref_of(db, _SRC, _TBL_OBJ)
+    assert ref == normalize_ref(_SRC, "public", "accounts") == "bank::public.accounts"
+    assert ref != "bank::public.public.accounts"          # the phantom the defect produced
+    _src, _schema, table, column = parse_ref(ref)
+    assert (table, column) == ("accounts", None)          # a TABLE decision key, not a column's
 
 
-def test_logical_ref_of_resolves_a_table_ref_through_its_stored_schema(db):
-    # A non-public-schema source's table node (schema_name set) resolves to the SCHEMA-PRESERVING
-    # table ref its evidence/decisions are actually keyed under.
+def test_logical_ref_of_preserves_a_table_nodes_real_schema(db):
+    """A non-public source's TABLE node records its real (pre-flatten) schema in ``schema_name``;
+    the rebuilt ref must carry it — on the TABLE identity, not on a phantom column."""
     _table_node(db, schema_name="DPL_EIB_COMPLIANCE")
-    expected = normalize_ref(_SRC, "DPL_EIB_COMPLIANCE", "accounts")
-    assert expected == "bank::dpl_eib_compliance.accounts"
-    assert logical_ref_of(db, _SRC, "public.accounts") == expected
+    assert logical_ref_of(db, _SRC, _TBL_OBJ) == "bank::dpl_eib_compliance.accounts"
+
+
+def test_logical_ref_of_keeps_the_same_table_name_distinct_across_schemas(db):
+    """Same table name declared under two different real schemas (one per catalog source — the graph
+    key is public-flattened, so within one source a table name has one schema row). The two refs
+    must stay two distinct schema-preserving identities."""
+    _table_node(db, source="bank_a", schema_name="crm")
+    _table_node(db, source="bank_b", schema_name="fin")
+    ref_a = logical_ref_of(db, "bank_a", _TBL_OBJ)
+    ref_b = logical_ref_of(db, "bank_b", _TBL_OBJ)
+    assert ref_a == "bank_a::crm.accounts"
+    assert ref_b == "bank_b::fin.accounts"
+    assert parse_ref(ref_a)[1:] != parse_ref(ref_b)[1:]   # distinct even ignoring the source
+
+
+def test_logical_ref_of_column_ref_resolution_is_unchanged_beside_a_table_node(db):
+    """The column-ref fixture: with BOTH the table node and its column node present, the 3-part
+    column ref keeps resolving to exactly the ref it always did."""
+    _table_node(db)
+    _col(db)
+    assert logical_ref_of(db, _SRC, _OBJ) == _REF
+
+
+def test_logical_ref_of_rejects_an_ambiguous_two_part_ref_with_no_graph_row(db):
+    """A two-part ref with no graph row to say what it is could be `schema.table` OR the legacy
+    `table.column` spelling. Guessing is the defect; with no explicit kind it must be rejected."""
+    with pytest.raises(ValueError):
+        logical_ref_of(db, _SRC, "accounts.balance")
+
+
+def test_logical_ref_of_resolves_a_two_part_legacy_spelling_with_explicit_kind(db):
+    """The legacy two-part column spelling stays usable — but only when the caller SAYS it is a
+    column (and a rowless table ref likewise says it is a table). Nothing is guessed."""
+    assert logical_ref_of(db, _SRC, "accounts.balance", kind="column") == _REF
+    assert logical_ref_of(db, _SRC, _TBL_OBJ, kind="table") == "bank::public.accounts"
 
 
 def test_logical_ref_of_reads_the_row_not_the_segments_for_a_legacy_table_ref(db):

@@ -30,6 +30,7 @@ from featuregen.overlay.upload.feature_assist import (
     ExternalRequirementPreview,
     FeatureIdea,
     FeatureSet,
+    Rejection,
     RoleBinding,
     SetRecommendation,
     _candidate_columns,
@@ -44,6 +45,13 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     capture_column_snapshot,
     ensure_generation_run,
 )
+from featuregen.overlay.upload.grounding_trace import (
+    GROUNDING_CANDIDATE_SET,
+    READ_SCOPE,
+    SuggestionDependencyClass,
+    build_trace,
+    dependency_pin,
+)
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -55,10 +63,14 @@ from featuregen.overlay.upload.planner.declarations import CompileBudget, build_
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.plan_envelope import (
     PlanEnvelopeV1,
+    plan_dependency_pins,
     plan_envelope_from_result,
+    plan_operand_roles,
+    plan_relationship_dependencies,
 )
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
+from featuregen.overlay.upload.read_scope import allowed_classes, read_scope_rule_content_hash
 from featuregen.overlay.upload.recipe_grounding_context import (
     RecipeGroundingContextV1,
     build_recipe_grounding_context,
@@ -205,16 +217,50 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
         operand_roles=_operand_roles(gf))
 
 
+@dataclass(frozen=True, slots=True)
+class RejectionRecordV1:
+    """One refused grounded candidate, WITH the template that produced it (Task 2A, freeze 0F-7 P3).
+
+    The V1 wire rejection is a ``{name, reason, code}`` dict and carries no template id, so a
+    consumer that wanted one had to match on the rendered NAME — the re-attribution guesswork
+    per-table grounding removed. This record carries the id the engine already knew, and the typed
+    `Rejection` (with its own decision trace) rather than a lossy projection of it.
+    """
+
+    template_id: str
+    candidate_name: str
+    rejection: Rejection
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateCandidatesResult:
+    """What one grounding pass produced — the SAME eight objects the 8-tuple carried, under their
+    established names, plus the rejection records (Task 2A, freeze 0F-7 P3).
+
+    This replaced a positionally-unpacked 8-tuple, deliberately and BREAKINGLY: a ninth member
+    would have been the fourth silent widening of a shape whose callers all index it positionally,
+    and the trace's whole point is that a later consumer can name what it reads. The surviving
+    candidates' traces ride INSIDE ``ideas`` (``FeatureIdea.grounding_trace``); the refused ones
+    ride on ``rejection_records[].rejection.trace``.
+    """
+
+    ideas: list[FeatureIdea]
+    rejections: list[dict]                          # the V1 wire shape, byte-identical
+    grounded_ids: frozenset[str]
+    rejected_ids: dict[str, tuple[str, ...]]
+    binding_by_id: dict[str, str]
+    incomplete_ids: dict[str, tuple[str, ...]]
+    contexts: dict[str, RecipeGroundingContextV1]
+    keys_by_recipe: dict[str, tuple[str, ...]]
+    rejection_records: tuple[RejectionRecordV1, ...] = ()
+
+
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          table: str | None = None,
                          also_tables: Sequence[str] = (),
-                         ) -> tuple[list[FeatureIdea], list[dict],
-                                    frozenset[str], dict[str, tuple[str, ...]], dict[str, str],
-                                    dict[str, tuple[str, ...]],
-                                    dict[str, RecipeGroundingContextV1],
-                                    dict[str, tuple[str, ...]]]:
+                         ) -> TemplateCandidatesResult:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
     ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
@@ -260,7 +306,9 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         if outcome.status is GroundingStatus.BUDGET_TRUNCATED
     }
     if not grounded:
-        return [], [], frozenset(), {}, {}, incomplete_ids, {}, {}
+        return TemplateCandidatesResult(
+            ideas=[], rejections=[], grounded_ids=frozenset(), rejected_ids={}, binding_by_id={},
+            incomplete_ids=incomplete_ids, contexts={}, keys_by_recipe={})
     by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
@@ -274,17 +322,26 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     binding_by_id: dict[str, str] = {}                   # SURVIVING template -> BindingQuality.value
     contexts: dict[str, RecipeGroundingContextV1] = {}
     keys_by_recipe: dict[str, list[str]] = {}
+    rejection_records: list[RejectionRecordV1] = []
     for gf in grounded:
         idea = _idea_from_grounded(gf, by_id[gf.template_id])
         raw = {"name": idea.name, "description": idea.description,
                "derives_from": list(idea.derives_from), "aggregation": idea.aggregation,
                "grain_table": idea.grain_table, "rationale": idea.rationale}
+        # Task 2A: the candidate's own identity, built BEFORE the gauntlet so it can be threaded in
+        # and the trace can be minted AT the decision points rather than stitched on afterwards.
+        # `build_recipe_grounding_context` is pure (template + grounded feature, no DB) and the
+        # object is reused verbatim below, so this moves no work and adds no read — it only makes
+        # the key available to a REFUSED candidate too, which is precisely the case V2 must explain.
+        context = build_recipe_grounding_context(by_id[gf.template_id], gf)
         # The TEMPLATE-DECLARED operand roles ride into the gauntlet alongside `raw` (which is bare
         # refs): they narrow which operands the unit/currency needs-check may ask about. Passed as a
         # kwarg rather than folded into `raw` so the LLM's raw shape — and therefore the LLM path —
         # is untouched.
         validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
-                                        roles=roles, operand_roles=idea.operand_roles)
+                                        roles=roles, operand_roles=idea.operand_roles,
+                                        candidate_key=context.recipe_candidate_key,
+                                        template_id=gf.template_id)
         if rej is None:
             # [F9] keep the VALIDATOR's idea (carries status + requirements), then SERVER-STAMP the H1a
             # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
@@ -294,26 +351,31 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
             # from `raw` (which is bare refs), so without this the template-declared roles would be
             # dropped again one line after being carried. Additive — the validator's status +
             # requirements are untouched.
+            # `replace` preserves `grounding_trace` by construction, so the server stamp cannot
+            # drop the trace the validator just minted.
             ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
                                  planner_applicability="not_applicable_single_catalog",
                                  operand_roles=idea.operand_roles))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
-            context = build_recipe_grounding_context(by_id[gf.template_id], gf)
             contexts[context.recipe_candidate_key] = context
             keys_by_recipe.setdefault(gf.template_id, []).append(context.recipe_candidate_key)
         else:
             rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
             rejected_ids[gf.template_id] = (rej.code,)
-    return (
-        ideas,
-        rejections,
-        frozenset(grounded_ids),
-        rejected_ids,
-        binding_by_id,
-        incomplete_ids,
-        contexts,
-        {recipe_id: tuple(keys) for recipe_id, keys in keys_by_recipe.items()},
+            # The SAME rejection, carrying its template id and its trace — the V1 dict above stays
+            # exactly the three keys the wire has always had.
+            rejection_records.append(RejectionRecordV1(gf.template_id, idea.name, rej))
+    return TemplateCandidatesResult(
+        ideas=ideas,
+        rejections=rejections,
+        grounded_ids=frozenset(grounded_ids),
+        rejected_ids=rejected_ids,
+        binding_by_id=binding_by_id,
+        incomplete_ids=incomplete_ids,
+        contexts=contexts,
+        keys_by_recipe={recipe_id: tuple(keys) for recipe_id, keys in keys_by_recipe.items()},
+        rejection_records=tuple(rejection_records),
     )
 
 
@@ -386,8 +448,40 @@ def _governed_rejection_reason(result: BindingPlanningResultV1) -> str:
     return result.contract_result_status.value
 
 
+def _governed_plan_trace(plan: BindingPlanV1, *, roles, pairs: tuple[tuple[str, str], ...],
+                         validation_status: str):
+    """The cross-catalog candidate's decision trace (Task 2A).
+
+    The governed planner IS this candidate's decision, so its trace is minted here, from the plan
+    the compiler already produced: the ordered crossings it selected (never re-planned), one pin per
+    crossing carrying the exact realization revision, the contract resolution that admitted it, the
+    read scope the compile ran under and the read set it resolved. No gauntlet rule runs on this
+    path, so ``validation_rule_content_hashes`` is honestly empty — this candidate's authority is
+    the governed contract, not the tri-state gauntlet.
+    """
+    pins = [
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=READ_SCOPE, dependency_key="read-scope",
+            content={"allowed_classes": allowed_classes(roles)}),
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=GROUNDING_CANDIDATE_SET,
+            dependency_key="physical_read_set",
+            content={"resolved_object_refs": [ref for _cs, ref in pairs]}),
+        *plan_dependency_pins(plan),
+    ]
+    return build_trace(
+        candidate_key=plan.physical_plan_id,
+        ordered_operand_roles=plan_operand_roles(plan),
+        ordered_relationship_path=plan_relationship_dependencies(plan),
+        validation_status=validation_status, requirements=(), dependency_pins=pins,
+        validation_rule_content_hashes=(),
+        read_scope_rule_content_hashes=(read_scope_rule_content_hash(),))
+
+
 def _governed_idea_from_result(result: BindingPlanningResultV1, template: Template,
-                               target_entity: str) -> FeatureIdea | None:
+                               target_entity: str, *, roles=()) -> FeatureIdea | None:
     """A SELECTED RESOLVED governed contract plan → a Gate-#1 :class:`FeatureIdea` carrying the exact
     compiled plan envelope (so drafting reconstructs the governed path, never a permissive one) and the
     STRUCTURED provenance (``origin`` / ``path_authority``). None when the run has no resolved contract
@@ -414,7 +508,11 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
         # H1a metadata from the SERVER's envelope — planner_applicability is "applicable_cross_catalog"
         # BECAUSE a governed plan_envelope is present (the path_authority↔planner_applicability mapping).
         generation_source="recipe", recipe_id=envelope.recipe_id,
-        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id)
+        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id,
+        # The governed path's own decision trace — the crossings the compiler SELECTED, retained so
+        # nothing downstream has to re-plan to explain this option (freeze 0F-7 / rule 15).
+        grounding_trace=_governed_plan_trace(plan, roles=roles, pairs=pairs,
+                                             validation_status="DESIGN_CHECKED"))
 
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
@@ -455,7 +553,7 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
             rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
                                "recipe_id": rid})
             continue
-        idea = _governed_idea_from_result(result, tmpl, target_entity)
+        idea = _governed_idea_from_result(result, tmpl, target_entity, roles=roles)
         if idea is not None:
             ideas.append(idea)
         else:
@@ -621,15 +719,18 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
-        (template_ideas, template_rejections, grounded_template_ids, rejected_template_ids,
-         binding_quality_by_template, incomplete_template_ids,
-         recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id) = (
-            _template_candidates(
-                conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
-                templates=_templates_to_ground(intent, applicability)))
-        if template_ideas:
-            alternatives.append(FeatureSet(lens="templates", features=template_ideas))
-        rejections.extend(template_rejections)
+        candidates = _template_candidates(
+            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+            templates=_templates_to_ground(intent, applicability))
+        grounded_template_ids = candidates.grounded_ids
+        rejected_template_ids = candidates.rejected_ids
+        binding_quality_by_template = candidates.binding_by_id
+        incomplete_template_ids = candidates.incomplete_ids
+        recipe_grounding_context_by_candidate_key = candidates.contexts
+        recipe_candidate_keys_by_recipe_id = candidates.keys_by_recipe
+        if candidates.ideas:
+            alternatives.append(FeatureSet(lens="templates", features=candidates.ideas))
+        rejections.extend(candidates.rejections)
     elif is_live:
         # 3C.2a — the LIVE governed cross-catalog lens (entity-scoped: no single catalog to ground on).
         # FIRST enforce the invariant over the LLM alternatives (a cross-catalog LLM idea has no governed

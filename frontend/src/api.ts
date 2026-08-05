@@ -12,11 +12,22 @@ export class ApiError extends Error {
   // record stays inspectable via GET /ingestion-runs/{id}. null when the server sent no header;
   // optional in the constructor so existing throw/new sites keep working unchanged.
   ingestionRunId: string | null
-  constructor(status: number, detail: string, ingestionRunId: string | null = null) {
+  // The machine-readable `error_code` a HANDLER-level refusal carries beside `detail` (e.g.
+  // SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION on a 422). null whenever the server sent none —
+  // framework validation errors deliberately have no code, so a caller must never read the
+  // absence as "some other code".
+  errorCode: string | null
+  constructor(
+    status: number,
+    detail: string,
+    ingestionRunId: string | null = null,
+    errorCode: string | null = null,
+  ) {
     super(detail)
     this.status = status
     this.detail = detail
     this.ingestionRunId = ingestionRunId
+    this.errorCode = errorCode
   }
 }
 
@@ -42,6 +53,7 @@ async function requestWithResponse<T>(
   if (!res.ok) {
     // statusText is empty under HTTP/2, so never let the message end up blank.
     let detail = res.statusText || `HTTP ${res.status}`
+    let errorCode: string | null = null
     try {
       const body = await res.json()
       if (typeof body.detail === 'string') {
@@ -52,12 +64,16 @@ async function requestWithResponse<T>(
           .map((e: { loc?: unknown[]; msg?: string }) => `${(e.loc ?? []).join('.')}: ${e.msg}`)
           .join('; ')
       }
+      // Two 422 bodies exist on the same route and neither may crash the client: a HANDLER
+      // refusal is {detail: string, error_code: string}, while a type failure caught before the
+      // handler ran keeps FastAPI's native list-`detail` and carries NO code.
+      if (typeof body.error_code === 'string') errorCode = body.error_code
     } catch {
       // non-JSON error body (proxy HTML page and the like): keep the status fallback
     }
     // A failed ingest still opened a run: keep its id (header) on the error, or it is lost —
     // the JSON body of a 4xx/5xx never carries it.
-    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'))
+    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode)
   }
   return { body: (await res.json()) as T, response: res }
 }
@@ -2552,10 +2568,19 @@ export interface FieldDecisionResult {
 // hypothesis, no intent, no LLM), and v1 offers no verb to accept, dismiss or govern a suggestion.
 // Every field below is the engine's own — statuses are the gauntlet's tri-state, `binding_quality`
 // is the signal it already returns. There is no relevance score in this system, so there is none here.
+// A registry-typed requirement parameter value. Tuples become lists on the wire, scalars pass
+// through; `requirements_to_json` emits `params` ADDITIVELY, only when a requirement has any.
+export type RequirementParamValue =
+  | string | number | boolean | null | (string | number | boolean | null)[]
+
 export interface SuggestionRequirement {
   code: string            // the closed REQUIREMENT_CODES vocabulary (UNIT_CONSISTENT, ...)
   operand: string[]       // [catalog_source, object_ref] the requirement concerns
   detail: string
+  // Additive v2 fields (`contract._serial.requirements_to_json`): present only when the typed
+  // requirement carries registry params / a non-default schema version. A v1 body has neither.
+  params?: [string, RequirementParamValue][]
+  schema_version?: string
 }
 
 export interface RecipeParts {
@@ -2628,6 +2653,323 @@ export interface TableSuggestions {
 export function getTableSuggestions(source: string, table: string): Promise<TableSuggestions> {
   return request(
     `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}/suggestions`,
+  )
+}
+
+// ---- Release A v2: the per-table DISCOVERY contract (`?contract_version=2`) -------------------
+// The same read-only route, asked for its richer payload EXPLICITLY. v1 remains the server default
+// for the whole of Release A, so a client that wants v2 says so in the URL — it never sniffs for an
+// optional field on a v1 body, which would make "an older deployment" and "a suggestion with no
+// category" the same observation.
+//
+// Everything below mirrors `overlay/upload/suggestion_contract.page_to_json` field-for-field. The
+// closed vocabularies are typed as unions because they ARE closed server-side; every renderer still
+// falls back for an unknown member rather than crashing on a newer backend.
+
+export type EvidenceProducer =
+  | 'source' | 'structural_connector' | 'parser' | 'llm' | 'profiler' | 'taxonomy'
+  | 'human' | 'legacy'
+export type AssertionStrength = 'proposed' | 'supported' | 'attested' | 'confirmed'
+export type EvidenceLifecycle = 'active' | 'stale' | 'rejected' | 'superseded'
+
+// One evidence OCCURRENCE on the real three-axis vocabulary. A value may carry several at once
+// (source + LLM + human); collapsing them into one "best authority" is forbidden by the contract,
+// so this always travels as a list and the UI renders every member.
+export interface EvidenceAuthority {
+  producer: EvidenceProducer
+  strength: AssertionStrength
+  lifecycle: EvidenceLifecycle
+  producer_ref: string | null
+  evidence_id: string | null
+}
+
+// WHERE a value came from, as a kind of authorship. Distinct from `strength`, which is how hard
+// its producer asserts it: an `llm_proposed` basis with `proposed` strength is the weakest pair.
+export type AttributedBasis = 'template_authored' | 'catalog_resolved' | 'human' | 'llm_proposed'
+// Read from governed state, never inferred. null for every Release-A discovery value.
+export type OperationalInfluence = 'governed' | 'hint'
+
+// A CONTROLLED registry id with provenance. `id` is the stable audit key; `display_name` is what a
+// human reads. Never minted from free text — catalog wording travels as AttributedText below.
+export interface AttributedLabel {
+  id: string
+  display_name: string
+  basis: AttributedBasis
+  evidence: EvidenceAuthority[]
+  operational_influence: OperationalInfluence | null
+  source_refs: string[]
+}
+
+// Attributed FREE TEXT: displayable and searchable, never a facet id. This is what unmapped
+// catalog domain/entity wording arrives as, and the UI must not badge it as a controlled value.
+export interface AttributedText {
+  value: string
+  basis: AttributedBasis
+  evidence: EvidenceAuthority[]
+  operational_influence: OperationalInfluence | null
+  source_refs: string[]
+}
+
+// What an operand IS to the computation, read from the engine's typed refs — never guessed from a
+// column name, a type or an AI-proposed concept.
+export type SuggestionOperandClassification = 'measure' | 'grain' | 'time' | 'grouping' | 'other'
+
+export interface SuggestionOperand {
+  catalog_source: string
+  logical_ref: string
+  graph_object_ref: string
+  table_ref: string
+  recipe_role: string       // the TEMPLATE AUTHOR's declared slot name; '' when none bound
+  classification: SuggestionOperandClassification
+  visibility_requires_current: string[]   // non-empty = this input is visibility-restricted
+  evidence_refs: string[]
+}
+
+// Release A's only `profile_status`: the profile plan has not landed, so the descriptive roles are
+// null because nobody has decided them, NOT because the dataset has none. Left as `string` because
+// the vocabulary's remaining members are owned by that plan and are not frozen here.
+export const PROFILE_STATUS_UNAVAILABLE = 'unavailable'
+
+export interface SuggestionSourceDataset {
+  catalog_source: string
+  table_ref: string
+  data_role: AttributedLabel | null
+  authority_role: AttributedLabel | null
+  temporal_storage_model: AttributedLabel | null
+  primary_entity: AttributedLabel | null
+  dataset_profile_hash: string | null
+  profile_status: string
+}
+
+// One TRAVERSED relationship leg, in the direction travelled.
+//
+// The last three are LEFT AS `string` ON PURPOSE, and the reason is worth stating because the rest
+// of this block narrows aggressively. Each is written by TWO producers that do not agree, and the
+// dataclass carrying them validates only `relationship_kind` — so a TS union here would be a claim
+// the server does not enforce, and a payload that violated it would type-check as impossible while
+// rendering as garbage. The renderer maps every member below to words and degrades unknown members
+// gracefully, which is the honest equivalent.
+//
+//   cardinality   — the join-path walker passes the `graph_edge` column through verbatim, whose DB
+//                   CHECK is '1:1' | '1:N' | 'N:1' | NULL; the planner instead emits the taxonomy's
+//                   `Cardinality` StrEnum: 'one_to_one' | 'one_to_many' | 'many_to_one' |
+//                   'many_to_many'. NULL becomes 'unknown' — never guessed at 1:1. Nothing
+//                   normalizes the two notations.
+//   safety_status — 'clearing' (governed-verified, or declared with no contradicting fact) or
+//                   'unverified'. Closed by call-site enumeration only, not by any validator.
+//   review_status — 'file_declared' when nobody confirmed it. Otherwise the approved_join status
+//                   column, whose CHECK admits 'DRAFT' | 'PARTIALLY_CONFIRMED' | 'VERIFIED' |
+//                   'REJECTED' | 'STALE' | 'REVERIFY' (only VERIFIED is reachable on an
+//                   operational edge today), or the planner's own 'governed_bridge' | 'unlinked'.
+export interface SuggestionRelationshipDependency {
+  relationship_ref: string
+  relationship_kind: string
+  from_ref: [string, string]
+  to_ref: [string, string]
+  realization_content_hash: string | null
+  cardinality: string
+  safety_status: string
+  review_status: string
+}
+
+// The CLOSED warning vocabulary. Prose renders a code; it is never an alternative decision field.
+// Staleness is deliberately absent: it is projection state, not a property of the suggestion.
+export const SUGGESTION_WARNING_CODES = [
+  'NEAR_LABEL', 'SENSITIVE_INPUT', 'MISSING_TEMPORAL_EVIDENCE', 'MISSING_UNIT', 'MISSING_CURRENCY',
+  'RELATIONSHIP_UNCONFIRMED', 'RELATIONSHIP_SAFETY_UNPROVEN',
+  'DIRECTIONAL_CARDINALITY_UNAVAILABLE', 'PROFILE_PROPOSED',
+] as const
+export type SuggestionWarningCode = (typeof SUGGESTION_WARNING_CODES)[number]
+
+export interface SuggestionWarning {
+  code: SuggestionWarningCode
+  operand_refs: [string, string][]
+  detail: string
+}
+
+export type SuggestionValidationStatus = 'DESIGN_CHECKED' | 'NEEDS_EXTERNAL_VALIDATION'
+// How completely the discovery registry maps this recipe. `needs_sme` is UNREPRESENTABLE in v1 —
+// the contract has no carrier for its provenance — so a UI chip for it could never occur.
+export type SuggestionDiscoveryDisposition = 'complete' | 'partial' | 'unclassified'
+// The server-stamped generation vocabulary. This surface emits only `recipe`.
+export type SuggestionGenerationSource = 'recipe' | 'llm_freeform' | 'user_defined'
+
+export interface FeatureSuggestionV2 {
+  schema_version: string          // 'feature-suggestion-v2'
+  suggestion_id: string           // STABLE logical candidate identity — the React key, not the name
+  suggestion_revision_id: string  // exact content/context revision
+  generation_source: SuggestionGenerationSource
+
+  template_id: string | null
+  recipe_revision_id: string | null
+  discovery_metadata_revision_id: string | null
+  validation_rule_content_hashes: string[]
+  read_scope_rule_content_hashes: string[]
+  name: string
+  display_name: string
+  business_interpretation: AttributedText | null
+  business_value: AttributedText | null
+
+  feature_category: AttributedLabel | null
+  // The provenance-badge signal a consumer must NOT read off `basis`, which says
+  // `template_authored` for a taxonomy-DERIVED category as well as for an authored one.
+  feature_category_derived_from_family_mapping: boolean
+  discovery_disposition: SuggestionDiscoveryDisposition
+  recipe_family: AttributedLabel | null
+  business_domains: AttributedLabel[]        // empty in Release A: no controlled resolver
+  contextual_domain_terms: AttributedText[]  // catalog wording, NOT a controlled domain
+  use_cases: AttributedLabel[]
+  keywords: AttributedText[]
+
+  entity: AttributedLabel | null
+  contextual_entity_terms: AttributedText[]
+  grain_refs: [string, string][]             // ordered composite key
+  operation_kind: string
+  window: string | null
+  time_ref: [string, string] | null
+  recipe: string
+  recipe_parts: RecipeParts
+
+  // The remaining AUTHORED recipe declarations. null means the SME wrote none: silence, not an
+  // empty value.
+  recipe_stage: AttributedText | null
+  eligibility_note: AttributedText | null
+  authoring_notes: AttributedText[]
+  output_additivity: AttributedText | null
+  point_in_time_declaration: AttributedText | null
+
+  source_datasets: SuggestionSourceDataset[]
+  operands: SuggestionOperand[]
+  relationship_dependencies: SuggestionRelationshipDependency[]
+  validation_status: SuggestionValidationStatus
+  requirements: SuggestionRequirement[]
+  warnings: SuggestionWarning[]
+  binding_quality: string
+
+  semantic_context_hashes: string[]   // empty in Release A: the semantic plan has not landed
+  dataset_profile_hashes: string[]    // empty in Release A: the profile plan has not landed
+  grounding_trace_content_hash: string
+}
+
+// The exact ids a reader compares for CURRENTNESS — and which are excluded from every semantic
+// hash for exactly that reason, so a replay under a new event id churns no revision.
+export interface SuggestionBuildProvenance {
+  scope_set_id: string | null
+  metadata_snapshot_ids: string[]
+  dependency_revision_ids: string[]
+  evidence_event_ids: string[]
+  relationship_realization_revision_ids: string[]
+  producer_commit: string | null
+  refresh_id: string | null
+  generated_at: string | null
+}
+
+export type SuggestionProjectionStateName =
+  | 'current' | 'stale' | 'pending' | 'partial' | 'failed' | 'retired'
+
+// Release-B projection currentness. Release A reports `null` rather than inventing a `current` it
+// cannot prove, so a UI must never synthesize a freshness badge from an absent projection.
+export interface SuggestionProjectionState {
+  state: SuggestionProjectionStateName
+  scope_set_id: string | null
+  read_scope_key: string
+  scope_epoch: number
+  target_fingerprint: string
+  current_fingerprint: string | null
+  generated_at: string | null
+  stale_reason: string | null
+  // The SAME closed key vocabulary the collection's identical field carries — a projection omits
+  // things for the same reasons a live page does, so it may not be the looser type.
+  omitted_counts: SuggestionOmittedCounts
+}
+
+export interface FeatureSuggestionHit {
+  suggestion: FeatureSuggestionV2
+  projection: SuggestionProjectionState | null
+  provenance: SuggestionBuildProvenance
+}
+
+// V1's counts with `clean_ready` renamed to what it actually means. `groups` keeps V1's `entities`
+// semantics: the number of NAMED grain buckets.
+export interface SuggestionSummaryV2 {
+  suggested: number
+  design_checked: number
+  needs_external_validation: number
+  groups: number
+}
+
+export interface SuggestionGroupV2 {
+  entity: AttributedLabel | null
+  contextual_entity_terms: AttributedText[]
+  grain_refs: [string, string][]
+  suggestion_ids: string[]
+}
+
+export interface SuggestionRejectionV2 {
+  template_id: string | null
+  candidate_name: string
+  code: string
+  explanation: string
+}
+
+// What a bound left out. Every key is a count of values the page did NOT show; an unknown key from
+// a newer backend degrades to its de-underscored words rather than disappearing. Scope-revealing
+// keys are dropped server-side, so a caller cannot tell "nothing withheld" from "N withheld".
+export type SuggestionOmissionKey =
+  | 'operands' | 'business_domains' | 'contextual_domain_terms' | 'contextual_entity_terms'
+  | 'use_cases' | 'keywords' | 'authoring_notes' | 'relationship_dependencies'
+  | 'evidence_refs' | 'term_evidence'
+  | 'withheld_missing_trace' | 'withheld_incomplete_trace' | 'withheld_missing_context'
+  | 'withheld_unresolvable_path' | 'withheld_non_recipe_generation_source'
+export type SuggestionOmittedCounts = Partial<Record<SuggestionOmissionKey, number>>
+
+export interface SuggestionCollectionContextV2 {
+  anchor_catalog_source: string | null
+  anchor_table_ref: string | null
+  anchor_column_ref: string | null
+  // false = this catalog holds no such table FOR THIS CALLER. Keeps the empty screen's DIAGNOSIS
+  // honest, exactly as in v1.
+  table_known: boolean | null
+  summary: SuggestionSummaryV2
+  groups: SuggestionGroupV2[]
+  rejections: SuggestionRejectionV2[]
+  neighbourhood: JoinNeighbourhood | null
+  omitted_counts: SuggestionOmittedCounts
+}
+
+// Named apart from the catalog-search `FacetBucket` above: the two contracts are versioned by
+// different owners and a shared name would silently couple them.
+export interface SuggestionFacetBucket {
+  id: string
+  display_name: string
+  count: number
+}
+
+export interface FeatureSuggestionPageV2 {
+  read_mode: 'on_demand' | 'projected'
+  read_scope_key: string          // opaque hash of the caller's visibility CLASSES; not authz
+  projection: SuggestionProjectionState | null
+  collection: SuggestionCollectionContextV2
+  hits: FeatureSuggestionHit[]
+  facets: Record<string, SuggestionFacetBucket[]>   // empty until Release B
+  next_cursor: string | null
+}
+
+// The typed handler-level refusal for a version this deployment does not serve. A NON-integer
+// `contract_version` is a different thing: it keeps FastAPI's native 422, whose `detail` is a LIST
+// and which carries no code at all.
+export const SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION = 'SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION'
+
+// Ask for v2 EXPLICITLY. The version is a literal, not a probe: if this deployment does not serve
+// it the route answers 422 with the code above and the caller says so, rather than silently
+// rendering a v1 body with every discovery field missing.
+export function getTableSuggestionsV2(
+  source: string,
+  table: string,
+): Promise<FeatureSuggestionPageV2> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
+      + '/suggestions?contract_version=2',
   )
 }
 

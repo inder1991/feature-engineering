@@ -6,6 +6,13 @@ disagree, this document wins; the plan is amended, not reinterpreted. Every deci
 verified against `origin/main @ fa9a20b0` — citations refer to that tree. The adversarial review
 that motivated each decision is `docs/architecture/2026-08-01-plan-review-semantic-context-and-catalog-profiles.md`.
 
+**Merge note (2026-08-05):** a parallel session independently authored a shorter "binding addendum"
+at this same path (visible in main's history at `a3f0123c`). This document supersedes it at this
+path: its migration-reservation table (§5 there) predated the executed allocations and disagrees
+with reality (1050 = crosswalk, 1051/1052 taken — the D7 table below is the executed record), and
+its unique §12 Task-0F companion freeze lives standalone as
+`docs/architecture/2026-08-03-verified-interfaces-suggestion-discovery.md`.
+
 **Program sequence (supersedes the execution-order diagrams inside both 2026-08-01 plans, which
 show codegen as a later sequential step — codegen remediation is an active PARALLEL predecessor):**
 

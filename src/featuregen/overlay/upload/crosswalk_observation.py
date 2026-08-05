@@ -347,7 +347,7 @@ CROSSWALK_LEGS: tuple[str, str] = (SOURCE_TO_MAPPING, MAPPING_TO_TARGET)
 # name and differ in tier stop being one row. It does NOT close FORGERY, and cannot: the binding is
 # a pure function of a public value object, so a producer can compute one for a scope it never
 # executed under. Neither would the durable fix — a persisted `execution_tier` column is written by
-# the same caller and is exactly as forgeable — which is why that fix (DEFERRED-WORK A.43) is
+# the same caller and is exactly as forgeable — which is why that fix (DEFERRED-WORK A.45) is
 # justified by READABILITY and audit rather than by trust. Closing forgery needs a trusted
 # execution attestation, which nothing in this repository produces.
 
@@ -397,7 +397,7 @@ def observation_scope_is_proved(recorded_scope_id: str, scope) -> bool:
     defect that let a sandbox probe answer a production question), not FORGERY. Nothing available
     without a trusted execution attestation would close forgery either: a persisted
     ``execution_tier`` column would be written by the same caller and be exactly as forgeable, which
-    is why the durable fix in DEFERRED-WORK A.43 is about READABILITY and audit rather than about
+    is why the durable fix in DEFERRED-WORK A.45 is about READABILITY and audit rather than about
     trust.
 
     False for a bare ``scope_id`` match, which establishes only that the two share a NAME: the tier

@@ -423,9 +423,10 @@ def test_the_namespace_is_the_one_the_binding_publishes_to() -> None:
 def test_there_is_no_production_path() -> None:
     """`__all__` is pinned with `==`, so a `production_namespace` cannot be added quietly."""
     assert set(identity.__all__) == {
-        "GENERATED_LOCK_FILENAME", "CompilationIdentity", "RenderedArtifactIdentity",
-        "SealedProject", "build_compilation_identity", "derive_namespace",
-        "generated_project_hash", "read_lock", "sandbox_execution_hash", "seal_project"}
+        "GENERATED_LOCK_FILENAME", "REQUIREMENTS_LOCK_FILENAME", "CompilationIdentity",
+        "RenderedArtifactIdentity", "SealedProject", "build_compilation_identity",
+        "derive_namespace", "generated_project_hash", "read_lock", "sandbox_execution_hash",
+        "seal_project"}
     assert [name for name in dir(identity) if "produc" in name.lower()] == []
 
 

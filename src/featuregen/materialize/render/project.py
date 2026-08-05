@@ -60,6 +60,7 @@ from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
+    REQUIREMENTS_LOCK_FILENAME,
     CompilationIdentity,
     SealedProject,
     build_compilation_identity,
@@ -1309,7 +1310,7 @@ def render_project(
 
     files = {
         "pyproject.toml": _render_pyproject(package, engine_versions=engine_versions),
-        "requirements.lock": _render_requirements(engine_versions),
+        REQUIREMENTS_LOCK_FILENAME: _render_requirements(engine_versions),
         "README.md": _render_readme(
             plan, compilation, datasets, package=package, environment_id=environment_id,
             engine_versions=engine_versions, published_target=published_target,

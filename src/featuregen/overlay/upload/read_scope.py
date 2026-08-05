@@ -28,6 +28,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from featuregen.canonical import contract_hash_v1
+from featuregen.contracts.contract_versions import register_contract_version
+
 #: Which role grants visibility of each raw TAG. **This is also the tag vocabulary migration 0993
 #: enforces on ``graph_node.sensitivity`` via a CHECK constraint** — the two are kept identical on
 #: purpose, so "a tag with no role" is an impossible row rather than a silently dropped access
@@ -166,3 +169,26 @@ def allowed_classes(roles: Iterable[str]) -> list[str]:
 #: Back-compat alias: the name predates the governed floor, when the raw tag was the only axis.
 #: The returned value is now the class list above.
 allowed_sensitivities = allowed_classes
+
+
+_READ_SCOPE_RULES_CONTRACT = "read-scope-rules"
+_READ_SCOPE_RULES_VERSION = "1"
+register_contract_version(_READ_SCOPE_RULES_CONTRACT, _READ_SCOPE_RULES_VERSION,
+                          owner="featuregen.overlay.upload.read_scope")
+
+
+def read_scope_rule_content_hash() -> str:
+    """The content identity of the read-scope RULES themselves (freeze 0F-7 P5).
+
+    A grounding trace records which visibility classes a run applied (that is a per-run pin); this
+    is the orthogonal question a trace must also answer — under WHICH rule set was that scope
+    computed. Both role maps, the SQL predicate and the migration-1032 precedence enter, so adding
+    a fourth grantable class, re-pointing a class at another role or changing the containment
+    operator all move this hash and mark every trace minted under the old rules as stale. PURE: no
+    DB, no roles, no request state."""
+    return contract_hash_v1(_READ_SCOPE_RULES_CONTRACT, _READ_SCOPE_RULES_VERSION, {
+        "sensitivity_roles": dict(sorted(SENSITIVITY_ROLES.items())),
+        "restriction_roles": dict(sorted(RESTRICTION_ROLES.items())),
+        "visibility_predicate": VISIBILITY_PREDICATE,
+        "precedence": "migration-1032",
+    })
