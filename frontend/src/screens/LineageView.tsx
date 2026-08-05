@@ -972,10 +972,14 @@ export function LineageView({
             // The NODE's own concept wins; the SearchHit only supplies the type the graph
             // payload does not carry. Preferring the hit would overwrite what the graph said
             // about this column with what the search index said about the anchor.
-            meta: [n.concept ?? anchor.concept,
-              anchor.data_type && anchor.data_type.toLowerCase() !== 'unknown'
-                && `${anchor.data_type} · source declared`]
-              .filter(Boolean).join(' · ') || null,
+            // Prefer the NODE's own declared type now that the payload carries it; the
+            // SearchHit is only the fallback for an anchor the graph did not describe.
+            meta: (() => {
+              const t = n.data_type ?? anchor.data_type
+              return [n.concept ?? anchor.concept,
+                t && t.toLowerCase() !== 'unknown' && `${t} · source declared`]
+                .filter(Boolean).join(' · ') || null
+            })(),
           } satisfies AnchorColData,
         }
       }

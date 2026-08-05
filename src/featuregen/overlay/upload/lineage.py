@@ -271,18 +271,24 @@ class _Builder:
                            "quarantine_pending": pending or None})]   # omit when nothing pending
             as_of_col, basis = self._as_of_basis(source, table)
             cols = self.conn.execute(
+                # data_type rides along so the canvas can state a column's declared type
+                # without a second round trip: the graph cards showed a concept but no type,
+                # which is half of what identifies a column.
                 "SELECT object_ref, column_name, is_grain, is_as_of, sensitivity, entity, "
-                "concept, domain FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+                "concept, domain, data_type FROM graph_node "
+                "WHERE catalog_source = %s AND kind = 'column' "
                 "AND table_name = %s AND visible_requires <@ %s "
                 "ORDER BY object_ref",
                 (source, table, self.allowed)).fetchall()
             self._table_cols[(source, table)] = [c[0] for c in cols]
-            for c_ref, column, is_grain, is_as_of, sensitivity, entity, concept, domain in cols:
+            for (c_ref, column, is_grain, is_as_of, sensitivity, entity, concept, domain,
+                 data_type) in cols:
                 out.append(_prune({"id": f"{source}:{c_ref}", "kind": "column",
                                    "object_ref": c_ref, "table": table, "column": column,
                                    "catalog_source": source, "grain": is_grain,
                                    "as_of": is_as_of, "sensitivity": sensitivity,
                                    "entity": entity, "concept": concept, "domain": domain,
+                                   "data_type": data_type,
                                    # as-of BASIS lives only in the availability_time fact, keyed on
                                    # the table's as-of column; attach it to that column alone
                                    "as_of_basis": basis if (is_as_of and column == as_of_col)

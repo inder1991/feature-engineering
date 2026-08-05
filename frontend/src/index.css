@@ -2547,48 +2547,33 @@ section > h2:first-child {
 
 /* xyflow built-in controls + minimap, restyled onto the tokens */
 .ln-wrap .react-flow__controls {
-  top: 13px;
-  right: 15px;
-  /* Hug the buttons. Without an explicit height the panel stretched down the whole canvas as a
-     tall white strip; the artifact's is a small pill that hugs its three controls. */
-  width: 30px;
-  height: auto;
-  max-height: max-content;
-  bottom: auto;
-  left: auto;
+  inset: 13px 15px auto auto;
+  display: flex;
+  width: 28px;
+  height: max-content;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 9px;
   background: var(--surface);
   box-shadow: var(--shadow);
-  box-shadow: var(--shadow);
-  border-radius: var(--radius);
-  overflow: hidden;
 }
 
+/* Small, as the artifact draws them: a map control must not compete with the map. Written as
+   ONE set of declarations — earlier attempts prepended into this block and the original 32px
+   values, still sitting below them, won every time. */
 .ln-wrap .react-flow__controls-button {
-  /* Small, as the artifact draws them: a map control should not compete with the map. */
-  width: 30px;
-  height: 28px;
+  width: 28px;
+  height: 26px;
   padding: 0;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  background: var(--surface);
-  color: var(--ink-soft);
-  width: 32px;
-  height: 32px;
   border: none;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
-  color: var(--ink);
+  color: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__controls-button:hover {
   background: var(--surface-2);
-}
-
-.ln-wrap .react-flow__controls-button svg {
-  fill: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__minimap {
