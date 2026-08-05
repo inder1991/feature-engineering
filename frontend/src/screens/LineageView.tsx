@@ -35,6 +35,7 @@ import {
   type SearchHit,
 } from '../api'
 import { useHashRoute } from '../nav'
+import { useColumnSuggestions } from './columnSuggestions'
 
 // The view traverses both ways from the anchor (the mockup has no direction control); the
 // constant is threaded through every fetch so expander clicks stay direction-aware.
@@ -569,6 +570,18 @@ export function LineageView({
   // setState on a gone component. The anchor fetch owns its own controller (aborted on re-anchor).
   const expandCtrls = useRef<Set<AbortController>>(new Set())
   const rf = useRef<ReactFlowInstance | null>(null)
+  // The same per-table suggestions read the asset dossier makes, filtered to this column's
+  // operands — one implementation and one set of read-scope rules across both surfaces.
+  const { matching } = useColumnSuggestions(anchor.catalog_source, {
+    ...anchor,
+    kind: anchor.column ? 'column' : 'table',
+    graph_ref: anchor.object_ref,
+    logical_ref: anchor.object_ref,
+    source: anchor.catalog_source,
+    schema_name: null,
+    operational_type: anchor.data_type,
+    declared_type: anchor.data_type,
+  })
 
   useEffect(() => {
     const id = ++seq.current
@@ -664,6 +677,14 @@ export function LineageView({
     () => drawnEdges.filter(e => visibleUnits.has(unitOf(e.from)) && visibleUnits.has(unitOf(e.to))),
     [drawnEdges, visibleUnits, unitOf],
   )
+
+  // Counts for the map label and the canvas summary, derived from the graph already in memory.
+  // The artifact's decision 14 is explicit: "The UI derives simple counts locally; it does not
+  // require a dashboard-summary endpoint."
+  const assetCount = visibleUnits.size
+  const bridgeCount = visibleEdges.filter(e => e.kind === 'entity_bridge').length
+  const featureCount = visibleEdges.filter(e => e.kind === 'derives').length
+  const joinCount = visibleEdges.filter(e => e.kind === 'join').length
 
   // Trace: the clicked column's feature-lineage path (derives -> feature -> consumers).
   const traced = useMemo(() => {
@@ -1229,6 +1250,17 @@ export function LineageView({
         </aside>
 
         <div className="ln-canvas">
+          {/* What this map IS, stated over it. Counts are derived locally from the loaded graph —
+              the artifact's decision 14 forbids requiring a summary endpoint for them. */}
+          <div className="ln-map-label">
+            <b>{anchor.entity ? `${anchor.entity} neighborhood` : 'Relationship neighborhood'}</b>
+            <span>
+              {assetCount} {assetCount === 1 ? 'asset' : 'assets'}
+              {bridgeCount > 0
+                ? ` · ${bridgeCount} cross-catalog mapping${bridgeCount === 1 ? '' : 's'}`
+                : ' · no cross-catalog mapping'}
+            </span>
+          </div>
         <ReactFlow
           nodes={flow.nodes}
           edges={flow.edges}
@@ -1258,6 +1290,24 @@ export function LineageView({
           />
           )}
         </ReactFlow>
+          <div className="ln-canvas-summary" aria-hidden="true">
+            <div className="ln-canvas-stat">
+              <strong>
+                {bridgeCount} business mapping{bridgeCount === 1 ? '' : 's'}
+              </strong>
+              <span>{bridgeCount === 0 ? 'No cross-catalog link in view' : 'Across catalogs'}</span>
+            </div>
+            <div className="ln-canvas-stat">
+              <strong>
+                {featureCount} registered feature{featureCount === 1 ? '' : 's'}
+              </strong>
+              <span>Recommendations shown separately</span>
+            </div>
+            <div className="ln-canvas-stat">
+              <strong>{joinCount} governed join{joinCount === 1 ? '' : 's'}</strong>
+              <span>Approved structural joins in view</span>
+            </div>
+          </div>
         </div>
 
         {/* A layout column, not a landmark: the Drawer inside already carries
@@ -1286,12 +1336,58 @@ export function LineageView({
               </section>
             )
           })()}
+          {drawerNode && matching.length > 0 && (
+            <section className="ln-inspector-section" aria-label="Recommended features">
+              <h3 className="ln-micro">Recommended features using this column</h3>
+              <div className="ln-recommendations">
+                {matching.slice(0, 3).map(hit => (
+                  <a
+                    key={hit.suggestion.suggestion_id}
+                    className="ln-recommendation"
+                    href={`#/suggested?${new URLSearchParams({
+                      source: anchor.catalog_source, table: anchor.table,
+                    }).toString()}`}
+                  >
+                    <strong>{hit.suggestion.name}</strong>
+                    <span>{hit.suggestion.recipe}</span>
+                    <em>Open recommendation →</em>
+                  </a>
+                ))}
+              </div>
+              {/* Decision 4: "explicitly separated from registered feature lineage". A discovery
+                  candidate and a shipped feature are different claims about the world. */}
+              <p className="ln-recommendation-note">
+                Recommendations are discovery candidates — not registered lineage.
+              </p>
+            </section>
+          )}
           {!drawerNode && (
             <p className="hint ln-inspector-empty">
               Select a node to see its identity, relationship trust and the features it can
               support.
             </p>
           )}
+          {/* The artifact pins two actions to the foot of the inspector. */}
+          <div className="ln-inspector-actions">
+            <a
+              className="btn btn--ghost"
+              href={`#/asset?${new URLSearchParams({
+                source: anchor.catalog_source, object_ref: anchor.object_ref,
+              }).toString()}`}
+            >
+              View details
+            </a>
+            {anchor.table && (
+              <a
+                className="btn btn--primary"
+                href={`#/suggested?${new URLSearchParams({
+                  source: anchor.catalog_source, table: anchor.table,
+                }).toString()}`}
+              >
+                All recommendations
+              </a>
+            )}
+          </div>
         </div>
       </div>
 

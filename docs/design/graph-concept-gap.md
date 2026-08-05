@@ -18,20 +18,20 @@ the rooms were not furnished.
 
 | Artifact block | Contents | State |
 | --- | --- | --- |
-| `.contextbar` | `COL` kind chip, full ref + `Customer Number · CIB · BO_DPL_CIB`, badges (`Customer identifier`, `2 checks required`), actions `← Results` / `View details` | **missing entirely** |
-| `.tools` §1 Relationship layers | swatch + name + **description** per layer (`Approved structural joins`, `Same business entity across catalogs`, `Existing production lineage`) | partial — bare checkboxes, no swatches, no descriptions |
-| `.tools` §2 **Line meaning** | legend with line samples: Verified join / Entity mapping / Containment | **missing** |
-| `.tools` §3 **Current scope** | `One hop around cust_num. Expand a table to fetch its next neighborhood.` | **missing** |
-| `.tools` §4 **Visibility** | `Only objects permitted for the current session are shown…` | **missing** |
-| `.canvas` `.map-label` | `Customer identity neighborhood · 3 assets · 1 cross-catalog mapping` | **missing** |
-| `.canvas` `.canvas-summary` | 3 stats pinned bottom, `pointer-events:none` (business mapping / registered features / readiness checks) | **missing** |
+| `.contextbar` | kind chip, full ref + wording, badges, `← Results` / `View details` | **DONE** — `2 checks required` omitted: readiness data this component is not given |
+| `.tools` §1 Relationship layers | swatch + name + description per layer | **DONE** |
+| `.tools` §2 Line meaning | legend with line samples | **DONE** |
+| `.tools` §3 Current scope | one-hop statement | **DONE** |
+| `.tools` §4 Visibility | read-scope statement | **DONE** |
+| `.canvas` `.map-label` | `Customer identity neighborhood · 3 assets · 1 cross-catalog mapping` | **DONE** |
+| `.canvas` `.canvas-summary` | 3 stats pinned bottom, `pointer-events:none` | **DONE** (counts derived locally per decision 14) |
 | Node cards | `node-kind` / `node-title` / grain badge / `node-meta` / freshness chip / column rows | different shape |
 | Edge labels | `belongs to`, `customer · strong` | different |
 | `.inspector` `.selected-label` + definition | `Selected column` + prose definition | **missing** |
 | `.inspector` `.fact-grid` | Business term / Domain / Grain use | **missing** |
 | `.inspector-section` Cross-catalog capability | relationship + `.trustline` 3 axes | **DONE** (`2d3d1ae5`) |
-| `.inspector-section` Recommended features | 3 `.recommendation` cards + `Recommendations are discovery candidates—not registered lineage.` | **missing** (decision 4) |
-| `.inspector-actions` | `View details` / `All recommendations`, pinned bottom via `margin-top:auto` | **missing** |
+| `.inspector-section` Recommended features | 3 `.recommendation` cards + separation note | **DONE** — reuses `useColumnSuggestions` |
+| `.inspector-actions` | `View details` / `All recommendations`, pinned bottom | **DONE** |
 
 ## Why this went wrong
 
@@ -40,7 +40,14 @@ building the artifact's content. That satisfied the decision list read literally
 float; facets do leave graph mode) while missing that the artifact also specifies *what those
 panels contain*. The decision list is a summary of the design, not a substitute for it.
 
-## Next pass
+## Still open
+
+- Inspector `.selected-label` / definition / `.pillrow` / `.fact-grid` — the existing `Drawer`
+  renders node detail in its own shape; the artifact's four-fact grid is not built.
+- Node card shape and edge labels (`belongs to`, `customer · strong`).
+- The three-axis trust test gap below.
+
+## Original next pass
 
 Build from the artifact's DOM outward, not from the existing component inward. Order:
 

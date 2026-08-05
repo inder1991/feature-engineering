@@ -1848,6 +1848,122 @@ section > h2:first-child {
   padding: 15px;
 }
 
+/* What this map IS, over the top-left of the canvas. */
+.ln-map-label {
+  position: absolute;
+  top: 13px;
+  left: 15px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--surface) 94%, transparent);
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.ln-map-label b { color: var(--ink); }
+
+/* The ONE overlay the artifact permits, and only because it cannot take a click:
+   pointer-events:none means it can never intercept a press meant for a node. */
+.ln-canvas-summary {
+  position: absolute;
+  right: 15px;
+  bottom: 13px;
+  left: 15px;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  pointer-events: none;
+}
+
+.ln-canvas-stat {
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--surface) 94%, transparent);
+}
+
+.ln-canvas-stat strong {
+  display: block;
+  font-size: 11px;
+}
+
+.ln-canvas-stat span {
+  color: var(--ink-faint);
+  font-size: 9.5px;
+}
+
+.ln-recommendations {
+  display: grid;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.ln-recommendation {
+  display: block;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.ln-recommendation:hover {
+  border-color: var(--proposal);
+}
+
+.ln-recommendation strong {
+  display: block;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ln-recommendation span {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  overflow-wrap: anywhere;
+}
+
+.ln-recommendation em {
+  display: inline-block;
+  margin-top: 5px;
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ln-recommendation-note {
+  margin: 7px 0 0;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+}
+
+/* Pinned to the foot of the column by margin-top:auto, as the artifact draws it. */
+.ln-inspector-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: auto;
+  padding: 12px 15px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
 .ln-inspector-section {
   margin: 0 15px 15px;
   padding-top: 13px;
