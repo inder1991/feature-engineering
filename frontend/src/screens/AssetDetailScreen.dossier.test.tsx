@@ -413,13 +413,17 @@ describe('section order', () => {
     }))
     await screen.findByTestId('column-suggestions')
     const text = document.body.textContent ?? ''
+    // The dossier reads in three tiers: the verdict strip, then the reasoning cards, then the
+    // receipts. Technical identity is LAST — it used to be first, which put the object/logical/
+    // graph refs in the most valuable position on the page and the business meaning below them.
     const order = [
-      'Identity',
-      'Meaning',
+      'Potential uses',
+      'Business meaning',
       'From the source glossary',
-      'Semantics',
-      'Governance',
+      'Operational semantics',
+      'Trust and coverage',
       'Suggested features using this column',
+      'Technical identity',
     ].map(h => text.indexOf(h))
     for (const idx of order) expect(idx).toBeGreaterThan(-1)
     for (let i = 1; i < order.length; i++) expect(order[i]).toBeGreaterThan(order[i - 1])

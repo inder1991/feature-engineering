@@ -4,7 +4,6 @@ import {
   type AssetApprovedJoin,
   type AssetDetail,
   type AssetHistoryRun,
-  type AssetIdentity,
   type AuditSummary,
   type EffectiveMetadataField,
   type EvidenceProposal,
@@ -19,14 +18,18 @@ import {
   type SemanticDivergence,
   type SemanticSubsection,
   type SemanticVerifiedEdge,
-  SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
-  type FeatureSuggestionPageV2,
   getAssetDetail,
-  getTableSuggestionsV2,
   postFieldDecision,
 } from '../api'
-import { useIdentityKey } from '../session'
-import { SuggestionCard } from './SuggestionCard'
+import { OverviewTab } from './AssetDetailOverview'
+import { AuthorityBadge } from './AuthorityBadge'
+import {
+  attestedByLabel,
+  authorityTone,
+  fieldValueText,
+  humanizeField,
+  typeDisplay,
+} from './assetDetailFields'
 
 // Asset detail: ONE catalog asset opened to its bounded sections (identity + metadata + evidence +
 // relationships + readiness + history + audit), reached via a Details action on a search hit. Every
@@ -47,53 +50,6 @@ const TABS = [
 ] as const
 type Tab = (typeof TABS)[number][0]
 
-// ---- authority / provenance rendering (driven by the field's fields, NEVER by value presence) ----
-// The four named authorities map from provenance; tone comes from the C1 authority level. A field
-// with a non-empty value but authority "missing" still reads as unattested — the badge is a fact
-// about who attested the value, not about whether a value exists.
-const PROVENANCE_LABEL: Record<string, string> = {
-  source_declared: 'source declared',
-  system_derived: 'system derived',
-  llm_proposed: 'llm proposed',
-  human_staged: 'human staged',
-}
-
-// Returns a LABEL only for a value that genuinely is one. `provenance` carries
-// `decision_event_id or fact_event_id` (asset_detail.py) — an opaque audit id such as
-// `fde_01KYM…` (fde = field decision event). The old fallback prettified any unrecognised string by
-// swapping underscores for spaces, and the badge CSS uppercases it, so an id rendered as
-// `FDE 01KYMVECPH7ER0VPC0A9DW4HSB` and looked entirely deliberate. Anything unrecognised is now
-// treated as an id, not a label: null, so the caller falls through to the real author.
-function provenanceLabel(provenance: string | null): string | null {
-  if (!provenance) return null
-  return PROVENANCE_LABEL[provenance] ?? null
-}
-
-// The badge shows the value's author: the governed decision provenance if any, else the evidence-layer
-// author (source attested / AI proposed / rulebook proposed), else "unattested" only when truly nothing.
-function attestedByLabel(field: EffectiveMetadataField): string {
-  return provenanceLabel(field.provenance) ?? field.evidence_provenance ?? 'unattested'
-}
-
-// The decision id is NOT on the badge — not as the label, not as a tooltip. An opaque
-// `fde_01KYM…` on hover is still an opaque id on screen. It lives in the Detail disclosure, where
-// someone tracing a decision is actually looking, and in the payload for anyone querying it.
-function attributionTitle(field: EffectiveMetadataField): string {
-  return `authority: ${field.authority} · c1: ${field.c1_status}`
-}
-
-// governed = a verified, load-bearing attestation (solid ok); hint = a proposal not yet governed
-// (accent); missing = nothing attested (quiet). Unknown authorities stay quiet, never break.
-const AUTHORITY_TONE: Record<string, string> = {
-  governed: 'gj-verified',
-  hint: 'gj-proposed',
-  missing: 'gj-none',
-}
-
-function authorityTone(authority: string): string {
-  return AUTHORITY_TONE[authority] ?? 'gj-none'
-}
-
 // A relationship row's tone/border come from the row's OWN `status` field, never from which list it
 // arrived in — the delivery's thesis is that authority is a response fact, not a position. VERIFIED
 // reads as governed (solid ok); anything else (e.g. PARTIALLY_CONFIRMED) reads as partial (warn).
@@ -103,10 +59,6 @@ function verifiedBadgeTone(status: string): string {
 
 function verifiedRowClass(status: string): string {
   return status === 'VERIFIED' ? 'adg-rel-verified' : 'adg-rel-partial'
-}
-
-function humanizeField(name: string): string {
-  return name.replaceAll('_', ' ')
 }
 
 // ---- field-correction commands (Delivery F) ----
@@ -283,35 +235,66 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
   const businessTerm = detail.source_glossary?.fields.business_term?.value
   const headlineType = typeDisplay(identity)
   const headlineConcept = detail.effective_metadata?.fields.concept
+  // The source's own definition, not the AI summary: the hero states what the source asserted, and
+  // the AI interpretation stays beside it in the Meaning card where the two can be compared.
+  const headlineDefinition = detail.effective_metadata?.fields.definition?.value
   const editingAction = editing ? fieldActions.get(editing) : undefined
   const editingMeta = editing ? detail.effective_metadata?.fields[editing] : undefined
 
   return (
     <section className="adg">
-      <header className="adg-id-head">
-        <div>
+      {/* The hero answers "what is this?" before any section is read: the BUSINESS term leads, the
+          physical ref is demoted beneath it, and the source definition is body prose rather than a
+          label/value row — a definition is a sentence, and a sentence in a <dd> gets scanned past.
+          The chips carry authority, so who attested a value is visible without opening a tab. */}
+      <header className="adg-hero">
+        <div className="adg-hero-main">
+          <p className="adg-hero-kicker">
+            {identity.kind === 'column' ? 'Column intelligence dossier' : 'Asset dossier'}
+          </p>
           <h2 className="adg-title">
             {businessTerm ?? (identity.column
               ? `${identity.table}.${identity.column}`
               : (identity.table ?? identity.object_ref))}
           </h2>
           <p className="adg-fqn mono">{identity.object_ref}</p>
-          <p className="hint">
-            {identity.source} · {identity.kind}
-            {identity.schema_name ? ` · ${identity.schema_name}` : ''}
-          </p>
-        </div>
-        <div className="adg-id-flags">
-          <span className="badge">
-            {headlineType.value}{headlineType.basis ? ` · ${headlineType.basis}` : ''}
-          </span>
-          {headlineConcept && (headlineConcept.value != null || headlineConcept.proposed_value != null) && (
-            <span className={`badge ${authorityTone(headlineConcept.authority)}`}>
-              {fieldValueText(headlineConcept)} · {attestedByLabel(headlineConcept)}
+          {headlineDefinition && <p className="adg-hero-definition">{headlineDefinition}</p>}
+          <div className="adg-id-flags">
+            <span className="badge" data-testid="type-display">
+              {headlineType.value}{headlineType.basis ? ` · ${headlineType.basis}` : ''}
             </span>
+            {headlineConcept
+              && (headlineConcept.value != null || headlineConcept.proposed_value != null) && (
+              <span className={`badge ${authorityTone(headlineConcept.authority)}`}>
+                {fieldValueText(headlineConcept)} · {attestedByLabel(headlineConcept)}
+              </span>
+            )}
+            {identity.is_grain && <span className="badge grain">grain</span>}
+            {identity.is_as_of && <span className="badge asof">as-of</span>}
+            <span className="badge gj-none">
+              {identity.source} · {identity.kind}
+              {identity.schema_name ? ` · ${identity.schema_name}` : ''}
+            </span>
+          </div>
+        </div>
+        <div className="adg-hero-actions">
+          <button
+            type="button"
+            className="btn btn--ghost"
+            onClick={() => setTab('relationships')}
+          >
+            View graph
+          </button>
+          {identity.kind === 'column' && identity.table && (
+            <a
+              className="btn btn--primary"
+              href={`#/suggested?${new URLSearchParams({
+                source, table: identity.table,
+              }).toString()}`}
+            >
+              Suggested features
+            </a>
           )}
-          {identity.is_grain && <span className="badge grain">grain</span>}
-          {identity.is_as_of && <span className="badge asof">as-of</span>}
         </div>
       </header>
 
@@ -336,7 +319,12 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
 
       <div className="adg-tabpanel">
         {tab === 'overview' && (
-          <OverviewTab detail={detail} source={source} isUnavailable={isUnavailable} />
+          <OverviewTab
+            detail={detail}
+            source={source}
+            isUnavailable={isUnavailable}
+            onOpenReadiness={() => setTab('readiness')}
+          />
         )}
         {tab === 'metadata' && (
           <MetadataTab
@@ -366,434 +354,6 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
           onConflict={onConflict}
           onClose={() => setEditing(null)}
         />
-      )}
-    </section>
-  )
-}
-
-// ---- shared field rendering -----------------------------------------------------------------
-
-// A field with no display value but a live proposal RENDERS the proposal (standing product
-// direction: AI-proposed is usable, never framed as failure). The badge then says who proposed it
-// and that nobody has confirmed it — "AI proposed · unconfirmed" — so the state is legible without
-// reading as an error.
-function showsProposal(field: EffectiveMetadataField): boolean {
-  return field.value == null && field.proposed_value != null
-}
-
-function AuthorityBadge({ field }: { field: EffectiveMetadataField }) {
-  if (showsProposal(field)) {
-    return (
-      <span className="badge gj-proposed" title={attributionTitle(field)}>
-        {`${field.evidence_provenance ?? 'proposed'} · unconfirmed`}
-      </span>
-    )
-  }
-  return (
-    <span
-      className={`badge ${authorityTone(field.authority)}`}
-      title={attributionTitle(field)}
-    >
-      {attestedByLabel(field)}
-    </span>
-  )
-}
-
-function fieldValueText(field: EffectiveMetadataField): string {
-  return field.value ?? field.proposed_value ?? '— not set'
-}
-
-// ---- type display policy (Task 3C) ----------------------------------------------------------
-// The one word "unknown" appears ONLY when nothing at all is held. An operational (technical)
-// type wins; else the source-DECLARED SQL type displays with its basis named; an attested type
-// (Task 7) upgrades the basis automatically because it lands in operational_type.
-function typeDisplay(identity: AssetIdentity): { value: string; basis: string | null } {
-  const op = identity.operational_type
-  if (op && op.trim() !== '' && op.trim().toLowerCase() !== 'unknown') {
-    return { value: op, basis: 'operational' }
-  }
-  if (identity.declared_type) return { value: identity.declared_type, basis: 'declared' }
-  return { value: 'unknown', basis: null }
-}
-
-// ---- overview -------------------------------------------------------------------------------
-
-// The dossier order (Task 3C): identity → meaning (definition + AI summary + the source glossary)
-// → semantics (the per-column axes, tri-state) → governance (the decision summary) → usage
-// (suggested features that use this column). The deeper tabs keep their homes; this page is the
-// answer to "what do we hold about this column?".
-function OverviewTab({
-  detail,
-  source,
-  isUnavailable,
-}: {
-  detail: AssetDetail
-  source: string
-  isUnavailable: (name: string) => boolean
-}) {
-  const { identity } = detail
-  const metadata = detail.effective_metadata
-  const t = typeDisplay(identity)
-  const operationalKnown = t.basis === 'operational'
-  return (
-    <>
-      <section className="adg-section">
-        <h3 className="micro-label">Identity</h3>
-        <dl className="kv adg-kv">
-          <div><dt>source</dt><dd className="mono">{identity.source}</dd></div>
-          <div><dt>kind</dt><dd>{identity.kind}</dd></div>
-          {identity.schema_name && (
-            <div><dt>schema</dt><dd className="mono">{identity.schema_name}</dd></div>
-          )}
-          {identity.table && <div><dt>table</dt><dd className="mono">{identity.table}</dd></div>}
-          {identity.column && <div><dt>column</dt><dd className="mono">{identity.column}</dd></div>}
-          <div><dt>object ref</dt><dd className="mono">{identity.object_ref}</dd></div>
-          <div><dt>logical ref</dt><dd className="mono">{identity.logical_ref}</dd></div>
-          <div><dt>graph ref</dt><dd className="mono">{identity.graph_ref}</dd></div>
-        </dl>
-      </section>
-
-      <section className="adg-section">
-        <h3 className="micro-label">Type</h3>
-        {/* The headline type + its basis. "unknown" appears ONLY when nothing at all is held —
-            a declared SQL type is real information and renders as `varchar(50) · declared`. */}
-        <p className="adg-type-line" data-testid="type-display">
-          <strong className="mono">{t.value}</strong>
-          {t.basis && <span className="badge">{t.basis}</span>}
-        </p>
-        <dl className="kv adg-kv">
-          <div>
-            <dt>declared type</dt>
-            <dd className="mono">{identity.declared_type ?? '— none declared'}</dd>
-          </div>
-          <div>
-            <dt>operational type</dt>
-            <dd className="mono">
-              {operationalKnown ? identity.operational_type : '— not attested yet'}
-            </dd>
-          </div>
-        </dl>
-        <p className="hint">
-          The declared type is what the source's schema calls this column. The operational type is
-          whether it is actually numeric-usable — only a technical source (a real database
-          connector) attests it. A declared type is never on its own evidence a column is
-          operationally numeric.
-        </p>
-      </section>
-
-      <MeaningSection metadata={metadata} isUnavailable={isUnavailable} />
-
-      <SourceGlossarySection detail={detail} />
-
-      <section className="adg-section">
-        <h3 className="micro-label">Semantics — what this column means operationally</h3>
-        {isUnavailable('effective_metadata') ? (
-          <p className="adg-unavailable" role="status">Not available to your roles.</p>
-        ) : !metadata || Object.keys(metadata.fields).length === 0 ? (
-          <p className="hint">{metadata?.note ?? 'No per-field metadata on this asset.'}</p>
-        ) : (
-          // EVERY axis renders, tri-state: a governed/attested value with its author; else a live
-          // proposal with "… · unconfirmed"; else an explicit "nothing known yet". A NULL axis must
-          // be distinguishable from a hidden one — silence is the one thing this list may not say.
-          <ul className="rows adg-fieldsum" data-testid="attested-metadata">
-            {AXIS_FIELDS.filter(([name]) => metadata.fields[name]).map(([name, label]) => (
-              <AxisRow key={name} name={name} label={label} field={metadata.fields[name]} />
-            ))}
-          </ul>
-        )}
-      </section>
-
-      <GovernanceSummary detail={detail} />
-
-      {identity.kind === 'column' && identity.table && (
-        <ColumnSuggestions source={source} identity={identity} />
-      )}
-    </>
-  )
-}
-
-// The dossier's semantics axes, in product words (the validated sample screen's vocabulary).
-// `type` lives in the Type section; `definition`/`ai_summary` live in Meaning.
-const AXIS_FIELDS: readonly [string, string][] = [
-  ['concept', 'Business concept'],
-  ['domain', 'Data domain'],
-  ['additivity', 'Aggregation behavior'],
-  ['unit', 'Unit'],
-  ['currency', 'Currency'],
-  ['entity', 'Entity'],
-  ['sensitivity_display', 'Sensitivity'],
-  ['party_role', 'Party role'],
-]
-
-function AxisRow({
-  name,
-  label,
-  field,
-}: {
-  name: string
-  label: string
-  field: EffectiveMetadataField
-}) {
-  const hasSomething = field.value != null || field.proposed_value != null
-  return (
-    <li className="row adg-field" data-testid={`axis-${name}`}>
-      <span className="adg-field-label">{label}</span>
-      {hasSomething ? (
-        <>
-          <span className="adg-field-value mono">{fieldValueText(field)}</span>
-          <AuthorityBadge field={field} />
-        </>
-      ) : (
-        // Explicit, quiet, and distinguishable from a hidden axis: nothing is known — no
-        // governed value, no proposal from anyone. Not an error, not an omission.
-        <span className="adg-field-value hint">nothing known yet</span>
-      )}
-    </li>
-  )
-}
-
-// Meaning: the source definition and the AI summary, SIDE BY SIDE — the summary never replaces
-// the definition, and it is labelled as AI-drafted so nobody mistakes a synthesis for the source.
-function MeaningSection({
-  metadata,
-  isUnavailable,
-}: {
-  metadata: EffectiveMetadataSection | undefined
-  isUnavailable: (name: string) => boolean
-}) {
-  if (isUnavailable('effective_metadata') || !metadata) return null
-  const definition = metadata.fields.definition
-  const summary = metadata.fields.ai_summary
-  if (!definition && !summary) return null
-  return (
-    <section className="adg-section" data-testid="meaning">
-      <h3 className="micro-label">Meaning</h3>
-      <div className="adg-meaning">
-        <div className="adg-meaning-col" data-testid="meaning-definition">
-          <p className="micro-label adg-sub">Definition</p>
-          {definition?.value != null ? (
-            <>
-              <p className="adg-meaning-text">{definition.value}</p>
-              <AuthorityBadge field={definition} />
-            </>
-          ) : (
-            <p className="hint">No definition from the source yet.</p>
-          )}
-        </div>
-        <div className="adg-meaning-col" data-testid="meaning-summary">
-          <p className="micro-label adg-sub">
-            AI summary <span className="badge gj-proposed">AI-drafted</span>
-          </p>
-          {summary?.value != null ? (
-            <p className="adg-meaning-text">{summary.value}</p>
-          ) : (
-            <p className="hint">No AI summary yet.</p>
-          )}
-        </div>
-      </div>
-    </section>
-  )
-}
-
-// "From the source glossary" — what the source FILE itself asserted, in product words, each value
-// with its source provenance chip. An asset whose upload declared none of these shows NO section
-// (nothing is fabricated); the declared SQL type joins the list because the file declared it too.
-const GLOSSARY_FIELDS: readonly [string, string][] = [
-  ['business_term', 'Business term'],
-  ['term_type', 'Term type'],
-  ['process_path', 'Business processes'],
-  ['related_terms', 'Related terms'],
-  ['bian_path', 'BIAN classification'],
-  ['fibo_path', 'FIBO classification'],
-  ['physical_fqn', 'Physical path'],
-]
-
-// The L1 → L2 → L3 process path, one line. The upload stores " > "-joined levels; render with
-// arrows so it reads as the path it is.
-function processPathText(value: string): string {
-  return value.split('>').map(part => part.trim()).filter(Boolean).join(' → ')
-}
-
-function SourceGlossarySection({ detail }: { detail: AssetDetail }) {
-  const fields = detail.source_glossary?.fields ?? {}
-  const declaredType = detail.identity.declared_type
-  const rows = GLOSSARY_FIELDS.filter(([key]) => fields[key])
-  if (rows.length === 0 && !declaredType) return null
-  return (
-    <section className="adg-section" data-testid="source-glossary">
-      <h3 className="micro-label">From the source glossary</h3>
-      <ul className="rows adg-fieldsum">
-        {rows.map(([key, label]) => (
-          <li className="row adg-field" key={key}>
-            <span className="adg-field-label">{label}</span>
-            <span className={`adg-field-value ${key === 'physical_fqn' ? 'mono' : ''}`}>
-              {key === 'process_path'
-                ? processPathText(fields[key].value)
-                : fields[key].value}
-            </span>
-            <span className="badge gj-verified">{fields[key].provenance}</span>
-          </li>
-        ))}
-        {declaredType && (
-          <li className="row adg-field" key="declared_type">
-            <span className="adg-field-label">Declared type</span>
-            <span className="adg-field-value mono">{declaredType}</span>
-            <span className="badge gj-verified">source declared</span>
-          </li>
-        )}
-      </ul>
-    </section>
-  )
-}
-
-// Governance, summarised: how many fields carry a decision head, and where to act. The full
-// evidence lifecycle + correction commands live in Metadata & evidence — this line keeps the
-// dossier's order honest without duplicating that tab.
-function GovernanceSummary({ detail }: { detail: AssetDetail }) {
-  const evidence = detail.evidence
-  if (!evidence) return null
-  const decided = Object.keys(evidence.latest_decision_by_field).length
-  return (
-    <section className="adg-section" data-testid="governance-summary">
-      <h3 className="micro-label">Governance</h3>
-      <p className="hint">
-        {decided === 0
-          ? 'No governed decisions on this column yet.'
-          : `${decided} ${decided === 1 ? 'field carries' : 'fields carry'} a governed decision.`}
-        {' '}Evidence, decisions and corrections live in Metadata &amp; evidence.
-      </p>
-    </section>
-  )
-}
-
-// ---- suggested features on the column (usage) -----------------------------------------------
-// The per-table suggestions route asked for the v2 DISCOVERY contract, filtered to the suggestions
-// whose bound OPERANDS include the opened column. The card component is the one the table screen
-// renders, so a suggestion carries the same semantic and warning vocabulary on both surfaces.
-// Honesty rules: a 403 renders an access message naming the permission (never an empty section);
-// an empty filter result says whether the TABLE has suggestions that simply don't use this column;
-// a deployment that does not serve v2 says so rather than showing a stripped card.
-// Exactly one is true at a time, and each is stored WITH the read scope it belongs to. Mirrors the
-// suggestions screen's own outcome union — the two surfaces read the same route under the same
-// scope rules, so they must not disagree about what "no answer yet" looks like.
-type SuggestionsOutcome =
-  | { kind: 'loading' }
-  | { kind: 'ok'; page: FeatureSuggestionPageV2 }
-  | { kind: 'forbidden' }
-  | { kind: 'unsupported' }
-  | { kind: 'error'; detail: string }
-
-function ColumnSuggestions({
-  source,
-  identity,
-}: {
-  source: string
-  identity: AssetIdentity
-}) {
-  const table = identity.table ?? ''
-  const objectRef = identity.object_ref
-  // Read scope decides which suggestions exist at all, so a result read under other claims is not
-  // an answer here. Keyed on principal + claims, never on the URL alone.
-  const identityKey = useIdentityKey()
-  // The separator is an escaped NUL: it is the one character that cannot occur in a principal,
-  // a catalog source or a table ref, so no pair of different scopes can collide into the same
-  // key. Written as an ESCAPE, never as a literal byte — a raw NUL in the source makes git treat
-  // the file as binary (diffs vanish) and hides it from every plain grep.
-  const requestKey = `${identityKey}\u0000${source}\u0000${table}`
-  // Stored WITH the key it was read under, and trusted below only while the two still match. An
-  // effect cannot give that guarantee — it runs AFTER the render the session-store update triggers,
-  // so clearing there would paint the previous scope's cards once first.
-  const [result, setResult] = useState<{ key: string; outcome: SuggestionsOutcome }>(
-    { key: requestKey, outcome: { kind: 'loading' } })
-  const outcome: SuggestionsOutcome =
-    result.key === requestKey ? result.outcome : { kind: 'loading' }
-
-  useEffect(() => {
-    if (!table) return
-    let live = true
-    const settle = (o: SuggestionsOutcome) => {
-      if (live) setResult({ key: requestKey, outcome: o })
-    }
-    settle({ kind: 'loading' })
-    getTableSuggestionsV2(source, table)
-      .then(body => settle({ kind: 'ok', page: body }))
-      .catch((e: unknown) => {
-        if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })
-        else if (e instanceof ApiError
-          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) settle({ kind: 'unsupported' })
-        else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
-      })
-    return () => {
-      live = false
-    }
-  }, [source, table, requestKey])
-
-  const data = outcome.kind === 'ok' ? outcome.page : null
-  const matching = useMemo(() => {
-    if (!data) return []
-    const ref = objectRef.toLowerCase()
-    return data.hits.filter(hit =>
-      hit.suggestion.operands.some(o => o.graph_object_ref.toLowerCase() === ref),
-    )
-  }, [data, objectRef])
-
-  return (
-    <section className="adg-section" data-testid="column-suggestions">
-      <div className="adg-section-head adg-suggestion-head">
-        <div>
-          <h3 className="micro-label">Suggested features using this column</h3>
-          {data && matching.length > 0 && (
-            <p className="hint">
-              {matching.length} of {data.collection.summary.suggested} table suggestions use{' '}
-              <code>{identity.column}</code>.
-            </p>
-          )}
-        </div>
-        {/* The handoff needs a table to land on. `table` is '' when identity.table is null (the
-            same sentinel the fetch effect guards on), and '#/suggested?source=X&table=' is a dead
-            destination — so withhold the action rather than offer one that goes nowhere. */}
-        {table && (
-          <a
-            className="btn btn--ghost"
-            href={`#/suggested?${new URLSearchParams({ source, table }).toString()}`}
-          >
-            View all table recommendations
-          </a>
-        )}
-      </div>
-      {outcome.kind === 'loading' ? (
-        <p className="hint" role="status">Reading what the catalog can build with this column…</p>
-      ) : outcome.kind === 'forbidden' ? (
-        // Honest access message, never silently swallowed into an empty list.
-        <p className="adg-unavailable" role="status">
-          You don't have access to feature suggestions. This view needs the{' '}
-          <code>catalog:read</code> permission and this session's roles don't carry it.
-        </p>
-      ) : outcome.kind === 'unsupported' ? (
-        <p className="adg-unavailable" role="status">
-          This deployment does not serve the discovery contract this screen asks for, so suggestions
-          cannot be shown here. The server is older than this screen.
-        </p>
-      ) : outcome.kind === 'error' || !data ? (
-        <p role="alert" className="error">
-          Could not load suggestions: {outcome.kind === 'error' ? outcome.detail : 'no payload returned'}
-        </p>
-      ) : matching.length === 0 ? (
-        <p className="hint">
-          {data.collection.summary.suggested === 0
-            ? 'No suggestions on this table yet.'
-            : `None of the ${data.collection.summary.suggested} suggestions on this table uses `
-              + 'this column.'}
-        </p>
-      ) : (
-        <ul className="rows adg-suggestion-grid">
-          {matching.map(hit => (
-            <SuggestionCard
-              key={hit.suggestion.suggestion_id} hit={hit} headingLevel={4}
-              omitted={data.collection.omitted_counts}
-            />
-          ))}
-        </ul>
       )}
     </section>
   )

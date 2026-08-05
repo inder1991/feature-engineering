@@ -3263,9 +3263,59 @@ button.stat:hover {
   gap: 12px;
 }
 
+/* ---- the dossier hero: tier 1, the verdict ----
+   Answers "what is this?" before any section is read. The business term leads at a size that wins
+   against everything below it; the physical ref is demoted, not lost. */
+.adg-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.adg-hero-main { min-width: 0; }
+
+.adg-hero-kicker {
+  margin: 0 0 6px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
 .adg-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 25px;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+}
+
+/* A definition is a sentence. Body prose at a readable measure, never a label/value row, which is
+   how a sentence ends up scanned past. */
+.adg-hero-definition {
+  max-width: 68ch;
+  margin: 11px 0 0;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.adg-hero .adg-id-flags {
+  flex-wrap: wrap;
+  margin-top: 13px;
+}
+
+.adg-hero-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
 }
 
 /* The headline is the business term; the fully-qualified ref rides underneath it so the physical
@@ -3280,6 +3330,205 @@ button.stat:hover {
 .adg-id-flags {
   display: inline-flex;
   gap: 6px;
+}
+
+/* ---- tier 1: the four-count strip ----
+   Extends the app-wide .stat rather than importing a private one, so the dossier reads as the same
+   system as every other screen. The qualifier line is the point: a bare `0` is a verdict, `0` with
+   "the parent table still provides context" is a fact. */
+.adg-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
+  gap: 10px;
+}
+
+.adg-stat {
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  padding: 11px 15px;
+}
+
+.adg-stat-label {
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.adg-stat small {
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+/* ---- tier 2: the reasoning grid ----
+   Two columns on wide screens; cards that carry a full-width payload span both. */
+.adg-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.adg-card {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.adg-card--full { grid-column: 1 / -1; }
+
+/* The head's second line names which authority governs the card. In a product whose value is
+   knowing who asserted what, that sentence is the feature, not decoration. */
+.adg-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.adg-card-head h3 {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+.adg-card-head p {
+  margin: 3px 0 0;
+  max-width: 62ch;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.adg-card-head .adg-count,
+.adg-card-head .btn { flex: none; }
+
+.adg-card-body { padding: 13px 15px; }
+
+/* Semantics: two axis columns on wide screens so eight rows read as one block, not a long scroll. */
+.adg-axes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+}
+
+/* ---- capability + coverage rows: label, copy, verdict ---- */
+.adg-cap,
+.adg-cov {
+  display: grid;
+  grid-template-columns: minmax(88px, 132px) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.adg-cap-role,
+.adg-cov-label {
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.adg-cap-copy,
+.adg-cov-copy { min-width: 0; }
+
+.adg-cap-copy strong,
+.adg-cov-copy strong {
+  display: block;
+  font-size: 11.5px;
+}
+
+.adg-cap-copy small,
+.adg-cov-copy small {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+/* A classification path renders as its own segments, so the hierarchy is legible at a glance
+   instead of being parsed out of punctuation by the reader. */
+.adg-path {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.adg-path em {
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 10.5px;
+  font-style: normal;
+}
+
+.adg-path i {
+  color: var(--ink-faint);
+  font-style: normal;
+}
+
+/* ---- tier 3: the receipts ----
+   Every ref and the response state. This used to be the FIRST section on the page. */
+.adg-tech {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+}
+
+.adg-tech > summary {
+  padding: 12px 15px;
+  cursor: pointer;
+  font-weight: 650;
+  font-size: 12.5px;
+}
+
+.adg-tech-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: 7px 18px;
+  margin: 0;
+  padding: 0 15px 6px;
+}
+
+.adg-tech-grid > div {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.adg-tech-grid dt,
+.adg-tech-grid dd { margin: 0; }
+
+.adg-tech-grid dt {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
+.adg-tech-grid dd {
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.adg-tech > .hint { padding: 4px 15px 14px; }
+
+.adg-recs { margin-top: 14px; }
+
+.adg-recs h3 {
+  margin: 0;
+  font-size: 13.5px;
 }
 
 /* A section heading that carries an action on its right. Defined here because the JSX applies it
@@ -5307,7 +5556,43 @@ button.stat:hover {
 
 /* ---- narrow layout: the label columns collapse before anything scrolls sideways ---- */
 
+/* The dossier collapses to one column before anything scrolls sideways. */
+@media (max-width: 1080px) {
+  .adg-grid,
+  .adg-axes {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 720px) {
+  .adg-hero {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .adg-title { font-size: 21px; }
+
+  .adg-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .adg-cap,
+  .adg-cov {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  /* The role label rides above its copy rather than squeezing a third column onto a phone. */
+  .adg-cap-role,
+  .adg-cov-label {
+    grid-column: 1 / -1;
+  }
+
+  .adg-tech-grid > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
   .adg-id-head,
   .adg-section-head {
     align-items: flex-start;
