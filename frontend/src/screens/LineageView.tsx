@@ -1450,6 +1450,7 @@ export function LineageView({
                     className="ln-recommendation"
                     href={`#/suggested?${new URLSearchParams({
                       source: anchor.catalog_source, table: anchor.table,
+                      ...(anchor.column ? { column: anchor.column } : {}),
                     }).toString()}`}
                   >
                     <strong>{hit.suggestion.display_name || hit.suggestion.name}</strong>
@@ -1490,6 +1491,7 @@ export function LineageView({
                 className="btn btn--primary"
                 href={`#/suggested?${new URLSearchParams({
                   source: anchor.catalog_source, table: anchor.table,
+                  ...(anchor.column ? { column: anchor.column } : {}),
                 }).toString()}`}
               >
                 All recommendations

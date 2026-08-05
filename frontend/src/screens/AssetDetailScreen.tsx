@@ -297,6 +297,7 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
               className="btn btn--primary"
               href={`#/suggested?${new URLSearchParams({
                 source, table: identity.table,
+                ...(identity.column ? { column: identity.column } : {}),
               }).toString()}`}
             >
               Suggested features

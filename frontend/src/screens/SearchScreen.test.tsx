@@ -452,13 +452,16 @@ describe('search screen — impact and graph', () => {
 
   it('Suggested features action navigates to the suggested route with the hit\'s table', async () => {
     // P4's ONE entry point: the sheet is otherwise unreachable. Suggestions are per TABLE, so a
-    // column hit opens the table it lives on — the bare table_name the backend keys on.
+    // A column hit opens the table it lives on -- the bare table_name the backend keys on --
+    // AND carries the column it came from. The page stays table-scoped; the column only names
+    // the context, which four identical pages otherwise dropped.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await userEvent.click(
       await screen.findByRole('button', { name: 'Suggested features for accounts' }),
     )
-    expect(window.location.hash).toBe('#/suggested?source=deposits&table=accounts')
+    expect(window.location.hash)
+      .toBe('#/suggested?source=deposits&table=accounts&column=balance')
   })
 
   it('jumps to the graph anchored on the row whose Graph action was clicked', async () => {

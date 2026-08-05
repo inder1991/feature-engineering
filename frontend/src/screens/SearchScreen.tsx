@@ -195,7 +195,13 @@ export function SearchScreen() {
   // The read-only suggested-features sheet's ONE entry point (P4). Same shape as Details, keyed on
   // the hit's own TABLE: suggestions are per table, so a column hit opens the table it lives on.
   function openSuggested(hit: SearchHit) {
-    navigate('suggested', { source: hit.catalog_source, table: hit.table })
+    // Carry the COLUMN so the table-scoped page can say which one you arrived from; without
+    // it, every column on a table lands on an identical page.
+    navigate('suggested', {
+      source: hit.catalog_source,
+      table: hit.table,
+      ...(hit.column ? { column: hit.column } : {}),
+    })
   }
 
   // Active-filter chips, in facet-group order, then flags.

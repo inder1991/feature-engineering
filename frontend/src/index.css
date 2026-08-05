@@ -5965,6 +5965,17 @@ button.stat:hover {
 .sfc-safety-note--eligibility strong { color: var(--danger); }
 
 /* Taxonomy first: what KIND of feature this is, before any of its parameters. */
+/* The arrival context a table-scoped page would otherwise drop. */
+.sfs-from {
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
 .sfc-taxonomy {
   display: flex;
   flex-wrap: wrap;

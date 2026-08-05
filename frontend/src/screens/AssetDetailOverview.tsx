@@ -600,7 +600,9 @@ function RecommendationsSection({
       aside={table ? (
         <a
           className="btn btn--ghost"
-          href={`#/suggested?${new URLSearchParams({ source, table }).toString()}`}
+          href={`#/suggested?${new URLSearchParams({
+            source, table, ...(identity.column ? { column: identity.column } : {}),
+          }).toString()}`}
         >
           View all recommendations
         </a>

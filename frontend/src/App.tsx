@@ -441,6 +441,11 @@ export default function App() {
             key={`${params.get('source') ?? ''}:${params.get('table') ?? ''}`}
             source={params.get('source') ?? ''}
             table={params.get('table') ?? ''}
+            // The column the reader arrived FROM. The page stays table-scoped -- its job is
+            // "everything this table can build" -- but four different columns landing on an
+            // identical page, with nothing saying which one you clicked, is indistinguishable
+            // from a broken link.
+            fromColumn={params.get('column') ?? undefined}
           />
         )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
