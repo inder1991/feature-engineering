@@ -485,3 +485,119 @@ def test_an_identity_from_another_catalog_is_a_CALLER_error(verified_join_catalo
 def test_the_plan_and_its_identity_types_are_frozen():
     with pytest.raises(Exception):
         TXN.table = "accounts"      # type: ignore[misc]
+
+
+# ── Release C: the two-leg crosswalk adapter (`plan_crosswalk_join`) ─────────────────────────────
+#
+# This module owns `plan_crosswalk_join` and had no test of it here at all: the coverage lived in
+# `test_crosswalk_ir.py`, which drives it THROUGH the IR. These four go at the adapter directly,
+# because every one of them is a case where the wrong answer is a silently wrong NUMBER rather than
+# an error — the same reason the rest of this file is weighted toward refusals.
+
+def _crosswalk_identities():
+    from tests.featuregen.materialize import crosswalk_fixtures as cf
+
+    def _of(bind):
+        return PhysicalIdentity(catalog_source=bind.identity.catalog_source,
+                                schema=bind.identity.schema, table=bind.identity.table)
+    return _of(cf.CIB_BINDING), _of(cf.FTR_BINDING), _of(cf.MAP_BINDING)
+
+
+def _plan_crosswalk(*, direction=None, admitted=None, tier=None):
+    from tests.featuregen.materialize import crosswalk_fixtures as cf
+
+    from featuregen.overlay.upload.bridge_realization import ExecutionTier
+    from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET
+
+    source, target, mapping = _crosswalk_identities()
+    forward = (direction or SOURCE_TO_TARGET) == SOURCE_TO_TARGET
+    return joins.plan_crosswalk_join(
+        admitted if admitted is not None else cf.admitted(),
+        direction=direction or SOURCE_TO_TARGET,
+        from_identity=source if forward else target,
+        to_identity=target if forward else source,
+        mapping_identity=mapping,
+        execution_tier=tier or ExecutionTier.PRODUCTION,
+        roles=_ROLES)
+
+
+def test_a_crosswalk_plans_TWO_steps_and_never_collapses_to_endpoint_equality():
+    """The mapping table is a RELATION on the path, not an implementation detail of a bridge.
+
+    Collapsing the two legs into one endpoint-to-endpoint equality would join `cib.acct_no` to
+    `ftr.counter_party_acct_no` directly — two different identifier schemes that were never equal —
+    and produce a plausible, empty-or-wrong result with no error anywhere.
+    """
+    from tests.featuregen.materialize import crosswalk_fixtures as cf
+
+    plan = _plan_crosswalk()
+    assert isinstance(plan, JoinPlan), getattr(plan, "detail", plan)
+    assert len(plan.steps) == 2
+    endpoints = {frozenset(pair) for step in plan.steps for pair in step.column_pairs}
+    assert frozenset({cf.CIB_ACCT, cf.FTR_ACCT}) not in endpoints, (
+        "the plan joins the two endpoints to each other: a crosswalk rendered as a direct bridge")
+    # Every pair has exactly one foot in the mapping table — which is what "two hops" means.
+    for pair in endpoints:
+        assert len([ref for ref in pair if ref.startswith(cf.MAP + ".")]) == 1
+
+
+def test_both_legs_column_pairs_reach_the_plan_so_neither_escapes_authorization():
+    """Gate 2 reads the plan's steps; a leg missing from it is a table read without authorization.
+
+    The failure this pins is asymmetric: dropping a leg from the PLAN removes its columns from the
+    physical read set, so the run reads a table nobody authorized — and every visible symptom
+    (fewer requirements, a shorter read set) looks like a smaller, tidier plan.
+    """
+    from tests.featuregen.materialize import crosswalk_fixtures as cf
+
+    plan = _plan_crosswalk()
+    assert isinstance(plan, JoinPlan), getattr(plan, "detail", plan)
+    refs = {ref for step in plan.steps for pair in step.column_pairs for ref in pair}
+    assert refs == {cf.CIB_ACCT, cf.MAP_ACCT, cf.MAP_EXT, cf.FTR_ACCT}
+    # Both catalogs are named by the steps themselves: the mapping dataset and the target endpoint
+    # need not live where the source relation does, so a single-catalog read of this plan is wrong.
+    assert {step.to_catalog_source for step in plan.steps} == {"cib", "ftr"}
+
+
+def test_the_reverse_direction_is_gated_on_its_OWN_measured_cardinality():
+    """1:1 forward with 2:1 reverse is the ordinary mapping-table shape, and it admits ONE way.
+
+    Reading the reverse direction's gate off the forward verdict — or inverting which verdict gates
+    which traversal — refuses every legal reverse plan and admits an illegal one. The fixture is
+    measured asymmetrically precisely so that swapping the two is visible here.
+    """
+    from featuregen.materialize.codes import CompilationRefusalCode as _Code
+    from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET, TARGET_TO_SOURCE
+
+    forward = _plan_crosswalk(direction=SOURCE_TO_TARGET)
+    reverse = _plan_crosswalk(direction=TARGET_TO_SOURCE)
+
+    assert isinstance(forward, JoinPlan), getattr(forward, "detail", forward)
+    assert forward.fans_out is False
+    assert isinstance(reverse, MaterializationRefused), (
+        "the reverse direction was planned on the forward direction's evidence")
+    assert reverse.code in {_Code.JOIN_FANOUT_UNSUPPORTED, _Code.JOIN_CARDINALITY_UNKNOWN}
+
+
+def test_a_fanning_crosswalk_direction_is_REFUSED_and_never_deduplicated():
+    """No DISTINCT, no pre-aggregation, no allocation. Same rule as every other join here.
+
+    Allocating one row across many is a governed business decision (whose transaction is a joint
+    account's?) and no allocation policy exists — so the traversal stops rather than inventing one.
+    """
+    from featuregen.materialize.codes import CompilationRefusalCode as _Code
+    from featuregen.overlay.upload.crosswalk_observation import TARGET_TO_SOURCE
+
+    refused = _plan_crosswalk(direction=TARGET_TO_SOURCE)
+
+    assert isinstance(refused, MaterializationRefused)
+    # The MEASURED fan-out is what stops it, and the refusal names that reason rather than a
+    # generic "unknown": admissibility is checked before the composed-cardinality branch, so this
+    # direction never reaches the point where a repair could be attempted.
+    assert refused.code is _Code.JOIN_CARDINALITY_UNKNOWN
+    assert "directional_crosswalk_fanout" in refused.detail
+    # And the module still offers nobody a way to repair one — the sibling assertion above, applied
+    # to the crosswalk path.
+    source = inspect.getsource(joins)
+    for banned in ("dropDuplicates", "drop_duplicates", "DISTINCT ON"):
+        assert banned not in source

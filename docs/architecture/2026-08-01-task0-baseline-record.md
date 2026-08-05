@@ -65,6 +65,16 @@ an output pipe; the recorded run above used `pipefail` and a verified `EXIT=0`.)
 **Test-count gate rule (per D9):** the literal-count gate for this program is scoped to the file
 list above (238 at baseline), never the whole repo (DEFERRED-WORK §C contamination).
 
+**Rebaseline ledger.** `RELEASE_GATE_BASELINE` in `tests/eval/mutation/test_must_die.py` holds the
+CURRENT literal count for exactly the seventeen files above. A DROP is a deleted guard and must be
+explained; a RISE is legitimate but must be recorded here in the same commit that moves it.
+
+| Count | Date | Why it moved |
+|---|---|---|
+| 238 | 2026-08-01 | Task-0 baseline, `origin/main @ fa9a20b0`. |
+| 273 | 2026-08-03 | Release-A integration added 31; the Track-2 merge added 4 first-hop cardinality tests to `test_joins.py`. |
+| **277** | **2026-08-05** | **Release C Task 13: +4 crosswalk adapter tests in `test_joins.py`.** `joins.plan_crosswalk_join` lives in that module and had NO test there at all — its entire coverage was in `tests/featuregen/materialize/test_crosswalk_ir.py`, which drives it THROUGH the IR and therefore cannot pin the adapter's own answers. The four go at it directly: two steps rather than one endpoint-equality collapse; both legs' column pairs reaching the plan so neither escapes Gate 2; each direction gated on its OWN measured cardinality; and a fanning direction refused rather than deduplicated. Three of Task 13's eight required mutations (`crosswalk_renders_endpoint_equality`, `crosswalk_cardinality_inverted`, `crosswalk_deduplicates_instead_of_refusing`) name them as victims, so the rise buys real kill coverage rather than count. |
+
 **Repo-wide suite status at baseline (recorded 2026-08-01, Task 0.6 review):** 2 pre-existing
 failures in `tests/featuregen/api/test_nginx_proxy_covers_frontend_calls.py` — the nginx proxy
 location list is missing `/data-sources`; both failures are present at `fa9a20b0` and unrelated to

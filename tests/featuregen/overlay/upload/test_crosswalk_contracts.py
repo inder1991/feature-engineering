@@ -525,3 +525,23 @@ def test_a_leg_pin_binding_tuple_that_names_a_blank_id_is_refused() -> None:
     assert exc.value.code == JOIN_LEG_PIN_MALFORMED
     with pytest.raises(CrosswalkContractError):
         _leg(JoinLegKind.SAME_CATALOG, predicate_content_hashes=("  ",))
+
+
+@pytest.mark.parametrize("field_name,value", [
+    ("mapping_binding_revision_id", "pbr_other_map"),
+    ("mapping_temporal_policy_revision_id", "dtp_other"),
+    ("composition_observation_revision_id", "cwo_other"),
+])
+def test_every_mapping_pin_moves_the_execution_revision_id(field_name, value) -> None:
+    """Release C Task 13. WHICH mapping table, under WHICH row rule, proved by WHICH measurement.
+
+    Drop any of the three out of the identity and two executions reading different tables — or the
+    same table under different row rules — collapse onto one id. Everything downstream keys on that
+    id: the render's pin tables, the artifact lock, the drift refusals. A collision there is not a
+    wrong answer that shows up as an error; it is a verdict measured over one table being served
+    for a traversal that reads another.
+    """
+    base = _execution()
+    moved = _execution(**{field_name: value})
+    assert moved.execution_revision_id != base.execution_revision_id, (
+        f"{field_name} is not inside the execution identity")
