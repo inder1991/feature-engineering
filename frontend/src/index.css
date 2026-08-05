@@ -6088,16 +6088,39 @@ button.stat:hover {
    .gj-partial, whose solid warn fill made the not-checked state far louder than the checked
    one -- the exact inversion this product forbids: a card waiting on a declared fact is honest
    output, not a failure. Outline both. */
+/* Soft tints, as the artifact draws them — checked reads green, ambiguous reads amber, and
+   NEITHER is a solid fill. The earlier grey-on-grey pair fixed the inversion but threw away
+   the signal with it: a reader could no longer tell the two states apart at a glance. */
 .sfc-status .badge {
-  border: 1px solid var(--line-strong);
-  background: var(--surface-2);
-  color: var(--ink-soft);
+  border: 1px solid var(--ok);
+  background: var(--ok-soft);
+  color: var(--ok);
 }
 
-.sfc-status .badge.gj-partial {
+.sfc-status .badge.gj-partial,
+.sfc-status .badge.gj-none {
   border-color: var(--warn);
   background: var(--warn-soft);
   color: var(--warn);
+}
+
+/* The binding chip rides beside them and must read at the same weight. */
+.sfc-status .gj-score {
+  padding: 2px 7px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+/* Left rail and field only — the artifact's note is the sentence, not a labelled row. */
+.sfc-safety-note {
+  display: block;
 }
 
 /* Long identifiers wrap at a boundary, not mid-token: "cust_smart_cust_pk / g_cd" is not a

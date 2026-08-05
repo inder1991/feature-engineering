@@ -78,7 +78,10 @@ describe('SuggestionCard end-user summary', () => {
     // The point-in-time note stays on the compact card; the eligibility note moved into the
     // detail (the artifact shows one safety block, not two). Both are still stated -- the
     // guarantee is that a safety constraint is never silently dropped, not where it sits.
-    expect(within(card).getAllByText('Point-in-time').length).toBeGreaterThan(0)
+    // The safety block dropped its uppercase label column — the artifact's note is the
+    // sentence on an amber field, not a labelled row. The DECLARATION is what must survive,
+    // and it does; the word "Point-in-time" was chrome.
+    expect(within(card).getAllByText(/point-in-time/i).length).toBeGreaterThan(0)
     expect(within(card).getAllByText(/not runtime-enforced/).length).toBeGreaterThan(0)
     // The detail labels it "Eligibility"; the card's block was "Eligibility and leakage".
     expect(within(card).getAllByText(/Eligibility/).length).toBeGreaterThan(0)

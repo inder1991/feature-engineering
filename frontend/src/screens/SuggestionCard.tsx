@@ -455,7 +455,7 @@ function entityWords(s: FeatureSuggestionV2): ReactNode {
       {s.entity === null
         ? <Absent>entity not named</Absent>
         : <span title={bounded(`id: ${s.entity.id}`)}>{s.entity.display_name}</span>}
-      {' per '}
+      {' · per '}
       {grain
         ? <span className="mono">{grain}</span>
         : <Absent>no governed grain column</Absent>}
@@ -568,7 +568,6 @@ export function SuggestionCard({
 
       {s.point_in_time_declaration !== null && (
         <div className="sfc-safety-note">
-          <strong>Point-in-time</strong>
           <span className="sfc-clamp">{s.point_in_time_declaration.value}</span>
         </div>
       )}
