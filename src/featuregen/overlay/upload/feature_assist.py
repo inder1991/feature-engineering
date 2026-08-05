@@ -1361,15 +1361,6 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
 
     Nothing here reads the trace, and nothing here decides differently because of it: every pin is
     written from a value the check had already read, and no pin adds a query."""
-    # ── the USE gate (Bar 4). Sensitivity decided who may SEE these operands; this decides whether
-    #    the feature may be BUILT from them. Placed with the other hard rejects, AFTER leakage and
-    #    freshness — a leaky or stale candidate is refused for the reason it has always been
-    #    refused, so no existing rejection changes code — and BEFORE any requirement is minted,
-    #    because a refused feature must never reach the tri-state at all. ──
-    use = _use_gate(conn, pairs, meta, raw.get("aggregation"))
-    if use.rejection is not None:
-        return None, use.rejection
-
     # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
     # (validation_requirements.build_requirement) — the deterministic code picks code + typed params
     # from server-known refs; a bad code/param is a PROGRAMMER error (raises), never swallowed. Imported
@@ -1446,6 +1437,16 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
                 return _reject(RejectCode.STALE, f"stale source: {src}")
+
+    # ── the USE gate (Bar 4). Sensitivity decided who may SEE these operands; this decides whether
+    #    the feature may be BUILT from them. Placed with the other hard rejects, AFTER leakage and
+    #    freshness — a leaky or stale candidate is refused for the reason it has always been
+    #    refused, so no existing rejection changes code — and BEFORE any requirement is minted,
+    #    because a refused feature must never reach the tri-state at all. The refusal rides
+    #    `_reject` so a use-gate refusal carries the decision trace like every other refusal. ──
+    use = _use_gate(conn, pairs, meta, raw.get("aggregation"))
+    if use.rejection is not None:
+        return _reject(use.rejection.code, use.rejection.message)
 
     aggregation = raw.get("aggregation")
     operation = _norm_agg(aggregation)   # the normalized operation string (server-known, not the LLM's)
