@@ -58,3 +58,31 @@ Result: roughly three times the height for the same information, and the reader 
 by tests in `SuggestedFeaturesScreen.test.tsx`, `SuggestionCard.capture.test.tsx` and
 `SuggestionCard.user-summary.test.tsx`. Several pin the current copy verbatim. Restructuring
 means updating them to assert the new positions with equal strength, not deleting them.
+
+
+## BLOCKER found while implementing (2026-08-05)
+
+The card the screenshots show is the **asset dossier's** "Suggested features using this
+column" panel — but `SuggestionCard` is the SAME component the standalone
+`SuggestedFeaturesScreen` renders. Restructuring it changes both surfaces.
+
+And the restructure collides with a deliberate, test-pinned product decision:
+
+    SuggestedFeaturesScreen.test.tsx:151
+    'keeps the fine-grained recipe family OFF the compact card and inside the detail'
+      expect(within(card).queryByText('Balance trend')).toBeNull()
+
+The artifact puts the recipe family on the compact card as a pill (`DURATION & STREAK`).
+Someone previously decided the opposite and pinned it. That is a product question, not a
+styling one, and it must be answered before the restructure proceeds:
+
+1. **The artifact wins** — family and stage become compact-card pills; update that test to
+   assert the new position with equal strength, and record why the earlier decision was
+   reversed.
+2. **The decision stands** — the compact card keeps family in the detail, and the asset
+   dossier's panel diverges from the artifact on this one point.
+3. **Split the component** — a denser variant for the dossier panel, the current card for
+   the standalone screen. Most work, and two cards to keep honest.
+
+An attempt at option 1 was reverted rather than shipped: it broke three tests, one of which
+exists specifically to prevent that change.
