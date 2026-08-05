@@ -184,7 +184,9 @@ describe('lineage view', () => {
     // Freshness is a FACT about the node, not a task. The reviewed concept removes the re-vouch /
     // re-upload workflow from the graph entirely: a read surface must not read as a remediation
     // queue, and re-uploading a catalog is not an action anyone performs from a graph node.
-    expect(screen.getByText('Stale snapshot')).toBeInTheDocument()
+    // Signalled ONCE, on the src line. The 58px amber band that used to restate it was the
+    // largest element on the card and almost entirely empty.
+    expect(screen.queryByText('Stale snapshot')).toBeNull()
     expect(screen.queryByText(/re-upload/i)).toBeNull()
     expect(screen.queryByText(/re-vouch/i)).toBeNull()
     expect(container.querySelector('.ln-card--stale')).not.toBeNull()

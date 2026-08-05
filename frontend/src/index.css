@@ -2264,9 +2264,8 @@ section > h2:first-child {
   border-color: var(--warn);
 }
 
-.ln-card--stale .ln-head {
-  background: var(--warn-soft);
-}
+/* Border only. Filling the head as well stated the same fact a third time (chip + head + band)
+   and made a routine snapshot age read as an alert. */
 
 .ln-card--pending {
   border-style: dashed;

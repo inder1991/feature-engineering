@@ -50,7 +50,6 @@ const HEAD_H = 40
 const SRC_H = 24
 const ROW_H = 32 // column rows are real buttons: hit targets >= 32px (PRODUCT.md)
 const PAD_H = 8
-const NOTE_H = 58
 const MORE_H = 32 // the "+N more columns" row, same hit-target height as a column row
 const COL_CAP = 8 // an expanded card caps its visible rows; the rest sits behind "+N more"
 // Full-list ceiling: with head + src + a stale note the card stays under the 640px canvas,
@@ -220,11 +219,9 @@ function TableNode({ data }: NodeProps<TableNT>) {
         {node.catalog_source} ·{' '}
         {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
       </div>
-      {node.stale && (
-        // Quiet, factual node status — no workflow. The source is named on the src line right
-        // above, so the badge does not repeat it and the fixed-height note never clips.
-        <div className="ln-note">Stale snapshot</div>
-      )}
+      {/* No stale band: the src line above already carries a STALE chip, and a 58px amber
+          restatement was the biggest element on the card and mostly empty space. Freshness is
+          signalled once, quietly. */}
       {rows.length > 0 && (
         <ul className={data.scroll ? 'ln-cols ln-cols--scroll' : 'ln-cols'}>
           {rows.map(col => (
@@ -828,7 +825,8 @@ export function LineageView({
         const h =
           HEAD_H +
           SRC_H +
-          (n.stale ? NOTE_H : 0) +
+          /* the stale band is gone; its height must go with it or every stale card keeps a
+             58px hole where it used to be */
           (rows.length > 0 ? listH + PAD_H : 0) +
           (more > 0 ? MORE_H : 0)
         placed.push({
