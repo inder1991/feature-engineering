@@ -86,3 +86,33 @@ styling one, and it must be answered before the restructure proceeds:
 
 An attempt at option 1 was reverted rather than shipped: it broke three tests, one of which
 exists specifically to prevent that change.
+
+## Second blocker: trimming the card collides with honesty guards (2026-08-05)
+
+The taxonomy pills and the 2x2 fact grid shipped (commit on this branch), but the card got
+LONGER, not shorter, because the verbose blocks above them were never removed. Removing them
+fails six tests, and three of those guard deliberate honesty decisions:
+
+| Test | Guards |
+| --- | --- |
+| `repeats the design-checked limit on the card itself, where the badge could mislead` | The "design checked means the INPUTS pass" note. It exists **because this card renders on the asset dossier**, where the page-level explanation does not. |
+| `renders an absent controlled vocabulary as "not supplied", never as an omitted section` | Business domains / use cases stating their own absence on the card |
+| `lists the first domains and counts the rest rather than growing the card` | The domain chip cap |
+
+The second and third are arguably satisfied by the detail disclosure, which renders both
+(SuggestionCard.tsx ~909-928) — an absence must be STATED, not stated FIRST.
+
+**The first is not.** Removing the design-checked note leaves a green `DESIGN CHECKED` badge
+on the dossier with nothing qualifying it, which is the exact misreading the note was written
+to prevent. The concept's card has no such note because the concept's page carries the
+explanation elsewhere; ours does not on the dossier.
+
+Options:
+
+1. Keep the note on the card, drop only category / domains / use cases into the detail.
+   Shorter card, honesty preserved. **Recommended.**
+2. Move the note to the dossier's panel header ("Suggested features using this column"), once,
+   instead of once per card — then the card can drop it.
+3. Accept the concept exactly and lose the qualifier. Not recommended.
+
+An attempt at option 3 was reverted rather than shipped.
