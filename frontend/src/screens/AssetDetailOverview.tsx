@@ -583,10 +583,17 @@ function RecommendationsSection({
       /* "Suggested", not "recommended": the route, the screen and the API all call this object a
          suggestion, and a second word for the same thing costs more than it buys. */
       title="Suggested features using this column"
+      /* The design-checked caveat lives HERE, once, instead of on every card. The cards' badges
+         name both states of the axis, so the reader can see what is being reported; this line
+         says what the check is worth. */
       subtitle={page && matching.length > 0
         ? `${matching.length} of ${page.collection.summary.suggested} table suggestions bind `
-          + `${identity.column}. Discovery candidates, distinct from registered feature lineage.`
-        : 'Discovery candidates, distinct from already-registered feature lineage.'}
+          + `${identity.column}. Discovery candidates, distinct from registered lineage. `
+          + 'A design check tests the inputs, not whether the feature predicts anything or can '
+          + 'run in production.'
+        : 'Discovery candidates, distinct from already-registered feature lineage. A design '
+          + 'check tests the inputs, not whether the feature predicts anything or can run in '
+          + 'production.'}
       /* The handoff needs a table to land on. `table` is '' when identity.table is null, and
          '#/suggested?source=X&table=' is a dead destination — so withhold the action rather
          than offer one that goes nowhere. */

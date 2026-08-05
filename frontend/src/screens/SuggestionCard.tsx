@@ -147,15 +147,21 @@ const BASIS_WORDS: Record<string, string> = {
   llm_proposed: 'AI-proposed',
 }
 
+// BOTH states name the same axis, so the badge is self-explaining: a reader who sees "design
+// checked" on one card and "design not checked" on another understands the badge answers one
+// narrow question about DESIGN, and is not declaring the feature ready. That replaces a
+// per-card paragraph nobody read past the second card.
 const STATUS_WORDS: Record<string, string> = {
   DESIGN_CHECKED: 'design checked',
-  NEEDS_EXTERNAL_VALIDATION: 'needs external validation',
+  NEEDS_EXTERNAL_VALIDATION: 'design not checked',
 }
 
-// design checked reads as settled-for-design; needs external validation as partial (warn) — never
-// as rejected. A card waiting on a declared fact is honest output, not a failure.
+// Neither state gets the success fill. Solid green reads as "good to go", which is precisely
+// the over-trust the removed paragraph existed to prevent — a design check is not an end-to-end
+// verification. Quiet chips; the WORDS carry the verdict. Not-checked stays partial, never
+// rejected: a card waiting on a declared fact is honest output, not a failure.
 const STATUS_TONE: Record<string, string> = {
-  DESIGN_CHECKED: 'gj-verified',
+  DESIGN_CHECKED: 'gj-none',
   NEEDS_EXTERNAL_VALIDATION: 'gj-partial',
 }
 
@@ -552,16 +558,6 @@ export function SuggestionCard({
           <span className="sfc-nolim">no limitations recorded</span>
         )}
       </div>
-
-      {/* The one place the words could mislead. "Design checked" describes the INPUTS, and the
-          reader is told so where the badge is, because this card also renders on the column
-          dossier where the page-level note does not exist. */}
-      {s.validation_status === 'DESIGN_CHECKED' && (
-        <p className="sfc-limit-note">
-          Design checked means the inputs pass the catalog&apos;s design rules. Predictive
-          usefulness and production execution are not proven.
-        </p>
-      )}
 
       <div className="sfc-tax">
         <div className="sfc-chiprow">

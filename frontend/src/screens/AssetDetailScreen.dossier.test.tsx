@@ -282,8 +282,12 @@ it('renders the SAME card vocabulary the table screen uses, drawer included', as
   expect(within(section).getByText('Liquidity')).toBeInTheDocument()
   expect(within(section).getByText('Execution safety')).toBeInTheDocument()
   expect(within(section).getByText(/could duplicate or drop rows/i)).toBeInTheDocument()
-  expect(within(section).getByText(/predictive usefulness and production execution are not proven/i))
-    .toBeInTheDocument()
+  // The caveat moved off every card and onto the panel header, once. The guarantee is unchanged
+  // -- a reader meets it before the badges -- and the badges now name both states of the axis
+  // themselves, which is what made the per-card paragraph redundant.
+  expect(within(section).getByText(
+    /a design check tests the inputs, not whether the feature predicts anything/i,
+  )).toBeInTheDocument()
   // the card heading sits BELOW the dossier section heading, not beside it
   expect(within(section).getByRole('heading', { level: 4, name: 'account_balance_avg_30d' }))
     .toBeInTheDocument()

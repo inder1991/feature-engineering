@@ -86,19 +86,26 @@ describe('SuggestedFeaturesScreen', () => {
       expect(screen.getByText(/not proof that it can run in production/i)).toBeInTheDocument()
     })
 
-  it('repeats the design-checked limit on the card itself, where the badge could mislead',
-    async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
-      renderScreen()
-      const checked = (await screen.findByText('account_balance_trend_90d')).closest('li')!
-      expect(within(checked).getByText('design checked')).toBeInTheDocument()
-      expect(within(checked).getByText(/predictive usefulness and production execution are not proven/i))
-        .toBeInTheDocument()
-      // the card that is NOT design checked does not carry the clarification of a word it never uses
-      const review = screen.getByText('customer_inflow_30d').closest('li')!
-      expect(within(review).getByText('needs external validation')).toBeInTheDocument()
-      expect(within(review).queryByText(/predictive usefulness/i)).toBeNull()
-    })
+  it('names BOTH states of the design axis, and never in the success tone', async () => {
+    // Same guarantee as before -- a reader cannot mistake the badge for proof -- with a better
+    // mechanism. The badge used to speak only when the news was good, so every card carried a
+    // paragraph explaining what green did NOT mean. Naming the opposite state makes the axis
+    // self-evident, and a label always on screen beats a sentence abandoned by the third card.
+    getTableSuggestionsV2.mockResolvedValue(page())
+    renderScreen()
+    const checked = (await screen.findByText('account_balance_trend_90d')).closest('li')!
+    const review = screen.getByText('customer_inflow_30d').closest('li')!
+    expect(within(checked).getByText('design checked')).toBeInTheDocument()
+    expect(within(review).getByText('design not checked')).toBeInTheDocument()
+
+    // A design check is not an end-to-end verification, so it must not wear the success fill:
+    // solid green reads as "good to go", which is the over-trust the paragraph guarded against.
+    expect(within(checked).getByText('design checked').className).not.toMatch(/gj-verified/)
+
+    // ...and the paragraph is gone from the cards entirely.
+    expect(within(checked).queryByText(/predictive usefulness/i)).toBeNull()
+    expect(within(review).queryByText(/predictive usefulness/i)).toBeNull()
+  })
 
   it('names what is MISSING for an unsuggestable table, never an approval that is not a gate',
     async () => {
