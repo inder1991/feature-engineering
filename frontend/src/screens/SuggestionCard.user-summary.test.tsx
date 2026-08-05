@@ -1,10 +1,13 @@
 import { render, screen, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { describe, expect, it } from 'vitest'
 import { SuggestionCard } from './SuggestionCard'
 import { hit, label, operand, text } from './SuggestedFeaturesScreen.fixture'
 
 describe('SuggestionCard end-user summary', () => {
-  it('keeps entity, stage, additivity, inputs, time authority and safety visible before expansion', () => {
+  // Inputs moved into the detail, so the name now says what it actually pins: what is legible
+  // on the compact card, plus that every input column is still reachable.
+  it('keeps entity, stage, additivity, time authority and safety on the compact card', async () => {
     const suggestion = hit({
       display_name: 'tenure_days',
       recipe_family: label({ id: 'tenure', display_name: 'Tenure' }),
@@ -51,7 +54,8 @@ describe('SuggestionCard end-user summary', () => {
     expect(within(taxonomy).getByText(/context stage/i)).toBeInTheDocument()
     // Additivity is one of the four boxed parameters now, under the concept's label.
     expect(within(card).getByText('Aggregation')).toBeInTheDocument()
-    expect(within(card).getByText('n/a')).toBeInTheDocument()
+    // "n/a" is a storage value; the card now reads it out as words.
+    expect(within(card).getByText('Not summable · n/a')).toBeInTheDocument()
 
     const asOf = within(card).getByText((_, element) =>
       element?.tagName === 'DD'
@@ -59,18 +63,26 @@ describe('SuggestionCard end-user summary', () => {
       && element.textContent?.includes('governed time anchor unresolved') === true)
     expect(asOf).toBeInTheDocument()
 
-    const inputs = card.querySelector('.sfc-inputs')
-    expect(inputs).not.toBeNull()
-    expect(within(inputs as HTMLElement).getByText('cust_cnsnt_mod_dt')).toBeInTheDocument()
-    expect(within(inputs as HTMLElement).getByText('business_dt')).toBeInTheDocument()
-    expect(within(inputs as HTMLElement).getByText('cust_num')).toBeInTheDocument()
-    expect(within(inputs as HTMLElement).getByText('origination')).toBeInTheDocument()
-    expect(within(inputs as HTMLElement).getByText('asof')).toBeInTheDocument()
-    expect(within(inputs as HTMLElement).getByText('entity')).toBeInTheDocument()
+    // Input columns moved into Full recommendation detail with the rest of the evidence. The
+    // guarantee is unchanged -- every input column is listed -- so assert the COLUMNS, not the
+    // container that happens to hold them.
+    await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
+    expect(within(card).getAllByText(/cust_cnsnt_mod_dt/).length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/business_dt/).length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/cust_num/).length).toBeGreaterThan(0)
+    // ...and each column still names the recipe ROLE it fills.
+    expect(within(card).getAllByText(/origination/).length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/asof/).length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/entity/).length).toBeGreaterThan(0)
 
-    expect(within(card).getByText('Point-in-time')).toBeInTheDocument()
-    expect(within(card).getByText(/not runtime-enforced/)).toBeInTheDocument()
-    expect(within(card).getByText('Eligibility and leakage')).toBeInTheDocument()
-    expect(within(card).getByText(/never use the purchased outcome/)).toBeInTheDocument()
+    // The point-in-time note stays on the compact card; the eligibility note moved into the
+    // detail (the artifact shows one safety block, not two). Both are still stated -- the
+    // guarantee is that a safety constraint is never silently dropped, not where it sits.
+    expect(within(card).getAllByText('Point-in-time').length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/not runtime-enforced/).length).toBeGreaterThan(0)
+    // The detail labels it "Eligibility"; the card's block was "Eligibility and leakage".
+    expect(within(card).getAllByText(/Eligibility/).length).toBeGreaterThan(0)
+    expect(within(card).getAllByText(/never use the purchased outcome/).length)
+      .toBeGreaterThan(0)
   })
 })

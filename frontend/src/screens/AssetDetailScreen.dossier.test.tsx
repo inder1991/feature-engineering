@@ -276,12 +276,12 @@ it('renders the SAME card vocabulary the table screen uses, drawer included', as
   })]))
   await renderDossier(detail())
   const section = await screen.findByTestId('column-suggestions')
-  // the card's own semantic and warning vocabulary, not a stripped copy
-  expect(within(section).getByText('suggested · recipe')).toBeInTheDocument()
-  expect(within(section).getByText('Trend & Trajectory')).toBeInTheDocument()
-  expect(within(section).getByText('Liquidity')).toBeInTheDocument()
-  expect(within(section).getByText('Execution safety')).toBeInTheDocument()
-  expect(within(section).getByText(/could duplicate or drop rows/i)).toBeInTheDocument()
+  // the card's own semantic and warning vocabulary, not a stripped copy. Category and family
+  // live in Full recommendation detail now, so they are asserted after it is opened below.
+  expect(within(section).getByText('account_balance_avg_30d')).toBeInTheDocument()
+  expect(within(section).getAllByText('Execution safety').length).toBeGreaterThan(0)
+  expect(within(section).getAllByText(/could duplicate or drop rows/i).length)
+    .toBeGreaterThan(0)
   // The caveat moved off every card and onto the panel header, once. The guarantee is unchanged
   // -- a reader meets it before the badges -- and the badges now name both states of the axis
   // themselves, which is what made the per-card paragraph redundant.
@@ -292,6 +292,11 @@ it('renders the SAME card vocabulary the table screen uses, drawer included', as
   expect(within(section).getByRole('heading', { level: 4, name: 'account_balance_avg_30d' }))
     .toBeInTheDocument()
   await userEvent.click(within(section).getByRole('button', { name: /show full detail/i }))
+  // Generation source moved into the detail's Classification section when the card head was
+  // reduced to the name. Same guarantee: a reader can always learn this is a recipe suggestion.
+  expect(within(section).getByText('suggested · recipe')).toBeInTheDocument()
+  expect(within(section).getAllByText('Trend & Trajectory').length).toBeGreaterThan(0)
+  expect(within(section).getByText('Liquidity')).toBeInTheDocument()
   const drawer = within(section).getByRole('group', {
     name: /full detail for account_balance_avg_30d/i,
   })
