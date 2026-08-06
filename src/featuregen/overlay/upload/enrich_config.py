@@ -155,12 +155,27 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 #   same item shape at the same `max_items` = 8 (`summary_payload` is `_drafting_payload`'s superset
 #   — 322 tok vs 308 — which is why they get ONE number rather than three; leaving summary at
 #   100_000 would have given the LARGER item the SMALLER budget). Required = 8 x (8_000 + other).
-#   At the measured `other` (308-322 tok) that is 66_464-66_576, i.e. 33% of 200_000. At a
-#   PATHOLOGICAL fill — every non-definition scalar at `_MAX_LEN_DEFAULT` (1000 chars) and
-#   `source_attributes` at the producer cap (`ftr_adapter._MAX_SOURCE_ATTRIBUTES` = 40) x 1000 chars,
-#   ~14_000 tok of metadata beside the definition — it is 8 x 22_000 = 176_000, i.e. 88% of 200_000.
-#   The bound therefore holds BOTH the measured and the pathological item at the full contamination
-#   bound of 8.
+#   At the measured `other` (308-322 tok) that is 66_464-66_576, i.e. 33% of 200_000.
+#
+#   RE-DERIVED (2026-08-06, Task 4b review): the paragraph that used to sit here computed the
+#   pathological fill at `ftr_adapter._MAX_SOURCE_ATTRIBUTES` = 40 and concluded "8 x 22_000 =
+#   176_000, i.e. 88% of 200_000 — the bound therefore holds BOTH the measured and the pathological
+#   item at the full contamination bound of 8". That producer cap was raised to 256 in the SAME
+#   round, so the conclusion was false the moment it was written. The real arithmetic:
+#
+#     source_attribute fill          tok/item   chunk cost (x8)    packed
+#     17 x 1000 (the REALISTIC max — the FTR export has 17 headers in total)   12_392    99_136   8/8
+#     256 x 1000 (the new theoretical maximum)                                 72_381   579_048   2/8
+#
+#   So 200_000 holds the measured item and the realistic-maximum item at the full contamination
+#   bound of 8, with ~2x headroom. It does NOT hold the degenerate 256-attribute item, and that is
+#   the DOCUMENTED OUTCOME rather than an oversight: packing degrades to 2 of 8 (~4x the calls),
+#   `chunk_items` still never drops an item for size, and the degraded chunk count for a 237-column
+#   catalog (ceil(237/2) x 2 + 8 = 246) still clears the deployed 512 per-stage ceiling. Both rows
+#   are pinned by `test_enrichment_context_wiring.py`
+#   (`test_a_realistic_source_attribute_fill_still_packs_a_full_chunk` and
+#   `test_a_DEGENERATE_source_attribute_fill_degrades_proportionally_and_never_truncates`), and the
+#   trigger for revisiting it is recorded in DEFERRED-WORK A.50.
 # * concept 200_000 -> 400_000. `max_items` is 20 and the item also carries the roster, so required =
 #   20 x (8_000 + roster). At the 199-entry resolved roster measured above, 20 x 13_230 = 264_600; at
 #   the 256-entry / 30-char saturated roster the previous block recorded (6_862 tok), 20 x 14_862 =

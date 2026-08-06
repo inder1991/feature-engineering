@@ -128,9 +128,14 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
     #
     # THE ZERO-TRUNCATION ACCEPTANCE (2026-08-06). NARRATIVE_MEMO's fixture definition is 802 chars.
     # At the old MAX_DEFINITION_LEN = 600 the classifier saw it CLIPPED — this assertion used to
-    # read `<= 600` and was passing on a truncated payload, and 41 of the fixture's 127 rows were in
-    # the same state. At 4000, and now at 32_000, the whole definition reaches the model, which is
-    # the point of the raise, so what is asserted now is that it arrives INTACT.
+    # read `<= 600` and was passing on a truncated payload. At 4000, and now at 32_000, the whole
+    # definition reaches the model, so what is asserted is that it arrives INTACT.
+    #
+    # THE TWO FILES ARE DIFFERENT MEASUREMENTS — an earlier revision of this comment claimed "41 of
+    # the fixture's 127 rows were in the same state", which is false. In THIS committed fixture
+    # exactly **1** of 127 exceeded 600 (this one, at 802). The **41** is the REAL FTR export's
+    # count (`FTR_Column_Mapping_final.csv`, gitignored: raw max 960, post-sanitize max 727), i.e.
+    # roughly a third of a real bank catalog. Never attribute the 41 to the fixture.
     from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
 
     memo_def = concept_items["narrative_memo"]["business_definition"]

@@ -699,31 +699,43 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "concept": {"type": "string", "maxLength": 128}},
                       "required": ["ref", "concept"]}}},
         "required": ["results"]},
+    # `definition` raised 500 -> 32_000 (2026-08-06), PAIRED with `enrich.draft_definitions`'
+    # `_accept_bounded(MAX_DEFINITION_LEN)`. This is the INBOUND half the first raise missed:
+    # `MAX_DEFINITION_LEN` widened only what we SEND, while a drafted definition over 500 chars was
+    # still refused coming back — below even the original 600. Every schema bound in this block is
+    # equal-by-test to its code-side accept gate (`test_enrich_output_bounds.py`), and they must
+    # move together: the schema rejects the WHOLE CHUNK where the code gate drops one item.
     ("overlay_definition_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "definition": {"type": "string", "maxLength": 500}},
+                                     "definition": {"type": "string", "maxLength": 32_000}},
                       "required": ["ref", "definition"]}}},
         "required": ["results"]},
-    # One plain-English sentence per column, for a human reading the catalog. Bounded at 400 to keep
-    # a wide table's chunk inside its input budget; the CODE-side `_accept_bounded(400)` is the real
-    # gate (a schema maxLength failure would reject the WHOLE chunk over one long answer).
+    # One plain-English sentence per column, for a human reading the catalog. Raised 400 -> 1000
+    # (2026-08-06): 400 REJECTED a legitimately long sentence outright rather than shortening it.
+    # 1000 is `_MAX_LEN_DEFAULT`, the per-value egress cap `ai_summary` is graded under when it is
+    # re-threaded — accepting above it would mint a value its own egress gate then EXCLUDES.
+    # The CODE-side `_accept_bounded` is the per-item gate (a schema maxLength failure would reject
+    # the WHOLE chunk over one long answer); the two are pinned equal by test.
     ("overlay_summary_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "summary": {"type": "string", "maxLength": 400}},
+                                     "summary": {"type": "string", "maxLength": 1000}},
                       "required": ["ref", "summary"]}}},
         "required": ["results"]},
     ("overlay_synonyms_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
+                      # Raised 200 -> 1000 (2026-08-06) to REJOIN `enrich._MAX_SYNONYMS_LEN`, which
+                      # had already gone 200 -> 1000. The pair had silently split: the code gate
+                      # accepted 1000 while this schema still failed the whole chunk at 201.
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "synonyms": {"type": "string", "maxLength": 200}},
+                                     "synonyms": {"type": "string", "maxLength": 1000}},
                       "required": ["ref", "synonyms"]}}},
         "required": ["results"]},
     # E4a T2 — one measure annotation per column: the `unit` (required — it is the whole question)
@@ -735,8 +747,12 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
+                      # `unit` raised 32 -> 64 (2026-08-06) to REJOIN `enrich._MAX_UNIT_LEN`, which
+                      # had already gone 32 -> 64; the pair had silently split the same way
+                      # `synonyms` did. `currency` stays 8: ISO-4217 is exactly three ASCII letters
+                      # and `_CURRENCY_CODE_RE` enforces that, so 8 is already slack, not a bound.
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "unit": {"type": "string", "maxLength": 32},
+                                     "unit": {"type": "string", "maxLength": 64},
                                      "currency": {"type": "string", "maxLength": 8}},
                       "required": ["ref", "unit"]}}},
         "required": ["results"]},
@@ -1558,9 +1574,13 @@ _COLUMN_PROFILE_KEYS = frozenset({
 _MAX_COLUMN_PROFILES = 512
 #: Breadth is the point of `source_attributes`; unboundedness is not. A file with hundreds of columns
 #: must not push the real signal out of a batch. ZERO-TRUNCATION RAISE (2026-08-06): 40 -> 256.
-#: NOTE the PRODUCER still binds first: `ftr_adapter._MAX_SOURCE_ATTRIBUTES` (40) caps how many
-#: unmapped headers the reader ever carries, and no real mapping export comes close (FTR has 17
-#: headers in total), so this cap is the egress backstop rather than the effective limit.
+#: THIS IS THE EFFECTIVE LIMIT. An earlier revision of this note said the producer still bound first
+#: at 40 — true when written, false since `ftr_adapter._MAX_SOURCE_ATTRIBUTES` was raised to 256 in
+#: the same round to stop it making this cap inert. The two are now EQUAL BY INTENT and pinned equal
+#: by `test_the_producer_caps_no_longer_bind_before_the_egress_caps_they_feed`: the producer must
+#: never exceed this (a longer list is egress-REJECTED here) and must never sit below it (that is
+#: silent truncation at the reader). No real mapping export comes near either — FTR has 17 headers
+#: in total — so the binding constraint in practice is the file, not this number.
 _MAX_SOURCE_ATTRIBUTES = 256
 
 # A STRUCTURED wide-roster entry (Task 4): only the identity keys, short strings only —

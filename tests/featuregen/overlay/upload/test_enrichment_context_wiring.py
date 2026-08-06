@@ -396,8 +396,26 @@ def test_the_rebudgeted_bounds_hold_the_measured_payloads() -> None:
     trustworthy. Note what the middle row would have cost at the OLD 24_000 concept budget: 107_300
     is 4.5x it, so the concept stage would have packed ~4 items per chunk instead of 20 — a 5x
     call-count increase on every re-upload. The Step-5 token raise is load-bearing, not decorative.
+
+    RE-DERIVED (2026-08-06, Task 4b re-review): the concept assertion was `max_items * 6862 <=
+    max_input_tokens` — 137_240 of 200_000, 69%, a real bound when written. A concurrent commit then
+    doubled that budget to 400_000 and the same line silently became a 34% no-op: the constant moved
+    beneath the test. It now MEASURES the item instead of restating a stale literal, and asserts the
+    budget is sized to that item rather than merely larger than it — so the next budget change has
+    to come back here, exactly as the `<6_000` allowance guard does.
     """
-    assert enrich_config.max_items("concept") * 6862 <= enrich_config.max_input_tokens("concept")
+    from featuregen.overlay.upload.canonical import MAX_COLUMNS_PER_TABLE
+
+    measured = estimate_tokens(BatchItem(
+        "h", _classifier_item_at_the_new_caps(siblings=MAX_COLUMNS_PER_TABLE - 1)))
+    chunk_cost = enrich_config.max_items("concept") * measured
+    assert chunk_cost <= enrich_config.max_input_tokens("concept"), (
+        f"the widest real concept item ({measured} tok) no longer packs its full chunk")
+    # …and the budget is SIZED to it, not arbitrarily above it. Halving the budget must not still
+    # fit, or the number has stopped being a derivation and become a round number.
+    assert chunk_cost > enrich_config.max_input_tokens("concept") // 2, (
+        f"{chunk_cost} uses under half of {enrich_config.max_input_tokens('concept')} — the budget "
+        f"is no longer derived from the item; re-derive it or lower it")
     # The domain item is a whole TABLE and carries no ADAPTER_LIST_LIMIT-bounded list, so its
     # measured 3,146 tok/item is untouched by the cap raise.
     assert enrich_config.max_items("domain") * 3146 <= enrich_config.max_input_tokens("domain")

@@ -71,6 +71,17 @@ _SYN_TASK = "overlay.enrich.synonyms"
 _UNIT_TASK = "overlay.enrich.unit"
 _SUMMARY_TASK = "overlay.enrich.summary"
 
+# Cap on ONE column's drafted SUMMARY — the accept gate on what the model may WRITE, paired with
+# `overlay_summary_batch`'s schema maxLength (pinned equal by `test_enrich_output_bounds.py`).
+#
+# ZERO-TRUNCATION RAISE (2026-08-06): 400 -> 1000. It is an ACCEPT gate, so 400 did not shorten a
+# long sentence, it DISCARDED the whole summary — the column then has none at all. 1000 is
+# deliberately `enrich_llm._MAX_LEN_DEFAULT` and not `MAX_DEFINITION_LEN`: a summary is ONE sentence
+# by instruction, and `ai_summary` is graded under `_MAX_LEN_DEFAULT` when it is re-threaded into
+# item metadata, so accepting above 1000 would mint a value its own egress gate later EXCLUDES —
+# the same inversion documented at `table_synth._MAX_PROFILE_PROSE`.
+_MAX_SUMMARY_LEN = 1000
+
 # Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
 # ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPT gate on MODEL OUTPUT
 # (`_accept_bounded`), so the old 200 silently REJECTED a rich alias line rather than shortening it;
@@ -83,9 +94,12 @@ _MAX_SYNONYMS_LEN = 1000
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
 # DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
 # B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
-# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 -> 32_000 (measured:
-# the widest definition in the committed FTR fixture is 802 chars, and 41 of its 127 rows were being
-# truncated at the shipped 600), so this window follows it with no edit here.
+# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 -> 32_000, so this
+# window follows it with no edit here. MEASURED, and the two files are DIFFERENT measurements (an
+# earlier revision of this comment merged them): the committed fixture's widest definition is 802
+# chars with **1** of its 127 rows over the shipped 600; the REAL FTR export
+# (`FTR_Column_Mapping_final.csv`, gitignored) has a raw max of 960 (727 post-sanitize) with **41**
+# of its 127 over 600. The 41 is the real export's number, never the fixture's.
 _MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 
@@ -2190,7 +2204,7 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     "if so, say what THIS column specifically is, do not repeat it. Treat each item "
                     "independently; never reuse another item's facts; return exactly one result per "
                     "input ref.",
-        accept=_accept_bounded(400), actor=actor,
+        accept=_accept_bounded(_MAX_SUMMARY_LEN), actor=actor,
         deadline_s=enrich_config.stage_deadline_s(), report=batch_report,
         ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_summary",
         dispatch_subjects=({h: _column_subject(by_hash[h]) for h in misses}
@@ -2248,7 +2262,13 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
             instruction="Draft a one-line business definition for EACH column. Treat each item "
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
-                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
+                        "exactly one result per input ref.",
+            # ZERO-TRUNCATION RAISE (2026-08-06): 500 -> MAX_DEFINITION_LEN. The 32_000 raise
+            # widened only the OUTBOUND side (`_MAX_LEN_BY_KEY` is an egress cap); this is the gate
+            # that decided how long a definition the model may WRITE, and at 500 it sat below even
+            # the original 600 — a drafted definition over 500 chars was DISCARDED, not shortened.
+            # Paired with `overlay_definition_batch`'s schema maxLength; pinned equal by test.
+            accept=_accept_bounded(MAX_DEFINITION_LEN), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_definition",
@@ -2273,7 +2293,7 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                                  "Draft a one-line business definition for this column.",
                                  actor,
                                  _single_ctx(ingestion_run_id, "enrich_definition",
-                                             _column_subject(row))), 500)
+                                             _column_subject(row))), MAX_DEFINITION_LEN)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", key_of[h], drafted, _DEFINITION_CACHE_VERSION)
