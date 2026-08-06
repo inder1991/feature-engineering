@@ -22,6 +22,7 @@ from featuregen.overlay.upload.dispatch_audit import (
     AuditIntegrityError,
     AuditUnavailable,
     compute_physical_request_hash,
+    formula_dispatch_reconciliation_failure,
     formula_dispatches_reconciled,
     record_dispatch,
 )
@@ -228,11 +229,11 @@ def test_formula_dispatch_reconciliation_requires_every_audit_dimension() -> Non
     dispatch = (
         "dispatch-1", "formula.author", input_hash, inputs, "anthropic", "test", 1, 1,
         compute_physical_request_hash(request), "formula.author", input_hash,
-        contract_hash, prompt_hash, schema_hash,
+        contract_hash, prompt_hash, schema_hash, 1,
     )
     link = (
         "call-1", "formula.author", "anthropic", "test", "formula-author-v1", 1,
-        "typed-formula-v1", 1, settings, input_hash,
+        "typed-formula-v1", 1, settings, input_hash, [],
     )
 
     class _Conn:
@@ -265,6 +266,96 @@ def test_formula_dispatch_reconciliation_requires_every_audit_dimension() -> Non
     assert not formula_dispatches_reconciled(_Conn(links=()), "run")
     assert not formula_dispatches_reconciled(_Conn(outcomes=()), "run")
     assert not formula_dispatches_reconciled(_Conn(trace=((0,),)), "run")
+
+
+def test_reconciliation_accepts_a_truncation_escalated_attempt() -> None:
+    """A truncation retry is dispatched at a RAISED max_tokens, so the physical hash of attempt 2
+    cannot equal a rebuild from the logical row's (original) generation_settings.
+
+    The logical `llm_call` stores the STARTING settings — deliberately, because they are the
+    idempotency key — and records the escalation in `repair_attempts`. Reconciliation must replay
+    that ledger to rebuild what each attempt PHYSICALLY carried, or every truncation retry on an
+    authoring run fails the `formula_dispatches_reconciled` hard gate.
+    """
+    def digest(value) -> str:
+        return hashlib.sha256(json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest()
+
+    schema = {"type": "object", "additionalProperties": False}
+    inputs = {"instruction": "author safely", "catalog_metadata": {}}
+    started = {"provider": "anthropic", "model": "test", "max_tokens": 4096}
+    escalated = {"provider": "anthropic", "model": "test", "max_tokens": 8192}
+    input_hash = compute_input_hash(inputs)
+    prompt_hash = digest(inputs["instruction"])
+    schema_hash = digest(schema)
+
+    def _request(settings):
+        return LLMRequest(
+            task="formula.author", prompt_id="formula-author-v1", prompt_version=1, inputs=inputs,
+            output_schema_id="typed-formula-v1", output_schema_version=1,
+            generation_settings=settings, output_schema=schema)
+
+    def _contract(settings):
+        return digest({
+            "call_role": "formula.author", "provider": "anthropic", "model": "test",
+            "generation_settings": settings, "prompt_id": "formula-author-v1",
+            "prompt_version": 1, "prompt_content_hash": prompt_hash,
+            "output_schema_id": "typed-formula-v1", "output_schema_version": 1,
+            "schema_content_hash": schema_hash})
+
+    def _dispatch(ref, settings, attempt_no):
+        return (ref, "formula.author", input_hash, inputs, "anthropic", "test", 1, 1,
+                compute_physical_request_hash(_request(settings)), "formula.author", input_hash,
+                _contract(settings), prompt_hash, schema_hash, attempt_no)
+
+    # the escalation as the driver records it on the logical call (one entry per physical re-call)
+    ledger = [{"attempt": 1, "class": "retry", "reason": "max_tokens", "max_tokens": 8192}]
+    link = ("call-1", "formula.author", "anthropic", "test", "formula-author-v1", 1,
+            "typed-formula-v1", 1, started, input_hash, ledger)
+
+    class _Result:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    class _Conn:
+        def __init__(self, dispatches):
+            self.dispatches = dispatches
+
+        def execute(self, sql, *args):
+            if "FROM llm_dispatch WHERE authoring_run_id" in sql:
+                return _Result(self.dispatches)
+            if "FROM llm_call_dispatch" in sql:
+                return _Result((link,))
+            if "FROM document_type_registry" in sql:
+                return _Result(((schema,),))
+            if "FROM llm_dispatch_outcome" in sql:
+                return _Result((("response_received",),))
+            if "FROM formula_authoring_trace_event" in sql:
+                return _Result(((1,),))
+            raise AssertionError(sql)
+
+    # attempt 1 at the starting ceiling, attempt 2 at the escalated one — both reconcile
+    good = (_dispatch("dispatch-1", started, 1), _dispatch("dispatch-2", escalated, 2))
+    assert formula_dispatches_reconciled(_Conn(good), "run"), \
+        formula_dispatch_reconciliation_failure(_Conn(good), "run")
+
+    # The hash is NOT weakened: a dispatch whose ceiling disagrees with the recorded ledger still
+    # fails. An escalation that was not audited cannot pass reconciliation by being an escalation.
+    unrecorded = {"provider": "anthropic", "model": "test", "max_tokens": 16384}
+    bad = (_dispatch("dispatch-1", started, 1), _dispatch("dispatch-2", unrecorded, 2))
+    assert formula_dispatch_reconciliation_failure(_Conn(bad), "run") == \
+        "PROVIDER_CONTRACT_HASH_MISMATCH"
+
+    # ...and the ledger is replayed POSITIONALLY: attempt 1 must still be the un-escalated request.
+    swapped = (_dispatch("dispatch-1", escalated, 1), _dispatch("dispatch-2", escalated, 2))
+    assert formula_dispatch_reconciliation_failure(_Conn(swapped), "run") is not None
 
 
 def test_formula_dispatch_reconciliation_query_runs_against_postgres(db) -> None:

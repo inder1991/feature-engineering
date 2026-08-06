@@ -90,7 +90,7 @@ def test_rejected_schema_keyword_is_token_only():
 # ---- finding #24: the adapter surfaces provider usage and applies the pinned settings ----------
 
 
-def _stub_adapter(monkeypatch, create):
+def _stub_adapter(monkeypatch, create, config=None):
     """A ClaudeLLM whose SDK surface is stubbed: `anthropic` in sys.modules is a bare module with
     the two exception types `.call` references, and the constructed client is a create-capturing
     fake — no SDK, no network."""
@@ -101,7 +101,7 @@ def _stub_adapter(monkeypatch, create):
     stub.APIStatusError = type("APIStatusError", (Exception,), {})
     stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
     monkeypatch.setitem(sys.modules, "anthropic", stub)
-    adapter = ClaudeLLM(ClaudeConfig(enabled=True))
+    adapter = ClaudeLLM(config or ClaudeConfig(enabled=True))
     adapter._client = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
     return adapter
 
@@ -140,6 +140,40 @@ def test_claude_adapter_surfaces_provider_usage_and_pinned_settings(monkeypatch)
     assert captured["max_tokens"] == 1024
     assert captured["thinking"] == {"type": "adaptive"}
     assert captured["output_config"]["effort"] == "low"    # pinned setting wins over config default
+
+
+def test_escalated_timeout_reaches_messages_create(monkeypatch):
+    """The scaled wall clock must reach `messages.create`, not just `_effective_timeout`.
+
+    A truncation retry is granted a raised `max_tokens`; if the timeout kwarg is still the
+    un-scaled config value the attempt is cut off mid-generation and the truncation is merely
+    relabelled as an APITimeoutError -> PROVIDER_TRANSIENT. This runs SDK-FREE via the `anthropic`
+    stub, so CI (which installs only the `dev` extra) actually guards the assembled kwarg — the
+    `_effective_timeout` unit tests alone cannot catch the helper being computed but not wired.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"concept": "monetary_amount"}')],
+        )
+
+    adapter = _stub_adapter(monkeypatch, _create, ClaudeConfig(enabled=True, timeout=60.0))
+    request = _schema_request({"provider": "anthropic", "model": "m", "max_tokens": 4096})
+
+    adapter.call(request)
+    assert (captured["max_tokens"], captured["timeout"]) == (4096, 60.0)  # baseline: as configured
+
+    # the 2nd truncation retry: 4x the ceiling AND 4x the clock, both on the wire
+    adapter.call(replace(request, timeout_scale=4.0,
+                         generation_settings={"provider": "anthropic", "model": "m",
+                                              "max_tokens": 16384}))
+    assert (captured["max_tokens"], captured["timeout"]) == (16384, 240.0)
 
 
 def test_claude_adapter_without_usage_still_returns_cleanly(monkeypatch):
