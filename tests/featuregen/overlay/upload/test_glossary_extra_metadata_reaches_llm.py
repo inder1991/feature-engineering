@@ -113,5 +113,17 @@ def test_the_extras_list_is_capped():
 
 
 def test_a_value_is_bounded():
-    text = f"{_HDR}\nBO.CUST.c,Term,Definition,Customer,varchar,,,{'x' * 900},Confidential,N,N,N\n"
-    assert all(len(a) <= 260 for a in _record(text).source_attributes)
+    """The bound is read from the constant, not restated. Task 4b's review found this cap
+    (`_MAX_SOURCE_ATTRIBUTE_LEN`) silently truncating every governance value at 240 chars — it is
+    the PRODUCER cap, so it bound before every downstream raise — and moved it to 1000, the length
+    at which the egress gate would otherwise EXCLUDE the whole item. A literal `260` here would have
+    asserted the new admissible length is refused.
+    """
+    from featuregen.overlay.upload.ftr_adapter import _MAX_SOURCE_ATTRIBUTE_LEN
+
+    over = _MAX_SOURCE_ATTRIBUTE_LEN + 400
+    text = f"{_HDR}\nBO.CUST.c,Term,Definition,Customer,varchar,,,{'x' * over},Confidential,N,N,N\n"
+    attrs = _record(text).source_attributes
+    assert all(len(a) <= _MAX_SOURCE_ATTRIBUTE_LEN for a in attrs)
+    # …and the bound really did bite on this input, so the assertion is not vacuous.
+    assert max(len(a) for a in attrs) == _MAX_SOURCE_ATTRIBUTE_LEN

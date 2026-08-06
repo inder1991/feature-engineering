@@ -1601,12 +1601,18 @@ _MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 # `table_synth._descriptor` — so `enrich.bounded_definition`'s window, the metadata-only egress cap,
 # and Pass B's descriptor bound can never drift apart. Defined HERE (not in `enrich`) because `enrich`
 # imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
-# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000 -> 32_000. MEASURED: the widest
-# `description_business_definition` in the committed FTR fixture
-# (`tests/.../fixtures/ftr_sample_synthetic.csv`, 127 rows) is 802 chars, and at the shipped 600
-# **41 of those 127** real definitions were being CUT mid-sentence before they ever reached a model.
-# 32_000 is ~40x the longest real value observed (53x the original 600) and still a bound — a 1 MB
-# "definition" is caught rather than egressed.
+# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000 -> 32_000.
+#
+# MEASURED — and the two files are DIFFERENT measurements, kept apart here because an earlier
+# revision of this comment merged them into one false sentence:
+#   * committed fixture (`tests/.../fixtures/ftr_sample_synthetic.csv`, 127 rows): widest
+#     `description_business_definition` 802 chars; **1** of the 127 exceeded the shipped 600.
+#   * REAL FTR export (`FTR_Column_Mapping_final.csv`, 127 rows, gitignored): widest raw value 960
+#     chars, 727 after the adapter's read-time sanitization; **41** of its 127 definitions exceeded
+#     600 — i.e. roughly a third of a real bank catalog's definitions were reaching the model CUT
+#     mid-sentence. That 41 is the real export's number, never the fixture's.
+# 32_000 is ~33x the widest real value and 53x the original 600 — deliberately far past any observed
+# input, and still a bound, so a 1 MB "definition" is caught rather than egressed.
 #
 # BOTH DIRECTIONS ARE INTENDED. This constant is the egress cap on what we SEND
 # (`_MAX_LEN_BY_KEY` -> `_item_len_ok`, and `enrich.bounded_definition`'s window), and it is also the

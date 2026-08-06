@@ -117,7 +117,12 @@ def test_slice1_view_flows_into_pass_b_and_egress_audit_persists(db, synthetic_f
         "SELECT task, redacted_input, input_redaction FROM llm_call "
         "WHERE run_id = 'overlay-enrichment'").fetchall()
     audited_tasks = {row[0] for row in rows}
-    assert audited_tasks & set(_PASS_B_TASKS), "no Pass B phase was audited at all"
+    # NAMED, not "at least one of": the narrow route is deterministic for this 126-column fixture,
+    # so exactly `table_synth` must be audited. `>= set(_PASS_B_TASKS)` became unsatisfiable when
+    # the route changed, but weakening it to an intersection would let a regression that drops the
+    # `table_synth` audit entirely still pass.
+    assert "table_synth" in audited_tasks
+    assert "table_synth_summary" not in audited_tasks   # the wide phase must not have run
     for task, redacted_input, _ in rows:
         blob = json.dumps(redacted_input)
         for token in _PLANTED_TOKENS:

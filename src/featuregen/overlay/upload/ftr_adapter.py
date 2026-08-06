@@ -179,8 +179,25 @@ _MAPPED_HEADERS = _CORE | _OPTIONAL | frozenset({_norm_header("bian_reference_1"
 
 #: Breadth is the goal; unboundedness is not. A file with hundreds of columns must not push the real
 #: signal out of a batch, so the passenger list is capped and each entry bounded.
-_MAX_SOURCE_ATTRIBUTES = 40
-_MAX_SOURCE_ATTRIBUTE_LEN = 240
+#:
+#: ZERO-TRUNCATION RAISE (2026-08-06, Task 4b review): 40 -> 256 and 240 -> 1000. These are the
+#: PRODUCER caps, and they bind BEFORE every downstream cap on this field — so while they sat at
+#: 40/240, raising `enrich_llm._MAX_SOURCE_ATTRIBUTES` to 256 and `enrich._MAX_META_LEN` to 1000
+#: achieved exactly nothing here and a 240+ character governance value was still cut on the way to
+#: the model. Source attributes are the CIB governance columns (`attribute_category`,
+#: `security_classification`, the PCI/AML/KYC and `pi_*` flags) — the only per-column signal that
+#: varies when a source auto-fills its description column by bucket, so cutting them is expensive.
+#:
+#: BOTH VALUES ARE CEILINGS SET BY DOWNSTREAM, not free choices — do not raise either alone:
+#:   * 256 is `enrich_llm._MAX_SOURCE_ATTRIBUTES`, the egress COUNT cap (`_item_shape_ok`). A longer
+#:     list makes the whole item egress-REJECTED.
+#:   * 1000 is `enrich_llm._MAX_LEN_DEFAULT`, the per-value LENGTH cap this field is graded under
+#:     (`_item_len_ok`, list branch, via `_max_len_for("source_attributes")`) and equally
+#:     `enrich._MAX_META_LEN`, which re-truncates each entry into the request. An entry over 1000
+#:     would have the column's WHOLE item EXCLUDED + audited — trading a silent trim for a dropped
+#:     column, which is strictly worse than the truncation this raise removes.
+_MAX_SOURCE_ATTRIBUTES = 256
+_MAX_SOURCE_ATTRIBUTE_LEN = 1000
 
 
 def _source_attributes(hmap: Mapping[str, str], raw: Mapping[str, object], redact) -> tuple[str, ...]:

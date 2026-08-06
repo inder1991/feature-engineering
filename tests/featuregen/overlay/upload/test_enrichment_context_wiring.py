@@ -329,28 +329,46 @@ def _resolved_roster(payload: dict) -> dict:
                               for e in payload["column_roster"]]}
 
 
-def _classifier_item_at_the_new_caps(*, siblings: int, name_len: int = 30) -> dict:
-    """A concept item at the zero-truncation caps: a SATURATED roster of long bank-style names,
-    every entry resolved. Anything smaller would make the packing assertions below vacuous."""
-    pad = "x" * max(0, name_len - 7)
-    cohort = [f"col{pad}{i:04d}" for i in range(siblings)] + ["anchor"]
-    bundle = _bundle("anchor", cohort)
-    return _resolved_roster(enrich._classifier_payload(_row("anchor"), _record("anchor"), bundle))
-
-
 #: A definition EXACTLY at `MAX_DEFINITION_LEN`. The whole point of the 32_000 raise is that this
 #: length now egresses, so it is the length the packing budgets must be proved against — an item
 #: built at any smaller definition makes every assertion below vacuous.
 _DEF_AT_CAP = ("The settlement amount of the posted financial transaction, expressed in the "
                "transaction currency. " * 2000)[:llm.MAX_DEFINITION_LEN]
 
+#: The REALISTIC source-attribute fill, not the cap. `ftr_adapter._MAX_SOURCE_ATTRIBUTES` was raised
+#: 40 -> 256 and `_MAX_SOURCE_ATTRIBUTE_LEN` 240 -> 1000, but those are ceilings set by the egress
+#: gates downstream, not by any observed file: the real FTR export has 17 headers IN TOTAL. Modelled
+#: at 17 entries of the full 1000 chars — every real attribute at its new maximum length — because
+#: that is the shape the budgets have to hold. The degenerate 256 x 1000 fill is a different
+#: question and is pinned separately, below.
+_REALISTIC_SOURCE_ATTRS = tuple(
+    (f"governance_header_{i}: " + "v" * 1000)[:1000] for i in range(17))
+
 
 def _record_at_the_definition_cap(column: str) -> GlossaryRecord:
     """A fully-populated FTR-shaped sidecar whose definition sits AT the cap, with
-    `source_attributes` at the FTR reader's own producer cap (40) so the non-definition metadata is
-    modelled at its realistic maximum too, not at zero."""
-    return _record(column, definition=_DEF_AT_CAP,
-                   source_attributes=tuple(f"attr_{i}=value" for i in range(40)))
+    `source_attributes` at their realistic count and their new maximum LENGTH, so the
+    non-definition metadata is modelled at its realistic maximum too, not at zero."""
+    return _record(column, definition=_DEF_AT_CAP, source_attributes=_REALISTIC_SOURCE_ATTRS)
+
+
+def _classifier_item_at_the_new_caps(*, siblings: int, name_len: int = 30) -> dict:
+    """A concept item at the zero-truncation caps on BOTH axes: a SATURATED roster of long
+    bank-style names at RESOLVED fill, AND the anchor's own prose at the definition cap with a
+    realistic source-attribute sidecar.
+
+    The prose half was missing at first — the item saturated the roster but carried a 40-character
+    fixture definition against a 32_000 cap, so it proved packing on the axis this task did not
+    widen and left the axis it did widen untested. Anything smaller on either axis makes the
+    packing assertions below vacuous.
+    """
+    pad = "x" * max(0, name_len - 7)
+    cohort = [f"col{pad}{i:04d}" for i in range(siblings)] + ["anchor"]
+    bundle = _bundle("anchor", cohort)
+    payload = enrich._classifier_payload(
+        _row("anchor"), _record_at_the_definition_cap("anchor"), bundle)
+    assert len(payload["business_definition"]) == llm.MAX_DEFINITION_LEN   # genuinely at the cap
+    return _resolved_roster(payload)
 
 
 def _drafting_item_at_the_definition_cap() -> dict:
@@ -407,7 +425,17 @@ def test_a_definition_at_the_cap_costs_the_tokens_the_budget_was_derived_from() 
     # The definition dominates the item, and the REST is the "other metadata" allowance the
     # derivation assumed. Pinning it bounds the assumption instead of leaving it prose.
     assert total >= definition_tokens
-    assert total - definition_tokens < 2_000, "non-definition metadata outgrew the derivation"
+    # RE-DERIVED (Task 4b review, Important #1): this guard was written at <2_000 and it FIRED when
+    # `ftr_adapter._MAX_SOURCE_ATTRIBUTE_LEN` went 240 -> 1000 — doing exactly its job. 17 realistic
+    # source attributes at the new 1000-char maximum are ~4_250 tokens on their own, so the
+    # non-definition allowance is now ~4_400. The bound is re-set with margin rather than relaxed to
+    # fit: it must still fail on the NEXT few-thousand-token addition, and the packing consequence
+    # is asserted directly below so the number is never the only thing holding the budget up.
+    other = total - definition_tokens
+    assert other < 6_000, f"non-definition metadata outgrew the derivation: {other}"
+    # The derivation exists to protect PACKING, so assert that, not just the arithmetic.
+    assert (enrich_config.max_items("definition") * total
+            <= enrich_config.max_input_tokens("definition"))
 
 
 @pytest.mark.parametrize("short", ["definition", "synonyms", "unit"])
@@ -529,6 +557,85 @@ def test_the_widest_ingestible_table_also_packs_at_the_item_bound() -> None:
                          max_items=enrich_config.max_items("concept"),
                          max_input_tokens=enrich_config.max_input_tokens("concept"))
     assert max(len(c) for c in chunks) == enrich_config.max_items("concept")
+
+
+# ── the ftr_adapter source-attribute caps (Task 4b review, Important #1) ─────────────────────────
+
+
+def test_the_producer_caps_no_longer_bind_before_the_egress_caps_they_feed() -> None:
+    """`ftr_adapter` is the PRODUCER of `source_attributes`, so its two caps bind BEFORE every
+    downstream one. While they sat at 40 / 240 chars, raising `enrich_llm._MAX_SOURCE_ATTRIBUTES` to
+    256 and `enrich._MAX_META_LEN` to 1000 achieved literally nothing on this field and a 240+ char
+    governance value was still cut on the way to the model.
+
+    Both are now set EXACTLY to the gates they feed, and neither may exceed them: a longer list is
+    egress-REJECTED on count (`_item_shape_ok`) and a longer value has the column's whole item
+    EXCLUDED + audited on length (`_item_len_ok`, via `_max_len_for("source_attributes")`). Going
+    past either would trade a silent trim for a dropped column, which is strictly worse.
+    """
+    from featuregen.overlay.upload import ftr_adapter
+
+    assert ftr_adapter._MAX_SOURCE_ATTRIBUTES == llm._MAX_SOURCE_ATTRIBUTES
+    assert ftr_adapter._MAX_SOURCE_ATTRIBUTE_LEN == llm._MAX_LEN_DEFAULT == enrich._MAX_META_LEN
+    # …and a value at the producer's new bound really does survive the whole path to egress.
+    at_bound = "governance_header: " + "v" * (ftr_adapter._MAX_SOURCE_ATTRIBUTE_LEN - 19)
+    assert len(at_bound) == ftr_adapter._MAX_SOURCE_ATTRIBUTE_LEN
+    meta = enrich._concept_metadata(_row("anchor"),
+                                    _record("anchor", source_attributes=(at_bound,)))
+    assert meta["source_attributes"] == [at_bound], "truncated between the reader and the request"
+    assert llm._item_egress_ok(meta) is True
+
+
+def test_a_realistic_source_attribute_fill_still_packs_a_full_chunk() -> None:
+    """The raise costs tokens, and the budgets must hold the REALISTIC fill: 17 entries (the real
+    FTR export's entire header count) each at the new 1000-char maximum. Every per-column stage must
+    still pack its full `max_items`, or the raise has bought richer context with more provider calls.
+    """
+    from featuregen.overlay.upload.canonical import MAX_COLUMNS_PER_TABLE
+
+    summary_item = enrich.summary_payload(
+        _row("anchor"), _record_at_the_definition_cap("anchor"),
+        {"concept": "monetary_stock", "party_role": "counterparty", "ai_synonyms": ["a", "b"]},
+        _bundle("anchor", ["anchor"]))
+    for short, payload in (("definition", _drafting_item_at_the_definition_cap()),
+                           ("summary", summary_item),
+                           ("concept", _classifier_item_at_the_new_caps(
+                               siblings=MAX_COLUMNS_PER_TABLE - 1))):
+        assert len(payload["source_attributes"]) == len(_REALISTIC_SOURCE_ATTRS)
+        chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(40)],
+                             max_items=enrich_config.max_items(short),
+                             max_input_tokens=enrich_config.max_input_tokens(short))
+        assert max(len(c) for c in chunks) == enrich_config.max_items(short), short
+
+
+def test_a_DEGENERATE_source_attribute_fill_degrades_proportionally_and_never_truncates() -> None:
+    """The honest cost of raising the COUNT cap 40 -> 256, recorded rather than discovered later.
+
+    No observed file comes near this — FTR has 17 headers in total — but a mapping export with 256
+    unmapped governance headers each at 1000 chars is now admissible, and it costs ~72_000 estimated
+    tokens per item. Packing falls to 2 of 8. That is the documented, ACCEPTABLE failure mode:
+    `chunk_items` never drops an item for size (an over-budget item forms its own chunk), so the
+    stage degrades PROPORTIONALLY into more calls, and the deployed per-stage ceiling still clears
+    the result. What must never happen is a lost column.
+    """
+    rec = _record("anchor", definition=_DEF_AT_CAP, source_attributes=tuple(
+        (f"governance_header_{i}: " + "v" * 1000)[:1000] for i in range(256)))
+    payload = enrich._drafting_payload(
+        _bundle("anchor", ["anchor"]),
+        {"table": _TABLE, "column": "anchor", "type": "varchar(11)", "concept": "monetary_stock"},
+        row=_row("anchor"), rec=rec)
+    chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(40)],
+                         max_items=enrich_config.max_items("definition"),
+                         max_input_tokens=enrich_config.max_input_tokens("definition"))
+    packed = max(len(c) for c in chunks)
+    assert 1 < packed < enrich_config.max_items("definition"), (
+        f"degenerate fill packed {packed}/{enrich_config.max_items('definition')}")
+    # Nothing is dropped: every item still rides some chunk.
+    assert sum(len(c) for c in chunks) == 40
+    # And the degraded chunk count still clears the deployed per-stage ceiling for a 237-column
+    # catalog — the bound that turns "more calls" into "stopped enriching columns".
+    worst_case_calls = -(-237 // packed) * 2 + 8
+    assert worst_case_calls < 512, worst_case_calls
 
 
 def test_a_widened_item_still_chunks_by_item_count_not_by_bytes() -> None:

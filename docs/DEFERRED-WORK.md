@@ -1299,3 +1299,39 @@ worst-case bill than 100 was, and the ceiling is no longer what stops a runaway 
 **Trigger:** the next authorised ingest of a real catalog. **Closure:** ingest one catalog with the
 enrichment stages on, read the per-stage physical call counts and elapsed times out of the `llm_call`
 audit rows, and record them against the derivation above — confirming it or replacing it.
+
+#### A.50 addendum — `source_attributes` producer caps, and the degenerate fill (2026-08-06, Task 4b review)
+
+The review's Important #1 found that **both** `ftr_adapter` producer caps bound before every
+downstream cap on this field, so Task 4b's raises to `enrich_llm._MAX_SOURCE_ATTRIBUTES` (256) and
+`enrich._MAX_META_LEN` (1000) were **inert on `source_attributes`**, and a 240+ character governance
+value was still being silently cut. Both producer caps were raised in step:
+`_MAX_SOURCE_ATTRIBUTES` 40 → 256 and `_MAX_SOURCE_ATTRIBUTE_LEN` 240 → 1000.
+
+**No residual truncation remains on this field.** Both values are now set exactly to the egress gates
+they feed and neither may go higher: a longer list is egress-REJECTED on count (`_item_shape_ok`), and
+a longer value has the column's whole item EXCLUDED + audited on length (`_item_len_ok` via
+`_max_len_for("source_attributes")` = `_MAX_LEN_DEFAULT`). Exceeding either would trade a silent trim
+for a dropped column.
+
+**What IS newly deferred: the degenerate fill.** Raising the COUNT cap 40 → 256 admits a shape that
+was previously impossible. Measured against the real builders and the real `chunk_items`:
+
+| source-attribute fill | tok/item (`definition`) | packed |
+|---|---|---|
+| 17 × ≤240 (the real FTR export — 17 headers in total) | 9_162 | 8 of 8 |
+| 40 × 240 (the old producer caps) | 10_565 | 8 of 8 |
+| **17 × 1000 (realistic count, new max length)** | **12_392** | **8 of 8** |
+| 256 × 1000 (the new theoretical maximum) | 72_381 | **2 of 8** |
+
+The realistic fill packs a full chunk on every stage, so the raise costs nothing in practice. The
+degenerate fill degrades packing ~4×. That is the *acceptable* failure mode — `chunk_items` never
+drops an item for size, so the stage degrades proportionally into more calls, and the degraded chunk
+count (`ceil(237/2) × 2 + 8 = 246`) still clears the deployed 512 per-stage ceiling. Both rows are
+pinned by tests (`test_a_realistic_source_attribute_fill_still_packs_a_full_chunk`,
+`test_a_DEGENERATE_source_attribute_fill_degrades_proportionally_and_never_truncates`).
+
+**Trigger:** a real mapping export with more than ~40 unmapped governance headers. None has been
+observed; CIB's header count is unmeasurable here because the file is absent. **Closure:** if such a
+file appears, decide whether the count cap should track the observed header count rather than the
+egress ceiling — the length cap should not move.
