@@ -42,8 +42,8 @@ def test_draft_definition_rides_bounded_as_business_definition():
     # The Pass-A draft rides as business_definition, bounded to the egress window in the view.
     # Sample-value stripping moved to the field-aware egress seam (Task 2: _redact_free_text_meta
     # routes business_definition through sanitize_definition at dispatch) — the assembler projects.
-    # Sized off the constant: the 2026-08-06 raise took it 600 -> 4000 and a fixed-length draft
-    # stopped exercising the bound at all.
+    # Sized off the constant: the 2026-08-06 raises took it 600 -> 4000 -> 32_000 and a
+    # fixed-length draft stopped exercising the bound at all.
     from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
 
     rows = [_row("txn", "acct")]

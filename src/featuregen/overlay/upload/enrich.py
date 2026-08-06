@@ -83,8 +83,9 @@ _MAX_SYNONYMS_LEN = 1000
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
 # DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
 # B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
-# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 (measured: the widest
-# real FTR definition is 960 chars), so this window follows it with no edit here.
+# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 -> 32_000 (measured:
+# the widest definition in the committed FTR fixture is 802 chars, and 41 of its 127 rows were being
+# truncated at the shipped 600), so this window follows it with no edit here.
 _MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 

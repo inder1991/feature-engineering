@@ -45,9 +45,11 @@ def _descriptor(view: ColumnMetadataView) -> dict:
     synthesizer sees the distinction even when one is blank.
 
     M4 still holds by construction: the view sources `business_definition` ONLY from the curated
-    sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded to
-    the 600 egress window; the field-aware egress seam (`_redact_free_text_meta`) re-sanitizes it
-    (sample-clause strip + PII) at dispatch. Facets are bounded structural tokens (200 cap)."""
+    sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded by
+    `column_view._bounded` to the ONE `enrich_llm.MAX_DEFINITION_LEN` egress window (32_000 since
+    2026-08-06 — named rather than restated, so the two cannot drift); the field-aware egress seam
+    (`_redact_free_text_meta`) re-sanitizes it (sample-clause strip + PII) at dispatch. Facets are
+    bounded structural tokens (200 cap)."""
     desc: dict = {"column": view.column,
                   "operational_type": (view.operational_type or "")[:200],
                   "declared_type": (view.declared_type or "")[:200]}
@@ -251,14 +253,16 @@ def table_vocab_normalize_temporal(raw: object) -> str | None:
 #: The bounded per-value length of a profile PROSE suggestion.
 #:
 #: It USED to be pinned to `enrich_llm.MAX_DEFINITION_LEN` ("so a description and a definition can
-#: never drift apart"). The 2026-08-06 zero-truncation raise took that constant 600 -> 4000 and
-#: this one deliberately did NOT follow, because the two answer different questions and the tie was
-#: coincidental. This value bounds Pass B's own OUTPUT, and that output can be re-threaded into
-#: ITEM metadata as `business_context`/`table_description`, where it meets the per-value egress
-#: ACCEPTANCE gate `enrich_llm._MAX_LEN_DEFAULT` (now 1000). So the load-bearing invariant is
-#: `_MAX_PROFILE_PROSE < _MAX_LEN_DEFAULT` — 600 against 1000 holds it with margin. Raising this to
-#: 4000 would make Pass B's own descriptions EXCLUDED-and-audited at the egress gate, which is the
-#: opposite of what the raise was for.
+#: never drift apart"). The 2026-08-06 zero-truncation raises took that constant 600 -> 4000 ->
+#: 32_000 and this one deliberately did NOT follow either time, because the two answer different
+#: questions and the tie was coincidental. This value bounds Pass B's own OUTPUT, and that output
+#: can be re-threaded into ITEM metadata as `business_context`/`table_description`, where it meets
+#: the per-value egress ACCEPTANCE gate `enrich_llm._MAX_LEN_DEFAULT` (now 1000). So the
+#: load-bearing invariant is `_MAX_PROFILE_PROSE < _MAX_LEN_DEFAULT` — 600 against 1000 holds it
+#: with margin, and it is UNDISTURBED by the 32_000 raise precisely because that raise moved
+#: `MAX_DEFINITION_LEN` and not `_MAX_LEN_DEFAULT`. Raising this to 4000 (let alone 32_000) would
+#: make Pass B's own descriptions EXCLUDED-and-audited at the egress gate, which is the opposite of
+#: what the raise was for. Pinned by `test_table_synth_assemble.py`.
 _MAX_PROFILE_PROSE = 600
 #: The one non-column citation a suggestion may name: the table's own curated definition.
 _TABLE_DEFINITION_REF = "table_definition"

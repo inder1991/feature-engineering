@@ -216,9 +216,9 @@ def test_business_definition_falls_back_to_draft_and_is_bounded():
 
     rows = [_row("txn", "fee")]
     h = content_hash(rows[0])
-    # Sized OFF the bound so it keeps testing the bound: the 2026-08-06 raise took
-    # MAX_DEFINITION_LEN 600 -> 4000, and a fixed 1_229-char draft now rides through WHOLE — which
-    # is the intent, but it would have left this test asserting nothing.
+    # Sized OFF the bound so it keeps testing the bound: the 2026-08-06 raises took
+    # MAX_DEFINITION_LEN 600 -> 4000 -> 32_000, and a fixed 1_229-char draft now rides through
+    # WHOLE — which is the intent, but it would have left this test asserting nothing.
     sentence = "A very long drafted definition sentence. "
     long_draft = (sentence * (MAX_DEFINITION_LEN // len(sentence) + 4)).strip()
     assert len(long_draft) > MAX_DEFINITION_LEN

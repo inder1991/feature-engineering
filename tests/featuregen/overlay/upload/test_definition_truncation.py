@@ -15,7 +15,8 @@ def test_medium_definition_survives_whole():
 
 def test_long_definition_truncates_on_word_boundary():
     # Sized OFF the bound: at a fixed 2000 chars this stopped exercising truncation entirely once
-    # the 2026-08-06 raise took _MAX_DEFINITION_LEN to 4000, and would have passed vacuously.
+    # the 2026-08-06 raises took _MAX_DEFINITION_LEN to 4000 and then 32_000, and would have passed
+    # vacuously. Sizing off the constant is what keeps it honest at any future value.
     text = "word " * (_MAX_DEFINITION_LEN // 2)
     assert len(text) > _MAX_DEFINITION_LEN, "the input must actually overflow the bound"
     out = bounded_definition(text, _MAX_DEFINITION_LEN)
@@ -25,9 +26,9 @@ def test_long_definition_truncates_on_word_boundary():
 
 
 def test_egress_allows_business_definition_up_to_the_definition_bound():
-    """Bounds read from the constants, not restated. The 2026-08-06 zero-truncation raise moved
-    them (600 -> 4000, 200 -> 1000) and every literal here would have silently inverted into an
-    assertion that the NEW admissible length is refused."""
+    """Bounds read from the constants, not restated. The 2026-08-06 zero-truncation raises moved
+    them (600 -> 4000 -> 32_000, 200 -> 1000) and every literal here would have silently inverted
+    into an assertion that the NEW admissible length is refused."""
     meta = {"table": "t", "column": "c", "business_definition": "x" * _MAX_DEFINITION_LEN}
     assert _item_egress_ok(meta) is True
     meta_bad = {"table": "t", "column": "c", "business_definition": "x" * (_MAX_DEFINITION_LEN + 1)}

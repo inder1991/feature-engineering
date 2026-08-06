@@ -128,8 +128,9 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
     #
     # THE ZERO-TRUNCATION ACCEPTANCE (2026-08-06). NARRATIVE_MEMO's fixture definition is 802 chars.
     # At the old MAX_DEFINITION_LEN = 600 the classifier saw it CLIPPED — this assertion used to
-    # read `<= 600` and was passing on a truncated payload. At 4000 the whole definition reaches the
-    # model, which is the point of the raise, so what is asserted now is that it arrives INTACT.
+    # read `<= 600` and was passing on a truncated payload, and 41 of the fixture's 127 rows were in
+    # the same state. At 4000, and now at 32_000, the whole definition reaches the model, which is
+    # the point of the raise, so what is asserted now is that it arrives INTACT.
     from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
 
     memo_def = concept_items["narrative_memo"]["business_definition"]

@@ -1601,12 +1601,26 @@ _MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 # `table_synth._descriptor` — so `enrich.bounded_definition`'s window, the metadata-only egress cap,
 # and Pass B's descriptor bound can never drift apart. Defined HERE (not in `enrich`) because `enrich`
 # imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
-# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000. MEASURED: the widest
-# `description_business_definition` in the real FTR export (`FTR_Column_Mapping_final.csv`, 127
-# rows) is 960 chars, so the shipped 600 was CUTTING real bank definitions mid-sentence before they
-# ever reached a model. 4000 is ~4x the measured worst case and still a bound — a 50 KB
+# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000 -> 32_000. MEASURED: the widest
+# `description_business_definition` in the committed FTR fixture
+# (`tests/.../fixtures/ftr_sample_synthetic.csv`, 127 rows) is 802 chars, and at the shipped 600
+# **41 of those 127** real definitions were being CUT mid-sentence before they ever reached a model.
+# 32_000 is ~40x the longest real value observed (53x the original 600) and still a bound — a 1 MB
 # "definition" is caught rather than egressed.
-MAX_DEFINITION_LEN = 4000
+#
+# BOTH DIRECTIONS ARE INTENDED. This constant is the egress cap on what we SEND
+# (`_MAX_LEN_BY_KEY` -> `_item_len_ok`, and `enrich.bounded_definition`'s window), and it is also the
+# admissibility bound on Pass-B/Pass-A material RE-THREADED into a later stage's item metadata. It is
+# NOT an accept gate on model OUTPUT: each drafting stage bounds its own answer separately
+# (`enrich._accept_bounded(500)` for the definition stage, 400 for summary, `_MAX_SYNONYMS_LEN` for
+# synonyms), so raising this does not by itself let a model write a longer definition.
+#
+# WHAT HAD TO MOVE WITH IT — `enrich_config._DEFAULT_MAX_INPUT_TOKENS`. A definition at this cap is
+# 8_000 estimated tokens (the estimator is exactly `len(json)//4`), so `max_items` of them no longer
+# shared a chunk at the old budgets and the stage's call count rose. See the derivation block in
+# `enrich_config`. Measured items/chunk at this cap, against the real `chunk_items`, are pinned by
+# `test_enrichment_context_wiring.py`.
+MAX_DEFINITION_LEN = 32_000
 
 # Per-value egress length cap. ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. MEASURED against the
 # real FTR export, the widest non-definition value is 105 chars (`related_terms`; then 84 for the

@@ -338,6 +338,32 @@ def _classifier_item_at_the_new_caps(*, siblings: int, name_len: int = 30) -> di
     return _resolved_roster(enrich._classifier_payload(_row("anchor"), _record("anchor"), bundle))
 
 
+#: A definition EXACTLY at `MAX_DEFINITION_LEN`. The whole point of the 32_000 raise is that this
+#: length now egresses, so it is the length the packing budgets must be proved against — an item
+#: built at any smaller definition makes every assertion below vacuous.
+_DEF_AT_CAP = ("The settlement amount of the posted financial transaction, expressed in the "
+               "transaction currency. " * 2000)[:llm.MAX_DEFINITION_LEN]
+
+
+def _record_at_the_definition_cap(column: str) -> GlossaryRecord:
+    """A fully-populated FTR-shaped sidecar whose definition sits AT the cap, with
+    `source_attributes` at the FTR reader's own producer cap (40) so the non-definition metadata is
+    modelled at its realistic maximum too, not at zero."""
+    return _record(column, definition=_DEF_AT_CAP,
+                   source_attributes=tuple(f"attr_{i}=value" for i in range(40)))
+
+
+def _drafting_item_at_the_definition_cap() -> dict:
+    """The item shape the `definition` / `synonyms` / `unit` stages dispatch, at the cap."""
+    rec = _record_at_the_definition_cap("anchor")
+    payload = enrich._drafting_payload(
+        _bundle("anchor", ["anchor"]),
+        {"table": _TABLE, "column": "anchor", "type": "varchar(11)", "concept": "monetary_stock"},
+        row=_row("anchor"), rec=rec)
+    assert len(payload["business_definition"]) == llm.MAX_DEFINITION_LEN   # genuinely at the cap
+    return payload
+
+
 def test_the_rebudgeted_bounds_hold_the_measured_payloads() -> None:
     """The measured maxima must fit their chunks — the whole point of re-budgeting.
 
@@ -361,6 +387,108 @@ def test_the_rebudgeted_bounds_hold_the_measured_payloads() -> None:
     # contamination surface.
     assert enrich_config.max_items("concept") == 20
     assert enrich_config.max_items("domain") == 8
+
+
+# ── MAX_DEFINITION_LEN 4000 -> 32_000: every stage carrying a definition must still pack ──────────
+
+
+def test_a_definition_at_the_cap_costs_the_tokens_the_budget_was_derived_from() -> None:
+    """The arithmetic the `enrich_config` budget block states, asserted rather than trusted.
+
+    `estimate_tokens` is exactly `len(json.dumps(metadata)) // 4`, so a definition at the 32_000 cap
+    is 8_000 estimated tokens BY CONSTRUCTION — that is the number every budget below was derived
+    from, and if the cap moves without the budgets this is the assertion that says so.
+    """
+    payload = _drafting_item_at_the_definition_cap()
+    definition_tokens = llm.MAX_DEFINITION_LEN // 4
+    assert definition_tokens == 8_000
+
+    total = estimate_tokens(BatchItem("h", payload))
+    # The definition dominates the item, and the REST is the "other metadata" allowance the
+    # derivation assumed. Pinning it bounds the assumption instead of leaving it prose.
+    assert total >= definition_tokens
+    assert total - definition_tokens < 2_000, "non-definition metadata outgrew the derivation"
+
+
+@pytest.mark.parametrize("short", ["definition", "synonyms", "unit"])
+def test_the_drafting_stages_still_pack_a_full_chunk_at_the_definition_cap(short: str) -> None:
+    """`definition`/`synonyms`/`unit` dispatch the SAME `_drafting_payload` item at the SAME
+    `max_items`, so all three are proved together — raising one budget and not its twins would have
+    left two stages shattered for the identical reason.
+
+    At the 4000 cap these packed 8 per chunk; a 32_000-char definition is 8_000 tokens, so 8 of them
+    (66_464) crossed the old 60_000 budget and packing fell to 7 — ~14% more provider calls on
+    stages that fan out PER COLUMN, against an unchanged `max_provider_calls`. The budget move is
+    what puts it back, and this is the assertion that fails if it is reverted.
+    """
+    payload = _drafting_item_at_the_definition_cap()
+    items = [BatchItem(f"h{i}", payload) for i in range(40)]
+    chunks = chunk_items(items, max_items=enrich_config.max_items(short),
+                         max_input_tokens=enrich_config.max_input_tokens(short))
+    assert max(len(c) for c in chunks) == enrich_config.max_items(short) == 8
+    assert len(chunks) == 5           # 40 items / 8 — bound by ITEM COUNT, not by tokens
+
+
+def test_the_summary_stage_still_packs_a_full_chunk_at_the_definition_cap() -> None:
+    """`summary_payload` is `_drafting_payload`'s superset (it also carries the ingest tail's
+    dossier extras), so it is the LARGEST of the 8-item stages and must be checked, not assumed.
+
+    It packed 8 per chunk at its old 100_000 too — the measured margin was real. The raise to
+    200_000 is about the ORDERING, asserted below: the bigger item must never hold the smaller
+    budget, or a pathological fill shatters summary while its own subset survives.
+    """
+    assert (enrich_config.max_input_tokens("summary")
+            >= enrich_config.max_input_tokens("definition")), \
+        "summary's item is definition's SUPERSET; it cannot have the tighter budget"
+    payload = enrich.summary_payload(
+        _row("anchor"), _record_at_the_definition_cap("anchor"),
+        {"concept": "monetary_stock", "party_role": "counterparty", "ai_synonyms": ["a", "b"]},
+        _bundle("anchor", ["anchor"]))
+    assert len(payload["business_definition"]) == llm.MAX_DEFINITION_LEN
+    chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(40)],
+                         max_items=enrich_config.max_items("summary"),
+                         max_input_tokens=enrich_config.max_input_tokens("summary"))
+    assert max(len(c) for c in chunks) == enrich_config.max_items("summary") == 8
+
+
+def test_the_concept_stage_still_packs_at_a_capped_definition_AND_a_saturated_roster() -> None:
+    """The concept item carries BOTH a `business_definition` and the sibling roster, so it is the
+    stage the 32_000 cap hurt most: 20 x (8_000 + ~5_200) = ~264_600 against the old 200_000 budget
+    dropped it from 20 items per chunk to 15 — a third more calls on the widest-fanning stage.
+
+    Built at the widest table ingestion admits (`MAX_COLUMNS_PER_TABLE`), every sibling resolved,
+    every column's definition at the cap.
+    """
+    from featuregen.overlay.upload.canonical import MAX_COLUMNS_PER_TABLE
+
+    cohort = ([f"col_bank_style_name_{i:04d}" for i in range(MAX_COLUMNS_PER_TABLE - 1)]
+              + ["anchor"])
+    rec = _record_at_the_definition_cap("anchor")
+    payload = _resolved_roster(
+        enrich._classifier_payload(_row("anchor"), rec, _bundle("anchor", cohort)))
+    assert len(payload["business_definition"]) == llm.MAX_DEFINITION_LEN
+    assert len(payload["column_roster"]) == MAX_COLUMNS_PER_TABLE - 1
+
+    chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(60)],
+                         max_items=enrich_config.max_items("concept"),
+                         max_input_tokens=enrich_config.max_input_tokens("concept"))
+    assert max(len(c) for c in chunks) == enrich_config.max_items("concept") == 20
+
+
+def test_pass_b_prose_stays_admissible_at_the_egress_gate_after_the_raise() -> None:
+    """The invariant the previous raise established and this one must not break.
+
+    `table_synth._MAX_PROFILE_PROSE` bounds Pass B's OWN output, which can be re-threaded into a
+    later item as `business_context`/`table_description`, where it meets `_MAX_LEN_DEFAULT` — NOT
+    `MAX_DEFINITION_LEN`. It was deliberately not pinned to the definition cap, so the 32_000 raise
+    must leave it admissible; a future "make these consistent" edit is what this catches.
+    """
+    from featuregen.overlay.upload.table_synth import _MAX_PROFILE_PROSE
+
+    assert _MAX_PROFILE_PROSE < llm._MAX_LEN_DEFAULT < llm.MAX_DEFINITION_LEN
+    at_bound = "x" * _MAX_PROFILE_PROSE
+    assert llm._item_egress_ok({"table": "t", "business_context": at_bound,
+                                "table_description": at_bound}) is True
 
 
 def test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps() -> None:

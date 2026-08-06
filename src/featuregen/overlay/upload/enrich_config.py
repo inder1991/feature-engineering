@@ -101,7 +101,8 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 # ── ZERO-TRUNCATION RAISE (2026-08-06) ───────────────────────────────────────────────────────────
 #
 # Every prose and item cap on the enrichment path went up so that nothing the platform knows is cut
-# on the way to the model (`enrich_llm.MAX_DEFINITION_LEN` 600 -> 4000, `_MAX_LEN_DEFAULT` 200 ->
+# on the way to the model (`enrich_llm.MAX_DEFINITION_LEN` 600 -> 4000 — and 4000 -> 32_000 in the
+# second raise below, `_MAX_LEN_DEFAULT` 200 ->
 # 1000, `_MAX_COLUMN_PROFILES` 64 -> 512, `semantic_context.ADAPTER_LIST_LIMIT` 40 -> 256,
 # `NEIGHBOUR_LIMIT` 64 -> 512). Read the block above for WHY that forces this map up with it: a
 # bigger item against a fixed token cap means fewer items per chunk, which means more provider
@@ -118,8 +119,68 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 # boundaries, not size limits. Raising the token budgets is exactly how you avoid having to touch
 # them. Packing at the new caps is pinned by
 # `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`.
-_DEFAULT_MAX_INPUT_TOKENS = {"concept": 200_000, "definition": 60_000, "domain": 200_000,
-                             "synonyms": 60_000, "unit": 60_000, "summary": 100_000,
+#
+# ── MAX_DEFINITION_LEN 4000 -> 32_000 (2026-08-06, second raise) ──────────────────────────────────
+#
+# `enrich_llm.MAX_DEFINITION_LEN` went 4000 -> 32_000, and it is the per-value egress cap on
+# `business_definition`. Every Pass-A stage whose ITEM metadata carries that key therefore gained up
+# to 8_000 estimated tokens PER ITEM, which is a chunking change, not a prose change.
+#
+# THE UNIT OF THE DERIVATION IS EXACT, not an approximation. `enrich_batch.estimate_tokens` IS
+# `len(json.dumps(metadata)) // 4` and `chunk_items` packs on nothing else, so "4 chars per token" is
+# the packer's own definition, and a cap of 32_000 chars is 8_000 estimated tokens by construction.
+# No real tokenizer is involved on this path.
+#
+# MEASURED against the REAL builders (`_drafting_payload`, `summary_payload`, `_classifier_payload`)
+# with a definition AT the 32_000 cap, a fully-populated FTR-shaped sidecar (term/domain/BIAN/FIBO/
+# process path/synonyms/related terms + 40 `source_attributes`) and, for the classifier, a saturated
+# 199-entry roster at RESOLVED fill — i.e. the widest table ingestion admits
+# (`MAX_COLUMNS_PER_TABLE`), every sibling carrying a concept and a party role:
+#
+#   stage                  tok/item   of which definition   chunk cost at max_items   packed BEFORE
+#   definition/synonyms/unit  8_308        8_000               8 x  8_308 =  66_464    7 of 8  (was 8)
+#   summary                   8_322        8_000               8 x  8_322 =  66_576    8 of 8
+#   concept                  13_230        8_000              20 x 13_230 = 264_600   15 of 20 (was 20)
+#   domain                    6_355            0               8 x  6_355 =  50_840    8 of 8
+#
+# So the raise cost the three `_drafting_payload` stages ~14% more provider calls and the concept
+# stage ~33% more — a PROPORTIONAL degradation (see the chunking note above), never a lost item, but
+# a real move toward the `max_provider_calls` ceiling on exactly the stages that fan out per column.
+# `domain` is untouched because a domain item is a whole TABLE and carries no `business_definition`
+# at all; its 200_000 stands as MEASURED-SUFFICIENT and is not churned.
+#
+# THE TWO RAISES, derived rather than guessed:
+#
+# * definition / synonyms / unit / summary 60_000 (100_000 for summary) -> 200_000. All four are the
+#   same item shape at the same `max_items` = 8 (`summary_payload` is `_drafting_payload`'s superset
+#   — 322 tok vs 308 — which is why they get ONE number rather than three; leaving summary at
+#   100_000 would have given the LARGER item the SMALLER budget). Required = 8 x (8_000 + other).
+#   At the measured `other` (308-322 tok) that is 66_464-66_576, i.e. 33% of 200_000. At a
+#   PATHOLOGICAL fill — every non-definition scalar at `_MAX_LEN_DEFAULT` (1000 chars) and
+#   `source_attributes` at the producer cap (`ftr_adapter._MAX_SOURCE_ATTRIBUTES` = 40) x 1000 chars,
+#   ~14_000 tok of metadata beside the definition — it is 8 x 22_000 = 176_000, i.e. 88% of 200_000.
+#   The bound therefore holds BOTH the measured and the pathological item at the full contamination
+#   bound of 8.
+# * concept 200_000 -> 400_000. `max_items` is 20 and the item also carries the roster, so required =
+#   20 x (8_000 + roster). At the 199-entry resolved roster measured above, 20 x 13_230 = 264_600; at
+#   the 256-entry / 30-char saturated roster the previous block recorded (6_862 tok), 20 x 14_862 =
+#   297_240 — 74% of 400_000. NOT budgeted for, deliberately: that saturated roster AND 20 columns
+#   each carrying a 32_000-char curated definition AND every scalar at its own cap, all at once,
+#   is not a shape any catalog produces, and crossing it degrades to ~13 items per chunk rather than
+#   to a lost item.
+#
+# `table_synth` STAYS at 60_000, and the reason is that raising it would be theatre. Its item is a
+# whole table's `column_profiles`, so its size is driven by COLUMN COUNT, not by the definition cap:
+# a 200-column table measures 41_814 tok/item at the ORIGINAL 600 cap, 212_664 at 4000 and 1_619_664
+# at 32_000 — it has packed 1 item per chunk at EVERY value this constant has ever held, including
+# before any of these raises. Making 4 such tables share a chunk would need a ~6.5M-token budget,
+# which is past any model's window; and `table_synth` fans out per TABLE (tens of items), not per
+# column (thousands), so one call per table is a cost the call ceiling absorbs. Recorded here so the
+# next reader does not "discover" it as a regression of this change. It is not one.
+#
+# `_DEFAULT_MAX_ITEMS` is, once again, UNCHANGED.
+_DEFAULT_MAX_INPUT_TOKENS = {"concept": 400_000, "definition": 200_000, "domain": 200_000,
+                             "synonyms": 200_000, "unit": 200_000, "summary": 200_000,
                              "table_synth": 60_000}
 
 
