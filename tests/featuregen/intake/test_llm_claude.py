@@ -181,6 +181,39 @@ def test_escalated_timeout_reaches_messages_create(monkeypatch):
     assert (captured["max_tokens"], captured["timeout"]) == (16384, 240.0)
 
 
+def test_the_sdk_client_is_constructed_with_retries_DISABLED(monkeypatch):
+    """`_stub_adapter` assigns `_client` directly, so nothing above exercises the CONSTRUCTION path
+    where `max_retries` is passed. This does.
+
+    The SDK defaults `max_retries` to 2 and retries APITimeoutError internally, so a bare
+    `anthropic.Anthropic()` makes every per-attempt ceiling cost up to 3x its configured value
+    inside a single `messages.create` — invisible to the driver, invisible in the log line, and
+    charged to the source advisory lock. Deleting the kwarg is a one-token edit that triples the
+    deployed bound, which is why it is asserted on the assembled call rather than trusted to review.
+    """
+    import sys
+    import types
+
+    captured = {}
+    stub = types.ModuleType("anthropic")
+    stub.APIStatusError = type("APIStatusError", (Exception,), {})
+    stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
+    stub.APITimeoutError = type("APITimeoutError", (stub.APIConnectionError,), {})
+
+    def _anthropic(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(messages=types.SimpleNamespace(create=None))
+
+    stub.Anthropic = _anthropic
+    monkeypatch.setitem(sys.modules, "anthropic", stub)
+
+    ClaudeLLM(ClaudeConfig(enabled=True))._ensure_client()
+
+    assert captured["max_retries"] == 0
+    assert captured == {"max_retries": 0}, (
+        "an extra constructor kwarg is a client-wide behaviour change; state it here deliberately")
+
+
 def test_claude_adapter_without_usage_still_returns_cleanly(monkeypatch):
     """#24: usage is OPTIONAL — a response without it yields empty cost_metadata, never a crash
     (FakeLLM-shaped clients carry no usage)."""

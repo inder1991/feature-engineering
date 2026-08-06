@@ -40,8 +40,11 @@ class ClaudeConfig:
     thinking: str = "adaptive"           # adaptive thinking (§9.5); budget_tokens is a 400 on 4.8
     effort: str = "high"
     # MF-4 — per-call wall-clock ceiling (seconds). A hung provider call would otherwise hold the
-    # source advisory lock indefinitely and could fail the whole catalog ingest. Retries stay bounded
-    # (2, unchanged); this bounds each attempt. Default 60s (env FEATUREGEN_LLM_TIMEOUT).
+    # source advisory lock indefinitely and could fail the whole catalog ingest. This bounds each
+    # PHYSICAL attempt — and because `_SDK_MAX_RETRIES` is 0 it is also the entire wall clock of one
+    # `messages.create`, so the ceiling an operator configures is the ceiling that elapses. The
+    # driver's bounded repair/retry budget (§9.2) is the only retry layer above it.
+    # Default 60s (env FEATUREGEN_LLM_TIMEOUT); the kind deployment sets 300.
     timeout: float = 60.0
 
     @classmethod
@@ -172,6 +175,30 @@ def _rejected_schema_keyword(message: str) -> str | None:
     return None
 
 
+#: `max_retries` for the Anthropic client. ZERO, deliberately.
+#:
+#: The SDK default is 2, and it retries `APITimeoutError` internally — its own documentation states
+#: "wall-clock can reach timeout x (max_retries+1)". So the SDK silently does, one layer down, the
+#: exact thing the `APITimeoutError` arm below refuses to do: re-issue a request identically after
+#: it needed longer than the clock it was given. Left at the default, a 300s configured ceiling
+#: costs up to 900s per physical attempt, and the per-attempt bound MF-4 exists to enforce (see
+#: `ClaudeConfig.timeout`) is multiplied by 3 while the source advisory lock is held.
+#:
+#: With this at 0, `drive_structured_call`'s bounded repair/retry budget is the ONE retry authority
+#: (spec §9.2), the elapsed wall time equals `_effective_timeout`, and the warning that arm logs is
+#: honest rather than a third of the truth.
+#:
+#: WHAT THIS GIVES UP, stated rather than discovered: the SDK's `retry-after`-respecting backoff on
+#: 429/5xx. The driver still retries PROVIDER_TRANSIENT twice, but IMMEDIATELY — it has no backoff
+#: of its own. Accepted because rate-limit storms are not this workload's shape: `run_batched`
+#: issues chunks strictly sequentially from a single-replica backend, so there is no burst
+#: concurrency to rate-limit, and the SDK's backoff sleeps are themselves unbounded additions to the
+#: lock hold (a `retry-after: 60` sleeps outside the `timeout` budget entirely). A 429 that does
+#: survive three immediate attempts leaves its items uncached for the next ingest — the ladder's
+#: ordinary fail-soft outcome — instead of holding the lock through a sleep nobody bounded.
+_SDK_MAX_RETRIES = 0
+
+
 class ClaudeLLM:
     """LLMClient over the Anthropic SDK. Construction is lazy — it does NOT import `anthropic`;
     the SDK loads inside `.call` only when enabled, so CI never imports it."""
@@ -193,7 +220,7 @@ class ClaudeLLM:
                     "anthropic SDK not installed; failing closed (no FakeLLM fallback, D5)"
                 ) from exc
             try:
-                self._client = anthropic.Anthropic()
+                self._client = anthropic.Anthropic(max_retries=_SDK_MAX_RETRIES)
             except Exception as exc:  # missing creds / config → fail closed
                 raise LLMAdapterUnavailable(f"Claude adapter unavailable: {exc}") from exc
         return self._client
@@ -249,14 +276,15 @@ class ClaudeLLM:
             return _fail(PROVIDER_NON_RETRYABLE)    # other non-retryable 4xx → fail closed
         except anthropic.APITimeoutError:
             # NOT transient, and ordered BEFORE APIConnectionError because it is a SUBCLASS of it —
-            # today this exception reaches that arm by inheritance, never by intent. The SDK has
-            # already retried genuine network faults internally (max_retries=2) before raising, so
-            # what arrives here is a request that needs longer than the ceiling this attempt was
-            # given — deterministic, and re-attempting it identically spends the budget proving it.
-            # Fail closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
+            # today this exception reaches that arm by inheritance, never by intent. With
+            # `_SDK_MAX_RETRIES` at 0 this is the first and ONLY attempt at this clock, so what
+            # arrives here is a request that needs longer than the ceiling it was given —
+            # deterministic, and re-attempting it identically spends the budget proving it. Fail
+            # closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
             # switches this adapter to streaming. The logged clock is the EFFECTIVE one (an
             # escalated truncation retry runs at a multiple of the configured value), or the
-            # operator reads a ceiling that was never applied.
+            # operator reads a ceiling that was never applied — and with no SDK retry layer beneath
+            # it, that effective clock is also the real elapsed wall time rather than a third of it.
             logger.warning("anthropic call timed out after %.0fs (task=%s) — non-retryable; "
                            "raise FEATUREGEN_LLM_TIMEOUT or stream",
                            _effective_timeout(request, self._config), request.task)

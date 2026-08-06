@@ -23,6 +23,31 @@ data:
   # the call succeeds in ONE shot (no costly retries). NB: setting this above the model's real output
   # ceiling makes the provider 400 the request outright, so this is the safe practical max, not higher.
   FEATUREGEN_LLM_MAX_TOKENS: "32000"
+  # Per-CALL wall-clock ceiling, seconds. The 60s default is mismatched with
+  # FEATUREGEN_LLM_MAX_TOKENS=32000 + adaptive thinking at effort=high: a slow call dies at 60s and,
+  # now that a timeout is classified non-retryable, fails its chunk outright — one billing, no
+  # result, a stage truthfully reported as truncated. 300s covers the heaviest task (feature
+  # generation), not just enrichment.
+  #
+  # WHAT THIS MULTIPLIES OUT TO, because the number alone does not say. `drive_structured_call` may
+  # issue up to FIVE physical calls for one logical call (1 initial + 2 truncation retries + 2
+  # repairs), and a truncation retry scales max_tokens AND this clock by the same ratio. With
+  # FEATUREGEN_LLM_MAX_TOKENS=32000 against the driver's 64000 escalation ceiling that ratio caps at
+  # 2x after a single step, so the worst-case chain is 300 + 4x600 = 2700s. The Anthropic client is
+  # built with max_retries=0 (llm_claude._SDK_MAX_RETRIES) precisely so the SDK does not multiply
+  # that by a further 3x, as its default of 2 would. NOTE THE INVERSION: LOWERING
+  # FEATUREGEN_LLM_MAX_TOKENS RAISES the worst case, because a smaller ceiling escalates further
+  # before capping — at the 4096 code default the ratio reaches 4x and the chain reaches 4500s.
+  # tests/featuregen/intake/test_deployment_llm_bounds.py pins this arithmetic against both files.
+  #
+  # 2700s exceeds OVERLAY_ENRICH_STAGE_DEADLINE_S below, and that is a known, bounded overshoot: the
+  # deadline is checked only BEFORE issuing each new chunk, so it cannot interrupt a call already in
+  # flight, and the source advisory lock is held for the excess. Reaching 2700s needs four
+  # consecutive calls that each run to ~their full ceiling AND return a complete-but-schema-invalid
+  # body, because a single timeout ends the chain outright — so the realistic bad case is one hung
+  # call at 300-600s. Bounding the LOGICAL call needs a deadline inside the driver; that is a code
+  # change, deliberately not a deployment one.
+  FEATUREGEN_LLM_TIMEOUT: "300"
   # Drift-freshness SLA = 30 days. This single-node demo cluster runs NO periodic drift scanner, so
   # the default 60-min SLA makes resolve_fact REVERIFY(drift_stale_pending_scan) as soon as a VERIFIED
   # fact's watermark ages past an hour — which silently drops is_grain/as_of and starves the planner.
@@ -53,10 +78,23 @@ data:
   # per-source lock while it runs, so a slow provider can now block re-uploads of the SAME source
   # for longer — acceptable here, worth revisiting for concurrent ingestion.
   OVERLAY_ENRICH_STAGE_DEADLINE_S: "1800"
-  # Release-A flags (verified-interfaces D8; both DEFAULT OFF until the Release-A deploy gate
-  # presents them together for approval). Truthy set: 1/true/yes/on.
-  # Richer feature-generation context (v2+ payload shape) — off ⟹ the thin v1 menu, byte-for-byte.
-  FEATUREGEN_FEATURE_CONTEXT: "0"
+  # Per-stage physical-provider-call ceiling for batched enrichment. The 32 default is exactly
+  # break-even at 126 columns (summary/synonyms both run over EVERY column at 8 per chunk, so a
+  # 256-column catalog exhausts it with zero retries). 100 covers ~500 columns with headroom for
+  # the degradation ladder while still tripping on a runaway loop. This is a COUNT bound, not a time
+  # bound — the deadline above and the wall-clock budget derived from it remain what stops a slow
+  # run, so raising this does not lengthen how long the stage may hold the source lock.
+  OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "100"
+  # Release-A flags (verified-interfaces D8). FEATUREGEN_FEATURE_CONTEXT is now ON (the Release-A
+  # deploy gate approved it); FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated.
+  # Truthy set: 1/true/yes/on.
+  # Richer feature-generation context (v4 payload). ON: feature generation receives the full
+  # semantic dossier — concept, definition, domain, ai_summary, semantic_terms, party_role,
+  # concept ancestry, identifier namespace, cross-catalog links — plus `semantic_authority`,
+  # the {field: "producer/strength"} map that makes an LLM proposal legible AS a proposal.
+  # Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION="3" drops to the shipped v3 payload
+  # WITHOUT falling back to the thin v1 menu.
+  FEATUREGEN_FEATURE_CONTEXT: "1"
   # THE v3 ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v4, the shared
   # SemanticContextBundleV1 contract. Add `FEATUREGEN_FEATURE_CONTEXT_VERSION: "3"` here to fall
   # back to the shipped v3 payload (smaller prompts, no concept ancestry / identifier namespace /
