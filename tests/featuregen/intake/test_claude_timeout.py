@@ -2,7 +2,10 @@
 `messages.create` cannot hold the source advisory lock indefinitely. The `ClaudeConfig.timeout`
 default/env test is SDK-FREE (constructs a dataclass only) and runs in CI; the call-path test drives
 `llm.call(...)`, which does `import anthropic`, so it is SDK-GATED via `pytest.importorskip`."""
-from featuregen.intake.llm_claude import ClaudeConfig
+from dataclasses import replace
+
+from featuregen.intake.llm import LLMRequest
+from featuregen.intake.llm_claude import ClaudeConfig, _effective_timeout
 
 
 def test_timeout_default_and_env(monkeypatch):
@@ -10,6 +13,33 @@ def test_timeout_default_and_env(monkeypatch):
     assert ClaudeConfig().timeout == 60.0
     monkeypatch.setenv("FEATUREGEN_LLM_TIMEOUT", "12.5")
     assert ClaudeConfig.from_env().timeout == 12.5
+
+
+def _req(timeout_scale=1.0):
+    return LLMRequest(task="t", prompt_id="p", prompt_version=1, inputs={},
+                      output_schema_id="s", output_schema_version=1,
+                      generation_settings={}, output_schema={"type": "object"},
+                      timeout_scale=timeout_scale)
+
+
+def test_effective_timeout_scales_the_configured_clock_with_the_escalated_ceiling():
+    # A truncation retry raises max_tokens; the wall clock must follow, or the retry is cut off
+    # before it can spend the ceiling it was given. SDK-free (the `_wire_output_config` idiom):
+    # `_effective_timeout` is pure, so the ceiling/clock coupling is provable without the SDK.
+    #
+    # It SCALES the configured value rather than replacing it — a later task sets
+    # FEATUREGEN_LLM_TIMEOUT deliberately at the deployment layer, and this must ride whatever
+    # that value is. Asserted against a NON-default config so a hard-coded 60 could not pass.
+    config = ClaudeConfig(timeout=300.0)
+    assert _effective_timeout(_req(), config) == 300.0            # un-escalated: exactly as configured
+    assert _effective_timeout(_req(2.0), config) == 600.0         # 2x the ceiling, 2x the clock
+    assert _effective_timeout(_req(4.0), config) == 1200.0
+
+
+def test_effective_timeout_leaves_the_baseline_call_untouched():
+    # The un-escalated path must keep EXACTLY today's timeout — this change raises the clock only
+    # for a retry that was granted more tokens, never the baseline for every call.
+    assert _effective_timeout(_req(), ClaudeConfig()) == ClaudeConfig().timeout == 60.0
 
 
 def test_messages_create_receives_timeout(monkeypatch):
@@ -21,7 +51,6 @@ def test_messages_create_receives_timeout(monkeypatch):
     import pytest
 
     pytest.importorskip("anthropic")
-    from featuregen.intake.llm import LLMRequest
     from featuregen.intake.llm_claude import ClaudeLLM
 
     captured = {}
@@ -42,3 +71,8 @@ def test_messages_create_receives_timeout(monkeypatch):
     with pytest.raises(RuntimeError):
         llm.call(req)
     assert captured["timeout"] == 7.0
+    # ...and an ESCALATED request (a truncation retry granted 4x the tokens) carries 4x the clock
+    # all the way to `messages.create` — the end-to-end wiring the pure helper cannot prove alone.
+    with pytest.raises(RuntimeError):
+        llm.call(replace(req, timeout_scale=4.0))
+    assert captured["timeout"] == 28.0

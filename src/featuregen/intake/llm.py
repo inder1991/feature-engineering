@@ -48,6 +48,15 @@ class LLMRequest:
     # (compute_input_hash reads ``inputs``, not request fields), never stored on the llm_call audit,
     # and never removed from ``inputs`` — the redacted inputs the guard/audit see are unchanged.
     cacheable_metadata_keys: tuple[str, ...] = ()
+    # Multiplier the adapter applies to its CONFIGURED per-attempt wall clock (MF-4,
+    # FEATUREGEN_LLM_TIMEOUT) — 1.0 is every baseline call, i.e. exactly the configured value. Only
+    # `_escalated` raises it, by the SAME ratio it raises `max_tokens`: an attempt granted 4x the
+    # output tokens needs 4x the clock to spend them, or the retry is cut off mid-generation and the
+    # truncation is merely relabelled as a timeout. A WIRE hint like `cacheable_metadata_keys`:
+    # excluded from the idempotency key (compute_input_hash reads ``inputs``; find_llm_call compares
+    # ``generation_settings``) and never stored on the llm_call audit — the ESCALATION is audited as
+    # the `max_tokens` entry in repair_attempts, and the clock is derived from it.
+    timeout_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -224,6 +233,12 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
     models, so replaying identical bytes re-truncates. Raise the ceiling instead. Schema-fault and
     transient retries ARE genuinely re-attemptable as-is and pass through unchanged.
 
+    ONE decision, two consequences: the ratio that raises the ceiling also raises `timeout_scale`,
+    because a ceiling the attempt has no TIME to fill is not a different attempt — it fails on the
+    adapter's per-attempt clock (MF-4) as an APITimeoutError, which maps to PROVIDER_TRANSIENT and
+    spends the same budget for the same FAILED outcome. Deriving both from one ratio here is what
+    stops the ceiling and the clock drifting apart.
+
     Returns `(request, raised_to)`; `raised_to` is None when nothing changed, so the caller can
     record the escalation in `attempts` without inventing a value.
     """
@@ -235,9 +250,12 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
         return request, None
     raised = min(int(current * _TRUNCATION_ESCALATION), _MAX_TOKENS_CEILING)
     if raised <= current:
-        return request, None       # already at the cap — do not burn a call re-proving it
+        return request, None       # already at the cap — escalate no further, and do not re-scale
     gs["max_tokens"] = raised
-    return replace(request, generation_settings=gs), raised
+    # The clock scales by the ACTUAL ratio applied, not by _TRUNCATION_ESCALATION: the attempt that
+    # lands on the cap gets a partial raise, and must get exactly that much more time.
+    return replace(request, generation_settings=gs,
+                   timeout_scale=request.timeout_scale * (raised / current)), raised
 
 
 def drive_structured_call(

@@ -127,6 +127,20 @@ def _wire_output_config(request: LLMRequest, config: ClaudeConfig) -> dict:
     }
 
 
+def _effective_timeout(request: LLMRequest, config: ClaudeConfig) -> float:
+    """The per-attempt wall clock (MF-4), SCALED by any truncation escalation the driver applied.
+
+    `config.timeout` stays the baseline for every ordinary call — the deployment layer owns that
+    value via FEATUREGEN_LLM_TIMEOUT, and this multiplies it rather than replacing it, so raising
+    the configured value raises the escalated ceilings with it. `request.timeout_scale` is 1.0
+    unless `_escalated` raised `max_tokens`, in which case it carries the SAME ratio: an attempt
+    allowed 4x the output tokens is allowed 4x the time to generate them. Without this the
+    escalated retry is cut off mid-generation and the truncation is merely relabelled as an
+    APITimeoutError -> PROVIDER_TRANSIENT. Pure + SDK-free so a unit test can prove the coupling
+    without importing the SDK."""
+    return config.timeout * request.timeout_scale
+
+
 # JSON-Schema keywords a provider 400 might name. Length/array-size/numeric bounds are stripped by the
 # wire projection; `enum`/`type` round out the recognizable tokens. Order = extraction priority.
 _SCHEMA_KEYWORDS = ("maxLength", "maxItems", "minItems", "minimum", "maximum",
@@ -196,7 +210,9 @@ class ClaudeLLM:
                     "type": request.generation_settings.get("thinking", self._config.thinking)},
                 "output_config": output_config,
                 "messages": [{"role": "user", "content": user_content}],
-                "timeout": self._config.timeout,   # MF-4 — bound each attempt (retries bounded at 2)
+                # MF-4 — bound each attempt (retries bounded at 2), scaled by any truncation
+                # escalation so a retry granted more tokens is granted the time to generate them.
+                "timeout": _effective_timeout(request, self._config),
             }
             if system is not None:                 # vocab-caching: a cached shared-prefix system block
                 create_kwargs["system"] = system   # (omitted entirely when there is no static prefix)

@@ -195,13 +195,41 @@ def test_a_truncation_retry_raises_max_tokens():
     assert outcome.repair_attempts[0]["max_tokens"] == 8192
 
 
+def test_a_truncation_retry_raises_the_wall_clock_with_the_ceiling():
+    """A raised ceiling the attempt has no TIME to fill is not a different attempt.
+
+    Generating 8-16K output tokens takes materially longer than the 60s default per-attempt clock,
+    and adaptive thinking spends more of that budget too. Leaving the clock pinned converts the
+    truncation into an APITimeoutError -> PROVIDER_TRANSIENT: the budget is still spent and the
+    outcome is still FAILED, which is the very "three calls, one outcome" this escalation removes.
+    """
+    seen: list[tuple[int, float]] = []
+
+    class _Truncating:
+        def call(self, request):
+            seen.append((request.generation_settings["max_tokens"], request.timeout_scale))
+            return LLMResult(output={}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_MAX_TOKENS)
+
+    request = LLMRequest(
+        task="t", prompt_id="p", prompt_version=1, inputs={},
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={"model": "m", "max_tokens": 4096},
+        output_schema={"type": "object"})
+    drive_structured_call(_Truncating(), request, lambda _out: None)
+
+    # ONE decision, two consequences: 4x the tokens is also 4x the clock. The first attempt is the
+    # un-escalated baseline — whatever FEATUREGEN_LLM_TIMEOUT is configured to, it is unchanged.
+    assert seen == [(4096, 1.0), (8192, 2.0), (16384, 4.0)]
+
+
 def test_a_transient_retry_is_replayed_unchanged():
     """Only truncation escalates — a transient fault is genuinely re-attemptable as-is."""
-    seen: list[int] = []
+    seen: list[tuple[int, float]] = []
 
     class _Transient:
         def call(self, request):
-            seen.append(request.generation_settings["max_tokens"])
+            seen.append((request.generation_settings["max_tokens"], request.timeout_scale))
             return LLMResult(output={}, self_reported_scores={}, call_ref="",
                              status=PROVIDER_TRANSIENT)
 
@@ -212,7 +240,8 @@ def test_a_transient_retry_is_replayed_unchanged():
         output_schema={"type": "object"})
     drive_structured_call(_Transient(), request, lambda _out: None)
 
-    assert seen == [4096, 4096, 4096]
+    # neither the ceiling NOR the clock moves — a transient retry must stay byte-identical
+    assert seen == [(4096, 1.0), (4096, 1.0), (4096, 1.0)]
 
 
 def test_provider_calls_counted_single_request():
