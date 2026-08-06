@@ -33,16 +33,17 @@ data:
   # issue up to FIVE physical calls for one logical call (1 initial + 2 truncation retries + 2
   # repairs), and a truncation retry scales max_tokens AND this clock by the same ratio. With
   # FEATUREGEN_LLM_MAX_TOKENS=32000 against the driver's 64000 escalation ceiling that ratio caps at
-  # 2x after a single step, so the worst-case chain is 300 + 4x600 = 2700s. The Anthropic client is
-  # built with max_retries=0 (llm_claude._SDK_MAX_RETRIES) precisely so the SDK does not multiply
-  # that by a further 3x, as its default of 2 would. NOTE THE INVERSION: LOWERING
-  # FEATUREGEN_LLM_MAX_TOKENS RAISES the worst case, because a smaller ceiling escalates further
-  # before capping — at the 4096 code default the ratio reaches 4x and the chain reaches 4500s.
+  # 2x after a single step, so the provider ceilings sum to 300 + 4x600 = 2700s, plus up to 2s of
+  # bounded transient backoff = 2702s. The Anthropic client is built with max_retries=0
+  # (llm_claude._SDK_MAX_RETRIES) precisely so the SDK does not multiply that by a further 3x, as
+  # its default of 2 would. NOTE THE INVERSION: LOWERING FEATUREGEN_LLM_MAX_TOKENS RAISES the worst
+  # case, because a smaller ceiling escalates further before capping — at the 4096 code default the
+  # ratio reaches 4x and the chain reaches 4500s.
   # tests/featuregen/intake/test_deployment_llm_bounds.py pins this arithmetic against both files.
   #
-  # 2700s exceeds OVERLAY_ENRICH_STAGE_DEADLINE_S below, and that is a known, bounded overshoot: the
+  # 2702s exceeds OVERLAY_ENRICH_STAGE_DEADLINE_S below, and that is a known, bounded overshoot: the
   # deadline is checked only BEFORE issuing each new chunk, so it cannot interrupt a call already in
-  # flight, and the source advisory lock is held for the excess. Reaching 2700s needs four
+  # flight, and the source advisory lock is held for the excess. Reaching 2702s needs four
   # consecutive calls that each run to ~their full ceiling AND return a complete-but-schema-invalid
   # body, because a single timeout ends the chain outright — so the realistic bad case is one hung
   # call at 300-600s. Bounding the LOGICAL call needs a deadline inside the driver; that is a code
@@ -85,9 +86,10 @@ data:
   # bound — the deadline above and the wall-clock budget derived from it remain what stops a slow
   # run, so raising this does not lengthen how long the stage may hold the source lock.
   OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "100"
-  # Release-A flags (verified-interfaces D8). FEATUREGEN_FEATURE_CONTEXT is now ON (the Release-A
-  # deploy gate approved it); FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated.
-  # Truthy set: 1/true/yes/on.
+  # Release-A flags (verified-interfaces D8). FEATUREGEN_FEATURE_CONTEXT is SET ON here;
+  # FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated. Truthy set: 1/true/yes/on.
+  # NOT AN APPROVAL RECORD: applying this ConfigMap IS the Release-A gate decision for the flag
+  # below, and that decision has not been taken. This file states a value, never a sign-off.
   # Richer feature-generation context (v4 payload). ON: feature generation receives the full
   # semantic dossier — concept, definition, domain, ai_summary, semantic_terms, party_role,
   # concept ancestry, identifier namespace, cross-catalog links — plus `semantic_authority`,

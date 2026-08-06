@@ -32,6 +32,7 @@ from featuregen.intake.llm import (
     _TRUNCATION_ESCALATION,
     DEFAULT_REPAIR_BUDGET,
     DEFAULT_RETRY_BUDGET,
+    transient_backoff_s,
 )
 from featuregen.intake.llm_claude import _SDK_MAX_RETRIES
 
@@ -50,7 +51,8 @@ _EXPECTED = {
 #: The worst-case wall clock of ONE logical call at the deployed configuration, in seconds, as
 #: computed by :func:`_worst_case_logical_call_seconds` and asserted below. Written out so the
 #: number in the manifest comment and the number the code produces cannot drift apart silently.
-_EXPECTED_WORST_CASE_S = 2700.0
+#: 2700s of provider ceilings + 2s of bounded transient backoff.
+_EXPECTED_WORST_CASE_S = 2702.0
 
 
 @pytest.fixture(scope="module")
@@ -71,16 +73,23 @@ def _worst_case_logical_call_seconds(timeout: float, max_tokens: int) -> float:
     The chain is `1 initial + DEFAULT_RETRY_BUDGET retries + DEFAULT_REPAIR_BUDGET repairs`, and
     every physical attempt is multiplied by the SDK's own internal retry count.
     """
-    scale, current = 1.0, max_tokens
+    scale, current, backoff = 1.0, max_tokens, 0.0
     total = timeout * scale                              # the initial attempt
-    for _ in range(DEFAULT_RETRY_BUDGET):
+    for retry_no in range(1, DEFAULT_RETRY_BUDGET + 1):
         raised = min(int(current * _TRUNCATION_ESCALATION), _MAX_TOKENS_CEILING)
         if raised > current:
-            scale *= raised / current
+            scale *= raised / current                    # a truncation retry: escalates, no wait
             current = raised
+        else:
+            # This retry can no longer escalate the clock, so the LONGEST chain spends it on the
+            # PROVIDER_TRANSIENT class instead — same per-attempt ceiling, plus bounded backoff.
+            # Choosing per retry is what makes this an upper bound over the class mix rather than
+            # over one assumed sequence.
+            backoff += transient_backoff_s(retry_no)
         total += timeout * scale
     total += DEFAULT_REPAIR_BUDGET * timeout * scale     # repairs keep the escalated ceiling/clock
-    return total * (_SDK_MAX_RETRIES + 1)
+    # Backoff is OURS, inside the driver loop — the SDK multiplier applies to provider attempts only.
+    return total * (_SDK_MAX_RETRIES + 1) + backoff
 
 
 # ── the values themselves ────────────────────────────────────────────────────────────────────────
@@ -156,7 +165,7 @@ def test_the_stage_deadline_CANNOT_bound_a_call_already_in_flight(config_map) ->
         max_tokens=int(config_map["FEATUREGEN_LLM_MAX_TOKENS"]),
     )
     assert worst_case > deadline
-    assert deadline + worst_case == 4500.0      # the real worst-case lock hold, stated once
+    assert deadline + worst_case == 4502.0      # the real worst-case lock hold, stated once
 
 
 # ── both deployment files ────────────────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ import hashlib
 import psycopg
 import logging
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
@@ -258,6 +259,33 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
                    timeout_scale=request.timeout_scale * (raised / current)), raised
 
 
+#: Bounded backoff before a PROVIDER_TRANSIENT re-call. Doubling from 1s, capped at 5s per wait.
+#:
+#: This driver was the ONLY retry layer with no wait at all: `_RETRYABLE` re-called in the same tick,
+#: so three attempts against a rate-limited or overloaded provider completed inside a few
+#: milliseconds and were three guaranteed failures. That was survivable only while the Anthropic SDK
+#: was absorbing the class underneath us with its own backoff; `llm_claude._SDK_MAX_RETRIES = 0`
+#: removed that, so the wait has to exist at the layer that can actually see the disposition.
+#:
+#: TRANSIENT ONLY, deliberately. `_RETRYABLE` also covers PROVIDER_MAX_TOKENS and
+#: PROVIDER_SCHEMA_FAULT, and both are DETERMINISTIC — a truncation does not un-truncate because we
+#: waited, so sleeping there would buy nothing and add latency to the common escalation path.
+#:
+#: WHAT IT DOES NOT RECOVER, stated so nobody reads more into it: a long provider `retry-after`
+#: (a per-minute token quota is commonly 30-60s). The PROVIDER_* taxonomy is a bare status token
+#: with no metadata channel, so the header the provider sends cannot reach this decision — see
+#: DEFERRED-WORK A.49. What this does recover is the short blip: 529 `overloaded_error` and
+#: transient 5xx, which typically clear in seconds.
+_TRANSIENT_BACKOFF_BASE_S = 1.0
+_TRANSIENT_BACKOFF_CAP_S = 5.0
+
+
+def transient_backoff_s(retries_used: int) -> float:
+    """Seconds to wait before the Nth transient re-call (N is 1-based). Public and pure so the
+    deployment-bounds test can fold it into the worst-case chain instead of hard-coding a number."""
+    return min(_TRANSIENT_BACKOFF_BASE_S * (2 ** (retries_used - 1)), _TRANSIENT_BACKOFF_CAP_S)
+
+
 #: Bound on the rendered repair feedback — a pathological error list must not grow the payload.
 _MAX_REPAIR_FEEDBACK_CHARS = 2000
 
@@ -325,6 +353,7 @@ def drive_structured_call(
     *,
     repair_budget: int = DEFAULT_REPAIR_BUDGET,
     retry_budget: int = DEFAULT_RETRY_BUDGET,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> StructuredCallOutcome:
     """Drive one structured LLM call to a fail-closed disposition (§9.2). Provider-agnostic:
     re-invokes `client.call` for repairs/retries. `validate_output(output)` raises
@@ -333,7 +362,12 @@ def drive_structured_call(
     Truncation/schema-fault/transient → bounded retry. Auth → fail closed + security-audit signal.
     Nothing proceeds on an unresolved outcome; an invalid structure is a doubt, not a value.
     The outcome's `provider_calls` counts every `client.call` issued (#21) so callers tallying a
-    provider-call budget account for repairs/retries, not just the initial request."""
+    provider-call budget account for repairs/retries, not just the initial request.
+
+    A TRANSIENT retry waits first (`transient_backoff_s`); the deterministic retry classes do not.
+    `sleep` is the seam that keeps that assertable without wall-clock — callers should leave it
+    alone, and the test suite zeroes the SCHEDULE rather than replacing the function, so the wait
+    still happens and can still be observed."""
     attempts: list[dict] = []
     repairs_used = 0
     retries_used = 0
@@ -388,6 +422,11 @@ def drive_structured_call(
                 request, raised = _escalated(request, ps)
                 attempts.append({"attempt": retries_used, "class": "retry", "reason": ps,
                                  **({"max_tokens": raised} if raised else {})})
+                # Wait only for the class a wait can help (see `_TRANSIENT_BACKOFF_BASE_S`). The
+                # ledger entry is appended BEFORE the wait, so an attempt is recorded as issued
+                # whether or not the process survives the sleep.
+                if ps == PROVIDER_TRANSIENT:
+                    sleep(transient_backoff_s(retries_used))
                 resp = client.call(request)
                 provider_calls += 1
                 continue

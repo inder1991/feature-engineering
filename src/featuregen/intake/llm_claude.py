@@ -188,14 +188,32 @@ def _rejected_schema_keyword(message: str) -> str | None:
 #: (spec §9.2), the elapsed wall time equals `_effective_timeout`, and the warning that arm logs is
 #: honest rather than a third of the truth.
 #:
-#: WHAT THIS GIVES UP, stated rather than discovered: the SDK's `retry-after`-respecting backoff on
-#: 429/5xx. The driver still retries PROVIDER_TRANSIENT twice, but IMMEDIATELY — it has no backoff
-#: of its own. Accepted because rate-limit storms are not this workload's shape: `run_batched`
-#: issues chunks strictly sequentially from a single-replica backend, so there is no burst
-#: concurrency to rate-limit, and the SDK's backoff sleeps are themselves unbounded additions to the
-#: lock hold (a `retry-after: 60` sleeps outside the `timeout` budget entirely). A 429 that does
-#: survive three immediate attempts leaves its items uncached for the next ingest — the ladder's
-#: ordinary fail-soft outcome — instead of holding the lock through a sleep nobody bounded.
+#: WHAT THIS GIVES UP. Three classes, not one — the SDK was absorbing more than self-inflicted
+#: rate-limit bursts, and each is listed with where it now lands:
+#:
+#: 1. CONNECTION-LEVEL TIMEOUTS, and this is the sharp edge. The SDK raises `APITimeoutError` from
+#:    ANY `httpx.TimeoutException` — connect, pool and write, not only "this generation needed more
+#:    clock". All of them reach the `APITimeoutError` arm below, which returns
+#:    PROVIDER_NON_RETRYABLE, which `llm.py` treats as terminal. So a sub-second TCP connect blip
+#:    now kills the chunk with no retry at ANY layer. NOT recovered here and NOT recovered by the
+#:    driver's backoff (that arm is never reached): the fix is to stop classifying every
+#:    `APITimeoutError` as a generation overrun, which is a change to the arm's own contract rather
+#:    than to this constant. Tracked as DEFERRED-WORK A.49.
+#: 2. PROVIDER-SIDE CAPACITY — 529 `overloaded_error`, and org-wide or shared-key ITPM/OTPM limits.
+#:    These are independent of OUR concurrency: one sequential caller issuing max_tokens=32000
+#:    requests is exactly the shape that meets an output-token-per-minute ceiling. They map to
+#:    PROVIDER_TRANSIENT and are RECOVERED, by the bounded backoff `llm._TRANSIENT_BACKOFF_BASE_S`
+#:    adds to the driver's own retry arm — at the layer that can see the disposition, and costing
+#:    ≤3s against a 2700s worst-case chain.
+#: 3. A LONG `retry-after`. Bounded backoff does not clear a 30-60s per-minute quota, and the
+#:    PROVIDER_* taxonomy carries no metadata channel to pass the provider's header into the
+#:    decision. Partially given up, deliberately, and tracked as DEFERRED-WORK A.49.
+#:
+#: What is NOT given up is the self-inflicted burst: `run_batched` issues chunks strictly
+#: sequentially from a single-replica backend, so there is no concurrency of ours to rate-limit.
+#: And the SDK's own sleeps were themselves an unbounded addition to the lock hold — a
+#: `retry-after: 60` sleeps outside the `timeout` budget entirely — which the driver's capped
+#: backoff is not.
 _SDK_MAX_RETRIES = 0
 
 
@@ -276,15 +294,26 @@ class ClaudeLLM:
             return _fail(PROVIDER_NON_RETRYABLE)    # other non-retryable 4xx → fail closed
         except anthropic.APITimeoutError:
             # NOT transient, and ordered BEFORE APIConnectionError because it is a SUBCLASS of it —
-            # today this exception reaches that arm by inheritance, never by intent. With
-            # `_SDK_MAX_RETRIES` at 0 this is the first and ONLY attempt at this clock, so what
-            # arrives here is a request that needs longer than the ceiling it was given —
-            # deterministic, and re-attempting it identically spends the budget proving it. Fail
-            # closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
-            # switches this adapter to streaming. The logged clock is the EFFECTIVE one (an
-            # escalated truncation retry runs at a multiple of the configured value), or the
-            # operator reads a ceiling that was never applied — and with no SDK retry layer beneath
-            # it, that effective clock is also the real elapsed wall time rather than a third of it.
+            # today this exception reaches that arm by inheritance, never by intent.
+            #
+            # The CASE THIS ARM IS FOR is a generation that needed longer than the ceiling it was
+            # given: deterministic, so re-attempting it identically spends the budget proving it.
+            # Fail closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
+            # switches this adapter to streaming.
+            #
+            # THE CASE IT ALSO CATCHES, and should not: the SDK raises APITimeoutError from ANY
+            # `httpx.TimeoutException`, so a connect/pool/write timeout — a transient network blip,
+            # not a long generation — takes this same terminal path. That used to be masked because
+            # the SDK retried those internally; `_SDK_MAX_RETRIES = 0` removed the mask without
+            # narrowing this arm, so the blip now kills the chunk with no retry at any layer.
+            # KNOWN AND TRACKED (DEFERRED-WORK A.49) rather than silently narrowed here: splitting
+            # the two needs a discriminator this arm does not currently have, and widening what
+            # counts as retryable is a change to the §9.2 taxonomy's contract, not a comment fix.
+            #
+            # The logged clock is the EFFECTIVE one (an escalated truncation retry runs at a
+            # multiple of the configured value), or the operator reads a ceiling that was never
+            # applied — and with no SDK retry layer beneath it, that effective clock is also the
+            # real elapsed wall time rather than a third of it.
             logger.warning("anthropic call timed out after %.0fs (task=%s) — non-retryable; "
                            "raise FEATUREGEN_LLM_TIMEOUT or stream",
                            _effective_timeout(request, self._config), request.task)

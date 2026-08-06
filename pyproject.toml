@@ -83,6 +83,7 @@ testpaths = ["tests"]
 addopts = "--import-mode=importlib -m 'not eval'"
 markers = [
     "eval: manual/nightly quality-gate tests (gold-set enrichment eval; not run in default CI)",
+    "real_backoff: opts OUT of the suite-wide transient-backoff zeroing (tests/conftest.py) so the test sees the REAL schedule. Only for tests that assert the schedule itself; they must still inject their own `sleep=` rather than actually waiting.",
 ]
 # Hard per-test timeout so a hung/deadlocked test (e.g. concurrent DB-lock waits in
 # the optimistic-concurrency / race tasks) FAILS fast instead of hanging the runner.

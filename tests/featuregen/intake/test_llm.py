@@ -2,10 +2,12 @@ import pytest
 
 from featuregen.contracts import SchemaValidationError
 from featuregen.intake.llm import (
+    DEFAULT_RETRY_BUDGET,
     PROVIDER_MAX_TOKENS,
     PROVIDER_NON_RETRYABLE,
     PROVIDER_OK,
     PROVIDER_REFUSAL,
+    PROVIDER_SCHEMA_FAULT,
     PROVIDER_TRANSIENT,
     STATUS_FAILED,
     STATUS_OK,
@@ -339,6 +341,74 @@ def test_a_transient_retry_is_replayed_unchanged():
 
     # neither the ceiling NOR the clock moves — a transient retry must stay byte-identical
     assert seen == [(4096, 1.0), (4096, 1.0), (4096, 1.0)]
+
+
+# ---- bounded backoff on the transient class (Task 4 review, Important 1) -----------------------
+
+
+def _driven(status, *, sleep):
+    """Drive a chain that returns `status` forever, recording every wait."""
+    calls: list[int] = []
+
+    class _Failing:
+        def call(self, request):
+            calls.append(1)
+            return LLMResult(output={}, self_reported_scores={}, call_ref="", status=status)
+
+    request = LLMRequest(
+        task="t", prompt_id="p", prompt_version=1, inputs={},
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={"model": "m", "max_tokens": 4096},
+        output_schema={"type": "object"})
+    outcome = drive_structured_call(_Failing(), request, lambda _out: None, sleep=sleep)
+    return outcome, len(calls)
+
+
+@pytest.mark.real_backoff
+def test_a_transient_retry_WAITS_before_re_calling():
+    """The gap `_SDK_MAX_RETRIES = 0` opened.
+
+    This driver was the only retry layer with no wait: it re-called in the same tick, so three
+    attempts against a rate-limited or overloaded provider finished inside a few milliseconds and
+    were three guaranteed failures. That was survivable only while the Anthropic SDK absorbed the
+    class underneath us with its own backoff, which Task 4 removed to bound the wall clock.
+
+    Injects its own `sleep`, so the suite-wide zeroing fixture cannot make this pass vacuously.
+    """
+    from featuregen.intake.llm import transient_backoff_s
+
+    waits: list[float] = []
+    _outcome, calls = _driven(PROVIDER_TRANSIENT, sleep=waits.append)
+
+    assert calls == 3                            # initial + 2 bounded retries
+    assert waits == [1.0, 2.0]                   # doubling, one wait per re-call — never before the first
+    assert waits == [transient_backoff_s(1), transient_backoff_s(2)]
+
+
+@pytest.mark.parametrize("status", [PROVIDER_MAX_TOKENS, PROVIDER_SCHEMA_FAULT])
+def test_a_DETERMINISTIC_retry_never_waits(status):
+    """Truncation and schema-fault share the `_RETRYABLE` arm but are deterministic: a truncation
+    does not un-truncate because we waited. Sleeping there would add latency to the COMMON
+    escalation path and buy nothing, so the wait is keyed to the class, not to the arm."""
+    waits: list[float] = []
+    _outcome, calls = _driven(status, sleep=waits.append)
+
+    assert calls == 3                            # the retries still happen
+    assert waits == []                           # they just do not wait
+
+
+@pytest.mark.real_backoff
+def test_the_backoff_schedule_is_BOUNDED():
+    """Doubling from 1s, capped at 5s per wait — so a widened `retry_budget` cannot turn the
+    backoff into an unbounded contributor to the source advisory lock hold. At the shipped budget
+    of 2 the whole schedule costs 3s against a 2702s worst-case chain."""
+    from featuregen.intake.llm import _TRANSIENT_BACKOFF_CAP_S, transient_backoff_s
+
+    schedule = [transient_backoff_s(n) for n in range(1, 8)]
+
+    assert schedule == [1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0]
+    assert max(schedule) == _TRANSIENT_BACKOFF_CAP_S
+    assert sum(schedule[:DEFAULT_RETRY_BUDGET]) == 3.0
 
 
 def test_provider_calls_counted_single_request():

@@ -1223,3 +1223,48 @@ train's value into the other's reader. **Closure:** one review-sized task that p
 (the ownership test's own `_FOREIGN_OWNED_CLASSES` comment records the discovery train's
 expectation that the landed semantic plan owns these names), re-exports from the loser, proves
 wire byte-stability both ways, and collapses the pin back into `_SINGLE_OWNER_CLASSES`.
+
+### A.49 Every `APITimeoutError` is classified as a generation overrun, and a long `retry-after` cannot reach the retry decision (2026-08-06, Task 4 review)
+
+Task 4 set `llm_claude._SDK_MAX_RETRIES = 0` to stop the Anthropic SDK multiplying the per-attempt
+wall clock by 3 (its default `max_retries=2` retries `APITimeoutError` internally, so a 300s ceiling
+cost up to 900s per physical attempt, held under the source advisory lock). That was the right call
+for the bound — worst-case chain 8100s → 2702s — but the SDK's retry layer was also silently
+absorbing two classes that nothing else covers. One is now recovered, two are not.
+
+**Recovered in Task 4:** provider-side capacity — 529 `overloaded_error` and transient 5xx. These
+map to `PROVIDER_TRANSIENT`, and `llm.drive_structured_call` previously re-called in the SAME tick
+(no `sleep` existed anywhere in the module), so three attempts completed inside a few milliseconds
+and were three guaranteed failures. `llm._TRANSIENT_BACKOFF_BASE_S` now waits 1s then 2s, capped at
+5s per wait, on the transient class only — deterministic classes (`PROVIDER_MAX_TOKENS`,
+`PROVIDER_SCHEMA_FAULT`) are excluded because waiting cannot change their outcome.
+
+**🟡 NOT recovered — connection-level timeouts are terminal.** The SDK raises `APITimeoutError` from
+*any* `httpx.TimeoutException` — connect, pool and write, not only a slow generation.
+`APITimeoutError` subclasses `APIConnectionError`, and `llm_claude`'s arm maps it to
+`PROVIDER_NON_RETRYABLE`, which `llm.py` treats as terminal. So a sub-second TCP connect blip now
+kills its chunk with **no retry at any layer**, and the backoff above does not help because that arm
+is never reached. Before Task 4 the SDK absorbed this invisibly. The arm's comment says so; the code
+does not yet act on it.
+
+**🟡 NOT recovered — a long `retry-after` never reaches the decision.** A per-minute token quota
+commonly returns `retry-after: 30`–`60`. `LLMResult` carries `status` as a bare `PROVIDER_*` token
+with no metadata channel, so the header the provider sent cannot influence how long the driver
+waits. Bounded backoff of ≤5s does not clear that class; it only converts an instant triple-failure
+into a slightly spaced one.
+
+**Trigger:** the first real 429/529 or connect-blip incident on a deployed catalog — or any change
+that raises ingestion concurrency above the single sequential caller `run_batched` is today, which
+is the assumption making the un-recovered classes tolerable.
+
+**Closure** (one review-sized task, both halves together since both are about the same seam):
+1. Give the timeout arm a discriminator so a connect/pool/write timeout maps to `PROVIDER_TRANSIENT`
+   while a generation overrun stays `PROVIDER_NON_RETRYABLE`. `APITimeoutError` is raised `from` the
+   underlying `httpx` exception, so `__cause__` is the likely discriminator — **verify against the
+   installed SDK rather than assuming**, since `anthropic` lives in the `llm` extra and is not
+   installed in CI, and add a guard test that fails if the SDK stops preserving the cause.
+2. Add a metadata channel for `retry-after` (an optional field on `LLMResult`, populated by the
+   adapter from the response headers) and honour it in `llm._TRANSIENT_BACKOFF_*` bounded by the
+   stage deadline, so the wait is the provider's number rather than ours.
+Both change the §9.2 taxonomy's contract, which is why Task 4 documented them instead of widening
+what counts as retryable inside a configuration change.
