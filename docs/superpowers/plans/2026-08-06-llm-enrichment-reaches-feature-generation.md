@@ -426,7 +426,9 @@ git commit -m "chore(deploy): enable v4 feature context; raise enrichment call c
 
 ---
 
-### Task 4b: Remove truncation from the LLM path — measure, then raise every cap
+### Task 4b: Remove truncation from the LLM path — raise every cap, bound it offline
+
+> **Live measurement is NOT authorised (human decision, 2026-08-06).** Steps 2 and 8 were before/after catalog ingests; both are now offline derivations. Do not run an upload, `deploy.sh`, `kubectl`, or anything that spends LLM budget anywhere in this task.
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/enrich_llm.py` — `MAX_DEFINITION_LEN`, `_MAX_LEN_DEFAULT`, `_TABLE_ADVISORY_MAX_LEN`, `_FEATURE_STRUCTURAL_MAX_LEN`, `_FEATURE_COLLECTION_MAX_ITEMS`, `_MAX_COLUMN_PROFILES`, `_MAX_SOURCE_ATTRIBUTES`
@@ -444,7 +446,7 @@ git commit -m "chore(deploy): enable v4 feature context; raise enrichment call c
 
 **Raise, do not delete.** These constants are the egress control surface — `_FEATURE_STRUCTURAL_MAX_LEN` in particular is an *acceptance gate*, not a formatter: a value over it is EXCLUDED from egress and audited, not truncated. Removing bounds entirely means unbounded uploader-authored text leaving the system with nothing to catch a pathological file. A bound at ~10× the real worst case is functionally zero truncation and still catches a 5,000-column table or a 50 KB "definition".
 
-**The interaction that decides the numbers.** More context per item ⟹ fewer items per chunk ⟹ more provider calls. `chunk_items` packs by BOTH item count and estimated tokens, so raising `NEIGHBOUR_LIMIT` multiplies every concept item and shatters the chunking. Measured baseline from `enrich_config.py`: a 40-entry resolved roster is ~971 tokens/item against a 24,000-token concept chunk budget. At `NEIGHBOUR_LIMIT=512` an item could exceed that budget alone, taking the concept stage from ~8 calls to ~72 for 144 columns. **Step 2 measures this before Step 5 commits to a number.**
+**The interaction that decides the numbers.** More context per item ⟹ fewer items per chunk ⟹ more provider calls. `chunk_items` packs by BOTH item count and estimated tokens, so raising `NEIGHBOUR_LIMIT` multiplies every concept item and shatters the chunking. Measured baseline from `enrich_config.py`: a 40-entry resolved roster is ~971 tokens/item against a 24,000-token concept chunk budget. At `NEIGHBOUR_LIMIT=512` an item could exceed that budget alone, taking the concept stage from ~8 calls to ~72 for 144 columns. **Step 8 tests this offline against the real `chunk_items`, and Step 2 raises the ceiling so that even the degenerate outcome cannot truncate enrichment.**
 
 - [ ] **Step 1: Measure the real data first**
 
@@ -465,17 +467,59 @@ PY
 
 Record: the widest value per header, and the largest table's column count. **Every constant below is set to ≥ 2× the measured maximum**, so replace the suggested values with `2 × measured` wherever the measurement is larger.
 
-- [ ] **Step 2: Measure the current call count, so Step 5's impact is visible**
+- [ ] **Step 2: Derive the call-count ceiling instead of measuring it — NO LIVE RUN**
 
-Run one ingest of the CIB file and record the per-stage physical call counts:
+> **Decision (2026-08-06, human):** the before/after live ingests are NOT authorised. Do not run a catalog upload, do not spend LLM budget. Replace the measurement with a ceiling derived from the code's own constants and guarded by a test. Steps 2 and 8 are both offline.
 
-```sql
-SELECT stage, state, detail FROM ingestion_run_stage
-WHERE ingestion_run_id = '<run id>' AND stage LIKE 'enrich_%' ORDER BY id;
-SELECT count(*) FROM llm_call WHERE run_id = '<enrichment run id>';
+The reason a measurement was wanted: raising the caps means more context per item, so `chunk_items` packs fewer items per chunk, so each stage makes more provider calls. `enrich_config.py:69-73` states the consequence exactly:
+
+> *"an item that alone exceeds the token budget still forms its own chunk — nothing is ever dropped for size. So an under-budgeted bound degrades PROPORTIONALLY (fewer items per chunk → more provider calls), never into a lost item. The real backstop is `budget(short).max_provider_calls`."*
+
+So the ceiling is the only thing that can turn "more calls" into **lost enrichment**. Crossing it does not slow the stage down; it stops enriching columns. Set it above any legitimate chunking outcome and let the wall clock be the operational bound.
+
+**`max_provider_calls` is PER STAGE, not per upload.** `enrich_batch.py:236` builds one `CallLedger(b.max_provider_calls)` per `run_batched` invocation, and `budget(short)` is keyed by task. Verify this before trusting the arithmetic below.
+
+Derive the worst case rather than guessing it. The degenerate case is one item per chunk, so for a column-scoped stage the chunk count equals the column count:
+
+```
+worst_case_calls = largest_catalog_items × max_batch_attempts + max_single_fallback
 ```
 
-Write the numbers into the commit message. Step 6 compares against them.
+With the shipped `max_batch_attempts=2` and `max_single_fallback=8` (`enrich_config.py:146-148`), and the 237-column `wide_catalogs` fixture as the largest catalog this repo exercises:
+
+```
+237 × 2 + 8 = 482
+```
+
+Set the ceiling above that, in `deploy/kind/k8s/20-backend.yaml` (Task 4 shipped `"100"` — this supersedes it):
+
+```yaml
+# Raised from 100 (2026-08-06). PER STAGE, not per upload. This is a RUNAWAY BACKSTOP, not a
+# throughput limiter: crossing it does not slow enrichment down, it silently stops enriching
+# columns (enrich_config.py:69-73 — an over-budget item forms its own chunk, so a tight bound
+# degrades into more calls, and the ceiling turns more calls into lost work). Derived from the
+# degenerate one-item-per-chunk case over the largest catalog this repo exercises:
+# 237 items x max_batch_attempts(2) + max_single_fallback(8) = 482. 512 clears it.
+# The operational cost bound is now OVERLAY_ENRICH_STAGE_DEADLINE_S, not this number.
+OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "512"
+```
+
+Pin the derivation so a future cap change that outgrows it fails a test rather than silently truncating:
+
+```python
+def test_the_call_ceiling_cannot_bind_before_the_wall_clock_does():
+    """The ceiling is a runaway backstop. If it can bind on a legitimate catalog, raising the
+    caps silently STOPS ENRICHING COLUMNS rather than merely costing more calls."""
+    b = enrich_config.budget("concept")
+    worst_case = _LARGEST_CATALOG_ITEMS * b.max_batch_attempts + b.max_single_fallback
+    assert b.max_provider_calls > worst_case, (
+        f"{b.max_provider_calls} can bind at {worst_case} worst-case calls — enrichment would "
+        f"truncate. Raise OVERLAY_ENRICH_MAX_PROVIDER_CALLS or lower the item caps.")
+```
+
+`_LARGEST_CATALOG_ITEMS = 237` with a comment naming `wide_catalogs` as its source. Read the ceiling through `enrich_config.budget(...)` under the deployed environment, not from a literal, so the test tracks the manifest.
+
+**State the cost trade in your report.** 512 per stage across the enrichment stages is a much larger worst-case bill than 100 was, and the ceiling is no longer what stops a runaway — `OVERLAY_ENRICH_STAGE_DEADLINE_S` is. Say so plainly; do not present this as free.
 
 - [ ] **Step 3: Raise the length caps**
 
@@ -585,9 +629,26 @@ Run: `uv run pytest tests/featuregen/overlay/upload/test_feature_context_budget.
 
 Expected: PASS. The egress suites pin what is admitted to leave the system; `_FEATURE_STRUCTURAL_MAX_LEN` is one of their gates and this task moves it. If an egress test fails, **do not relax the test** — the cap change has admitted a shape the guard was built to refuse, and that is the finding.
 
-- [ ] **Step 8: Re-run the ingest and compare call counts against Step 2**
+- [ ] **Step 8: Prove offline that the chunking did not shatter — NO LIVE RUN**
 
-Confirm the per-stage totals still sit inside `OVERLAY_ENRICH_MAX_PROVIDER_CALLS=100`. If `enrich_concept` has grown sharply, `NEIGHBOUR_LIMIT` is the cause — lower it to the largest real table's column count (from Step 1) rather than 512, which is what "no truncation" actually requires.
+> Same decision as Step 2: no ingest, no LLM spend. Replace the re-measurement with a chunking assertion that runs against the real `chunk_items` and the real caps.
+
+The risk Step 8 existed to catch is `NEIGHBOUR_LIMIT=512` multiplying every concept item until items no longer share a chunk. That is measurable without a provider: build items at the NEW caps, run the REAL `chunk_items` against the REAL token budget, and assert the packing did not collapse to one item per chunk.
+
+```python
+def test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps():
+    """The cap raise must degrade packing PROPORTIONALLY, not shatter it. One item per chunk
+    means the concept stage's call count equals its column count — the shape that made the old
+    ceiling bind."""
+    items = [_a_concept_item_at_the_new_caps(i) for i in range(60)]
+    chunks = chunk_items(items, short="concept")
+    assert len(chunks) < len(items), "every item formed its own chunk — packing collapsed"
+    assert max(len(c) for c in chunks) > 1
+```
+
+Build `_a_concept_item_at_the_new_caps` from the same assembly the stage uses, at a fully-populated `NEIGHBOUR_LIMIT` roster — an item smaller than production would make this test pass vacuously. If packing HAS collapsed, that is the real finding: lower `NEIGHBOUR_LIMIT` to the largest real table's column count (from Step 1) rather than 512. Report the measured items-per-chunk either way.
+
+**What this does NOT prove, and must be said so in the report:** the true per-stage call count against a real catalog is still unmeasured. Steps 2 and 8 now bound the failure mode (the ceiling cannot bind; packing has not collapsed) without observing the actual number. A live before/after remains the only way to know it, and it is deferred by explicit human decision — record that in `docs/DEFERRED-WORK.md` so it is not mistaken for verified.
 
 - [ ] **Step 9: Commit, with the measurements in the message**
 
@@ -599,7 +660,9 @@ git add src/featuregen/overlay/upload/enrich_llm.py src/featuregen/overlay/uploa
         tests/featuregen/overlay/upload/test_feature_context_budget.py
 git commit -m "feat(egress): raise every prose and item cap for zero-truncation LLM context
 
-Measured before/after: <call counts from Steps 2 and 8>, <assembled bytes from Step 6>."
+Ceiling derived (not measured): 237 items x 2 attempts + 8 fallbacks = 482 worst case, ceiling 512.
+Packing at the new caps: <items-per-chunk from Step 8>. Assembled bytes: <from Step 6>.
+A live before/after call count is DEFERRED by human decision - see DEFERRED-WORK."
 ```
 
 ---
