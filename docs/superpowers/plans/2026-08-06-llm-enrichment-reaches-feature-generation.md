@@ -549,14 +549,34 @@ These sit far below Opus's 1M-token window; the binding constraint is cost per c
 FEATURE_CONTEXT_BYTE_BUDGET = 1_500_000
 ```
 
-Update the budget test to assert the headroom holds at the measured catalog size:
+**You will break `test_measured_mandatory_bytes_for_v3_and_v4` — that is the point, and you must re-pin it, not delete it.** That test measures the 237-column `wide_catalogs` fixture and pins BOTH versions to tolerance ranges taken at the OLD caps:
 
 ```python
-def test_a_144_column_v4_payload_fits_with_headroom_at_the_raised_caps():
-    columns = _build_v4_columns(n=144)          # reuse this file's existing builder
-    assembled = _assembled_bytes(columns, _table_context(columns))
-    assert assembled < FEATURE_CONTEXT_BYTE_BUDGET * 0.6, (
-        f"{assembled} bytes leaves under 40% headroom — raise the budget or re-check the caps")
+    assert 150_000 < v3 < 200_000, f"v3 mandatory bytes moved: {v3}"
+    assert 215_000 < v4 < 285_000, f"v4 mandatory bytes moved: {v4}"
+```
+
+Raising `MAX_DEFINITION_LEN` 600 → 4000 (and the rest) moves both numbers well above their upper bounds. The ranges exist so a payload change has to come back and re-argue the budget — this task IS that change.
+
+Do it in this order, and do not guess the numbers:
+
+1. Apply Steps 1–5 and the constant above.
+2. Run `uv run pytest tests/featuregen/overlay/upload/test_feature_context_budget.py::test_measured_mandatory_bytes_for_v3_and_v4 -v` and read the two failure messages — they print the real measured `v3` and `v4`.
+3. Re-pin both ranges around the MEASURED values at ±15%, keeping the same message format.
+4. Put the measured v4 figure into the comment above `FEATURE_CONTEXT_BYTE_BUDGET`, replacing `~1_048 bytes/column (237 columns -> 248_601)`. The comment must state what was measured, not what was expected.
+5. Confirm `assert v4 < FEATURE_CONTEXT_BYTE_BUDGET` (already in the test) still holds, and add the headroom assertion below it.
+
+Add this to the same test, using the file's real helper — `_mandatory_bytes(conn, version, monkeypatch)`. **There is no `_build_v4_columns` helper in this file; do not invent one.** The fixture is `wide_catalogs` and the catalog is 237 columns, not 144:
+
+```python
+def test_the_raised_caps_leave_headroom_on_the_worst_realistic_catalog(wide_catalogs, monkeypatch):
+    """237 mandatory columns at the zero-truncation caps must still clear the budget with room.
+
+    Headroom is the point: the budget is not a target to fill. If this fails, the caps grew faster
+    than the budget and one of the two is wrong — decide which, do not just raise the budget."""
+    v4 = _mandatory_bytes(wide_catalogs, 4, monkeypatch)
+    assert v4 < FEATURE_CONTEXT_BYTE_BUDGET * 0.6, (
+        f"{v4} bytes leaves under 40% headroom against {FEATURE_CONTEXT_BYTE_BUDGET}")
 ```
 
 - [ ] **Step 7: Run the suites — the egress one is the one that matters**
@@ -979,13 +999,34 @@ In `_context_v4_column`, immediately after the existing `out["semantic_authority
     # branches on `confidence_band`, and the alternatives are context for the model, never a
     # classification. `_context_v4_column` already strips empty values, so a column that was never
     # adjudicated simply carries neither key.
-    adj = current_adjudication(conn, c["catalog_source"], c["object_ref"])
+    #
+    # READ IT BY `bundle.object_ref`, NOT `c["object_ref"]`. The adjudication subject pointer is
+    # keyed by the SCHEMA-PRESERVING logical ref, which is what the bundle carries; `c` and the
+    # emitted payload carry the PUBLIC-FLATTENED graph ref (see the note on `out["object_ref"]`
+    # above). Passing the flattened form matches no pointer row, so every column would silently
+    # come back unadjudicated — the keys would simply never appear and the feature would look
+    # implemented. Read this BEFORE the `out["object_ref"]` overwrite line, or from `bundle`.
+    adj, _result_id = load_current_adjudication(conn, bundle.object_ref)
     if adj is not None:
         out["confidence_band"] = adj.confidence_band
         out["concept_alternatives"] = list(adj.alternatives)
 ```
 
-Reuse `asset_detail.py`'s existing adjudication read rather than writing a second one — it already resolves the migration-1046 current pointer. If it is not exported, lift it to a shared helper and have both call it; do not duplicate the query.
+Import at the top of the function body, matching how `asset_detail.py:692` does it (deferred import, to keep the module-import cycle it already avoids):
+
+```python
+    from featuregen.overlay.upload.semantic_adjudication import load_current_adjudication
+```
+
+**The exact API — verified, do not substitute from memory:**
+
+```python
+def load_current_adjudication(conn, logical_ref: str) -> tuple[SemanticAdjudicationV2 | None, str | None]
+```
+
+It takes ONE ref (not `catalog_source` + `object_ref`) and returns a **2-tuple** of `(adjudication, structured_result_id)`. `SemanticAdjudicationV2` carries `selected_concept`, `alternatives: tuple[str, ...]`, `confidence_band: str`, `reason_codes`, `missing_context`, `ontology_gap`.
+
+This is `asset_detail.py`'s existing read — the one that already resolves the migration-1046 current pointer. Call it; do not write a second query.
 
 - [ ] **Step 4: Run the tests — expect PASS**
 
