@@ -42,11 +42,19 @@ _KIND_BACKEND = _ROOT / "deploy" / "kind" / "k8s" / "20-backend.yaml"
 
 #: The values this deployment ships. Task 4's brief fixes all three; they are restated here so a
 #: silent revert in the manifest is a red test rather than a quieter cluster.
+#: `OVERLAY_ENRICH_MAX_PROVIDER_CALLS` was raised 100 -> 512 by Task 4b (the zero-truncation cap
+#: raise), and :func:`test_the_call_ceiling_cannot_bind_before_the_wall_clock_does` below derives
+#: that number rather than restating it.
 _EXPECTED = {
     "FEATUREGEN_FEATURE_CONTEXT": "1",
-    "OVERLAY_ENRICH_MAX_PROVIDER_CALLS": "100",
+    "OVERLAY_ENRICH_MAX_PROVIDER_CALLS": "512",
     "FEATUREGEN_LLM_TIMEOUT": "300",
 }
+
+#: The largest catalog this repo exercises end-to-end: the `wide_catalogs` fixture in
+#: `tests/featuregen/overlay/upload/test_feature_context_budget.py` — 126 real FTR glossary columns
+#: plus 111 CIB-shaped technical columns.
+_LARGEST_CATALOG_ITEMS = 237
 
 #: The worst-case wall clock of ONE logical call at the deployed configuration, in seconds, as
 #: computed by :func:`_worst_case_logical_call_seconds` and asserted below. Written out so the
@@ -166,6 +174,51 @@ def test_the_stage_deadline_CANNOT_bound_a_call_already_in_flight(config_map) ->
     )
     assert worst_case > deadline
     assert deadline + worst_case == 4502.0      # the real worst-case lock hold, stated once
+
+
+def test_the_call_ceiling_cannot_bind_before_the_wall_clock_does(config_map, monkeypatch) -> None:
+    """The ceiling is a RUNAWAY BACKSTOP, and the distinction is the whole point of this test.
+
+    `enrich_config`'s own chunking note: an item that alone exceeds the token budget still forms its
+    own chunk, so an under-budgeted bound degrades PROPORTIONALLY — fewer items per chunk, more
+    provider calls — never into a lost item. `max_provider_calls` is the ONE thing that converts
+    "more calls" into "stopped enriching columns". Task 4b raised every prose and item cap, which is
+    exactly the change that makes items bigger and chunks smaller, so if this ceiling can bind on a
+    legitimate catalog the raise silently truncates enrichment instead of merely costing more.
+
+    Derived, not measured — a live before/after ingest was not authorised (see DEFERRED-WORK). The
+    degenerate case is one item per chunk, so for a column-scoped stage the chunk count equals the
+    column count.
+
+    The budget is read through `enrich_config` under the MANIFEST's own environment rather than from
+    a literal, so this tracks the deployment instead of a copy of it.
+    """
+    from featuregen.overlay.upload import enrich_config
+
+    for key, value in config_map.items():
+        if key.startswith("OVERLAY_ENRICH_"):
+            monkeypatch.setenv(key, value)
+
+    b = enrich_config.budget("concept")
+    worst_case = _LARGEST_CATALOG_ITEMS * b.max_batch_attempts + b.max_single_fallback
+    assert b.max_provider_calls > worst_case, (
+        f"{b.max_provider_calls} can bind at {worst_case} worst-case calls — enrichment would "
+        f"truncate. Raise OVERLAY_ENRICH_MAX_PROVIDER_CALLS or lower the item caps.")
+
+
+def test_the_ceiling_is_PER_STAGE_not_per_upload() -> None:
+    """The arithmetic above is only sound if each stage gets its own ledger. `run_batched` builds
+    `CallLedger(b.max_provider_calls)` per invocation unless a caller passes a shared one (only Pass
+    B does, to make its critic's nested calls spend from the same stage ceiling), so N stages over
+    one upload may spend N x the ceiling. Pinned because a change to per-RUN scoping would make the
+    derived 512 wrong in the expensive direction without failing anything else."""
+    import inspect
+
+    from featuregen.overlay.upload import enrich_batch
+
+    source = inspect.getsource(enrich_batch.run_batched)
+    assert "CallLedger(b.max_provider_calls)" in source, (
+        "run_batched no longer builds its own per-invocation ledger — re-derive the ceiling")
 
 
 # ── both deployment files ────────────────────────────────────────────────────────────────────────

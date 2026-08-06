@@ -14,6 +14,8 @@ from featuregen.overlay.upload import enrich_llm
 from featuregen.overlay.upload.enrich_batch import EGRESS, VALID, BatchItem
 from featuregen.overlay.upload.enrich_llm import (
     _FREE_TEXT_META_KEYS,
+    _MAX_LEN_DEFAULT,
+    MAX_DEFINITION_LEN,
     _item_egress_ok,
     _item_len_ok,
     _item_shape_ok,
@@ -93,17 +95,23 @@ def test_unknown_free_text_kind_is_a_hard_error(monkeypatch):
 
 
 def test_shape_gate_has_no_length_opinion_but_combined_gate_does():
-    long_def = {"table": "t", "table_definition": "x" * 601}
+    long_def = {"table": "t", "table_definition": "x" * (MAX_DEFINITION_LEN + 1)}
     assert _item_shape_ok(long_def) is True       # shape/allowlist only — no length opinion
     assert _item_len_ok(long_def) is False        # the definition length bound lives here
     assert _item_egress_ok(long_def) is False     # the combined contract is unchanged
 
 
-def test_table_definition_gets_the_600_definition_bound():
-    assert _item_egress_ok({"table": "t", "table_definition": "x" * 600}) is True
-    assert _item_egress_ok({"table": "t", "table_definition": "x" * 601}) is False
-    # every other scalar stays at the tight 200 default
-    assert _item_egress_ok({"table": "t", "term_name": "x" * 201}) is False
+def test_table_definition_gets_the_WIDER_definition_bound():
+    """Read from the constants: the 2026-08-06 zero-truncation raise moved both (600 -> 4000 and
+    200 -> 1000). What is pinned is the RELATIONSHIP — a definition gets a wider window than any
+    other scalar, and over-window is refused in both cases — not the two numbers."""
+    assert _MAX_LEN_DEFAULT < MAX_DEFINITION_LEN
+    assert _item_egress_ok({"table": "t", "table_definition": "x" * MAX_DEFINITION_LEN}) is True
+    assert _item_egress_ok(
+        {"table": "t", "table_definition": "x" * (MAX_DEFINITION_LEN + 1)}) is False
+    # every other scalar stays at the tighter default
+    assert _item_egress_ok({"table": "t", "term_name": "x" * _MAX_LEN_DEFAULT}) is True
+    assert _item_egress_ok({"table": "t", "term_name": "x" * (_MAX_LEN_DEFAULT + 1)}) is False
 
 
 def test_shape_gate_still_rejects_forbidden_keys_and_wrong_types():
@@ -122,11 +130,12 @@ def _concept_batch_call(db, items, script_results):
 
 
 def test_long_raw_definition_sanitizes_within_bound_and_egresses(db):
-    """[F7] crux: the length gate runs AFTER sanitization. A raw business_definition over 600
-    chars whose sample clause strips down to a short meaning must still egress — the old combined
-    pre-redaction gate excluded it before the sanitizer could shorten it."""
-    raw = "The posted fee amount. Representative values such as " + "9" * 700 + "."
-    assert len(raw) > 600
+    """[F7] crux: the length gate runs AFTER sanitization. A raw business_definition OVER the
+    definition bound whose sample clause strips down to a short meaning must still egress — the old
+    combined pre-redaction gate excluded it before the sanitizer could shorten it."""
+    raw = ("The posted fee amount. Representative values such as "
+           + "9" * (MAX_DEFINITION_LEN + 100) + ".")
+    assert len(raw) > MAX_DEFINITION_LEN
     items = [BatchItem("h1", {"table": "fees", "column": "amt", "type": "numeric",
                               "business_definition": raw})]
     res = _concept_batch_call(db, items, [{"ref": "h1", "concept": "monetary_amount"}])
@@ -138,7 +147,8 @@ def test_item_still_over_bound_after_sanitization_is_excluded_and_audited(db):
     """A sanitized value still over its egress bound is excluded on the same egress path (terminal
     EGRESS outcome + EGRESS_BLOCKED security event), while the sibling item proceeds."""
     items = [BatchItem("h1", {"table": "fees", "column": "amt", "type": "numeric",
-                              "business_definition": "x" * 601}),      # no clause to strip
+                              # sized off the bound so it stays over it after any future raise
+                              "business_definition": "x" * (MAX_DEFINITION_LEN + 1)}),
              BatchItem("h2", {"table": "fees", "column": "posted_on", "type": "date"})]
     res = _concept_batch_call(db, items, [{"ref": "h2", "concept": "event_date"}])
     by = {o.ref: o for o in res.outcomes}

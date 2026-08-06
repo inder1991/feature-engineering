@@ -1268,3 +1268,34 @@ is the assumption making the un-recovered classes tolerable.
    stage deadline, so the wait is the provider's number rather than ours.
 Both change the §9.2 taxonomy's contract, which is why Task 4 documented them instead of widening
 what counts as retryable inside a configuration change.
+
+### A.50 The enrichment call count at the raised caps was DERIVED, never measured (2026-08-06, Task 4b)
+
+Task 4b raised every prose and item cap on the enrichment path for zero truncation
+(`MAX_DEFINITION_LEN` 600 → 4000, `_MAX_LEN_DEFAULT` 200 → 1000, `_MAX_COLUMN_PROFILES` 64 → 512,
+`ADAPTER_LIST_LIMIT` 40 → 256, `NEIGHBOUR_LIMIT` 64 → 512) and raised the per-task chunk token
+budgets and `OVERLAY_ENRICH_MAX_PROVIDER_CALLS` (100 → 512) with them.
+
+The task's original plan settled the cost question with a before/after catalog ingest. **That
+measurement is NOT authorised** (human decision, 2026-08-06: no upload, no `deploy.sh`, no LLM
+spend), so both steps were replaced with offline bounds:
+
+* **The ceiling cannot bind.** `test_deployment_llm_bounds.py::test_the_call_ceiling_cannot_bind_before_the_wall_clock_does`
+  derives the degenerate one-item-per-chunk worst case (237 items × 2 attempts + 8 fallbacks = 482)
+  from the live budget under the manifest's own environment and asserts 512 clears it.
+* **The chunking did not shatter.** `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`
+  runs the REAL `chunk_items` over items built at a saturated resolved roster and asserts packing is
+  still bound by `max_items` (20/chunk), not by tokens.
+
+**What that does NOT establish.** The true per-stage call count against a real catalog is still
+unobserved. The two tests bound the FAILURE MODE — the ceiling cannot truncate a stage, and packing
+has not collapsed to one item per chunk — without observing the actual number, the actual latency,
+or the actual bill. Do not read them as a verified cost.
+
+**The cost that was accepted, plainly:** 512 physical provider calls per stage is a much larger
+worst-case bill than 100 was, and the ceiling is no longer what stops a runaway —
+`OVERLAY_ENRICH_STAGE_DEADLINE_S` (1800s) is.
+
+**Trigger:** the next authorised ingest of a real catalog. **Closure:** ingest one catalog with the
+enrichment stages on, read the per-stage physical call counts and elapsed times out of the `llm_call`
+audit rows, and record them against the derivation above — confirming it or replacing it.

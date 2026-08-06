@@ -107,9 +107,19 @@ from featuregen.overlay.upload.source_profile import (
 CONTRACT_VERSION = 1
 
 #: Bounded neighbour roster carried on the bundle itself (mirrors the Pass-B egress cap scale).
-NEIGHBOUR_LIMIT = 64
-#: Bounded list length inside every purpose-adapter payload.
-ADAPTER_LIST_LIMIT = 40
+#: ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 512, tracking `enrich_llm._MAX_COLUMN_PROFILES`. At 64
+#: a classifier looking at a 126- or 144-column bank table saw HALF its siblings, and which half
+#: was an ordering accident. THE ONE WITH A CALL-COUNT COST: a neighbour roster multiplies EVERY
+#: concept item, so `chunk_items` packs fewer items per chunk and the concept stage makes more
+#: provider calls. `enrich_config._DEFAULT_MAX_INPUT_TOKENS["concept"]` was raised in step to keep
+#: packing intact, and the packing itself is pinned by
+#: `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`.
+NEIGHBOUR_LIMIT = 512
+#: Bounded list length inside every purpose-adapter payload. ZERO-TRUNCATION RAISE (2026-08-06):
+#: 40 -> 256. This is the cap that actually reaches the prompt (the bundle holds up to
+#: `NEIGHBOUR_LIMIT`; the adapter slices to this), so it is the one that decided how much of a real
+#: table a classifier could see.
+ADAPTER_LIST_LIMIT = 256
 
 
 class SemanticContextError(ValueError):
@@ -1647,7 +1657,7 @@ def _roster(bundle: SemanticContextBundleV1) -> list[dict]:
 #: which is the shape the egress layer classifies `related_terms` under (`_LIST_PROSE_META_KEYS`):
 #: each term is then PII-scanned at its own indexed path (`related_terms[0]`) and length-bounded
 #: per TERM rather than per joined blob — a 40-term glossary column whose joined string exceeds the
-#: 200-char per-value cap would otherwise have its WHOLE item egress-excluded.
+#: per-value cap (`enrich_llm._MAX_LEN_DEFAULT`) would otherwise have its WHOLE item egress-excluded.
 _RELATED_TERMS_JOIN = ", "
 
 

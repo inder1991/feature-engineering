@@ -13,6 +13,7 @@ from featuregen.overlay.upload import table_synth as ts
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.column_view import build_table_views
 from featuregen.overlay.upload.enrich_llm import (
+    _MAX_COLUMN_PROFILES,
     _MAX_ROSTER,
     _item_egress_ok,
     _roster_entry_ok,
@@ -123,7 +124,10 @@ def test_roster_entry_validator_rejects_unknown_keys_and_flat_strings():
 
 
 def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
-    n = 70                                                     # >64 -> 2 chunks
+    # Sized off the router constant, not a literal. `_MAX_COLUMN_PROFILES` is Pass B's narrow/wide
+    # ROUTER as well as an egress cap, and the 2026-08-06 raise took it 64 -> 512 — at a fixed 70
+    # columns this test silently stopped exercising the two-phase path it exists to cover.
+    n = _MAX_COLUMN_PROFILES + 6                               # wide -> 2 chunks
     rows = [_row("ftr", f"c{i}", typ="integer") for i in range(n)]
     records = [_rec("s::banking.ftr", is_table=True, definition="All FTR postings.")]
     items = assemble_table_items(_views(rows, records=records))

@@ -372,11 +372,19 @@ _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_enti
 # text and never model output — so they are length-bounded like any other structural list.
 _TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns", "advisories"})
 #: Advisory sentences are longer than a ref; bounded so a mutated table cannot smuggle a payload.
-_TABLE_ADVISORY_MAX_LEN = 400
-_FEATURE_STRUCTURAL_MAX_LEN = 200
+#: ZERO-TRUNCATION RAISE (2026-08-06): 400 -> 2000, ~10x the longest advisory this repo's closed
+#: advisory table emits. Still a bound — a mutated table cannot smuggle an unbounded payload.
+_TABLE_ADVISORY_MAX_LEN = 2000
+#: ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPTANCE gate, not a formatter: a
+#: value over it is EXCLUDED from egress and audited, never truncated. So values of 201–1000 chars
+#: are now ADMITTED where they were previously refused — a deliberate widening of the egress
+#: SURFACE. Redaction (`_redact_free_text_meta` / `sanitize_feature_context`) still runs first, so
+#: this is a size decision, not a PII one.
+_FEATURE_STRUCTURAL_MAX_LEN = 1000
 #: Bound on a v4 list/mapping so one column cannot carry an unbounded payload past the byte budget
-#: into the egress scanner.
-_FEATURE_COLLECTION_MAX_ITEMS = 40
+#: into the egress scanner. ZERO-TRUNCATION RAISE (2026-08-06): 40 -> 256, above the widest real
+#: table this platform ingests (144 columns) so a per-column collection is never clipped.
+_FEATURE_COLLECTION_MAX_ITEMS = 256
 
 
 def _token(v: object) -> bool:
@@ -1536,10 +1544,24 @@ _COLUMN_PROFILE_KEYS = frozenset({
     "identifier_role", "temporal_role", "semantic_type", "entity",
     "term_type", "domain", "process_path",
 })
-_MAX_COLUMN_PROFILES = 64
+#: ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 512.
+#:
+#: READ THIS BEFORE MOVING IT AGAIN — it is not only an egress cap, it is Pass B's NARROW/WIDE
+#: ROUTER (`table_synth.synthesize_tables`). At 64 every real bank table (126 FTR / 144 CIB
+#: columns) took the TWO-PHASE path: its profiles were split into 64-column chunks, each chunk was
+#: SUMMARIZED, and the single phase-2 synthesis then decided grain / table_role / primary_entity /
+#: event_or_snapshot from those lossy summaries plus a names-and-types roster — never from the
+#: columns' own definitions. The two-phase path exists BECAUSE of this cap (a wider item was
+#: egress-REJECTED), not because summarizing is better. At 512 a real table synthesizes in ONE call
+#: over its COMPLETE profiles, and the two-phase path remains as the backstop for a genuinely
+#: pathological (>512-column) table. Fewer provider calls, strictly richer context.
+_MAX_COLUMN_PROFILES = 512
 #: Breadth is the point of `source_attributes`; unboundedness is not. A file with hundreds of columns
-#: must not push the real signal out of a batch.
-_MAX_SOURCE_ATTRIBUTES = 40
+#: must not push the real signal out of a batch. ZERO-TRUNCATION RAISE (2026-08-06): 40 -> 256.
+#: NOTE the PRODUCER still binds first: `ftr_adapter._MAX_SOURCE_ATTRIBUTES` (40) caps how many
+#: unmapped headers the reader ever carries, and no real mapping export comes close (FTR has 17
+#: headers in total), so this cap is the egress backstop rather than the effective limit.
+_MAX_SOURCE_ATTRIBUTES = 256
 
 # A STRUCTURED wide-roster entry (Task 4): only the identity keys, short strings only —
 # structured (never the old `name:type` flat string) because a column name may itself contain
@@ -1579,28 +1601,39 @@ _MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 # `table_synth._descriptor` — so `enrich.bounded_definition`'s window, the metadata-only egress cap,
 # and Pass B's descriptor bound can never drift apart. Defined HERE (not in `enrich`) because `enrich`
 # imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
-MAX_DEFINITION_LEN = 600
+# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000. MEASURED: the widest
+# `description_business_definition` in the real FTR export (`FTR_Column_Mapping_final.csv`, 127
+# rows) is 960 chars, so the shipped 600 was CUTTING real bank definitions mid-sentence before they
+# ever reached a model. 4000 is ~4x the measured worst case and still a bound — a 50 KB
+# "definition" is caught rather than egressed.
+MAX_DEFINITION_LEN = 4000
 
-# Per-value egress length cap. Every scalar is capped at 200 EXCEPT the two sanitized DEFINITION
-# fields — the intended metadata payload — which get a larger (still-bounded) window so a real
-# definition is not cut mid-sentence before it egresses. `business_definition` matches
-# `enrich.bounded_definition`'s bound (same constant); [F7] gives the table-level
-# `table_definition` the SAME 600 window (it previously inherited the 200 default).
+# Per-value egress length cap. ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. MEASURED against the
+# real FTR export, the widest non-definition value is 105 chars (`related_terms`; then 84 for the
+# FQN, 54 for synonyms), so the old 200 sat at less than 2x the observed maximum — one wider export
+# away from excluding items. 1000 is ~10x it. The two sanitized DEFINITION fields keep their own,
+# larger window (`MAX_DEFINITION_LEN`) so a full definition is never cut mid-sentence.
 #
-# DELIBERATELY not widened for the three keys that joined `_DEFINITION_META_KEYS` later
-# (`table_description`, `business_context`, `semantic_terms`): the sanitize PIPELINE and the length
-# WINDOW are separate knobs, and widening what may egress is not part of grading them. They keep
-# the tight 200 default they had as prose. Note the direction of the mismatch is safe: Pass B bounds
-# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), so a future producer threading
-# a full-length `business_context` back into ITEM metadata would have the item EXCLUDED + audited by
-# `_item_len_ok`, never silently truncated — at which point widening this map is the deliberate
-# decision to make.
-_MAX_LEN_DEFAULT = 200
+# This is an ACCEPTANCE gate, not a formatter: an over-cap value has its whole ITEM excluded from
+# egress and audited, never truncated. Raising it therefore ADMITS shapes previously refused; it
+# does not silently lengthen anything already flowing.
+#
+# The three keys that joined `_DEFINITION_META_KEYS` later (`table_description`, `business_context`,
+# `semantic_terms`) still take this default rather than the definition window — but the safety
+# property that used to justify the tight 200 has INVERTED, and that is deliberate: Pass B bounds
+# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), which at a 200 default meant a
+# re-threaded `business_context` had its item EXCLUDED + audited. At 1000 it is ADMITTED instead,
+# which is the outcome this task wants. `_MAX_PROFILE_PROSE` must stay BELOW this default; see the
+# note beside it.
+_MAX_LEN_DEFAULT = 1000
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
                    "table_definition": MAX_DEFINITION_LEN,
                    # Task 1: the authored one-line recipe intent (longest authored value is 323
-                   # chars at the 0F-2 baseline) — bounded above the 200 default, still closed.
-                   "recipe_intent": 400}
+                   # chars at the 0F-2 baseline). Kept as an EXPLICIT entry rather than left to
+                   # inherit the default, so lowering `_MAX_LEN_DEFAULT` later cannot silently
+                   # re-truncate an authored field; raised 400 -> 1000 with the default because a
+                   # per-key cap BELOW the default is an incoherence, not a control.
+                   "recipe_intent": 1000}
 
 
 def _max_len_for(key: str) -> int:

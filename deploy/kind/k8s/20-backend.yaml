@@ -79,13 +79,25 @@ data:
   # per-source lock while it runs, so a slow provider can now block re-uploads of the SAME source
   # for longer — acceptable here, worth revisiting for concurrent ingestion.
   OVERLAY_ENRICH_STAGE_DEADLINE_S: "1800"
-  # Per-stage physical-provider-call ceiling for batched enrichment. The 32 default is exactly
-  # break-even at 126 columns (summary/synonyms both run over EVERY column at 8 per chunk, so a
-  # 256-column catalog exhausts it with zero retries). 100 covers ~500 columns with headroom for
-  # the degradation ladder while still tripping on a runaway loop. This is a COUNT bound, not a time
-  # bound — the deadline above and the wall-clock budget derived from it remain what stops a slow
-  # run, so raising this does not lengthen how long the stage may hold the source lock.
-  OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "100"
+  # Per-stage physical-provider-call ceiling for batched enrichment. Raised from 100 (2026-08-06).
+  # PER STAGE, not per upload: enrich_batch.run_batched builds one CallLedger per invocation.
+  #
+  # This is a RUNAWAY BACKSTOP, not a throughput limiter. Crossing it does not slow enrichment down,
+  # it silently STOPS ENRICHING COLUMNS — enrich_config's chunking note explains why: an over-budget
+  # item still forms its own chunk, so a tight token bound degrades into MORE CALLS, and this
+  # ceiling is the only thing that turns more calls into lost work. The zero-truncation cap raise
+  # made items larger, so that degradation is exactly what it risks.
+  #
+  # Derived (NOT measured — a live before/after ingest was not authorised) from the degenerate
+  # one-item-per-chunk case over the largest catalog this repo exercises:
+  #   237 items x max_batch_attempts(2) + max_single_fallback(8) = 482.  512 clears it.
+  # tests/featuregen/intake/test_deployment_llm_bounds.py recomputes this from the live budget so a
+  # future cap change that outgrows it fails a test instead of truncating a stage.
+  #
+  # COST: 512 per stage is a much larger worst-case bill than 100 was, and this number is no longer
+  # what stops a runaway — OVERLAY_ENRICH_STAGE_DEADLINE_S above is. This remains a COUNT bound, not
+  # a time bound, so raising it does not lengthen how long the stage may hold the source lock.
+  OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "512"
   # Release-A flags (verified-interfaces D8). FEATUREGEN_FEATURE_CONTEXT is SET ON here;
   # FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated. Truthy set: 1/true/yes/on.
   # NOT AN APPROVAL RECORD: applying this ConfigMap IS the Release-A gate decision for the flag

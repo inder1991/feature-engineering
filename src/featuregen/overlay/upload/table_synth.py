@@ -248,9 +248,17 @@ def table_vocab_normalize_temporal(raw: object) -> str | None:
     return normalize_temporal_storage_model(raw)
 
 
-#: The bounded per-value length of a profile PROSE suggestion — the same 600-char window the
-#: sanitized business definition uses (`enrich_llm.MAX_DEFINITION_LEN`), so a description and a
-#: definition can never drift apart on what "bounded" means.
+#: The bounded per-value length of a profile PROSE suggestion.
+#:
+#: It USED to be pinned to `enrich_llm.MAX_DEFINITION_LEN` ("so a description and a definition can
+#: never drift apart"). The 2026-08-06 zero-truncation raise took that constant 600 -> 4000 and
+#: this one deliberately did NOT follow, because the two answer different questions and the tie was
+#: coincidental. This value bounds Pass B's own OUTPUT, and that output can be re-threaded into
+#: ITEM metadata as `business_context`/`table_description`, where it meets the per-value egress
+#: ACCEPTANCE gate `enrich_llm._MAX_LEN_DEFAULT` (now 1000). So the load-bearing invariant is
+#: `_MAX_PROFILE_PROSE < _MAX_LEN_DEFAULT` — 600 against 1000 holds it with margin. Raising this to
+#: 4000 would make Pass B's own descriptions EXCLUDED-and-audited at the egress gate, which is the
+#: opposite of what the raise was for.
 _MAX_PROFILE_PROSE = 600
 #: The one non-column citation a suggestion may name: the table's own curated definition.
 _TABLE_DEFINITION_REF = "table_definition"
@@ -643,8 +651,12 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 
     Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
     as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
-    single phase-2 synthesis over the summaries + a complete roster). NARROW tables (``<=64`` profiles)
-    keep today's single-call fast path byte-for-byte. A wide table synthesizes over whatever chunk
+    single phase-2 synthesis over the summaries + a complete roster). NARROW tables
+    (``<=_MAX_COLUMN_PROFILES`` profiles) keep today's single-call fast path byte-for-byte. Since the
+    2026-08-06 zero-truncation raise took that cap 64 -> 512, EVERY real bank table on this platform
+    (126/144 columns) is narrow and synthesizes in ONE call over its complete profiles; the two-phase
+    path is now the backstop for a pathological (>512-column) table rather than the normal route.
+    A wide table synthesizes over whatever chunk
     summaries LANDED (the roster is complete regardless); only a table with ZERO chunk summaries,
     or whose synthesis is invalid, simply never appears in the returned dict — the caller then reports
     the honest partial/failed outcome (no phantom "resolved").
@@ -849,7 +861,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
     advisory input keyed by chunk ref and record no per-field dispositions.
 
-    Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
+    Phase 1: split each wide table into consecutive ``<=_MAX_COLUMN_PROFILES``-profile chunks and
+    SUMMARIZE each chunk
     (no fact output) — every chunk item is egress-safe. Phase 2: for each table with AT LEAST ONE
     chunk summary, run ONE synthesis over whatever chunk summaries LANDED + a compact complete roster
     of STRUCTURED ``{column, operational_type, declared_type}`` entries + the table's

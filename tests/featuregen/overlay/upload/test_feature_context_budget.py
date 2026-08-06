@@ -90,10 +90,46 @@ def test_measured_mandatory_bytes_for_v3_and_v4(wide_catalogs, monkeypatch, reco
     assert v4 > v3, "v4 carries strictly more context than v3"
     # The measured values the budget was set from, pinned with tolerance so a payload change that
     # moves them by more than ~15% has to come back here and re-argue the budget.
-    assert 150_000 < v3 < 200_000, f"v3 mandatory bytes moved: {v3}"
-    assert 215_000 < v4 < 285_000, f"v4 mandatory bytes moved: {v4}"
+    #
+    # RE-MEASURED 2026-08-06 at the zero-truncation caps: v3 175_520, v4 241_491. The old v4 band
+    # (215_000..285_000) was centred on 248_601, a figure the payload had already drifted away from
+    # while staying inside the tolerance — which is how a "measured" number stops being one. Both
+    # bands are now +/-15% of a freshly measured value.
+    assert 149_000 < v3 < 202_000, f"v3 mandatory bytes moved: {v3}"
+    assert 205_000 < v4 < 278_000, f"v4 mandatory bytes moved: {v4}"
     # …and the re-budgeted value clears the worst realistic case with headroom.
     assert v4 < FEATURE_CONTEXT_BYTE_BUDGET
+
+
+def test_the_raised_caps_leave_headroom_on_the_worst_realistic_catalog(wide_catalogs, monkeypatch):
+    """237 mandatory columns at the zero-truncation caps must still clear the budget with room.
+
+    Headroom is the point: the budget is not a target to fill. If this fails, the caps grew faster
+    than the budget and one of the two is wrong — decide which, do not just raise the budget."""
+    v4 = _mandatory_bytes(wide_catalogs, 4, monkeypatch)
+    assert v4 < FEATURE_CONTEXT_BYTE_BUDGET * 0.6, (
+        f"{v4} bytes leaves under 40% headroom against {FEATURE_CONTEXT_BYTE_BUDGET}")
+
+
+def test_the_budget_is_what_decides_how_wide_a_catalog_can_be_served_untrimmed(wide_catalogs,
+                                                                               monkeypatch):
+    """WHY the budget was raised, given that the cap raise did not move the bytes above.
+
+    The assembled `definition` comes straight from `graph_node`, so `MAX_DEFINITION_LEN` never
+    touches this path — the truncation risk here is not per-VALUE length, it is CATALOG WIDTH: past
+    roughly `budget / bytes-per-column` mandatory columns, `_V4_TRIM_ORDER` starts shedding prose
+    (definition first) and the model stops seeing what the platform knows. That shed is silent, and
+    it is the same defect the cap raise exists to remove, arriving through a different door.
+
+    Pinned as a RATIO so it survives a payload that gets fatter or leaner per column."""
+    v4 = _mandatory_bytes(wide_catalogs, 4, monkeypatch)
+    bytes_per_column = v4 / 237
+    columns_servable_untrimmed = FEATURE_CONTEXT_BYTE_BUDGET / bytes_per_column
+    # The 200-column-per-table ingest cap (canonical.MAX_COLUMNS_PER_TABLE) means a catalog reaches
+    # this width across several tables; the budget is per feature-generation call, not per table.
+    assert columns_servable_untrimmed > 1_000, (
+        f"only {columns_servable_untrimmed:.0f} mandatory columns fit untrimmed at "
+        f"{bytes_per_column:.0f} bytes/column — prose starts being shed below a realistic catalog")
 
 
 @pytest.mark.parametrize("version", [3, 4])

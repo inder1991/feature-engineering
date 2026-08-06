@@ -417,6 +417,10 @@ python -c "import yaml,sys; d=[x for x in yaml.safe_load_all(open('deploy/kind/k
 ```
 Expected: `{'FEATUREGEN_FEATURE_CONTEXT': '1', 'OVERLAY_ENRICH_MAX_PROVIDER_CALLS': '100', 'FEATUREGEN_LLM_TIMEOUT': '300'}`
 
+> **SUPERSEDED by Task 4b (2026-08-06):** the ceiling is now `"512"`, derived rather than estimated
+> — see Task 4b Step 2. Task 4's `"100"` above is the historical value; re-running this check today
+> correctly prints `512`.
+
 - [ ] **Step 3: Commit**
 
 ```bash

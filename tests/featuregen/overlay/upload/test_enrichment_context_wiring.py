@@ -102,11 +102,29 @@ def test_the_classifier_payload_carries_every_named_context_field() -> None:
 
 
 def test_the_roster_is_bounded_and_carries_the_sibling_semantics() -> None:
-    cohort = [f"col_{i:03d}" for i in range(120)] + ["anchor"]
+    # The cohort is sized OFF the limit, not off a literal: the 2026-08-06 raise took
+    # ADAPTER_LIST_LIMIT 40 -> 256, and a fixed 120-column cohort would have quietly stopped
+    # testing the bound (120 < 256 returns 120 and the assertion becomes an identity).
+    cohort = [f"col_{i:03d}" for i in range(sc.ADAPTER_LIST_LIMIT + 20)] + ["anchor"]
     bundle = _bundle("anchor", cohort)
     payload = enrich._classifier_payload(_row("anchor"), _record("anchor"), bundle)
     assert len(payload["column_roster"]) == sc.ADAPTER_LIST_LIMIT
     assert all(set(e) <= llm._ROSTER_ENTRY_KEYS for e in payload["column_roster"])
+
+
+def test_a_real_table_now_fits_the_roster_whole_so_nothing_is_sliced_off() -> None:
+    """The point of the raise. `canonical.MAX_COLUMNS_PER_TABLE` caps ingestion at 200 columns per
+    table, and ADAPTER_LIST_LIMIT is now 256 — so for EVERY table this platform can ingest the
+    sibling roster is COMPLETE, and which siblings a classifier sees is no longer an ordering
+    accident. At the old 40 a 126-column FTR table showed the classifier under a third of them."""
+    from featuregen.overlay.upload.canonical import MAX_COLUMNS_PER_TABLE
+
+    assert sc.ADAPTER_LIST_LIMIT >= MAX_COLUMNS_PER_TABLE
+    assert sc.NEIGHBOUR_LIMIT >= MAX_COLUMNS_PER_TABLE
+    widest = [f"col_{i:03d}" for i in range(MAX_COLUMNS_PER_TABLE - 1)] + ["anchor"]
+    payload = enrich._classifier_payload(_row("anchor"), _record("anchor"),
+                                         _bundle("anchor", widest))
+    assert len(payload["column_roster"]) == MAX_COLUMNS_PER_TABLE - 1   # every sibling, none cut
 
 
 def test_the_drafting_tasks_receive_the_current_stronger_facts() -> None:
@@ -258,7 +276,10 @@ def test_the_widened_roster_entry_keys_are_admitted_and_bounded() -> None:
           "concept": "customer_id", "party_role": "subject"}
     assert llm._roster_entry_ok(ok)
     assert not llm._roster_entry_ok({**ok, "sensitivity": "pii"})    # unclassified -> blocked
-    assert not llm._roster_entry_ok({**ok, "concept": "x" * 201})    # over the per-value bound
+    # The bound is read from the constant, not restated: the 2026-08-06 raise moved it 200 -> 1000
+    # and a literal here would have silently become an assertion that 201 chars is admitted.
+    assert llm._roster_entry_ok({**ok, "concept": "x" * llm._MAX_LEN_DEFAULT})
+    assert not llm._roster_entry_ok({**ok, "concept": "x" * (llm._MAX_LEN_DEFAULT + 1)})
 
 
 def test_a_full_classifier_item_passes_the_per_item_egress_contract() -> None:
@@ -295,18 +316,91 @@ def test_the_evidence_material_is_the_identity_payload_not_the_prompt() -> None:
 # ── batch bounds: the re-budget is real, and the estimator can see the roster ────────────────────
 
 
+def _resolved_roster(payload: dict) -> dict:
+    """The payload with every roster entry at its RESOLVED fill — column + concept + party role.
+
+    This is the shape a RE-upload produces (every sibling already classified) and it is ~3.5x the
+    bytes of the bare first-upload roster, so it, not the bare one, is the size the budgets must
+    hold. Modelled here rather than round-tripped through the store because the size question is
+    about the JSON the estimator sees, and `_classifier_payload` builds that from the bundle.
+    """
+    return {**payload,
+            "column_roster": [{**e, "concept": "monetary_stock", "party_role": "counterparty"}
+                              for e in payload["column_roster"]]}
+
+
+def _classifier_item_at_the_new_caps(*, siblings: int, name_len: int = 30) -> dict:
+    """A concept item at the zero-truncation caps: a SATURATED roster of long bank-style names,
+    every entry resolved. Anything smaller would make the packing assertions below vacuous."""
+    pad = "x" * max(0, name_len - 7)
+    cohort = [f"col{pad}{i:04d}" for i in range(siblings)] + ["anchor"]
+    bundle = _bundle("anchor", cohort)
+    return _resolved_roster(enrich._classifier_payload(_row("anchor"), _record("anchor"), bundle))
+
+
 def test_the_rebudgeted_bounds_hold_the_measured_payloads() -> None:
-    """The measured FTR maxima recorded in `enrich_config` must fit their chunks — the whole point
-    of re-budgeting. The per-item figures are the RESOLVED ones (every sibling carrying a concept +
-    party role), re-measured in the review: 1,144 tok for a classifier item with a full 40-entry
-    roster, 3,146 tok for a whole-table domain item. The old 750 here understated the classifier by
-    ~50% and made the headroom look like 60% when it is ~5%."""
-    assert enrich_config.max_items("concept") * 1144 <= enrich_config.max_input_tokens("concept")
+    """The measured maxima must fit their chunks — the whole point of re-budgeting.
+
+    RE-MEASURED 2026-08-06 at the zero-truncation caps, resolved roster, long bank-style names:
+
+        roster fill                              tok/item   chunk cost (x20)   % of budget
+        40 entries  (the OLD ADAPTER_LIST_LIMIT)      982             19_640         9.8% of 200_000
+        199 entries (the widest INGESTIBLE table)   5_365            107_300        53.6%
+        256 entries (a saturated ADAPTER_LIST)      6_862            137_240        68.6%
+
+    The 982 reproduces the 971-1,144 the previous review recorded, which is why the rest is
+    trustworthy. Note what the middle row would have cost at the OLD 24_000 concept budget: 107_300
+    is 4.5x it, so the concept stage would have packed ~4 items per chunk instead of 20 — a 5x
+    call-count increase on every re-upload. The Step-5 token raise is load-bearing, not decorative.
+    """
+    assert enrich_config.max_items("concept") * 6862 <= enrich_config.max_input_tokens("concept")
+    # The domain item is a whole TABLE and carries no ADAPTER_LIST_LIMIT-bounded list, so its
+    # measured 3,146 tok/item is untouched by the cap raise.
     assert enrich_config.max_items("domain") * 3146 <= enrich_config.max_input_tokens("domain")
     # The isolation boundaries themselves are UNCHANGED: payload size never buys itself a wider
     # contamination surface.
     assert enrich_config.max_items("concept") == 20
     assert enrich_config.max_items("domain") == 8
+
+
+def test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps() -> None:
+    """The cap raise must degrade packing PROPORTIONALLY, not shatter it.
+
+    `NEIGHBOUR_LIMIT` 64 -> 512 and `ADAPTER_LIST_LIMIT` 40 -> 256 multiply EVERY concept item, and
+    `chunk_items` packs by both item count and estimated tokens. One item per chunk would make the
+    concept stage's call count equal its COLUMN count — the shape that makes a call ceiling bind and
+    turns "more expensive" into "stopped enriching columns".
+
+    Run against the real `chunk_items` and the real budgets, at a saturated resolved roster. This is
+    the offline stand-in for the live before/after call count, which is DEFERRED by human decision
+    (docs/DEFERRED-WORK.md) — it bounds the failure mode without observing the real number.
+    """
+    payload = _classifier_item_at_the_new_caps(siblings=sc.ADAPTER_LIST_LIMIT + 20)
+    assert len(payload["column_roster"]) == sc.ADAPTER_LIST_LIMIT   # genuinely saturated
+
+    items = [BatchItem(f"h{i}", payload) for i in range(60)]
+    chunks = chunk_items(items, max_items=enrich_config.max_items("concept"),
+                         max_input_tokens=enrich_config.max_input_tokens("concept"))
+    assert len(chunks) < len(items), "every item formed its own chunk — packing collapsed"
+    assert max(len(c) for c in chunks) > 1
+    # Stronger than "did not collapse": packing is still bound by the ITEM COUNT, not by tokens, so
+    # the call count is what it was before the raise. If this ever drops below max_items the stage
+    # has started costing more calls and the ceiling arithmetic in the deployment must be revisited.
+    assert max(len(c) for c in chunks) == enrich_config.max_items("concept")
+
+
+def test_the_widest_ingestible_table_also_packs_at_the_item_bound() -> None:
+    """The production case, as opposed to the saturated one above: `MAX_COLUMNS_PER_TABLE` caps
+    ingestion at 200 columns, so a real concept item's roster tops out at 199 siblings and can never
+    reach `ADAPTER_LIST_LIMIT` at all."""
+    from featuregen.overlay.upload.canonical import MAX_COLUMNS_PER_TABLE
+
+    payload = _classifier_item_at_the_new_caps(siblings=MAX_COLUMNS_PER_TABLE - 1)
+    assert len(payload["column_roster"]) == MAX_COLUMNS_PER_TABLE - 1    # never sliced
+    chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(60)],
+                         max_items=enrich_config.max_items("concept"),
+                         max_input_tokens=enrich_config.max_input_tokens("concept"))
+    assert max(len(c) for c in chunks) == enrich_config.max_items("concept")
 
 
 def test_a_widened_item_still_chunks_by_item_count_not_by_bytes() -> None:

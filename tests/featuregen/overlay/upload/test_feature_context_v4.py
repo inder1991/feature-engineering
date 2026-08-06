@@ -237,9 +237,13 @@ def test_an_unclassified_key_still_blocks_the_whole_menu(db, v4):
 def test_the_new_collection_keys_are_bounded(db, v4):
     """Shape and length together: an unbounded list would walk past the byte budget into the
     scanner. The classification refuses it rather than trusting the producer."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_COLLECTION_MAX_ITEMS
+
     _bank_graph(db)
     payload = _column(db, "public.payments.tran_amt")
-    payload["concept_path"] = ["x"] * 200
+    # Sized off the cap: the 2026-08-06 zero-truncation raise took it 40 -> 256, so a fixed 200-item
+    # list is now ADMISSIBLE and this assertion would have inverted.
+    payload["concept_path"] = ["x"] * (_FEATURE_COLLECTION_MAX_ITEMS + 1)
     assert sanitize_feature_context({"columns": [payload]})[0] is None
 
     payload = _column(db, "public.payments.tran_amt")

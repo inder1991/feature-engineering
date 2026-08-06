@@ -69,13 +69,16 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 # BOTH item count and estimated tokens, and an item that alone exceeds the token budget still forms
 # its own chunk — nothing is ever dropped for size. So an under-budgeted bound degrades
 # PROPORTIONALLY (fewer items per chunk -> more provider calls), never into a lost item. The real
-# backstop is `budget(short).max_provider_calls` (32), which — since the Pass-B critic fix — counts
-# every PHYSICAL call of the run, nested seams included.
+# backstop is `budget(short).max_provider_calls` (code default 32; the kind deployment ships 512 —
+# see the zero-truncation note below), which — since the Pass-B critic fix — counts every PHYSICAL
+# call of the run, nested seams included. It is PER `run_batched` INVOCATION, i.e. per stage, not
+# per upload (`enrich_batch.py` builds the ledger inside `run_batched`).
 #
 # NOT BOUNDED, and deliberately recorded here: the domain item's `columns` list has NO COUNT CAP in
 # `enrich_llm._item_shape_ok` (it falls to the generic list-of-strings branch; only `column_profiles`
 # / `chunk_summaries` / `column_roster` / `source_attributes` carry count caps). Per-VALUE length is
-# capped at 200, so a pathological table bounds each name but not how many ride: a 5,000-column
+# capped at `_MAX_LEN_DEFAULT` (1000 since the zero-truncation raise), so a pathological table
+# bounds each name but not how many ride: a 5,000-column
 # table would egress as one ~150K-token item in its own chunk. No such table exists in any catalog
 # on this platform today; capping it is a deliberate egress-shape change (an over-count item would
 # be EXCLUDED + audited), not a comment fix, so it is documented rather than silently done here.
@@ -94,9 +97,30 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 # every batch to one item. The sibling roster and table context therefore ride PER-ITEM metadata by
 # design, where the estimator sees them honestly — pinned by a test, so nobody can "optimize" the
 # roster into `shared_metadata` and make the budget blind to it again.
-_DEFAULT_MAX_INPUT_TOKENS = {"concept": 24000, "definition": 8000, "domain": 26000,
-                             "synonyms": 8000, "unit": 8000, "summary": 14000,
-                             "table_synth": 6000}
+#
+# ── ZERO-TRUNCATION RAISE (2026-08-06) ───────────────────────────────────────────────────────────
+#
+# Every prose and item cap on the enrichment path went up so that nothing the platform knows is cut
+# on the way to the model (`enrich_llm.MAX_DEFINITION_LEN` 600 -> 4000, `_MAX_LEN_DEFAULT` 200 ->
+# 1000, `_MAX_COLUMN_PROFILES` 64 -> 512, `semantic_context.ADAPTER_LIST_LIMIT` 40 -> 256,
+# `NEIGHBOUR_LIMIT` 64 -> 512). Read the block above for WHY that forces this map up with it: a
+# bigger item against a fixed token cap means fewer items per chunk, which means more provider
+# calls, which at a tight ceiling means SILENT truncation rather than a bigger bill.
+#
+# The roster is the multiplier that matters — it went from 40 entries to 256, so a classifier item
+# grew roughly 6x (the measured 971-1,144 tok/item above scales with roster fill). These bounds are
+# raised well past that growth rather than trimmed to it: they sit far below Opus's 1M-token window,
+# and the binding constraint on a call is COST, not the model. Deliberately generous, because the
+# failure mode of a tight bound here is a shattered chunking and a truncated stage, while the
+# failure mode of a loose one is a chunk that packs its full `_DEFAULT_MAX_ITEMS`.
+#
+# `_DEFAULT_MAX_ITEMS` is STILL unchanged, for the reason stated above: those are contamination
+# boundaries, not size limits. Raising the token budgets is exactly how you avoid having to touch
+# them. Packing at the new caps is pinned by
+# `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`.
+_DEFAULT_MAX_INPUT_TOKENS = {"concept": 200_000, "definition": 60_000, "domain": 200_000,
+                             "synonyms": 60_000, "unit": 60_000, "summary": 100_000,
+                             "table_synth": 60_000}
 
 
 def mode(short: str) -> str:

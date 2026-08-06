@@ -61,7 +61,10 @@ _TASK = "overlay.enrich.concept"
 # Cap on any single glossary-sidecar metadata value placed in an LLM request. Matches the per-value
 # bound the metadata-only egress filter (`enrich_llm._item_egress_ok`) enforces, so a long business
 # definition is trimmed to its leading meaning rather than silently excluding the whole column.
-_MAX_META_LEN = 200
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000, tracking `enrich_llm._MAX_LEN_DEFAULT`. The two
+# must move TOGETHER: this one truncates, that one excludes, so this being the larger of the pair
+# would turn a trim into a dropped column.
+_MAX_META_LEN = 1000
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 _SYN_TASK = "overlay.enrich.synonyms"
@@ -69,13 +72,19 @@ _UNIT_TASK = "overlay.enrich.unit"
 _SUMMARY_TASK = "overlay.enrich.summary"
 
 # Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
-_MAX_SYNONYMS_LEN = 200
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPT gate on MODEL OUTPUT
+# (`_accept_bounded`), so the old 200 silently REJECTED a rich alias line rather than shortening it;
+# the widest real `synonyms_aliases` value in the FTR export is 54 chars, so 1000 is far past any
+# legitimate list while still refusing a model that starts writing paragraphs.
+_MAX_SYNONYMS_LEN = 1000
 
-# Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
-# definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
+# Larger bound for a SANITIZED business definition specifically. The `_MAX_META_LEN` default cut
+# every real definition mid-sentence; sanitized definitions are the intended payload, so allow a bigger
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
 # DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
 # B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
+# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 (measured: the widest
+# real FTR definition is 960 chars), so this window follows it with no edit here.
 _MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 
@@ -479,9 +488,13 @@ def _parse_domain_result(raw: str) -> tuple[str, dict[str, str], dict[str, str]]
 
 # ── E4a T2: the MEASURE ANNOTATION accept gate ────────────────────────────────────────────────────
 # A unit is a short measurement TOKEN, never prose — "AED", "fils", "%", "bps", "days", "shares",
-# "transactions", "USD per share". 32 chars is generous for every real one and far too small for a
+# "transactions", "USD per share". 64 chars is generous for every real one and far too small for a
 # sentence, so a model that starts explaining itself is rejected rather than stored as a unit.
-_MAX_UNIT_LEN = 32
+# ZERO-TRUNCATION RAISE (2026-08-06): 32 -> 64. This one is an ACCEPT gate, so 32 did not shorten a
+# long unit, it DISCARDED the whole proposal — and a compound unit ("basis points per annum on
+# average daily balance") is a legitimate answer that 32 refused. The read-side display bound in
+# `feature_assist._MAX_SUGGESTION_LEN` moves with it and stays the larger of the two.
+_MAX_UNIT_LEN = 64
 # Starts with a letter/digit/% (never punctuation or a list-stringified `['a','b']`) and continues
 # with the characters real units use. Deliberately NOT a closed vocabulary: units are open (every
 # commodity, rate basis and count noun is one), so a closed list would reject legitimate values
@@ -636,7 +649,7 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
         meta_defn = strip_sample_values(rec.definition)
         if meta_defn:
             # The sanitized business definition is the payload we WANT the classifier to see, so give
-            # it the larger word-bounded window instead of the 200-char default that cut it mid-sentence.
+            # it the larger word-bounded window instead of the `_MAX_META_LEN` default.
             meta["business_definition"] = bounded_definition(meta_defn, _MAX_DEFINITION_LEN)
         for key, val in (("term_name", rec.term_name), ("data_domain", rec.domain),
                          ("bian_path", rec.bian_path), ("fibo_path", rec.fibo_path)):

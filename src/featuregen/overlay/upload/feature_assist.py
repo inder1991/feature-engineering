@@ -602,8 +602,11 @@ def _profile_advisories(members: list[dict]) -> dict:
 # all 237 are mandatory (`test_feature_context_budget.py` builds both and records the numbers):
 #
 #   v3 mandatory bytes, 237 columns:  175_520   (~740 bytes/column)
-#   v4 mandatory bytes, 237 columns:  248_601   (~1_048 bytes/column)
+#   v4 mandatory bytes, 237 columns:  241_491   (~1_019 bytes/column)
 #   v4 with every trimmable field shed: 203_629
+#
+# The v4 figure was RE-MEASURED on 2026-08-06 (it read 248_601 when v4 landed; the payload drifted
+# down since, inside the test's tolerance, so the recorded number had quietly stopped being true).
 #
 # The finding that matters: at 60_000 the SHIPPED v3 payload ALREADY raised ContextTooLarge on
 # these catalogs — nearly 3x over. v4 did not create that cliff; it would have deepened it. So the
@@ -616,12 +619,30 @@ def _profile_advisories(members: list[dict]) -> dict:
 # WHAT THIS BUDGET DOES NOT BOUND — the COST. This is the assembly's own byte ceiling and nothing
 # downstream caps input size: the provider call carries no input-token limit, so raising the budget
 # from 60_000 to 300_000 removed a refusal, not a spend control. On the measured catalogs above v4
-# sends ~2.2x the v3 prompt bytes for the same 237 columns (248_601 vs 175_520), and a mid-size
+# sends ~1.4x the v3 prompt bytes for the same 237 columns (241_491 vs 175_520), and a mid-size
 # catalog that previously refused now succeeds at ~4x the bytes it used to attempt. Input tokens are
 # the cheaper half of a call and this is metadata, not data — but "cheaper" is not "free", and the
 # number belongs beside the constant that produces it rather than in a review nobody re-reads.
 # `FEATUREGEN_FEATURE_CONTEXT_VERSION=3` is the lever that takes it back (the D8 ladder above).
-FEATURE_CONTEXT_BYTE_BUDGET = 300_000
+#
+# ── ZERO-TRUNCATION RAISE, 300_000 -> 1_500_000 (2026-08-06) ─────────────────────────────────────
+#
+# STATED HONESTLY, because the measurement did not say what the change expected it to say: raising
+# every prose and item cap did NOT move these numbers. The assembled `definition` is read straight
+# out of `graph_node` (see `_candidate_columns`' query), so it never passes through
+# `enrich_llm.MAX_DEFINITION_LEN` at all — that cap governs the ENRICHMENT egress path, not this
+# assembly. v4 measured 241_491 both before and after the raise.
+#
+# The raise is still the right change, for a reason that is about CATALOG SIZE rather than per-value
+# length. At ~1_019 bytes/column, 300_000 bytes is roughly 294 columns — so a catalog past ~300
+# mandatory columns starts shedding prose through `_V4_TRIM_ORDER` (definition first) and, past the
+# trimmed floor, refuses outright. That trim IS truncation on the feature-generation path, arriving
+# by a different door than the caps. 1_500_000 moves the first shed to ~1_470 columns.
+#
+# The cost is the same cost as before, five times over: nothing downstream bounds the prompt, so on
+# a catalog large enough to use this headroom the request is correspondingly larger. It buys the
+# absence of silent shedding, not free context.
+FEATURE_CONTEXT_BYTE_BUDGET = 1_500_000
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -1044,9 +1065,16 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
 
 
 # The AI's suggestion is DISPLAY TEXT on a review card, so it is bounded like one. T2's drafter
-# already caps a drafted unit at 32 chars; this is the independent read-side ceiling (a suggestion
-# from any future writer can never turn a requirement into an unbounded payload).
-_MAX_SUGGESTION_LEN = 64
+# already caps a drafted unit at 64 chars (`enrich._MAX_UNIT_LEN`); this is the independent
+# read-side ceiling (a suggestion from any future writer can never turn a requirement into an
+# unbounded payload).
+#
+# ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 256. Unlike the accept gates above, this one TRUNCATES
+# an already-ACCEPTED value on its way out — so at 64 it was exactly co-located with the drafter's
+# old bound and any future writer with a longer legitimate value would have been silently clipped
+# on the card rather than refused at the door. It stays deliberately ABOVE `_MAX_UNIT_LEN` so the
+# display ceiling can never be the thing that cuts a value the drafter accepted.
+_MAX_SUGGESTION_LEN = 256
 
 
 def _ai_suggestion_with_evidence(conn, logical_ref: str, field_name: str):

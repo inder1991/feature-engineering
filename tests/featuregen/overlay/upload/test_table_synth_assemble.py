@@ -39,15 +39,21 @@ def test_one_item_per_table_egress_admissible():
 
 
 def test_draft_definition_rides_bounded_as_business_definition():
-    # The Pass-A draft rides as business_definition, bounded to the 600 egress window in the view.
+    # The Pass-A draft rides as business_definition, bounded to the egress window in the view.
     # Sample-value stripping moved to the field-aware egress seam (Task 2: _redact_free_text_meta
     # routes business_definition through sanitize_definition at dispatch) — the assembler projects.
+    # Sized off the constant: the 2026-08-06 raise took it 600 -> 4000 and a fixed-length draft
+    # stopped exercising the bound at all.
+    from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
+
     rows = [_row("txn", "acct")]
-    long_draft = ("A drafted business definition sentence about the account. " * 20).strip()
+    sentence = "A drafted business definition sentence about the account. "
+    long_draft = (sentence * (MAX_DEFINITION_LEN // len(sentence) + 4)).strip()
+    assert len(long_draft) > MAX_DEFINITION_LEN
     drafts = {content_hash(rows[0]): long_draft}
     items = assemble_table_items(_views(rows, concepts={}, definitions=drafts))
     desc = items[0].metadata["column_profiles"][0]
-    assert desc["business_definition"] and len(desc["business_definition"]) <= 600
+    assert desc["business_definition"] and len(desc["business_definition"]) <= MAX_DEFINITION_LEN
     assert _item_egress_ok(items[0].metadata) is True
 
 
