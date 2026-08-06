@@ -258,6 +258,28 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
                    timeout_scale=request.timeout_scale * (raised / current)), raised
 
 
+#: Bound on the rendered repair feedback — a pathological error list must not grow the payload.
+_MAX_REPAIR_FEEDBACK_CHARS = 2000
+
+
+def _safe_reason(exc: SchemaValidationError) -> str:
+    """A VALUE-FREE description of why the structure failed.
+
+    `jsonschema.ValidationError.message` embeds the offending INSTANCE VALUE, which derives from
+    the catalog metadata this call egressed and has NOT been through `assert_llm_safe` (that guard
+    scans `redacted_intent` and `catalog_metadata` only). Feeding the raw message back into the
+    repair prompt would re-egress content past the PII guard. Carry only the JSON pointer and the
+    failed keyword — enough for the model to fix its output, structurally incapable of leaking a
+    value. `registry.validate` raises `from exc`, so the structured cause is always available.
+    """
+    cause = exc.__cause__
+    path = getattr(cause, "json_path", None)
+    validator = getattr(cause, "validator", None)
+    if path and validator:
+        return f"{path}: failed '{validator}'"
+    return "the structure did not match the required schema"
+
+
 def drive_structured_call(
     client: LLMClient,
     request: LLMRequest,
@@ -287,7 +309,9 @@ def drive_structured_call(
                 validate_output(resp.output)
             except SchemaValidationError as exc:
                 ps = PROVIDER_INVALID
-                errors.append(str(exc))
+                # `_safe_reason`, never `str(exc)`: this text is re-prompted to the provider AND
+                # stored verbatim as audited request input, and the raw message carries a value.
+                errors.append(_safe_reason(exc))
             else:
                 status = (
                     STATUS_REPAIRED if repairs_used

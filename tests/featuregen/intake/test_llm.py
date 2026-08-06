@@ -14,6 +14,7 @@ from featuregen.intake.llm import (
     FakeResponse,
     LLMRequest,
     LLMResult,
+    _safe_reason,
     compute_input_hash,
     drive_structured_call,
 )
@@ -139,6 +140,58 @@ def test_provider_ok_but_schema_invalid_repairs_then_validates():
     assert out.status == STATUS_REPAIRED
     assert out.output == {"entity": "customer"}
     assert len(out.repair_attempts) == 1 and out.repair_attempts[0]["class"] == "repair"
+
+
+def test_repair_reasons_never_carry_the_offending_value():
+    """jsonschema messages embed the instance value; the repair channel must not."""
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError) as raised:
+        jsonschema.validate(instance={"ref": "Acme Corporation Ltd"},
+                            schema={"type": "object",
+                                    "properties": {"ref": {"type": "integer"}}})
+    exc = SchemaValidationError(f"t@v1: {raised.value.message}")
+    exc.__cause__ = raised.value
+
+    reason = _safe_reason(exc)
+    assert "Acme Corporation Ltd" not in reason
+    assert "ref" in reason and "type" in reason
+
+
+def test_a_repair_recall_carries_the_value_free_reason_to_the_provider():
+    """What the repair re-call actually SENDS is the thing under test, not the helper in isolation.
+
+    The reason reaches the provider twice over: in `_repair_errors` (rendered into the repair turn)
+    and in the audited `repair_attempts` ledger (stored verbatim in `llm_dispatch.redacted_input`).
+    Neither may carry the instance value, which never went through the §9.4 egress guard."""
+    import jsonschema
+
+    schema = {"type": "object", "properties": {"ref": {"type": "integer"}}}
+
+    def _validate(output):
+        try:
+            jsonschema.validate(instance=dict(output), schema=schema)
+        except jsonschema.ValidationError as exc:
+            raise SchemaValidationError(f"t@v1: {exc.message}") from exc
+
+    seen: list[dict] = []
+
+    class _Offending:
+        def call(self, request):
+            seen.append(dict(request.inputs))
+            return LLMResult(output={"ref": "Acme Corporation Ltd"}, self_reported_scores={},
+                             call_ref="", status=PROVIDER_OK)
+
+    outcome = drive_structured_call(_Offending(), _req(), _validate, repair_budget=1)
+
+    assert outcome.status == STATUS_FAILED
+    assert "_repair_errors" not in seen[0]                     # nothing to repair on a first attempt
+    assert seen[1]["_repair_errors"] == ["$.ref: failed 'type'"]
+    # and the ledger the audit chain replays says the same, without moving the ceiling (a repair
+    # entry consumes its slot; only a truncation retry carries a raised max_tokens).
+    (entry,) = outcome.repair_attempts
+    assert entry["reason"] == "$.ref: failed 'type'"
+    assert "max_tokens" not in entry
 
 
 def test_repair_budget_exhausted_fails_into_clarification():

@@ -15,6 +15,7 @@ import os
 from dataclasses import dataclass
 
 from featuregen.intake.llm import (
+    _MAX_REPAIR_FEEDBACK_CHARS,
     DEFAULT_LLM_MODEL,
     PROVIDER_AUTH_ERROR,
     PROVIDER_MAX_TOKENS,
@@ -94,7 +95,11 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
     user message — byte-for-byte today's rendering (definition/domain batches, single-mode calls, and
     every non-enrichment caller are unaffected). Pure + SDK-free so the split is unit-testable
     without importing the provider SDK. Operates on a COPY of the catalog metadata, so
-    ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched."""
+    ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched.
+
+    A REPAIR re-call additionally appends the driver's value-free validation complaint to the user
+    turn (see the ``_repair_errors`` block below); a first attempt carries no such key and renders
+    exactly as before."""
     intent = request.inputs.get(INPUT_KEY_INTENT, "")
     catalog = dict(request.inputs.get(INPUT_KEY_CATALOG, {}) or {})
     cache_keys = [k for k in request.cacheable_metadata_keys if k in catalog]
@@ -109,6 +114,17 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
         f"Intent (redacted, LLM-safe): {intent}\n"
         f"Catalog metadata (names/types/grain only): {catalog}"
     )
+    # A repair re-call carries the errors that refuted the previous answer. Without this the
+    # repair sends byte-identical bytes and the budget buys nothing. The key is `_`-prefixed so it
+    # stays OUT of `compute_input_hash` — the repair keeps its parent's identity while differing
+    # on the wire, which is exactly the intent. The values are already value-free (`_safe_reason`).
+    errors = request.inputs.get("_repair_errors")
+    if errors:
+        rendered = "; ".join(str(e) for e in errors)[:_MAX_REPAIR_FEEDBACK_CHARS]
+        user_content += (
+            "\n\nYour previous answer did not validate against the required output schema. "
+            f"Correct exactly these problems and return the fixed structure: {rendered}"
+        )
     return system, user_content
 
 

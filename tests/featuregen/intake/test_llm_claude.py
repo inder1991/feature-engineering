@@ -236,6 +236,37 @@ def test_wire_prompt_without_cacheable_keys_is_a_single_user_message():
     assert user.startswith("Structure the following intent")
 
 
+def _repair_request(inputs):
+    from featuregen.intake.llm import LLMRequest
+
+    return LLMRequest(
+        task="t", prompt_id="p", prompt_version=1,
+        inputs=inputs,
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={}, output_schema={"type": "object"})
+
+
+def test_wire_prompt_renders_repair_errors():
+    """A repair re-call must DIFFER on the wire from the answer it refutes. Without this the
+    repair sends byte-identical bytes and the budget buys nothing."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    request = _repair_request({"redacted_intent": "i", "catalog_metadata": {},
+                               "_repair_errors": ["$.items[3].ref: failed 'required'"]})
+    _system, user_content = _wire_prompt(request)
+    assert "$.items[3].ref: failed 'required'" in user_content
+    assert "did not validate" in user_content
+
+
+def test_wire_prompt_omits_the_repair_block_on_a_first_attempt():
+    """No previous answer, no complaint about one."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    request = _repair_request({"redacted_intent": "i", "catalog_metadata": {}})
+    _system, user_content = _wire_prompt(request)
+    assert "did not validate" not in user_content
+
+
 def test_claude_adapter_sends_vocab_as_a_cached_system_block(monkeypatch):
     """End-to-end at the adapter: a request that marks the vocab cacheable makes the SDK call carry a
     `system` block with `cache_control`, and the volatile user turn no longer re-sends the vocab."""
