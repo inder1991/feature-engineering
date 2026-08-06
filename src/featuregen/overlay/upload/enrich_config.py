@@ -24,7 +24,38 @@ _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
 # `summary` sits with the other prose tasks at 8: it runs over EVERY column (not just the blank
 # ones), so it is the widest fan-out of any task, and a small chunk keeps cross-item contamination —
 # one column's summary borrowing another's facts — to the same bound the siblings hold.
-_DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8, "unit": 8,
+#
+# ── `definition` 8 -> 4 (2026-08-06) ─────────────────────────────────────────────────────────────
+#
+# LOWERED, which is the only direction this map may move without accuracy evidence, and the binding
+# reason is the OUTPUT-token ceiling rather than contamination. Every other bound in this task's
+# work was about INPUT (`chunk_items` packs on `estimate_tokens`, which measures the request); this
+# one is about the RESPONSE, which nothing in `enrich_config` measures.
+#
+# `MAX_DEFINITION_LEN` went 600 -> 32_000, so ONE drafted definition may now be ~8_000 output tokens
+# (the estimator's own 4-chars-per-token unit; real tokenisation of English prose is slightly worse,
+# so this UNDERSTATES). Against the deployed `FEATUREGEN_LLM_MAX_TOKENS = 32000` and the driver's
+# `_MAX_TOKENS_CEILING = 64_000` / `_TRUNCATION_ESCALATION = 2.0`:
+#
+#   items   chunk output at the cap   vs 32_000 initial   after ONE escalation to 64_000
+#   8       ~64_000 tok               truncates           EXACTLY AT the ceiling -> unservable
+#   4       ~32_000 tok               marginal            fits with 2x headroom
+#
+# At 8 the escalated ceiling IS the wall: a chunk of full-length definitions cannot be served even
+# after the retry budget is spent, and the chunk fails. At 4 the escalation actually rescues it. So
+# this is not "8 costs more calls than 4" — it is "8 has a shape it can never complete".
+#
+# HONEST SCOPE: that is the worst case, not the common one. The prompt asks for a ONE-LINE
+# definition and the widest real value measured is 960 chars, so a realistic chunk is ~2_000 output
+# tokens at either setting and never escalates. The change buys the tail, not the median.
+#
+# Contamination points the same way (an item is now up to 53x larger, so a chunk of 8 is a far wider
+# surface than when this was set), and the human asked for it. Three independent grounds agree.
+#
+# `summary` was checked against the same arithmetic and deliberately LEFT at 8: its accept bound is
+# `enrich._MAX_SUMMARY_LEN` = 1000 chars = ~250 output tokens, so 8 items is ~2_000 tokens — 6% of
+# the 32_000 ceiling. It has no output-token problem to fix.
+_DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 4, "domain": 8, "synonyms": 8, "unit": 8,
                       "summary": 8, "table_synth": 4}
 
 # ── RE-BUDGET, joint Task 4 (measured, not guessed) ──────────────────────────────────────────────
@@ -152,10 +183,19 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 # THE TWO RAISES, derived rather than guessed:
 #
 # * definition / synonyms / unit / summary 60_000 (100_000 for summary) -> 200_000. All four are the
-#   same item shape at the same `max_items` = 8 (`summary_payload` is `_drafting_payload`'s superset
-#   — 322 tok vs 308 — which is why they get ONE number rather than three; leaving summary at
-#   100_000 would have given the LARGER item the SMALLER budget). Required = 8 x (8_000 + other).
-#   At the measured `other` (308-322 tok) that is 66_464-66_576, i.e. 33% of 200_000.
+#   same item shape (`summary_payload` is `_drafting_payload`'s superset — 322 tok vs 308 — which is
+#   why they get ONE number rather than three; leaving summary at 100_000 would have given the
+#   LARGER item the SMALLER budget). Required = `max_items` x (8_000 + other). At the measured
+#   `other` (308-322 tok) that is 66_464-66_576 at 8 items, i.e. 33% of 200_000.
+#
+#   `max_items` IS NO LONGER 8 FOR ALL FOUR (2026-08-06): `definition` dropped to 4 for an
+#   OUTPUT-token reason this INPUT budget does not model — see the `_DEFAULT_MAX_ITEMS` note above.
+#   So 200_000 is now held by `synonyms` / `unit` / `summary` at 8, and `definition` sits at half
+#   that requirement inside the same number. The shared budget is deliberately NOT re-cut to 4
+#   items: an input budget larger than the requirement costs nothing (packing is bound by
+#   `max_items` first), while a per-stage split would be a fourth number to keep in step for no
+#   gain. What the budget must hold is asserted by measurement, not by this paragraph — see
+#   `test_the_drafting_stages_still_pack_a_full_chunk_at_the_definition_cap`.
 #
 #   RE-DERIVED (2026-08-06, Task 4b review): the paragraph that used to sit here computed the
 #   pathological fill at `ftr_adapter._MAX_SOURCE_ATTRIBUTES` = 40 and concluded "8 x 22_000 =
@@ -166,6 +206,9 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "synonyms": 8
 #     source_attribute fill          tok/item   chunk cost (x8)    packed
 #     17 x 1000 (the REALISTIC max — the FTR export has 17 headers in total)   12_392    99_136   8/8
 #     256 x 1000 (the new theoretical maximum)                                 72_381   579_048   2/8
+#
+#   (Both rows are at `max_items` = 8, which is still `synonyms` / `unit` / `summary`. `definition`
+#   at 4 is strictly inside them: 4 x 12_392 = 49_568, and the degenerate fill packs 2 of 4.)
 #
 #   So 200_000 holds the measured item and the realistic-maximum item at the full contamination
 #   bound of 8, with ~2x headroom. It does NOT hold the degenerate 256-attribute item, and that is

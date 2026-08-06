@@ -25,7 +25,10 @@ def test_pass_a_defaults_batch_table_synth_single_and_reads_env(monkeypatch):
 def test_max_items_default_and_override(monkeypatch):
     # MF-8a — conservative isolation ceilings (were 40/12/20). The env override still wins.
     assert cfg.max_items("concept") == 20
-    assert cfg.max_items("definition") == 8
+    # `definition` lowered 8 -> 4 (2026-08-06) for a RESPONSE-token reason, not a contamination one:
+    # at `MAX_DEFINITION_LEN` = 32_000 chars a chunk of 8 needs ~64_000 output tokens, exactly the
+    # driver's escalation ceiling. Its siblings keep 8 — their outputs are short.
+    assert cfg.max_items("definition") == 4
     assert cfg.max_items("domain") == 8
     monkeypatch.setenv("OVERLAY_ENRICH_BATCH_CONCEPT_MAX_ITEMS", "16")
     assert cfg.max_items("concept") == 16

@@ -458,21 +458,27 @@ def test_a_definition_at_the_cap_costs_the_tokens_the_budget_was_derived_from() 
 
 @pytest.mark.parametrize("short", ["definition", "synonyms", "unit"])
 def test_the_drafting_stages_still_pack_a_full_chunk_at_the_definition_cap(short: str) -> None:
-    """`definition`/`synonyms`/`unit` dispatch the SAME `_drafting_payload` item at the SAME
-    `max_items`, so all three are proved together — raising one budget and not its twins would have
-    left two stages shattered for the identical reason.
+    """`definition`/`synonyms`/`unit` dispatch the SAME `_drafting_payload` item, so all three are
+    proved together — raising one budget and not its twins would have left two stages shattered for
+    the identical reason.
 
     At the 4000 cap these packed 8 per chunk; a 32_000-char definition is 8_000 tokens, so 8 of them
     (66_464) crossed the old 60_000 budget and packing fell to 7 — ~14% more provider calls on
     stages that fan out PER COLUMN, against an unchanged `max_provider_calls`. The budget move is
     what puts it back, and this is the assertion that fails if it is reverted.
+
+    They no longer share a `max_items`: `definition` dropped 8 -> 4 for an OUTPUT-token reason
+    (`_DEFAULT_MAX_ITEMS`' note), so the counts are READ per stage rather than restated. What is
+    asserted is the property — packing is bound by the ITEM COUNT, never by tokens — which is what
+    the budget exists to guarantee and what survives either setting.
     """
     payload = _drafting_item_at_the_definition_cap()
     items = [BatchItem(f"h{i}", payload) for i in range(40)]
-    chunks = chunk_items(items, max_items=enrich_config.max_items(short),
+    max_items = enrich_config.max_items(short)
+    chunks = chunk_items(items, max_items=max_items,
                          max_input_tokens=enrich_config.max_input_tokens(short))
-    assert max(len(c) for c in chunks) == enrich_config.max_items(short) == 8
-    assert len(chunks) == 5           # 40 items / 8 — bound by ITEM COUNT, not by tokens
+    assert max(len(c) for c in chunks) == max_items
+    assert len(chunks) == -(-40 // max_items)     # bound by ITEM COUNT, not by tokens
 
 
 def test_the_summary_stage_still_packs_a_full_chunk_at_the_definition_cap() -> None:
@@ -482,6 +488,11 @@ def test_the_summary_stage_still_packs_a_full_chunk_at_the_definition_cap() -> N
     It packed 8 per chunk at its old 100_000 too — the measured margin was real. The raise to
     200_000 is about the ORDERING, asserted below: the bigger item must never hold the smaller
     budget, or a pathological fill shatters summary while its own subset survives.
+
+    `summary` KEPT its 8 when `definition` dropped to 4, and the reason is the OUTPUT side rather
+    than this INPUT one: a summary is bounded at `_MAX_SUMMARY_LEN` = 1000 chars = ~250 output
+    tokens, so 8 of them is ~2_000 against a 32_000 response ceiling. Pinned below so the two stages
+    cannot be "made consistent" without re-checking which constraint actually binds each.
     """
     assert (enrich_config.max_input_tokens("summary")
             >= enrich_config.max_input_tokens("definition")), \
@@ -494,7 +505,7 @@ def test_the_summary_stage_still_packs_a_full_chunk_at_the_definition_cap() -> N
     chunks = chunk_items([BatchItem(f"h{i}", payload) for i in range(40)],
                          max_items=enrich_config.max_items("summary"),
                          max_input_tokens=enrich_config.max_input_tokens("summary"))
-    assert max(len(c) for c in chunks) == enrich_config.max_items("summary") == 8
+    assert max(len(c) for c in chunks) == enrich_config.max_items("summary")
 
 
 def test_the_concept_stage_still_packs_at_a_capped_definition_AND_a_saturated_roster() -> None:

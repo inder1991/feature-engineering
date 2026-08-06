@@ -78,6 +78,91 @@ def test_the_summary_bound_stays_below_the_definition_bound_and_at_its_egress_ca
     assert llm._max_len_for("ai_summary") == enrich._MAX_SUMMARY_LEN
 
 
+#: The deployed response ceiling and the driver's escalation of it. Read from the code and the
+#: manifest rather than restated, because the whole point is that these three interact.
+def _response_ceilings() -> tuple[int, int]:
+    import pathlib
+
+    import yaml
+
+    from featuregen.intake.llm import _MAX_TOKENS_CEILING, _TRUNCATION_ESCALATION
+
+    root = pathlib.Path(__file__).resolve().parents[4]
+    docs = yaml.safe_load_all((root / "deploy" / "kind" / "k8s" / "20-backend.yaml")
+                              .read_text(encoding="utf-8"))
+    cfg = next(d for d in docs if d.get("kind") == "ConfigMap")["data"]
+    deployed = int(cfg["FEATUREGEN_LLM_MAX_TOKENS"])
+    return deployed, min(int(deployed * _TRUNCATION_ESCALATION), _MAX_TOKENS_CEILING)
+
+
+def test_the_definition_chunk_fits_the_RESPONSE_ceiling_not_just_the_request_budget() -> None:
+    """THE reason `_DEFAULT_MAX_ITEMS["definition"]` went 8 -> 4, and the one bound nothing else in
+    `enrich_config` models.
+
+    Every other budget in this subsystem is about the REQUEST (`chunk_items` packs on
+    `estimate_tokens`, which measures item metadata). This is about the RESPONSE. A definition at
+    `MAX_DEFINITION_LEN` is ~8_000 output tokens, so a chunk's output cost is `max_items x 8_000`,
+    and it meets `FEATUREGEN_LLM_MAX_TOKENS` — which the driver may escalate exactly ONCE
+    (`_TRUNCATION_ESCALATION`, clamped at `_MAX_TOKENS_CEILING`).
+
+    At 8 items that is ~64_000 tokens against a 64_000 escalated ceiling: AT the wall, with the
+    retry budget already spent — a chunk of full-length definitions could never complete. At 4 it is
+    ~32_000, which the escalation clears with 2x headroom. This asserts the headroom exists, so
+    raising `max_items` back without moving `FEATUREGEN_LLM_MAX_TOKENS` fails here rather than in a
+    live run.
+    """
+    from featuregen.overlay.upload import enrich_config
+
+    deployed, escalated = _response_ceilings()
+    per_definition = llm.MAX_DEFINITION_LEN // 4          # the estimator's own chars-per-token unit
+    chunk_output = enrich_config.max_items("definition") * per_definition
+
+    assert chunk_output <= escalated, (
+        f"{enrich_config.max_items('definition')} definitions at the cap need {chunk_output} output "
+        f"tokens against an escalated ceiling of {escalated} — the chunk could never complete")
+    # Not merely "fits": it must fit with room, because 4-chars-per-token UNDERSTATES real
+    # tokenisation and the JSON wrapper (refs, braces, escaping) rides on top.
+    assert chunk_output <= escalated // 2, (
+        f"{chunk_output} of {escalated} leaves no margin for the response wrapper")
+    # The 8-item shape this replaced is recorded as the thing that does NOT fit.
+    assert 8 * per_definition > escalated // 2
+
+
+def test_the_summary_chunk_has_no_response_ceiling_problem() -> None:
+    """Checked rather than assumed when `definition` moved: `summary` keeps 8 because its accept
+    bound is 1000 chars (~250 output tokens), so a full chunk is ~2_000 tokens — a few percent of
+    the deployed ceiling. The two stages are bound by different constraints and must not be
+    "made consistent" with each other."""
+    from featuregen.overlay.upload import enrich_config
+
+    deployed, _escalated = _response_ceilings()
+    chunk_output = enrich_config.max_items("summary") * (enrich._MAX_SUMMARY_LEN // 4)
+    assert chunk_output * 10 < deployed, (
+        f"summary now costs {chunk_output} output tokens per chunk against {deployed} — it has "
+        f"acquired the problem that moved `definition` to 4")
+
+
+def test_the_REMAINING_ceiling_on_a_long_definition_is_the_SINGLE_LINE_rule() -> None:
+    """The bound that still stops a 32_000-char definition short, documented rather than discovered.
+
+    `_bounded` rejects on `"\\n" in val` (M9 — it also catches a list-stringified `['a','b']` dump).
+    That rule was written when the cap was 200-600 chars, where "a definition is one line" is a fair
+    description. At 32_000 it is the effective ceiling on ACHIEVABLE length: a model writing a long
+    definition will paragraph it, and the whole value is then DISCARDED — not shortened, not
+    salvaged to its first line. The prompt does say "one-line", so this is consistent; it is
+    recorded here because "the cap is 32_000" and "you can get 32_000 chars back" are different
+    claims, and only the first is true without qualification.
+
+    NOT changed here: relaxing it is a real decision about what a malformed definition looks like,
+    not a mechanical raise, and it would weaken the list-dump guard in the same stroke.
+    """
+    accept = enrich._accept_bounded(llm.MAX_DEFINITION_LEN)
+    one_line = "A single unbroken sentence. " * 100
+    assert accept(one_line[:llm.MAX_DEFINITION_LEN])[1] == "valid"
+    # The same text, paragraphed, is refused OUTRIGHT — length is not what decides it.
+    assert accept("First paragraph.\nSecond paragraph.") == (None, "invalid_value")
+
+
 def test_an_accepted_definition_survives_every_consumer_at_the_new_length() -> None:
     """Traced before raising: nothing downstream re-bounds an accepted definition BELOW the gate.
 
