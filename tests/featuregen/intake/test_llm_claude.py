@@ -92,14 +92,19 @@ def test_rejected_schema_keyword_is_token_only():
 
 def _stub_adapter(monkeypatch, create, config=None):
     """A ClaudeLLM whose SDK surface is stubbed: `anthropic` in sys.modules is a bare module with
-    the two exception types `.call` references, and the constructed client is a create-capturing
-    fake — no SDK, no network."""
+    the three exception types `.call` references, and the constructed client is a create-capturing
+    fake — no SDK, no network.
+
+    `APITimeoutError` subclasses `APIConnectionError` here because it does in the real SDK; the
+    adapter's arm ordering depends on that, so a stub that flattened the hierarchy would let a
+    broken ordering pass. (The classification itself is exercised in `test_claude_timeout.py`.)"""
     import sys
     import types
 
     stub = types.ModuleType("anthropic")
     stub.APIStatusError = type("APIStatusError", (Exception,), {})
     stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
+    stub.APITimeoutError = type("APITimeoutError", (stub.APIConnectionError,), {})
     monkeypatch.setitem(sys.modules, "anthropic", stub)
     adapter = ClaudeLLM(config or ClaudeConfig(enabled=True))
     adapter._client = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
@@ -147,7 +152,7 @@ def test_escalated_timeout_reaches_messages_create(monkeypatch):
 
     A truncation retry is granted a raised `max_tokens`; if the timeout kwarg is still the
     un-scaled config value the attempt is cut off mid-generation and the truncation is merely
-    relabelled as an APITimeoutError -> PROVIDER_TRANSIENT. This runs SDK-FREE via the `anthropic`
+    relabelled as an APITimeoutError -> PROVIDER_NON_RETRYABLE. This runs SDK-FREE via the `anthropic`
     stub, so CI (which installs only the `dev` extra) actually guards the assembled kwarg — the
     `_effective_timeout` unit tests alone cannot catch the helper being computed but not wired.
     """

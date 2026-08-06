@@ -235,9 +235,9 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
 
     ONE decision, two consequences: the ratio that raises the ceiling also raises `timeout_scale`,
     because a ceiling the attempt has no TIME to fill is not a different attempt — it fails on the
-    adapter's per-attempt clock (MF-4) as an APITimeoutError, which maps to PROVIDER_TRANSIENT and
-    spends the same budget for the same FAILED outcome. Deriving both from one ratio here is what
-    stops the ceiling and the clock drifting apart.
+    adapter's per-attempt clock (MF-4) as an APITimeoutError, which maps to PROVIDER_NON_RETRYABLE
+    and ENDS the call on the spot, discarding the retry budget that was still left. Deriving both
+    from one ratio here is what stops the ceiling and the clock drifting apart.
 
     Returns `(request, raised_to)`; `raised_to` is None when nothing changed, so the caller can
     record the escalation in `attempts` without inventing a value.

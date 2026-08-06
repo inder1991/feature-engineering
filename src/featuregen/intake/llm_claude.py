@@ -152,8 +152,8 @@ def _effective_timeout(request: LLMRequest, config: ClaudeConfig) -> float:
     unless `_escalated` raised `max_tokens`, in which case it carries the SAME ratio: an attempt
     allowed 4x the output tokens is allowed 4x the time to generate them. Without this the
     escalated retry is cut off mid-generation and the truncation is merely relabelled as an
-    APITimeoutError -> PROVIDER_TRANSIENT. Pure + SDK-free so a unit test can prove the coupling
-    without importing the SDK."""
+    APITimeoutError -> PROVIDER_NON_RETRYABLE, which now ends the call outright. Pure + SDK-free so
+    a unit test can prove the coupling without importing the SDK."""
     return config.timeout * request.timeout_scale
 
 
@@ -247,8 +247,22 @@ class ClaudeLLM:
             if status == 429 or status >= 500:
                 return _fail(PROVIDER_TRANSIENT)    # rate-limit / transient 5xx → bounded retry
             return _fail(PROVIDER_NON_RETRYABLE)    # other non-retryable 4xx → fail closed
+        except anthropic.APITimeoutError:
+            # NOT transient, and ordered BEFORE APIConnectionError because it is a SUBCLASS of it —
+            # today this exception reaches that arm by inheritance, never by intent. The SDK has
+            # already retried genuine network faults internally (max_retries=2) before raising, so
+            # what arrives here is a request that needs longer than the ceiling this attempt was
+            # given — deterministic, and re-attempting it identically spends the budget proving it.
+            # Fail closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
+            # switches this adapter to streaming. The logged clock is the EFFECTIVE one (an
+            # escalated truncation retry runs at a multiple of the configured value), or the
+            # operator reads a ceiling that was never applied.
+            logger.warning("anthropic call timed out after %.0fs (task=%s) — non-retryable; "
+                           "raise FEATUREGEN_LLM_TIMEOUT or stream",
+                           _effective_timeout(request, self._config), request.task)
+            return _fail(PROVIDER_NON_RETRYABLE)
         except anthropic.APIConnectionError:
-            return _fail(PROVIDER_TRANSIENT)        # network → bounded retry
+            return _fail(PROVIDER_TRANSIENT)        # network → bounded retry (NOT a timeout: above)
 
         provider_status = _map_stop_reason(resp.stop_reason)
         output, scores = _parse_structured(resp)

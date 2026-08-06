@@ -3,6 +3,7 @@ import pytest
 from featuregen.contracts import SchemaValidationError
 from featuregen.intake.llm import (
     PROVIDER_MAX_TOKENS,
+    PROVIDER_NON_RETRYABLE,
     PROVIDER_OK,
     PROVIDER_REFUSAL,
     PROVIDER_TRANSIENT,
@@ -296,8 +297,8 @@ def test_a_truncation_retry_raises_the_wall_clock_with_the_ceiling():
 
     Generating 8-16K output tokens takes materially longer than the 60s default per-attempt clock,
     and adaptive thinking spends more of that budget too. Leaving the clock pinned converts the
-    truncation into an APITimeoutError -> PROVIDER_TRANSIENT: the budget is still spent and the
-    outcome is still FAILED, which is the very "three calls, one outcome" this escalation removes.
+    truncation into an APITimeoutError -> PROVIDER_NON_RETRYABLE: the escalation is thrown away and
+    the call ends FAILED on the very attempt the raised ceiling was supposed to rescue.
     """
     seen: list[tuple[int, float]] = []
 
@@ -373,6 +374,23 @@ def test_provider_calls_counted_when_retry_budget_exhausted():
     out = drive_structured_call(fake, _req(), _needs_entity, retry_budget=2)
     assert out.status == STATUS_FAILED
     assert out.provider_calls == 3
+
+
+def test_a_non_retryable_outcome_is_not_re_attempted():
+    """The other half of "a timeout is not retried": once the adapter NAMES a timeout
+    `non_retryable`, the driver must issue exactly ONE physical call and stop.
+
+    Asserted on `provider_calls` rather than on `_RETRYABLE` membership, so adding the token back
+    to the retryable tuple fails here — the point is the spend, not the tuple. At the 300s ceiling
+    a later task configures, the difference this pins is 300s versus 900s per doomed call.
+    """
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status=PROVIDER_NON_RETRYABLE)])
+    out = drive_structured_call(fake, _req(), _needs_entity, retry_budget=2)
+    assert out.status == STATUS_FAILED
+    assert out.provider_calls == 1
+    assert out.repair_attempts == ()      # nothing was re-called, so nothing is on the ledger
 
 
 def test_auth_error_fails_closed_and_flags_security_audit():
