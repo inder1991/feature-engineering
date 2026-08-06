@@ -262,6 +262,34 @@ def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, i
 _MAX_REPAIR_FEEDBACK_CHARS = 2000
 
 
+def _path_is_schema_declared(cause: object) -> bool:
+    """True when EVERY segment of the failing instance path came from the SCHEMA, not the data.
+
+    jsonschema records the instance path (`absolute_path`, which `json_path` renders) and the
+    schema path (`absolute_schema_path`) side by side. A DECLARED property name always appears in
+    the schema path immediately after the literal `properties`. A key that reached the validator
+    through `additionalProperties: <subschema>`, `patternProperties` or `propertyNames` never
+    appears there at all — those keywords descend carrying the MODEL-CHOSEN key in the instance
+    path only (`$.totals['Acme Corporation Ltd']` against a schema path of
+    `properties/totals/additionalProperties/type`). So the names following `properties` are exactly
+    the schema's own vocabulary, and an instance segment outside it is model-supplied text. Array
+    indices are integers and carry nothing.
+
+    A GUARD, not a schema walker: the vocabulary is pooled across the whole schema path rather than
+    matched level by level, so a model-chosen key that happens to equal a name declared elsewhere in
+    the schema is emitted. That is the accepted bound — the emitted token is still schema-authored
+    text drawn from a fixed vocabulary, never data. A cause that cannot show its instance path is
+    unverifiable, and unverifiable means unsafe.
+    """
+    instance_path = getattr(cause, "absolute_path", None)
+    if instance_path is None:
+        return False
+    schema_path = list(getattr(cause, "absolute_schema_path", None) or ())
+    declared = {name for keyword, name in zip(schema_path, schema_path[1:])
+                if keyword == "properties"}
+    return all(isinstance(seg, int) or seg in declared for seg in instance_path)
+
+
 def _safe_reason(exc: SchemaValidationError) -> str:
     """A VALUE-FREE description of why the structure failed.
 
@@ -269,13 +297,23 @@ def _safe_reason(exc: SchemaValidationError) -> str:
     the catalog metadata this call egressed and has NOT been through `assert_llm_safe` (that guard
     scans `redacted_intent` and `catalog_metadata` only). Feeding the raw message back into the
     repair prompt would re-egress content past the PII guard. Carry only the JSON pointer and the
-    failed keyword — enough for the model to fix its output, structurally incapable of leaking a
-    value. `registry.validate` raises `from exc`, so the structured cause is always available.
+    failed keyword — enough for the model to fix its output. `registry.validate` raises `from exc`,
+    so the structured cause is always available.
+
+    The keyword is always a schema token. The POINTER is NOT, and this is the trap: `json_path` is
+    built from INSTANCE property names, so under an open object a key the MODEL chose rides out
+    verbatim. Every schema that reaches a `validate_output` today is closed
+    (`additionalProperties: false`), so nothing leaks — but that is an invariant of OTHER modules,
+    unenforced and undocumented there, and an egress boundary may not rest on it. So the guarantee
+    is re-derived here rather than assumed: a pointer is emitted ONLY when
+    `_path_is_schema_declared` proves every segment is an array index or a schema-declared name,
+    and anything else falls back to the value-free constant. The next author to register an open
+    document schema gets a duller repair complaint, never a leak.
     """
     cause = exc.__cause__
     path = getattr(cause, "json_path", None)
     validator = getattr(cause, "validator", None)
-    if path and validator:
+    if path and validator and _path_is_schema_declared(cause):
         return f"{path}: failed '{validator}'"
     return "the structure did not match the required schema"
 

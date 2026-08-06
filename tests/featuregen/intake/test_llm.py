@@ -158,6 +158,49 @@ def test_repair_reasons_never_carry_the_offending_value():
     assert "ref" in reason and "type" in reason
 
 
+def test_a_model_chosen_key_never_rides_out_inside_the_json_pointer():
+    """The pointer is built from INSTANCE property names, so it is not automatically schema text.
+
+    Under an open object (`additionalProperties: <subschema>`) jsonschema descends with the key the
+    MODEL chose, and that key lands in `json_path` verbatim — the same leak the raw message is
+    rejected for, arriving through the channel that replaced it. Every schema reaching
+    `validate_output` today is closed, so this is latent rather than live; the guarantee has to hold
+    HERE, not in the schemas.
+    """
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError) as raised:
+        jsonschema.validate(
+            instance={"totals": {"Acme Corporation Ltd": "not a number"}},
+            schema={"type": "object",
+                    "properties": {"totals": {"type": "object",
+                                              "additionalProperties": {"type": "integer"}}}})
+    assert "Acme Corporation Ltd" in raised.value.json_path   # the leak being guarded against
+    exc = SchemaValidationError(f"t@v1: {raised.value.message}")
+    exc.__cause__ = raised.value
+
+    assert _safe_reason(exc) == "the structure did not match the required schema"
+
+
+def test_a_pointer_of_declared_names_and_indices_still_reaches_the_model():
+    """The guard must not over-fire: a pointer built only from schema-declared names and array
+    indices is precisely what makes a repair actionable, and it survives intact. Without this, a
+    guard that always fell back would satisfy the leak test above and quietly gut the feature."""
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError) as raised:
+        jsonschema.validate(
+            instance={"items": [{"ref": 1}, {"ref": "Acme Corporation Ltd"}]},
+            schema={"type": "object",
+                    "properties": {"items": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {"ref": {"type": "integer"}}}}}})
+    exc = SchemaValidationError(f"t@v1: {raised.value.message}")
+    exc.__cause__ = raised.value
+
+    assert _safe_reason(exc) == "$.items[1].ref: failed 'type'"
+
+
 def test_a_repair_recall_carries_the_value_free_reason_to_the_provider():
     """What the repair re-call actually SENDS is the thing under test, not the helper in isolation.
 
