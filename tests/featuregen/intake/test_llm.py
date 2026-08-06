@@ -2,8 +2,10 @@ import pytest
 
 from featuregen.contracts import SchemaValidationError
 from featuregen.intake.llm import (
+    PROVIDER_MAX_TOKENS,
     PROVIDER_OK,
     PROVIDER_REFUSAL,
+    PROVIDER_TRANSIENT,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_REPAIRED,
@@ -169,6 +171,48 @@ def test_max_tokens_retries_then_validates():
     out = drive_structured_call(fake, _req(), _needs_entity)
     assert out.status == STATUS_RETRIED
     assert out.repair_attempts[0]["class"] == "retry"
+
+
+def test_a_truncation_retry_raises_max_tokens():
+    """A max_tokens retry must DIFFER from the attempt it follows, or it cannot succeed."""
+    seen: list[int] = []
+
+    class _Truncating:
+        def call(self, request):
+            seen.append(request.generation_settings["max_tokens"])
+            return LLMResult(output={}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_MAX_TOKENS)
+
+    request = LLMRequest(
+        task="t", prompt_id="p", prompt_version=1, inputs={},
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={"model": "m", "max_tokens": 4096},
+        output_schema={"type": "object"})
+    outcome = drive_structured_call(_Truncating(), request, lambda _out: None)
+
+    assert seen == [4096, 8192, 16384], "each retry must raise the ceiling"
+    assert outcome.status == STATUS_FAILED
+    assert outcome.repair_attempts[0]["max_tokens"] == 8192
+
+
+def test_a_transient_retry_is_replayed_unchanged():
+    """Only truncation escalates — a transient fault is genuinely re-attemptable as-is."""
+    seen: list[int] = []
+
+    class _Transient:
+        def call(self, request):
+            seen.append(request.generation_settings["max_tokens"])
+            return LLMResult(output={}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_TRANSIENT)
+
+    request = LLMRequest(
+        task="t", prompt_id="p", prompt_version=1, inputs={},
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={"model": "m", "max_tokens": 4096},
+        output_schema={"type": "object"})
+    drive_structured_call(_Transient(), request, lambda _out: None)
+
+    assert seen == [4096, 4096, 4096]
 
 
 def test_provider_calls_counted_single_request():

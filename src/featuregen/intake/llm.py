@@ -188,7 +188,7 @@ class StructuredCallOutcome:
     self_reported_scores: dict
     status: str                 # STATUS_*
     validation_result: dict     # {"result": status, "reason"?: str}
-    repair_attempts: tuple      # ({attempt, class, reason}, ...)
+    repair_attempts: tuple      # ({attempt, class, reason, max_tokens?}, ...) — max_tokens on an escalated retry
     cost_metadata: dict
     security_audit_reason: str | None
     # #21 — provider requests ACTUALLY issued (1 + repairs + retries), reported even on a FAILED
@@ -209,6 +209,35 @@ def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int
         security_audit_reason=reason if security_audit else None,
         provider_calls=provider_calls,
     )
+
+
+#: A provider 400s a `max_tokens` above the model's real output ceiling, so escalation is bounded —
+#: past the cap the retry budget is spent honestly rather than on a request that will be rejected.
+_TRUNCATION_ESCALATION = 2.0
+_MAX_TOKENS_CEILING = 64_000
+
+
+def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, int | None]:
+    """A retry that DIFFERS from the attempt it follows.
+
+    A `max_tokens` truncation is deterministic — sampling parameters are removed on current
+    models, so replaying identical bytes re-truncates. Raise the ceiling instead. Schema-fault and
+    transient retries ARE genuinely re-attemptable as-is and pass through unchanged.
+
+    Returns `(request, raised_to)`; `raised_to` is None when nothing changed, so the caller can
+    record the escalation in `attempts` without inventing a value.
+    """
+    if provider_status != PROVIDER_MAX_TOKENS:
+        return request, None
+    gs = dict(request.generation_settings)
+    current = int(gs.get("max_tokens") or 0)
+    if current <= 0:
+        return request, None
+    raised = min(int(current * _TRUNCATION_ESCALATION), _MAX_TOKENS_CEILING)
+    if raised <= current:
+        return request, None       # already at the cap — do not burn a call re-proving it
+    gs["max_tokens"] = raised
+    return replace(request, generation_settings=gs), raised
 
 
 def drive_structured_call(
@@ -276,7 +305,9 @@ def drive_structured_call(
         if ps in _RETRYABLE:
             if retries_used < retry_budget:
                 retries_used += 1
-                attempts.append({"attempt": retries_used, "class": "retry", "reason": ps})
+                request, raised = _escalated(request, ps)
+                attempts.append({"attempt": retries_used, "class": "retry", "reason": ps,
+                                 **({"max_tokens": raised} if raised else {})})
                 resp = client.call(request)
                 provider_calls += 1
                 continue
