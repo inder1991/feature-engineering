@@ -345,9 +345,17 @@ _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semant
 #
 # All three are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
 # column and is audited, never truncated into a different classification token.
+#
+# `confidence_band` (Task 6b) is the ADJUDICATOR's grade — a member of the closed
+# `semantic_adjudication.CONFIDENCE_BANDS` vocabulary (`high|medium|low`), validated on the way in
+# (`adjudication_from_output` invalidates the whole result for an off-vocabulary band) and AGAIN on
+# the re-validating current-pointer read. It is PLATFORM-generated, never uploader-typed, so the
+# two-origin argument that moved `domain` to prose does not reach it and the prose grade's redactor
+# would have nothing to scrub. It is EXPLANATION, never authority: nothing branches on it.
 _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept",
                                            "party_role", "sub_domain",
-                                           "table_role", "event_or_snapshot"})
+                                           "table_role", "event_or_snapshot",
+                                           "confidence_band"})
 # PROSE grade for the feature menu: PII-redacted via `redact_free_text` (no sample-clause strip and
 # no data-marker gate — that is the DEFINITION grade), then length-bounded like any structural
 # value. This is the grade `_SCALAR_PROSE_META_KEYS` (line ~125) already gives these exact three
@@ -404,6 +412,11 @@ _FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value"})
 #
 #   * `concept_path` / `missing_context` — lists of closed-vocabulary tokens (registry concept
 #     names; `semantic_context.MISSING_CONTEXT_CODES`).
+#   * `concept_alternatives` (Task 6b) — the adjudicator's shortlist: at most
+#     `semantic_adjudication.MAX_ALTERNATIVES` (3) names, each filtered to `CONCEPT_REGISTRY`
+#     membership on the way in and again on the re-validating read, so it is the SAME closed
+#     vocabulary `concept_path` carries and takes the same grade. It is CONTEXT for the model to
+#     weigh, never a classification and never an authority claim of its own.
 #   * `identifier_namespace` — {scheme, issuer_scope, basis}: the value space an identifier lives
 #     in. `scheme` is a registry namespace, `basis` is the closed NAMESPACE_BASES vocabulary and
 #     `issuer_scope` is a catalog-scope token.
@@ -414,7 +427,8 @@ _FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value"})
 #   * `relationships` — the current cross-catalog links: platform-minted refs plus the closed
 #     availability/review vocabularies. NEVER a claim of executability (that answer needs a
 #     revalidating reader and does not belong in a prompt).
-_FEATURE_COLUMN_TOKEN_LIST_KEYS = frozenset({"concept_path", "missing_context"})
+_FEATURE_COLUMN_TOKEN_LIST_KEYS = frozenset({"concept_path", "missing_context",
+                                             "concept_alternatives"})
 _FEATURE_COLUMN_OBJECT_KEYS: dict[str, frozenset[str]] = {
     "identifier_namespace": frozenset({"scheme", "issuer_scope", "basis"}),
 }

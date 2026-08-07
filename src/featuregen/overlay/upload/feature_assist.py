@@ -438,7 +438,11 @@ def _enriched_menu(conn, cols: list[dict], *, roles: Iterable[str] = ()) -> list
 #: budget. Prose goes first (it is the largest and the least load-bearing), then the discovery
 #: extras. `missing_context`, the governed|hint fact wrappers and `semantic_authority` are NOT
 #: trimmable: they are what stop the model treating an AI proposal as a governed fact, and a
-#: context that dropped them to fit would be smaller and less safe.
+#: context that dropped them to fit would be smaller and less safe. The adjudication signals
+#: (`confidence_band` / `concept_alternatives`, Task 6b) are absent for the same reason and one
+#: more: they exist ONLY on the columns the platform could not settle, they cost ~27-92 bytes
+#: there, and shedding them would remove the uncertainty marker from exactly the columns whose
+#: uncertainty the model most needs to see.
 _V4_TRIM_ORDER: tuple[str, ...] = ("semantic_terms", "ai_summary", "definition", "relationships",
                                    "concept_path")
 
@@ -483,9 +487,13 @@ def _context_v4_column(conn, c: dict, *, roles: Iterable[str]) -> dict:
 
     The bundle is the ONE assembly (semantic Task 1) — read-scoped and batched at that seam — so
     this path cannot drift from the Context tab or from data-agent retrieval, which read the same
-    contract. Everything the adapter emits is already egress-classified (D10); the two keys added
-    here (`semantic_authority`, and `party_role` promoted out of the adapter's identity block) are
-    classified alongside them.
+    contract. Everything the adapter emits is already egress-classified (D10); the keys added here
+    (`semantic_authority`, `party_role` promoted out of the adapter's identity block, and the
+    adjudication's `confidence_band` / `concept_alternatives`) are classified alongside them.
+
+    The two ADJUDICATION keys are joined here rather than in the bundle on purpose — see the note
+    at the join. They ride the anchor's own read scope: a column whose bundle `roles` refuses never
+    reaches that read at all, because the fallback below returns first.
 
     A column whose bundle cannot be assembled (it vanished between the candidate read and here, or
     read scope narrowed) falls back to the v3 shape rather than dropping the column: a MISSING
@@ -508,8 +516,33 @@ def _context_v4_column(conn, c: dict, *, roles: Iterable[str]) -> dict:
     # `missing_context` is read-scoped ABSENCE, not a data-quality verdict — it tells the model
     # what this view does not carry so it stops inferring from silence.
     out["semantic_authority"] = _semantic_authority(bundle)
+    # The adjudicator's JUDGEMENT signals. Deliberately joined HERE and NOT in the bundle:
+    # `semantic_context`'s own docstring draws that line — an adjudication is a judgement ABOUT the
+    # semantics, not one of them, so it is served BESIDE the bundle — and this keeps it. Both are
+    # ADVISORY: nothing here or downstream branches on `confidence_band` (the Task-5 contract:
+    # explanation, never authority — it cannot turn an `llm/proposed` concept into a stronger
+    # assertion), and `concept_alternatives` is context for the model to weigh, never a
+    # classification. Neither carries or implies an authority of its own; the concept's authority is
+    # `semantic_authority` above, unchanged.
+    #
+    # READ IT BY `bundle.object_ref`, NOT `c["object_ref"]`. The 1046 adjudication subject pointer is
+    # keyed by the SCHEMA-PRESERVING logical ref, which is what the bundle carries; `c` and the
+    # emitted payload carry the PUBLIC-FLATTENED graph ref (see the note on `out["object_ref"]`
+    # above). Passing the flattened form matches no pointer row, so every column would silently come
+    # back unadjudicated — the keys would simply never appear and the feature would look implemented.
+    #
+    # Deferred import, matching `asset_detail._semantic_adjudication_section`, to keep the
+    # module-import cycle that module already avoids (`semantic_adjudication` imports `enrich_llm`).
+    from featuregen.overlay.upload.semantic_adjudication import load_current_adjudication
+
+    adjudication, _result_id = load_current_adjudication(conn, bundle.object_ref)
+    if adjudication is not None:
+        out["confidence_band"] = adjudication.confidence_band
+        out["concept_alternatives"] = list(adjudication.alternatives)
     # The adapter emits `null` for anything the bundle does not hold; a null in a prompt is noise
-    # the egress scanner still has to walk. Drop the empties — absence IS the honest signal.
+    # the egress scanner still has to walk. Drop the empties — absence IS the honest signal, and it
+    # is what a never-adjudicated column (the NORMAL case: adjudication is the exception path) and
+    # an adjudication with no shortlist both carry.
     return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 

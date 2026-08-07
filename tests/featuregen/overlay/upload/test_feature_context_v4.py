@@ -473,6 +473,174 @@ def test_an_over_long_proposed_value_is_refused_not_truncated(db, v4):
     assert sanitize_feature_context({"columns": [payload]})[0] is None
 
 
+# ── the adjudicator's JUDGEMENT signals (Task 6b) ───────────────────────────────────────────────
+
+#: The unclear column of the worked fixture: a counterparty BIC whose `concept` is not a registry
+#: member at all, which is exactly what `selection_reasons` refers for adjudication.
+_ADJUDICATED = "public.payments.counter_party_bic"
+
+
+def _adjudicate(db, logical_ref: str, *, alternatives=("bank_bic", "branch_id"),
+                confidence_band: str = "medium", catalog_revision: str = "rev1"):
+    """Store a CURRENT adjudication for `logical_ref` through the REAL Task-5 machinery — the
+    audited dispatch seam, the 1039 structured-result store and the migration-1046 current pointer.
+    FakeLLM plays the provider; nothing live runs.
+
+    `unclassified` PLUS two alternatives is the motivating case the plan names: "probably a bank
+    BIC, possibly a branch id" is something a generator can weigh, where a bare `unclassified` is a
+    dead end.
+
+    THE ALTERNATIVES ARE REGISTRY MEMBERS ON PURPOSE. `adjudication_from_output` keeps only
+    `alt in CONCEPT_REGISTRY`, on write AND again on the re-validating read, so a test naming an
+    invented concept (`bic_code`, `institution_id`) would be asserting a value this platform cannot
+    produce — the assertion would fail for a reason that has nothing to do with this seam."""
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.upload import semantic_adjudication as adj
+
+    client = FakeLLM(script={adj.SEMANTIC_ADJUDICATION_TASK: FakeResponse(output={
+        "selected_concept": "unclassified", "alternatives": list(alternatives),
+        "confidence_band": confidence_band, "reason_codes": ["name_only_signal"],
+        "missing_context": ["definition_missing"]})})
+    target = adj.AdjudicationTargetV1(
+        candidate=adj.AdjudicationCandidateV1(
+            logical_ref=logical_ref, column_name="counter_party_bic", declared_type="varchar",
+            definition="Bank identifier code of the counterparty institution.", concept=None),
+        selection_reasons=("unclassified_column",))
+    (result,) = adj.adjudicate_targets(
+        db, client, [target], catalog_revision=catalog_revision,
+        actor=mint_test_identity(subject="user:admin", role_claims=("platform-admin",)))
+    assert result.adjudication is not None, result.skipped_reason
+    return result
+
+
+def test_the_v4_payload_carries_the_adjudication_signals(db, v4):
+    """The adjudicator produces both signals on every column it reviews and, before this, neither
+    reached the model: the band was stored and displayed, and the shortlist lived only on the asset
+    dossier. For a generator asked to weigh what it is offered, "medium confidence, and the two
+    concepts seriously considered were these" is the weighing input."""
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}")
+    payload = _column(db, _ADJUDICATED)
+    assert payload["confidence_band"] == "medium"
+    assert payload["concept_alternatives"] == ["bank_bic", "branch_id"]
+
+
+def test_a_column_never_adjudicated_carries_neither_key(db, v4):
+    """Absence is the honest signal — `_context_v4_column` already drops empty values, and most
+    columns are CLEAR and were never referred, so this is the normal case, not a gap."""
+    _bank_graph(db)
+    payload = _column(db, "public.payments.tran_amt")
+    assert "confidence_band" not in payload
+    assert "concept_alternatives" not in payload
+
+
+def test_an_adjudication_with_no_shortlist_carries_the_band_and_no_empty_list(db, v4):
+    """"I considered nothing else" is not the same claim as "here is my shortlist". An empty list
+    would egress as noise the scanner still walks and read as a deliberated-and-empty shortlist."""
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}", alternatives=())
+    payload = _column(db, _ADJUDICATED)
+    assert payload["confidence_band"] == "medium"
+    assert "concept_alternatives" not in payload
+
+
+def test_the_adjudication_is_read_by_the_logical_ref_not_the_flattened_graph_ref(db, v4):
+    """The trap that would have made this feature look implemented while delivering nothing.
+
+    The 1046 subject pointer is keyed by the SCHEMA-PRESERVING logical ref, which the BUNDLE
+    carries; `c` and the emitted payload carry the PUBLIC-FLATTENED graph ref. Here the column's
+    real schema is not `public`, so the two spellings differ in more than the `source::` prefix —
+    read it by anything derived from `c["object_ref"]` and the pointer lookup matches no row, the
+    keys silently never appear, and every column comes back unadjudicated."""
+    _bank_graph(db)
+    db.execute("UPDATE graph_node SET schema_name = %s "
+               "WHERE catalog_source = %s AND lower(object_ref) = %s",
+               ("dpl_eib_compliance", _SRC, _ADJUDICATED))
+    _adjudicate(db, f"{_SRC}::dpl_eib_compliance.payments.counter_party_bic")
+    payload = _column(db, _ADJUDICATED)
+    # The EMITTED ref is still the flattened one the grounding step matches against…
+    assert payload["object_ref"] == _ADJUDICATED
+    # …and the adjudication was nonetheless found.
+    assert payload["confidence_band"] == "medium"
+    assert payload["concept_alternatives"] == ["bank_bic", "branch_id"]
+
+
+def test_the_band_is_advisory_and_moves_nothing_else_in_the_payload(db, v4):
+    """`confidence_band` is EXPLANATION, never authority (the Task-5 contract, restated on this
+    seam). Nothing here or downstream branches on it, so the same column adjudicated `low` instead
+    of `high` must produce a payload that differs in that one key and nowhere else — not a different
+    concept, not a different authority, not a dropped alternative."""
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}", confidence_band="high")
+    high = _column(db, _ADJUDICATED)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}", confidence_band="low", catalog_revision="rev2")
+    low = _column(db, _ADJUDICATED)
+    assert (high["confidence_band"], low["confidence_band"]) == ("high", "low")
+    assert {k: v for k, v in high.items() if k != "confidence_band"} == {
+        k: v for k, v in low.items() if k != "confidence_band"}
+
+
+def test_the_v3_rollback_carries_no_adjudication_signals(db, v4, monkeypatch):
+    """The D8 safety valve stays a CLEAN rollback: at v3 an adjudicated column carries exactly the
+    shipped v3 shape, so rolling back cannot leave a key behind that the v3 egress classification
+    was never argued for."""
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}")
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "3")
+    assert _feature_schema_version() == 3
+    payload = _column(db, _ADJUDICATED)
+    assert "confidence_band" not in payload
+    assert "concept_alternatives" not in payload
+
+
+def test_the_adjudication_signals_are_egress_classified(db, v4, monkeypatch):
+    """The landmine that has fired on every payload task here. Neither key appears in any
+    `_FEATURE_COLUMN_*` classifier by default and the adapter's terminal branch returns None, so
+    emitting one unclassified refuses the WHOLE column — not the field. Each is pinned against the
+    list it ACTUALLY belongs to, so this fails both if someone drops one and if someone silently
+    re-grades one."""
+    from featuregen.overlay.upload import enrich_llm
+
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}")
+    payload = _column(db, _ADJUDICATED)
+    assert {"confidence_band", "concept_alternatives"} <= set(payload)
+    safe, _pii, _samples, _version = sanitize_feature_context({"columns": [payload]})
+    assert safe is not None, "an adjudication key is unclassified — egress blocked the whole column"
+    assert set(safe["columns"][0]) == set(payload)
+
+    for attr, key in (("_FEATURE_COLUMN_IDENTITY_KEYS", "confidence_band"),
+                      ("_FEATURE_COLUMN_TOKEN_LIST_KEYS", "concept_alternatives")):
+        original = getattr(enrich_llm, attr)
+        monkeypatch.setattr(enrich_llm, attr, original - {key})
+        assert sanitize_feature_context({"columns": [payload]})[0] is None, (attr, key)
+        monkeypatch.setattr(enrich_llm, attr, original)
+    # …and neither is graded PROSE: both are PLATFORM-generated closed values (a `CONFIDENCE_BANDS`
+    # member and registry concept names), never uploader-typed text, so the redactor+audit grade the
+    # taxonomy paths carry would buy nothing and would misdocument the egress surface.
+    assert not ({"confidence_band", "concept_alternatives"}
+                & enrich_llm._FEATURE_COLUMN_PROSE_KEYS)
+
+
+def test_an_over_long_band_or_alternative_is_refused_not_truncated(db, v4):
+    """Both grades are ACCEPTANCE gates, not formatters — a value over the bound excludes the
+    column and is audited, never clipped into a different token."""
+    from featuregen.overlay.upload.enrich_llm import (
+        _FEATURE_COLLECTION_MAX_ITEMS,
+        _FEATURE_STRUCTURAL_MAX_LEN,
+    )
+
+    _bank_graph(db)
+    _adjudicate(db, f"{_SRC}::{_ADJUDICATED}")
+    payload = _column(db, _ADJUDICATED)
+    over_long = dict(payload, confidence_band="x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1))
+    assert sanitize_feature_context({"columns": [over_long]})[0] is None
+    over_wide = dict(payload,
+                     concept_alternatives=["x"] * (_FEATURE_COLLECTION_MAX_ITEMS + 1))
+    assert sanitize_feature_context({"columns": [over_wide]})[0] is None
+
+
 # ── egress: every new key classified, golden ────────────────────────────────────────────────────
 
 
