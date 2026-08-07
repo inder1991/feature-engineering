@@ -100,18 +100,48 @@ This text is saved to the database and cleanly printed inside your microservice 
 * **Operational Fit:** The model achieved an **F1-score of 0.882** and an **AUC of 0.934**. It maintains high precision (**91%**), minimizing false alarms for innocent customers, while catching **85.5%** of actual weekend fraud attempts.
 
 ### 🎨 Tool UI Component ArchitectureIf you are structuring how your Microservice application should organize its interface layout to display this data, follow this strict modular pattern:
-┌───────────────────────────────────────────────────────────┐
-│ [Top Panel]: Original Hypothesis & Validation Status      │
-│ ➔ "Hypothesis Confirmed / Partially Validated / Failed"    │
-├─────────────────────────────┬─────────────────────────────┤
-│ [Left Panel]: Performance    │ [Right Panel]: SHAP Weights │
-│ ➔ AUC-ROC Score Gauge      │ ➔ 1. Feature A (41%) [████] │
-│ ➔ F1 Operational Metrics    │ ➔ 2. Feature B (18%) [██]   │
-│ ➔ 2x2 Confusion Matrix      │ ➔ 3. Feature C (09%) [█]    │
-├─────────────────────────────┴─────────────────────────────┤
-│ [Bottom Panel]: LLM Critic Executive Action Steps         │
-│ ➔ "Automated recommendations for next Kedro iteration..." │
-└───────────────────────────────────────────────────────────┘
+
+<table>
+  <!-- Top Panel: Core Hypothesis Validation -->
+  <tr>
+    <td colspan="2" style="background-color: #f8f9fa; padding: 15px; border: 1px solid #dee2e6;">
+      <strong>🎯 Top Panel: Original Hypothesis & Validation Status</strong><br />
+      <span style="color: #28a745;">✔ Hypothesis Confirmed</span> — <em>"Customers with sudden spikes in transaction frequency over the weekend are highly likely to be fraudulent actors."</em>
+    </td>
+  </tr>
+  
+  <!-- Middle Panels: Performance and SHAP Splitting -->
+  <tr>
+    <td width="50%" style="vertical-align: top; padding: 15px; border: 1px solid #dee2e6;">
+      <strong>📊 Left Panel: Performance Metrics</strong>
+      <ul>
+        <li><strong>AUC-ROC:</strong> 0.934</li>
+        <li><strong>F1-Score:</strong> 0.882</li>
+        <li><strong>Precision:</strong> 91.0% | <strong>Recall:</strong> 85.5%</li>
+      </ul>
+      <code>[ 2x2 Confusion Matrix Embedded Here ]</code>
+    </td>
+    <td width="50%" style="vertical-align: top; padding: 15px; border: 1px solid #dee2e6;">
+      <strong>💡 Right Panel: SHAP Feature Weights</strong>
+      <ol>
+        <li><code>velocity_count_weekend_48h</code> (41.2%)</li>
+        <li><code>avg_amount_per_tx_30d</code> (18.5%)</li>
+        <li><code>account_age_days</code> (9.2%)</li>
+      </ol>
+    </td>
+  </tr>
+  
+  <!-- Bottom Panel: LLM Actionable Insights -->
+  <tr>
+    <td colspan="2" style="background-color: #f1f3f5; padding: 15px; border: 1px solid #dee2e6;">
+      <strong>🧠 Bottom Panel: LLM Critic Executive Action Steps</strong>
+      <ul>
+        <li><strong>Mitigate Bias:</strong> Combine account age metrics with weekend velocity to catch instant bad actors.</li>
+        <li><strong>Feature Pruning:</strong> Safely remove historical monthly averages from the next Kedro run on Hadoop to save computational resources.</li>
+      </ul>
+    </td>
+  </tr>
+</table>
 
 
 
