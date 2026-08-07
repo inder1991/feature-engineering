@@ -95,6 +95,13 @@ def test_measured_mandatory_bytes_for_v3_and_v4(wide_catalogs, monkeypatch, reco
     # (215_000..285_000) was centred on 248_601, a figure the payload had already drifted away from
     # while staying inside the tolerance — which is how a "measured" number stops being one. Both
     # bands are now +/-15% of a freshly measured value.
+    #
+    # RE-MEASURED 2026-08-07 (Task 6, the D13.1/D13.2 axes in the payload): v3 175_520 (unmoved —
+    # v3 has no bundle keys), v4 250_982 (+3.9%). The move is real and is the 126 FTR columns:
+    # `bian_path`/`process_path` come from the glossary export, so those columns now carry two real
+    # taxonomy paths each (~+75 bytes/column there, ~+40 averaged over all 237). Recorded here
+    # DELIBERATELY rather than left to drift inside the band — that is the failure the paragraph
+    # above describes. The band itself is unchanged: +3.9% does not warrant re-arguing the budget.
     assert 149_000 < v3 < 202_000, f"v3 mandatory bytes moved: {v3}"
     assert 205_000 < v4 < 278_000, f"v4 mandatory bytes moved: {v4}"
     # …and the re-budgeted value clears the worst realistic case with headroom.

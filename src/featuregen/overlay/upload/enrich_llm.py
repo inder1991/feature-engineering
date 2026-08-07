@@ -327,12 +327,36 @@ _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semant
 # handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
 # `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
 # of structural identity as `concept`.
+#
+# THE FIVE D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here, and the grade is a decision:
+#
+#   * `sub_domain` is `domain`'s finer sibling — the SAME `field_policies._MEANING` policy, the same
+#     short classification label, and `domain` has ridden this list since v4 shipped. Splitting the
+#     pair across two grades would be the harder thing to justify.
+#   * `bian_path` / `process_path` are the source glossary's own " > "-joined taxonomy hierarchies
+#     (`_GLOSSARY_TERM`). They are uploader-authored, like `domain`, and like `domain` they are
+#     short delimited LABELS, not narrative authored against real rows — the property the definition
+#     grade exists for. They are also `redact_text`-scrubbed at ingest (`ftr_adapter`). So the
+#     bounded identity gate is the right shape; routing a delimited path through `sanitize_
+#     definition`'s FAIL-CLOSED data-marker scan would put the whole menu at the mercy of a
+#     taxonomy leaf that happens to read like a sample clause.
+#   * `table_role` / `event_or_snapshot` are platform-derived `_TABLE_ADVISORY` tokens — the same
+#     grade `_TABLE_CONTEXT_IDENTITY_KEYS` gives `data_role`/`primary_entity`, and `table_role` is
+#     already `_STRUCTURAL_META_KEYS` on the enrichment seam.
+#
+# All five are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
+# column and is audited, never truncated into a different taxonomy path.
 _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain",
-                                           "party_role"})
+                                           "party_role", "sub_domain", "bian_path", "process_path",
+                                           "table_role", "event_or_snapshot"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
-_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
+# `proposed_value` (Task 6) is the LLM's answer for a fact it could not win — present ONLY where
+# `value` is null, and a bounded token exactly like `value`. It is a SUBKEY of the wrapper rather
+# than a sibling column key so it cannot be read as an operationally-resolved fact by anything that
+# reads `.value`; classifying it here is what stops the whole column failing closed.
+_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value"})
 # ── feature-context v4 (semantic Task 8, D10) ────────────────────────────────────────────────────
 # Every NEW key ships with an explicit classification here plus a golden egress test; unclassified
 # stays BLOCKED, and now loudly. All four groups carry closed-vocabulary tokens or platform-minted
@@ -421,14 +445,18 @@ def _dict_list_ok(v: object, allowed: frozenset[str]) -> bool:
 
 
 def _fact_wrapper_ok(v: object) -> bool:
-    """A governed/hint fact wrapper: exactly {value, authority}; value a bounded str or None
-    (RF-I7: is_grain/is_as_of booleans arrive RENDERED as "true"/"false" strings); authority in
-    {governed, hint}. Enum-ish tokens, never sample-bearing prose."""
+    """A governed/hint fact wrapper: {value, authority} plus the optional `proposed_value`; both
+    values a bounded str or None (RF-I7: is_grain/is_as_of booleans arrive RENDERED as
+    "true"/"false" strings); authority in {governed, hint}. Enum-ish tokens, never sample-bearing
+    prose. `proposed_value` is bounded on the SAME gate as `value` — it is a model-authored token,
+    so an unbounded one would be the one place a wrapper could smuggle a payload."""
     if not isinstance(v, dict) or any(k not in _FEATURE_FACT_SUBKEYS for k in v):
         return False
-    val = v.get("value")
-    if val is not None and not (isinstance(val, str) and len(val) <= _FEATURE_STRUCTURAL_MAX_LEN):
-        return False
+    for key in ("value", "proposed_value"):
+        val = v.get(key)
+        if val is not None and not (isinstance(val, str)
+                                    and len(val) <= _FEATURE_STRUCTURAL_MAX_LEN):
+            return False
     return v.get("authority") in ("governed", "hint")
 
 

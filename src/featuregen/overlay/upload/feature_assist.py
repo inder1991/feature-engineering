@@ -443,6 +443,14 @@ _V4_TRIM_ORDER: tuple[str, ...] = ("semantic_terms", "ai_summary", "definition",
                                    "concept_path")
 
 
+#: The TABLE-context field names the v4 payload emits per column (`table_role`,
+#: `event_or_snapshot` — Task 6). Their authority is folded into `semantic_authority` below;
+#: `table_context`'s OTHER fields (`definition`, `domain`, `ai_summary`, `semantic_terms`) share
+#: their names with the COLUMN's own fields, and folding those in would label the column's value
+#: with the table's authority. Hence an explicit list, not "everything on table_context".
+_V4_TABLE_AUTHORITY_FIELDS: frozenset[str] = frozenset({"table_role", "event_or_snapshot"})
+
+
 def _semantic_authority(bundle) -> dict[str, str]:
     """``{field: "producer/strength"}`` for every semantic value that has evidence — the D2 axes ON
     THE WIRE (D10: the wire carries the triple, never the derived `llm_proposed` display label).
@@ -453,6 +461,16 @@ def _semantic_authority(bundle) -> dict[str, str]:
     bytes, not information."""
     out: dict[str, str] = {}
     for value in bundle.resolved_semantics:
+        if not value.evidence:
+            continue
+        lead = value.evidence[0]
+        out[value.field_name] = f"{lead.producer}/{lead.strength}"
+    # The two TABLE axes the payload also emits live on `table_context`, which the loop above never
+    # walks — without this they would egress with nothing beside them saying who proposed them. A
+    # column field of the same name always wins: the column's own authority is never overwritten.
+    for value in bundle.table_context:
+        if value.field_name not in _V4_TABLE_AUTHORITY_FIELDS or value.field_name in out:
+            continue
         if not value.evidence:
             continue
         lead = value.evidence[0]

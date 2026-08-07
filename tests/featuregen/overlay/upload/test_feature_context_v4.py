@@ -211,6 +211,162 @@ def test_empty_values_are_omitted_rather_than_sent_as_nulls(db, v4):
     assert "" not in payload.values()
 
 
+# ── the D13.1/D13.2 classification axes (Task 6) ────────────────────────────────────────────────
+
+
+def _with_classification_axes(db):
+    """Populate the migration-1051 COLUMN axes on the measure and the two TABLE-shape axes on its
+    table — the state a real enriched catalog is in and the fixture is not."""
+    db.execute(
+        "UPDATE graph_node SET sub_domain = %s, bian_path = %s, process_path = %s "
+        "WHERE catalog_source = %s AND lower(object_ref) = %s",
+        ("Sanctions Screening", "BIAN>Party>Reference", "Onboarding>KYC",
+         _SRC, "public.payments.tran_amt"))
+    db.execute(
+        "UPDATE graph_node SET table_role = %s, event_or_snapshot = %s "
+        "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s",
+        ("fact", "event", _SRC, "payments"))
+
+
+_AXES = ("sub_domain", "bian_path", "process_path", "table_role", "event_or_snapshot")
+
+
+def test_feature_payload_carries_the_classification_axes(db, v4):
+    """The second narrowing. The bundle has carried these since Task 5; the payload dropped them,
+    so the generator saw `domain` and no refinement, and no answer at all to "is this table an
+    event log or a snapshot?" — the question that decides whether a windowed count is arithmetic
+    or nonsense."""
+    _bank_graph(db)
+    _with_classification_axes(db)
+    payload = _column(db, "public.payments.tran_amt")
+    assert payload["sub_domain"] == "Sanctions Screening"
+    assert payload["bian_path"] == "BIAN>Party>Reference"
+    assert payload["process_path"] == "Onboarding>KYC"
+    assert payload["table_role"] == "fact"
+    assert payload["event_or_snapshot"] == "event"
+
+
+def test_the_classification_axes_are_egress_classified(db, v4, monkeypatch):
+    """The landmine. None of the five appears in any `_FEATURE_COLUMN_*` classifier by default and
+    the adapter's terminal branch returns None, so emitting one unclassified refuses the WHOLE
+    column payload — not the field. The loop is the pin: remove any single axis from the list it
+    was classified into and the column is refused again."""
+    from featuregen.overlay.upload import enrich_llm
+
+    _bank_graph(db)
+    _with_classification_axes(db)
+    payload = _column(db, "public.payments.tran_amt")
+    assert set(_AXES) <= set(payload)
+    safe, _pii, _samples, _version = sanitize_feature_context({"columns": [payload]})
+    assert safe is not None, "an axis is unclassified — egress blocked the whole column"
+    assert set(safe["columns"][0]) == set(payload)
+
+    original = enrich_llm._FEATURE_COLUMN_IDENTITY_KEYS
+    for axis in _AXES:
+        monkeypatch.setattr(enrich_llm, "_FEATURE_COLUMN_IDENTITY_KEYS", original - {axis})
+        assert sanitize_feature_context({"columns": [payload]})[0] is None, axis
+
+
+def test_an_axis_longer_than_the_structural_bound_refuses_rather_than_truncates(db, v4):
+    """Identity grade is an ACCEPTANCE gate, not a formatter: an over-long path is excluded, never
+    silently clipped into a different taxonomy path."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    _bank_graph(db)
+    _with_classification_axes(db)
+    payload = _column(db, "public.payments.tran_amt")
+    payload["bian_path"] = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
+    assert sanitize_feature_context({"columns": [payload]})[0] is None
+
+
+def test_an_ai_proposed_axis_is_legible_as_a_proposal(db, v4):
+    """No unconfirmed value without its authority. `sub_domain` rides `resolved_semantics` so the
+    column loop already covers it; `table_role` lives on `table_context`, which that loop never
+    walks — an LLM-proposed table shape would otherwise egress with nothing beside it saying who
+    said so."""
+    _bank_graph(db)
+    _with_classification_axes(db)
+    for logical_ref, field_name, value in (
+            (f"{_SRC}::public.payments.tran_amt", "sub_domain", "Sanctions Screening"),
+            (f"{_SRC}::public.payments", "table_role", "fact")):
+        record_field_evidence(
+            db, logical_ref=logical_ref, field_name=field_name, proposed_value=value,
+            producer="llm", strength="proposed", producer_ref="pass-a",
+            source_snapshot_id="snap",
+            input_hash=field_input_hash(logical_ref=logical_ref, field_name=field_name,
+                                        material=f"{value}:llm"))
+    payload = _column(db, "public.payments.tran_amt")
+    assert payload["semantic_authority"]["sub_domain"] == "llm/proposed"
+    assert payload["semantic_authority"]["table_role"] == "llm/proposed"
+    # The table's own `definition`/`domain`/`ai_summary`/`semantic_terms` share their names with the
+    # COLUMN's fields; folding those in would relabel the column's own values with the table's
+    # authority. Only the two axes the payload emits are folded in.
+    assert payload["semantic_authority"].get("definition") != "llm/proposed"
+
+
+# ── the LLM's proposed measure annotation (Task 6 step 4) ───────────────────────────────────────
+
+
+def _fee_amt_with_llm_measure(db):
+    """A monetary column the source declared NO unit or currency for, plus the LLM's `llm/proposed`
+    answer to both. `_MEASURE_ANNOTATION` bars the LLM from BOTH the display and operational rules,
+    so `graph_node.unit`/`currency` stay NULL and the proposal can never win resolution."""
+    from featuregen.overlay.upload.graph import add_column_row
+
+    add_column_row(db, _SRC, CanonicalRow(_SRC, "payments", "fee_amt", "numeric",
+                                          additivity="additive",
+                                          definition="Fee charged on the transaction."))
+    ref = f"{_SRC}::public.payments.fee_amt"
+    for field_name, value in (("unit", "currency"), ("currency", "AED")):
+        record_field_evidence(
+            db, logical_ref=ref, field_name=field_name, proposed_value=value,
+            producer="llm", strength="proposed", producer_ref="pass-a",
+            source_snapshot_id="snap",
+            input_hash=field_input_hash(logical_ref=ref, field_name=field_name,
+                                        material=f"{value}:llm"))
+
+
+def test_the_payload_carries_a_proposal_it_used_to_only_announce(db, v4):
+    """Before Task 6 this payload said `unit: {"value": null}` while `semantic_authority` said
+    `unit: "llm/proposed"` — it announced a proposal it did not include. The proposal now rides a
+    SEPARATE key: `value` still means "operationally resolved", so nothing reading `.value` can
+    mistake a guess for a governed fact."""
+    _bank_graph(db)
+    _fee_amt_with_llm_measure(db)
+    payload = _column(db, "public.payments.fee_amt")
+    assert payload["semantic_authority"]["unit"] == "llm/proposed"
+    assert payload["semantic_authority"]["currency"] == "llm/proposed"
+    assert payload["unit"] == {"value": None, "authority": "hint", "proposed_value": "currency"}
+    assert payload["currency"] == {"value": None, "authority": "hint", "proposed_value": "AED"}
+    # A fact the operational read model DID answer carries no proposal key at all — the wrapper
+    # every existing consumer reads is byte-identical to what it was.
+    assert payload["additivity"] == {"value": "additive", "authority": "hint"}
+
+
+def test_the_proposed_value_subkey_is_egress_classified(db, v4, monkeypatch):
+    """`_fact_wrapper_ok` refuses any subkey outside `_FEATURE_FACT_SUBKEYS`, so the proposal is the
+    same landmine shape as the axes: unclassified, it refuses the whole column."""
+    from featuregen.overlay.upload import enrich_llm
+
+    _bank_graph(db)
+    _fee_amt_with_llm_measure(db)
+    payload = _column(db, "public.payments.fee_amt")
+    assert sanitize_feature_context({"columns": [payload]})[0] is not None
+    monkeypatch.setattr(enrich_llm, "_FEATURE_FACT_SUBKEYS",
+                        enrich_llm._FEATURE_FACT_SUBKEYS - {"proposed_value"})
+    assert sanitize_feature_context({"columns": [payload]})[0] is None
+
+
+def test_an_over_long_proposed_value_is_refused_not_truncated(db, v4):
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    _bank_graph(db)
+    _fee_amt_with_llm_measure(db)
+    payload = _column(db, "public.payments.fee_amt")
+    payload["unit"]["proposed_value"] = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
+    assert sanitize_feature_context({"columns": [payload]})[0] is None
+
+
 # ── egress: every new key classified, golden ────────────────────────────────────────────────────
 
 

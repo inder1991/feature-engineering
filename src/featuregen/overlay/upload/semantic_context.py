@@ -320,13 +320,20 @@ class SemanticValueV1:
 
     `operational_influence` is the separate `governed | hint` operational-facts axis — READ from
     the shipped authority readers, never inferred from a producer; `None` for fields outside the
-    operational-facts surface."""
+    operational-facts surface.
+
+    `proposed_value` is the LLM's answer where it did NOT win resolution — the state a
+    `field_policies` rule that excludes the LLM produces by design (`_MEASURE_ANNOTATION` for
+    `unit`/`currency`). It is deliberately a SECOND attribute rather than a fallback inside
+    `value`: `value` means "what the operational read model resolved", and a consumer that could
+    not tell the two apart is exactly how a guess clears a safety check."""
 
     field_name: str
     value: object | None
     evidence: tuple[EvidenceAuthorityV1, ...]
     resolution_status: str
     operational_influence: str | None = None
+    proposed_value: object | None = None
 
     def __post_init__(self) -> None:
         if self.resolution_status not in RESOLUTION_STATUSES:
@@ -1473,12 +1480,19 @@ def bundle_from_store(
             influence = "governed" if (bool(is_as_of) and availability_event is not None) else "hint"
         else:
             influence = "hint"
+        # The LLM's own answer for this field, whether or not it won resolution. For a field whose
+        # policy excludes the LLM (`_MEASURE_ANNOTATION`: unit/currency) this is the ONLY place the
+        # proposal survives — `graph_node` never receives it, by design.
+        llm_proposed = evidence_values.get(
+            (logical_ref, _EVIDENCE_FIELD.get(field_name, field_name),
+             EvidenceProducer.LLM.value))
         resolved_values.append(SemanticValueV1(
             field_name=field_name,
             value=value,
             evidence=entries,
             resolution_status="current" if value is not None else UNRESOLVED_PENDING_REVIEW,
             operational_influence=influence,
+            proposed_value=llm_proposed,
         ))
     resolved_values.sort(key=lambda v: v.field_name)
 
@@ -1817,8 +1831,14 @@ def for_summary(bundle: SemanticContextBundleV1, *, extra: Mapping | None = None
 def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
     """Feature-generation context (the v4 shape's raw material). Fact keys reuse the
     `_FEATURE_COLUMN_FACT_KEYS` wrapper convention: `{value, authority}` with authority the
-    OPERATIONAL `governed|hint` axis — an LLM-proposed semantic value NEVER rides this wrapper
-    (its authority is the D2 triple on the bundle, visible separately)."""
+    OPERATIONAL `governed|hint` axis — an LLM-proposed semantic value NEVER rides `value`
+    (its authority is the D2 triple on the bundle, visible separately).
+
+    Task 6 adds an OPTIONAL third subkey, `proposed_value`, present only where `value` is null and
+    the LLM proposed one. It is the same rule stated positively: the proposal is INCLUDED rather
+    than merely announced, and it is unmistakably not the resolved value because it is not under
+    `value`. `_MEASURE_ANNOTATION` and `graph_node.unit` are untouched — nothing here can clear a
+    safety check that reads the projected fact."""
     table, column = _identity_parts(bundle)
     resolved = {v.field_name: v for v in bundle.resolved_semantics}
     out: dict = {
@@ -1836,10 +1856,28 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
         got = resolved.get(fact_key)
         value = _render(got.value) if got is not None else None
         authority = got.operational_influence if got is not None else "hint"
-        out[fact_key] = {"value": value, "authority": authority or "hint"}
+        entry = {"value": value, "authority": authority or "hint"}
+        # The LLM's answer where it did NOT win resolution (unit/currency under
+        # `_MEASURE_ANNOTATION`). A SEPARATE key: `value` still means "operationally resolved", so
+        # no existing consumer changes behaviour and no safety check can be cleared by it. Without
+        # this the payload ANNOUNCED the proposal — `semantic_authority` says `unit: llm/proposed` —
+        # while sending `{"value": null}`, which is strictly worse than either alternative.
+        if got is not None and got.proposed_value is not None and value is None:
+            entry["proposed_value"] = _render(got.proposed_value)
+        out[fact_key] = entry
     out["concept_path"] = list(bundle.concept_path)
     out["identifier_namespace"] = _namespace_dict(bundle)
     out["party_role"] = _value_of(bundle, "party_role")
+    # D13.1/D13.2 axes. `sub_domain` refines `domain`; `bian_path` / `process_path` are the
+    # SOURCE's own taxonomy, which the generator should weigh above anything the model inferred.
+    out["sub_domain"] = _value_of(bundle, "sub_domain")
+    out["bian_path"] = _value_of(bundle, "bian_path")
+    out["process_path"] = _value_of(bundle, "process_path")
+    # Table SHAPE. A windowed count is right on an event log and wrong on a snapshot; the
+    # generator cannot make that call without being told which it is. These two ride
+    # `table_context` (not `resolved_semantics`), so they are read through `_table_value`.
+    out["table_role"] = _table_value(bundle, "table_role")
+    out["event_or_snapshot"] = _table_value(bundle, "event_or_snapshot")
     out["relationships"] = [
         {"relationship_ref": link.relationship_ref, "kind": link.kind,
          "availability": link.availability, "review_status": link.review_status}
