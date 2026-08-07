@@ -741,6 +741,41 @@ def test_source_and_resolved_semantics_stay_separate(db) -> None:
     assert statuses <= sc.RESOLUTION_STATUSES
 
 
+# ── classification axes (the five fields the bundle used to drop) ────────────────────────────────
+
+
+def test_bundle_carries_the_column_classification_axes(db) -> None:
+    """sub_domain / bian_path / process_path are on graph_node and must ride the bundle."""
+    _graph(db, _rows())
+    db.execute(
+        "UPDATE graph_node SET sub_domain = %s, bian_path = %s, process_path = %s "
+        "WHERE catalog_source = %s AND lower(object_ref) = %s AND kind = 'column'",
+        ("Sanctions Screening", "BIAN>Party>Reference", "Onboarding>KYC",
+         "cib", "public.bo_cib_customer.cust_num"))
+    bundle = sc.bundle_from_store(db, "cib", "public.bo_cib_customer.cust_num",
+                                  roles=_ALL_ACCESS)
+    got = {v.field_name: v.value for v in bundle.resolved_semantics}
+    assert got["sub_domain"] == "Sanctions Screening"
+    assert got["bian_path"] == "BIAN>Party>Reference"
+    assert got["process_path"] == "Onboarding>KYC"
+
+
+def test_bundle_carries_the_table_classification_axes(db) -> None:
+    _graph(db, _rows())
+    db.execute(
+        "UPDATE graph_node SET table_role = %s, event_or_snapshot = %s "
+        "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s",
+        ("fact", "event", "cib", "bo_cib_customer"))
+    bundle = sc.bundle_from_store(db, "cib", "public.bo_cib_customer.cust_num",
+                                  roles=_ALL_ACCESS)
+    got = {v.field_name: v.value for v in bundle.table_context}
+    assert got["table_role"] == "fact"
+    assert got["event_or_snapshot"] == "event"
+    # The emission order is hashed, so it is sorted on BOTH builders — never the loop's order.
+    assert ([v.field_name for v in bundle.table_context]
+            == sorted(v.field_name for v in bundle.table_context))
+
+
 # ── purpose adapters ─────────────────────────────────────────────────────────────────────────────
 
 

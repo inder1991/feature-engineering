@@ -1263,8 +1263,11 @@ _EVIDENCE_FIELD = {"data_type": "logical_representation"}
 #: `read_column_facts`); every other semantic field carries `operational_influence=None`.
 _OPERATIONAL_FIELDS = ("additivity", "currency", "data_type", "declared_type", "entity",
                        "is_grain", "is_as_of", "unit")
-_DISPLAY_FIELDS = ("ai_summary", "concept", "definition", "domain", "party_role",
-                   "semantic_terms")
+# `bian_path` / `process_path` are the SOURCE's own taxonomy paths and `sub_domain` is the LLM's
+# finer axis beside `domain` — all three are display/recommendation tier (field_policies `_MEANING`
+# / `_GLOSSARY_TERM`), so they ride the same list as `domain` itself.
+_DISPLAY_FIELDS = ("ai_summary", "bian_path", "concept", "definition", "domain", "party_role",
+                   "process_path", "semantic_terms", "sub_domain")
 
 
 def _render(raw: object) -> str | None:
@@ -1366,7 +1369,8 @@ def bundle_from_store(
     anchor = conn.execute(
         "SELECT object_ref, schema_name, table_name, column_name, data_type, declared_type, "
         "definition, domain, concept, semantic_terms, ai_summary, additivity, unit, currency, "
-        "entity, is_grain, is_as_of, party_role, grain_fact_event_id, availability_fact_event_id "
+        "entity, is_grain, is_as_of, party_role, grain_fact_event_id, availability_fact_event_id, "
+        "sub_domain, bian_path, process_path "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = %s "
         "AND kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s",
         (source, flat_ref, allowed)).fetchone()
@@ -1374,7 +1378,8 @@ def bundle_from_store(
         raise KeyError(f"no visible column {object_ref!r} in catalog {catalog_source!r}")
     (_ref, schema_name, table_name, column_name, data_type, declared_type, definition, domain,
      concept_name, semantic_terms, ai_summary, additivity, unit, currency, entity, is_grain,
-     is_as_of, party_role, grain_event, availability_event) = anchor
+     is_as_of, party_role, grain_event, availability_event,
+     sub_domain, bian_path, process_path) = anchor
     logical_ref = normalize_ref(source, schema_name or None, table_name, column_name)
     table_logical_ref = normalize_ref(source, schema_name or None, table_name)
 
@@ -1400,7 +1405,8 @@ def bundle_from_store(
     # The table anchor's visibility is DERIVED (D11): the caller provably sees >= 1 of its
     # columns (the anchor above), so the table row itself needs no second predicate.
     table_row = conn.execute(
-        "SELECT definition, domain, semantic_terms, ai_summary FROM graph_node "
+        "SELECT definition, domain, semantic_terms, ai_summary, table_role, event_or_snapshot "
+        "FROM graph_node "
         "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s",
         (source, table_name)).fetchone()
 
@@ -1414,6 +1420,7 @@ def bundle_from_store(
         "ai_summary": ai_summary, "concept": concept_name, "definition": definition,
         "domain": domain, "semantic_terms": semantic_terms,
         "party_role": party_role or getattr(normalize_party_role(column_name), "value", None),
+        "sub_domain": sub_domain, "bian_path": bian_path, "process_path": process_path,
     }
     operational = {
         "additivity": additivity, "currency": currency, "data_type": data_type,
@@ -1477,9 +1484,12 @@ def bundle_from_store(
 
     table_values: list[SemanticValueV1] = []
     if table_row is not None:
-        t_definition, t_domain, t_semantic_terms, t_ai_summary = table_row
+        (t_definition, t_domain, t_semantic_terms, t_ai_summary,
+         t_table_role, t_event_or_snapshot) = table_row
         for field_name, raw in (("ai_summary", t_ai_summary), ("definition", t_definition),
-                                ("domain", t_domain), ("semantic_terms", t_semantic_terms)):
+                                ("domain", t_domain), ("semantic_terms", t_semantic_terms),
+                                ("table_role", t_table_role),
+                                ("event_or_snapshot", t_event_or_snapshot)):
             value = _render(raw)
             entries = tuple(evidence_by_field.get((table_logical_ref, field_name), ()))
             if value is None and not entries:
@@ -1488,6 +1498,11 @@ def bundle_from_store(
                 field_name=field_name, value=value, evidence=entries,
                 resolution_status="current" if value is not None else
                 UNRESOLVED_PENDING_REVIEW))
+    # Sorted like `resolved_values` above and like `bundle_from_upload`'s own table context: the
+    # emission order is hashed, so leaving it as the loop's literal order would make the two
+    # builders hash IDENTICAL table facts differently. A no-op for the four legacy fields (their
+    # loop order was already alphabetical); it is the two axes added beside them that need it.
+    table_values.sort(key=lambda v: v.field_name)
 
     relationship = _scoped_relationship_context(
         conn, flat_ref, allowed, logical_ref=logical_ref, roles=roles, omitted=omitted)
