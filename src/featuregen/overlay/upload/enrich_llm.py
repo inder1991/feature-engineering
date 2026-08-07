@@ -328,27 +328,53 @@ _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semant
 # `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
 # of structural identity as `concept`.
 #
-# THE FIVE D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here, and the grade is a decision:
+# THREE of the five D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here:
 #
 #   * `sub_domain` is `domain`'s finer sibling — the SAME `field_policies._MEANING` policy, the same
-#     short classification label, and `domain` has ridden this list since v4 shipped. Splitting the
-#     pair across two grades would be the harder thing to justify.
-#   * `bian_path` / `process_path` are the source glossary's own " > "-joined taxonomy hierarchies
-#     (`_GLOSSARY_TERM`). They are uploader-authored, like `domain`, and like `domain` they are
-#     short delimited LABELS, not narrative authored against real rows — the property the definition
-#     grade exists for. They are also `redact_text`-scrubbed at ingest (`ftr_adapter`). So the
-#     bounded identity gate is the right shape; routing a delimited path through `sanitize_
-#     definition`'s FAIL-CLOSED data-marker scan would put the whole menu at the mercy of a
-#     taxonomy leaf that happens to read like a sample clause.
+#     short classification label, and MODEL-authored (D13.2), not uploader text. `domain` has
+#     ridden this list since v4 shipped; splitting the pair would be the harder thing to justify.
 #   * `table_role` / `event_or_snapshot` are platform-derived `_TABLE_ADVISORY` tokens — the same
 #     grade `_TABLE_CONTEXT_IDENTITY_KEYS` gives `data_role`/`primary_entity`, and `table_role` is
 #     already `_STRUCTURAL_META_KEYS` on the enrichment seam.
 #
-# All five are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
-# column and is audited, never truncated into a different taxonomy path.
+# `bian_path` / `process_path` are DELIBERATELY NOT here — see `_FEATURE_COLUMN_PROSE_KEYS`.
+#
+# All three are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
+# column and is audited, never truncated into a different classification token.
 _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain",
-                                           "party_role", "sub_domain", "bian_path", "process_path",
+                                           "party_role", "sub_domain",
                                            "table_role", "event_or_snapshot"})
+# PROSE grade for the feature menu: PII-redacted via `redact_free_text` (no sample-clause strip and
+# no data-marker gate — that is the DEFINITION grade), then length-bounded like any structural
+# value. This is the grade `_SCALAR_PROSE_META_KEYS` (line ~125) already gives these exact two keys
+# on the ENRICHMENT seam, and the two seams now agree — the principle stated in this file's egress
+# header. Three reasons it is prose and not identity, in the order they were established:
+#
+#   1. `redact_free_text`'s own docstring names its subject as "an uploaded glossary's curated
+#      business definitions / synonyms / TAXONOMY PATHS". These are the values it was written for.
+#   2. "They are already redacted at ingest" is NOT true of `bian_path`. It has TWO origins:
+#      `ftr_adapter` builds it through `_redact` (`ftr_adapter.py:482`), but the generic
+#      `glossary_reader.read_glossary` — a live upload branch via `api/routes/uploads.py:155` —
+#      builds the same `GlossaryRecord` with a bare `_cell(...)` and NO redaction, and
+#      `ingest._write_glossary_source_evidence` persists either one identically. (`process_path` IS
+#      single-origin — only the FTR adapter populates it — but grading the pair apart on that
+#      difference would be a trap for the next reader.)
+#   3. Identity grade applies `_structural_ok` ONLY: a type-and-length check, no redaction. The
+#      remaining net is `assert_llm_safe`, whose `_first_pii` is deterministic regex
+#      (EMAIL/SSN/PAN/IBAN/PHONE/ACCOUNT); `redact_free_text` routes through the `IntentRedactor` DI
+#      seam, whose docstring names personal-NAME detection as the residual a registered NER
+#      redactor closes. At identity grade a name in a `process_path` would egress here while being
+#      scrubbed on the enrichment seam.
+#
+# The FAILURE DIRECTION also improves. At identity grade, PII here sails past `_structural_ok` and
+# then trips `assert_llm_safe`, which raises `EgressViolation` and kills the WHOLE feature-
+# generation call. Prose grade redacts it and the call proceeds.
+#
+# NOT FIXED HERE, and flagged rather than smuggled: `domain` has the same two-origin story
+# (`glossary_reader.py:242` does not redact it either) and is still identity-grade on this seam. It
+# is a PRE-EXISTING v3/v4 key, not one Task 6 introduced, and re-grading it changes shipped
+# behaviour — it needs its own decision, not a ride-along.
+_FEATURE_COLUMN_PROSE_KEYS = frozenset({"bian_path", "process_path"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
@@ -381,7 +407,12 @@ _FEATURE_COLUMN_OBJECT_KEYS: dict[str, frozenset[str]] = {
 }
 _FEATURE_COLUMN_MAPPING_KEYS = frozenset({"semantic_authority"})
 _FEATURE_COLUMN_DICT_LIST_KEYS: dict[str, frozenset[str]] = {
-    "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status"}),
+    # `outbound_cardinality` (Task 6) is the closed `Cardinality` vocabulary or None — a token like
+    # its siblings, so the existing `_dict_list_ok` shape still holds. It is DIRECTIONAL (the hop
+    # away from the anchor's own table) and named for its direction; a bare `cardinality` here
+    # would read as a verdict on the pair, which `semantic_context` explicitly refuses to publish.
+    "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status",
+                                "outbound_cardinality"}),
 }
 # `business_context` is PROSE (a data owner wrote it), so it routes through the definition
 # sanitizer exactly like `table_definition` — sample-clause stripped, data-marker scanned, PII
@@ -498,6 +529,21 @@ def sanitize_feature_context(
         pii_spans.extend({"key": path, **dict(s)} for s in d.redacted_spans)
         return d.clean
 
+    def _prose(text: object, path: str) -> str | None:  # None ⟹ fail closed
+        """PII-only redaction for the uploader-authored taxonomy paths — the `_prose` half of the
+        enrichment seam's grade, applied here. Bounded AFTER redaction, like the enrichment seam's
+        own length gate, so the cap applies to what would actually egress rather than to what
+        arrived."""
+        nonlocal version
+        if not isinstance(text, str):
+            return None
+        res = redact_free_text(text)
+        version = version or res.redaction_version
+        if res.text is None or len(res.text) > _FEATURE_STRUCTURAL_MAX_LEN:
+            return None
+        pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
+        return res.text
+
     def _structural_ok(v: object) -> bool:  # identity strings may be None (concept/domain nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
 
@@ -516,6 +562,14 @@ def sanitize_feature_context(
                         out[k] = v
                         continue
                     clean = _defn(v, path)
+                    if clean is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = clean
+                elif k in _FEATURE_COLUMN_PROSE_KEYS:
+                    if v is None:                # absent taxonomy path — no content to scan
+                        out[k] = v
+                        continue
+                    clean = _prose(v, path)
                     if clean is None:
                         return None, pii_spans, sample_audits, version
                     out[k] = clean

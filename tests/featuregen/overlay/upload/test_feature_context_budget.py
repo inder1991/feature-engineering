@@ -89,7 +89,14 @@ def test_measured_mandatory_bytes_for_v3_and_v4(wide_catalogs, monkeypatch, reco
     assert v3 > 60_000
     assert v4 > v3, "v4 carries strictly more context than v3"
     # The measured values the budget was set from, pinned with tolerance so a payload change that
-    # moves them by more than ~15% has to come back here and re-argue the budget.
+    # moves them materially has to come back here and re-argue the budget.
+    #
+    # THE BAND IS NO LONGER "+/-15% OF THE CURRENT MEASUREMENT", and saying so would be the same
+    # rot this comment was written to prevent. It was centred on v4=241_491 in 2026-08-06; the
+    # 2026-08-07 measurement is 250_982, so the live band is now -18%/+11% around it. Deliberately
+    # NOT re-centred: re-centring on every measurement turns the guard into a ratchet that always
+    # passes. It is re-argued when a change actually threatens the budget, and the numbers below
+    # record what each measurement was.
     #
     # RE-MEASURED 2026-08-06 at the zero-truncation caps: v3 175_520, v4 241_491. The old v4 band
     # (215_000..285_000) was centred on 248_601, a figure the payload had already drifted away from

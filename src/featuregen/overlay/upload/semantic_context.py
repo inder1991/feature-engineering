@@ -1725,6 +1725,32 @@ def _with_extra(payload: dict, extra: Mapping | None) -> dict:
     return payload
 
 
+def _outbound_cardinality(bundle: SemanticContextBundleV1,
+                          link: RelationshipContextV1) -> str | None:
+    """The cardinality of the hop AWAY from THIS bundle's own table, or None.
+
+    "Does this join fan out?" separates a correct aggregate from a silently multiplied one, so the
+    generator needs the answer — but cardinality is not a property of a LINK. It lives on each
+    directional realization (:attr:`DirectionalRealizationContextV1.cardinality`) and on each named
+    crosswalk direction, and this module refuses to collapse them into one verdict for the pair:
+    "a crosswalk that is 1:1 forward and N:1 in reverse is ordinary, and a surface that showed one
+    verdict for the pair would either hide a usable direction or imply an unusable one"
+    (:class:`CrosswalkDirectionContextV1`).
+
+    So this answers ONE named question, and the payload key is named for it
+    (`outbound_cardinality`) so it cannot be read as symmetric. The same link read from the other
+    end legitimately answers differently.
+
+    ``None`` means NOBODY HAS ESTABLISHED IT — a state, never a failure, and the signal that
+    `plan_join` will refuse the hop later. It arises three ways, all honest: a crosswalk carries no
+    realizations at all (by construction); a realization whose cardinality is unknown carries
+    ``None``; and realizations that DISAGREE for this direction are reported unknown rather than
+    resolved by an arbitrary pick."""
+    seen = {r.cardinality for r in link.realizations if r.from_ref == bundle.table_ref}
+    seen.discard(None)
+    return seen.pop() if len(seen) == 1 else None
+
+
 def _namespace_dict(bundle: SemanticContextBundleV1) -> dict | None:
     ns = bundle.identifier_namespace
     if ns is None:
@@ -1880,7 +1906,10 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
     out["event_or_snapshot"] = _table_value(bundle, "event_or_snapshot")
     out["relationships"] = [
         {"relationship_ref": link.relationship_ref, "kind": link.kind,
-         "availability": link.availability, "review_status": link.review_status}
+         "availability": link.availability, "review_status": link.review_status,
+         # DIRECTIONAL, and named for its direction. None == nobody has established it, and that
+         # IS the signal — see `_outbound_cardinality` for why this is not a verdict on the pair.
+         "outbound_cardinality": _outbound_cardinality(bundle, link)}
         for link in bundle.relationship_context[:ADAPTER_LIST_LIMIT]
     ]
     out["missing_context"] = list(bundle.missing_context)

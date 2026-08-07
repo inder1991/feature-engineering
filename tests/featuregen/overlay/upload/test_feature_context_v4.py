@@ -261,10 +261,53 @@ def test_the_classification_axes_are_egress_classified(db, v4, monkeypatch):
     assert safe is not None, "an axis is unclassified — egress blocked the whole column"
     assert set(safe["columns"][0]) == set(payload)
 
-    original = enrich_llm._FEATURE_COLUMN_IDENTITY_KEYS
-    for axis in _AXES:
-        monkeypatch.setattr(enrich_llm, "_FEATURE_COLUMN_IDENTITY_KEYS", original - {axis})
-        assert sanitize_feature_context({"columns": [payload]})[0] is None, axis
+    # Each axis is pinned against the list it ACTUALLY belongs to, so this fails both if someone
+    # drops an axis and if someone silently re-grades one (identity <-> prose): removing
+    # `bian_path` from the identity list must NOT refuse the column, because it is not there.
+    for attr, axes in (("_FEATURE_COLUMN_IDENTITY_KEYS",
+                        ("sub_domain", "table_role", "event_or_snapshot")),
+                       ("_FEATURE_COLUMN_PROSE_KEYS", ("bian_path", "process_path"))):
+        original = getattr(enrich_llm, attr)
+        for axis in axes:
+            monkeypatch.setattr(enrich_llm, attr, original - {axis})
+            assert sanitize_feature_context({"columns": [payload]})[0] is None, (attr, axis)
+        monkeypatch.setattr(enrich_llm, attr, original)
+    assert set(_AXES) == set(enrich_llm._FEATURE_COLUMN_IDENTITY_KEYS
+                             | enrich_llm._FEATURE_COLUMN_PROSE_KEYS) & set(_AXES)
+
+
+def test_the_uploader_authored_taxonomy_paths_are_pii_redacted_not_merely_bounded(db, v4):
+    """The two axes the ENRICHMENT seam already grades prose (`_SCALAR_PROSE_META_KEYS`) are graded
+    prose HERE too, so the two seams agree — the stated principle of this module's egress header.
+
+    Why it is not enough that they are redacted at ingest: `bian_path` has TWO origins. The FTR
+    adapter redacts (`ftr_adapter._redact`), but the GENERIC `read_glossary` — a live upload branch
+    (`api/routes/uploads.py`) — builds the same `GlossaryRecord` with a bare `_cell(...)` and no
+    redaction at all. Resting this seam's safety on "it was already scrubbed" would rest it on a
+    chain that is already broken.
+
+    The failure DIRECTION matters too: at identity grade an un-redacted email here would sail past
+    `_structural_ok` and then trip `assert_llm_safe`, which raises `EgressViolation` and kills the
+    whole feature-generation call. Prose grade redacts it and the call proceeds."""
+    _bank_graph(db)
+    _with_classification_axes(db)
+    db.execute("UPDATE graph_node SET bian_path = %s, process_path = %s "
+               "WHERE catalog_source = %s AND lower(object_ref) = %s",
+               ("Party > Contact > john.smith@example.com",
+                "Onboarding > KYC > escalate to john.smith@example.com",
+                _SRC, "public.payments.tran_amt"))
+    payload = _column(db, "public.payments.tran_amt")
+    assert "john.smith@example.com" in json.dumps(payload), "the fixture must actually carry PII"
+
+    safe, pii_spans, _samples, version = sanitize_feature_context({"columns": [payload]})
+    assert safe is not None, "prose grade REDACTS; it must not fail the column closed"
+    assert "john.smith@example.com" not in json.dumps(safe)
+    # Redacted, not dropped: the taxonomy path still reaches the generator, minus the PII.
+    assert "Party" in safe["columns"][0]["bian_path"]
+    assert "KYC" in safe["columns"][0]["process_path"]
+    # …and the redaction is REPORTED, so the audit records what left and under which version.
+    assert version is not None
+    assert {s["key"] for s in pii_spans} >= {"columns[0].bian_path", "columns[0].process_path"}
 
 
 def test_an_axis_longer_than_the_structural_bound_refuses_rather_than_truncates(db, v4):
@@ -343,6 +386,29 @@ def test_the_payload_carries_a_proposal_it_used_to_only_announce(db, v4):
     assert payload["additivity"] == {"value": "additive", "authority": "hint"}
 
 
+def test_a_fact_that_DID_resolve_never_carries_the_proposal_beside_it(db, v4):
+    """The `and value is None` clause, pinned. It is the whole basis of the design claim that
+    `value` still means "operationally resolved": where the operational read model HAS an answer,
+    the LLM's competing answer must not ride along beside it, or the wrapper starts carrying two
+    candidate values and the reader has to arbitrate.
+
+    `additivity` resolves from `graph_node` AND has an `llm/proposed` row here proposing the
+    opposite. Delete `and value is None` from `for_feature_generation` and this test fails."""
+    _bank_graph(db)
+    ref = f"{_SRC}::public.payments.tran_amt"
+    record_field_evidence(
+        db, logical_ref=ref, field_name="additivity", proposed_value="semi_additive",
+        producer="llm", strength="proposed", producer_ref="pass-a", source_snapshot_id="snap",
+        input_hash=field_input_hash(logical_ref=ref, field_name="additivity",
+                                    material="semi_additive:llm"))
+    payload = _column(db, "public.payments.tran_amt")
+    # The proposal EXISTS and is legible as one…
+    assert payload["semantic_authority"]["additivity"] == "llm/proposed"
+    # …but the resolved fact stands alone: exactly two keys, and never the LLM's contradiction.
+    assert payload["additivity"] == {"value": "additive", "authority": "hint"}
+    assert "semi_additive" not in json.dumps(payload)
+
+
 def test_the_proposed_value_subkey_is_egress_classified(db, v4, monkeypatch):
     """`_fact_wrapper_ok` refuses any subkey outside `_FEATURE_FACT_SUBKEYS`, so the proposal is the
     same landmine shape as the axes: unclassified, it refuses the whole column."""
@@ -408,6 +474,106 @@ def test_the_new_collection_keys_are_bounded(db, v4):
 
     payload = _column(db, "public.payments.tran_amt")
     payload["relationships"] = [{"relationship_ref": "r", "invented": "x"}]
+    assert sanitize_feature_context({"columns": [payload]})[0] is None
+
+
+# ── the relationship hop's DIRECTIONAL cardinality (Task 6 step 4) ──────────────────────────────
+
+
+def _stored_link(db):
+    """ONE governed cib<->ftr link with ONE current realization running cib.customers ->
+    ftr.transactions at many_to_one. The same machinery `test_semantic_context` uses, because a
+    `CanonicalRow(joins_to=..., cardinality=...)` declaration is NOT an identifier link — the
+    `_bank_graph` fixture's `relationship_context` is empty and cannot exercise this."""
+    from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
+    from tests.featuregen.overlay.upload.test_bridge_assessment_contracts import (
+        _executable_pair,
+        _realization,
+    )
+
+    from featuregen.data_agent.physical import record_binding_revision
+    from featuregen.overlay.projection import OverlayProjection
+    from featuregen.overlay.upload.bridge_assessment import (
+        IdentifierLinkAssessmentV1,
+        LinkReviewStatus,
+        NamespaceVerdict,
+        PopulationRelation,
+    )
+    from featuregen.overlay.upload.bridge_realization import (
+        BridgeRealizationCurrentV1,
+        RealizationLifecycle,
+        SafetyStatus,
+    )
+    from featuregen.overlay.upload.bridge_store import (
+        BridgeDependencyRefV1,
+        record_candidate_assessment,
+        record_realization_revision,
+    )
+    from featuregen.projections.runner import run_projection
+
+    left, right = _executable_pair()
+    assessment = IdentifierLinkAssessmentV1(
+        left_endpoint=left, right_endpoint=right,
+        namespace_verdict=NamespaceVerdict.POSSIBLE,
+        governed_population_relation=PopulationRelation.UNKNOWN,
+        assessment_version="assessment-v1", bridge_fact_key="bridge-fact-1")
+    record_candidate_assessment(db, assessment, expected_pointer_version=0)
+    govern_bridge_fact(
+        db, "bridge-fact-1", entity="customer", left_source="cib",
+        left_ref="public.customers.customer_id", right_source="ftr",
+        right_ref="public.transactions.customer_id", status="DRAFT")
+    record_binding_revision(db, left.physical_binding)
+    record_binding_revision(db, right.physical_binding)
+    revision = _realization(left, right)          # from cib::public.customers, many_to_one
+    record_realization_revision(
+        db, revision,
+        BridgeRealizationCurrentV1(
+            revision.realization_id, revision.realization_revision_id,
+            SafetyStatus.DETERMINISTICALLY_VALIDATED, LinkReviewStatus.UNREVIEWED,
+            RealizationLifecycle.ACTIVE, 1),
+        dependencies=(BridgeDependencyRefV1("bridge_fact", "bridge-fact-1", "head-1"),))
+    build_graph(db, "cib", [CanonicalRow("cib", "customers", "customer_id", "text", is_grain=True)])
+    build_graph(db, "ftr", [CanonicalRow("ftr", "transactions", "customer_id", "text")])
+    run_projection(db, OverlayProjection())
+
+
+def _column_of(db, source: str, object_ref: str) -> dict:
+    cols = _candidate_columns(db, source, roles=())
+    row = next(c for c in cols if c["object_ref"] == object_ref)
+    return _context_column(db, row, roles=())
+
+
+def test_the_relationship_carries_the_cardinality_of_the_hop_away_from_this_table(db, v4):
+    """"Does this join fan out?" is the difference between a correct aggregate and a silently
+    multiplied one — but it is a DIRECTIONAL question, and this module refuses to answer it as a
+    symmetric one (`CrosswalkDirectionContextV1`: "a surface that showed one verdict for the pair
+    would either hide a usable direction or imply an unusable one").
+
+    So the key is named for its direction and reports ONE side: the hop away from the anchor's own
+    table. The same link, read from both ends, gives two different honest answers."""
+    _stored_link(db)
+    cib = _column_of(db, "cib", "public.customers.customer_id")
+    (out,) = cib["relationships"]
+    assert out["outbound_cardinality"] == "many_to_one"
+
+    ftr = _column_of(db, "ftr", "public.transactions.customer_id")
+    (back,) = ftr["relationships"]
+    assert back["relationship_ref"] == out["relationship_ref"], "the SAME link, other end"
+    # Nobody has established what the hop away from THIS table does. None says exactly that; it
+    # does not borrow the other direction's verdict, and `plan_join` will refuse the hop later.
+    assert back["outbound_cardinality"] is None
+
+
+def test_the_outbound_cardinality_key_is_egress_classified(db, v4, monkeypatch):
+    from featuregen.overlay.upload import enrich_llm
+
+    _stored_link(db)
+    payload = _column_of(db, "cib", "public.customers.customer_id")
+    assert sanitize_feature_context({"columns": [payload]})[0] is not None
+    monkeypatch.setattr(
+        enrich_llm, "_FEATURE_COLUMN_DICT_LIST_KEYS",
+        {"relationships": enrich_llm._FEATURE_COLUMN_DICT_LIST_KEYS["relationships"]
+         - {"outbound_cardinality"}})
     assert sanitize_feature_context({"columns": [payload]})[0] is None
 
 
