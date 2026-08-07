@@ -18,6 +18,7 @@ every column is hidden). :func:`catalog_visible` is that predicate; the routes 4
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 from psycopg.types.json import Jsonb
@@ -27,9 +28,12 @@ from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.upload.catalog_profiles import (
     CatalogProfileCurrentV1,
     CatalogProfileRevisionV1,
+    catalog_narrative_block,
     narrative_content_payload,
 )
 from featuregen.overlay.upload.read_scope import allowed_classes
+
+logger = logging.getLogger(__name__)
 
 
 class CatalogProfileConflict(Exception):
@@ -148,6 +152,39 @@ def current_catalog_profile_revision_id(conn: DbConn, catalog_source: str) -> st
         "SELECT revision_id FROM catalog_profile_current WHERE catalog_source = %s",
         (catalog_source,)).fetchone()
     return row[0] if row is not None else None
+
+
+def current_catalog_narrative_block(conn: DbConn, catalog_source: str) -> dict:
+    """The current narrative as MODEL CONTEXT (Task 7b), or ``{}``.
+
+    ``{}`` — never ``None`` — because every caller merges it into a block it is already building,
+    and "this catalog has no authored narrative" must add no key at all rather than a key saying
+    nothing. `semantic_context.MISSING_CONTEXT_CODES` already carries `catalog_profile_absent` for
+    the honest statement of that state; this function must not manufacture a second, blank one.
+
+    FLAG-GATED on `FEATUREGEN_DATASET_PROFILES`, the single Release-A gate. That is not caution, it
+    is the flag's contract: with it off the upload part is ignored with a warning and the PUT route
+    404s, so NO supported write path can author a narrative — and every existing payload stays
+    byte-identical. Reading one anyway would surface state the deployment does not admit exists.
+
+    FAIL-SOFT. A narrative is advisory context; an unavailable or torn narrative store degrades this
+    call to "no narrative" and is logged, exactly as `ingest`'s existing catalog-context probe
+    does. Failing an upload or a feature-generation request over descriptive prose would be a worse
+    outcome than sending the payload without it.
+    """
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    if not dataset_profiles_enabled():
+        return {}
+    try:
+        current = current_catalog_profile(conn, catalog_source)
+    except Exception:  # noqa: BLE001 — advisory: a narrative never fails its caller
+        logger.warning("advisory catalog-narrative read failed for %r", catalog_source,
+                       exc_info=True)
+        return {}
+    if current is None:
+        return {}
+    return catalog_narrative_block(current[0])
 
 
 def catalog_visible(conn: DbConn, catalog_source: str, *, roles: Iterable[str] = ()) -> bool:

@@ -2733,16 +2733,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # "unknown" are indistinguishable and the rule abstains rather than refuting every
                 # claim in the catalog. Read fail-soft: an unavailable narrative store degrades to
                 # abstention, never to a wrong refutation.
+                #
+                # Task 7b: read the NARRATIVE ITSELF, not just whether one exists. This probe had
+                # the prose in reach and threw it away — Pass B was told "a human wrote something
+                # about this catalog" and never shown what, while the upload form promised the
+                # description is "used by the AI when it interprets tables". The boolean is now
+                # derived from the same read, so the contradiction rule's behaviour is unchanged.
                 try:
                     from featuregen.overlay.upload.profile_store import (
+                        current_catalog_narrative_block,
                         current_catalog_profile_revision_id,
                     )
                     _catalog_context = current_catalog_profile_revision_id(
                         conn, catalog_source) is not None
+                    _catalog_narrative = current_catalog_narrative_block(conn, catalog_source)
                 except Exception:  # noqa: BLE001 — advisory: abstain rather than misfire
                     logger.warning("advisory catalog-narrative probe failed for %r",
                                    catalog_source, exc_info=True)
                     _catalog_context = False
+                    _catalog_narrative = {}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
                                               dispositions=dispositions,
@@ -2750,7 +2759,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                                               ingestion_run_id=ingestion_run_id,
                                               catalog_source=catalog_source,
                                               schema_by_table=schema_by_table, stats=passb_stats,
-                                              catalog_context_available=_catalog_context)
+                                              catalog_context_available=_catalog_context,
+                                              catalog_narrative=_catalog_narrative)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical

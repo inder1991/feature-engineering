@@ -179,3 +179,64 @@ def build_catalog_profile_revision(
         content_hash=content_hash,
         revision_id=f"cpr_{content_hash}",
     )
+
+
+# ── the narrative as MODEL CONTEXT (Task 7b) ────────────────────────────────────────────────────
+#
+# The upload form promises this prose is "used by search and by the AI when it interprets tables".
+# It was used by neither model-facing seam: the bundle carried `catalog_profile_revision_id` (the
+# id, not the prose) and the ingest path read that id only as a BOOLEAN, to decide whether the
+# `authority_claim_without_source_context` contradiction could fire at all.
+#
+# ONE builder, because two renderings of the same narrative would drift. Two seams consume it, both
+# at TABLE grain — never per column, where a 4000-character description multiplied by a 144-column
+# table would dominate the payload:
+#
+#   * `table_synth` — the per-table Pass-B synthesis item. Highest leverage: Pass B decides grain,
+#     `table_role`, `primary_entity` and `event_or_snapshot` from column names and profiles alone,
+#     and a sentence like "all outbound SWIFT/RTGS payments; Compliance-owned" answers three of the
+#     four outright.
+#   * `feature_assist._table_context` — the feature-generation table block.
+#
+# KEY NAMES ARE PREFIXED `catalog_` on purpose. The table block ALREADY carries a `business_context`
+# (migration 1052 — the per-table narrative Pass B writes) and a `table_definition`. An unprefixed
+# `business_context` here would collide with one and be read as the other; the prefix also tells the
+# model which GRAIN it is reading about, which is the whole reason the block is worth sending.
+CATALOG_NARRATIVE_AUTHORITY_KEY = "catalog_narrative_authority"
+
+#: Every key the block can emit, in emission order. Frozen as data so the two seams' egress
+#: allowlists can be checked against it by test rather than by eye.
+CATALOG_NARRATIVE_KEYS: tuple[str, ...] = (
+    "catalog_display_name", "catalog_description", "catalog_business_context",
+    "catalog_business_domains", CATALOG_NARRATIVE_AUTHORITY_KEY,
+)
+
+
+def catalog_narrative_block(revision: CatalogProfileRevisionV1) -> dict:
+    """One catalog's authored narrative, as bounded model context with its authority LABELED.
+
+    AUTHORITY. The block publishes the revision's OWN stored D2 axes as ``producer/strength`` — the
+    same wire form `semantic_context`'s `semantic_authority` uses (D10: the wire carries the pair,
+    never a derived display label). For an authored narrative that is ``human/proposed``: prose a
+    person typed, which INFORMS the model and overrides nothing. It must not default any dataset's
+    role, authority or temporal model — :func:`put_catalog_profile` states that constraint for the
+    write side, and reading the stored axes rather than asserting a stronger one preserves it here.
+    Nothing downstream branches on this value; it is context, exactly like the prose beside it.
+
+    An unauthored field is OMITTED, never sent blank: a fabricated empty string is a value the model
+    can reason about, and "nobody wrote one" is honestly the absence of the key.
+    """
+    block: dict = {}
+    if revision.display_name:
+        block["catalog_display_name"] = revision.display_name
+    if revision.description:
+        block["catalog_description"] = revision.description
+    if revision.business_context:
+        block["catalog_business_context"] = revision.business_context
+    if revision.business_domains:
+        block["catalog_business_domains"] = list(revision.business_domains)
+    if block:
+        # Only where there is prose to attribute. A block that is nothing but an authority label
+        # would announce a narrative that does not exist.
+        block[CATALOG_NARRATIVE_AUTHORITY_KEY] = f"{revision.producer}/{revision.strength}"
+    return block

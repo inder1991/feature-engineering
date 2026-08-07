@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
@@ -67,9 +67,11 @@ from featuregen.overlay.upload.join_path import (
     join_outcome_relationship_path,
 )
 from featuregen.overlay.upload.need_metadata import is_measure_need_role
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.pii_policy_store import active_pii_use_policies
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+from featuregen.overlay.upload.profile_store import current_catalog_narrative_block
 from featuregen.overlay.upload.read_scope import (
     allowed_sensitivities,
     read_scope_rule_content_hash,
@@ -298,7 +300,12 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
            # join — never a second unscoped fetch. Display projections, so they inform the model
            # and change no gate: the numeric, currency, grain, availability and join checks stay
            # exactly as authoritative as they were.
-           "t.data_role, t.authority_role, t.temporal_storage_model, t.business_context "
+           "t.data_role, t.authority_role, t.temporal_storage_model, t.business_context, "
+           # Task 7b: `schema_name` is not payload — it is the key `_business_terms` rebuilds each
+           # row's SCHEMA-PRESERVING logical ref from, because `field_evidence` is keyed by that ref
+           # while `graph_node.object_ref` is the public-flattened one. Selected here so the term
+           # lookup needs no second graph query.
+           "c.schema_name "
            "FROM graph_node c "
            "LEFT JOIN graph_node t ON t.catalog_source = c.catalog_source AND t.kind = 'table' "
            "AND t.table_name = c.table_name "
@@ -314,17 +321,68 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
         sql += " AND c.catalog_source = %s"
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
-    return [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
-             "concept": r[4], "domain": r[5], "definition": r[6], "ai_summary": r[7],
-             "data_type": r[8], "declared_type": r[9], "semantic_terms": r[10], "entity": r[11],
-             "additivity": r[12], "unit": r[13], "currency": r[14], "is_grain": r[15],
-             "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
-             # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
-             # shifted every index past it, and these two were the tail I missed first time.
-             "table_definition": r[19], "table_primary_entity": r[20],
-             "table_data_role": r[21], "table_authority_role": r[22],
-             "table_temporal_storage_model": r[23], "table_business_context": r[24]}
-            for r in rows]
+    out = [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
+            "concept": r[4], "domain": r[5], "definition": r[6], "ai_summary": r[7],
+            "data_type": r[8], "declared_type": r[9], "semantic_terms": r[10], "entity": r[11],
+            "additivity": r[12], "unit": r[13], "currency": r[14], "is_grain": r[15],
+            "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
+            # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
+            # shifted every index past it, and these two were the tail I missed first time.
+            "table_definition": r[19], "table_primary_entity": r[20],
+            "table_data_role": r[21], "table_authority_role": r[22],
+            "table_temporal_storage_model": r[23], "table_business_context": r[24],
+            "schema_name": r[25]}
+           for r in rows]
+    terms = _business_terms(conn, out)
+    for row in out:
+        row["business_term"] = terms.get(_logical_ref_of_row(row))
+    return out
+
+
+def _logical_ref_of_row(row: dict) -> str:
+    """The row's SCHEMA-PRESERVING logical ref — the key every evidence store uses. `object_ref` on
+    the menu is the PUBLIC-FLATTENED graph ref (see `_context_v4_column`), and looking evidence up
+    by that spelling matches no row: the field would populate for a public-schema catalog and
+    silently never populate for a glossary catalog, which is the harder half of that bug to notice.
+    """
+    return normalize_ref(row["catalog_source"], row.get("schema_name") or None,
+                         row["table"], row["column"])
+
+
+def _business_terms(conn, rows: list[dict]) -> dict[str, str]:
+    """`{logical_ref: business_term}` for these candidates, in ONE batched read (Task 7b).
+
+    The glossary's curated business NAME for a column has no `field_resolution._DISPLAY_COLUMN`
+    entry, so it reaches no flat `graph_node` column and the candidate query cannot join it. It
+    lives as SOURCE evidence, which is exactly where `semantic_context.bundle_from_store` reads it
+    from for the payload — this read exists because `_column_tokens` scores the CANDIDATE row, not
+    the (lazily built, budget-gated) enriched payload, so a payload-only fix would leave the
+    objective/column intersection as blind to the bank's own vocabulary as it was.
+
+    PRODUCER-SCOPED TO `source`, and that is not caution — it is what keeps the ranking and the
+    PAYLOAD looking at the same value. `bundle_from_store` builds `source_semantics` from SOURCE
+    rows only, so that is exactly the `business_term` `for_feature_generation` emits; an unscoped
+    read here would let the ranking match a term the model is never shown. (A HUMAN-corrected
+    business term reaches neither surface today — the bundle carries no resolved projection for a
+    field with no `_DISPLAY_COLUMN` entry. That is a pre-existing gap in the bundle, and closing it
+    HERE alone would create the divergence this scope exists to prevent.)
+
+    Read scope needs no predicate here: `rows` are already the scoped candidates, and this reads
+    only their own refs. Fail-soft — a term is ranking colour, never a gate."""
+    if not rows:
+        return {}
+    refs = sorted({_logical_ref_of_row(r) for r in rows})
+    try:
+        found = conn.execute(
+            "SELECT DISTINCT ON (logical_ref) logical_ref, proposed_value FROM field_evidence "
+            "WHERE field_name = 'business_term' AND lifecycle = 'active' AND producer = 'source' "
+            "AND logical_ref = ANY(%s) ORDER BY logical_ref, created_at DESC, evidence_id DESC",
+            (refs,)).fetchall()
+    except Exception:  # noqa: BLE001 — advisory: a curated term never fails the request
+        logger.warning("advisory business_term read failed for %d candidates", len(rows),
+                       exc_info=True)
+        return {}
+    return {ref: value for ref, value in found if isinstance(value, str) and value}
 
 
 def _menu(cols: list[dict]) -> list[dict]:
@@ -479,6 +537,15 @@ _V4_TRIM_ORDER: tuple[str, ...] = ("semantic_terms", "ai_summary", "definition",
 #: with the table's authority. Hence an explicit list, not "everything on table_context".
 _V4_TABLE_AUTHORITY_FIELDS: frozenset[str] = frozenset({"table_role", "event_or_snapshot"})
 
+#: The SOURCE-only semantic fields the v4 payload emits (Task 7b). Both are curated glossary values
+#: that reach no `graph_node` display column, so they ride `bundle.source_semantics` alone and the
+#: `resolved_semantics` loop below never sees them — a value would have egressed with nothing beside
+#: it saying who vouched for it. Named EXPLICITLY, exactly like `_V4_TABLE_AUTHORITY_FIELDS`, and not
+#: "everything on source_semantics": most source fields share a name with the column's own resolved
+#: field (`definition`, `domain`, `entity`…), and folding those in would label the resolved value
+#: with the DECLARED value's authority.
+_V4_SOURCE_AUTHORITY_FIELDS: frozenset[str] = frozenset({"business_term", "related_terms"})
+
 
 def _semantic_authority(bundle) -> dict[str, str]:
     """``{field: "producer/strength"}`` for every semantic value that has evidence — the D2 axes ON
@@ -499,6 +566,15 @@ def _semantic_authority(bundle) -> dict[str, str]:
     # column field of the same name always wins: the column's own authority is never overwritten.
     for value in bundle.table_context:
         if value.field_name not in _V4_TABLE_AUTHORITY_FIELDS or value.field_name in out:
+            continue
+        if not value.evidence:
+            continue
+        lead = value.evidence[0]
+        out[value.field_name] = f"{lead.producer}/{lead.strength}"
+    # The two SOURCE-only glossary fields (Task 7b), same rule and same precedence: a resolved field
+    # of the same name always wins, so a column's own authority is never overwritten.
+    for value in bundle.source_semantics:
+        if value.field_name not in _V4_SOURCE_AUTHORITY_FIELDS or value.field_name in out:
             continue
         if not value.evidence:
             continue
@@ -587,18 +663,33 @@ def _trimmed(column: dict, level: int) -> dict:
     return {k: v for k, v in column.items() if k not in shed}
 
 
-def _table_context(cols: list[dict]) -> list[dict]:
+def _table_context(cols: list[dict], *,
+                   narratives: Mapping[str, Mapping] | None = None) -> list[dict]:
     """One context block per TABLE, assembled ONLY from the already-authorized candidate rows
     (spec §5): a table whose columns were all read-scope-excluded has no rows here and gets no
     block. Confirmed grain columns require a non-null grain_fact_event_id and the as-of column a
     non-null availability_fact_event_id (governed-VERIFIED, not merely file-declared);
-    primary_entity is ADVISORY."""
+    primary_entity is ADVISORY.
+
+    `narratives` (Task 7b) is `{catalog_source: catalog_narrative_block}` — the prose a human typed
+    about the CATALOG, which the upload form promises is "used by the AI when it interprets tables"
+    and which reached no model-facing payload at all. RESOLVED BY THE CALLER, and keyed by catalog
+    because an entity-scoped gather legitimately spans several: `select_relevant_context` resolves
+    it once per catalog rather than once per table. Passing nothing means the caller resolved no
+    narrative, and the block is then byte-identical to its pre-Task-7b shape — which is also what a
+    catalog with no authored narrative gets, honestly, with `catalog_profile_absent` already saying
+    so in the column payload's missing-context codes.
+
+    It rides the TABLE block and not the column payload on purpose: it is one fact about the whole
+    catalog, and a 4000-character description repeated across 144 columns would crowd out the column
+    context it exists to interpret."""
     by_table: dict[tuple[str, str], list[dict]] = {}
     for c in cols:
         by_table.setdefault((c["catalog_source"], c["table"]), []).append(c)
     blocks: list[dict] = []
     for (_catalog, table), members in sorted(by_table.items()):
         block: dict = {"table": table}
+        block.update((narratives or {}).get(_catalog) or {})
         tdef = next((m["table_definition"] for m in members if m.get("table_definition")), None)
         if tdef:
             block["table_definition"] = tdef
@@ -941,8 +1032,11 @@ def _column_tokens(col: dict) -> set[str]:
     toks: set[str] = set()
     # `ai_summary` included so the agent finds a column by the same words SEARCH finds it by —
     # otherwise the two surfaces disagree about what the catalog contains.
+    # `business_term` (Task 7b) is the GLOSSARY's curated business NAME — for a bank whose physical
+    # columns are `CPTY_EXPSR_AMT`, it is the only readable English the column has, and without it
+    # an objective phrased in the bank's own vocabulary could not match the bank's own term.
     for k in ("object_ref", "table", "column", "concept", "domain", "semantic_terms", "entity",
-              "ai_summary"):
+              "ai_summary", "business_term"):
         v = col.get(k)
         if isinstance(v, str):
             toks |= _tokenize(v)
@@ -1013,6 +1107,12 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
             out.append(_trimmed(enriched_by_ref[key], trim))
         return out
 
+    # The catalog narrative, resolved ONCE per catalog present in the candidate set (Task 7b). Not
+    # once per table and not once per column: it is one fact about the whole catalog, and
+    # `_table_context` is called repeatedly below as the budget loop searches for a fit.
+    narratives = {source: block for source in sorted({c["catalog_source"] for c in cols})
+                  if (block := current_catalog_narrative_block(conn, source))}
+
     mandatory = [c for c in cols if _is_mandatory(c, obj_entity)]
     optional = [c for c in cols if not _is_mandatory(c, obj_entity)]
     scored = sorted(optional,
@@ -1020,8 +1120,8 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
 
     selected = list(mandatory)
     trim = 0
-    while (_assembled_bytes(_enriched(selected, trim=trim), _table_context(selected))
-           > byte_budget):
+    while (_assembled_bytes(_enriched(selected, trim=trim),
+                            _table_context(selected, narratives=narratives)) > byte_budget):
         if trim >= len(_V4_TRIM_ORDER):
             raise ContextTooLarge(
                 f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
@@ -1034,14 +1134,16 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     dropped = 0
     for i, c in enumerate(scored):
         trial = selected + [c]
-        if _assembled_bytes(_enriched(trial, trim=trim), _table_context(trial)) > byte_budget:
+        if _assembled_bytes(_enriched(trial, trim=trim),
+                            _table_context(trial, narratives=narratives)) > byte_budget:
             dropped = len(scored) - i
             break
         selected = trial
     if dropped:
         logger.info("feature-context relevance dropped %d of %d optional columns (byte budget %d)",
                     dropped, len(optional), byte_budget)
-    return _enriched(selected, trim=trim), _table_context(selected), dropped
+    return (_enriched(selected, trim=trim), _table_context(selected, narratives=narratives),
+            dropped)
 
 
 def _build_menu(conn, cols: list[dict], *, objective: str | None = None,

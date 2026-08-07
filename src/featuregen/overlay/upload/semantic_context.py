@@ -1899,6 +1899,17 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
     out["sub_domain"] = _value_of(bundle, "sub_domain")
     out["bian_path"] = _value_of(bundle, "bian_path")
     out["process_path"] = _value_of(bundle, "process_path")
+    # The GLOSSARY's curated vocabulary (Task 7b). `for_concept_enrichment` and `for_summary` have
+    # always sent both — the feature seam sent neither, so a generator was shown `CPTY_EXPSR_AMT`
+    # with no access to the bank's own name for it ("Counterparty Exposure Amount") or to the
+    # related vocabulary a human already curated, while Task 6d paid a provider to invent the same
+    # kind of vocabulary for the objective. Both are uploader-authored and PROSE-graded on egress
+    # (`_FEATURE_COLUMN_PROSE_KEYS` / `_FEATURE_COLUMN_PROSE_LIST_KEYS`), never identity.
+    out["business_term"] = _value_of(bundle, "business_term")
+    # ALWAYS A LIST. `_token_list_ok`/`_prose_list` both refuse a None, and the refusal is the WHOLE
+    # column, so emitting None for a column with no curated related terms — i.e. every column of
+    # every technical catalog — would have silently killed the payload rather than omitted a field.
+    out["related_terms"] = _related_terms(bundle) or []
     # Table SHAPE. A windowed count is right on an event log and wrong on a snapshot; the
     # generator cannot make that call without being told which it is. These two ride
     # `table_context` (not `resolved_semantics`), so they are read through `_table_value`.

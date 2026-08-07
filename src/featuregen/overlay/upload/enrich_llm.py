@@ -45,6 +45,15 @@ from featuregen.intake.redaction import (
     build_llm_inputs,
     redact_free_text,
 )
+from featuregen.overlay.upload.catalog_profiles import (
+    CATALOG_NARRATIVE_KEYS,
+)
+from featuregen.overlay.upload.catalog_profiles import (
+    MAX_BUSINESS_CONTEXT as MAX_CATALOG_BUSINESS_CONTEXT,
+)
+from featuregen.overlay.upload.catalog_profiles import (
+    MAX_DESCRIPTION as MAX_CATALOG_DESCRIPTION,
+)
 from featuregen.overlay.upload.dispatch_audit import (
     AuditingClient,
     DispatchAuditContext,
@@ -104,15 +113,27 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 # with no gate for a data marker at all. The strictly-stronger direction, so nothing that used to
 # egress cleanly is newly leaked; a value carrying an unconsumable marker now BLOCKS its item
 # (audited) instead of egressing.
+# * `catalog_description` / `catalog_business_context` (Task 7b) — the CATALOG narrative a human
+#   typed in the upload form (migration 1047). Same class again: uploader-authored narrative prose,
+#   up to 4000 characters, written while looking at the real dataset — so it can embed a sample
+#   clause in a sentence exactly as a table description can. Prose grade would give it the PII
+#   backstop only; the definition grade adds the sample-clause strip and the fail-closed
+#   data-marker scan, which is the strictly-stronger direction.
 _DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition",
-                                   "table_description", "business_context", "semantic_terms"})
+                                   "table_description", "business_context", "semantic_terms",
+                                   "catalog_description", "catalog_business_context"})
 # [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
 # `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
 # they are never presumable-clean and each entry is PII-scanned at an indexed path.
 # `related_terms` (richness Task 3 Step 6c) is the sidecar's uploader-authored term list — same
 # never-presumable-clean rule, per-item PII scan at an indexed path.
-_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_terms"})
+# `catalog_business_domains` (Task 7b) is the uploader's own list of business domains for the whole
+# catalog — free text a person typed into a form, bounded at 32 items of 200 chars. It is here and
+# NOT with the structural lists for the same reason `source_attributes` is: a list shape is not a
+# safety property, and grading uploader text as structural gives it no redaction at all.
+_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_terms",
+                                   "catalog_business_domains"})
 # `term_type`/`process_path` are sidecar (uploader-authored) scalars; `ai_synonyms` is the AI's
 # comma-joined synonym draft riding the tail summary payload — all PII-scanned as prose. The
 # remaining Step-6c summary keys (`concept`, `party_role`, `grain_role`, `table_role`) are
@@ -122,8 +143,12 @@ _LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_ter
 # above for why. What stays prose is genuinely short, non-narrative field text: a term name, a
 # domain, a taxonomy/process path, a term type, and the AI's comma-joined synonym draft. None of
 # those is authored against real rows, so none carries a sample clause by contract.
+# `catalog_display_name` (Task 7b) is the catalog's human-readable NAME (bounded at 200) — short,
+# non-narrative uploader text, the same shape as `term_name`. Not definition-kind: a name is not
+# authored against rows, so it carries no sample clause by contract.
 _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path",
-                                     "term_type", "process_path", "ai_synonyms"})
+                                     "term_type", "process_path", "ai_synonyms",
+                                     "catalog_display_name"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
@@ -155,6 +180,10 @@ _STRUCTURAL_META_KEYS = frozenset({
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
+    # Task 7b — the catalog narrative's AUTHORITY label. `producer/strength` read from the
+    # revision's own stored D2 axes (`human/proposed`), so it is a closed-vocabulary pair the
+    # platform minted, never uploader text. The narrative PROSE beside it is free-text-classified.
+    "catalog_narrative_authority",
     # concept critic (attest/concept_critic.py)
     "logical_ref", "proposed_concept", "shape_conflicts", "proposed_concept_meaning",
     # semantic Task 5 — targeted adjudication. Both are CLOSED-VOCABULARY token lists computed by
@@ -395,7 +424,18 @@ _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "con
 #   c. The DI SEAM. When a NER-backed `IntentRedactor` IS registered, prose-graded values route
 #      through it; identity-graded values never would. This is the line that makes (3) closeable
 #      later without touching this list again.
-_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "bian_path", "process_path"})
+#
+# `business_term` (Task 7b) joins them: the glossary's curated business NAME for the column
+# ("Counterparty Exposure Amount" for `CPTY_EXPSR_AMT`). Uploader-authored through the SAME
+# unredacted `glossary_reader` branch reason (2) names for `domain`, and already prose-graded on the
+# enrichment seam as `term_name` (`_SCALAR_PROSE_META_KEYS`) — so the two seams agree, which is this
+# file's stated principle.
+_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "bian_path", "process_path", "business_term"})
+# The LIST form of the same grade (Task 7b): each item PII-redacted at its own indexed path
+# (`related_terms[1]`) and bounded per TERM, mirroring `_LIST_PROSE_META_KEYS` on the enrichment
+# seam. `related_terms` is uploader-authored curated vocabulary, so the token-list grade its SHAPE
+# suggests would be wrong twice over — no redaction, and no audit of what left.
+_FEATURE_COLUMN_PROSE_LIST_KEYS = frozenset({"related_terms"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
@@ -445,11 +485,37 @@ _FEATURE_COLUMN_DICT_LIST_KEYS: dict[str, frozenset[str]] = {
 # sanitizer exactly like `table_definition` — sample-clause stripped, data-marker scanned, PII
 # redacted. Classifying it as an identity string would have let an uploader's paragraph egress
 # unscanned, which is the whole reason the definition grade exists.
-_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_context"})
+#
+# Task 7b adds the two long CATALOG-narrative fields at the same grade and for the same reason —
+# see `_DEFINITION_META_KEYS`. Note the DELIBERATE key names: `catalog_business_context` is the
+# narrative a human typed about the CATALOG (migration 1047); the unprefixed `business_context`
+# beside it is the per-TABLE narrative Pass B writes (migration 1052). Two different values, two
+# grains, one block — the prefix is what keeps them apart on the wire.
+#
+# There is no length ceiling on this grade, which is why the 4000-character fields take it: an
+# acceptance gate that refused a legitimately-authored narrative would refuse the WHOLE payload,
+# not the field.
+_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_context",
+                                            "catalog_description", "catalog_business_context"})
 # The Release-A profile classifications are CLOSED-vocabulary tokens (profile_vocab), not prose.
+# `catalog_narrative_authority` is the `producer/strength` pair read off the narrative revision's
+# own stored D2 axes — platform-minted, never uploader text.
 _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity",
                                           "data_role", "authority_role",
-                                          "temporal_storage_model"})
+                                          "temporal_storage_model",
+                                          "catalog_narrative_authority"})
+# The table block's PROSE grade (Task 7b) — the missing half of this seam. The column side has had
+# `_FEATURE_COLUMN_PROSE_KEYS` since `domain` moved off identity grade in `c62ab49d`; the table side
+# had only DEFINITION (sample-strip + marker gate) and LIST/IDENTITY (no redaction at all), so a
+# short uploader-typed label had nowhere honest to go. `catalog_display_name` is bounded at 200 by
+# `catalog_profiles.MAX_DISPLAY_NAME`, well inside `_FEATURE_STRUCTURAL_MAX_LEN`, with room for
+# redaction to LENGTHEN it.
+_TABLE_CONTEXT_PROSE_KEYS = frozenset({"catalog_display_name"})
+# The list form: each item redacted and bounded on its own, at its own indexed audit path. NOT
+# `_TABLE_CONTEXT_LIST_KEYS`, which is for PLATFORM-authored sentences (`advisories`) and structural
+# refs (`grain_columns`) and applies no redaction — grading uploader text there was the exposure
+# `c62ab49d` fixed one seam over.
+_TABLE_CONTEXT_PROSE_LIST_KEYS = frozenset({"catalog_business_domains"})
 # `advisories` are PLATFORM-authored sentences from a closed table in this repo — never uploader
 # text and never model output — so they are length-bounded like any other structural list.
 _TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns", "advisories"})
@@ -578,6 +644,21 @@ def sanitize_feature_context(
         pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
         return res.text
 
+    def _prose_list(v: object, path: str) -> list | None:   # None ⟹ fail closed
+        """A LIST of uploader-authored prose — `_prose` per item, at that item's own indexed path
+        (`related_terms[1]`), so the audit keeps per-term granularity and one long term is bounded
+        on its own rather than as part of a joined blob. A non-list, or a list over the collection
+        cap, fails closed like any other shape violation."""
+        if not isinstance(v, list) or len(v) > _FEATURE_COLLECTION_MAX_ITEMS:
+            return None
+        cleaned: list[str] = []
+        for i, item in enumerate(v):
+            clean = _prose(item, f"{path}[{i}]")
+            if clean is None:
+                return None
+            cleaned.append(clean)
+        return cleaned
+
     def _structural_ok(v: object) -> bool:  # identity strings may be None (`concept` is nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
 
@@ -607,6 +688,11 @@ def sanitize_feature_context(
                     if clean is None:
                         return None, pii_spans, sample_audits, version
                     out[k] = clean
+                elif k in _FEATURE_COLUMN_PROSE_LIST_KEYS:
+                    cleaned = _prose_list(v, path)
+                    if cleaned is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = cleaned
                 elif k in _FEATURE_COLUMN_IDENTITY_KEYS:
                     if not _structural_ok(v):
                         return None, pii_spans, sample_audits, version
@@ -653,6 +739,19 @@ def sanitize_feature_context(
                     if clean is None:
                         return None, pii_spans, sample_audits, version
                     out[k] = clean
+                elif k in _TABLE_CONTEXT_PROSE_KEYS:
+                    if v is None:                # unauthored label — no content to scan
+                        out[k] = v
+                        continue
+                    clean = _prose(v, path)
+                    if clean is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = clean
+                elif k in _TABLE_CONTEXT_PROSE_LIST_KEYS:
+                    cleaned = _prose_list(v, path)
+                    if cleaned is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = cleaned
                 elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
                     if not _structural_ok(v):
                         return None, pii_spans, sample_audits, version
@@ -1761,6 +1860,11 @@ _ITEM_META_ALLOWED = frozenset({
     # 200 default otherwise) and the item builder normalizes/validates them before egress.
     "recipe_family", "recipe_intent", "recipe_aggregation", "funnel_stage",
     "legacy_use_case_tags",
+    # Task 7b — the CATALOG narrative on the per-TABLE Pass-B synthesis item. Per table, never per
+    # column: a 4000-character description multiplied across a 144-column table would dominate the
+    # payload it is meant to inform. The four prose fields are free-text-classified above
+    # (definition / prose / list-of-prose); the authority label is structural.
+    *CATALOG_NARRATIVE_KEYS,
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -1893,8 +1997,20 @@ MAX_DEFINITION_LEN = 32_000
 # which is the outcome this task wants. `_MAX_PROFILE_PROSE` must stay BELOW this default; see the
 # note beside it.
 _MAX_LEN_DEFAULT = 1000
+#: The CATALOG-narrative acceptance bound (Task 7b), on the two fields `catalog_profiles` accepts at
+#: 4000 characters. Left to inherit `_MAX_LEN_DEFAULT` a legitimately-authored description would
+#: EXCLUDE its whole Pass-B item — that table would lose its synthesis (grain, table_role,
+#: primary_entity, event_or_snapshot), silently, audited only as an egress block. Set at TWICE the
+#: authored bound rather than exactly at it, because this gate runs AFTER redaction and redaction is
+#: not length-preserving in the shrinking direction: `DefaultIntentRedactor` substitutes a
+#: `[REDACTED:LABEL]` placeholder that is LONGER than several tokens it replaces, so a
+#: maximum-length narrative carrying PII would otherwise be refused for having been scrubbed.
+#: DERIVED from the authored bounds, never re-typed, so raising them cannot leave this behind.
+_CATALOG_NARRATIVE_MAX_LEN = 2 * max(MAX_CATALOG_DESCRIPTION, MAX_CATALOG_BUSINESS_CONTEXT)
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
                    "table_definition": MAX_DEFINITION_LEN,
+                   "catalog_description": _CATALOG_NARRATIVE_MAX_LEN,
+                   "catalog_business_context": _CATALOG_NARRATIVE_MAX_LEN,
                    # Task 1: the authored one-line recipe intent (longest authored value is 323
                    # chars at the 0F-2 baseline). Kept as an EXPLICIT entry rather than left to
                    # inherit the default, so lowering `_MAX_LEN_DEFAULT` later cannot silently

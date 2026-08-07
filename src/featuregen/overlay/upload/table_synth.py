@@ -14,12 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload import enrich_config, table_vocab
 from featuregen.overlay.upload.attest.dataset_profile_critic import CRITIC_BUDGET_EXHAUSTED
+from featuregen.overlay.upload.catalog_profiles import CATALOG_NARRATIVE_KEYS
 from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES, ENRICHMENT_RUN_ID
 from featuregen.overlay.upload.object_ref import normalize_ref
@@ -642,7 +643,8 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                       catalog_source: str | None = None,
                       schema_by_table: dict[str, str] | None = None,
                       stats: dict | None = None,
-                      catalog_context_available: bool = False) -> dict[str, dict]:
+                      catalog_context_available: bool = False,
+                      catalog_narrative: Mapping | None = None) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
@@ -678,7 +680,25 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     C5-T5 — ``ingestion_run_id`` + ``catalog_source`` (+ ``schema_by_table``, the Pass-B fact-key
     schema map): with a run id, every Pass B dispatch (chunk summaries AND syntheses) is pre-audited
     and attributed to the run + its TABLE subjects under stage ``pass_b``. ``ingestion_run_id=None``
-    (every direct/test caller) is byte-for-byte today's behavior."""
+    (every direct/test caller) is byte-for-byte today's behavior.
+
+    ``catalog_narrative`` (Task 7b) is the catalog's authored narrative as model context
+    (:func:`catalog_profiles.catalog_narrative_block`), joined onto EVERY item here. This is the
+    highest-leverage place that prose could go: Pass B decides grain, ``table_role``,
+    ``primary_entity`` and ``event_or_snapshot`` from column names and profiles alone, and a
+    sentence like "funds-transfer records — all outbound SWIFT/RTGS payments; Compliance-owned"
+    answers three of those four outright. Grain is the most expensive thing in this pipeline to get
+    wrong. It is CONTEXT and carries its own ``human/proposed`` authority label; it refutes nothing
+    and defaults nothing — the deterministic contradictions and the proposal-blind critic remain the
+    only things that can overturn a suggestion.
+
+    Joined BEFORE ``context_revision`` deliberately: the narrative is part of the QUESTION, so an
+    edit must re-ask it rather than replay an answer given to a different one. The item's OWN keys
+    win a collision, so no catalog-grain value can displace a table's identity; ``None`` (every
+    direct caller, and any catalog with no authored narrative) leaves every item byte-identical."""
+    if catalog_narrative:
+        items = [BatchItem(ref=it.ref, metadata={**catalog_narrative, **it.metadata})
+                 for it in items]
     narrow = [it for it in items
               if len(it.metadata.get("column_profiles") or []) <= _MAX_COLUMN_PROFILES]
     wide = [it for it in items
@@ -880,6 +900,7 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     columns_by_ref: dict[str, set[str]] = {}
     roster_by_table: dict[str, list[dict]] = {}
     table_def_by_table: dict[str, str] = {}
+    carried_narrative: dict[str, dict] = {}
     for it in wide_items:
         table = it.ref
         profiles = it.metadata.get("column_profiles") or []
@@ -891,6 +912,12 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         table_def = it.metadata.get("table_definition")
         if table_def:
             table_def_by_table[table] = table_def
+        # Task 7b: the CATALOG narrative rides the assembled item too, and the phase-2 item below is
+        # REBUILT from scratch — so it must be carried forward explicitly for exactly the reason
+        # `table_definition` is. Without this the wide path silently drops it, and a wide table is
+        # precisely the one whose grain the narrative helps most.
+        carried_narrative[table] = {k: v for k, v in it.metadata.items()
+                                    if k in CATALOG_NARRATIVE_KEYS}
         refs: list[str] = []
         for idx, chunk in enumerate(_chunk_profiles(profiles)):
             ref = f"{table}#chunk{idx}"
@@ -945,7 +972,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
             logger.info("table_synth wide %r summarized %d/%d chunks — synthesizing on the partial "
                         "summaries (roster is complete)", table, len(present), len(refs))
         chunk_summaries = [json.loads(summaries[r]) for r in present]
-        metadata: dict = {"table": table, "chunk_summaries": chunk_summaries,
+        metadata: dict = {**carried_narrative.get(table, {}),
+                          "table": table, "chunk_summaries": chunk_summaries,
                           "column_roster": roster_by_table[table]}
         if table in table_def_by_table:
             metadata["table_definition"] = table_def_by_table[table]

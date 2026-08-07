@@ -59,6 +59,7 @@ from featuregen.overlay.upload.enrich_llm import (
     _FEATURE_COLUMN_MAPPING_KEYS,
     _FEATURE_COLUMN_OBJECT_KEYS,
     _FEATURE_COLUMN_PROSE_KEYS,
+    _FEATURE_COLUMN_PROSE_LIST_KEYS,
     _FEATURE_COLUMN_TOKEN_LIST_KEYS,
     _FEATURE_FACT_SUBKEYS,
 )
@@ -140,17 +141,12 @@ DELIBERATELY_OMITTED: dict[str, str] = {
 #: `for_feature_generation`, classify it in the right `enrich_llm._FEATURE_COLUMN_*` set, re-pin the
 #: byte budget, then DELETE its entry here — which the staleness test below forces.
 UNCARRIED_GAPS: dict[str, str] = {
-    "business_term": (
-        "GAP. The glossary's curated business NAME for the column ('Counterparty Exposure Amount' "
-        "for `CPTY_EXPSR_AMT`). `for_concept_enrichment` and `for_summary` both send it as "
-        "`term_name`; the feature seam sends neither it nor its tokens "
-        "(`feature_assist._column_tokens` omits it too), so an objective phrased in the bank's own "
-        "vocabulary cannot match the bank's own term."),
-    "related_terms": (
-        "GAP, and an ironic one. Task 6d added an LLM call to expand the OBJECTIVE with related "
-        "business vocabulary, while the glossary's own curated related terms — already parsed, "
-        "already persisted, already egress-classified as `_LIST_PROSE_META_KEYS`, and already sent "
-        "by `for_concept_enrichment` — reach this seam not at all."),
+    # CLOSED by Task 7b, and their entries deleted rather than re-labelled — which the staleness
+    # test below forces either way:
+    #   * `business_term` now rides `for_feature_generation` (prose-graded) AND
+    #     `feature_assist._column_tokens`, so an objective in the bank's own vocabulary can reach
+    #     the bank's own term.
+    #   * `related_terms` now rides the same payload as a per-term-redacted prose LIST.
     "fibo_path": (
         "DEFERRED by a recorded decision (progress ledger, 2026-08-07): not emitted on any "
         "feature seam today, and the reason is that it has no egress grade here yet, NOT that it "
@@ -333,7 +329,7 @@ def test_every_key_the_feature_payload_emits_is_egress_classified():
         _FEATURE_COLUMN_IDENTITY_KEYS | _FEATURE_COLUMN_PROSE_KEYS | _FEATURE_COLUMN_FACT_KEYS
         | _FEATURE_COLUMN_TOKEN_LIST_KEYS | _FEATURE_COLUMN_MAPPING_KEYS
         | _FEATURE_COLUMN_DEFINITION_KEYS | set(_FEATURE_COLUMN_OBJECT_KEYS)
-        | set(_FEATURE_COLUMN_DICT_LIST_KEYS))
+        | set(_FEATURE_COLUMN_DICT_LIST_KEYS) | _FEATURE_COLUMN_PROSE_LIST_KEYS)
     assert not set(payload) - classified, (
         f"{sorted(set(payload) - classified)} are emitted by `for_feature_generation` but graded by "
         "no `enrich_llm._FEATURE_COLUMN_*` set — every feature-generation call would be refused "
