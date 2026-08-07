@@ -44,6 +44,55 @@ def test_thin_menu_with_null_identity_untouched():
     assert (spans, audits, ver) == ([], [], None)
 
 
+def test_thin_menu_domain_is_prose_redacted_on_every_menu_version():
+    """`domain` rides EVERY menu version — the v1 thin menu and the v3 enriched menu
+    (`_MENU_IDENTITY_FIELDS`) as well as v4 (`for_feature_generation`) — and every one of them lands
+    in this adapter, because `audited_structured_call` runs it on every call. It is uploader-TYPED:
+    the generic `glossary_reader.read_glossary` builds it with a bare `_cell(...)` and no redaction,
+    so "already scrubbed at ingest" is not true of it.
+
+    Put `domain` back in `_FEATURE_COLUMN_IDENTITY_KEYS` and the raw token below reaches the
+    provider, on all three versions at once. This is a change of GRADE, not of detection: the same
+    `_PII_PATTERNS` back both seams and no `IntentRedactor` is registered in `src/`."""
+    meta = {"columns": [{"object_ref": "public.t.c", "table": "t", "column": "c",
+                         "concept": None, "domain": f"Retail Ops ({_PII_TOKEN})"}]}
+    safe, spans, _audits, ver = sanitize_feature_context(meta)
+    assert safe is not None                                  # redacted, NOT fail-closed
+    assert _PII_TOKEN not in json.dumps(safe)
+    assert "[REDACTED:EMAIL]" in safe["columns"][0]["domain"]
+    assert "Retail Ops" in safe["columns"][0]["domain"]      # kept, minus the PII
+    assert [s["key"] for s in spans] == ["columns[0].domain"]
+    assert all(s["type"] == "EMAIL" and "value" not in s for s in spans)
+    assert ver
+    # A CLEAN domain is content-identical: prose grade rebuilds the dict and stamps a version
+    # (the value WAS scanned, which "metadata-only" would misreport), but never edits the text.
+    clean = {"columns": [{"object_ref": "public.t.c", "domain": "Retail Ops"}]}
+    ok, ok_spans, _a, ok_ver = sanitize_feature_context(clean)
+    assert ok == clean and ok_spans == []
+    assert ok_ver                                            # scanned, and honestly recorded
+
+
+def test_redaction_can_grow_a_domain_past_the_structural_bound():
+    """The byte budget does NOT only shrink. `DefaultIntentRedactor` substitutes a
+    `[REDACTED:LABEL]` placeholder that is LONGER than several tokens it replaces (16 chars for a
+    6-char email), and the prose branch bounds AFTER redaction — so a near-budget value carrying PII
+    can cross `_FEATURE_STRUCTURAL_MAX_LEN` on the way out and be refused where the same-length
+    un-scrubbed value was admitted. Fail-closed direction, and deliberate: bounding before redaction
+    would bound a string that is not the one egressing."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    email = " a@b.co"                                         # 7 chars in, 17 chars out
+    at_budget = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email)) + email
+    assert len(at_budget) == _FEATURE_STRUCTURAL_MAX_LEN      # admitted at identity grade
+    assert sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": at_budget}]})[0] is None
+    # One char shorter and the SAME value survives redaction inside the bound — the refusal above
+    # is the placeholder's growth, not a blanket ban on a near-budget domain.
+    under = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email) - 10) + email
+    assert sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": under}]})[0] is not None
+
+
 def test_definition_sample_clause_stripped_and_audited():
     meta = {"columns": [{"object_ref": "public.t.amount", "table": "t", "column": "amount",
                         "definition": _SAMPLE,

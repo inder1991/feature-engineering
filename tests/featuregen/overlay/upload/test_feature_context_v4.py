@@ -310,6 +310,46 @@ def test_the_uploader_authored_taxonomy_paths_are_pii_redacted_not_merely_bounde
     assert {s["key"] for s in pii_spans} >= {"columns[0].bian_path", "columns[0].process_path"}
 
 
+def test_domain_is_prose_graded_like_the_taxonomy_paths(db, v4):
+    """`domain` is UPLOADER-TYPED and the chain that types it never redacts: a CSV satisfying
+    `is_glossary_csv` but not `is_glossary_mapping` routes to `read_glossary`
+    (`api/routes/uploads.py`), whose `domain=_cell(fmap, raw, "domain")` (`glossary_reader.py`) has
+    no redaction step at all; `ingest` persists it as SOURCE evidence, `field_resolution` projects
+    it onto `graph_node.domain`, and `for_feature_generation` emits it. At identity grade the ONLY
+    check it met on this seam was `_structural_ok` — a type-and-length test with no redactor.
+
+    Move `domain` back into `_FEATURE_COLUMN_IDENTITY_KEYS` and this fails on the second assertion:
+    the raw address survives into the payload the provider receives.
+
+    What this deliberately does NOT claim: prose grade adds no DETECTION. `redact_free_text`'s
+    `_scan` and `assert_llm_safe`'s `_first_pii` walk the SAME `_PII_PATTERNS`, and no
+    `IntentRedactor` is registered anywhere in `src/`, so both seams run `DefaultIntentRedactor`'s
+    pattern set. A personal NAME here still egresses. What changes is the FAILURE DIRECTION
+    (redact-and-proceed instead of an `EgressViolation` that kills the whole generation call), the
+    AUDIT (a `pii_spans` entry keyed to the nested path, with a version), and the DI seam a
+    registered NER redactor would later plug into."""
+    from featuregen.overlay.upload import enrich_llm
+
+    assert "domain" in enrich_llm._FEATURE_COLUMN_PROSE_KEYS
+    assert "domain" not in enrich_llm._FEATURE_COLUMN_IDENTITY_KEYS
+
+    _bank_graph(db)
+    db.execute("UPDATE graph_node SET domain = %s "
+               "WHERE catalog_source = %s AND lower(object_ref) = %s",
+               ("Payments — escalate to john.smith@example.com", _SRC,
+                "public.payments.tran_amt"))
+    payload = _column(db, "public.payments.tran_amt")
+    assert "john.smith@example.com" in payload["domain"], "the fixture must actually carry PII"
+
+    safe, pii_spans, _samples, version = sanitize_feature_context({"columns": [payload]})
+    assert safe is not None, "prose grade REDACTS; it must not fail the column closed"
+    assert "john.smith@example.com" not in json.dumps(safe)
+    # Redacted, not dropped: the domain label still reaches the generator, minus the PII.
+    assert "Payments" in safe["columns"][0]["domain"]
+    assert version is not None
+    assert {s["key"] for s in pii_spans} >= {"columns[0].domain"}
+
+
 def test_an_axis_longer_than_the_structural_bound_refuses_rather_than_truncates(db, v4):
     """Identity grade is an ACCEPTANCE gate, not a formatter: an over-long path is excluded, never
     silently clipped into a different taxonomy path."""

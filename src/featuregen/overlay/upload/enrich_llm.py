@@ -324,57 +324,70 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
 # descriptor — wiring the query alone would have removed columns from the menu, not enriched them.
 _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semantic_terms"})
 # Identity strings: `catalog_source` is deliberately NOT emitted by the enriched menu (RF-I7
-# handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
+# handoff) and `concept` may be None — absence/None is structural-optional, never a block.
 # `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
 # of structural identity as `concept`.
 #
 # THREE of the five D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here:
 #
-#   * `sub_domain` is `domain`'s finer sibling — the SAME `field_policies._MEANING` policy, the same
-#     short classification label, and MODEL-authored (D13.2), not uploader text. `domain` has
-#     ridden this list since v4 shipped; splitting the pair would be the harder thing to justify.
+#   * `sub_domain` carries the SAME `field_policies._MEANING` policy as `domain` and reads as the
+#     same short classification label — but its ONLY producer is
+#     `enrich._write_sub_domain_evidence`, which admits a value through `accept_label`. It is
+#     MODEL-authored (D13.2), never uploader-typed, so the two-origin argument that moved `domain`
+#     to prose does not reach it. The asymmetry between the pair IS the rule: the grade follows who
+#     TYPED the value, not how the key reads.
 #   * `table_role` / `event_or_snapshot` are platform-derived `_TABLE_ADVISORY` tokens — the same
 #     grade `_TABLE_CONTEXT_IDENTITY_KEYS` gives `data_role`/`primary_entity`, and `table_role` is
 #     already `_STRUCTURAL_META_KEYS` on the enrichment seam.
 #
-# `bian_path` / `process_path` are DELIBERATELY NOT here — see `_FEATURE_COLUMN_PROSE_KEYS`.
+# `domain` / `bian_path` / `process_path` are DELIBERATELY NOT here — see
+# `_FEATURE_COLUMN_PROSE_KEYS`.
 #
 # All three are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
 # column and is audited, never truncated into a different classification token.
-_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain",
+_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept",
                                            "party_role", "sub_domain",
                                            "table_role", "event_or_snapshot"})
 # PROSE grade for the feature menu: PII-redacted via `redact_free_text` (no sample-clause strip and
 # no data-marker gate — that is the DEFINITION grade), then length-bounded like any structural
-# value. This is the grade `_SCALAR_PROSE_META_KEYS` (line ~125) already gives these exact two keys
-# on the ENRICHMENT seam, and the two seams now agree — the principle stated in this file's egress
-# header. Three reasons it is prose and not identity, in the order they were established:
+# value. This is the grade `_SCALAR_PROSE_META_KEYS` (line ~125) already gives these exact three
+# keys on the ENRICHMENT seam (as `data_domain`, `bian_path`, `process_path`), and the two seams now
+# agree — the principle stated in this file's egress header. Three reasons they are prose and not
+# identity, in the order they were established:
 #
 #   1. `redact_free_text`'s own docstring names its subject as "an uploaded glossary's curated
 #      business definitions / synonyms / TAXONOMY PATHS". These are the values it was written for.
-#   2. "They are already redacted at ingest" is NOT true of `bian_path`. It has TWO origins:
+#   2. "They are already redacted at ingest" is NOT true. `bian_path` has TWO origins:
 #      `ftr_adapter` builds it through `_redact` (`ftr_adapter.py:482`), but the generic
 #      `glossary_reader.read_glossary` — a live upload branch via `api/routes/uploads.py:155` —
 #      builds the same `GlossaryRecord` with a bare `_cell(...)` and NO redaction, and
-#      `ingest._write_glossary_source_evidence` persists either one identically. (`process_path` IS
-#      single-origin — only the FTR adapter populates it — but grading the pair apart on that
-#      difference would be a trap for the next reader.)
-#   3. Identity grade applies `_structural_ok` ONLY: a type-and-length check, no redaction. The
-#      remaining net is `assert_llm_safe`, whose `_first_pii` is deterministic regex
-#      (EMAIL/SSN/PAN/IBAN/PHONE/ACCOUNT); `redact_free_text` routes through the `IntentRedactor` DI
-#      seam, whose docstring names personal-NAME detection as the residual a registered NER
-#      redactor closes. At identity grade a name in a `process_path` would egress here while being
-#      scrubbed on the enrichment seam.
+#      `ingest._write_glossary_source_evidence` persists either one identically. `domain` is the
+#      same shape (`glossary_reader.py:242`), and from there it is projected onto
+#      `graph_node.domain` (`field_resolution.py`) and emitted by
+#      `semantic_context.for_feature_generation`. (`process_path` IS single-origin — only the FTR
+#      adapter populates it — but grading the trio apart on that difference would be a trap for the
+#      next reader.)
+#   3. Identity grade applies `_structural_ok` ONLY: a type-and-length check, no redaction and no
+#      audit trail.
 #
-# The FAILURE DIRECTION also improves. At identity grade, PII here sails past `_structural_ok` and
-# then trips `assert_llm_safe`, which raises `EgressViolation` and kills the WHOLE feature-
-# generation call. Prose grade redacts it and the call proceeds.
+# WHAT THE PROSE GRADE ACTUALLY BUYS, stated precisely so nobody reads more into it. It does NOT add
+# detection: `redact_free_text`'s `_scan` and `assert_llm_safe`'s `_first_pii` walk the SAME
+# `_PII_PATTERNS` tuple, and NO `IntentRedactor` is registered anywhere in `src/` (only the
+# `register_intent_redactor` helper exists), so `redact_free_text` falls back to
+# `DefaultIntentRedactor` and the pattern set is identical on both seams. A personal NAME in a
+# `domain` still egresses today, at either grade — closing that needs a registered NER redactor, not
+# this list. What it buys is three concrete things:
 #
-# NOT FIXED HERE, and flagged rather than smuggled: `domain` has the same two-origin story
-# (`glossary_reader.py:242` does not redact it either) and is still identity-grade on this seam. It
-# is a PRE-EXISTING v3/v4 key, not one Task 6 introduced, and re-grading it changes shipped
-# behaviour — it needs its own decision, not a ride-along.
-_FEATURE_COLUMN_PROSE_KEYS = frozenset({"bian_path", "process_path"})
+#   a. FAILURE DIRECTION. At identity grade a detectable PII token sails past `_structural_ok` and
+#      then trips `assert_llm_safe`, which raises `EgressViolation` and kills the WHOLE feature-
+#      generation call. Prose grade scrubs the span and the call proceeds.
+#   b. AUDIT. The scrub is reported as a `pii_spans` entry keyed `columns[N].domain` with a
+#      redaction_version, so `llm_call.input_redaction` records what left and under which version.
+#      Identity grade records nothing.
+#   c. The DI SEAM. When a NER-backed `IntentRedactor` IS registered, prose-graded values route
+#      through it; identity-graded values never would. This is the line that makes (3) closeable
+#      later without touching this list again.
+_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "bian_path", "process_path"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
@@ -530,10 +543,17 @@ def sanitize_feature_context(
         return d.clean
 
     def _prose(text: object, path: str) -> str | None:  # None ⟹ fail closed
-        """PII-only redaction for the uploader-authored taxonomy paths — the `_prose` half of the
-        enrichment seam's grade, applied here. Bounded AFTER redaction, like the enrichment seam's
-        own length gate, so the cap applies to what would actually egress rather than to what
-        arrived."""
+        """PII-only redaction for the uploader-authored short labels — the taxonomy paths and the
+        business `domain`. The `_prose` half of the enrichment seam's grade, applied here. Bounded
+        AFTER redaction, like the enrichment seam's own length gate, so the cap applies to what
+        would actually egress rather than to what arrived.
+
+        Redaction is NOT length-preserving in the shrinking direction: `DefaultIntentRedactor`
+        substitutes a `[REDACTED:LABEL]` placeholder, which is LONGER than several of the tokens it
+        replaces (a 6-char email becomes 16 chars). So a near-budget value carrying PII can cross
+        `_FEATURE_STRUCTURAL_MAX_LEN` after scrubbing and be refused where an un-scrubbed one of the
+        same length was admitted. That is the fail-closed direction and it is deliberate — bounding
+        BEFORE redaction would bound a string that is not the one egressing."""
         nonlocal version
         if not isinstance(text, str):
             return None
@@ -544,7 +564,7 @@ def sanitize_feature_context(
         pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
         return res.text
 
-    def _structural_ok(v: object) -> bool:  # identity strings may be None (concept/domain nullable)
+    def _structural_ok(v: object) -> bool:  # identity strings may be None (`concept` is nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
 
     new_columns = columns
