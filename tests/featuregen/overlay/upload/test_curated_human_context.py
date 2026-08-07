@@ -328,6 +328,29 @@ def test_a_narrative_scrubbed_empty_leaves_no_key_behind():
     assert "catalog_business_domains" not in safe["table_context"][0]
 
 
+def test_a_dropped_value_is_never_handed_back_by_the_structural_passthrough():
+    """The hole under the drop mechanism. Both seams short-circuit to the ORIGINAL payload when no
+    free text was scanned (`version is None`) — and a value the scrubber refuses WITHOUT running a
+    scrubber body (a non-`str` under a free-text key) leaves `version` None while the key has
+    already been dropped. The passthrough then returns the untouched original, egressing the exact
+    value the warning line said was removed.
+
+    Not reachable from `catalog_narrative_block`, which emits validated `str`/`list[str]` — but
+    "never silent" is the contract this whole mechanism rests on, and a log line that asserts
+    something false is worse than no log line."""
+    safe, _spans, _audits, _v = sanitize_feature_context(
+        {"columns": [{"object_ref": "x"}],
+         "table_context": [{"table": "t", "catalog_display_name": 12345}]})
+    assert safe is not None
+    assert "catalog_display_name" not in safe["table_context"][0], "the drop was undone"
+
+    meta, _s, _a, _v2 = enrich_llm._redact_free_text_meta(
+        {"table": "t", "catalog_display_name": 12345})
+    assert meta is not None
+    assert "catalog_display_name" not in meta, "the drop was undone"
+    assert meta["table"] == "t"
+
+
 def test_the_pass_b_item_carries_the_narrative_past_its_own_egress_gate():
     """Pass B decides grain, table_role, primary_entity and event_or_snapshot from columns and
     profiles alone — and grain is the most expensive thing in this pipeline to get wrong. The
@@ -429,18 +452,83 @@ def test_a_pass_b_suggestion_can_rest_on_the_narrative_and_say_so():
     dishonestly."""
     from featuregen.overlay.upload.table_synth import _cited_refs, make_ref_accept
 
+    carried = frozenset({"catalog_business_context"})
     synthesis = {
         "business_context": "The book of record for outbound SWIFT and RTGS payments.",
         "evidence_refs": [{"field": "business_context", "refs": ["catalog_business_context"]}]}
-    assert _cited_refs(synthesis, "business_context", cols={"pmt_id"}) == [
-        "catalog_business_context"]
+    assert _cited_refs(synthesis, "business_context", cols={"pmt_id"},
+                       narrative_refs=carried) == ["catalog_business_context"]
+
+    dispositions: list[dict] = []
+    accept = make_ref_accept({"payments": {"pmt_id"}}, dispositions=dispositions,
+                             inventory_by_table={"payments": []},
+                             narrative_refs_by_table={"payments": carried})
+    accept(json.dumps(synthesis), "payments")     # (raw, ref) — raw first
+    got = {d["field"]: (d["status"], d["reason"]) for d in dispositions}
+    assert got["business_context"] == ("accepted", None), got
+
+
+def test_a_narrative_ref_cannot_be_cited_when_no_item_carries_one():
+    """THE FORGERY SURFACE, and it is the DEFAULT deployment. `FEATUREGEN_DATASET_PROFILES` is off
+    by default, so no Pass-B item carries any narrative key — and an unconditional allowlist would
+    let a model clear the `no_evidence_ref` gate by naming prose that does not exist. That is the
+    "cite anything to get accepted" behaviour widening these refs was supposed to make unnecessary,
+    and it would have widened the forgeable set from one ref to six."""
+    from featuregen.overlay.upload.table_synth import _cited_refs, make_ref_accept
+
+    synthesis = {
+        "business_context": "Invented.",
+        "evidence_refs": [{"field": "business_context", "refs": ["catalog_description"]}]}
+    assert _cited_refs(synthesis, "business_context", cols={"pmt_id"}) == []
 
     dispositions: list[dict] = []
     accept = make_ref_accept({"payments": {"pmt_id"}}, dispositions=dispositions,
                              inventory_by_table={"payments": []})
-    accept(json.dumps(synthesis), "payments")     # (raw, ref) — raw first
+    accept(json.dumps(synthesis), "payments")
     got = {d["field"]: (d["status"], d["reason"]) for d in dispositions}
-    assert got["business_context"] == ("accepted", None), got
+    assert got["business_context"] == ("dropped_invalid", "no_evidence_ref"), got
+
+
+def test_only_the_narrative_keys_the_item_actually_carries_are_citable():
+    """Per ITEM, not per deployment. A catalog that authored a description but no business context
+    makes the first citable and the second not — the allowlist is the item's own contents."""
+    from featuregen.overlay.upload.table_synth import _cited_refs, narrative_refs_of
+
+    carried = narrative_refs_of({"table": "payments", "column_profiles": [],
+                                 "catalog_description": _DESCRIPTION})
+    assert carried == frozenset({"catalog_description"})
+    synthesis = {"evidence_refs": [{"field": "business_context",
+                                    "refs": ["catalog_description", "catalog_business_context"]}]}
+    assert _cited_refs(synthesis, "business_context", cols=set(),
+                       narrative_refs=carried) == ["catalog_description"]
+
+
+def test_the_synthesis_run_derives_the_citable_set_from_the_items_it_dispatched():
+    """WHAT CONSUMES THIS. The gate is only real if `_run_synthesis` builds the map from the SAME
+    items it sends — a version that took the parameter but never threaded it would leave the
+    forgery surface open while every test above passed."""
+    from featuregen.overlay.upload import table_synth
+    from featuregen.overlay.upload.enrich_batch import BatchItem
+
+    seen: dict = {}
+    monkeypatch_target = table_synth.make_ref_accept
+
+    def _capture(*args, **kwargs):
+        seen.update(kwargs.get("narrative_refs_by_table") or {})
+        return monkeypatch_target(*args, **kwargs)
+
+    table_synth.make_ref_accept = _capture
+    try:
+        table_synth._run_synthesis(
+            None, None,
+            [BatchItem(ref="payments", metadata={"table": "payments",
+                                                 "catalog_description": _DESCRIPTION}),
+             BatchItem(ref="other", metadata={"table": "other"})],
+            columns_by_table={}, actor=None, instruction="x")
+    except Exception:  # noqa: BLE001 — the dispatch fails on a None conn; the capture already ran
+        pass
+    table_synth.make_ref_accept = monkeypatch_target
+    assert seen == {"payments": frozenset({"catalog_description"}), "other": frozenset()}
 
 
 def test_a_hallucinated_narrative_key_is_still_dropped():
@@ -450,7 +538,8 @@ def test_a_hallucinated_narrative_key_is_still_dropped():
 
     synthesis = {"evidence_refs": [
         {"field": "business_context", "refs": ["catalog_mission_statement", "catalog_description"]}]}
-    assert _cited_refs(synthesis, "business_context", cols=set()) == ["catalog_description"]
+    assert _cited_refs(synthesis, "business_context", cols=set(),
+                       narrative_refs=frozenset({"catalog_description"})) == ["catalog_description"]
 
 
 def test_the_pass_b_prompt_says_what_the_narrative_is_and_that_it_is_citable():

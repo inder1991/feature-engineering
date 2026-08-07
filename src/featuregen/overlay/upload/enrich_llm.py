@@ -300,6 +300,7 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     pii_spans: list[dict] = []
     sample_audits: list[dict] = []
     version: str | None = None
+    dropped = False
 
     # D10: fail CLOSED on any top-level key with NO declared classification — the intersection loop
     # below only visits the free-text keys, so an unclassified key would otherwise egress unscanned
@@ -345,6 +346,17 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
         # spans already appended by the scrubber are kept: the record must say what was removed.
         droppable = key in _ADVISORY_CONTEXT_KEYS
         val = out[key]
+        if droppable and not isinstance(val, (str, list)):
+            # UNSCANNABLE. Neither branch below can run on it, so leaving it in place would egress
+            # advisory free text that NO scrubber ever looked at — the batch path is protected by
+            # `_item_shape_ok`, the single-call path is not. Dropping is the fail-closed direction
+            # and costs only context. (Deliberately scoped to the advisory keys: the same shape
+            # under an ordinary free-text key is pre-existing behaviour this task does not own.)
+            logger.warning("advisory context %r is not scannable free text (%s) — DROPPED from the "
+                           "item", key, type(val).__name__)
+            del out[key]
+            dropped = True
+            continue
         if isinstance(val, str):
             redacted = scrub(val, key)
             if redacted is None:
@@ -353,6 +365,7 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
                 logger.warning("advisory context %r failed its egress scan — DROPPED from the item "
                                "(the item still egresses)", key)
                 del out[key]
+                dropped = True
                 continue
             out[key] = redacted
         elif isinstance(val, list):
@@ -364,11 +377,13 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
                         return None, pii_spans, sample_audits, version
                     logger.warning("advisory context %r[%d] failed its egress scan — that ITEM "
                                    "dropped", key, i)
+                    dropped = True
                     continue
                 new_list.append(nv)
             # An advisory list scrubbed empty carries nothing; a fabricated `[]` is not context.
             if droppable and not new_list:
                 del out[key]
+                dropped = True
                 continue
             out[key] = new_list
     profiles = out.get("column_profiles")
@@ -383,7 +398,12 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
                 desc = {**desc, "business_definition": nv}
             new_profiles.append(desc)
         out["column_profiles"] = new_profiles
-    if version is None:
+    # `dropped` guards the passthrough (review round 2). A value the scrubber REFUSED without ever
+    # setting `version` — a non-`str` under a free-text key, so no scrubber body ran — would
+    # otherwise be handed back inside the ORIGINAL `metadata`, egressing the exact value the log
+    # line above says was dropped. "Never silent" is the contract this drop mechanism rests on; a
+    # warning that is not true is worse than no warning.
+    if version is None and not dropped:
         return metadata, [], [], None                      # no free-text — metadata untouched
     return out, pii_spans, sample_audits, version
 
@@ -657,6 +677,7 @@ def sanitize_feature_context(
     pii_spans: list[dict] = []
     sample_audits: list[dict] = []
     version: str | None = None
+    dropped = False
 
     def _defn(text: object, path: str) -> str | None:  # None ⟹ fail closed
         nonlocal version
@@ -711,15 +732,17 @@ def sanitize_feature_context(
             if clean is None:
                 if not droppable:
                     return None
-                logger.warning("advisory context %s[%d] failed its egress scan — item dropped",
-                               path, i)
+                _drop_advisory(f"{path}[{i}]")
                 continue
             cleaned.append(clean)
         return cleaned
 
-    def _drop_advisory(key: str, path: str) -> None:
+    def _drop_advisory(path: str) -> None:
         """Record an advisory-context value removed by its own scan. Never silent: the
-        `sample_audits` entry the scrubber already appended says WHAT was removed and why."""
+        `sample_audits` entry the scrubber already appended says WHAT was removed and why, and
+        `dropped` keeps the structural-passthrough below from handing the original back."""
+        nonlocal dropped
+        dropped = True
         logger.warning("advisory context %s failed its egress scan — DROPPED from the block (the "
                        "payload still egresses)", path)
 
@@ -803,7 +826,7 @@ def sanitize_feature_context(
                     if clean is None:
                         if k not in _ADVISORY_CONTEXT_KEYS:
                             return None, pii_spans, sample_audits, version
-                        _drop_advisory(k, path)
+                        _drop_advisory(path)
                         continue
                     out[k] = clean
                 elif k in _TABLE_CONTEXT_PROSE_KEYS:
@@ -814,7 +837,7 @@ def sanitize_feature_context(
                     if clean is None:
                         if k not in _ADVISORY_CONTEXT_KEYS:
                             return None, pii_spans, sample_audits, version
-                        _drop_advisory(k, path)
+                        _drop_advisory(path)
                         continue
                     out[k] = clean
                 elif k in _TABLE_CONTEXT_PROSE_LIST_KEYS:
@@ -824,7 +847,7 @@ def sanitize_feature_context(
                         return None, pii_spans, sample_audits, version
                     if advisory and not cleaned:
                         # Scrubbed empty — a fabricated `[]` is not context, so drop the key.
-                        _drop_advisory(k, path)
+                        _drop_advisory(path)
                         continue
                     out[k] = cleaned
                 elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
@@ -843,7 +866,10 @@ def sanitize_feature_context(
             rebuilt_ctx.append(out)
         new_ctx = rebuilt_ctx
 
-    if version is None:
+    # `dropped` guards the passthrough (review round 2): a refused value that never ran a scrubber
+    # body — a non-`str` under a prose/definition key — leaves `version` None, and returning the
+    # ORIGINAL `metadata` would egress the very value the log line said was dropped.
+    if version is None and not dropped:
         return metadata, [], [], None            # structural passthrough only — untouched
     safe = dict(metadata)
     safe["columns"] = new_columns

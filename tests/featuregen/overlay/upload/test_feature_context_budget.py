@@ -319,9 +319,11 @@ def test_measured_cost_of_the_catalog_narrative(wide_catalogs, record_property):
       * the LARGEST a human can author            +29_788 bytes total (~14_894 / table)
 
     THE WORST CASE IS THE REAL ONE. Every bound is read from `catalog_profiles`
-    (200 + 4_000 + 4_000 + 32x200 = 12_600 characters of authored text), because the first version
-    of this test wrote `32 x 200` in its comment and then built `f"domain-{i}"` — 32 strings of ~9
-    characters. It pinned 17_544 and called it the maximum; the maximum is 29_788, ~70% higher.
+    (200 + 4_000 + 4_000 + 32x200 = 14_600 characters of authored text, which is what the measured
+    ~14_894 bytes/table reconciles against), because the first version of this test wrote `32 x 200`
+    in its comment and then built `f"domain-{i}"` — 32 strings of ~9 characters. It pinned 17_544
+    and called it the maximum; the maximum is 29_788, ~70% higher. The corrected note then got the
+    SUM wrong (12_600) on the way past, which is why the figure is now tied to the measurement.
 
     So the honest numbers: the worst case is ~11% of the measured v4 payload and ~2% of the budget.
     It does NOT scale with catalog width — a 1_000-column catalog pays the same per table — and
@@ -370,6 +372,10 @@ def test_measured_cost_of_the_catalog_narrative(wide_catalogs, record_property):
     worst, real = _delta(biggest), _delta(realistic)
     record_property("narrative_worst_case_bytes", worst)
     record_property("narrative_realistic_bytes", real)
+    # The authored-character sum in the docstring, CHECKED rather than typed — two successive
+    # revisions of this test got a hand-arithmetic figure wrong, so the number now has to hold.
+    assert MAX_DISPLAY_NAME + MAX_DESCRIPTION + MAX_BUSINESS_CONTEXT + MAX_DOMAINS * MAX_DOMAIN_LEN \
+        == 14_600
     assert len(base) == 2, "the per-TABLE claim above is measured against 2 tables"
     assert 700 < real < 1_200, f"realistic narrative cost moved: {real}"
     assert 28_000 < worst < 32_000, f"worst-case narrative cost moved: {worst}"

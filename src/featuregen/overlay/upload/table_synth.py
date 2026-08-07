@@ -278,16 +278,37 @@ _MAX_PROFILE_PROSE = 600
 #: (Grain, as-of, `primary_entity`, `table_role` and `event_or_snapshot` were never ref-gated — they
 #: are validated against column membership — so the narrative could already influence them. That is
 #: the brief's #1 leverage point and it worked from the first commit; this widens the rest.)
-_NON_COLUMN_CITATION_REFS: frozenset[str] = frozenset({"table_definition", *CATALOG_NARRATIVE_KEYS})
+#:
+#: CITABLE ONLY WHERE THE ITEM CARRIES THEM (review round 2). The first version of this admitted all
+#: five UNCONDITIONALLY, which is a forgery surface rather than a capability: `FEATUREGEN_DATASET_
+#: PROFILES` is OFF BY DEFAULT, so in the default deployment NO item carries a narrative key at all —
+#: yet a model emitting `{"field": "business_context", "refs": ["catalog_description"]}` would clear
+#: the `no_evidence_ref` gate and land its prose accepted, citing something that does not exist.
+#: That is exactly the "cite anything to get accepted" behaviour the gate exists to prevent, and it
+#: is the behaviour widening these refs was supposed to make UNNECESSARY. The presence signal is
+#: threaded per table from the items themselves (`_run_synthesis`), so the rule is now what the
+#: sentence above always claimed: the refs an item ACTUALLY carries.
+_NARRATIVE_CITATION_REFS: frozenset[str] = frozenset(CATALOG_NARRATIVE_KEYS)
 _TABLE_DEFINITION_REF = "table_definition"
 
 
-def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
+def narrative_refs_of(metadata: Mapping) -> frozenset[str]:
+    """The catalog-narrative keys ONE Pass-B item actually carries — the citable set for that table.
+    Empty for every item without a narrative, which is every item in a default deployment."""
+    return frozenset(k for k in metadata if k in _NARRATIVE_CITATION_REFS)
+
+
+def _cited_refs(synthesis: dict, field: str, *, cols: set[str],
+                narrative_refs: frozenset[str] = frozenset()) -> list[str]:
     """The refs this suggestion cites, filtered to the BOUNDED TABLE CONTEXT it was given: a real
-    column of THIS table, the literal ``table_definition``, or one of the catalog-narrative keys the
-    item carries. A hallucinated ref is dropped rather than trusted, so "names existing evidence
-    refs" is enforced, never assumed."""
-    allowed = {c.lower() for c in cols} | _NON_COLUMN_CITATION_REFS
+    column of THIS table, the literal ``table_definition``, or a catalog-narrative key THIS ITEM
+    CARRIES. A hallucinated ref is dropped rather than trusted, so "names existing evidence refs" is
+    enforced, never assumed.
+
+    ``narrative_refs`` defaults to EMPTY, which is the fail-closed direction: a caller that has not
+    said which narrative the item carries has not established that any exists, so none is citable.
+    """
+    allowed = {c.lower() for c in cols} | {_TABLE_DEFINITION_REF} | narrative_refs
     out: list[str] = []
     for entry in synthesis.get("evidence_refs") or []:
         if not isinstance(entry, dict) or str(entry.get("field") or "").strip() != field:
@@ -302,7 +323,7 @@ def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
 
 def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
                            contradictions: dict[str, str], put, source_definition: str | None,
-                           critic) -> dict:
+                           critic, narrative_refs: frozenset[str] = frozenset()) -> dict:
     """Validate the four profile suggestions, appending one disposition each (TOTAL over
     :data:`PROFILE_DISPOSITION_FIELDS`). Returns the accepted values, keyed by field.
 
@@ -333,7 +354,7 @@ def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
             put(ref, field, "abstained")
             return
         value = raw.strip()[:_MAX_PROFILE_PROSE]
-        refs = _cited_refs(synthesis, field, cols=cols)
+        refs = _cited_refs(synthesis, field, cols=cols, narrative_refs=narrative_refs)
         if not refs:
             put(ref, field, "dropped_invalid", "no_evidence_ref")
             return
@@ -358,7 +379,7 @@ def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
         if value is None:
             put(ref, field, "dropped_invalid", f"{field}_off_vocab")
             return
-        refs = _cited_refs(synthesis, field, cols=cols)
+        refs = _cited_refs(synthesis, field, cols=cols, narrative_refs=narrative_refs)
         if not refs:
             put(ref, field, "dropped_invalid", "no_evidence_ref")
             return
@@ -392,6 +413,7 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
                     source_context_by_table: dict[str, bool] | None = None,
                     source_definition_by_table: dict[str, str] | None = None,
                     catalog_context_available: bool = False,
+                    narrative_refs_by_table: dict[str, frozenset[str]] | None = None,
                     critic=None):
     """A ref-aware accept for `validate_batch_results(..., ref_aware=True)`. `ref` is the table name;
     validate the serialized `synthesis` against THAT table's real columns and map a valid result onto
@@ -524,6 +546,7 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
         profile = _accept_profile_fields(
             s, ref, cols=cols, contradictions=contradictions, put=_put,
             source_definition=(source_definition_by_table or {}).get(ref),
+            narrative_refs=(narrative_refs_by_table or {}).get(ref) or frozenset(),
             critic=critic)
 
         # A parseable synthesis with neither grain nor availability is a VALID ABSTENTION (some tables
@@ -837,6 +860,10 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                           or it.metadata.get("column_roster") or []) for it in items}
     source_definitions = {it.ref: it.metadata.get("table_definition") for it in items
                           if it.metadata.get("table_definition")}
+    # Review round 2: WHICH narrative keys each item actually carries, so a citation can only name
+    # context that reached the model. Built from the items themselves — the same place `inventory`
+    # and `source_definitions` come from — so it cannot disagree with what egressed.
+    narrative_refs = {it.ref: narrative_refs_of(it.metadata) for it in items}
     # ONE ledger for this synthesis run, shared by the batching ladder AND the critic it fires from
     # inside `accept`: a critique is a physical provider call, so it spends the SAME ceiling the
     # chunks spend (the finding — critic calls were invisible to `max_provider_calls`). The ledger
@@ -848,7 +875,8 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         columns_by_table, dispositions=dispositions, inventory_by_table=inventory,
         source_definition_by_table=source_definitions,
         source_context_by_table={ref: True for ref in source_definitions},
-        catalog_context_available=catalog_context_available, critic=budgeted_critic)
+        catalog_context_available=catalog_context_available,
+        narrative_refs_by_table=narrative_refs, critic=budgeted_critic)
     batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
