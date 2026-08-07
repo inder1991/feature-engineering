@@ -2502,10 +2502,30 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
     return result
 
 
-_SYN_INSTRUCTION = ("List the business SYNONYMS and common aliases for EACH column — the other names "
-                    "a business user would search for it by. Return ONE comma-separated line per "
-                    "item, terms only, no explanation. Treat each item independently: use only that "
-                    "item's table/column/type/concept; return exactly one result per input ref.")
+# Synonyms are the ONLY semantic handle an UNCLASSIFIED column has: with no concept it cannot be
+# found by meaning, so its aliases are the entire basis on which anyone can search for it. The prior
+# wording undermined that twice — it asked for no COUNT (the model returned whatever it felt like,
+# typically three or four) and it told the model to "use only that item's table/column/type/concept",
+# which FORBADE the business definition, the single richest source of aliases in the payload.
+#
+# The definition is already IN the item (`_drafting_payload` -> `for_summary`, restored by
+# `_definition_egress_guard` for a curated column): this instruction stops refusing the model
+# permission to read what it is being shown. On a TECHNICAL column the guard withholds it (M4) and
+# the model simply has one fewer source — the instruction names it, it does not require it.
+#
+# "ONE comma-separated LINE" is LOAD-BEARING, not style: the consumer `ingest._project_semantic_terms`
+# splits on COMMAS only, so a newline-separated answer projects as ONE term with the whole blob as
+# its dedupe key. The `_accept_single_line` gate below refuses that shape, and an instruction must
+# never ask for output the gate discards — so asking for MORE terms must never become asking for a
+# term per line.
+_SYN_INSTRUCTION = (
+    "List the business SYNONYMS and common aliases for EACH column — the other names a business "
+    "user would search for it by. Give 15 to 20 terms where the evidence supports them; give fewer "
+    "only when the column is genuinely narrow. Use the item's table, column name, type, concept AND "
+    "its business definition — the definition is usually the richest source of aliases, so read it. "
+    "If the concept is the literal value 'unclassified', ignore it: it is the absence of a "
+    "classification, not a hint. Return ONE comma-separated line per item, terms only, no "
+    "explanation. Treat each item independently; return exactly one result per input ref.")
 
 
 def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
