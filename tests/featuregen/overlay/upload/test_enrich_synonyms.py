@@ -18,10 +18,16 @@ What this file pins, and why each is a REVERT-CATCHER rather than a restatement:
     instruction widened which stage READS the definition, not which columns may send one;
   * 20 terms fit inside `_MAX_SYNONYMS_LEN`, inside the `_MAX_META_LEN` window that SILENTLY
     TRUNCATES them into the same run's summary payload, and inside the per-value egress cap they
-    meet again on the NEXT run as `semantic_terms`.
+    meet again on the NEXT run as `semantic_terms`;
+  * a run that drafted every column and STORED NOTHING no longer reports a clean `succeeded` — the
+    review follow-up. A column with no glossary record is a designed SKIP, not a failure, so the
+    failure count stayed 0 and the stage looked identical to one that stored everything.
 """
 from __future__ import annotations
 
+import re
+
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload import enrich
 from featuregen.overlay.upload import enrich_llm as llm
@@ -29,11 +35,14 @@ from featuregen.overlay.upload import semantic_context as sc
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import UNCLASSIFIED
 from featuregen.overlay.upload.enrich import _SYN_INSTRUCTION, content_hash, draft_synonyms
-from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+from featuregen.overlay.upload.ingest import _enrichment_outcome
 
 _SOURCE = "ftr"
 _TABLE = "comp_fin_tran"
 _SCHEMA = "dpl_core"
+_ACTOR = IdentityEnvelope(subject="user:uploader", actor_kind="human", authenticated=True,
+                          auth_method="oidc", role_claims=("data_owner",))
 
 #: A real bank alias set for `create_user_nm` at the count the instruction now asks for. Used to
 #: measure the bound against realistic text rather than against padding.
@@ -86,7 +95,9 @@ def _technical_bundle(row: CanonicalRow) -> sc.SemanticContextBundleV1:
 
 
 def test_the_synonym_instruction_asks_for_a_count_and_permits_the_definition() -> None:
-    assert "15" in _SYN_INSTRUCTION and "20" in _SYN_INSTRUCTION
+    """The bare `"15" in ...` / `"20" in ...` this started as passed on "Give 1520 terms" — a
+    substring check cannot tell a RANGE from a typo. Matched as a range of two whole numbers."""
+    assert re.search(r"\b15\b.{0,12}\b20\b", _SYN_INSTRUCTION), _SYN_INSTRUCTION
     assert "use only that item's table/column/type/concept" not in _SYN_INSTRUCTION
     assert "definition" in _SYN_INSTRUCTION.lower()
 
@@ -205,6 +216,124 @@ def test_the_MERGED_projection_still_fits_egress_after_twenty_terms_are_added() 
     # …and the raw accept bound itself does not sit ABOVE the egress cap, which would let a
     # near-maximal answer alone push the merge over on a column with any glossary text at all.
     assert enrich._MAX_SYNONYMS_LEN <= llm._max_len_for("semantic_terms")
+
+
+# ── the stage may not claim a success it did not have ───────────────────────────────────────────
+
+
+def test_a_column_with_no_glossary_record_is_COUNTED_as_skipped_not_silently_dropped(db) -> None:
+    """`_write_synonym_evidence`'s `ref_of` returns None for a column with no glossary record — "no
+    schema-preserving identity to key evidence on". That is a designed SKIP, so it is deliberately
+    not a failure, and the writer's return value (the failure count) stays 0.
+
+    Which is exactly how a run that stored nothing used to look identical to one that stored
+    everything. `_write_llm_field_evidence` has always accepted a `counts` out-param that increments
+    `skipped` on a None ref; this writer never passed it, so the count was not merely unreported —
+    it was never COMPUTED. It is passed now.
+    """
+    # TRANSACTION FIRST, deliberately. psycopg3's `conn.transaction()` COMMITS when it is the
+    # OUTERMOST block, and the writer opens one per item — so calling it as this test's first DB
+    # operation commits real `field_evidence` rows that survive the fixture's teardown rollback and
+    # leak into every later test in the session (`test_pass_a_evidence` asserts a GLOBAL
+    # `count(*) WHERE producer = 'llm'` of zero, and fails). One statement here puts the connection
+    # in a transaction, so the writer's blocks are SAVEPOINTS and the rollback reaches them. The
+    # sibling writer tests get this incidentally by calling `build_graph` first; stating it is the
+    # difference between a hermetic test and one that happens to run early.
+    db.execute("SELECT 1")
+
+    curated = _row("create_user_nm", type_="varchar(100)")
+    orphan = _row("no_sidecar_col", type_="varchar(100)")     # in the file, absent from the glossary
+    glossary = GlossaryUpload(rows=[curated], records=[_record("create_user_nm")])
+
+    counts: dict[str, int] = {}
+    failures = enrich._write_synonym_evidence(
+        db, source=_SOURCE, rows=[curated, orphan],
+        synonyms={content_hash(curated): _TWENTY_REAL_TERMS,
+                  content_hash(orphan): _TWENTY_REAL_TERMS},
+        glossary=glossary, bindings=None, source_snapshot_id="snap", counts=counts)
+
+    assert failures == 0                      # a skip is NOT a failure — that is the whole trap
+    assert counts.get("skipped") == 1         # …and it is now visible instead of inferred from zero
+    assert counts.get("written") == 1         # non-vacuous: the curated sibling really did store
+
+
+def test_drafted_everything_stored_nothing_is_PARTIAL_never_a_clean_succeeded() -> None:
+    """The outcome the count exists to correct.
+
+    A glossary-less upload drafts synonyms for every column (`draft_synonyms` is gated only on
+    `client`) and stores NONE of them: the writer is gated on `glossary is not None and snapshot_id
+    is not None`, `_project_semantic_terms` is unreachable (its only call sites are inside
+    `_ingest_glossary_evidence`), and the same-run summary ride-along does not run either
+    (`enrich_summary` is `not_applicable` when `glossary is None`). So the drafted terms have ZERO
+    consumers on that path.
+
+    Every item still RESOLVED, so `resolved == expected`, `unresolved == 0` and `internal_failures
+    == 0` — the exact shape that returned `succeeded`. It reports `partial` now.
+    """
+    resolved = {"h1": "a, b", "h2": "c, d", "h3": "e, f"}
+    state, reason, detail = _enrichment_outcome(resolved, 3, evidence_skipped=3)
+    assert state == "partial"
+    assert reason == "evidence_not_stored"
+    assert detail["evidence_skipped"] == 3
+    assert detail["resolved"] == 3 and "unresolved" not in detail    # nothing failed; nothing landed
+    # The pre-fix behaviour, stated as the thing this must never return again.
+    assert _enrichment_outcome(resolved, 3)[0] == "succeeded"
+
+
+def test_a_GLOSSARY_LESS_ingest_reports_partial_not_succeeded_end_to_end(db) -> None:
+    """The wiring, not just the two halves. This is the run the reviewer found: a TECHNICAL upload
+    with a client drafts synonyms for every column and persists none of them, because
+    `_write_synonym_evidence` is never CALLED (gated on `glossary is not None and snapshot_id is not
+    None`) rather than called-and-skipping. So the writer's `counts` stay empty and the branch that
+    counts the whole draft as skipped is in `ingest_upload` itself — untested by the two unit tests
+    above, and the thing most likely to be wrong.
+    """
+    from datetime import timedelta
+
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.stage_report import StageRecorder
+
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+    rows = [CanonicalRow("tech_csv", "comp_fin_tran", "create_user_nm", "varchar"),
+            CanonicalRow("tech_csv", "comp_fin_tran", "txn_amt", "numeric")]
+    results = [{"ref": content_hash(r), "synonyms": _TWENTY_REAL_TERMS} for r in rows]
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"results": []}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": []}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": results}),
+    })
+    rec = StageRecorder()
+    res = ingest_upload(db, "tech_csv", rows, actor=_ACTOR, client=client, stage_recorder=rec)
+    assert res.status == "ingested", (res.status, res.reason, res.flagged)
+
+    report = next(r for r in rec.reports if r.stage == "enrich_synonyms")
+    assert report.detail["resolved"] == 2            # every column really was drafted…
+    assert report.detail["evidence_skipped"] == 2    # …and every one of them stored nowhere
+    assert report.state == "partial"                 # NOT the clean `succeeded` this used to be
+    assert report.reason_code == "evidence_not_stored"
+    # The money actually was spent: this is a labelling fix, not a claim that nothing happened.
+    assert report.detail["expected"] == 2
+
+
+def test_a_skip_is_ranked_below_a_real_failure_and_below_truncation() -> None:
+    """A designed non-write must never be laundered into `items_failed` — the same lie `truncated`
+    was introduced to stop — and must never MASK a louder one. Precedence: a dispatched failure
+    outranks truncation, which outranks a skip; the counts all still ride the detail."""
+    _s, reason, detail = _enrichment_outcome({"h1": "a"}, 2, evidence_skipped=1)
+    assert reason == "items_failed" and detail["evidence_skipped"] == 1     # real failure wins
+    _s, reason, detail = _enrichment_outcome({"h1": "a"}, 2, not_attempted=1, evidence_skipped=1)
+    assert reason == "truncated" and detail["evidence_skipped"] == 1        # truncation outranks it
+    # A stage that stored everything is unchanged, byte-for-byte — no key, no state change.
+    state, reason, detail = _enrichment_outcome({"h1": "a"}, 1)
+    assert (state, reason) == ("succeeded", None) and "evidence_skipped" not in detail
+    # Clamped: a writer cannot decline more items than the stage resolved.
+    assert _enrichment_outcome({"h1": "a"}, 1, evidence_skipped=9)[2]["evidence_skipped"] == 1
 
 
 def test_the_SAME_RUN_ride_along_to_the_summary_stage_neither_truncates_nor_excludes() -> None:

@@ -1482,10 +1482,19 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
 def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             synonyms: dict[str, str], glossary: GlossaryUpload,
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> int:
+                            source_snapshot_id: str,
+                            counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted synonyms (E1a T4) as FIRST-CLASS ``llm/proposed`` ``semantic_terms``
     ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller MUST propagate
     into its stage report (``partial``/``items_failed``).
+
+    ``counts`` (optional out-param) receives the writer's per-item dispositions
+    (:data:`EVIDENCE_WRITE_DISPOSITIONS`). It is not optional in PRACTICE for the ingest caller, and
+    the reason is `skipped`: ``ref_of`` returns ``None`` for every column WITHOUT a glossary record,
+    so those items are drafted at full LLM cost and stored nowhere. Skips are deliberately NOT
+    failures, so a caller reading only the failure count sees zero and reports a clean ``succeeded``
+    for a run that persisted nothing. Passing ``counts`` is how that stops being invisible — the
+    count was previously not merely unreported but never COMPUTED.
 
     NOT search-only and NOT human-confirmed: an AI synonym may be the ONLY semantic signal that
     selects a column — it needs no corroboration and passes no new gate. What makes that safe is that
@@ -1523,7 +1532,7 @@ def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="semantic_terms", items=synonyms, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every glossary column still in this upload (written this run OR transient-missed);
     # computed through the SAME `ref_of` the write used, so a fresh row is never handed to retirement.

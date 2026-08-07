@@ -285,7 +285,8 @@ class IngestResult:
 
 
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
-                        not_attempted: int = 0) -> tuple[str, str | None, dict]:
+                        not_attempted: int = 0,
+                        evidence_skipped: int = 0) -> tuple[str, str | None, dict]:
     """``(state, reason_code, detail)`` for a per-item stage (#22) — the honest account. ``None``
     (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING (and
     nothing merely truncated) is ``failed``; SOME items unresolved — or the stage caught per-item
@@ -302,7 +303,18 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     When unresolved is (partly) truncation, its count rides in ``detail["not_attempted"]`` and — if
     there is no GENUINE dispatched failure — the reason_code is the distinct, honest ``truncated``.
     ``items_failed`` stays reserved for items actually dispatched and rejected/failed (a run with
-    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``)."""
+    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``).
+
+    ``evidence_skipped`` (from an evidence writer's ``counts`` out-param) is the third way a stage
+    can resolve every item and still leave nothing behind: the items were drafted, and the WRITER
+    declined to store them by design — for ``enrich_synonyms``, every column without a glossary
+    record, because there is no schema-preserving ref to key evidence on. Like ``not_attempted``
+    this is NOT a failure and must not be laundered into ``items_failed``; unlike it, the items were
+    both dispatched AND resolved, so it cannot be inferred from ``unresolved`` either — a stage that
+    drafted all 126 columns and stored 0 has ``resolved == expected`` and zero failures, which is
+    exactly the shape that used to return a clean ``succeeded``. It reports ``partial`` /
+    ``evidence_not_stored`` instead. Ranked LAST of the three: a real failure outranks truncation,
+    which outranks a designed non-write."""
     if result is None:
         return "failed", "exception", {"expected": expected}
     detail: dict = {"resolved": len(result), "expected": expected}
@@ -321,6 +333,10 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     not_attempted = min(max(not_attempted, 0), unresolved)
     if not_attempted:
         detail["not_attempted"] = not_attempted
+    # Clamped to what was actually resolved: a writer cannot decline more items than the stage drafted.
+    evidence_skipped = min(max(evidence_skipped, 0), len(result))
+    if evidence_skipped:
+        detail["evidence_skipped"] = evidence_skipped
     dispatched_failures = unresolved - not_attempted   # unresolved items that WERE tried
     if expected and not result and not not_attempted:
         return "failed", "no_items_resolved", detail
@@ -328,6 +344,8 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
         return "partial", "items_failed", detail
     if not_attempted:
         return "partial", "truncated", detail
+    if evidence_skipped:
+        return "partial", "evidence_not_stored", detail
     return "succeeded", None, detail
 
 
@@ -2446,6 +2464,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         synonyms = None
         syn_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        syn_counts: dict[str, int] = {}   # honest-labeling: the WRITER's per-item dispositions
         syn_evidence_failures = 0
         try:
             with conn.transaction():
@@ -2463,19 +2482,34 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     try:
                         syn_evidence_failures = _write_synonym_evidence(
                             conn, source=catalog_source, rows=vr.good, synonyms=synonyms,
-                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
+                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=syn_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
                         # to the advisory handler below, which logs it.
                         syn_evidence_failures = 1
                         raise
+                elif synonyms:
+                    # THE WRITER NEVER RAN. `_write_synonym_evidence` is gated on a glossary AND a
+                    # snapshot id, so a TECHNICAL upload drafts synonyms for EVERY column — at full
+                    # LLM cost, since `draft_synonyms` above is gated only on `client` — and stores
+                    # none of them. On that path the drafted terms have no consumer at all: this
+                    # writer is skipped, `_project_semantic_terms` is unreachable (its only call
+                    # sites are inside `_ingest_glossary_evidence`), and the same-run summary
+                    # ride-along does not run either (`enrich_summary` is `not_applicable` when
+                    # `glossary is None`). Counting the whole draft as SKIPPED here is what stops
+                    # the stage reporting a clean `succeeded` for a run that persisted nothing.
+                    # It is honest labeling only — the fix for the drafting itself (a ref strategy
+                    # for non-glossary columns) is a design decision, deliberately not made here.
+                    syn_counts["skipped"] = len(synonyms)
         except Exception:  # noqa: BLE001
             logger.warning("advisory synonym enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             synonyms, len({content_hash(r) for r in vr.good}),
             internal_failures=syn_evidence_failures,
-            not_attempted=syn_stats.get("not_attempted", 0))
+            not_attempted=syn_stats.get("not_attempted", 0),
+            evidence_skipped=syn_counts.get("skipped", 0))
         record_stage(stage_recorder, "enrich_synonyms", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
