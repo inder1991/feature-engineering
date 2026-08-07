@@ -1368,6 +1368,75 @@ git commit -m "test(feature-gen): fail when a bundle field never reaches the fea
 
 ---
 
+### Task 7b: The curated human context reaches the model
+
+**Files:**
+- Modify: `src/featuregen/overlay/upload/semantic_context.py` (`_table_semantics` / the table loop, `for_concept_enrichment`, `for_summary`, `for_feature_generation`)
+- Modify: `src/featuregen/overlay/upload/enrich_llm.py` (egress classification for the new keys)
+- Modify: `src/featuregen/overlay/upload/feature_assist.py` (`_column_tokens`, `_table_context`)
+- Test: `tests/featuregen/overlay/upload/test_feature_context_coverage.py` (the `UNCARRIED_GAPS` entries this closes), plus focused tests per seam
+
+**Interfaces:**
+- Consumes: `catalog_profile_revision` (migration 1047 — `display_name`, `description`, `business_context`, `business_domains`), and the glossary's `business_term` / `related_terms`.
+- Produces: a catalog-narrative block on the table context, and two more column fields on the existing seams.
+
+Three gaps, all the same shape: **curated human context that never reaches the model.** Task 7's coverage test found two; the third came from reading the upload UI against the code.
+
+| Gap | Where it is today | Where it never arrives |
+|---|---|---|
+| **Catalog narrative** — name, description, business context, business domains | `catalog_profile_revision` (1047); rendered on asset detail | **No LLM payload at all.** The bundle carries `catalog_profile_revision_id` — the ID, not the prose |
+| **`business_term`** — the glossary's curated business NAME for a column | sent by `for_concept_enrichment` and `for_summary` | the feature seam, and `feature_assist._column_tokens` |
+| **`related_terms`** — the glossary's curated related vocabulary | parsed, persisted, egress-classified `_LIST_PROSE_META_KEYS`, sent by `for_concept_enrichment` | the feature seam |
+
+**Why the catalog narrative is the big one.** The upload form promises *"used by search and by the AI when it interprets tables."* Grep `catalog_profile`, `display_name` and `business_domains` across `enrich.py`, `enrich_llm.py` and `feature_assist.py`: **zero hits.** The interface makes a promise the code does not keep. Verify that yourself before starting — if it has changed, say so and re-scope.
+
+**Do not confuse the two `business_context` fields.** `graph_node.business_context` (1052) is the per-table narrative Pass B *writes*, and it is already wired. `catalog_profile_revision.business_context` (1047) is what a human types in the upload form, and it is not. This task is about the second.
+
+**Where it pays off, in order of leverage** — put the block where each stage can use it:
+
+1. **Pass B table synthesis** decides grain, `table_role`, `primary_entity`, `event_or_snapshot` from columns and profiles alone. *"Funds-transfer records… all outbound SWIFT/RTGS payments; Compliance-owned"* answers three of those four outright. Grain is the most expensive thing in the pipeline to get wrong.
+2. **Pass A concept assignment.** `AMT` means different things in a payments catalog and a customer catalog. One shared block per batch, not per column.
+3. **`business_domains` seeds `domain`** — the model currently guesses a value the human already supplied.
+4. **Adjudication.** Catalog scope is exactly the tiebreaker between two plausible concepts, and adjudication is already the exception path.
+5. **Feature generation.** The generator sees a column menu with no idea what the catalog *is*.
+6. **Objective expansion (6d).** Expanding "counterparty exposure" without knowing payments-vs-lending gives generic synonyms.
+
+**Two things that must be right, or this becomes a defect instead of a feature:**
+
+- **Authority.** This is `human/proposed` prose — it informs the model and NEVER overrides evidence. It must be reachable through `semantic_authority` or carry an explicit status key, like every other unconfirmed value in this plan. It must not default any dataset's role, authority or temporal model — `put_catalog_profile`'s own docstring already states that constraint for the write side; preserve it on the read side.
+- **Egress grade.** Uploader-typed free text takes the **prose** grade (`_FEATURE_COLUMN_PROSE_KEYS` / `_TABLE_CONTEXT_DEFINITION_KEYS`), routed through `redact_free_text`, NOT identity grade. Grading uploader text as identity was a real exposure two tasks ago (`domain`, fixed in `c62ab49d`). `business_term` and `related_terms` are also uploader-authored — same grade.
+
+**The landmine, which has now fired on five tasks:** a payload key added without classification hits `else: return None` and refuses the **whole payload**, not the field. Classify every key you add, and pin each with a removal-from-its-own-list refusal test — the established pattern in `test_feature_context_v4.py`.
+
+**Budget.** The catalog block is per-table, not per-column, so it is cheap — but say what it costs and confirm the pinned bands still hold. `business_term` and `related_terms` are per-column and are not.
+
+**Acceptance:** Task 7's `UNCARRIED_GAPS` map shrinks. `business_term` and `related_terms` move out of it, and its accounting test — which fails on any stale entry in **both** directions — must stay green for the right reason. Do not edit that map to make a test pass; if a gap cannot be closed, report it rather than re-labelling it.
+
+- [ ] **Step 1: Verify the three gaps still exist**, exactly as described. Grep for the catalog-profile keys in the three LLM-facing modules; confirm `business_term`/`related_terms` are absent from `for_feature_generation` and from `_column_tokens`. Report what you found before changing anything — if any gap has closed, re-scope and say so.
+
+- [ ] **Step 2: Write the failing tests first**, one per gap, at the seam each is missing from. Assert the value reaches the payload, not merely that a key exists. Run them; record the exact failures.
+
+- [ ] **Step 3: Carry the catalog narrative onto the table context.** Read the current revision through the existing store, join it into the table-context block that already rides both the enrichment and feature-generation payloads, and label its authority. A catalog with no profile must degrade to today's payload exactly — `catalog_profile_absent` already exists as a missing-context code; keep it honest.
+
+- [ ] **Step 4: Carry `business_term` and `related_terms` to the feature seam**, and add `business_term`'s tokens to `_column_tokens` so an objective phrased in the bank's own vocabulary can match the bank's own term.
+
+- [ ] **Step 5: Classify every new key** and pin each with a removal-refusal test.
+
+- [ ] **Step 6: Run** `uv run pytest tests/featuregen/overlay/upload/ -q`, the budget suite, and the coverage suite. Re-pin any measured band that moved, to the MEASURED value — never a guess.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git commit -m "feat(context): the curated human context reaches the model
+
+Catalog narrative (1047), business_term and related_terms all reach the
+enrichment and feature-generation seams. Closes two UNCARRIED_GAPS entries
+and the upload form's unkept promise that its description is 'used by the AI
+when it interprets tables'."
+```
+
+---
+
 ### Task 8: Unconfirmed grain and as-of reach generation, labelled
 
 **Files:**
