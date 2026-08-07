@@ -80,6 +80,36 @@ def test_the_feature_grounding_bounds_are_code_only_and_the_schema_carries_none(
     assert fa._MAX_GROUNDING_WHY_LEN > 0 and fa._MAX_GROUNDING_ENTRIES > 0
 
 
+def test_the_objective_expansion_bounds_are_code_only_and_the_schema_carries_none() -> None:
+    """The SAME resolution as the grounding array, reached for the same reason (Task 6d).
+
+    `objective_expansion` returns a list of short business terms. Its two bounds — 40 terms, 64
+    chars each — live in `feature_assist` alone:
+
+      * `maxItems` may not appear in ANY schema in `_SCHEMAS` (the provider 400s on it), pinned by
+        `test_enrich_llm.test_no_output_schema_carries_array_minitems_or_maxitems`;
+      * a `maxLength` on the item is stripped from the WIRE but validated against the RESPONSE, so
+        it fires BEFORE `_accept_expansion_terms` and one over-long term destroys the whole
+        expansion — and a failed call caches nothing, so that question re-bills on every request
+        thereafter. The code gate drops the one term and keeps the rest.
+
+    STRUCTURE stays: `items: {"type": "string"}` survives the projection, so the model is told it.
+    """
+    from featuregen.overlay.upload import feature_assist as fa
+
+    node = llm._SCHEMAS[("objective_expansion", 1)]["properties"]["terms"]
+
+    def _has(n, kw: str) -> bool:
+        if isinstance(n, dict):
+            return kw in n or any(_has(v, kw) for v in n.values())
+        return isinstance(n, list) and any(_has(v, kw) for v in n)
+
+    for banned in ("maxLength", "maxItems", "minItems", "minLength"):
+        assert not _has(node, banned), f"{banned} on the objective-expansion response schema"
+    assert node["items"] == {"type": "string"}          # …but the shape IS asked for
+    assert fa._MAX_EXPANSION_TERMS > 0 and fa._MAX_EXPANSION_TERM_LEN > 0
+
+
 def test_a_definition_may_now_be_written_at_the_full_definition_length() -> None:
     """The actual fix: the accept gate no longer refuses a long drafted definition.
 

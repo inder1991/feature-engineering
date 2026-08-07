@@ -320,10 +320,13 @@ def test_planted_sample_token_never_egresses_and_is_audited(db, monkeypatch):
 
     # 1. Absent from the actual provider request.
     assert captured, "the model was never called"
-    req_meta = captured[0]["catalog_metadata"]
+    # Task 6d put the menu assembly's objective-expansion call AHEAD of the generation call, so the
+    # generation request is now selected by its SHAPE rather than by position — and the planted
+    # token is asserted absent from EVERY captured request, which is what this test always meant.
+    req_meta = next(c["catalog_metadata"] for c in captured if "columns" in c["catalog_metadata"])
     col = next(c for c in req_meta["columns"] if c["object_ref"] == "public.transactions.amount")
     assert _PLANTED not in col["definition"]
-    assert _PLANTED not in json.dumps(captured[0])
+    assert _PLANTED not in json.dumps(captured)
 
     # 2. Absent from the persisted llm_call.redacted_input.
     row = db.execute("SELECT redacted_input, input_redaction FROM llm_call "

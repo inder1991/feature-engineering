@@ -33,7 +33,7 @@ from featuregen.contracts.evidence_axes import EvidenceAuthorityV1
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.evidence import EvidenceProducer
-from featuregen.overlay.field_evidence import read_active_field_evidence
+from featuregen.overlay.field_evidence import canonical_hash, read_active_field_evidence
 from featuregen.overlay.upload import grounding_trace as _gt
 from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
@@ -46,7 +46,10 @@ from featuregen.overlay.upload.concepts import (
     is_personal_data,
     is_protected_characteristic,
 )
-from featuregen.overlay.upload.enrich_llm import audited_structured_call
+from featuregen.overlay.upload.enrich_llm import (
+    audited_structured_call,
+    drive_audited_structured_call,
+)
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CATALOG_PROJECTION_UNAVAILABLE,
     CatalogProjectionUnavailable,
@@ -74,6 +77,10 @@ from featuregen.overlay.upload.read_scope import (
 from featuregen.overlay.upload.semantic_context import (
     bundle_from_store,
     for_feature_generation,
+)
+from featuregen.overlay.upload.structured_results import (
+    find_structured_result,
+    record_structured_result,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
@@ -728,19 +735,189 @@ def _tokenize(text: str | None) -> set[str]:
     return set(_TOKEN_RE.findall((text or "").lower()))
 
 
-def _objective_tokens(objective: str | None, entity: str | None, scope) -> set[str]:
-    """The objective token set, by source priority (spec §6): the GOVERNED confirmed scope (leaf ids
-    + target_entity + modelling_contexts) when present and not unscoped; else the DIRECT-ASSIST
-    objective free-text + explicit entity; else the LEXICAL objective alone. NO LLM call."""
+def _objective_source(objective: str | None, entity: str | None, scope) -> str:
+    """The TEXT the objective tokens come from, by source priority (spec §6): the GOVERNED confirmed
+    scope (leaf ids + target_entity + modelling_contexts) when present and not unscoped; else the
+    DIRECT-ASSIST objective free-text + explicit entity; else the LEXICAL objective alone.
+
+    ONE function decides the priority, and both the literal tokenisation and the Task-6d expansion
+    read it. That is the whole reason it exists: expanding the raw `objective` instead would put the
+    free text back into the governed route through the side door — a governed scope of
+    `retail_churn` with a stale `"weather forecast"` objective would start matching weather columns
+    via LLM-derived synonyms, which is precisely the substitution the source priority forbids
+    (`test_tokenize_and_objective_source_priority` pins the literal half of that rule)."""
     if scope is not None and not scope.unscoped:
-        toks: set[str] = set()
-        for uid in ([scope.primary] if scope.primary else []) + list(scope.secondary):
-            toks |= _tokenize(uid)
-        toks |= _tokenize(scope.target_entity)
-        for mc in scope.modelling_contexts:
-            toks |= _tokenize(mc)
+        parts = [
+            *([scope.primary] if scope.primary else []),
+            *scope.secondary,
+            scope.target_entity,
+            *scope.modelling_contexts,
+        ]
+    else:
+        parts = [objective, entity]
+    return " ".join(p for p in parts if p)
+
+
+def _literal_tokens(objective: str | None, entity: str | None, scope) -> set[str]:
+    """Today's tokenisation, byte-for-byte: the tokens of `_objective_source`. NO LLM call."""
+    return _tokenize(_objective_source(objective, entity, scope))
+
+
+#: The replay identity of one expansion. Bump to retire every stored expansion explicitly — a
+#: reworded instruction, a different accept gate, or a changed subject derivation all reach the
+#: model with a DIFFERENT question, and replaying a v1 answer against a v2 question is the trap
+#: `CONCEPT_CRITIC_VERSION` documents. The version is the ONLY lever: the prompt text is
+#: deliberately NOT hashed, so an editorial re-wording is a decision somebody makes here.
+OBJECTIVE_EXPANSION_VERSION = 1
+OBJECTIVE_EXPANSION_RESULT_TYPE = "objective_expansion"
+OBJECTIVE_EXPANSION_TASK = "overlay.feature.objective_expansion"
+OBJECTIVE_EXPANSION_PROMPT_ID = "objective_expansion_v1"
+OBJECTIVE_EXPANSION_SCHEMA_ID = "objective_expansion"
+
+#: BOTH bounds are CODE-ONLY, and the expansion schema carries NEITHER — see the long note beside
+#: `_SCHEMAS[("objective_expansion", 1)]`. Short version: `maxItems` is repo-wide forbidden (the
+#: provider 400s on it), and a `maxLength` there is stripped from the wire yet validated on the
+#: response, so it would fire before this gate and let ONE long term destroy the whole expansion
+#: — the resolution `feature_ideas`' grounding array already reached. Over-bound terms are
+#: DROPPED here, one at a time. `test_enrich_output_bounds.py` pins the schema's silence.
+_MAX_EXPANSION_TERMS = 40
+_MAX_EXPANSION_TERM_LEN = 64
+#: What we SEND. The objective is user-typed and otherwise unbounded on this seam (the per-item
+#: `_MAX_LEN_BY_KEY` gate governs the BATCH path, not a single call's metadata), so it is bounded
+#: here — and bounded BEFORE the cache key is computed, so the key always names exactly the bytes
+#: that egressed.
+_MAX_EXPANSION_SUBJECT_LEN = 2_000
+
+_EXPANSION_INSTRUCTION = (
+    "You are widening a search over a data catalog's COLUMN METADATA. Given the analyst's "
+    "objective below, return the related business terms that a bank's catalog might use for the "
+    "same ideas — synonyms, standard industry vocabulary, and the words another house style would "
+    "use for the same thing (for example 'obligor' for 'counterparty', 'facility' for 'credit "
+    "line'). Return single words or short noun phrases only: no sentences, no explanations, no "
+    "column names, and nothing invented about this particular catalog. Repeating the objective's "
+    "own words is wasted — they are already searched for."
+)
+
+
+def _expansion_input_hash(subject: str) -> str:
+    """THE CACHE KEY. Content-addressed on the expansion version and the NORMALIZED subject text,
+    and on nothing else.
+
+    What is deliberately absent is the point: no catalog, no catalog revision, no role scope, no
+    entity beyond what the subject already carries. The expansion is about the QUESTION, not the
+    corpus — "counterparty" relates to "obligor" whichever catalog is loaded — so folding a catalog
+    identity in would mint a fresh provider call per upload for an answer that cannot vary. The
+    same question is the same answer, forever, until the version moves."""
+    return canonical_hash({
+        "expansion_version": OBJECTIVE_EXPANSION_VERSION,
+        "subject": subject,
+    })
+
+
+def _expansion_subject(objective: str | None, entity: str | None, scope) -> str:
+    """The bounded, normalized text we both KEY on and SEND. Normalizing (whitespace-collapsed,
+    lower-cased) before hashing is what makes "Total Counterparty Exposure" and "total counterparty
+    exposure" one cached question rather than two: the terms are consumed through `_tokenize`,
+    which lower-cases anyway, so the two can never want different answers."""
+    return " ".join(_objective_source(objective, entity, scope).split()).lower()[
+        :_MAX_EXPANSION_SUBJECT_LEN]
+
+
+def _accept_expansion_terms(raw: object) -> tuple[str, ...]:
+    """The CODE-side gate on the model's answer: strings only, non-blank, within the per-term
+    length bound, case-insensitively de-duplicated, capped. Anything else is dropped ENTRY-wise —
+    a malformed list costs the terms it malformed, never the expansion."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        term = item.strip()
+        if not term or len(term) > _MAX_EXPANSION_TERM_LEN or term.lower() in seen:
+            continue
+        seen.add(term.lower())
+        out.append(term)
+        if len(out) >= _MAX_EXPANSION_TERMS:
+            break
+    return tuple(out)
+
+
+def _expand_objective(conn, client: LLMClient, subject: str) -> tuple[str, ...]:
+    """One tiny audited call returning the business vocabulary related to `subject`, replayed from
+    the content-addressed 1039 store for a question already asked.
+
+    REPLAY FIRST, ALWAYS: `find_structured_result` is consulted before any dispatch, so the second
+    identical objective costs nothing. A VALIDATED answer is stored even when it is EMPTY — "this
+    question has no useful expansion" is an answer, and not storing it would re-bill that question
+    on every request forever, which is the cache-shaped-thing failure mode.
+
+    Nothing here is caught: the ONE containment site is `_objective_tokens`, so every failure —
+    provider throw, egress block, repair exhaustion, store fault — lands on the same fallback."""
+    input_hash = _expansion_input_hash(subject)
+    stored = find_structured_result(
+        conn, result_type=OBJECTIVE_EXPANSION_RESULT_TYPE,
+        result_version=OBJECTIVE_EXPANSION_VERSION, input_content_hash=input_hash)
+    if stored is not None:
+        return _accept_expansion_terms(dict(stored.output).get("terms"))
+    call = drive_audited_structured_call(
+        conn, client, task=OBJECTIVE_EXPANSION_TASK, prompt_id=OBJECTIVE_EXPANSION_PROMPT_ID,
+        schema_id=OBJECTIVE_EXPANSION_SCHEMA_ID,
+        # `objective` is an ALREADY-CLASSIFIED key on the enrichment seam
+        # (`enrich_llm._ROUNDTRIP_PROSE_KEYS`) — the same grade the generation call's own
+        # `objective` rides under — so this adds NO new key to the egress surface and cannot trip
+        # the fail-closed classifier. On the governed route the subject is platform-derived scope
+        # vocabulary, which is strictly safer than the human text the class was written for.
+        catalog_metadata={"objective": subject},
+        instruction=_EXPANSION_INSTRUCTION)
+    if call.output is None:
+        # Egress block, provider failure, or a response that failed repair. The call is audited;
+        # NOTHING is cached, so a transient fault does not freeze an empty expansion in place.
+        return ()
+    terms = _accept_expansion_terms(call.output.get("terms"))
+    if call.llm_call_ref:
+        record_structured_result(
+            conn, result_type=OBJECTIVE_EXPANSION_RESULT_TYPE,
+            result_version=OBJECTIVE_EXPANSION_VERSION, input_content_hash=input_hash,
+            output={"terms": list(terms)},
+            producer_kind="llm_call", producer_ref=call.llm_call_ref,
+            authority={"authority": "llm_advisory", "subject_hash": input_hash})
+    return terms
+
+
+def _objective_tokens(objective: str | None, entity: str | None, scope, *,
+                      conn=None, client: LLMClient | None = None) -> set[str]:
+    """The objective's own words, plus LLM-derived related business terms.
+
+    ADVISORY and additive: the literal tokens are always retained, so expansion can only widen the
+    candidate set, never narrow it. `client=None` (every pure caller, and any degraded deployment)
+    returns exactly today's literal tokenisation — byte-for-byte unchanged.
+
+    WHAT CONSUMES THIS: `select_relevant_context`'s ranking key,
+    `-len(_column_tokens(c) & obj_tokens)`, and nothing else. The tokens never reach the model, are
+    never persisted against a column, and cannot promote a column past the MANDATORY set or past
+    the byte budget — a wrong expansion re-orders the optional tail of one menu and costs nothing
+    beyond that. That bounded blast radius is why a failed expansion is a shrug rather than an
+    error."""
+    toks = _literal_tokens(objective, entity, scope)
+    subject = _expansion_subject(objective, entity, scope)
+    if conn is None or client is None or not subject:
         return toks
-    return _tokenize(objective) | _tokenize(entity)
+    try:
+        expanded = _expand_objective(conn, client, subject)
+    except Exception:  # noqa: BLE001 — advisory: a failed expansion must never fail the request
+        logger.warning("objective expansion failed; falling back to literal tokens", exc_info=True)
+        return toks
+    derived = {t for term in expanded for t in _tokenize(term)} - toks
+    if derived:
+        # The reviewer's answer to "why did `obligor` match my question about counterparties?" —
+        # the derivation is otherwise invisible, because what the ranking consumes is a flat set.
+        # The subject is elided at the same 80 chars `_generate` already elides the objective to.
+        logger.info("objective expansion widened [%s] by %d term(s): %s",
+                    subject if len(subject) <= 80 else subject[:79] + "…",
+                    len(expanded), ", ".join(sorted(derived)))
+    return toks | derived
 
 
 def _objective_entity(entity: str | None, scope) -> str | None:
@@ -783,7 +960,9 @@ def _assembled_bytes(columns: list[dict], table_context: list[dict]) -> int:
 def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
                             entity: str | None, scope=None,
                             byte_budget: int | None = None,
-                            roles: Iterable[str] = ()) -> tuple[list[dict], list[dict], int]:
+                            roles: Iterable[str] = (),
+                            client: LLMClient | None = None,
+                            ) -> tuple[list[dict], list[dict], int]:
     """Deterministic relevance selection ([F13], spec §6). Returns
     (selected_enriched_columns, table_context, dropped_count). Mandatory columns (confirmed grain,
     as-of, entity-match) are ALWAYS included; the rest are added by descending shared-token score,
@@ -801,10 +980,15 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     is shed first, level by level, and the level that fits is used; `ContextTooLarge` is raised only
     when even the fully trimmed mandatory set exceeds the budget. Dropping a mandatory column
     instead would silently remove the grain or the time anchor and produce a confidently wrong
-    feature."""
+    feature.
+
+    `client` (Task 6d) is OPTIONAL and ADVISORY: given one, the objective is expanded with related
+    business terms before the intersection, so a question about "counterparty exposure" can reach a
+    column whose vocabulary says "obligor". Omitted (every pure caller, and any degraded
+    deployment) the ranking is byte-for-byte today's literal token intersection."""
     if byte_budget is None:
         byte_budget = FEATURE_CONTEXT_BYTE_BUDGET
-    obj_tokens = _objective_tokens(objective, entity, scope)
+    obj_tokens = _objective_tokens(objective, entity, scope, conn=conn, client=client)
     obj_entity = _objective_entity(entity, scope)
     enriched_by_ref: dict[tuple[str, str], dict] = {}
 
@@ -850,18 +1034,22 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
 
 def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
                 entity: str | None = None, scope=None,
-                roles: Iterable[str] = ()) -> tuple[list[dict], list[dict]]:
+                roles: Iterable[str] = (),
+                client: LLMClient | None = None) -> tuple[list[dict], list[dict]]:
     """The menu + per-table context for one generation call. Flag-OFF ⟹ the thin pre-Slice-3 menu
     and NO context (byte-identical). Flag-ON ⟹ the enriched, relevance-selected menu + context
     (may raise ContextTooLarge).
 
     `roles` is the CALLER's scope, threaded down to the v4 bundle build (D11). The candidate rows
     were already read-scoped; the bundle re-applies the same scope at its own boundary rather than
-    inheriting a clearance from a row that passed it earlier."""
+    inheriting a clearance from a row that passed it earlier.
+
+    `client` is the SAME seam the generation call uses, handed on so relevance ranking can widen
+    the question (Task 6d). Flag-OFF never reaches the ranking at all, so it never expands."""
     if not feature_context_enabled():
         return _menu(cols), []
     columns, table_context, _dropped = select_relevant_context(
-        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
+        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles, client=client)
     return columns, table_context
 
 
@@ -2156,7 +2344,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
     registered = _registered_signatures(conn)
     try:
         menu, table_context = _build_menu(
-            conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
+            conn, cols, objective=objective, entity=entity, scope=scope, roles=roles,
+            client=client)
     except ContextTooLarge as exc:
         logger.warning("feature context too large for %r: %s", objective, exc)
         return [], [{"name": "", "reason": str(exc), "code": RejectCode.CONTEXT_TOO_LARGE}]
@@ -2329,7 +2518,7 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
             "aggregation": idea.get("aggregation"), "issue": instruction}]
     try:
         menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity,
-                                          roles=roles)
+                                          roles=roles, client=client)
     except ContextTooLarge as exc:
         return None, {"name": str(idea.get("name", "")), "reason": str(exc),
                       "code": RejectCode.CONTEXT_TOO_LARGE}
@@ -2380,7 +2569,8 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
     try:
-        menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles)
+        menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles,
+                                          client=client)
     except ContextTooLarge as exc:
         logger.warning("feature-recipe context too large for %r: %s", nl_query, exc)
         return Recipe(intent=nl_query, grain_table=None, derives_from=[], aggregation=None,

@@ -1267,6 +1267,46 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         },
         "required": ["concept", "reason_codes"],
     },
+    # Objective expansion (feature-gen Task 6d). The question is ten words and the catalog is
+    # hundreds of columns, so the relevance intersection is widened by expanding the SMALL side:
+    # one tiny call returns the related business vocabulary ("obligor" for "counterparty"), the
+    # match afterwards stays a deterministic set intersection, and an identical question replays
+    # from the 1039 store rather than re-billing.
+    #
+    # BOTH BOUNDS ARE CODE-ONLY (`feature_assist._MAX_EXPANSION_TERMS` = 40 and
+    # `_MAX_EXPANSION_TERM_LEN` = 64), and this schema deliberately carries NEITHER. The task brief
+    # asked for `maxItems: 40` and `items.maxLength: 64` here; both were tried and both are wrong,
+    # for two different reasons that happen to point the same way:
+    #
+    #   * `maxItems` may not appear in ANY schema in this dict — the Anthropic structured-output
+    #     API rejects it with HTTP 400, pinned repo-wide by
+    #     `test_enrich_llm.test_no_output_schema_carries_array_minitems_or_maxitems`.
+    #   * `maxLength` is legal but WRONG HERE, and the reason is `feature_ideas`' grounding array's
+    #     reason verbatim: it is stripped from the wire by `project_for_anthropic` (so the model is
+    #     never TOLD 64) yet still validated against the RESPONSE — so it fires FIRST, before the
+    #     per-entry code gate, and one 65-char term destroys the whole expansion. The terms in this
+    #     list are siblings exactly as grounding entries are, and the cost is worse than a lost
+    #     answer: a failed call caches NOTHING, so a question whose answer reliably contains one
+    #     long term would re-bill on every request forever. The code gate drops that ONE term,
+    #     keeps its 39 siblings, and caches. `test_enrich_output_bounds.py` pins the absence.
+    #
+    # STRUCTURE is a different matter and IS validated: `items: {"type": "string"}` survives the
+    # projection, so the model is told it and a null/number entry legitimately fails the response —
+    # the same bargain `derives_from` already takes.
+    ("objective_expansion", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "description": "Related business terms for the analyst's objective — synonyms and "
+                               "industry vocabulary naming the same ideas. Single words or short "
+                               "noun phrases only.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["terms"],
+    },
 }
 
 # Pass B v2 (Phase-2 Slice 1, Task 4): the OUTPUT contract is byte-for-byte v1 — v2 exists because

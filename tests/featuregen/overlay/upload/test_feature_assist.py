@@ -413,6 +413,246 @@ def test_refine_is_told_the_grounding_rules_its_schema_now_compels(db, v5):
     assert [(g.column, g.role) for g in revised.grounding] == [(_AMOUNT, "measure")]
 
 
+# ── Task 6d: expand the question, not the corpus ────────────────────────────────────────────────
+
+
+def _expansion_client(terms):
+    """Answers the expansion schema, and counts how many provider requests it was asked for."""
+    from featuregen.intake.llm import LLMResult
+
+    class _Client:
+        count = 0
+
+        def call(self, request):
+            self.count += 1
+            return LLMResult(output={"terms": list(terms)}, self_reported_scores={},
+                             call_ref="", status="ok")
+
+    return _Client()
+
+
+def test_the_objective_is_expanded_with_related_business_terms(db):
+    toks = fa._objective_tokens("total counterparty exposure by customer", entity=None, scope=None,
+                                conn=db,
+                                client=_expansion_client(["obligor", "limit", "facility"]))
+    assert {"counterparty", "exposure", "customer"} <= toks    # the literal words survive
+    assert {"obligor", "limit", "facility"} <= toks            # and the derived ones join them
+
+
+def test_expansion_is_replayed_for_an_identical_objective(db):
+    """The same question must not re-bill. Second call issues no provider request."""
+    calls = _expansion_client(["obligor"])
+    fa._objective_tokens("total counterparty exposure", None, None, conn=db, client=calls)
+    fa._objective_tokens("total counterparty exposure", None, None, conn=db, client=calls)
+    assert calls.count == 1
+
+
+def test_no_client_degrades_to_literal_tokens(db):
+    """Expansion is advisory: with no provider the search behaves exactly as it does today."""
+    toks = fa._objective_tokens("counterparty exposure", None, None, conn=db, client=None)
+    assert toks == {"counterparty", "exposure"}
+
+
+def test_no_conn_degrades_to_literal_tokens():
+    """The other half of the same guard, and the one every pure caller takes."""
+    assert fa._objective_tokens("counterparty exposure", None, None,
+                                conn=None, client=_expansion_client(["obligor"])) == {
+        "counterparty", "exposure"}
+
+
+# ── every degradation path lands on the same fallback ───────────────────────────────────────────
+
+
+def _degrading_client(behaviour):
+    from featuregen.intake.llm import LLMResult
+
+    class _Client:
+        def call(self, request):
+            if behaviour == "throw":
+                raise RuntimeError("provider outage")
+            return LLMResult(output=behaviour, self_reported_scores={}, call_ref="", status="ok")
+
+    return _Client()
+
+
+@pytest.mark.parametrize("behaviour", [
+    "throw",                       # provider outage / a fake with no script for this task
+    {"terms": "not a list"},       # a validated-looking answer the code gate cannot read
+    {"nothing": "useful"},         # the wrong shape entirely (fails repair, output None)
+    {"terms": []},                 # an HONEST empty expansion
+    {"terms": [None, 42, "   ", "x" * 65]},   # every entry individually unusable
+])
+def test_every_expansion_failure_falls_back_to_exactly_todays_literal_tokens(db, behaviour):
+    """Feature generation must never fail because expansion failed. Each of these reaches the
+    fallback by a DIFFERENT route — a client throw, a code-gate rejection, repair exhaustion, an
+    empty answer, per-entry drops — and every one of them must be indistinguishable from today."""
+    literal = fa._objective_tokens("counterparty exposure", None, None, conn=db, client=None)
+    assert fa._objective_tokens("counterparty exposure", None, None, conn=db,
+                                client=_degrading_client(behaviour)) == literal
+
+
+def test_an_objective_carrying_pii_is_blocked_at_the_egress_guard_and_still_ranks(db):
+    """The objective is USER-TYPED text. It rides the same guard as every other call, so a payload
+    the guard refuses costs the expansion and nothing else — the ranking still happens."""
+    objective = "exposure for alice@example.com"
+    assert fa._objective_tokens(objective, None, None, conn=db,
+                                client=_expansion_client(["obligor"])) == fa._objective_tokens(
+        objective, None, None, conn=db, client=None)
+    assert db.execute("SELECT count(*) FROM security_audit "
+                      "WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0] == 1
+
+
+def test_an_unusable_entry_costs_only_itself_and_never_its_siblings(db):
+    """THE reason the length bound is code-side rather than a schema `maxLength`. A 65-char term is
+    dropped and its 39 usable siblings survive; a schema bound would have been validated against
+    the response FIRST and destroyed the whole expansion — and cached nothing, so the question
+    would re-bill forever. Blanks and case-variant repeats are dropped the same way."""
+    toks = fa._objective_tokens("counterparty", None, None, conn=db,
+                                client=_expansion_client(
+                                    ["obligor", "OBLIGOR", "   ", "facility", "y" * 65]))
+    assert {"obligor", "facility"} <= toks
+    assert "y" not in toks
+    assert fa._accept_expansion_terms(["obligor", "OBLIGOR", "  ", "y" * 65]) == ("obligor",)
+    assert fa._accept_expansion_terms([f"t{i}" for i in range(200)]) == tuple(
+        f"t{i}" for i in range(fa._MAX_EXPANSION_TERMS))
+
+
+# ── source priority survives the expansion ──────────────────────────────────────────────────────
+
+
+def test_the_governed_route_expands_the_SCOPE_and_never_the_discarded_objective(db):
+    """The trap this design exists to avoid. Under a confirmed scope the free-text objective is
+    DISCARDED by source priority (spec §6) — so expanding the raw objective would put it straight
+    back in through the side door, as LLM-derived synonyms of the very words the rule excluded.
+    What gets expanded is what gets tokenised: the scope."""
+    from featuregen.intake.llm import LLMResult
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
+
+    sent: list[str] = []
+
+    class _Client:
+        def call(self, request):
+            sent.append(request.inputs["catalog_metadata"]["objective"])
+            return LLMResult(output={"terms": ["attrition"]}, self_reported_scores={},
+                             call_ref="", status="ok")
+
+    scope = ConfirmedScope(primary="retail_churn", secondary=(), target_entity="Account",
+                           modelling_contexts=("ifrs9",))
+    toks = fa._objective_tokens("weather forecast", None, scope, conn=db, client=_Client())
+    assert {"retail", "churn", "account", "ifrs9"} <= toks     # the governed words still lead
+    assert "attrition" in toks                                  # widened from the SCOPE
+    assert "weather" not in toks and "forecast" not in toks     # …and never from the objective
+    assert "weather" not in sent[0] and "retail_churn" in sent[0]  # it never even egressed
+
+
+def test_case_and_spacing_are_one_cached_question(db):
+    """The cache key is the NORMALIZED subject, so a reviewer retyping their own question with
+    different capitalisation does not re-bill it."""
+    calls = _expansion_client(["obligor"])
+    fa._objective_tokens("Total  Counterparty   Exposure", None, None, conn=db, client=calls)
+    fa._objective_tokens("total counterparty exposure", None, None, conn=db, client=calls)
+    assert calls.count == 1
+
+
+def test_an_empty_expansion_is_cached_too(db):
+    """"This question has no useful expansion" IS an answer. Not storing it would re-bill that
+    question on every request forever — the cache-shaped-thing failure mode."""
+    calls = _expansion_client([])
+    fa._objective_tokens("predict churn", None, None, conn=db, client=calls)
+    fa._objective_tokens("predict churn", None, None, conn=db, client=calls)
+    assert calls.count == 1
+
+
+def test_a_provider_fault_is_NOT_frozen_into_the_cache(db):
+    """The other direction, and the one a naive cache gets wrong: a transient outage must not pin
+    an empty expansion in place for the life of the store."""
+    fa._objective_tokens("predict churn", None, None, conn=db, client=_degrading_client("throw"))
+    assert "attrition" in fa._objective_tokens("predict churn", None, None, conn=db,
+                                               client=_expansion_client(["attrition"]))
+
+
+# ── what consumes the tokens ────────────────────────────────────────────────────────────────────
+
+
+def test_the_derived_terms_reach_the_RANKING_and_not_merely_the_token_set(db):
+    """The consumption trace, end to end. `_objective_tokens` feeds exactly one thing — the
+    `-len(_column_tokens(c) & obj_tokens)` sort key — so the proof that the expansion works is that
+    the menu comes back in a different ORDER, with the column nobody's literal words could reach
+    now in front."""
+    from featuregen.overlay.upload.graph import build_graph as _bg
+
+    _bg(db, "bank", [
+        CanonicalRow("bank", "book", "aaa_paint_colour", "text"),
+        CanonicalRow("bank", "book", "obligor_limit", "numeric"),
+    ])
+    cols = fa._candidate_columns(db, "bank", roles=())
+
+    def _refs(**kw):
+        return [c["object_ref"] for c in fa.select_relevant_context(
+            db, cols, objective="counterparty exposure", entity=None, scope=None, **kw)[0]]
+
+    # Literally, NOTHING matches "counterparty exposure": the tie breaks on object_ref.
+    assert _refs() == ["public.book.aaa_paint_colour", "public.book.obligor_limit"]
+    # Widened by one derived term, the column that means the same thing leads.
+    assert _refs(client=_expansion_client(["obligor"])) == [
+        "public.book.obligor_limit", "public.book.aaa_paint_colour"]
+
+
+def _task_recorder(terms):
+    from featuregen.intake.llm import LLMResult
+
+    class _Client:
+        def __init__(self):
+            self.tasks: list[str] = []
+
+        def call(self, request):
+            self.tasks.append(request.task)
+            if request.task == fa.OBJECTIVE_EXPANSION_TASK:
+                return LLMResult(output={"terms": list(terms)}, self_reported_scores={},
+                                 call_ref="", status="ok")
+            return LLMResult(output={"features": []}, self_reported_scores={}, call_ref="",
+                             status="ok")
+
+    return _Client()
+
+
+@pytest.mark.parametrize("version", ["3", "4", "5"])
+def test_the_expansion_is_not_payload_VERSION_gated(db, monkeypatch, version):
+    """Relevance ranking runs for every feature-context payload version, so the thing that widens
+    it does too. Gating this on the v5 contract would silently switch it off on a rollback."""
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, version)
+    _bank_graph(db)
+    client = _task_recorder(["obligor"])
+    recommend_features(db, "counterparty exposure", client, catalog_source="bank", budget=1,
+                       critic=False)
+    assert fa.OBJECTIVE_EXPANSION_TASK in client.tasks
+
+
+def test_flag_off_issues_no_expansion_call_at_all(db, monkeypatch):
+    """Flag-OFF returns the thin pre-Slice-3 menu without ever ranking, so there is no question to
+    widen and nothing may be billed for one."""
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    _bank_graph(db)
+    client = _task_recorder(["obligor"])
+    recommend_features(db, "counterparty exposure", client, catalog_source="bank", budget=1,
+                       critic=False)
+    assert fa.OBJECTIVE_EXPANSION_TASK not in client.tasks
+
+
+def test_the_expansion_lands_on_an_llm_call_like_every_other_call(db):
+    """User text egressed for the platform's own convenience is still egress: it is audited, and
+    the replay row points back at the call that produced it."""
+    fa._objective_tokens("counterparty exposure", None, None, conn=db,
+                         client=_expansion_client(["obligor"]))
+    ref = db.execute("SELECT llm_call_ref FROM llm_call WHERE task = %s",
+                     (fa.OBJECTIVE_EXPANSION_TASK,)).fetchone()
+    assert ref is not None
+    assert db.execute(
+        "SELECT count(*) FROM structured_result_provenance "
+        "WHERE producer_kind = 'llm_call' AND producer_ref = %s", (ref[0],)).fetchone()[0] == 1
+
+
 def test_refine_at_v4_carries_the_human_instruction_untouched(db, v5, monkeypatch):
     monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
     from featuregen.overlay.upload.feature_assist import refine_idea
