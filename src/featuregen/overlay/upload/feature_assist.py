@@ -667,9 +667,28 @@ def _table_context(cols: list[dict], *,
                    narratives: Mapping[str, Mapping] | None = None) -> list[dict]:
     """One context block per TABLE, assembled ONLY from the already-authorized candidate rows
     (spec §5): a table whose columns were all read-scope-excluded has no rows here and gets no
-    block. Confirmed grain columns require a non-null grain_fact_event_id and the as-of column a
-    non-null availability_fact_event_id (governed-VERIFIED, not merely file-declared);
-    primary_entity is ADVISORY.
+    block. Grain and as-of are emitted whether governed-VERIFIED or merely file-declared, each with
+    a `grain_status` / `as_of_status` of "confirmed" or "declared" so the model can weigh them.
+    Omitting an unconfirmed grain made the model invent one; primary_entity is ADVISORY.
+
+    WHAT "confirmed" MEANS HERE, stated precisely because the word oversells itself. It is the
+    LIFECYCLE sense: a CONFIRMED overlay-fact event is projected onto this column, so the platform
+    treats the value as operational and a contract bound to it can compile. It does NOT mean a human
+    reviewed it. `ingest._assert_fact` AUTO-CONFIRMS a file-declared grain/as-of with
+    `authority_basis=source_declared` (honest attribution: "the fact is authoritative because the
+    SOURCE declared it", never a fabricated confirmer), so an ordinary upload's declared grain lands
+    here as "confirmed". The surface that DOES separate a human endorsement from a source-declared
+    auto-confirm is `bridge_assessment._human_reviewed`, and it needs the fact STREAM — which this
+    function, called repeatedly inside the budget loop on plain candidate rows, deliberately does
+    not read. So "declared" means strictly "no governed fact is currently servable for this table":
+    the file's flag survived a drift-STALEd / expired / never-projected fact.
+
+    AND WHAT THIS DOES NOT REACH: a grain the AI merely PROPOSED. Pass B routes its grain and
+    availability candidates into PROPOSED-only governed facts (`table_synth._propose_table_facts`),
+    `resolve_fact` serves VERIFIED only, and `is_grain` is written by exactly two things — the FILE
+    (`build_graph`) and the VERIFIED projection (`table_fact_projection`). An AI proposal therefore
+    never sets `is_grain` at all, so no relaxation of the fact-event test can surface it; it would
+    take a read of the PROPOSED fact stream.
 
     `narratives` (Task 7b) is `{catalog_source: catalog_narrative_block}` — the prose a human typed
     about the CATALOG, which the upload form promises is "used by the AI when it interprets tables"
@@ -693,14 +712,42 @@ def _table_context(cols: list[dict], *,
         tdef = next((m["table_definition"] for m in members if m.get("table_definition")), None)
         if tdef:
             block["table_definition"] = tdef
-        grain_cols = sorted(m["column"] for m in members
-                            if m["is_grain"] and m["grain_fact_event_id"])
-        if grain_cols:
-            block["grain_columns"] = grain_cols
-        as_of = next((m["column"] for m in sorted(members, key=lambda x: x["column"])
+        # Grain and as-of reach the model whether or not a governed fact currently backs them — an
+        # unconfirmed grain is better information than a missing one, PROVIDED the model is told
+        # which it is. The status is ADVISORY CONTEXT, NOT PERMISSION: a `declared` grain still
+        # cannot compile, and the guard that says so lives on the execution path
+        # (`semantic_bindings/projection.py`, `governed_grain`, `materialize/spine`), each of which
+        # reads the fact stream and none of which reads this block.
+        #
+        # A CONFIRMATION IS NEVER WIDENED BY A DECLARATION. `project_table_facts_for_ref` SPARES
+        # file-declared columns from its clear, so a table whose file declares (a, b) while the
+        # governed grain is (a) genuinely carries is_grain on both, one stamped and one not.
+        # Emitting the UNION there would assert a grain nobody attested — not the file's and not
+        # the fact's — and would label the attested answer `declared` on the way past. So where ANY
+        # confirmation exists the confirmed set wins and the block is byte-identical to its
+        # pre-Task-8 shape; the relaxation only ever ADDS a table that had nothing.
+        # `confirmed_grain` is a subset of `declared_grain` by construction (both need is_grain),
+        # so the one emptiness test below covers both.
+        confirmed_grain = sorted(m["column"] for m in members
+                                 if m["is_grain"] and m["grain_fact_event_id"])
+        declared_grain = sorted(m["column"] for m in members if m["is_grain"])
+        if declared_grain:
+            block["grain_columns"] = confirmed_grain or declared_grain
+            block["grain_status"] = "confirmed" if confirmed_grain else "declared"
+        # Same rule on the time axis, and the ordering makes it bite: a plain "first as-of column"
+        # pick would hand the model an UNCONFIRMED `a_ts` over a confirmed `z_ts` and call it the
+        # anchor. The governed availability fact names exactly ONE column, so the confirmed branch
+        # is at most one candidate anyway.
+        by_name = sorted(members, key=lambda x: x["column"])
+        as_of = next((m["column"] for m in by_name
                       if m["is_as_of"] and m["availability_fact_event_id"]), None)
+        as_of_status = "confirmed"
+        if as_of is None:
+            as_of = next((m["column"] for m in by_name if m["is_as_of"]), None)
+            as_of_status = "declared"
         if as_of:
             block["as_of_column"] = as_of
+            block["as_of_status"] = as_of_status
         pentity = next((m["table_primary_entity"] for m in members
                         if m.get("table_primary_entity")), None)
         if pentity:
@@ -750,10 +797,15 @@ def _profile_advisories(members: list[dict]) -> dict:
     advisory = _DATA_ROLE_ADVISORIES.get(str(out.get("data_role") or ""))
     if advisory:
         out["advisories"] = [advisory]
-    # A SNAPSHOT table that also carries a governed as-of column is the mismatch worth naming: the
-    # time column reads like an event stream and the storage model says it is not one.
-    if out.get("data_role") == "snapshot_fact" and any(
-            m["is_as_of"] and m["availability_fact_event_id"] for m in members):
+    # A SNAPSHOT table that also carries an as-of column is the mismatch worth naming: the time
+    # column reads like an event stream and the storage model says it is not one.
+    #
+    # TRACKS WHAT THE BLOCK EMITS (Task 8), which is why the confirmation test that used to be here
+    # is gone. `_table_context` now emits a merely-DECLARED as-of column too, and suppressing the
+    # warning for exactly those tables would silence it where the anchor is least examined. The
+    # sentence is true of the storage model, not of the confirmation: a snapshot's time column marks
+    # when the snapshot was taken whether or not a human has signed for it.
+    if out.get("data_role") == "snapshot_fact" and any(m["is_as_of"] for m in members):
         out.setdefault("advisories", []).append(
             "its as-of column marks WHEN the snapshot was taken, not when an event happened — a "
             "windowed count over it counts snapshots, not activity")

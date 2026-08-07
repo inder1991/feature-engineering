@@ -569,10 +569,17 @@ _TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_contex
 # The Release-A profile classifications are CLOSED-vocabulary tokens (profile_vocab), not prose.
 # `catalog_narrative_authority` is the `producer/strength` pair read off the narrative revision's
 # own stored D2 axes — platform-minted, never uploader text.
+#
+# Task 8 adds `grain_status` / `as_of_status` at the SAME grade and for the same reason: each is one
+# of exactly two platform-minted tokens ("confirmed" | "declared") that `_table_context` computes
+# from whether a governed fact event stamped the column. Nothing uploader-typed and nothing
+# model-authored reaches them, so the prose grade's redactor would have nothing to scrub and would
+# misdocument the egress surface. They are LABELS, never permission: see `_table_context`.
 _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity",
                                           "data_role", "authority_role",
                                           "temporal_storage_model",
-                                          "catalog_narrative_authority"})
+                                          "catalog_narrative_authority",
+                                          "grain_status", "as_of_status"})
 # The table block's PROSE grade (Task 7b) — the missing half of this seam. The column side has had
 # `_FEATURE_COLUMN_PROSE_KEYS` since `domain` moved off identity grade in `c62ab49d`; the table side
 # had only DEFINITION (sample-strip + marker gate) and LIST/IDENTITY (no redaction at all), so a

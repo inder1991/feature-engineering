@@ -204,11 +204,17 @@ def test_table_context_from_authorized_rows_requires_fact_event_id(db):
     ctx = {b["table"]: b for b in fa._table_context(cols)}
     assert ctx["accounts"]["table_definition"] == "Accounts master"
     assert ctx["accounts"]["primary_entity"] == "Account"
-    # Only the fact-event-linked grain column is confirmed; the file-declared one is excluded.
+    # Task 8 RE-READ THIS TEST rather than relaxing it, and it still holds — for a sharper reason.
+    # `accounts` carries a CONFIRMED grain (account_id, fact-event-linked) alongside a merely
+    # file-declared one (region), and a confirmation is never widened by a declaration: the union
+    # would assert a grain nobody attested. So the confirmed set still wins, unchanged, and the
+    # block says so.
     assert ctx["accounts"]["grain_columns"] == ["account_id"]
+    assert ctx["accounts"]["grain_status"] == "confirmed"
     assert "as_of_column" not in ctx["accounts"]
     assert ctx["transactions"]["as_of_column"] == "txn_date"
-    assert "grain_columns" not in ctx["transactions"]
+    assert ctx["transactions"]["as_of_status"] == "confirmed"
+    assert "grain_columns" not in ctx["transactions"]      # no is_grain column at all — no key
 
 
 def test_table_context_skips_read_scope_excluded_table(db):
