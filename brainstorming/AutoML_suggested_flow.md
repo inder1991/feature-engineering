@@ -3,16 +3,15 @@ I have explicitly compiled the physical asset on the server backend. To guarante
 
 # Agentic AutoML & Feature Store Integration Specification## 1. System Architecture & Flow
 
-[User Hypothesis] ──> [Feature Generation Agent] ──> [Kedro Pipeline on Hadoop]
-│
-(Saves Offline Features)
-│
-▼
-[Tool UI Dashboard] <── (Rich Summary + JSON) ── [AutoML Critic/Reporter Agent]
-▲
-(Feeds Metrics & Plots)
-│
-[AutoML Compute Engine]
+
+| Step | Core Component | Active Process / Event | Data Handoff Payload |
+| :--- | :--- | :--- | :--- |
+| **1** | **User Input & Core LLM** | User inputs a natural language business hypothesis into your tool's UI. | `User Text String` |
+| **2** | **Feature Generation Agent** | Translates hypothesis to PySpark code and deploys it to your **Hadoop Cluster**. | `Kedro Pipeline Code Execution` |
+| **3** | **Offline Feature Store** | Kedro run finishes on Hadoop and writes the finalized analytical dataset. | `Hadoop Table Destination Path` |
+| **4** | **AutoML Compute Engine** | Triggered asynchronously via webhook. Runs model selection, cross-validation, and metrics. | `Raw Model Performance Arrays` |
+| **5** | **AutoML Critic Agent** | Evaluates the model math, evaluates SHAP feature weights, and builds an analysis template. | `Structured JSON Payload` |
+| **6** | **Microservice UI Portal** | Ingests the JSON payload to print the natural language summary natively in the dashboard. | `Rendered User Dashboard Cards` |
 
 
 ### Architectural Steps
@@ -100,9 +99,23 @@ This text is saved to the database and cleanly printed inside your microservice 
 * **Algorithm:** LightGBM Classifier (Optimized via automated search).
 * **Operational Fit:** The model achieved an **F1-score of 0.882** and an **AUC of 0.934**. It maintains high precision (**91%**), minimizing false alarms for innocent customers, while catching **85.5%** of actual weekend fraud attempts.
 
+### 🎨 Tool UI Component ArchitectureIf you are structuring how your Microservice application should organize its interface layout to display this data, follow this strict modular pattern:
+┌───────────────────────────────────────────────────────────┐
+│ [Top Panel]: Original Hypothesis & Validation Status      │
+│ ➔ "Hypothesis Confirmed / Partially Validated / Failed"    │
+├─────────────────────────────┬─────────────────────────────┤
+│ [Left Panel]: Performance    │ [Right Panel]: SHAP Weights │
+│ ➔ AUC-ROC Score Gauge      │ ➔ 1. Feature A (41%) [████] │
+│ ➔ F1 Operational Metrics    │ ➔ 2. Feature B (18%) [██]   │
+│ ➔ 2x2 Confusion Matrix      │ ➔ 3. Feature C (09%) [█]    │
+├─────────────────────────────┴─────────────────────────────┤
+│ [Bottom Panel]: LLM Critic Executive Action Steps         │
+│ ➔ "Automated recommendations for next Kedro iteration..." │
+└───────────────────────────────────────────────────────────┘
+
+
+
 ### 💡 Recommended Feature Next Steps
 * **Mitigate Bias:** `account_age_days` holds a high SHAP ranking. This implies newer accounts are disproportionately targeted. Consider asking the agent to generate cross-features combining `account_age_days` with `velocity_count_weekend_48h` to capture immediate bad actors.
 * **Feature Pruning:** Features related to historical monthly averages showed negligible SHAP values (<0.01). They can safely be removed from the next Kedro run on your Hadoop cluster to reduce computation costs.
-
-Would you like me to map out a Python orchestration script that extracts the raw metrics from an engine like Optuna or FLAML and shapes it into the exact JSON format defined in section 2?
 
