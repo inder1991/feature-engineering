@@ -554,6 +554,39 @@ def test_case_and_spacing_are_one_cached_question(db):
     assert calls.count == 1
 
 
+def test_two_different_questions_are_two_different_cache_entries(db):
+    """THE load-bearing property of the cache key, and the ONLY test that can catch its absence.
+
+    Every other cache test here uses ONE normalized subject, so a degenerate key that dropped
+    `subject` altogether — `canonical_hash({"expansion_version": 1})` — would replay the first
+    question's expansion for EVERY question thereafter and still pass all of them, and the full
+    suite besides. That is exactly the failure this design exists to avoid: one question's synonyms
+    silently serving every other question in the deployment."""
+    from featuregen.intake.llm import LLMResult
+
+    answers = {"total counterparty exposure": ["obligor"], "customer churn risk": ["attrition"]}
+    asked: list[str] = []
+
+    class _PerSubject:
+        def call(self, request):
+            subject = request.inputs["catalog_metadata"]["objective"]
+            asked.append(subject)
+            return LLMResult(output={"terms": answers[subject]}, self_reported_scores={},
+                             call_ref="", status="ok")
+
+    client = _PerSubject()
+    first = fa._objective_tokens("total counterparty exposure", None, None, conn=db, client=client)
+    second = fa._objective_tokens("customer churn risk", None, None, conn=db, client=client)
+
+    assert asked == ["total counterparty exposure", "customer churn risk"]  # a 2nd Q = a 2nd call
+    assert "obligor" in first and "obligor" not in second       # …and no cross-contamination,
+    assert "attrition" in second and "attrition" not in first   # in either direction.
+    # …while EACH question is still replayed on its own second asking. Distinctness and replay are
+    # one property, and a test that pins only one of them pins neither.
+    assert fa._objective_tokens("customer churn risk", None, None, conn=db, client=client) == second
+    assert len(asked) == 2
+
+
 def test_an_empty_expansion_is_cached_too(db):
     """"This question has no useful expansion" IS an answer. Not storing it would re-bill that
     question on every request forever — the cache-shaped-thing failure mode."""
@@ -651,6 +684,29 @@ def test_the_expansion_lands_on_an_llm_call_like_every_other_call(db):
     assert db.execute(
         "SELECT count(*) FROM structured_result_provenance "
         "WHERE producer_kind = 'llm_call' AND producer_ref = %s", (ref[0],)).fetchone()[0] == 1
+
+
+def test_every_call_in_one_request_names_the_HUMAN_who_typed_the_question(db, v5):
+    """The expansion payload is a BARE USER SENTENCE — the row in this flow that most needs to say
+    who typed it. Absent a threaded actor the seam substitutes `enrich_llm._ENRICH_ACTOR`, an
+    UNAUTHENTICATED service principal, while the sibling calls carrying the SAME sentence name the
+    human. One request must never attribute one copy of a sentence to a service and the rest to a
+    person: the audit would read as two different parties asking."""
+    from tests.featuregen._helpers import mint_test_identity
+
+    human = mint_test_identity(subject="user:analyst")
+    _bank_graph(db)
+    client = _task_recorder(["obligor"])
+    recommend_features(db, "counterparty exposure", client, catalog_source="bank", budget=1,
+                       critic=False, actor=human)
+
+    rows = db.execute("SELECT task, created_by->>'subject', created_by->>'actor_kind' "
+                      "FROM llm_call").fetchall()
+    assert {t for t, _s, _k in rows} >= {fa.OBJECTIVE_EXPANSION_TASK, "overlay.feature.recommend"}
+    assert {s for _t, s, _k in rows} == {"user:analyst"}          # every row, expansion included
+    assert {k for _t, _s, k in rows} == {"human"}                 # …and never a service principal
+    # Named explicitly so the assertion above cannot pass by the expansion simply not happening.
+    assert any(t == fa.OBJECTIVE_EXPANSION_TASK for t, _s, _k in rows)
 
 
 def test_refine_at_v4_carries_the_human_instruction_untouched(db, v5, monkeypatch):

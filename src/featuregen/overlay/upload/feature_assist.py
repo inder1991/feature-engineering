@@ -844,7 +844,8 @@ def _accept_expansion_terms(raw: object) -> tuple[str, ...]:
     return tuple(out)
 
 
-def _expand_objective(conn, client: LLMClient, subject: str) -> tuple[str, ...]:
+def _expand_objective(conn, client: LLMClient, subject: str, *,
+                      actor: IdentityEnvelope | None = None) -> tuple[str, ...]:
     """One tiny audited call returning the business vocabulary related to `subject`, replayed from
     the content-addressed 1039 store for a question already asked.
 
@@ -852,6 +853,13 @@ def _expand_objective(conn, client: LLMClient, subject: str) -> tuple[str, ...]:
     identical objective costs nothing. A VALIDATED answer is stored even when it is EMPTY — "this
     question has no useful expansion" is an answer, and not storing it would re-bill that question
     on every request forever, which is the cache-shaped-thing failure mode.
+
+    `actor` is the HUMAN subject the route threaded in, exactly as `_call_raw` takes it. It is NOT
+    optional in spirit: this call's payload is a BARE USER SENTENCE, so it is the one row in the
+    whole feature-generation flow that most needs to name who typed it. Absent, the seam falls back
+    to the unauthenticated service identity, which would attribute a human's question to
+    `featuregen-overlay-enrichment` while the three sibling calls carrying the SAME sentence name
+    the human.
 
     Nothing here is caught: the ONE containment site is `_objective_tokens`, so every failure —
     provider throw, egress block, repair exhaustion, store fault — lands on the same fallback."""
@@ -870,7 +878,7 @@ def _expand_objective(conn, client: LLMClient, subject: str) -> tuple[str, ...]:
         # the fail-closed classifier. On the governed route the subject is platform-derived scope
         # vocabulary, which is strictly safer than the human text the class was written for.
         catalog_metadata={"objective": subject},
-        instruction=_EXPANSION_INSTRUCTION)
+        instruction=_EXPANSION_INSTRUCTION, actor=actor)
     if call.output is None:
         # Egress block, provider failure, or a response that failed repair. The call is audited;
         # NOTHING is cached, so a transient fault does not freeze an empty expansion in place.
@@ -887,7 +895,8 @@ def _expand_objective(conn, client: LLMClient, subject: str) -> tuple[str, ...]:
 
 
 def _objective_tokens(objective: str | None, entity: str | None, scope, *,
-                      conn=None, client: LLMClient | None = None) -> set[str]:
+                      conn=None, client: LLMClient | None = None,
+                      actor: IdentityEnvelope | None = None) -> set[str]:
     """The objective's own words, plus LLM-derived related business terms.
 
     ADVISORY and additive: the literal tokens are always retained, so expansion can only widen the
@@ -905,7 +914,7 @@ def _objective_tokens(objective: str | None, entity: str | None, scope, *,
     if conn is None or client is None or not subject:
         return toks
     try:
-        expanded = _expand_objective(conn, client, subject)
+        expanded = _expand_objective(conn, client, subject, actor=actor)
     except Exception:  # noqa: BLE001 — advisory: a failed expansion must never fail the request
         logger.warning("objective expansion failed; falling back to literal tokens", exc_info=True)
         return toks
@@ -962,6 +971,7 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
                             byte_budget: int | None = None,
                             roles: Iterable[str] = (),
                             client: LLMClient | None = None,
+                            actor: IdentityEnvelope | None = None,
                             ) -> tuple[list[dict], list[dict], int]:
     """Deterministic relevance selection ([F13], spec §6). Returns
     (selected_enriched_columns, table_context, dropped_count). Mandatory columns (confirmed grain,
@@ -985,10 +995,12 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     `client` (Task 6d) is OPTIONAL and ADVISORY: given one, the objective is expanded with related
     business terms before the intersection, so a question about "counterparty exposure" can reach a
     column whose vocabulary says "obligor". Omitted (every pure caller, and any degraded
-    deployment) the ranking is byte-for-byte today's literal token intersection."""
+    deployment) the ranking is byte-for-byte today's literal token intersection. `actor` rides with
+    it for the same reason `_call_raw` takes one — that expansion call egresses the human's own
+    sentence, so the immutable llm_call must name the human and not the service default."""
     if byte_budget is None:
         byte_budget = FEATURE_CONTEXT_BYTE_BUDGET
-    obj_tokens = _objective_tokens(objective, entity, scope, conn=conn, client=client)
+    obj_tokens = _objective_tokens(objective, entity, scope, conn=conn, client=client, actor=actor)
     obj_entity = _objective_entity(entity, scope)
     enriched_by_ref: dict[tuple[str, str], dict] = {}
 
@@ -1035,7 +1047,8 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
 def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
                 entity: str | None = None, scope=None,
                 roles: Iterable[str] = (),
-                client: LLMClient | None = None) -> tuple[list[dict], list[dict]]:
+                client: LLMClient | None = None,
+                actor: IdentityEnvelope | None = None) -> tuple[list[dict], list[dict]]:
     """The menu + per-table context for one generation call. Flag-OFF ⟹ the thin pre-Slice-3 menu
     and NO context (byte-identical). Flag-ON ⟹ the enriched, relevance-selected menu + context
     (may raise ContextTooLarge).
@@ -1044,12 +1057,14 @@ def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
     were already read-scoped; the bundle re-applies the same scope at its own boundary rather than
     inheriting a clearance from a row that passed it earlier.
 
-    `client` is the SAME seam the generation call uses, handed on so relevance ranking can widen
-    the question (Task 6d). Flag-OFF never reaches the ranking at all, so it never expands."""
+    `client`/`actor` are the SAME pair every generation call in this module already carries, handed
+    on so relevance ranking can widen the question under the caller's own identity (Task 6d).
+    Flag-OFF never reaches the ranking at all, so it never expands."""
     if not feature_context_enabled():
         return _menu(cols), []
     columns, table_context, _dropped = select_relevant_context(
-        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles, client=client)
+        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles, client=client,
+        actor=actor)
     return columns, table_context
 
 
@@ -2345,7 +2360,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
     try:
         menu, table_context = _build_menu(
             conn, cols, objective=objective, entity=entity, scope=scope, roles=roles,
-            client=client)
+            client=client, actor=actor)
     except ContextTooLarge as exc:
         logger.warning("feature context too large for %r: %s", objective, exc)
         return [], [{"name": "", "reason": str(exc), "code": RejectCode.CONTEXT_TOO_LARGE}]
@@ -2518,7 +2533,7 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
             "aggregation": idea.get("aggregation"), "issue": instruction}]
     try:
         menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity,
-                                          roles=roles, client=client)
+                                          roles=roles, client=client, actor=actor)
     except ContextTooLarge as exc:
         return None, {"name": str(idea.get("name", "")), "reason": str(exc),
                       "code": RejectCode.CONTEXT_TOO_LARGE}
@@ -2570,7 +2585,7 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     known = {c["object_ref"] for c in cols}
     try:
         menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles,
-                                          client=client)
+                                          client=client, actor=actor)
     except ContextTooLarge as exc:
         logger.warning("feature-recipe context too large for %r: %s", nl_query, exc)
         return Recipe(intent=nl_query, grain_table=None, derives_from=[], aggregation=None,
