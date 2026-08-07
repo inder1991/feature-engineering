@@ -342,11 +342,21 @@ def _bounded(val: str | None, max_len: int) -> str | None:
     not shortened, not salvaged — leaving the column with no AI definition and a failure that looked
     like a provider blip.
 
-    M9's intent is kept by two narrower guards that do the real work:
+    M9's intent is kept by two narrower guards:
       * `startswith("[")` catches the stringified-list form INDEPENDENTLY — relaxing newlines never
         weakened it (the earlier claim that it did was wrong);
-      * `_is_enumeration` catches what the newline ban uniquely caught: a multi-line bulleted or
-        numbered answer. That, and only that, was the cost.
+      * `_is_enumeration` catches the multi-line bulleted or numbered answer.
+
+    WHAT IS NOW ADMISSIBLE AND WAS NOT — stated rather than glossed, because an earlier revision of
+    this note claimed the enumeration was the ONLY thing the newline ban uniquely caught, and it was
+    not: a multi-line JSON OBJECT or YAML dump (`{\\n  "definition": "..."\\n}`) now passes every
+    relaxed gate. `startswith("[")` covers arrays only, so nothing refuses an object.
+
+    DELIBERATELY NOT GUARDED. The asymmetry decides it: a false negative caches an ugly but VISIBLE
+    value that a human can see and fix, while a false positive leaves the column with NO definition
+    and a silent failure indistinguishable from a provider blip. Erring loose is right here, and a
+    structural-output model returning a JSON blob inside a JSON string field is a schema-level
+    malfunction that a shape guard on this seam would only half-catch anyway.
     """
     if not val or len(val) > max_len or val.startswith("[") or _is_enumeration(val):
         return None
@@ -371,10 +381,39 @@ def _accept_concept(raw: str) -> tuple[str | None, str]:
 
 
 def _accept_bounded(max_len: int):
-    """Accept a plausible short single-line value (reuses _bounded); else invalid -> not cached."""
+    """Accept a plausible bounded, non-list-shaped value (reuses `_bounded`); else invalid -> not
+    cached. NEWLINES ARE ALLOWED — see `_bounded`. A gate whose value must stay on ONE line uses
+    `_accept_single_line` instead."""
     def _accept(raw: str) -> tuple[str | None, str]:
         v = _bounded(raw, max_len)
         return (v, "valid") if v is not None else (None, "invalid_value")
+    return _accept
+
+
+def _accept_single_line(max_len: int):
+    """`_accept_bounded` PLUS the single-line rule `_bounded` no longer enforces globally.
+
+    `_bounded` stopped rejecting newlines so a long DEFINITION could be paragraphed. Two gates must
+    NOT inherit that relaxation, and both keep their pre-relaxation behaviour byte-for-byte:
+
+      * `domain` — a grouping-key LABEL, never prose. A multi-line label mints a malformed group,
+        and it flows into `_accept_domain_result` as both the table default and the column overrides.
+      * `synonyms` — the answer is parsed by splitting on COMMAS
+        (`ingest._project_semantic_terms`: `for term in (ev.proposed_value or "").split(",")`), and
+        `_SYN_INSTRUCTION` asks for "ONE comma-separated line per item". A newline-separated answer
+        would be cached and projected as a SINGLE term ("account number\\nacct num\\nacc #") rather
+        than three, with the whole blob as its dedupe key — silently worse than the rejection it
+        replaced, because a rejected item is retried.
+
+    `unit` needs no equivalent: `_UNIT_TOKEN_RE.fullmatch` excludes newlines by construction.
+    """
+    bounded = _accept_bounded(max_len)
+
+    def _accept(raw: str) -> tuple[str | None, str]:
+        value, reason = bounded(raw)
+        if value is None:
+            return None, reason
+        return (None, "invalid_value") if "\n" in value else (value, "valid")
     return _accept
 
 
@@ -406,17 +445,15 @@ def _accept_domain(max_len: int):
     rejects a prompt/task echo or an internal dotted identifier (``_is_task_echo``). A rejected value
     is invalid -> treated as failure -> NOT cached (M3), same as any other reject. Domains stay
     open-vocabulary: no controlled list — only our own task/namespace identifiers are filtered out."""
-    bounded = _accept_bounded(max_len)
+    # `_accept_single_line`, not `_accept_bounded`: a domain is a grouping-key LABEL and must not
+    # inherit the newline relaxation made for paragraphed definitions. See that helper for why.
+    bounded = _accept_single_line(max_len)
 
     def _accept(raw: str) -> tuple[str | None, str]:
         value, reason = bounded(raw)
         if value is None:
             return None, reason
-        # A domain is a LABEL (a grouping key), not prose. `_bounded` stopped rejecting newlines so
-        # a long DEFINITION could be paragraphed; that relaxation has no business reaching here, and
-        # this keeps the domain gate byte-for-byte what it was. `unit` needs no equivalent — its
-        # `_UNIT_TOKEN_RE` fullmatch already excludes newlines by construction.
-        if "\n" in value or _is_task_echo(value):
+        if _is_task_echo(value):
             return None, "invalid_value"
         return value, "valid"
     return _accept
@@ -2492,7 +2529,11 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     by_hash = {content_hash(r): r for r in rows}
     bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
     rec_of = _rec_lookup(glossary)
-    accept = _accept_bounded(_MAX_SYNONYMS_LEN)
+    # SINGLE LINE, not merely bounded: the consumer splits this on COMMAS
+    # (`ingest._project_semantic_terms`) and `_SYN_INSTRUCTION` asks for one comma-separated line,
+    # so a newline-separated answer would be projected as ONE term instead of several. The 2026-08-06
+    # newline relaxation was for paragraphed DEFINITIONS and must not reach this gate.
+    accept = _accept_single_line(_MAX_SYNONYMS_LEN)
 
     if enrich_config.mode("synonyms") == "batch":
         # Group by table so table context is sent once; the prompt isolates items (anti-contamination).

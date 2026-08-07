@@ -195,6 +195,41 @@ def test_a_LIST_SHAPED_answer_is_still_refused() -> None:
     assert accept("The balance as of 1. the posting date, per policy.")[1] == "valid"
 
 
+def test_the_newline_relaxation_did_NOT_reach_the_comma_parsed_gates() -> None:
+    """`_bounded` backs five accept gates; the relaxation was for paragraphed DEFINITIONS only.
+
+    Two gates would have been silently damaged by inheriting it, and both keep their pre-relaxation
+    behaviour:
+
+      * `synonyms` — the consumer is `ingest._project_semantic_terms`, which does
+        `(ev.proposed_value or "").split(",")`, and `_SYN_INSTRUCTION` asks for "ONE comma-separated
+        line per item". A newline-separated answer would be cached and projected as ONE term with
+        the whole blob as its dedupe key, instead of three terms. Silently WORSE than the rejection
+        it replaced, because a rejected item is retried.
+      * `domain` — a grouping-key LABEL flowing into `_accept_domain_result` as both the table
+        default and the column overrides; a multi-line label mints a malformed group.
+    """
+    listy = "account number\nacct num\nacc #"
+
+    syn = enrich._accept_single_line(enrich._MAX_SYNONYMS_LEN)
+    assert syn(listy) == (None, "invalid_value")
+    assert syn("account number, acct num, acc #")[1] == "valid"     # the shape the prompt asks for
+
+    dom = enrich._accept_domain(64)
+    assert dom("Compliance\nRetail Banking") == (None, "invalid_value")
+    assert dom("Compliance")[1] == "valid"
+
+    # …while the DEFINITION gate, the one the relaxation was for, still takes it.
+    assert enrich._accept_bounded(llm.MAX_DEFINITION_LEN)("First para.\n\nSecond para.")[1] == "valid"
+
+    # The consumer's contract is the reason, so pin it rather than describing it: comma is the only
+    # separator it knows.
+    import inspect
+
+    from featuregen.overlay.upload import ingest
+    assert '.split(",")' in inspect.getsource(ingest._project_semantic_terms)
+
+
 def test_the_prompt_and_the_gate_AGREE_about_shape() -> None:
     """The instruction used to ask for a "one-line" definition, which at a 32_000-char cap invited
     exactly the shape the caps were widened to stop forcing. A model must never be asked for output

@@ -61,14 +61,30 @@ _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
 # `len(unresolved) > b.min_split` and `min_split` is 4, so a definition chunk can never satisfy it;
 # a chunk failing past its batch retries now goes straight to per-item single fallback.
 #
-# That is the RIGHT outcome, not a gap, and `min_split` is deliberately NOT lowered for this stage:
+# PER-STAGE LOWERING OF `min_split` WAS NEVER AN OPTION. `budget(short)` takes `short` and NEVER
+# READS IT — every field is a global env lookup — so `OVERLAY_ENRICH_MIN_SPLIT` moves the tier for
+# EVERY stage or none. (An earlier revision of this note said min_split was "deliberately not
+# lowered for this stage", which implied a choice that does not exist without new plumbing.) The
+# decision is therefore to accept the tier's loss here, and it is the right one:
 #   * the split tier exists to avoid paying PER-ITEM cost on a LARGE chunk — splitting 20 concept
 #     items to 10+10 to 5+5 is far cheaper than 20 single calls. At 4 items there is no such saving.
 #   * single fallback resolves each of the 4 items INDEPENDENTLY, which is strictly better isolation
 #     than a 2+2 re-batch, where one poisoned item can still take its partner down.
-#   * it costs no more budget: `max_single_fallback` (8) is a PER-RUN cap, and a failing 4-item chunk
-#     consumes at most 4 of it where a failing 8-item chunk consumed up to 8 — the budget now
-#     stretches across MORE chunks, not fewer.
+#   * the size-driven failure the tier existed to recover from is DESIGNED OUT by moving to 4: an
+#     over-long chunk is exactly what 4 items prevents.
+#
+# BUT THE FAILURE LADDER IS GENUINELY SHORTER, and that is the honest cost. An 8-item chunk failing
+# `keep_threshold` used to split into 4+4, each half re-entering `process` with a FRESH
+# `max_batch_attempts` — a recovery rung that cost ZERO single-fallback budget. A 4-item chunk now
+# spends that budget immediately, so `left_uncached` arrives EARLIER on a run with several failing
+# chunks. Worth stating: the tier was not only a cost optimisation.
+#
+# NOT a compensating gain, and previously miscounted here: `max_single_fallback` (8) is a PER-RUN
+# cap, and halving `max_items` DOUBLES the chunk count, so 8 fallback calls rescue exactly 8 items
+# either way. That is a wash, not a saving. The real offsetting fact is the worst-case CALL count:
+# two failing 4-item chunks cost ~6 batch + 8 fallback, against ~3 batch + 6 split-batch + 8
+# fallback for one failing 8-item chunk.
+#
 # Pinned by `test_enrich_batch.py::test_the_split_tier_is_intentionally_unreachable_for_definitions`,
 # so if `max_items` is ever raised back above `min_split` the tier silently reactivates and that
 # test is what says so.
