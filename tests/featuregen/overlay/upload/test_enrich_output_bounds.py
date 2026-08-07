@@ -142,25 +142,73 @@ def test_the_summary_chunk_has_no_response_ceiling_problem() -> None:
         f"acquired the problem that moved `definition` to 4")
 
 
-def test_the_REMAINING_ceiling_on_a_long_definition_is_the_SINGLE_LINE_rule() -> None:
-    """The bound that still stops a 32_000-char definition short, documented rather than discovered.
+def test_a_PARAGRAPHED_definition_is_accepted_whole() -> None:
+    """The rule this file used to pin the other way round, now relaxed by human decision.
 
-    `_bounded` rejects on `"\\n" in val` (M9 — it also catches a list-stringified `['a','b']` dump).
-    That rule was written when the cap was 200-600 chars, where "a definition is one line" is a fair
-    description. At 32_000 it is the effective ceiling on ACHIEVABLE length: a model writing a long
-    definition will paragraph it, and the whole value is then DISCARDED — not shortened, not
-    salvaged to its first line. The prompt does say "one-line", so this is consistent; it is
-    recorded here because "the cap is 32_000" and "you can get 32_000 chars back" are different
-    claims, and only the first is true without qualification.
+    `_bounded` rejected any value containing a newline (M9). That was fair when the cap was 200-600
+    chars — "a definition is one line" describes a 600-char definition. At `MAX_DEFINITION_LEN` =
+    32_000 it had become the binding ceiling on ACHIEVABLE length: a model writing a long definition
+    paragraphs it, and the whole value was DISCARDED — not shortened, not salvaged to its first
+    line — leaving the column with no AI definition at all, indistinguishable from a provider blip.
 
-    NOT changed here: relaxing it is a real decision about what a malformed definition looks like,
-    not a mechanical raise, and it would weaken the list-dump guard in the same stroke.
+    Accepted WHOLE is the assertion that matters: not truncated at the first newline, not
+    normalised. What the model wrote is what is cached.
     """
     accept = enrich._accept_bounded(llm.MAX_DEFINITION_LEN)
-    one_line = "A single unbroken sentence. " * 100
-    assert accept(one_line[:llm.MAX_DEFINITION_LEN])[1] == "valid"
-    # The same text, paragraphed, is refused OUTRIGHT — length is not what decides it.
-    assert accept("First paragraph.\nSecond paragraph.") == (None, "invalid_value")
+    paragraphed = ("The posted settlement amount for the transaction.\n\n"
+                   "It is denominated in the transaction currency and excludes fees, which are "
+                   "carried separately.\n\n"
+                   "For reversals the sign is inverted rather than a separate row being written.")
+    value, reason = accept(paragraphed)
+    assert reason == "valid"
+    assert value == paragraphed                    # whole, byte-for-byte
+
+    # A long paragraphed definition at the cap survives too — the point of the raise.
+    long_prose = ("A paragraph about the column's meaning and derivation.\n\n" * 2000)
+    long_prose = long_prose[:llm.MAX_DEFINITION_LEN]
+    assert accept(long_prose) == (long_prose, "valid")
+
+
+def test_a_LIST_SHAPED_answer_is_still_refused() -> None:
+    """M9's real intent, kept by a targeted guard instead of a blanket newline ban.
+
+    The earlier justification for keeping the ban — "it protects the list-dump guard" — was wrong:
+    `startswith("[")` catches the stringified `['a','b']` form INDEPENDENTLY. What the newline ban
+    uniquely caught is a multi-LINE enumeration, and that is exactly what `_is_enumeration` now
+    catches on its own.
+    """
+    accept = enrich._accept_bounded(llm.MAX_DEFINITION_LEN)
+    for listy in ("- the account number\n- the branch code\n- the currency",
+                  "1. the account number\n2. the branch code",
+                  "1) first thing\n2) second thing",
+                  "(a) first thing\n(b) second thing",
+                  "* alpha\n* beta\n* gamma"):
+        assert accept(listy) == (None, "invalid_value"), listy
+    # The stringified-list form is refused by its OWN guard, with no help from the newline rule.
+    assert accept("['alpha', 'beta']") == (None, "invalid_value")
+    assert enrich._is_enumeration("['alpha', 'beta']") is False   # …and not by this one
+
+    # ONE marker-led line is prose, not a list: a sentence may legitimately open with a dash or a
+    # numeral, and refusing that would re-create the over-rejection this change exists to remove.
+    assert accept("- a single dashed clause about the column") == (
+        "- a single dashed clause about the column", "valid")
+    assert accept("The balance as of 1. the posting date, per policy.")[1] == "valid"
+
+
+def test_the_prompt_and_the_gate_AGREE_about_shape() -> None:
+    """The instruction used to ask for a "one-line" definition, which at a 32_000-char cap invited
+    exactly the shape the caps were widened to stop forcing. A model must never be asked for output
+    the gate then discards, in either direction."""
+    import inspect
+
+    # CODE only: the comments in this function narrate the "one-line" history on purpose, and
+    # matching them would make this test unfixable-by-construction.
+    code = "\n".join(ln for ln in inspect.getsource(enrich.draft_definitions).splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "one-line" not in code, "the drafting instruction still asks for one line"
+    assert code.count("never a bulleted") + code.count("not a bulleted") == 2, (
+        "BOTH instructions (batch and single mode) must name the one shape `_is_enumeration` "
+        "still refuses — a model must never be asked for output the gate discards")
 
 
 def test_an_accepted_definition_survives_every_consumer_at_the_new_length() -> None:

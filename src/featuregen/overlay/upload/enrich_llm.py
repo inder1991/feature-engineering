@@ -1634,12 +1634,19 @@ _MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 # 32_000 is ~33x the widest real value and 53x the original 600 — deliberately far past any observed
 # input, and still a bound, so a 1 MB "definition" is caught rather than egressed.
 #
-# BOTH DIRECTIONS ARE INTENDED. This constant is the egress cap on what we SEND
-# (`_MAX_LEN_BY_KEY` -> `_item_len_ok`, and `enrich.bounded_definition`'s window), and it is also the
-# admissibility bound on Pass-B/Pass-A material RE-THREADED into a later stage's item metadata. It is
-# NOT an accept gate on model OUTPUT: each drafting stage bounds its own answer separately
-# (`enrich._accept_bounded(500)` for the definition stage, 400 for summary, `_MAX_SYNONYMS_LEN` for
-# synonyms), so raising this does not by itself let a model write a longer definition.
+# BOTH DIRECTIONS ARE INTENDED, AND BOTH ARE NOW WIRED. This constant is the egress cap on what we
+# SEND (`_MAX_LEN_BY_KEY` -> `_item_len_ok`, and `enrich.bounded_definition`'s window), the
+# admissibility bound on Pass-B/Pass-A material RE-THREADED into a later stage's item metadata, AND
+# — since the inbound fix — the ACCEPT gate on what the model may WRITE back: `draft_definitions`
+# passes exactly this constant to `_accept_bounded`, and `_SCHEMAS["overlay_definition_batch"]`
+# carries it as `definition.maxLength`.
+#
+# (An earlier revision of this note said the opposite — "it is NOT an accept gate on model OUTPUT …
+# so raising this does not by itself let a model write a longer definition". That was TRUE when
+# written and is the exact half-finished state the inbound fix closed: the accept gate then read
+# `_accept_bounded(500)`, below even the original 600. Raising this constant now moves both
+# directions, which is why the schema/code pairs are pinned equal by `test_enrich_output_bounds.py`
+# — the two fail differently, per-item vs whole-chunk, so they must never drift apart again.)
 #
 # WHAT HAD TO MOVE WITH IT — `enrich_config._DEFAULT_MAX_INPUT_TOKENS`. A definition at this cap is
 # 8_000 estimated tokens (the estimator is exactly `len(json)//4`), so `max_items` of them no longer

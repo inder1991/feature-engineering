@@ -362,3 +362,24 @@ def test_definition_cache_key_includes_concept(db):
     from featuregen.overlay.upload.enrich import _def_cache_key
     row = CanonicalRow("deposits", "accounts", "bal", "numeric")
     assert _def_cache_key(content_hash(row), "monetary_stock") != _def_cache_key(content_hash(row), "")
+
+
+def test_the_split_tier_is_intentionally_unreachable_for_definitions():
+    """A failure-mode consequence of `max_items("definition")` 8 -> 4, decided rather than discovered.
+
+    `run_batched`'s adaptive-split tier fires on `len(unresolved) > b.min_split`. With `min_split`
+    at 4 and a definition chunk holding at most 4 items, that condition can never hold: a definition
+    chunk failing past its batch retries goes STRAIGHT to per-item single fallback.
+
+    That is the intended outcome and `min_split` is deliberately not lowered for this stage — the
+    split tier exists to avoid per-ITEM cost on a LARGE chunk (20 concept items to 10+10 to 5+5
+    beats 20 single calls), and at 4 items there is no such saving while single fallback gives
+    strictly better isolation. This test is what fires if `max_items` is ever raised back above
+    `min_split` and the tier silently reactivates, so the rationale gets re-read rather than assumed.
+    """
+    assert cfg.max_items("definition") <= cfg.budget("definition").min_split, (
+        "the split tier is reachable again for definitions — re-read the note on "
+        "`_DEFAULT_MAX_ITEMS` before relying on either behaviour")
+    # The stages that DO still reach it, so this is a real distinction and not a vacuous inequality.
+    assert cfg.max_items("concept") > cfg.budget("concept").min_split
+    assert cfg.max_items("summary") > cfg.budget("summary").min_split

@@ -313,10 +313,42 @@ def _single_ctx(ingestion_run_id: str | None, stage: str,
                                 subjects=(subject,))
 
 
+#: A line that opens with an ENUMERATION marker — `- x`, `* x`, `• x`, `1. x`, `2) x`, `(3) x`,
+#: `a. x`. Anchored at line start, so prose that merely contains a dash or a number is untouched.
+_ENUMERATION_LINE_RE = re.compile(r"[ \t]*(?:[-*•·–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)])[ \t]+\S")
+
+
+def _is_enumeration(val: str) -> bool:
+    """True when the value is a multi-line LIST rather than multi-paragraph PROSE.
+
+    M9's newline ban used to catch this, at the cost of also refusing every legitimate paragraphed
+    definition. Two or more marker-led lines is the signal: one is an ordinary sentence that happens
+    to start with a dash or a numeral, several is a model answering with a bulleted list.
+    """
+    lines = [ln for ln in val.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    return sum(1 for ln in lines if _ENUMERATION_LINE_RE.match(ln)) >= 2
+
+
 def _bounded(val: str | None, max_len: int) -> str | None:
-    """Accept a plausible short single-line label/definition; reject empty, over-long, multiline,
-    or list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching."""
-    if not val or len(val) > max_len or "\n" in val or val.startswith("["):
+    """Accept a plausible label/definition; reject empty, over-long, LIST-SHAPED, or
+    list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching.
+
+    NEWLINES ARE ALLOWED (2026-08-06, human decision). The blanket `"\\n" in val` ban was written
+    when the definition cap was 200-600 chars, where "a definition is one line" was a fair
+    description. At `MAX_DEFINITION_LEN` = 32_000 it had become the binding ceiling on ACHIEVABLE
+    length: a model writing a long definition paragraphs it, and the whole value was DISCARDED —
+    not shortened, not salvaged — leaving the column with no AI definition and a failure that looked
+    like a provider blip.
+
+    M9's intent is kept by two narrower guards that do the real work:
+      * `startswith("[")` catches the stringified-list form INDEPENDENTLY — relaxing newlines never
+        weakened it (the earlier claim that it did was wrong);
+      * `_is_enumeration` catches what the newline ban uniquely caught: a multi-line bulleted or
+        numbered answer. That, and only that, was the cost.
+    """
+    if not val or len(val) > max_len or val.startswith("[") or _is_enumeration(val):
         return None
     return val
 
@@ -380,7 +412,11 @@ def _accept_domain(max_len: int):
         value, reason = bounded(raw)
         if value is None:
             return None, reason
-        if _is_task_echo(value):
+        # A domain is a LABEL (a grouping key), not prose. `_bounded` stopped rejecting newlines so
+        # a long DEFINITION could be paragraphed; that relaxation has no business reaching here, and
+        # this keeps the domain gate byte-for-byte what it was. `unit` needs no equivalent — its
+        # `_UNIT_TOKEN_RE` fullmatch already excludes newlines by construction.
+        if "\n" in value or _is_task_echo(value):
             return None, "invalid_value"
         return value, "valid"
     return _accept
@@ -2259,7 +2295,15 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
             conn, client, short="definition", task=_DEF_TASK,
             prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
             shared_metadata={}, items=items, out_key="definition",
-            instruction="Draft a one-line business definition for EACH column. Treat each item "
+            # The instruction USED to say "one-line", which stopped being coherent when
+            # MAX_DEFINITION_LEN reached 32_000 and the accept gate began allowing paragraphs: it
+            # asked for exactly the shape the caps were widened to stop forcing. It now asks for a
+            # complete definition and names the ONE shape still refused (`_is_enumeration`), so the
+            # prompt and the gate agree — a model is never invited to produce output we discard.
+            instruction="Draft a complete business definition for EACH column. Write as much as the "
+                        "column genuinely needs — one sentence for an obvious field, several "
+                        "paragraphs where the meaning, derivation or caveats warrant it. Write "
+                        "flowing PROSE, not a bulleted or numbered list. Treat each item "
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
                         "exactly one result per input ref.",
@@ -2290,7 +2334,11 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                                      "table": row.table, "column": row.column, "type": row.type},
                                      row=row, rec=rec_of(row)),
                                  "definition",
-                                 "Draft a one-line business definition for this column.",
+                                 # Kept in step with the batch instruction above: prose, any
+                                 # length up to the cap, never a bulleted list.
+                                 "Draft a complete business definition for this column. Write as "
+                                 "much as it genuinely needs, as flowing prose — never a bulleted "
+                                 "or numbered list.",
                                  actor,
                                  _single_ctx(ingestion_run_id, "enrich_definition",
                                              _column_subject(row))), MAX_DEFINITION_LEN)

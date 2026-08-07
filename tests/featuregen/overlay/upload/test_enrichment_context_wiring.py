@@ -642,7 +642,9 @@ def test_a_DEGENERATE_source_attribute_fill_degrades_proportionally_and_never_tr
 
     No observed file comes near this — FTR has 17 headers in total — but a mapping export with 256
     unmapped governance headers each at 1000 chars is now admissible, and it costs ~72_000 estimated
-    tokens per item. Packing falls to 2 of 8. That is the documented, ACCEPTABLE failure mode:
+    tokens per item. Packing falls BELOW the stage's `max_items` (to 2, whether that ceiling is the
+    8 this was written at or the 4 `definition` now carries). That is the documented, ACCEPTABLE
+    failure mode:
     `chunk_items` never drops an item for size (an over-budget item forms its own chunk), so the
     stage degrades PROPORTIONALLY into more calls, and the deployed per-stage ceiling still clears
     the result. What must never happen is a lost column.

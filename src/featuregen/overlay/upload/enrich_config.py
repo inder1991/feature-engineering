@@ -55,6 +55,23 @@ _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
 # `summary` was checked against the same arithmetic and deliberately LEFT at 8: its accept bound is
 # `enrich._MAX_SUMMARY_LEN` = 1000 chars = ~250 output tokens, so 8 items is ~2_000 tokens — 6% of
 # the 32_000 ceiling. It has no output-token problem to fix.
+#
+# A FAILURE-MODE CONSEQUENCE, decided rather than discovered: at 4 items the ADAPTIVE-SPLIT tier of
+# `enrich_batch`'s degradation ladder becomes unreachable for this stage. The tier fires on
+# `len(unresolved) > b.min_split` and `min_split` is 4, so a definition chunk can never satisfy it;
+# a chunk failing past its batch retries now goes straight to per-item single fallback.
+#
+# That is the RIGHT outcome, not a gap, and `min_split` is deliberately NOT lowered for this stage:
+#   * the split tier exists to avoid paying PER-ITEM cost on a LARGE chunk — splitting 20 concept
+#     items to 10+10 to 5+5 is far cheaper than 20 single calls. At 4 items there is no such saving.
+#   * single fallback resolves each of the 4 items INDEPENDENTLY, which is strictly better isolation
+#     than a 2+2 re-batch, where one poisoned item can still take its partner down.
+#   * it costs no more budget: `max_single_fallback` (8) is a PER-RUN cap, and a failing 4-item chunk
+#     consumes at most 4 of it where a failing 8-item chunk consumed up to 8 — the budget now
+#     stretches across MORE chunks, not fewer.
+# Pinned by `test_enrich_batch.py::test_the_split_tier_is_intentionally_unreachable_for_definitions`,
+# so if `max_items` is ever raised back above `min_split` the tier silently reactivates and that
+# test is what says so.
 _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 4, "domain": 8, "synonyms": 8, "unit": 8,
                       "summary": 8, "table_synth": 4}
 
@@ -116,9 +133,12 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 4, "domain": 8, "synonyms": 8
 # * definition/synonyms/unit (2,160 = 27% of 8000) and summary (2,176 = 16% of 14000) keep their
 #   bounds: the margin is measured, not assumed.
 #
-# `_DEFAULT_MAX_ITEMS` is deliberately UNCHANGED everywhere. Those are cross-item CONTAMINATION
+# `_DEFAULT_MAX_ITEMS` was deliberately UNCHANGED by THIS raise. Those are cross-item CONTAMINATION
 # isolation boundaries (MF-8a above), not size limits; shrinking them to pay for bigger payloads
 # would trade an accuracy control for a byte budget and multiply the call count at the same time.
+# (`definition` was LOWERED 8 -> 4 later, for an OUTPUT-token reason no budget in this file models —
+# see the note on `_DEFAULT_MAX_ITEMS` itself. Lowering moves WITH the MF-8a rationale; the rule
+# these paragraphs state is that nothing here may be RAISED to pay for bytes.)
 #
 # NOTE on `estimate_tokens` and `shared_metadata` (the honest accounting): the estimator measures
 # ITEM metadata only. That is CORRECT for the one shared block that exists — the ~276-concept
@@ -146,9 +166,10 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 4, "domain": 8, "synonyms": 8
 # failure mode of a tight bound here is a shattered chunking and a truncated stage, while the
 # failure mode of a loose one is a chunk that packs its full `_DEFAULT_MAX_ITEMS`.
 #
-# `_DEFAULT_MAX_ITEMS` is STILL unchanged, for the reason stated above: those are contamination
-# boundaries, not size limits. Raising the token budgets is exactly how you avoid having to touch
-# them. Packing at the new caps is pinned by
+# `_DEFAULT_MAX_ITEMS` was not RAISED here either, for the reason stated above: those are
+# contamination boundaries, not size limits. Raising the token budgets is exactly how you avoid
+# having to touch them. (`definition` was later LOWERED to 4 — a different question, decided by the
+# response ceiling rather than by this input budget.) Packing at the new caps is pinned by
 # `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`.
 #
 # ── MAX_DEFINITION_LEN 4000 -> 32_000 (2026-08-06, second raise) ──────────────────────────────────
@@ -236,7 +257,10 @@ _DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 4, "domain": 8, "synonyms": 8
 # column (thousands), so one call per table is a cost the call ceiling absorbs. Recorded here so the
 # next reader does not "discover" it as a regression of this change. It is not one.
 #
-# `_DEFAULT_MAX_ITEMS` is, once again, UNCHANGED.
+# `_DEFAULT_MAX_ITEMS` was, once again, not RAISED by any of the above. The ONE movement it has had
+# is `definition` 8 -> 4 (a LOWERING, decided by the response ceiling — see its own note), so the
+# invariant these blocks defend still holds: no isolation boundary has ever been widened to buy
+# bytes.
 _DEFAULT_MAX_INPUT_TOKENS = {"concept": 400_000, "definition": 200_000, "domain": 200_000,
                              "synonyms": 200_000, "unit": 200_000, "summary": 200_000,
                              "table_synth": 60_000}

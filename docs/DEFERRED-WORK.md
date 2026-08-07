@@ -1335,3 +1335,31 @@ pinned by tests (`test_a_realistic_source_attribute_fill_still_packs_a_full_chun
 observed; CIB's header count is unmeasurable here because the file is absent. **Closure:** if such a
 file appears, decide whether the count cap should track the observed header count rather than the
 egress ceiling — the length cap should not move.
+
+#### A.50 addendum 2 — a 32_000-char definition is now PRODUCIBLE, which makes the v4 trim reachable on a narrow catalog (2026-08-06)
+
+Two changes closed the inbound half of the zero-truncation work: the definition accept gate and its
+paired schema `maxLength` moved from 500 to `MAX_DEFINITION_LEN` (32_000), and `enrich._bounded`'s
+blanket newline ban was replaced with a targeted `_is_enumeration` guard, so a model may now return a
+paragraphed definition instead of having it discarded whole.
+
+**The consequence to record:** `FEATURE_CONTEXT_BYTE_BUDGET` (1_500_000) ÷ 32_000 ≈ **46 columns** of
+full-length definitions before `_V4_TRIM_ORDER` starts shedding `definition` from the
+feature-generation payload. That shed was always reachable on catalog WIDTH (~1_470 columns at the
+measured ~1_019 bytes/column). It is now also reachable on a NARROW catalog, because 32_000-char
+drafted definitions are producible for the first time — 46 such columns is a small table.
+
+The degradation is graceful and already implemented: `_V4_TRIM_ORDER` sheds prose per-kind, longest
+category first, and a mandatory column is never dropped — a missing grain or time column would
+produce a confidently wrong feature, which is why the trim policy exists. So this is a recorded
+interaction, not a defect.
+
+**No action taken.** Raising the byte budget again to cover it would be premature: no catalog has
+produced even one 32_000-char definition yet, the figure is a ceiling rather than an expectation
+(the widest real definition measured is 960 chars), and the right response depends on whether long
+definitions turn out to be common or pathological.
+
+**Trigger:** the first ingest that produces definitions averaging over ~10_000 chars, or any
+observation of `_V4_TRIM_ORDER` shedding `definition` on a catalog under ~200 columns. **Closure:**
+decide whether the budget should scale with observed definition length, or whether the drafting
+prompt should target a shorter definition, rather than raising a constant against a hypothetical.
