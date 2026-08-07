@@ -176,14 +176,18 @@ def test_an_over_budget_mandatory_set_is_trimmed_before_it_is_refused(wide_catal
     # Between the measured fully-trimmed floor and the untrimmed cost: the only way to serve every
     # mandatory column here is to shed prose.
     #
-    # RE-MEASURED 2026-08-07 (Task 7b): floor 203_629 -> 214_433, untrimmed 248_600 -> 259_405, so
-    # the old 210_000 pin had fallen BELOW the floor and this test refused instead of trimming. The
-    # floor rose because the two fields Task 7b adds are only PARTLY trimmable: the payload's
-    # `business_term`/`related_terms` do shed with the prose ladder's tail, but their
-    # `semantic_authority` entries do NOT — that key is deliberately un-trimmable, because a payload
-    # that sheds the authority labels makes an AI proposal look like a resolved fact.
+    # RE-MEASURED 2026-08-07 (Task 7b): floor 206_010 -> 214_433, untrimmed 250_982 -> 259_405, so
+    # the old 210_000 pin had fallen BELOW the floor and this test refused instead of trimming.
     #
-    # It is a 5.3% rise in the FLOOR, not in the budget: `FEATURE_CONTEXT_BYTE_BUDGET` is 1_500_000,
+    # WHY THE FLOOR ROSE, corrected — the first version of this note claimed the new fields "shed
+    # with the prose ladder's tail" and that was simply false. `_V4_TRIM_ORDER` is unchanged, so
+    # NOTHING Task 7b added is trimmable: `business_term`, `related_terms` and their two
+    # `semantic_authority` entries all survive a full trim. The floor therefore rose by exactly what
+    # the payload rose by, +8_423 — pinned as an equality by
+    # `test_the_floor_rose_by_exactly_what_the_payload_rose_by`, which also reconstructs the BEFORE
+    # numbers in-process so neither side can go stale again.
+    #
+    # It is a 4.1% rise in the FLOOR, not in the budget: `FEATURE_CONTEXT_BYTE_BUDGET` is 1_500_000,
     # ~7x this figure, so no real catalog trims at all. Re-pinned to a MEASURED midpoint.
     columns, _ctx, dropped = select_relevant_context(
         wide_catalogs, _candidates(wide_catalogs), objective="customer balance", entity="customer",
@@ -245,35 +249,108 @@ def test_enrichment_is_lazy_so_a_dropped_column_is_never_assembled(wide_catalogs
 
 # ── Task 7b: what the curated human context costs ───────────────────────────────────────────────
 
+#: The per-column keys Task 7b added. Named here so the baseline below is RECONSTRUCTED rather than
+#: remembered — every "before" number in this file is then a same-commit measurement.
+_TASK_7B_COLUMN_KEYS = ("business_term", "related_terms")
+
+
+def _without_task_7b(column: dict) -> dict:
+    """One v4 column payload as it stood BEFORE Task 7b. Nothing else about the column moved, so
+    this is an exact reconstruction, not an approximation."""
+    out = {k: v for k, v in column.items() if k not in _TASK_7B_COLUMN_KEYS}
+    if isinstance(out.get("semantic_authority"), dict):
+        out["semantic_authority"] = {k: v for k, v in out["semantic_authority"].items()
+                                     if k not in _TASK_7B_COLUMN_KEYS}
+    return out
+
+
+def test_the_floor_rose_by_exactly_what_the_payload_rose_by(wide_catalogs, monkeypatch,
+                                                            record_property):
+    """The reconciliation, MEASURED at one commit — and the reason the first version of this
+    explanation was wrong.
+
+    That version said `business_term`/`related_terms` "shed with the prose ladder's tail". They do
+    not: `_V4_TRIM_ORDER` is `(semantic_terms, ai_summary, definition, relationships, concept_path)`
+    and Task 7b did not touch it, so NOTHING it added is trimmable. The trimmed set is a strict
+    subset of the untrimmed one, so if nothing added is sheddable the two deltas must be EQUAL —
+    and the committed figures (+10_804 floor against +8_423 payload) could not both be true. The
+    stale one was the 203_629 floor baseline: it dates from the 2026-08-06 measurement, when the
+    untrimmed payload was 241_491, and it was never re-measured when Task 6 moved the payload to
+    250_982. Reconstructing the baseline in-process removes the class of error entirely.
+
+    MEASURED HERE (237 columns, 2 tables): floor 206_010 -> 214_433, payload 250_982 -> 259_405 —
+    the same +8_423, un-sheddable, as the equality below now enforces.
+    """
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
+    cols = _candidates(wide_catalogs)
+    base = _table_context(cols)
+    full = [fa._context_column(wide_catalogs, c, roles=()) for c in cols]
+    trimmed = [fa._trimmed(c, len(fa._V4_TRIM_ORDER)) for c in full]
+
+    untrimmed_now = _assembled_bytes(full, base)
+    untrimmed_before = _assembled_bytes([_without_task_7b(c) for c in full], base)
+    floor_now = _assembled_bytes(trimmed, base)
+    floor_before = _assembled_bytes([_without_task_7b(c) for c in trimmed], base)
+
+    record_property("floor_before", floor_before)
+    record_property("floor_now", floor_now)
+    # The reconstructed baselines, pinned so the prose above is checkable and not remembered.
+    assert (floor_before, untrimmed_before) == (206_010, 250_982), (
+        f"reconstructed baseline moved: floor {floor_before}, payload {untrimmed_before}")
+    assert not set(_TASK_7B_COLUMN_KEYS) & set(fa._V4_TRIM_ORDER), (
+        "a Task-7b key became trimmable — the equality below no longer has to hold, and the "
+        "explanation above needs rewriting rather than the assertion relaxing")
+    assert floor_now - floor_before == untrimmed_now - untrimmed_before, (
+        f"floor +{floor_now - floor_before} vs payload "
+        f"+{untrimmed_now - untrimmed_before}: impossible while nothing added is sheddable")
+    assert (floor_now, untrimmed_now) == (214_433, 259_405), (
+        f"re-measure and re-pin: floor {floor_now}, payload {untrimmed_now}")
+
+
 def test_measured_cost_of_the_catalog_narrative(wide_catalogs, record_property):
     """What the catalog narrative costs, MEASURED — the reason it rides the TABLE block.
 
     It is one fact about the whole catalog. Per column it would have been the most expensive thing
-    in the payload; per table it is a rounding error beside the ~1_075 bytes each COLUMN costs:
+    in the payload; per table it is small beside the ~1_094 bytes each COLUMN costs:
 
-      * 2 tables, 237 columns, base table_context   171 bytes
-      * a realistic narrative                      +902 bytes total  (~451 / table)
-      * the LARGEST a human can author           +17_544 bytes total (~8_772 / table)
-        (`catalog_profiles` bounds: 200 + 4000 + 4000 + 32x200)
+      * 2 tables, 237 columns, base table_context     171 bytes
+      * a realistic narrative                        +902 bytes total  (~451 / table)
+      * the LARGEST a human can author            +29_788 bytes total (~14_894 / table)
 
-    The worst case is ~7% of the measured v4 payload and ~1.2% of the budget, and it does NOT scale
-    with catalog width — a 1_000-column catalog pays the same per table. That is the whole argument
-    for the placement, so it is pinned rather than asserted in prose: put the narrative on the
-    COLUMN payload instead and the worst case becomes ~8.7 KB x 237, which is 8x the entire v4
-    payload and would push a real catalog straight into `_V4_TRIM_ORDER` shedding.
+    THE WORST CASE IS THE REAL ONE. Every bound is read from `catalog_profiles`
+    (200 + 4_000 + 4_000 + 32x200 = 12_600 characters of authored text), because the first version
+    of this test wrote `32 x 200` in its comment and then built `f"domain-{i}"` — 32 strings of ~9
+    characters. It pinned 17_544 and called it the maximum; the maximum is 29_788, ~70% higher.
+
+    So the honest numbers: the worst case is ~11% of the measured v4 payload and ~2% of the budget.
+    It does NOT scale with catalog width — a 1_000-column catalog pays the same per table — and
+    that is the whole argument for the placement, pinned as arithmetic rather than prose: on the
+    COLUMN payload the same worst case would be ~14.9 KB x 237 = ~3.5 MB, more than TEN TIMES the
+    entire v4 payload and over twice the whole byte budget.
     """
     import json
 
     from featuregen.overlay.upload.catalog_profiles import (
+        MAX_BUSINESS_CONTEXT,
+        MAX_DESCRIPTION,
+        MAX_DISPLAY_NAME,
+        MAX_DOMAIN_LEN,
+        MAX_DOMAINS,
         build_catalog_profile_revision,
         catalog_narrative_block,
     )
 
     cols = _candidates(wide_catalogs)
     base = _table_context(cols)
+    # EVERY bound READ from `catalog_profiles`, never re-typed. The first version of this test
+    # documented `32 x 200` and then built 32 strings of ~9 characters (`f"domain-{i}"`, ~278 bytes
+    # against 6_400), so the "authorable maximum" it pinned was ~59% of the real one — the exact
+    # class of drift the v3/v4 band comment above exists to prevent, committed in the same change.
     biggest = catalog_narrative_block(build_catalog_profile_revision(
-        catalog_source="budget_ftr", display_name="D" * 200, description="x" * 4000,
-        business_context="y" * 4000, business_domains=tuple(f"domain-{i}" for i in range(32)),
+        catalog_source="budget_ftr", display_name="D" * MAX_DISPLAY_NAME,
+        description="x" * MAX_DESCRIPTION, business_context="y" * MAX_BUSINESS_CONTEXT,
+        business_domains=tuple(f"{i:03d}" + "d" * (MAX_DOMAIN_LEN - 3) for i in range(MAX_DOMAINS)),
         producer_ref="u"))
     realistic = catalog_narrative_block(build_catalog_profile_revision(
         catalog_source="budget_ftr", display_name="CIB Payments Catalog",
@@ -293,10 +370,11 @@ def test_measured_cost_of_the_catalog_narrative(wide_catalogs, record_property):
     worst, real = _delta(biggest), _delta(realistic)
     record_property("narrative_worst_case_bytes", worst)
     record_property("narrative_realistic_bytes", real)
-    assert len(base) == 2, "the per-TABLE claim below is measured against 2 tables"
+    assert len(base) == 2, "the per-TABLE claim above is measured against 2 tables"
     assert 700 < real < 1_200, f"realistic narrative cost moved: {real}"
-    assert 15_000 < worst < 20_000, f"worst-case narrative cost moved: {worst}"
+    assert 28_000 < worst < 32_000, f"worst-case narrative cost moved: {worst}"
     # The placement argument, as arithmetic rather than assertion: per column this same worst case
-    # would be ~237x, several times the WHOLE v4 payload.
-    assert worst // len(base) * 237 > 275_000 > _size(base) + worst
-    assert _size(base) + worst < FEATURE_CONTEXT_BYTE_BUDGET // 50
+    # would be ~237x, more than TEN TIMES the whole v4 payload.
+    assert worst // len(base) * 237 > 3_000_000
+    # Headroom against the budget, stated as the real ratio rather than a comfortable-sounding one.
+    assert _size(base) + worst < FEATURE_CONTEXT_BYTE_BUDGET // 40

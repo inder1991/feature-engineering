@@ -230,6 +230,39 @@ _ROUNDTRIP_PROSE_KEYS = frozenset({
 })
 
 
+# ── DROPPABLE ADVISORY CONTEXT (Task 7b review, Important-1) ─────────────────────────────────────
+#
+# Free text whose content is CONTEXT ABOUT the subject rather than the subject itself. A value the
+# sanitizer BLANKS is dropped from the payload; it does not fail the payload closed.
+#
+# The rule everywhere else — blanked means block — is right where the field IS the subject. A column
+# `business_definition` the sanitizer blanks must block its item: silently egressing the column
+# without the meaning the model was asked to reason about produces a confident answer to a question
+# nobody could answer. The catalog narrative is not that. Losing it DEGRADES the payload; it cannot
+# falsify it, and the model is never told a narrative exists.
+#
+# WHAT MADE THIS LOAD-BEARING: BLAST RADIUS. `sanitize_definition` fails closed on five literal
+# phrases (`sample values`, `example values`, `observed values`, `representative values`, `values
+# such as` — sanitize.py:55-62), and a business user types the narrative into a form that validates
+# LENGTH AND TYPE ONLY (`catalog_profiles.parse_narrative_payload`). "The description gives example
+# values for each payment type" is ordinary phrasing. The narrative rides EVERY table block and
+# EVERY Pass-B item, so under the ordinary rule that one sentence would refuse every
+# feature-generation call for the catalog AND exclude every table from Pass B — no grain, no
+# table_role, no primary_entity, no event_or_snapshot, audited only as an egress block. One
+# sentence, whole catalog. A bad phrase in one `table_definition` costs one table; this cost
+# everything.
+#
+# NOT SOLVED BY DOWNGRADING TO THE PROSE GRADE. Prose has no such failure mode precisely because it
+# has no sample-clause strip and no marker gate — so `values such as 3708484836801` would egress
+# intact, which is the leak the definition grade exists to stop and which real FTR prose demonstrably
+# contains. Dropping keeps the strong scan AND removes the kill switch: the marker-bearing value
+# never egresses, and everything else still does.
+#
+# The drop is NOT silent: the `sample_audits` entry (state `suspected_unhandled`) is recorded exactly
+# as before, so `llm_call.input_redaction` still says what was removed and why, and both seams log.
+_ADVISORY_CONTEXT_KEYS = frozenset(CATALOG_NARRATIVE_KEYS)
+
+
 def _meta_field_kind(key: str) -> str:
     """The egress KIND of one free-text metadata key: ``definition`` (sample-strip + PII via
     `sanitize_definition`), ``prose`` (PII-only via `redact_free_text`), or ``list_of_prose``
@@ -308,19 +341,35 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     for key in sorted(_FREE_TEXT_META_KEYS & out.keys()):
         kind = _meta_field_kind(key)                       # ValueError on an unclassified key
         scrub = _definition if kind == "definition" else _prose
+        # Advisory context DROPS rather than blocking — see `_ADVISORY_CONTEXT_KEYS`. The audits and
+        # spans already appended by the scrubber are kept: the record must say what was removed.
+        droppable = key in _ADVISORY_CONTEXT_KEYS
         val = out[key]
         if isinstance(val, str):
             redacted = scrub(val, key)
             if redacted is None:
-                return None, pii_spans, sample_audits, version
+                if not droppable:
+                    return None, pii_spans, sample_audits, version
+                logger.warning("advisory context %r failed its egress scan — DROPPED from the item "
+                               "(the item still egresses)", key)
+                del out[key]
+                continue
             out[key] = redacted
         elif isinstance(val, list):
             new_list = []
             for i, v in enumerate(val):
                 nv = scrub(v, f"{key}[{i}]") if isinstance(v, str) else v
                 if nv is None:
-                    return None, pii_spans, sample_audits, version
+                    if not droppable:
+                        return None, pii_spans, sample_audits, version
+                    logger.warning("advisory context %r[%d] failed its egress scan — that ITEM "
+                                   "dropped", key, i)
+                    continue
                 new_list.append(nv)
+            # An advisory list scrubbed empty carries nothing; a fabricated `[]` is not context.
+            if droppable and not new_list:
+                del out[key]
+                continue
             out[key] = new_list
     profiles = out.get("column_profiles")
     if isinstance(profiles, list):
@@ -644,20 +693,35 @@ def sanitize_feature_context(
         pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
         return res.text
 
-    def _prose_list(v: object, path: str) -> list | None:   # None ⟹ fail closed
+    def _prose_list(v: object, path: str, *, droppable: bool = False) -> list | None:
         """A LIST of uploader-authored prose — `_prose` per item, at that item's own indexed path
         (`related_terms[1]`), so the audit keeps per-term granularity and one long term is bounded
         on its own rather than as part of a joined blob. A non-list, or a list over the collection
-        cap, fails closed like any other shape violation."""
+        cap, fails closed like any other shape violation (``None``).
+
+        ``droppable`` (the `_ADVISORY_CONTEXT_KEYS` contract): a single item that fails its scan is
+        DROPPED and the rest of the list still egresses, rather than the failure escalating to the
+        whole payload. The shape violations above still fail closed either way — a non-list is a
+        producer bug, not a scrubbing outcome."""
         if not isinstance(v, list) or len(v) > _FEATURE_COLLECTION_MAX_ITEMS:
             return None
         cleaned: list[str] = []
         for i, item in enumerate(v):
             clean = _prose(item, f"{path}[{i}]")
             if clean is None:
-                return None
+                if not droppable:
+                    return None
+                logger.warning("advisory context %s[%d] failed its egress scan — item dropped",
+                               path, i)
+                continue
             cleaned.append(clean)
         return cleaned
+
+    def _drop_advisory(key: str, path: str) -> None:
+        """Record an advisory-context value removed by its own scan. Never silent: the
+        `sample_audits` entry the scrubber already appended says WHAT was removed and why."""
+        logger.warning("advisory context %s failed its egress scan — DROPPED from the block (the "
+                       "payload still egresses)", path)
 
     def _structural_ok(v: object) -> bool:  # identity strings may be None (`concept` is nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
@@ -737,7 +801,10 @@ def sanitize_feature_context(
                         continue
                     clean = _defn(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        if k not in _ADVISORY_CONTEXT_KEYS:
+                            return None, pii_spans, sample_audits, version
+                        _drop_advisory(k, path)
+                        continue
                     out[k] = clean
                 elif k in _TABLE_CONTEXT_PROSE_KEYS:
                     if v is None:                # unauthored label — no content to scan
@@ -745,12 +812,20 @@ def sanitize_feature_context(
                         continue
                     clean = _prose(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        if k not in _ADVISORY_CONTEXT_KEYS:
+                            return None, pii_spans, sample_audits, version
+                        _drop_advisory(k, path)
+                        continue
                     out[k] = clean
                 elif k in _TABLE_CONTEXT_PROSE_LIST_KEYS:
-                    cleaned = _prose_list(v, path)
+                    advisory = k in _ADVISORY_CONTEXT_KEYS
+                    cleaned = _prose_list(v, path, droppable=advisory)
                     if cleaned is None:
                         return None, pii_spans, sample_audits, version
+                    if advisory and not cleaned:
+                        # Scrubbed empty — a fabricated `[]` is not context, so drop the key.
+                        _drop_advisory(k, path)
+                        continue
                     out[k] = cleaned
                 elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
                     if not _structural_ok(v):

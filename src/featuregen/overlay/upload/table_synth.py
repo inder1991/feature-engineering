@@ -265,15 +265,29 @@ def table_vocab_normalize_temporal(raw: object) -> str | None:
 #: make Pass B's own descriptions EXCLUDED-and-audited at the egress gate, which is the opposite of
 #: what the raise was for. Pinned by `test_table_synth_assemble.py`.
 _MAX_PROFILE_PROSE = 600
-#: The one non-column citation a suggestion may name: the table's own curated definition.
+#: The non-column citations a suggestion may name.
+#:
+#: `table_definition` is the table's own curated definition. The CATALOG-NARRATIVE keys (Task 7b)
+#: joined it at prompt v5, and without them the narrative was mechanically UNCITABLE: an honest
+#: citation of `catalog_description` was filtered out here, `_accept_profile_fields` then dropped the
+#: suggestion as `no_evidence_ref`, and the only route to acceptance was attaching a COLUMN citation
+#: the suggestion does not actually rest on. That made `table_description`, `business_context`,
+#: `authority_role` and `temporal_storage_model` incapable of resting on the prose this task exists
+#: to deliver — and it would have taught the model to cite dishonestly to get an answer accepted.
+#:
+#: (Grain, as-of, `primary_entity`, `table_role` and `event_or_snapshot` were never ref-gated — they
+#: are validated against column membership — so the narrative could already influence them. That is
+#: the brief's #1 leverage point and it worked from the first commit; this widens the rest.)
+_NON_COLUMN_CITATION_REFS: frozenset[str] = frozenset({"table_definition", *CATALOG_NARRATIVE_KEYS})
 _TABLE_DEFINITION_REF = "table_definition"
 
 
 def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
     """The refs this suggestion cites, filtered to the BOUNDED TABLE CONTEXT it was given: a real
-    column of THIS table, or the literal ``table_definition``. A hallucinated ref is dropped rather
-    than trusted, so "names existing evidence refs" is enforced, never assumed."""
-    allowed = {c.lower() for c in cols} | {_TABLE_DEFINITION_REF}
+    column of THIS table, the literal ``table_definition``, or one of the catalog-narrative keys the
+    item carries. A hallucinated ref is dropped rather than trusted, so "names existing evidence
+    refs" is enforced, never assumed."""
+    allowed = {c.lower() for c in cols} | _NON_COLUMN_CITATION_REFS
     out: list[str] = []
     for entry in synthesis.get("evidence_refs") or []:
         if not isinstance(entry, dict) or str(entry.get("field") or "").strip() != field:
@@ -746,8 +760,16 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 
 #: The Pass-B synthesis contract, named once so the request, the replay identity and the tests read
 #: the same values.
-_SYNTH_PROMPT_ID = "overlay_table_synth_v4"
-_SYNTH_PROMPT_VERSION = 4
+#:
+#: v5 (Task 7b) — the CATALOG NARRATIVE. Two prompt changes that only make sense together, so they
+#: ship as one version: `_TYPE_FIELDS_NOTE` now says what the catalog-narrative keys ARE (whole
+#: catalog, not this table; context, never a fact about this table), and `_PROFILE_NOTE` names them
+#: as citable refs alongside `table_definition`. Widening `_cited_refs` without telling the model
+#: would have left the capability unreachable; telling the model without widening `_cited_refs`
+#: would have taught it to cite something the code silently discards. The SCHEMA is untouched — the
+#: response shape did not move, only the question.
+_SYNTH_PROMPT_ID = "overlay_table_synth_v5"
+_SYNTH_PROMPT_VERSION = 5
 _SYNTH_SCHEMA_VERSION = 3
 #: The phase-1 (wide-table) summary prompt id. Its VERSIONS are `_SYNTH_PROMPT_VERSION` /
 #: `_SYNTH_SCHEMA_VERSION` — one Pass B run stamps ONE contract generation across both phases.
@@ -799,8 +821,9 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
 
     Ships the Pass B contract via the Task-1 version seam, read from `_SYNTH_PROMPT_VERSION` /
-    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v4** (the code-side `table_role` vocab is
-    enumerated in the instruction) over the **canonical v3 schema** — a REAL v3 body, because v2 is
+    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v5** (the code-side `table_role` vocab is
+    enumerated in the instruction; v5 adds the catalog-narrative context and its citability) over
+    the **canonical v3 schema** — a REAL v3 body, because v2 is
     a byte-alias of v1 with `additionalProperties: false` and would reject the profile suggestions.
     [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
     WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
@@ -930,7 +953,7 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
         # The phase-1 summary is stamped with the SAME contract generation as the phase-2 synthesis
-        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v4 over the canonical
+        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v5 over the canonical
         # v3 schema), so one Pass B run never egresses under two generations. Read from the
         # constants rather than re-typed: the previous literal 4/3 pair carried a comment still
         # claiming "prompt v3 / canonical schema v2", which is exactly how a drifted copy hides. The
@@ -998,6 +1021,14 @@ _TYPE_FIELDS_NOTE = (
     "from documentation, not a confirmation of the physical type. Never treat declared_type as the "
     "operational type. When present, table_definition is the curated business definition of the "
     "whole table. "
+    # Prompt v5 (Task 7b): the model was being handed this prose with nothing saying what it is,
+    # what GRAIN it describes, or that it must not be treated as settled fact.
+    "When present, catalog_description / catalog_business_context / catalog_display_name / "
+    "catalog_business_domains describe the WHOLE CATALOG this table belongs to, not this table — "
+    "they are prose a person typed to say what the dataset is and why the business keeps it, and "
+    "catalog_narrative_authority names who said it. Use them to interpret what a row of this table "
+    "represents; they are CONTEXT, never a fact about this table and never a substitute for the "
+    "columns. "
 )
 
 # Prompt v3 ([F1]): the accepted table_role values are enumerated in the PROMPT (and enforced
@@ -1026,8 +1057,10 @@ _PROFILE_NOTE = (
     "authority_role (how authoritative this COPY is); and temporal_storage_model (how it stores "
     "history). "
     "EVERY suggestion must cite its evidence in `evidence_refs` as {field, refs}, naming ONLY "
-    "columns from the provided list or the literal 'table_definition' — a suggestion citing nothing "
-    "is discarded. "
+    "columns from the provided list, the literal 'table_definition', or one of the catalog "
+    "narrative keys when the item carries them ('catalog_description', 'catalog_business_context', "
+    "'catalog_display_name', 'catalog_business_domains') — a suggestion citing nothing is "
+    "discarded. "
     "When a table_definition is already provided it is CURATED and stays current: offer a "
     "table_description only as an ALTERNATIVE for human review, never as a correction, and NEVER "
     "paraphrase the curated text back. Omit any field the evidence does not settle — an omission is "

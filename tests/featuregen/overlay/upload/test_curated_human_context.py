@@ -25,6 +25,8 @@ removal-from-its-own-list refusal test — remove the classification, the payloa
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from tests.featuregen._helpers import mint_test_identity
 from tests.featuregen.overlay.upload.test_feature_context_coverage import (
@@ -241,6 +243,91 @@ def test_a_maximum_length_authored_narrative_is_admitted_not_refused():
     assert safe is not None and safe["table_context"][0]["catalog_description"] == longest
 
 
+# ── gap 1: an ordinary business phrase must not become a catalog-wide kill switch ───────────────
+#
+# `sanitize_definition` fails closed on five literal phrases (sanitize.py:55-62). The narrative
+# rides EVERY table block and EVERY Pass-B item, so under the ordinary blanked-means-block rule one
+# sentence in the upload form would refuse every feature-generation call for the catalog AND exclude
+# every table from Pass B. `catalog_profiles.parse_narrative_payload` validates length and type
+# only — nothing warns the business user at author time.
+
+#: A realistic sentence, not a probe. A data owner describing a catalog writes this.
+_MARKER_SENTENCE = ("Funds-transfer records for the corporate and investment bank. The description "
+                    "column gives example values for each payment type.")
+
+
+def test_an_ordinary_business_phrase_does_not_refuse_the_whole_feature_payload():
+    """The blast-radius fix. The marker-bearing narrative field is DROPPED — it never egresses —
+    while the rest of the payload, including the other narrative fields, still does."""
+    from featuregen.overlay.upload.sanitize import sanitize_definition
+
+    assert sanitize_definition(_MARKER_SENTENCE).reason == "unhandled_marker", (
+        "the sentence no longer trips the data-marker gate — this test asserts nothing")
+    block = {"table": "payments", "catalog_description": _MARKER_SENTENCE,
+             "catalog_business_context": _CONTEXT, "catalog_display_name": _DISPLAY}
+    safe, _spans, audits, _v = sanitize_feature_context(
+        {"columns": [{"object_ref": "x"}], "table_context": [block]})
+    assert safe is not None, "one ordinary sentence refused the whole catalog's feature generation"
+    out = safe["table_context"][0]
+    assert "catalog_description" not in out, "the marker-bearing value egressed"
+    assert out["catalog_business_context"] == _CONTEXT, "the drop took the rest of the block with it"
+    assert out["catalog_display_name"] == _DISPLAY
+    # NEVER SILENT: the sanitizer's own audit still says what was removed and why.
+    assert any(a["state"] == "suspected_unhandled"
+               and a["path"] == "table_context[0].catalog_description" for a in audits)
+
+
+def test_the_same_phrase_in_a_table_definition_still_fails_closed():
+    """The drop is scoped to ADVISORY context and nothing else. A `table_definition` the sanitizer
+    blanks still refuses: that field IS the subject the model was asked to reason about, and
+    egressing the block without it produces a confident answer to a question nobody could answer."""
+    payload = {"columns": [{"object_ref": "x"}],
+               "table_context": [{"table": "payments", "table_definition": _MARKER_SENTENCE}]}
+    assert sanitize_feature_context(payload)[0] is None
+
+
+def test_an_ordinary_business_phrase_does_not_exclude_every_pass_b_item():
+    """The same fix at the enrichment seam. Excluding the item costs that table its ENTIRE
+    synthesis — grain, table_role, primary_entity, event_or_snapshot — audited only as an egress
+    block, and the narrative is on every item, so it would have cost the whole catalog."""
+    meta, _spans, audits, _v = enrich_llm._redact_free_text_meta(
+        {"table": "payments", "catalog_description": _MARKER_SENTENCE,
+         "catalog_business_context": _CONTEXT})
+    assert meta is not None, "one ordinary sentence excluded every table from Pass B"
+    assert "catalog_description" not in meta
+    assert meta["catalog_business_context"] == _CONTEXT
+    assert meta["table"] == "payments"
+    assert any(a["state"] == "suspected_unhandled" for a in audits)
+
+
+def test_a_column_definition_that_blanks_still_excludes_its_own_item():
+    """The other side of the same boundary, at the Pass-B seam."""
+    assert enrich_llm._redact_free_text_meta(
+        {"table": "t", "business_definition": _MARKER_SENTENCE})[0] is None
+
+
+def test_one_bad_domain_drops_that_term_not_the_list_and_not_the_payload():
+    """Per-item, like every other prose list on this seam. A redactor failure on one authored
+    domain must not take the other 31 with it, nor the catalog."""
+    long_domain = "z" * (enrich_llm._FEATURE_STRUCTURAL_MAX_LEN + 1)
+    block = {"table": "t", "catalog_business_domains": ["payments", long_domain, "treasury"]}
+    safe, _spans, _audits, _v = sanitize_feature_context(
+        {"columns": [{"object_ref": "x"}], "table_context": [block]})
+    assert safe is not None
+    assert safe["table_context"][0]["catalog_business_domains"] == ["payments", "treasury"]
+
+
+def test_a_narrative_scrubbed_empty_leaves_no_key_behind():
+    """A fabricated `[]` or `""` is not context — it is a value the model can reason about. Absence
+    is the honest signal, and it is the same signal an unauthored field gives."""
+    long_domain = "z" * (enrich_llm._FEATURE_STRUCTURAL_MAX_LEN + 1)
+    safe, _spans, _audits, _v = sanitize_feature_context(
+        {"columns": [{"object_ref": "x"}],
+         "table_context": [{"table": "t", "catalog_business_domains": [long_domain]}]})
+    assert safe is not None
+    assert "catalog_business_domains" not in safe["table_context"][0]
+
+
 def test_the_pass_b_item_carries_the_narrative_past_its_own_egress_gate():
     """Pass B decides grain, table_role, primary_entity and event_or_snapshot from columns and
     profiles alone — and grain is the most expensive thing in this pipeline to get wrong. The
@@ -330,6 +417,56 @@ def test_a_narrative_edit_re_keys_the_pass_b_replay_identity(monkeypatch):
     _run({"catalog_description": "Inbound collections."})
     _run(None)
     assert len(set(revisions)) == 3, "the narrative is outside the Pass-B replay identity"
+
+
+def test_a_pass_b_suggestion_can_rest_on_the_narrative_and_say_so():
+    """The blocker: `_cited_refs` filtered `evidence_refs` to columns + `table_definition`, and
+    `_accept_profile_fields` drops a suggestion with empty refs as `no_evidence_ref`. So
+    `table_description` / `business_context` / `authority_role` / `temporal_storage_model` were
+    MECHANICALLY incapable of resting on the narrative — an honest citation was filtered out and the
+    field discarded, and the only route to acceptance was attaching a column citation the suggestion
+    does not actually rest on. Delivering prose the model may not cite would have taught it to cite
+    dishonestly."""
+    from featuregen.overlay.upload.table_synth import _cited_refs, make_ref_accept
+
+    synthesis = {
+        "business_context": "The book of record for outbound SWIFT and RTGS payments.",
+        "evidence_refs": [{"field": "business_context", "refs": ["catalog_business_context"]}]}
+    assert _cited_refs(synthesis, "business_context", cols={"pmt_id"}) == [
+        "catalog_business_context"]
+
+    dispositions: list[dict] = []
+    accept = make_ref_accept({"payments": {"pmt_id"}}, dispositions=dispositions,
+                             inventory_by_table={"payments": []})
+    accept(json.dumps(synthesis), "payments")     # (raw, ref) — raw first
+    got = {d["field"]: (d["status"], d["reason"]) for d in dispositions}
+    assert got["business_context"] == ("accepted", None), got
+
+
+def test_a_hallucinated_narrative_key_is_still_dropped():
+    """Widening the allowlist is not un-gating it. A ref that is neither a real column nor a real
+    context key is still discarded, so "names existing evidence refs" stays enforced."""
+    from featuregen.overlay.upload.table_synth import _cited_refs
+
+    synthesis = {"evidence_refs": [
+        {"field": "business_context", "refs": ["catalog_mission_statement", "catalog_description"]}]}
+    assert _cited_refs(synthesis, "business_context", cols=set()) == ["catalog_description"]
+
+
+def test_the_pass_b_prompt_says_what_the_narrative_is_and_that_it_is_citable():
+    """Both halves of prompt v5, pinned together because either alone is a defect: widening
+    `_cited_refs` without telling the model leaves the capability unreachable, and telling the model
+    without widening `_cited_refs` invites a citation the code silently discards."""
+    from featuregen.overlay.upload import table_synth
+
+    assert "catalog_description" in table_synth._TYPE_FIELDS_NOTE
+    assert "WHOLE CATALOG" in table_synth._TYPE_FIELDS_NOTE
+    assert "catalog_business_context" in table_synth._PROFILE_NOTE
+    # The version MUST move with the text — a changed question replayed under the old identity is
+    # the trap this contract's own comments document.
+    assert table_synth._SYNTH_PROMPT_VERSION == 5
+    assert table_synth._SYNTH_PROMPT_ID.endswith("v5")
+    assert table_synth._SUMMARY_PROMPT_ID.endswith("v5")
 
 
 def test_the_long_narrative_fields_have_their_own_egress_length_cap():

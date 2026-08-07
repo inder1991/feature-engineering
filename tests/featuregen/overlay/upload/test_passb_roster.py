@@ -153,13 +153,15 @@ def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
     # both phases ship the Slice-2 contract via the Task-1 seam: prompt v3, canonical schema
     # Profile Task 4 moved the contract to prompt v4 / schema v3 — a REAL v3 body, because v2 is a
     # byte-alias of v1 with `additionalProperties: false` and would REJECT the profile suggestions.
+    # Task 7b moved it to prompt v5 (the catalog narrative: what it IS, and that it is citable);
+    # the SCHEMA is unmoved because the response shape did not change, only the question.
     # ONE generation across the whole run: the chunk-summary call stamps the same pair.
-    assert synth_req.prompt_version == 4 and synth_req.output_schema_version == 3
+    assert synth_req.prompt_version == 5 and synth_req.output_schema_version == 3
     summary_req = [r for r in client.requests if r.task == "table_synth_summary"][0]
-    assert summary_req.prompt_version == 4 and summary_req.output_schema_version == 3
+    assert summary_req.prompt_version == 5 and summary_req.output_schema_version == 3
 
 
-def test_narrow_fast_path_ships_the_v4_prompt_and_v3_schema(db):
+def test_narrow_fast_path_ships_the_v5_prompt_and_v3_schema(db):
     rows = [_row("narrow", "c0")]
     items = assemble_table_items(_views(rows))
     client = _RecordingLLM({"table_synth": FakeResponse(output={"results": [
@@ -167,7 +169,7 @@ def test_narrow_fast_path_ships_the_v4_prompt_and_v3_schema(db):
     out = synthesize_tables(db, client, items, columns_by_table={"narrow": {"c0"}}, actor=None)
     assert out["narrow"]["grain"] == {"columns": ["c0"], "is_unique": True}
     req = [r for r in client.requests if r.task == "table_synth"][0]
-    assert req.prompt_version == 4 and req.output_schema_version == 3
+    assert req.prompt_version == 5 and req.output_schema_version == 3
 
 
 # ── v2 schemas + instructions describe the dual-type contract ───────────────────────────────────
