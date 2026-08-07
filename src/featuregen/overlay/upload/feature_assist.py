@@ -110,6 +110,11 @@ class RejectCode:
     MALFORMED_ITEM = "MALFORMED_ITEM"       # LLM returned a non-object feature item (guarded, not fatal)
     AMBIGUOUS_CATALOG = "AMBIGUOUS_CATALOG"
     UNKNOWN_COLUMN = "UNKNOWN_COLUMN"
+    # The model's own `grounding` array named a column the catalog never offered (Task 6c). The
+    # feature may still compute — its `derives_from` grounded — but the account it gives of itself
+    # cites something that does not exist, so the proposal is discarded rather than shown with a
+    # fabricated explanation attached.
+    UNKNOWN_GROUNDING_COLUMN = "UNKNOWN_GROUNDING_COLUMN"
     LEAKAGE = "LEAKAGE"
     STALE = "STALE"
     ADDITIVITY = "ADDITIVITY"
@@ -154,6 +159,9 @@ FEATURE_REFUSAL_FAMILIES: dict[str, str] = {
     RejectCode.MALFORMED_ITEM: STRUCTURALLY_UNSUITABLE,
     RejectCode.AMBIGUOUS_CATALOG: STRUCTURALLY_UNSUITABLE,
     RejectCode.UNKNOWN_COLUMN: STRUCTURALLY_UNSUITABLE,
+    # Same family as UNGROUNDED / UNKNOWN_COLUMN: the proposal, AS STATED, cannot be audited. No
+    # setting a human could change would make a citation of a non-existent column true.
+    RejectCode.UNKNOWN_GROUNDING_COLUMN: STRUCTURALLY_UNSUITABLE,
     RejectCode.LEAKAGE: STRUCTURALLY_UNSUITABLE,
     RejectCode.NON_NUMERIC: STRUCTURALLY_UNSUITABLE,
     RejectCode.NO_JOIN_PATH: STRUCTURALLY_UNSUITABLE,
@@ -331,21 +339,29 @@ def feature_context_enabled() -> bool:
 #:   4 — the shared `SemanticContextBundleV1` contract (semantic Task 8): v3 plus concept ancestry,
 #:       identifier namespace/issuer, party role, the D2 (producer, strength) axes per semantic
 #:       field, current cross-catalog links and the closed missing-context codes.
+#:   5 — Task 6c. The first version whose OUTPUT contract moved rather than its input: every
+#:       proposed feature returns `grounding`, its own account of which offered column it used.
 #: Bumped because the record must identify WHICH contract egressed. Adding a field to the payload
 #: while leaving the version at 2 makes a v2 record ambiguous — with or without summaries — which
 #: defeats the reason the version is stamped at all.
-_FEATURE_CONTEXT_SCHEMA_VERSION = 4
+_FEATURE_CONTEXT_SCHEMA_VERSION = 5
+
+#: The version from which the OUTPUT carries `grounding`. Below it the wire item is CLOSED without
+#: a `grounding` key, so the generation instruction must not ask for one — a model is never asked
+#: for output its schema forbids.
+_GROUNDING_SCHEMA_VERSION = 5
 
 #: The D8 ROLLBACK LADDER, in one place:
 #:   flag off                              -> v1, the thin pre-Slice-3 menu, byte-for-byte;
 #:   flag on + FEATUREGEN_FEATURE_CONTEXT_VERSION=3 -> today's SHIPPED v3 behaviour;
-#:   flag on (default)                     -> v4.
+#:   flag on + FEATUREGEN_FEATURE_CONTEXT_VERSION=4 -> v4, the rich menu with NO returned grounding;
+#:   flag on (default)                     -> v5.
 #: The env override exists precisely so v3 stays REACHABLE after Task 8 — a rollback that dropped
 #: to the v1 thin menu would be a functional regression dressed as a safety valve. Only versions
 #: this module can actually render are honoured; anything else falls back to the default and warns,
 #: because a typo in a deploy manifest must not silently downgrade the contract.
 FEATURE_CONTEXT_VERSION_ENV = "FEATUREGEN_FEATURE_CONTEXT_VERSION"
-_SELECTABLE_CONTEXT_VERSIONS = (3, 4)
+_SELECTABLE_CONTEXT_VERSIONS = (3, 4, 5)
 
 
 def _feature_schema_version() -> int:
@@ -908,6 +924,47 @@ class ExternalRequirementPreview:
             content_hash=str(d.get("content_hash", "")))
 
 
+#: What a column can CONTRIBUTE to a feature — a CLOSED vocabulary (Task 6c). Free text here would
+#: become a second, ungoverned way of saying what `operand_roles` / `RoleBinding.role` already say,
+#: and the six between them cover every way a column enters a calculation. Closed on the WIRE
+#: (`x-wire-enum`) and again in `_ground_notes`; deliberately NOT closed on the response schema,
+#: where an off-vocabulary answer would fail the whole call instead of costing one entry.
+GROUNDING_ROLES: tuple[str, ...] = ("measure", "grain", "time_anchor", "filter", "currency",
+                                    "dimension")
+
+#: The model's evidence clause is DISPLAY TEXT on a review card, so it is bounded like one — and
+#: the bound lives HERE, not in the response schema, because `maxLength` is stripped from the wire
+#: (the model never learns it) yet still validated against the response: one long clause would fail
+#: the whole call. Truncating, not refusing: an explanation that ran long must never cost a feature.
+_MAX_GROUNDING_WHY_LEN = 200
+#: And a ceiling on how many entries ride back, so an unbounded array cannot become an unbounded
+#: response. Applied AFTER every entry is validated (see `_ground_notes`).
+_MAX_GROUNDING_ENTRIES = 32
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingNote:
+    """ONE column the generator says it used, what it contributed, and the evidence it named.
+
+    EXPLANATORY, NEVER AUTHORITY. Nothing in the gauntlet, the USE gate, the tri-state or any
+    downstream disposition reads these values — a feature carrying a confident-sounding note is
+    neither more trusted nor more complete than the identical feature carrying none
+    (`test_grounding_changes_no_disposition` pins it). Its whole job is to let a reviewer see WHY a
+    feature was proposed instead of guessing, and to let the operator tell whether the widened
+    semantic context is being READ rather than merely delivered.
+
+    `column` is a RESOLVED catalog object_ref, never the model's raw string: an entry that could not
+    be resolved against the offered candidate set discarded the whole proposal before this object
+    was built (`_ground_notes`), so nothing here can be a channel for an ungrounded ref.
+    """
+    column: str
+    role: str                       # in GROUNDING_ROLES
+    why: str
+
+    def to_json(self) -> dict:
+        return {"column": self.column, "role": self.role, "why": self.why}
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureIdea:
     name: str
@@ -1004,6 +1061,19 @@ class FeatureIdea:
     #    None also on every path that threads no candidate identity (LLM / planner / confirm-time
     #    revalidation). Nothing in the V1 payload reads it.
     grounding_trace: GroundingDecisionTraceV1 | None = None
+    # ── Task 6c: the GENERATOR's own account of what it used, per proposed feature ──
+    #    Each note is one offered column, the role it played, and the evidence the model named.
+    #    EXPLANATORY, NEVER AUTHORITY: no check, requirement, status, dedup signature or gate reads
+    #    it, and a feature is not more trusted for carrying a confident one. Empty for every
+    #    non-LLM path (recipes and the planner declare `operand_roles` instead), for every contract
+    #    version below `_GROUNDING_SCHEMA_VERSION` (the wire item has no such key), and for a model
+    #    that simply did not answer — all three are honest absence, never a refusal.
+    #
+    #    NOT the same axis as `grounding_trace`, which sits above it: that is the PLATFORM's
+    #    verifiable record of what the gauntlet read; this is the MODEL's unverifiable claim about
+    #    what it reasoned from. Only the columns are checked — they must exist in the offered
+    #    candidate set — and nothing checks the claim itself, which is why nothing may rest on it.
+    grounding: tuple[GroundingNote, ...] = ()
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -1113,6 +1183,48 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
             seen.add(resolved)
             out.append(resolved)
     return out
+
+
+def _ground_notes(raw_grounding: object,
+                  known: set[str]) -> tuple[tuple[GroundingNote, ...], str | None]:
+    """Resolve the model's `grounding` array. Returns (notes, unresolved_column).
+
+    A non-empty `unresolved_column` means the model cited a column the catalog never offered, and
+    the CALLER discards the whole feature. Two different failures, treated differently on purpose:
+
+      * an UNOFFERED COLUMN is a false claim about the CATALOG — the account the feature gives of
+        itself is fabricated, and left in place the array would be a second channel for ungrounded
+        refs to re-enter beside the ones `_ground_refs` already filters out of `derives_from`. It
+        costs the feature, visibly, under its own reject code.
+      * an OFF-VOCABULARY ROLE is a limit of OUR taxonomy, not a fabrication — the model may simply
+        have a word we do not model. It costs the ENTRY, never the feature.
+
+    Resolution is `_ground_refs`' — exact ref, else a unique bare-name/suffix match — so the model's
+    reference FORMAT cannot un-ground an otherwise-valid feature, and the emitted `column` is the
+    resolved object_ref so a reviewer follows a real catalog ref rather than the model's string.
+    An ABSENT or empty array is honest absence: no notes, no rejection, no disposition changed.
+    """
+    if not isinstance(raw_grounding, list):
+        # Absent (the normal case at v4 and below) or a shape we cannot read. Neither is a refusal:
+        # `grounding` is optional on the response precisely so a model that skips it does not turn
+        # every such response into a whole-call failure.
+        return (), None
+    notes: list[GroundingNote] = []
+    for entry in raw_grounding:
+        if not isinstance(entry, dict):
+            continue
+        raw_column = str(entry.get("column", "")).strip()
+        resolved = _ground_refs([raw_column], known) if raw_column else []
+        if not resolved:
+            return (), raw_column or "(unnamed)"
+        role = str(entry.get("role", "")).strip().lower()
+        if role not in GROUNDING_ROLES:
+            logger.info("dropping a grounding entry with an off-vocabulary role %r", role[:40])
+            continue
+        notes.append(GroundingNote(column=resolved[0], role=role,
+                                   why=str(entry.get("why", ""))[:_MAX_GROUNDING_WHY_LEN]))
+    # Capped LAST, so a fabricated column past the cap is still refused rather than trimmed away.
+    return tuple(notes[:_MAX_GROUNDING_ENTRIES]), None
 
 
 # The AI's suggestion is DISPLAY TEXT on a review card, so it is bounded like one. T2's drafter
@@ -1473,6 +1585,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
               "derives_from", {"resolved_object_refs": list(derives)})
     if not derives:
         return _reject(RejectCode.UNGROUNDED, "ungrounded")
+    # Task 6c — the model's own account of what it used, checked against the SAME offered candidate
+    # set the returned refs are, and here beside them so the two grounding rules read as one. The
+    # notes themselves are NOT pinned into the decision trace and NOT read by anything below: the
+    # trace records what the PLATFORM verified, and an unverifiable model claim in it would be
+    # indistinguishable from a verified dependency.
+    notes, unresolved = _ground_notes(raw.get("grounding"), known)
+    if unresolved is not None:
+        return _reject(RejectCode.UNKNOWN_GROUNDING_COLUMN,
+                       f"grounding names a column that was never offered: {unresolved[:80]}")
     pairs: list[tuple[str, str]] = []
     for d in derives:
         srcs = src_of.get(d, set())
@@ -1772,6 +1893,10 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         # PROVENANCE, from the gate that already ran above: the policy revisions that licensed this
         # candidate's personal-data operands, or () when it binds none.
         personal_data_policy_revision_ids=use.personal_data_policy_revision_ids,
+        # Task 6c: carried, never consulted. `status` and `requirements` above were both decided
+        # before this line and neither reads `notes` — the ONE property that makes an explanation
+        # safe to accept from a model is that nothing rests on it.
+        grounding=notes,
         grounding_trace=trace.build(
             validation_status=status, requirements=tuple(requirements),
             validation_rule_content_hashes=evaluated_rule_content_hashes(
@@ -1906,7 +2031,7 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
+                    "feature_ideas", _generation_instruction(objective), inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     for raw in out.get("features", []):
@@ -1929,6 +2054,36 @@ _DERIVES_FROM_DIRECTIVE = (
     "`object_ref` string(s) — format public.<table>.<column> — of the source columns it is computed "
     "from, copied verbatim from the provided columns list. A feature whose `derives_from` is empty or "
     "omitted cannot be grounded and is discarded, so never leave it blank.")
+
+# Task 6c. Two things are being asked for that the schema alone cannot ask for. The first is
+# COVERAGE — an entry per column used, including the ones that are in the menu because the
+# calculation is wrong without them (the confirmed grain, the as-of column) rather than because they
+# match the objective. The second is HONESTY ABOUT AUTHORITY: the widened context distinguishes a
+# confirmed semantic from one the enrichment merely PROPOSED, and a reader who cannot tell which a
+# feature rests on has been given confidence they did not earn. Neither makes the feature more or
+# less trusted by the platform — this is for the human.
+_GROUNDING_DIRECTIVE = (
+    "\n\nFor EVERY feature you propose, return a `grounding` entry per column you used: the column, "
+    "its role, and one short clause naming the evidence you relied on. Where a value you relied on "
+    "is marked llm/proposed in `semantic_authority`, or a fact carries `proposed_value` rather than "
+    "`value`, say so — a feature resting on an unconfirmed semantic is still worth proposing, and "
+    "the reader needs to know which one it is.")
+
+
+def _generation_instruction(objective: str) -> str:
+    """The generation instruction: the (already-redacted) objective plus the fixed system
+    directives. Both are PII-free constants appended AFTER the objective, so the egress guard still
+    scans the whole string and the llm_call audit records exactly what was asked.
+
+    The grounding directive is version-gated because below `_GROUNDING_SCHEMA_VERSION` the wire
+    item is CLOSED without a `grounding` key: asking for it there would demand output the schema
+    forbids the model to give — the inversion `test_the_prompt_and_the_gate_AGREE_about_shape`
+    exists to catch on the enrichment side.
+    """
+    instruction = objective + _DERIVES_FROM_DIRECTIVE
+    if _feature_schema_version() >= _GROUNDING_SCHEMA_VERSION:
+        instruction += _GROUNDING_DIRECTIVE
+    return instruction
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -1973,7 +2128,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
+                        "feature_ideas", _generation_instruction(objective), inputs, actor=actor,
                         prompt_version=_feature_schema_version(),
                         schema_version=_feature_schema_version())
         proposed = out.get("features", [])

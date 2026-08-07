@@ -64,6 +64,15 @@ def _project(node: object) -> object:
     #     (a supported keyword) here on the wire only.
     if "x-wire-required" in node:
         node["required"] = node.pop("x-wire-required")
+    # 3c) the same wire-only bargain for a CLOSED VOCABULARY. `enum` is provider-SUPPORTED, so a
+    #     canonical `enum` would constrain the model AND be validated against the response — and on
+    #     a permissive body (feature_ideas' grounding `role`) one off-vocabulary answer would then
+    #     fail the WHOLE call for a value nothing branches on. `x-wire-enum` puts the vocabulary
+    #     where it earns its keep — guiding generation — and leaves the response lenient, with the
+    #     closure enforced per item in code. Use it ONLY where the code owns the closure; a value
+    #     the code trusts belongs in a canonical `enum` so an off-vocabulary answer cannot be read.
+    if "x-wire-enum" in node:
+        node["enum"] = node.pop("x-wire-enum")
     # 4) recurse into nested schema containers
     for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(node.get(key), dict):

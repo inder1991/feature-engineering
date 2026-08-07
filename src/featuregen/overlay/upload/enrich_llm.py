@@ -1305,10 +1305,74 @@ for _synth_alias_id in ("overlay_table_synth", "overlay_table_synth_summary_batc
 # version identifies the INPUT contract — but D10 makes registration a PRECONDITION, not a
 # follow-up: `_feature_schema_version()` may not return 4 until this loop has run, or
 # `_require_schema` refuses the dispatch and feature generation returns nothing with the flag on.
+# v5 (Task 6c) is the FIRST feature-gen version whose OUTPUT contract differs: every proposed
+# feature returns `grounding` — its own account of which offered column it used, in what role, and
+# on what evidence. Everything the request may ALSO stamp (recipe / leakage / set-rec) keeps the
+# v1 alias, because only `feature_ideas` gained a field and `_feature_schema_version()` stamps one
+# number across all four.
 for _feature_schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
     _SCHEMAS[(_feature_schema_id, 2)] = _SCHEMAS[(_feature_schema_id, 1)]
     _SCHEMAS[(_feature_schema_id, 3)] = _SCHEMAS[(_feature_schema_id, 1)]
     _SCHEMAS[(_feature_schema_id, 4)] = _SCHEMAS[(_feature_schema_id, 1)]
+    if _feature_schema_id != "feature_ideas":
+        _SCHEMAS[(_feature_schema_id, 5)] = _SCHEMAS[(_feature_schema_id, 1)]
+
+#: The v5 `grounding` array: WHY this feature, in the model's own words, against columns that
+#: really exist. EXPLANATORY ONLY — `feature_assist` reads it for display and pins that nothing
+#: branches on its content.
+#:
+#: WHAT IS *NOT* HERE IS THE POINT. `maxItems`, `maxLength` and `minItems` are stripped from the
+#: wire by `project_for_anthropic` but STILL validated against the response, so a bound here would
+#: fail the WHOLE call for one long clause the model was never told to shorten — the failure mode
+#: `test_enrich_output_bounds` exists to describe. `required` and `enum` are carried WIRE-ONLY
+#: (`x-wire-required` / `x-wire-enum`) for the same reason the feature item itself is: the canonical
+#: stays permissive so one malformed entry cannot take its siblings' good answers with it, and the
+#: deterministic gauntlet filters per entry. Every bound that matters lives in
+#: `feature_assist._ground_notes`, where it drops ONE entry instead of one call.
+_FEATURE_GROUNDING_SCHEMA: dict = {
+    "type": "array",
+    "description": "REQUIRED. One entry per column from the provided columns menu that you actually "
+                   "used in this feature — what it contributed and the evidence you relied on.",
+    "items": {
+        "type": "object",
+        # Open on the canonical (the projection closes it on the wire) — exactly as the feature
+        # item above is, and for the same leniency reason.
+        "additionalProperties": True,
+        "properties": {
+            "column": {"type": "string",
+                       "description": "the EXACT object_ref from the provided columns menu "
+                                      "(format public.<table>.<column>). A column that was never "
+                                      "offered is not a valid answer, and naming one discards the "
+                                      "whole feature."},
+            "role": {"type": "string",
+                     "x-wire-enum": ["measure", "grain", "time_anchor", "filter", "currency",
+                                     "dimension"],
+                     "description": "what this column contributes to the feature."},
+            "why": {"type": "string",
+                    "description": "ONE short clause naming the evidence you relied on."},
+        },
+        "x-wire-required": ["column", "role", "why"],
+    },
+}
+
+
+def _feature_ideas_with_grounding() -> dict:
+    """v5 = the v1 body plus one key. DERIVED from v1 rather than restated so the two cannot drift:
+    every earlier version is an alias of v1, so a v1 edit that v5 did not inherit would silently
+    split the contract in half."""
+    import copy
+
+    body = copy.deepcopy(_SCHEMAS[("feature_ideas", 1)])
+    item = body["properties"]["features"]["items"]
+    item["properties"]["grounding"] = copy.deepcopy(_FEATURE_GROUNDING_SCHEMA)
+    # Wire-required for the reason `derives_from` is: measured on Opus, a merely-DECLARED key on a
+    # nested array item is silently omitted. An absent array is still ACCEPTED by the code (honest
+    # absence, never a call failure) — this asks, it does not enforce.
+    item["x-wire-required"] = [*item["x-wire-required"], "grounding"]
+    return body
+
+
+_SCHEMAS[("feature_ideas", 5)] = _feature_ideas_with_grounding()
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads

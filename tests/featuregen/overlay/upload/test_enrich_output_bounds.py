@@ -51,6 +51,35 @@ def test_the_schema_bound_equals_the_code_accept_bound(schema_id, field, code_bo
     assert _schema_bound(schema_id, field) == code_bound, schema_id
 
 
+def test_the_feature_grounding_bounds_are_code_only_and_the_schema_carries_none() -> None:
+    """The OTHER resolution of the same tension, recorded here so it is not "made consistent" with
+    the pairs above (Task 6c).
+
+    Those four stages ACCEPT-OR-DROP one item at a time, so an equal schema bound is harmless — it
+    can only fire where the code gate would have fired anyway. `feature_ideas` is different in kind:
+    its canonical body is deliberately permissive so ONE malformed idea cannot fail the whole
+    response, and the code gate TRUNCATES rather than drops. An equal `maxLength` would therefore
+    fire FIRST, at response validation, and kill every sibling idea for one long clause the model
+    was never told to shorten — `maxLength` and `maxItems` are stripped from the wire.
+
+    So the grounding bounds live in code ALONE, and the schema carries none. This asserts BOTH
+    halves, because either alone is the bug: a schema that grew a bound, or code that lost one.
+    """
+    from featuregen.overlay.upload import feature_assist as fa
+
+    node = (llm._SCHEMAS[("feature_ideas", 5)]
+            ["properties"]["features"]["items"]["properties"]["grounding"])
+
+    def _has(n, kw: str) -> bool:
+        if isinstance(n, dict):
+            return kw in n or any(_has(v, kw) for v in n.values())
+        return isinstance(n, list) and any(_has(v, kw) for v in n)
+
+    for banned in ("maxLength", "maxItems", "minItems", "minLength", "required", "enum"):
+        assert not _has(node, banned), f"{banned} on the grounding response schema"
+    assert fa._MAX_GROUNDING_WHY_LEN > 0 and fa._MAX_GROUNDING_ENTRIES > 0
+
+
 def test_a_definition_may_now_be_written_at_the_full_definition_length() -> None:
     """The actual fix: the accept gate no longer refuses a long drafted definition.
 

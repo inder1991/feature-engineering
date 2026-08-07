@@ -46,6 +46,8 @@ _SRC = "bank"
 
 @pytest.fixture
 def v4(monkeypatch):
+    """Flag on, no override. Still named `v4` after the v5 bump (Task 6c) because v5 is the SAME
+    INPUT contract — v5 changed only what comes BACK — and this file is about the payload."""
     monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
     monkeypatch.delenv(fa.FEATURE_CONTEXT_VERSION_ENV, raising=False)
     return monkeypatch
@@ -104,8 +106,9 @@ def test_flag_off_is_v1_and_the_thin_menu_byte_for_byte(db, monkeypatch):
                for m in _menu(cols))
 
 
-def test_flag_on_defaults_to_v4(db, v4):
-    assert _feature_schema_version() == 4
+def test_flag_on_defaults_to_the_newest_contract(db, v4):
+    """v5 since Task 6c — the same v4 INPUT contract, with `grounding` on the way back."""
+    assert _feature_schema_version() == 5
 
 
 def test_the_env_override_keeps_v3_reachable_not_the_v1_thin_menu(db, v4, monkeypatch):
@@ -125,7 +128,7 @@ def test_an_unrenderable_version_falls_back_to_the_default_rather_than_downgradi
     """A typo in a deploy manifest must not silently ship a different contract."""
     for raw in ("2", "99", "", "  ", "four"):
         monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, raw)
-        assert _feature_schema_version() == 4, raw
+        assert _feature_schema_version() == 5, raw
 
 
 # ── D10: registration before a version may be requested ─────────────────────────────────────────
@@ -135,7 +138,9 @@ def test_every_version_the_ladder_can_return_is_registered(db, v4, monkeypatch):
     from featuregen.overlay.upload.enrich_llm import _SCHEMAS
 
     ids = ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec")
-    for version in (1, 3, 4):
+    # Read from the ladder itself, never restated: a version added to `_SELECTABLE_CONTEXT_VERSIONS`
+    # without a registered body must fail HERE rather than being invisible to a stale literal.
+    for version in (1, *fa._SELECTABLE_CONTEXT_VERSIONS):
         if version == 1:
             monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
         else:
