@@ -110,10 +110,12 @@ class RejectCode:
     MALFORMED_ITEM = "MALFORMED_ITEM"       # LLM returned a non-object feature item (guarded, not fatal)
     AMBIGUOUS_CATALOG = "AMBIGUOUS_CATALOG"
     UNKNOWN_COLUMN = "UNKNOWN_COLUMN"
-    # The model's own `grounding` array named a column the catalog never offered (Task 6c). The
-    # feature may still compute — its `derives_from` grounded — but the account it gives of itself
-    # cites something that does not exist, so the proposal is discarded rather than shown with a
-    # fabricated explanation attached.
+    # The model's own `grounding` array named a column that matches NOTHING the catalog offered
+    # (Task 6c). The feature may still compute — its `derives_from` grounded — but the account it
+    # gives of itself cites something that does not exist, so the proposal is discarded rather than
+    # shown with a fabricated explanation attached. Narrow by construction: an AMBIGUOUS name, a
+    # missing one and an unreadable role all cost their own entry and never the feature
+    # (`_ground_notes`), because none of those is a false claim about the catalog.
     UNKNOWN_GROUNDING_COLUMN = "UNKNOWN_GROUNDING_COLUMN"
     LEAKAGE = "LEAKAGE"
     STALE = "STALE"
@@ -1154,16 +1156,29 @@ def _grain_column_ref(conn, catalog_source: str, table: str) -> str | None:
     return row[0] if row else None
 
 
+def _by_bare_column(known: set[str]) -> dict[str, str | None]:
+    """Bare column name -> the ONE object_ref ending in it, or ``None`` when several do (AMBIGUOUS).
+
+    ONE home for the suffix-resolution rule. `_ground_refs` and `_ground_notes` must agree about
+    what a bare name means — a second copy of an identity-bearing rule is a rule that drifts — and
+    the two need DIFFERENT answers from it (a dropped ref vs a dropped note), which they can only
+    give from the same map. The ``None`` marker is what makes "ambiguous" distinguishable from
+    "unknown"; collapsing them is what made an ambiguous name cost a whole feature.
+    """
+    by_col: dict[str, str | None] = {}
+    for ref in known:
+        col = ref.rsplit(".", 1)[-1]
+        by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    return by_col
+
+
 def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     """Resolve each LLM-proposed ``derives_from`` entry to a real catalog ``object_ref``. Exact match
     first; else a UNIQUE bare-column-name / suffix match, so a model that emits ``actual_tran_amt``
     (or ``public.t.actual_tran_amt`` verbatim) both ground to the same object_ref — the model's
     reference FORMAT must not silently un-ground an otherwise-valid feature. Ambiguous column names
     (same name in >1 table) and unknown refs are dropped. Order-preserving + de-duplicated."""
-    by_col: dict[str, str | None] = {}
-    for ref in known:
-        col = ref.rsplit(".", 1)[-1]
-        by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    by_col = _by_bare_column(known)
     # The model returns derives_from as EITHER a JSON list OR a single string — and measured on Opus, that
     # string is frequently a COMMA/semicolon/newline-separated list of several refs
     # ("public.t.a, public.t.b, public.t.c"). Split it so a multi-column feature grounds on ALL its
@@ -1189,39 +1204,63 @@ def _ground_notes(raw_grounding: object,
                   known: set[str]) -> tuple[tuple[GroundingNote, ...], str | None]:
     """Resolve the model's `grounding` array. Returns (notes, unresolved_column).
 
-    A non-empty `unresolved_column` means the model cited a column the catalog never offered, and
-    the CALLER discards the whole feature. Two different failures, treated differently on purpose:
+    EXACTLY ONE failure costs the whole feature, and the CALLER applies it: a `column` that names
+    NOTHING in the offered candidate set. That is a false claim about the CATALOG — the account the
+    feature gives of itself is fabricated — and left in place the array would be a second channel
+    for ungrounded refs to re-enter beside the ones `_ground_refs` filters out of `derives_from`.
 
-      * an UNOFFERED COLUMN is a false claim about the CATALOG — the account the feature gives of
-        itself is fabricated, and left in place the array would be a second channel for ungrounded
-        refs to re-enter beside the ones `_ground_refs` already filters out of `derives_from`. It
-        costs the feature, visibly, under its own reject code.
-      * an OFF-VOCABULARY ROLE is a limit of OUR taxonomy, not a fabrication — the model may simply
-        have a word we do not model. It costs the ENTRY, never the feature.
+    EVERY other malformation costs THAT ENTRY and nothing else, because none of them is a claim
+    about the catalog that is false:
 
-    Resolution is `_ground_refs`' — exact ref, else a unique bare-name/suffix match — so the model's
-    reference FORMAT cannot un-ground an otherwise-valid feature, and the emitted `column` is the
-    resolved object_ref so a reviewer follows a real catalog ref rather than the model's string.
-    An ABSENT or empty array is honest absence: no notes, no rejection, no disposition changed.
+      * an AMBIGUOUS bare name (the same column name in >1 table) — and the payload invites exactly
+        this: `_table_context` presents grain and as-of columns as BARE NAMES, and the grounding
+        directive asks the model to account for them. A model that copies the name it was SHOWN,
+        for a column that really was offered, must not lose its feature over the spelling. Note the
+        asymmetry that would otherwise exist: for `derives_from` the identical ambiguity drops one
+        ref and the feature survives, so the EXPLANATION would have been strictly harsher than the
+        thing it explains.
+      * a MISSING or non-string `column` — an incomplete entry. `column` is wire-required and
+        response-OPTIONAL by deliberate design (a canonical `required` would fail the whole call);
+        treating the omission the schema tolerates as a fabrication would contradict that in the
+        same breath. `None` in particular must never be stringified into a column literally named
+        "None" and reported to a human as an invention.
+      * an OFF-VOCABULARY ROLE — a limit of OUR taxonomy, not a fabrication.
+
+    Resolution is `_ground_refs`' — exact ref, else a unique bare-name/suffix match, off the SAME
+    `_by_bare_column` map — so the model's reference FORMAT cannot un-ground a feature, and the
+    emitted `column` is the resolved object_ref so a reviewer follows a real catalog ref rather than
+    the model's string. An ABSENT or empty array is honest absence: no notes, no rejection, no
+    disposition changed.
     """
     if not isinstance(raw_grounding, list):
         # Absent (the normal case at v4 and below) or a shape we cannot read. Neither is a refusal:
         # `grounding` is optional on the response precisely so a model that skips it does not turn
         # every such response into a whole-call failure.
         return (), None
+    by_col = _by_bare_column(known)
     notes: list[GroundingNote] = []
     for entry in raw_grounding:
         if not isinstance(entry, dict):
             continue
-        raw_column = str(entry.get("column", "")).strip()
-        resolved = _ground_refs([raw_column], known) if raw_column else []
-        if not resolved:
-            return (), raw_column or "(unnamed)"
+        column = entry.get("column")
+        column = column.strip() if isinstance(column, str) else ""
+        if not column:
+            continue                                  # incomplete — dropped, never a fabrication
+        tail = column.rsplit(".", 1)[-1]
+        if column in known:
+            resolved: str | None = column
+        elif tail in by_col:
+            resolved = by_col[tail]                   # None ⟹ the bare name is AMBIGUOUS
+        else:
+            return (), column                         # names NOTHING — the one fatal case
+        if resolved is None:
+            logger.info("dropping an ambiguous grounding column %r", column[:80])
+            continue
         role = str(entry.get("role", "")).strip().lower()
         if role not in GROUNDING_ROLES:
             logger.info("dropping a grounding entry with an off-vocabulary role %r", role[:40])
             continue
-        notes.append(GroundingNote(column=resolved[0], role=role,
+        notes.append(GroundingNote(column=resolved, role=role,
                                    why=str(entry.get("why", ""))[:_MAX_GROUNDING_WHY_LEN]))
     # Capped LAST, so a fabricated column past the cap is still refused rather than trimmed away.
     return tuple(notes[:_MAX_GROUNDING_ENTRIES]), None
@@ -1593,7 +1632,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     notes, unresolved = _ground_notes(raw.get("grounding"), known)
     if unresolved is not None:
         return _reject(RejectCode.UNKNOWN_GROUNDING_COLUMN,
-                       f"grounding names a column that was never offered: {unresolved[:80]}")
+                       f"grounding names a column that does not exist: {unresolved[:80]}")
     pairs: list[tuple[str, str]] = []
     for d in derives:
         srcs = src_of.get(d, set())
@@ -2070,20 +2109,29 @@ _GROUNDING_DIRECTIVE = (
     "the reader needs to know which one it is.")
 
 
+def _grounding_directive() -> str:
+    """The grounding directive at the versions whose schema can carry the answer, else "".
+
+    Version-gated in BOTH directions, and both directions are the same rule — the prompt and the
+    schema must agree about shape:
+
+      * below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding` key, so
+        asking for one would demand output the schema forbids the model to give;
+      * AT it the key is wire-REQUIRED, so the model is compelled to answer — and compelling an
+        answer while withholding the rules for it is the same inversion the other way up. That is
+        why EVERY call stamping this version appends it, including `refine_idea`, whose human
+        instruction otherwise carries no system directive at all.
+    """
+    return (_GROUNDING_DIRECTIVE
+            if _feature_schema_version() >= _GROUNDING_SCHEMA_VERSION else "")
+
+
 def _generation_instruction(objective: str) -> str:
     """The generation instruction: the (already-redacted) objective plus the fixed system
     directives. Both are PII-free constants appended AFTER the objective, so the egress guard still
     scans the whole string and the llm_call audit records exactly what was asked.
-
-    The grounding directive is version-gated because below `_GROUNDING_SCHEMA_VERSION` the wire
-    item is CLOSED without a `grounding` key: asking for it there would demand output the schema
-    forbids the model to give — the inversion `test_the_prompt_and_the_gate_AGREE_about_shape`
-    exists to catch on the enrichment side.
     """
-    instruction = objective + _DERIVES_FROM_DIRECTIVE
-    if _feature_schema_version() >= _GROUNDING_SCHEMA_VERSION:
-        instruction += _GROUNDING_DIRECTIVE
-    return instruction
+    return objective + _DERIVES_FROM_DIRECTIVE + _grounding_directive()
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -2290,8 +2338,14 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
         inputs["table_context"] = table_context
     if objective:
         inputs["objective"] = objective
+    # The grounding directive rides here too — NOT the derives-from one, which this path has never
+    # appended. The difference is that the v5 wire item makes `grounding` REQUIRED on this call:
+    # the schema compels an answer, so the rules for it must travel with the request rather than
+    # leaving a human's revision to be refused for a convention it was never told (see
+    # `_grounding_directive`). A fixed PII-free constant appended after the human's instruction, so
+    # the egress guard still scans the whole string and the llm_call records exactly what was asked.
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", instruction, inputs, actor=actor,
+                    "feature_ideas", instruction + _grounding_directive(), inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     proposed = out.get("features", [])

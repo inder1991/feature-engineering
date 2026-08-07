@@ -180,6 +180,61 @@ def test_a_feature_that_returns_no_grounding_is_accepted_unchanged(db, v5):
     assert _report(db, _returning(_idea(grounding=[]))).ideas[0].grounding == ()
 
 
+def test_an_ambiguous_bare_name_drops_that_entry_and_never_the_feature(db, v5):
+    """The payload HANDS the model bare names — `_table_context` presents grain and as-of columns
+    as bare column names, and the grounding directive asks the model to account for them. A model
+    that copies the name it was SHOWN, for a column that really was offered, must not lose its
+    feature because that name happens to exist in two tables.
+
+    The asymmetry is the argument: `derives_from` names `amount` by its exact ref below and grounds
+    fine, and were IT the ambiguous one it would drop a ref and keep the feature. The EXPLANATION
+    must never be judged more harshly than the thing it explains."""
+    from featuregen.overlay.upload.graph import add_column_row
+
+    _bank_graph(db)
+    add_column_row(db, "bank", CanonicalRow("bank", "accounts", "amount", "numeric"))
+    report = _report(db, _returning(_idea(grounding=[
+        {"column": "amount", "role": "measure", "why": "ambiguous across two tables"},
+        {"column": _GRAIN, "role": "grain", "why": "unambiguous, so it survives"}])))
+    assert [(g.column, g.role) for g in report.ideas[0].grounding] == [(_GRAIN, "grain")]
+
+
+def test_an_entry_with_no_column_is_dropped_and_never_read_as_a_fabrication(db, v5):
+    """`column` is wire-required and response-OPTIONAL by deliberate design — a canonical `required`
+    would fail the whole call. Treating the omission the schema tolerates as a fabrication would
+    contradict that in the same breath, so an incomplete entry costs itself and nothing more."""
+    _bank_graph(db)
+    for missing in ({"role": "measure", "why": "no column key"},
+                    {"column": "   ", "role": "measure", "why": "whitespace"}):
+        report = _report(db, _returning(_idea(grounding=[
+            missing, {"column": _AMOUNT, "role": "measure", "why": "the good one"}])))
+        assert [g.column for g in report.ideas[0].grounding] == [_AMOUNT], missing
+        assert report.rejections == [], missing
+
+
+def test_a_non_string_column_is_absence_not_a_column_literally_named_None():
+    """The sharp case, and the one place a unit test is the HONEST test.
+
+    `str(None)` is `"None"` — a naive read would report to a human that the model invented a column
+    called None. `_ground_notes` reads a non-string as ABSENT instead.
+
+    Deliberately not driven through `recommend_features_report`: it cannot get there. The canonical
+    schema types `column` as `string` (structure IS validated, and unlike a stripped `maxLength` the
+    model is TOLD it on the wire), so a `null` fails response validation, burns the 2 repairs and
+    fails the round — the same treatment `derives_from`'s own `items: {type: string}` gives. This
+    branch is the belt-and-braces behind that, asserted where it is reachable rather than pretended
+    to be exercised end to end."""
+    known = {_AMOUNT}
+    for bad in (None, 42, ["a"], {"x": 1}):
+        notes, unresolved = fa._ground_notes(
+            [{"column": bad, "role": "measure", "why": "w"},
+             {"column": _AMOUNT, "role": "measure", "why": "good"}], known)
+        assert unresolved is None, bad                      # never reported as a fabrication
+        assert [n.column for n in notes] == [_AMOUNT], bad  # …and never the string "None"
+    # A non-dict entry is skipped for the same reason, and neither shape refuses the feature.
+    assert fa._ground_notes(["a bare string", None], known) == ((), None)
+
+
 def test_an_unknown_role_drops_that_entry_and_never_the_feature(db, v5):
     """The role vocabulary is CLOSED: free text there would become an ungoverned second vocabulary.
     But an off-vocabulary role is a limit of OUR taxonomy, not a false claim about the catalog, so
@@ -323,3 +378,55 @@ def test_the_instruction_asks_for_grounding_only_at_the_version_that_can_carry_i
     monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
     _report(db, _Capture(), budget=1)
     assert "grounding" not in seen[-1]
+
+
+def test_refine_is_told_the_grounding_rules_its_schema_now_compels(db, v5):
+    """`refine_idea` stamps `_feature_schema_version()` like every other feature-gen call, so at v5
+    the projected wire item makes `grounding` REQUIRED — the schema compels an answer. Compelling an
+    answer while withholding the rules for it is the same prompt/schema inversion as asking for
+    output the schema forbids, so the directive travels with this call too, even though this path
+    has never carried the derives-from one.
+
+    It is version-gated here as well: at v4 the wire item has no such key and the human's
+    instruction goes out untouched."""
+    from featuregen.overlay.upload.feature_assist import refine_idea
+
+    _bank_graph(db)
+    seen: list[str] = []
+
+    class _Client:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            seen.append(request.inputs["redacted_intent"])
+            return LLMResult(output={"features": [_idea(name="txn_count_30d",
+                                                        aggregation="count_30d",
+                                                        grounding=[{"column": _AMOUNT,
+                                                                    "role": "measure",
+                                                                    "why": "the amount"}])]},
+                             self_reported_scores={}, call_ref="", status="ok")
+
+    revised, rejection = refine_idea(db, {"name": "txn_count_90d", "derives_from": [_AMOUNT]},
+                                     "use a 30 day window", _Client(), catalog_source="bank")
+    assert rejection is None and revised is not None
+    assert seen[-1].startswith("use a 30 day window") and "grounding" in seen[-1]
+    # …and a revision's grounding is carried through the same gauntlet, not silently dropped.
+    assert [(g.column, g.role) for g in revised.grounding] == [(_AMOUNT, "measure")]
+
+
+def test_refine_at_v4_carries_the_human_instruction_untouched(db, v5, monkeypatch):
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
+    from featuregen.overlay.upload.feature_assist import refine_idea
+
+    _bank_graph(db)
+    seen: list[str] = []
+
+    class _Client:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            seen.append(request.inputs["redacted_intent"])
+            return LLMResult(output={"features": [_idea()]}, self_reported_scores={}, call_ref="",
+                             status="ok")
+
+    refine_idea(db, {"name": "orig", "derives_from": [_AMOUNT]}, "tighten it", _Client(),
+                catalog_source="bank")
+    assert seen[-1] == "tighten it"
