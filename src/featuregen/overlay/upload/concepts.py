@@ -171,23 +171,29 @@ _ALL: tuple[Concept, ...] = (
             description="A person or organisation NAME. Names display and group; they are "
                         "never identifiers and never join keys."),
     Concept("module_id", "categorical",
+            is_a="category_code",
             description="A source-system module/product code (which subsystem produced the row). "
                         "System-scoped categorical; not a business category and not a key."),
 
     # ── §3.3 Temporal (point-in-time critical) ────────────────────────────────────────────────────
     Concept("as_of_date", "temporal", pit_role="as_of",
+            is_a="valid_time",
             description="Decision reference date — the point features are computed as-of."),
     Concept("effective_date", "temporal", pit_role="effective",
+            is_a="valid_time",
             description="State start date — when a value/state became effective."),
     Concept("origination_date", "temporal", pit_role="event",
+            is_a="event_timestamp",
             description="When a loan/account/facility was originated (an occurrence)."),
     Concept("maturity_date", "temporal", pit_role="maturity",
             description="Contractual maturity/expiry date."),
-    Concept("trade_date", "temporal", pit_role="event", description="Date a trade was struck."),
+    Concept("trade_date", "temporal", pit_role="event", is_a="event_timestamp",
+            description="Date a trade was struck."),
     Concept("value_date", "temporal", pit_role="effective",
+            is_a="effective_date",
             description="Date value/funds become economically effective (FX/payments)."),
     Concept("settlement_date", "temporal", pit_role="event",
-            description="Date a trade/payment settles (an occurrence)."),
+            is_a="event_timestamp", description="Date a trade/payment settles (an occurrence)."),
     Concept("event_timestamp", "temporal", pit_role="event",
             description="Timestamp an event occurred (dated at occurrence)."),
     Concept("duration_tenure", "temporal", additivity="non_additive",
@@ -227,14 +233,18 @@ _ALL: tuple[Concept, ...] = (
     Concept("beta", "quantity_risk", additivity="non_additive",
             description="Deposit beta (a ratio). Non-additive."),
     Concept("pd", "quantity_risk", additivity="non_additive",
+            is_a="score_probability",
             description="Basel probability of default (generalises pd_ttc/pd_pit). Non-additive. "
                         "LEAKAGE-RISK when a model output — flag before use as a feature."),
 
     # ── §3.5 Categorical & coded ──────────────────────────────────────────────────────────────────
     Concept("category_code", "categorical", description="Generic coded category."),
-    Concept("product_type", "categorical", description="Product classification."),
-    Concept("account_type", "categorical", description="Account classification (current/savings/loan/…)."),
-    Concept("transaction_type", "categorical", description="Transaction classification."),
+    Concept("product_type", "categorical", is_a="category_code",
+            description="Product classification."),
+    Concept("account_type", "categorical", is_a="category_code",
+            description="Account classification (current/savings/loan/…)."),
+    Concept("transaction_type", "categorical", is_a="category_code",
+            description="Transaction classification."),
     Concept("direct_debit", "categorical",
             description="Direct-debit mandate + its lifecycle events (setup / amend / cancel). Distinct "
                         "from a one-off transaction — cancellation is a Stage-4 churn signal "
@@ -243,19 +253,25 @@ _ALL: tuple[Concept, ...] = (
             description="Standing-order mandate + events (setup / redirect / cancel). Redirection to an "
                         "external bank is a primacy-loss signal (§A9)."),
     Concept("debit_credit_indicator", "categorical",
+            is_a="category_code",
             description="Flow DIRECTION on a transaction (debit vs credit / dr-cr / sign). Required by "
                         "every cash-flow feature (inflow_outflow_ratio §A4) — distinct from boolean_flag."),
     Concept("beneficiary_bank", "categorical",
             description="The payee's destination bank / sort-code / scheme, with an internal-vs-EXTERNAL "
                         "flag. Powers the own-money-to-a-competitor primacy signal (§A9)."),
-    Concept("channel", "categorical", description="Origination/servicing channel (mobile/web/branch/call-center)."),
+    Concept("channel", "categorical", is_a="category_code",
+            description="Origination/servicing channel (mobile/web/branch/call-center)."),
     Concept("country_code", "categorical", sensitivity="proxy",
+            is_a="category_code",
             description="ISO country code. When it encodes nationality/residence it is a national-"
                         "origin PROXY (ECOA/fair-lending) — proxy-flagged; use-case-gate for credit."),
-    Concept("industry_code", "categorical", description="Industry classification (NAICS/SIC)."),
-    Concept("mcc", "categorical", description="Merchant category code."),
-    Concept("instrument_type", "categorical", description="Instrument classification."),
+    Concept("industry_code", "categorical", is_a="category_code",
+            description="Industry classification (NAICS/SIC)."),
+    Concept("mcc", "categorical", is_a="category_code", description="Merchant category code."),
+    Concept("instrument_type", "categorical", is_a="category_code",
+            description="Instrument classification."),
     Concept("lifecycle_state", "categorical",
+            is_a="category_code",
             description="Lifecycle state / status (origination→active→delinquent→default→restructured→"
                         "closed/written-off). Features condition on it; transitions are often the target."),
 
@@ -266,19 +282,20 @@ _ALL: tuple[Concept, ...] = (
 
     # ── §3.7 Flags (boolean) — some are targets (leakage anchors) ─────────────────────────────────
     Concept("boolean_flag", "flag", description="Generic boolean flag."),
-    Concept("delinquency_flag", "flag", leakage_anchor=True,
+    Concept("delinquency_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Delinquency indicator. LEAKAGE ANCHOR — is the target for delinquency models."),
-    Concept("default_flag", "flag", leakage_anchor=True,
+    Concept("default_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Default indicator. LEAKAGE ANCHOR — is the target for PD/default models."),
-    Concept("fraud_flag", "flag", leakage_anchor=True,
+    Concept("fraud_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Fraud indicator. LEAKAGE ANCHOR — is the target for fraud models."),
-    Concept("restructured_flag", "flag", near_label=True,
+    Concept("restructured_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Restructure / forbearance indicator. NEAR-LABEL: forbearance ≈ the default "
                         "label (§B2 Stage-4) — the 3-part leakage control must flag it."),
-    Concept("sanctions_hit_flag", "flag", sensitivity="pii", near_label=True,
+    Concept("sanctions_hit_flag", "flag", sensitivity="pii", is_a="boolean_flag", near_label=True,
             description="Sanctions-screening hit — sensitive (read-scoped, AML-lawful-basis; not fair-"
                         "lending-blocked). NEAR-LABEL: a filed hit ≈ the sanctions-model target."),
     Concept("pep_flag", "flag", sensitivity="pii",
+            is_a="boolean_flag",
             description="Politically-exposed-person indicator — GDPR-sensitive (political); read-scoped "
                         "and AML-lawful-basis. Tagged pii (usable for AML), NOT special_category-blocked."),
 
@@ -296,6 +313,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("kyc_document", "sensitive", sensitivity="pii",
             description="KYC identity document — carries PII; read-scoped."),
     Concept("beneficiary_name", "sensitive", sensitivity="pii", entity_link="beneficiary",
+            is_a="party_name",
             description="Payee name on a transfer — PII, read-scoped. Name-matched against the customer "
                         "name to DERIVE the own-account flag downstream (§A9 external_own_transfer_trend; "
                         "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
@@ -328,6 +346,7 @@ _ALL: tuple[Concept, ...] = (
                         "on egress (a deterministic gate, not just a prose warning)."),
     Concept("document_reference", "text", description="Reference/pointer to a stored document."),
     Concept("unstructured_doc", "text", sensitivity="pii",
+            is_a="free_text",
             description="Loan/KYC document body. Tagged pii: may carry PII/special-category content — "
                         "read-scoped + screen on egress."),
 
@@ -338,7 +357,8 @@ _ALL: tuple[Concept, ...] = (
                         "built from it or from its defining source columns."),
 
     # ── §3.11 Behavioural / digital ───────────────────────────────────────────────────────────────
-    Concept("event_type", "behavioural", description="Digital event classification."),
+    Concept("event_type", "behavioural", is_a="category_code",
+            description="Digital event classification."),
     Concept("session", "behavioural", description="Session grouping of digital activity."),
     Concept("clickstream", "behavioural", description="Sequence of page/app interactions."),
     Concept("channel_usage", "behavioural", description="Usage intensity by channel."),
@@ -365,6 +385,7 @@ _ALL: tuple[Concept, ...] = (
                         "features require both valid_time ≤ as_of AND system_time ≤ as_of — the second "
                         "drops values restated later that you didn't know at prediction time."),
     Concept("booking_date", "temporal", pit_role="system_time",
+            is_a="system_time",
             description="Date an entry was booked to the ledger (a knowledge/system-time date)."),
     Concept("business_day_convention", "temporal",
             description="Rule for adjusting dates to business days (following/modified-following/…)."),
@@ -375,17 +396,21 @@ _ALL: tuple[Concept, ...] = (
     Concept("currency_code", "currency",
             description="The monetary UNIT. CANNOT mix currencies in a sum — convert to a base "
                         "currency via a point-in-time fx_rate first; mixing USD+EUR is a wrong number."),
-    Concept("base_currency", "currency", description="Reporting/base currency all amounts convert to."),
-    Concept("local_currency", "currency", description="Native/local currency of the amount."),
+    Concept("base_currency", "currency", is_a="currency_code",
+            description="Reporting/base currency all amounts convert to."),
+    Concept("local_currency", "currency", is_a="currency_code",
+            description="Native/local currency of the amount."),
     Concept("fx_conversion_rate", "currency", additivity="non_additive",
             description="Point-in-time FX rate used to convert local→base. Non-additive."),
     Concept("cross_rate", "currency", additivity="non_additive",
+            is_a="fx_conversion_rate",
             description="Currency cross-rate (via a common base). Non-additive."),
 
     # ── §3.15 Data eligibility (P0 compliance) ────────────────────────────────────────────────────
     Concept("data_purpose", "eligibility", description="Declared purpose the data may be used for."),
     Concept("consent_status", "eligibility", description="Whether consent covers the intended use."),
-    Concept("retention_class", "eligibility", description="Retention policy class / max retention window."),
+    Concept("retention_class", "eligibility", is_a="category_code",
+            description="Retention policy class / max retention window."),
     Concept("data_residency", "eligibility", description="Jurisdiction the data must reside in."),
 
     # ── §3.16 Regulatory capital & accounting (the spine) ─────────────────────────────────────────
@@ -405,14 +430,17 @@ _ALL: tuple[Concept, ...] = (
     Concept("downturn_lgd", "regulatory_capital", additivity="non_additive", is_a="lgd",
             description="Downturn loss given default. Non-additive."),
     Concept("fair_value", "accounting", additivity="semi_additive",
+            is_a="monetary_stock",
             description="Fair-value carrying amount (a valuation stock). Semi-additive (latest over time)."),
     Concept("amortised_cost", "accounting", additivity="semi_additive",
+            is_a="monetary_stock",
             description="Amortised-cost carrying amount (a balance). Semi-additive (latest over time)."),
-    Concept("impairment_stage", "accounting", near_label=True,
+    Concept("impairment_stage", "accounting", is_a="category_code", near_label=True,
             description="IFRS9 stage 1/2/3 (ordinal). Not aggregatable — condition on it. NEAR-LABEL: "
                         "stage 3 (credit-impaired) ≈ the default label — the 3-part leakage control "
                         "must flag it."),
     Concept("accrual", "accounting", additivity="additive",
+            is_a="monetary_flow",
             description="Accrued interest/amount over a period (flow-like). Additive over the period."),
     Concept("provision_amount", "accounting", additivity="semi_additive", is_a="monetary_stock",
             description="Loan-loss provision — a provision STOCK. Semi-additive: sum across exposures, "
@@ -432,8 +460,10 @@ _ALL: tuple[Concept, ...] = (
     Concept("esg_score", "esg", additivity="non_additive", description="ESG rating/score. Non-additive."),
     Concept("carbon_intensity", "esg", additivity="non_additive",
             description="Emissions per unit of activity/revenue. Non-additive (a ratio)."),
-    Concept("green_flag", "esg", description="Green/sustainable-finance eligibility flag."),
-    Concept("sharia_compliant_flag", "esg", description="Sharia-compliance flag (Islamic banking)."),
+    Concept("green_flag", "esg", is_a="boolean_flag",
+            description="Green/sustainable-finance eligibility flag."),
+    Concept("sharia_compliant_flag", "esg", is_a="boolean_flag",
+            description="Sharia-compliance flag (Islamic banking)."),
 
     # ══════════════════════════════════════════════════════════════════════════════════════════
     # Phase-2 additive expansion — closes the SME gap-review's missing-concept findings (§B) plus
@@ -449,6 +479,7 @@ _ALL: tuple[Concept, ...] = (
                         "master limit): semi-additive at most (latest over time); never naively sum "
                         "nested limits — double-counts. Contrast a drawn balance (§E limit-vs-balance)."),
     Concept("limit_type", "categorical",
+            is_a="category_code",
             description="Kind of limit (facility / counterparty / country / sector / settlement / "
                         "single-name). Disambiguates a limit's scope."),
     Concept("covenant", "quantity_risk", additivity="non_additive", near_label=True,
@@ -456,9 +487,11 @@ _ALL: tuple[Concept, ...] = (
                         "NEAR-LABEL: a breach borders the default/forbearance label — the leakage control "
                         "must flag headroom/breach features."),
     Concept("collateral_type", "categorical",
+            is_a="category_code",
             description="Kind of collateral (cash / real-estate / securities / receivables / guarantee). "
                         "Drives haircut + advance_rate."),
     Concept("lien_seniority", "categorical",
+            is_a="category_code",
             description="Priority of the security interest (first / second lien, senior / subordinated) "
                         "— ordinal; drives recovery/LGD. Loan-level (contrast tranche)."),
     Concept("netting_set_id", "identifier", namespace="netting_set", entity_link="netting_set",
@@ -498,12 +531,14 @@ _ALL: tuple[Concept, ...] = (
             description="Option-implied volatility (a market observable / surface point). Non-additive "
                         "across strikes/expiries."),
     Concept("position_direction", "categorical",
+            is_a="category_code",
             description="Market position DIRECTION (long / short / buy / sell). Required for netting and "
                         "signed exposure — distinct from boolean_flag (cf. debit_credit_indicator)."),
     Concept("expected_exposure", "quantity_risk", additivity="semi_additive", is_a="monetary_stock",
             description="Expected (positive) exposure — EPE, counterparty credit risk. A monetary "
                         "exposure STOCK: sum across netting sets, latest over time."),
     Concept("potential_future_exposure", "quantity_risk", additivity="non_additive",
+            is_a="monetary_stock",
             description="PFE — a high-quantile future exposure. Non-additive (a quantile; sub-additive "
                         "with diversification — never sum across netting sets, like var)."),
     Concept("expected_shortfall", "quantity_risk", additivity="non_additive",
@@ -538,13 +573,15 @@ _ALL: tuple[Concept, ...] = (
     Concept("trade_line", "categorical",
             description="A credit-bureau tradeline — one account's history (limit/balance/status) on the "
                         "file. External / FCRA-regulated reference data."),
-    Concept("sicr_flag", "flag", near_label=True,
+    Concept("sicr_flag", "flag", is_a="boolean_flag", near_label=True,
             description="IFRS9 Significant-Increase-in-Credit-Risk trigger (Stage 1→2). NEAR-LABEL: the "
                         "staging trigger borders the default label — flag."),
-    Concept("delinquency_bucket", "quantity_risk", additivity="non_additive", near_label=True,
+    Concept("delinquency_bucket", "quantity_risk", additivity="non_additive", is_a="category_code",
+            near_label=True,
             description="Ordinal delinquency bucket (current / 1-29 / 30-59 / 60-89 / 90+ DPD). "
                         "Non-additive. NEAR-LABEL: the 90+ bucket is a default backstop — flag."),
     Concept("exposure_class", "categorical",
+            is_a="category_code",
             description="Basel exposure class / regulatory segment (sovereign / bank / corporate / "
                         "retail / equity). Drives the risk_weight; the standardised/IRB segment."),
     Concept("customer_risk_rating", "quantity_risk", additivity="non_additive",
@@ -559,13 +596,13 @@ _ALL: tuple[Concept, ...] = (
     Concept("effective_maturity", "temporal", additivity="non_additive", is_a="tenor",
             description="Basel effective maturity (M), floored/capped 1–5y — a regulatory duration. "
                         "Non-additive."),
-    Concept("npe_flag", "flag", near_label=True,
+    Concept("npe_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Non-performing-exposure flag (EBA NPE: 90+ DPD / unlikely-to-pay). NEAR-LABEL: "
                         "NPE overlaps the default definition — flag (a distinct-but-adjacent target)."),
-    Concept("watchlist_hit_flag", "flag", near_label=True,
+    Concept("watchlist_hit_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Internal credit watchlist / early-warning hit. NEAR-LABEL: watchlisting borders "
                         "the default/forbearance funnel — flag."),
-    Concept("adverse_media_flag", "flag", sensitivity="pii", near_label=True,
+    Concept("adverse_media_flag", "flag", sensitivity="pii", is_a="boolean_flag", near_label=True,
             description="Negative-news (adverse-media) screening hit — AML, read-scoped (may carry "
                         "special-category/criminal data). NEAR-LABEL: borders the financial-crime label."),
     Concept("collateral_value", "monetary", additivity="semi_additive", is_a="monetary_stock",
@@ -575,6 +612,7 @@ _ALL: tuple[Concept, ...] = (
             description="Beneficial/parent ownership stake (%) — the consolidation weight on a group "
                         "edge. Non-additive (a proportion)."),
     Concept("model_tier", "categorical",
+            is_a="category_code",
             description="Model-risk materiality tier (SR 11-7 / model governance). Governance metadata — "
                         "gates validation rigour; not aggregatable."),
 
@@ -604,6 +642,7 @@ _ALL: tuple[Concept, ...] = (
             description="Net asset value per unit — a PRICE. Non-additive. (Fund-level total NAV is a "
                         "stock — see monetary_stock.)"),
     Concept("settlement_status", "categorical",
+            is_a="category_code",
             description="Settlement lifecycle status (pending / settled / failed / partial). Distinct "
                         "from settlement_date; a fail is the settlement_fail outcome."),
     Concept("settlement_cycle", "temporal",
@@ -613,11 +652,13 @@ _ALL: tuple[Concept, ...] = (
             description="Corporate-action event (dividend / split / merger / rights). Entitlement is "
                         "fixed at record_date, priced at ex_date, paid at pay_date."),
     Concept("record_date", "temporal", pit_role="effective",
+            is_a="effective_date",
             description="Corporate-action record date — entitlement is FIXED (effective) as-of this date."),
     Concept("ex_date", "temporal", pit_role="as_of",
             description="Ex-dividend/ex-entitlement date — entitlement is read AS-OF here (the price "
                         "drops by the entitlement on this date)."),
     Concept("pay_date", "temporal", pit_role="event",
+            is_a="event_timestamp",
             description="Corporate-action payment date — the cash/stock pays (an occurrence)."),
     Concept("securities_loan", "monetary", additivity="semi_additive", is_a="monetary_stock",
             description="Securities lending/borrowing (SFT) position — a STOCK. Semi-additive: sum "
@@ -644,6 +685,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("tracking_error", "quantity_risk", additivity="non_additive",
             description="Std-dev of active return vs benchmark (active risk). Non-additive."),
     Concept("expense_ratio", "monetary", additivity="non_additive",
+            is_a="monetary_rate",
             description="Fund expense ratio (TER / OCF) — annual cost as a % of assets. Non-additive "
                         "(a ratio)."),
 
@@ -680,6 +722,7 @@ _ALL: tuple[Concept, ...] = (
                         "Additive within one firm; NOT summable across a portfolio (cross-entity "
                         "double-count). See emissions_data_quality."),
     Concept("financed_emissions", "esg", additivity="additive",
+            is_a="scope_3_emissions",
             description="PCAF financed emissions — emissions ATTRIBUTED to loans/investments. Additive "
                         "across the book (attribution avoids double-count); heavily ESTIMATED."),
     Concept("taxonomy_alignment", "esg", additivity="non_additive",
@@ -699,13 +742,16 @@ _ALL: tuple[Concept, ...] = (
 
     # ── Specialist · payments (gap-review §B) ────────────────────────────────────────────────────
     Concept("payment_rail", "categorical",
+            is_a="category_code",
             description="Payment rail (FPS / BACS / CHAPS / SEPA / ACH / Fedwire / RTGS / card). Drives "
                         "speed, cost and settlement finality."),
     Concept("scheme", "categorical",
+            is_a="category_code",
             description="Card/payment SCHEME (Visa / Mastercard / Amex). Distinct from the rail."),
     Concept("interchange", "monetary", additivity="additive", is_a="monetary_flow",
             description="Interchange fee (issuer revenue on a card transaction). A flow — additive."),
     Concept("merchant_discount_rate", "monetary", additivity="non_additive",
+            is_a="monetary_rate",
             description="Merchant discount rate (MDR) — the acquiring fee % charged to a merchant. "
                         "Non-additive (a rate)."),
     Concept("corridor", "categorical", sensitivity="proxy",
@@ -715,9 +761,11 @@ _ALL: tuple[Concept, ...] = (
             description="The irrevocability point of a payment. PIT-critical: real-time (APP-scam) "
                         "scoring must DECIDE BEFORE finality — a batch trailing-window model cannot."),
     Concept("nostro_vostro", "categorical",
+            is_a="category_code",
             description="Correspondent-account type (nostro = our account abroad / vostro = their "
                         "account here). Reconciliation + liquidity grain."),
     Concept("iso20022_purpose_code", "categorical",
+            is_a="category_code",
             description="ISO 20022 payment purpose code (SALA / SUPP / …) — structured payment context "
                         "for AML/analytics."),
 
@@ -726,16 +774,19 @@ _ALL: tuple[Concept, ...] = (
             description="Reference / master data (slowly-changing) vs transactional facts — different "
                         "PIT semantics: join AS-OF and watch restatement (system_time), don't event-date it."),
     Concept("model_output", "flag",
+            is_a="boolean_flag",
             description="Provenance marker: this column is a MODEL OUTPUT (score/PD/ESG derived), not "
                         "observed. Leakage-risk when its target overlaps the feature target; also a "
                         "model-monitoring input."),
     Concept("data_quality_flag", "flag",
+            is_a="boolean_flag",
             description="Data-quality marker (missing / imputed / stale / reconciliation-break). Gate "
                         "features on it; not a target."),
     Concept("source_system", "categorical",
             description="Provenance: the originating system-of-record. Lineage / reconciliation / "
                         "join disambiguation."),
     Concept("segment", "categorical",
+            is_a="category_code",
             description="Customer/portfolio segment (mass / affluent / HNW; value/behaviour tiers). "
                         "Audit for proxy leakage if derived from protected attributes."),
     Concept("peer_group", "categorical",
@@ -748,6 +799,7 @@ _ALL: tuple[Concept, ...] = (
             description="The non-monetary UNIT (shares / oz / MWh / tonnes / bbl) — the unit-mixing "
                         "guard for quantity_units. Mixing units in a sum is a wrong number (cf. currency_code)."),
     Concept("vulnerability_flag", "sensitive", sensitivity="special_category",
+            is_a="boolean_flag",
             description="FCA Consumer-Duty vulnerable-customer indicator — highly sensitive (may derive "
                         "from health/capacity): read-scoped + eligibility-gated. MUST support fair "
                         "treatment, never disadvantage."),
@@ -760,6 +812,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("desk_id", "identifier", namespace="desk", entity_link="desk",
             description="Links to the trading desk entity — a markets grain."),
     Concept("bureau_provenance", "flag",
+            is_a="boolean_flag",
             description="Provenance marker: EXTERNAL bureau/third-party data — FCRA-regulated and heavily "
                         "lagged/restated (use system_time to avoid restated-data leakage)."),
     Concept("collateral_id", "identifier", namespace="collateral", entity_link="collateral",
@@ -803,12 +856,14 @@ _ALL: tuple[Concept, ...] = (
     Concept("anacredit_attribute", "categorical",
             description="An ECB AnaCredit granular loan-level reporting attribute. Reference data."),
     Concept("finrep_corep_line", "categorical",
+            is_a="regulatory_report_line",
             description="An EBA FINREP (financial) / COREP (own-funds) template line. Reporting lineage."),
     Concept("mifir_transaction_report", "categorical",
             description="A MiFIR/MiFID II transaction-report field/record (RTS 22, T+1). Reporting event."),
     Concept("emir_report", "categorical",
             description="An EMIR derivative trade-repository report record. Reporting event."),
     Concept("fatca_crs_classification", "categorical", sensitivity="proxy",
+            is_a="category_code",
             description="FATCA/CRS reportable-person / tax-residency classification. Tax residency is a "
                         "national-origin PROXY — use-case-gate for credit."),
 
@@ -819,6 +874,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("tpp_id", "identifier", namespace="tpp", entity_link="tpp",
             description="Links to the third-party provider (AISP/PISP) entity."),
     Concept("aisp_pisp_flag", "categorical",
+            is_a="category_code",
             description="Open-Banking access role (AIS account-information vs PIS payment-initiation). "
                         "PSD2 classification."),
     Concept("api_call_event", "behavioural",
@@ -833,21 +889,25 @@ _ALL: tuple[Concept, ...] = (
             description="On-chain wallet address — pseudonymous but linkable (clustering/chain-analysis), "
                         "so treat as personal data; read-scoped. FATF travel-rule relevant."),
     Concept("stablecoin", "crypto",
+            is_a="digital_asset",
             description="A fiat-referenced stablecoin (peg + reserve risk). Distinct from cbdc."),
     Concept("on_chain_txn", "crypto",
             description="An on-chain transaction/event — irreversible on block-confirmation finality; "
                         "AML chain-analysis input."),
     Concept("cbdc", "crypto",
+            is_a="digital_asset",
             description="Central-bank digital currency (retail/wholesale) — programmable central-bank "
                         "money; distinct from private crypto/stablecoin."),
 
     # ── Still-missing area · securitization & structured finance ─────────────────────────────────
     Concept("tranche", "categorical",
+            is_a="category_code",
             description="A securitization tranche (senior / mezzanine / equity) with attach/detach "
                         "points — ordinal loss priority. Structure-level (contrast lien_seniority)."),
     Concept("spv_id", "identifier", namespace="spv", entity_link="spv",
             description="Links to the bankruptcy-remote SPV/issuer entity (securitization)."),
     Concept("waterfall_position", "categorical",
+            is_a="category_code",
             description="Position in the cashflow waterfall (payment priority) — ordinal."),
     Concept("credit_enhancement", "monetary", additivity="semi_additive", is_a="monetary_stock",
             description="Credit enhancement absorbing losses (over-collateralisation / reserve fund / "
@@ -860,8 +920,10 @@ _ALL: tuple[Concept, ...] = (
             description="Annuity conversion factor (pot→income) — actuarial (mortality + rates). "
                         "Non-additive."),
     Concept("vesting", "categorical",
+            is_a="category_code",
             description="Vesting status/schedule — when benefits become owned. Gates entitlement."),
     Concept("decumulation", "categorical",
+            is_a="category_code",
             description="Retirement decumulation (drawdown) phase, vs accumulation — sequencing/longevity "
                         "risk differs."),
 
@@ -875,6 +937,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("risk_control_id", "identifier", namespace="risk_control", entity_link="risk_control",
             description="Links to a risk/control entity (RCSA) — the op-risk taxonomy grain."),
     Concept("near_miss_flag", "flag",
+            is_a="boolean_flag",
             description="Operational near-miss (control failure, no/immaterial loss) — an early-warning "
                         "signal, not a loss."),
 
@@ -886,6 +949,7 @@ _ALL: tuple[Concept, ...] = (
             description="Links to a cost-basis tax lot (acquisition date + basis) — the CGT realisation "
                         "grain (FIFO/LIFO/spec-id)."),
     Concept("taxable_flag", "flag",
+            is_a="boolean_flag",
             description="Taxability indicator (taxable vs exempt / tax-advantaged, e.g. ISA/401k). "
                         "Gates net return."),
 
@@ -894,6 +958,7 @@ _ALL: tuple[Concept, ...] = (
             description="Non-traditional underwriting data (rent / utility / telco / psychometric) — "
                         "external + PROXY-RISK for protected attributes; use-case-gate for credit."),
     Concept("thin_file_flag", "flag",
+            is_a="boolean_flag",
             description="Thin-file / credit-invisible indicator — reject-inference + inclusion relevant. "
                         "Not a target."),
     Concept("cashflow_underwriting_signal", "quantity_risk", additivity="non_additive",
@@ -908,6 +973,7 @@ _ALL: tuple[Concept, ...] = (
             description="Wholesale/market funding balance (vs sticky retail deposits) — a funding STOCK; "
                         "liquidity/run-off risk. Semi-additive: latest over time."),
     Concept("resolution_group", "categorical",
+            is_a="category_code",
             description="Resolution group / strategy classification (single vs multiple point of entry, "
                         "ring-fencing). Distinct from a customer group."),
 
@@ -919,13 +985,16 @@ _ALL: tuple[Concept, ...] = (
             description="Customer redress/compensation paid (remediation, e.g. PPI). A flow — additive; "
                         "a conduct cost."),
     Concept("root_cause_code", "categorical",
+            is_a="category_code",
             description="Root-cause taxonomy code for a complaint/incident — thematic conduct analytics."),
 
     # ── Still-missing area · correspondent banking & SWIFT ───────────────────────────────────────
     Concept("swift_message_type", "categorical",
+            is_a="category_code",
             description="SWIFT message type (MT103 customer / MT202 bank-to-bank / ISO 20022 MX). "
                         "Payment classification."),
     Concept("nested_correspondent_flag", "flag",
+            is_a="boolean_flag",
             description="Nested/downstream-correspondent indicator (a bank clearing for another bank's "
                         "clients) — elevated AML risk (visibility gap; FATF/Wolfsberg)."),
 
@@ -934,6 +1003,7 @@ _ALL: tuple[Concept, ...] = (
             description="Nature/biodiversity impact-or-dependency (TNFD / SBTN) — ESTIMATED, nascent "
                         "data. Non-additive."),
     Concept("deforestation_flag", "esg",
+            is_a="boolean_flag",
             description="Deforestation-linked supply-chain flag (EUDR due-diligence). Not a target."),
 
     # ── Legacy aliases — the original 11 vocabulary strings retained so live enriched columns and
@@ -962,40 +1032,47 @@ _ALL: tuple[Concept, ...] = (
     # concept below is grounded in a column present in a loaded catalog, never invented from a
     # taxonomy. NONE is additive: these are states, flags and identifiers, not measures to sum.
     Concept("new_to_bank_flag", "flag",
+            is_a="boolean_flag",
             description="Whether the party is within the bank's new-to-bank (NTB) window. Usually "
                         "arrives as a PAIR at different offsets (current vs 9 months prior); the pair "
                         "is what yields tenure movement and first-year cohort behaviour, so the "
                         "offset belongs in the column's own definition, not in this concept."),
     Concept("customer_relationship_status", "categorical",
+            is_a="category_code",
             description="Lifecycle state of the bank's relationship with the party — active, dormant, "
                         "closed, special handling. The relationship's own state, distinct from any "
                         "single source system's record status (see source_system_status)."),
     Concept("source_system_status", "categorical",
+            is_a="category_code",
             description="A party's record status WITHIN one originating system (Finacle, Calypso, "
                         "FinOne, Advent, VisionPlus). Operational plumbing, not a business state: it "
                         "says whether that system holds the party, never how the bank regards them."),
     Concept("staff_indicator", "flag", sensitivity="pii",
+            is_a="boolean_flag",
             description="Whether the party is an employee of the bank. A POPULATION control as much "
                         "as a feature — staff accounts carry preferential pricing and insider "
                         "controls, so they are routinely excluded from behavioural models. Personal "
                         "employment data about an identifiable person, hence the pii floor."),
     Concept("legal_entity_type", "categorical",
+            is_a="category_code",
             description="What KIND of party this is — individual, sole proprietor, corporate, joint, "
                         "trust. Constitution / legal structure. Drives which features are even "
                         "meaningful, since an individual and a corporate share few attributes."),
     Concept("residency_status", "categorical",
+            is_a="category_code",
             description="The party's residency for regulatory and tax purposes — resident, "
                         "non-resident, free-zone. A jurisdictional eligibility fact, not a location."),
-    Concept("restriction_status", "flag", near_label=True,
+    Concept("restriction_status", "flag", is_a="boolean_flag", near_label=True,
             description="Whether the party is under a servicing restriction — suspended, negated, "
                         "blacklisted, watch-listed. near_label: these are AML/fraud CONSEQUENCES, so "
                         "a financial-crime model trained on them reads its own answer back. Not a "
                         "hard leakage anchor — they are legitimate as controls and as filters."),
-    Concept("restriction_reason", "categorical", near_label=True,
+    Concept("restriction_reason", "categorical", is_a="category_code", near_label=True,
             description="WHY a party is restricted — the suspension / negation / blacklist reason "
                         "code or note. Borders an outcome for the same reason restriction_status "
                         "does, and is more specific, so it leaks more readily."),
     Concept("nominee_indicator", "flag",
+            is_a="boolean_flag",
             description="Whether the party holds in a nominee capacity — the named party is not the "
                         "beneficial owner. Material to AML beneficial-ownership treatment and to "
                         "whether party-level behaviour can be attributed to a real person."),
@@ -1003,10 +1080,12 @@ _ALL: tuple[Concept, ...] = (
             description="Identifier of the corporate GROUP a party belongs to (parent group / "
                         "conglomerate). The join key for group-level exposure and concentration."),
     Concept("parent_customer_id", "identifier", namespace="cif", entity_link="customer",
+            is_a="customer_id",
             description="Reference to another PARTY that is this one's parent — a self-referencing "
                         "hierarchy. Shares the `customer` entity link with customer_id deliberately: "
                         "a different entity would make the hierarchy unbridgeable across catalogs."),
     Concept("record_deleted_flag", "flag",
+            is_a="boolean_flag",
             description="Soft-delete marker on the record. A POPULATION filter, never a predictor — "
                         "a model that treats it as an ordinary feature trains on rows the bank "
                         "considers deleted, and must exclude them instead."),
@@ -1022,6 +1101,7 @@ _ALL: tuple[Concept, ...] = (
     # 20022 party role into one word loses the handling difference — a phone can be tokenised, an
     # address generalised to a region feature, a party role is a structural field of the message.
     Concept("payment_narrative", "text", sensitivity="pii",
+            is_a="free_text",
             description="Free-text remittance information on a payment (narration, "
                         "sender-to-receiver info, inter-bank information). The single richest signal "
                         "in transaction data — it drives categorisation, merchant identification and "
@@ -1054,6 +1134,7 @@ _ALL: tuple[Concept, ...] = (
                         "business entity. Deliberately NOT an identifier: a hash column that "
                         "bridged would pair with every other hash column in every catalog."),
     Concept("statement_visibility_flag", "flag",
+            is_a="boolean_flag",
             description="Whether a transaction is shown on, or suppressed from, the customer "
                         "statement. Presentation rather than economics — a suppressed entry still "
                         "moved money, so it must not be mistaken for a reversal or exclusion."),
@@ -1069,24 +1150,25 @@ _ALL: tuple[Concept, ...] = (
     # Every concept here is `categorical` with NO entity_link — the two conditions the bridge
     # derivation requires — so a label can never be proposed as a join key. The paired identifier is
     # untouched and still links catalogs; only the name stops pretending to.
-    Concept("branch_name", "categorical", descriptive=True,
+    Concept("branch_name", "categorical", is_a="code_label", descriptive=True,
             description="Human-readable name of a branch (the label beside branch_id). Groups and "
                         "displays; never a join key — two catalogs' branch names are text that may "
                         "coincide, not a shared identifier."),
-    Concept("relationship_manager_name", "categorical", sensitivity="pii", descriptive=True,
+    Concept("relationship_manager_name", "categorical", sensitivity="pii", is_a="code_label",
+            descriptive=True,
             description="Name of the relationship manager (the label beside "
                         "relationship_manager_id). An identifiable employee, so it carries a pii "
                         "floor for the same reason record_author does."),
-    Concept("merchant_name", "categorical", descriptive=True,
+    Concept("merchant_name", "categorical", is_a="code_label", descriptive=True,
             description="Trading name of a merchant (the label beside merchant_id). Notoriously "
                         "inconsistent across acquirers — the id joins, the name does not."),
-    Concept("account_name", "categorical", descriptive=True,
+    Concept("account_name", "categorical", is_a="code_label", descriptive=True,
             description="Display name or title of an account (the label beside account_id). Often "
                         "carries the holder's name, so treat as free text rather than a key."),
-    Concept("instrument_name", "categorical", descriptive=True,
+    Concept("instrument_name", "categorical", is_a="code_label", descriptive=True,
             description="Readable name of a financial instrument (the label beside instrument_id). "
                         "The ISIN/CUSIP identifies it; the name only describes it."),
-    Concept("counterparty_name", "categorical", descriptive=True,
+    Concept("counterparty_name", "categorical", is_a="code_label", descriptive=True,
             description="Name of the counterparty to a transaction (the label beside "
                         "counterparty_id). Distinct from beneficiary_name, which names the party a "
                         "payment is FOR rather than the party it is WITH."),
@@ -1097,6 +1179,7 @@ _ALL: tuple[Concept, ...] = (
                         "and doubles every code into two apparently-equal columns."),
 
     Concept("kyc_narrative", "text", sensitivity="pii",
+            is_a="free_text",
             description="Free-prose KYC commentary — nature of business, corporate background, "
                         "high-risk rationale. Uploader-authored text about an identifiable party, so "
                         "it carries a pii floor and is read-scoped rather than freely searchable."),

@@ -153,7 +153,11 @@ class _CountingConn:
 def test_concept_path_walks_is_a_ancestry() -> None:
     assert concept_path("monetary_stock") == ("monetary_stock",)
     assert concept_path("ead") == ("ead", "monetary_stock")
-    assert concept_path("pd_ttc") == ("pd_ttc", "pd")
+    # Task 9b lengthened this chain by backfilling `pd is_a score_probability` — the walk must
+    # follow ancestry to the ROOT, not stop at the first parent, so a multi-hop chain is the
+    # interesting case rather than a regression.
+    assert concept_path("pd_ttc") == ("pd_ttc", "pd", "score_probability")
+    assert concept_path("value_date") == ("value_date", "effective_date", "valid_time")
 
 
 def test_concept_path_unclassified_and_unknown_are_empty() -> None:
