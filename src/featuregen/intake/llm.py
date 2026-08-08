@@ -21,7 +21,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
 from featuregen.contracts.db import DbConn
 from featuregen.idgen import mint_id
 
@@ -289,6 +289,16 @@ def transient_backoff_s(retries_used: int) -> float:
 #: Bound on the rendered repair feedback — a pathological error list must not grow the payload.
 _MAX_REPAIR_FEEDBACK_CHARS = 2000
 
+#: Bound on ONE author-attested reason (see `AttestedSchemaValidationError`). Separate from
+#: `_MAX_REPAIR_FEEDBACK_CHARS` on purpose: that one bounds the JOINED string `_wire_prompt`
+#: renders, i.e. the WIRE only. The reason is also stored per attempt and un-joined in
+#: `llm_call.repair_attempts` — and, where the caller is dispatch-audited, verbatim in
+#: `llm_dispatch.redacted_input` — neither of which passes through that truncation. So the bound
+#: has to exist where the reason is minted. Generous: every attested reason in the tree is well
+#: under 200 chars, and this is a backstop against an author folding a whole vocabulary in, not a
+#: style rule.
+MAX_ATTESTED_REASON_CHARS = 300
+
 
 def _path_is_schema_declared(cause: object) -> bool:
     """True when EVERY segment of the failing instance path came from the SCHEMA, not the data.
@@ -337,7 +347,25 @@ def _safe_reason(exc: SchemaValidationError) -> str:
     `_path_is_schema_declared` proves every segment is an array index or a schema-declared name,
     and anything else falls back to the value-free constant. The next author to register an open
     document schema gets a duller repair complaint, never a leak.
+
+    ONE EXEMPTION, and it is a type: an :class:`AttestedSchemaValidationError` carries a reason its
+    AUTHOR attested is value-free, and that reason is preferred over everything below. It exists
+    because a HAND-WRITTEN validator (`analysis.intent.validate_intent`) raises with no jsonschema
+    `__cause__` at all, so the structural rebuild has nothing to work from and every such failure —
+    including deliberately actionable ones like "that is a table; entity_ref must be a column" —
+    collapsed into the generic constant. The attested reason is preferred over the structural
+    pointer even when both exist: an author who wrote one did so because it says something the
+    pointer cannot (which field, and what the field WANTED), and it is value-free by the same
+    attestation. `getattr` is deliberately NOT used to find it — only the declared type may claim
+    the exemption, so `grep AttestedSchemaValidationError` enumerates every claim ever made, and an
+    `llm_safe_reason` attribute stapled onto a plain error is ignored. Bounded by
+    `MAX_ATTESTED_REASON_CHARS` because the un-joined reason reaches audit columns that
+    `_wire_prompt`'s truncation never sees.
     """
+    if isinstance(exc, AttestedSchemaValidationError):
+        attested = str(exc.llm_safe_reason or "").strip()
+        if attested:
+            return attested[:MAX_ATTESTED_REASON_CHARS]
     cause = exc.__cause__
     path = getattr(cause, "json_path", None)
     validator = getattr(cause, "validator", None)

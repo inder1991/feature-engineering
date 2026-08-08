@@ -1,8 +1,9 @@
 import pytest
 
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
 from featuregen.intake.llm import (
     DEFAULT_RETRY_BUDGET,
+    MAX_ATTESTED_REASON_CHARS,
     PROVIDER_MAX_TOKENS,
     PROVIDER_NON_RETRYABLE,
     PROVIDER_OK,
@@ -238,6 +239,107 @@ def test_a_repair_recall_carries_the_value_free_reason_to_the_provider():
     (entry,) = outcome.repair_attempts
     assert entry["reason"] == "$.ref: failed 'type'"
     assert "max_tokens" not in entry
+
+
+# ── the author-attested exemption (Task 2b) ─────────────────────────────────────────────────────
+
+def test_an_attested_reason_reaches_the_repair_channel():
+    """A hand-authored validator has no jsonschema `__cause__`, so the structural rebuild has
+    nothing to work from and every such failure collapses to one generic constant. The attested
+    subclass is the ONE way past that: the author states, in the type, that this string is
+    value-free."""
+    exc = AttestedSchemaValidationError(
+        "entity_ref 'ftr::x.Ahmed Al-Mansouri' is not offered. Choose from: a, b, c",
+        llm_safe_reason="entity_ref: not one of the offered column_refs")
+
+    assert _safe_reason(exc) == "entity_ref: not one of the offered column_refs"
+    assert "Ahmed Al-Mansouri" not in _safe_reason(exc)
+
+
+def test_an_attested_reason_wins_over_a_structural_cause():
+    """Both available: the ATTESTED one is preferred. The author wrote it precisely because it says
+    something the pointer cannot — which field, and what the field wanted."""
+    import jsonschema
+
+    with pytest.raises(jsonschema.ValidationError) as raised:
+        jsonschema.validate(instance={"ref": "Acme Corporation Ltd"},
+                            schema={"type": "object",
+                                    "properties": {"ref": {"type": "integer"}}})
+    exc = AttestedSchemaValidationError("t@v1: boom", llm_safe_reason="entity_ref: wants a column")
+    exc.__cause__ = raised.value
+
+    assert _safe_reason(exc) == "entity_ref: wants a column"
+
+
+def test_the_default_is_unchanged_by_the_attestation_seam():
+    """THE binding constraint. An error that did not attest must behave EXACTLY as before — no
+    cause is still the generic constant, and a value-bearing message is still discarded."""
+    plain = SchemaValidationError(
+        "entity_ref 'ftr::x.Ahmed Al-Mansouri' is not one of the columns offered")
+    assert _safe_reason(plain) == "the structure did not match the required schema"
+
+
+def test_only_the_declared_type_may_claim_the_exemption():
+    """A duck-typed attribute is NOT an attestation. The exemption is a TYPE so that `grep
+    AttestedSchemaValidationError` enumerates every site that ever claimed it; an attribute set on
+    a plain error somewhere far away would be an invisible one."""
+    impostor = SchemaValidationError("t@v1: boom")
+    impostor.llm_safe_reason = "Ahmed Al-Mansouri: not offered"   # noqa: B010 — deliberate
+
+    assert _safe_reason(impostor) == "the structure did not match the required schema"
+
+
+def test_an_attestation_must_actually_say_something():
+    """An empty or whitespace attestation falls back to the sanitised default rather than sending
+    an empty complaint the model cannot act on. Constructing one without a reason at all is a
+    TypeError — you cannot have the type without the attestation."""
+    assert _safe_reason(AttestedSchemaValidationError("boom", llm_safe_reason="   ")) == (
+        "the structure did not match the required schema")
+    with pytest.raises(TypeError):
+        AttestedSchemaValidationError("boom")            # type: ignore[call-arg]
+
+
+def test_an_attested_reason_is_bounded_in_the_LEDGER_not_only_on_the_wire():
+    """`_wire_prompt` truncates the JOINED errors at 2000 chars, but `repair_attempts[].reason` is
+    stored un-truncated in `llm_call.repair_attempts` and (audit-wrapped) in
+    `llm_dispatch.redacted_input`. So the bound has to exist HERE, where the reason is minted."""
+    exc = AttestedSchemaValidationError("boom", llm_safe_reason="x" * (MAX_ATTESTED_REASON_CHARS * 3))
+    assert len(_safe_reason(exc)) == MAX_ATTESTED_REASON_CHARS
+
+
+def test_an_attested_reason_reaches_the_provider_and_the_ledger():
+    """The same two consumers Task 2 proved for the structural reason, re-proved for the attested
+    one: the repair TURN and the audited ledger entry."""
+    seen: list[dict] = []
+
+    def _validate(output):
+        raise AttestedSchemaValidationError(
+            f"entity_ref {output.get('ref')!r} is not offered",
+            llm_safe_reason="entity_ref: not one of the offered column_refs")
+
+    class _Offending:
+        def call(self, request):
+            seen.append(dict(request.inputs))
+            return LLMResult(output={"ref": "Ahmed Al-Mansouri"}, self_reported_scores={},
+                             call_ref="", status=PROVIDER_OK)
+
+    outcome = drive_structured_call(_Offending(), _req(), _validate, repair_budget=1)
+
+    assert outcome.status == STATUS_FAILED
+    assert "_repair_errors" not in seen[0]
+    assert seen[1]["_repair_errors"] == ["entity_ref: not one of the offered column_refs"]
+    (entry,) = outcome.repair_attempts
+    assert entry["reason"] == "entity_ref: not one of the offered column_refs"
+    # and the model's own text never rode along on either channel
+    assert "Ahmed Al-Mansouri" not in str(seen[1]) and "Ahmed Al-Mansouri" not in str(entry)
+
+
+def test_the_attested_reason_stays_out_of_the_identity_hash():
+    """A repair must keep its parent's identity or it double-charges and forks dedup. The attested
+    reason rides the same `_`-prefixed transient key, so this holds for it too."""
+    base = {"redacted_intent": "count", "catalog_metadata": {}}
+    assert compute_input_hash(base) == compute_input_hash(
+        {**base, "_repair_errors": ["entity_ref: not one of the offered column_refs"]})
 
 
 def test_repair_budget_exhausted_fails_into_clarification():
