@@ -804,6 +804,14 @@ def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]
                 # governance already adjudicated back in front of the model wearing the wrong label.
                 out[table_key][fact_type]["proposed"] = _machine_proposal(
                     stream, state.draft_event_id, fact_type)
+            # EVERY OTHER FOLDED STATUS FALLS THROUGH ON PURPOSE, leaving `human=False,
+            # proposed=None`. PARTIALLY_CONFIRMED, REVERIFY, STALE and REJECTED then take whatever
+            # the candidate row says: a still-stamped column reads `source_declared` (true — no
+            # human review is recorded for the value being SERVED), and an unstamped one emits
+            # nothing. None of them may read `human_confirmed` (the endorsement is in flight, or
+            # lapsed, or refused) and none may read `ai_proposed` (they are not open proposals).
+            # Named here because a fall-through that is correct by omission reads like one nobody
+            # thought about.
         return out
     except Exception:  # noqa: BLE001 — prompt context must never take down feature generation
         logger.warning("table-fact authority unreadable for %d table(s) — the grain/as-of status "
@@ -2691,15 +2699,26 @@ def _grounding_directive() -> str:
 # model_in_the_directive` fails if a fourth is ever added without its sentence. Like its two
 # siblings above it is a fixed PII-free constant appended after the redacted objective, so the
 # egress guard still scans it and the llm_call audit records exactly what was asked.
+# EVERY CLAUSE MUST BE TRUE IN EVERY STATE THAT PRODUCES ITS TOKEN, which is a stricter test than
+# "true in the normal case" and is where the first draft of this sentence failed. `source_declared`
+# is produced by THREE states, not two: ingest's source-declared auto-confirm, a file-declared flag
+# whose governed fact is not servable, and — because `_table_fact_authority` is fail-soft — a grain
+# a human REALLY DID endorse, whose stream could not be read. The draft said "the uploaded catalog
+# file asserted it, so NOBODY has reviewed it", which in that third state is not a weaker claim than
+# the truth but a DIFFERENT and FALSE one: it asserts a fact about a file that never declared
+# anything, and denies a review that happened.
+#
+# So the token is defined by what is RECORDED, never by what occurred. "No human review is recorded
+# for it" is true in all three, and it is also exactly what the platform can evidence.
 _TABLE_CONTEXT_STATUS_DIRECTIVE = (
-    "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name WHO "
-    "asserted that table's grain (what one row means) or its as-of column (when the row was true), "
-    "and nothing else: `human_confirmed` — a person with authority over the table reviewed and "
-    "signed it; `source_declared` — the uploaded catalog file asserted it and the platform recorded "
-    "it automatically, so NOBODY has reviewed it; `ai_proposed` — a model inferred it from the "
-    "schema and it is unconfirmed. Use all three: an unreviewed grain is better information than "
-    "none, and a feature resting on one is still worth proposing — but only `human_confirmed` means "
-    "a person checked it.")
+    "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name what the "
+    "platform can EVIDENCE about that table's grain (what one row means) or its as-of column (when "
+    "the row was true), and nothing else: `human_confirmed` — a person with authority over the "
+    "table reviewed and signed it; `source_declared` — NO HUMAN REVIEW IS RECORDED for it, which "
+    "usually means the uploaded catalog file asserted it and the platform recorded it "
+    "automatically; `ai_proposed` — a model inferred it from the schema and it is unconfirmed. Use "
+    "all three: an unreviewed grain is better information than none, and a feature resting on one is "
+    "still worth proposing — but only `human_confirmed` means a person checked it.")
 # The one clause that mentions `grounding`, split out because a model must NEVER be asked for output
 # its schema forbids: below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding`
 # key, and a sentence telling the model to write one there is the same prompt/schema inversion
@@ -2710,7 +2729,8 @@ _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE = (
     "`grounding` entry — the reader needs to know which it was.")
 
 
-def _table_context_directive(table_context: Iterable[Mapping] | None) -> str:
+def _table_context_directive(table_context: Iterable[Mapping] | None, *,
+                             cites_grounding: bool) -> str:
     """The status vocabulary, or "" when no block in this payload carries a status.
 
     Gated on the PAYLOAD, not on a flag, and for the same reason `_grounding_directive` is gated on
@@ -2718,11 +2738,21 @@ def _table_context_directive(table_context: Iterable[Mapping] | None) -> str:
     `table_context` at all, and a catalog where every table abstained sends blocks with no status —
     defining tokens that do not appear is noise the egress guard still has to walk, and it invites
     the model to look for a key it will not find.
+
+    `cites_grounding` says whether THIS CALL'S contract has a `grounding` array to cite the status
+    in — TRUE for the two `feature_ideas` paths, FALSE for `feature_recipe`, whose response contract
+    is `{grain_table, join_table, derives_from, aggregation, as_of_column}` and which `Recipe` reads
+    key by key. Two gates, not one, and both are the same rule stated at two grains: the clause
+    rides only where the schema HAS the key (`cites_grounding`) and where that key is live at this
+    version (`_grounding_directive`). Asking a recipe call to write a `grounding` entry would spend
+    its output on a field nothing reads — the same prompt/schema inversion as demanding output the
+    wire item forbids, arriving by the other door.
     """
     if not any(b.get("grain_status") or b.get("as_of_status") for b in (table_context or ())):
         return ""
     return _TABLE_CONTEXT_STATUS_DIRECTIVE + (
-        _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE if _grounding_directive() else "")
+        _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE
+        if cites_grounding and _grounding_directive() else "")
 
 
 def _generation_instruction(objective: str, *,
@@ -2732,7 +2762,7 @@ def _generation_instruction(objective: str, *,
     scans the whole string and the llm_call audit records exactly what was asked.
     """
     return (objective + _DERIVES_FROM_DIRECTIVE + _grounding_directive()
-            + _table_context_directive(table_context))
+            + _table_context_directive(table_context, cites_grounding=True))
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -2950,7 +2980,8 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
                     "feature_ideas",
                     instruction + _grounding_directive()
-                    + _table_context_directive(table_context), inputs, actor=actor,
+                    + _table_context_directive(table_context, cites_grounding=True),
+                    inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     proposed = out.get("features", [])
@@ -2994,8 +3025,20 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     recipe_inputs: dict = {"columns": menu}
     if table_context:
         recipe_inputs["table_context"] = table_context
+    # THE THIRD SURFACE THAT SENDS THESE TOKENS, and the one the first version of Task 8b missed.
+    # This path puts `table_context` in the inputs exactly like the two generation paths, so with
+    # the context flag on a recipe request for a table whose grain is `ai_proposed` hands the model
+    # a token it has never been told the meaning of — precisely the defect Task 8's review raised,
+    # surviving on one surface of three. `Recipe.grain_table` / `as_of_column` then come back to
+    # `POST /features/recipe` looking grounded.
+    #
+    # `cites_grounding=False`: the recipe RESPONSE contract is
+    # {grain_table, join_table, derives_from, aggregation, as_of_column}, which `Recipe` reads key
+    # by key. There is no `grounding` array here at any version, so telling the model to write one
+    # would spend its output on a field nothing reads.
     out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    nl_query, recipe_inputs, actor=actor,
+                    nl_query + _table_context_directive(table_context, cites_grounding=False),
+                    recipe_inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     derives = [d for d in out.get("derives_from", []) if d in known]

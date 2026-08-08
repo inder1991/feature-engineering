@@ -901,6 +901,66 @@ def test_an_ai_proposal_naming_a_column_the_caller_cannot_SEE_is_dropped_whole()
     assert "as_of_column" not in hidden and "secret_ts" not in repr(hidden)
 
 
+def test_the_source_declared_SENTENCE_is_true_in_the_state_that_degrades_to_it(db):
+    """PIN THE SENTENCE, NOT JUST THE LABEL — review's finding, and the sharper half of it.
+
+    `_table_fact_authority` is fail-soft, so an unreadable stream degrades a GENUINELY
+    human-confirmed grain to `source_declared`. The first draft of the directive defined that token
+    as "the uploaded catalog file asserted it, so NOBODY has reviewed it". In this state that is not
+    a weaker claim than the truth — it is a DIFFERENT and FALSE one: it asserts a fact about a file
+    that never declared anything, and denies a review that actually happened.
+
+    The token is now defined by what is RECORDED, never by what occurred, so the sentence holds in
+    all three states that produce it. This test drives the hardest of the three — a real human
+    confirmation through the real four-eyes gate, with the read then forced to fail — and asserts
+    the label AND the sentence attached to it together, because the label alone was already green
+    while the sentence was false."""
+    from datetime import UTC, datetime
+
+    from tests.featuregen._helpers import mint_test_identity
+    from tests.featuregen.overlay.upload.conftest import _confirm_grain
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
+
+    _sealed()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+    rows = [CanonicalRow("degp", "facility_limits", "cust_id", "text"),
+            CanonicalRow("degp", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "degp", rows, actor=owner, now=now).status == "ingested"
+    _propose_ai_grain(db, "degp", "facility_limits", ["cust_id"])
+    _confirm_grain(db, "degp", "facility_limits", ["cust_id"], actor=admin)
+    project_table_facts_for_ref(db, source="degp", table="facility_limits", now=now)
+
+    cols = fa._candidate_columns(db, "degp", roles=())
+    # A HUMAN really did confirm this grain — established through the real gate, not asserted.
+    healthy = fa._table_fact_authority(db, cols)
+    assert healthy[("degp", "facility_limits")]["grain"]["human"] is True
+
+    class _Broken:
+        """A conn whose event read raises — the fail-soft path, reached without patching the code."""
+
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        def execute(self, *_a, **_kw):
+            raise RuntimeError("event stream unreadable")
+
+    degraded = fa._table_fact_authority(_Broken(), cols)
+    assert degraded == {}, "the fail-soft path did not trigger — this test proves nothing"
+    block = fa._table_context(cols, authority=degraded)[0]
+    assert block["grain_status"] == "source_declared"
+
+    # …and THIS is what the model is told that token means. The claim must be about the RECORD.
+    directive = fa._table_context_directive([block], cites_grounding=True)
+    assert "NO HUMAN REVIEW IS RECORDED" in directive
+    # The over-claims the first draft made, each false in the state just constructed.
+    assert "NOBODY has reviewed it" not in directive
+    assert "the uploaded catalog file asserted it, so" not in directive
+
+
 def test_an_unresolved_authority_never_claims_a_human_endorsement():
     """THE DEGRADED PATH. The fact-stream read is fail-soft (an unreadable stream must not take
     down feature generation), so the block can be built with no authority at all. It then falls to
@@ -1030,7 +1090,8 @@ def test_every_status_token_is_defined_for_the_model_in_the_directive():
     found the payload carried these tokens as bare JSON with no prompt text defining them anywhere,
     so the model read the English word and took `confirmed` at face value. Every member of the
     closed vocabulary must appear in the sentence that travels with the payload."""
-    directive = fa._table_context_directive([{"table": "t", "grain_status": "ai_proposed"}])
+    directive = fa._table_context_directive(
+        [{"table": "t", "grain_status": "ai_proposed"}], cites_grounding=True)
     assert directive, "the table-context directive is empty — the tokens reach the model undefined"
     for token in fa.TABLE_FACT_STATUSES:
         assert token in directive, f"{token} is emitted but never explained to the model"
@@ -1041,7 +1102,7 @@ def test_the_directive_is_absent_when_no_table_context_travels():
     explaining keys that are not in the payload is noise the egress scanner still has to walk. The
     instruction is then BYTE-IDENTICAL to its pre-8b form — asserted against the composition, not
     against itself."""
-    assert fa._table_context_directive([]) == ""
+    assert fa._table_context_directive([], cites_grounding=True) == ""
     assert fa._generation_instruction("predict churn", table_context=[]) == (
         "predict churn" + fa._DERIVES_FROM_DIRECTIVE + fa._grounding_directive())
 
@@ -1052,7 +1113,81 @@ def test_the_directive_travels_when_a_table_context_does():
     instruction = fa._generation_instruction(
         "predict churn", table_context=[{"table": "t", "grain_status": "source_declared"}])
     assert instruction.startswith("predict churn")
-    assert fa._table_context_directive([{"table": "t"}]) in instruction
+    assert fa._table_context_directive([{"table": "t"}], cites_grounding=True) in instruction
+
+
+def test_EVERY_call_that_sends_a_table_context_also_sends_the_vocabulary(db, v5):
+    """THE DEFECT REVIEW FOUND: `feature_recipe` put `table_context` in its inputs and called the
+    model with the raw `nl_query`, so the tokens travelled as bare JSON on one surface of three —
+    the exact failure Task 8's review raised, surviving in the change that was meant to fix it. It
+    is reachable from `POST /features/recipe`, and `Recipe.grain_table` / `as_of_column` come back
+    to the caller looking grounded.
+
+    Driven across ALL THREE surfaces rather than the two I remembered, because "every call site"
+    was a claim I made and had not checked."""
+    from featuregen.overlay.upload.feature_assist import feature_recipe, refine_idea
+
+    _bank_graph(db)
+    seen: list[tuple[dict, str]] = []
+
+    class _Client:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            seen.append((request.inputs, request.inputs["redacted_intent"]))
+            return LLMResult(output={"features": [_idea()], "grain_table": "accounts",
+                                     "derives_from": [_AMOUNT], "aggregation": "sum_90d"},
+                             self_reported_scores={}, call_ref="", status="ok")
+
+    recommend_features(db, "predict churn", _Client(), catalog_source="bank", budget=1,
+                       critic=False)
+    refine_idea(db, {"name": "orig", "derives_from": [_AMOUNT]}, "tighten it", _Client(),
+                catalog_source="bank")
+    feature_recipe(db, "total spend per account", _Client(), catalog_source="bank")
+
+    # Read off the WIRE (`catalog_metadata` is where `build_llm_inputs` puts it), so this checks
+    # what actually egressed rather than what the caller believed it assembled.
+    carried = [(inputs["catalog_metadata"]["table_context"], intent) for inputs, intent in seen
+               if inputs.get("catalog_metadata", {}).get("table_context")]
+    assert len(carried) >= 3, "a surface stopped sending table_context — re-derive this test"
+    checked = 0
+    for blocks, intent in carried:
+        statuses = ({b.get("grain_status") for b in blocks}
+                    | {b.get("as_of_status") for b in blocks}) - {None}
+        assert statuses, "the bank fixture stopped producing a status — this test proves nothing"
+        for token in statuses:
+            assert token in intent, (
+                f"a call sent {token!r} in table_context with no definition in its instruction")
+            checked += 1
+    assert checked >= 3
+    # NAMED, not counted: the recipe call is the surface that was broken, so this test must fail if
+    # it stops being exercised rather than quietly passing on the two that were always fine.
+    assert any(intent.startswith("total spend per account") for _blocks, intent in carried), (
+        "the feature_recipe surface is not in this sample — the regression it pins is unguarded")
+
+
+def test_the_recipe_call_is_not_told_to_write_a_grounding_entry(db, v5):
+    """…and the fix must not repeat the defect it fixes. The recipe RESPONSE contract is
+    {grain_table, join_table, derives_from, aggregation, as_of_column} — `Recipe` reads it key by
+    key and there is no `grounding` array at any version. Telling this call to write one would spend
+    its output on a field nothing reads, which is the same prompt/schema inversion as demanding
+    output the wire item forbids, arriving by the other door."""
+    from featuregen.overlay.upload.feature_assist import feature_recipe
+
+    _bank_graph(db)
+    seen: list[str] = []
+
+    class _Client:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            seen.append(request.inputs["redacted_intent"])
+            return LLMResult(output={"grain_table": "accounts", "derives_from": [_AMOUNT]},
+                             self_reported_scores={}, call_ref="", status="ok")
+
+    feature_recipe(db, "total spend per account", _Client(), catalog_source="bank")
+    assert seen[-1].startswith("total spend per account")
+    assert "grounding" not in seen[-1]
+    # …while the tokens it DOES send are still defined.
+    assert "source_declared" in seen[-1]
 
 
 def test_the_directives_grounding_clause_is_version_gated(v5, monkeypatch):
@@ -1066,17 +1201,22 @@ def test_the_directives_grounding_clause_is_version_gated(v5, monkeypatch):
     The token DEFINITIONS still travel at v4, because v4 does send `table_context` and those tokens
     really are in the payload."""
     blocks = [{"table": "t", "grain_status": "source_declared"}]
-    assert "grounding" in fa._table_context_directive(blocks)          # v5 (the `v5` fixture)
+    assert "grounding" in fa._table_context_directive(blocks, cites_grounding=True)  # v5 fixture
     monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
-    at_v4 = fa._table_context_directive(blocks)
+    at_v4 = fa._table_context_directive(blocks, cites_grounding=True)
     assert "grounding" not in at_v4
     assert fa.TABLE_FACT_STATUSES <= {t for t in fa.TABLE_FACT_STATUSES if t in at_v4}
+    # The OTHER gate, at v5 where the version test alone would let the clause through: a call whose
+    # response contract has no `grounding` array must not be told to write one.
+    monkeypatch.delenv(fa.FEATURE_CONTEXT_VERSION_ENV, raising=False)
+    assert "grounding" not in fa._table_context_directive(blocks, cites_grounding=False)
 
 
 def test_the_directive_is_skipped_for_blocks_that_carry_no_status():
     """A table_context can travel with no grain or as-of on ANY block (every table abstained). The
     tokens are then not in the payload, so defining them is the same noise as flag-off."""
-    assert fa._table_context_directive([{"table": "t", "table_definition": "a table"}]) == ""
+    assert fa._table_context_directive(
+        [{"table": "t", "table_definition": "a table"}], cites_grounding=True) == ""
 
 
 # ── the FOUR states, each driven through REAL code against a REAL database ───────────────────────

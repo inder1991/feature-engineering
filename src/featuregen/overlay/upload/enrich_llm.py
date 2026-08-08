@@ -571,10 +571,16 @@ _TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_contex
 # own stored D2 axes — platform-minted, never uploader text.
 #
 # Task 8 adds `grain_status` / `as_of_status` at the SAME grade and for the same reason: each is one
-# of exactly two platform-minted tokens ("confirmed" | "declared") that `_table_context` computes
-# from whether a governed fact event stamped the column. Nothing uploader-typed and nothing
-# model-authored reaches them, so the prose grade's redactor would have nothing to scrub and would
-# misdocument the egress surface. They are LABELS, never permission: see `_table_context`.
+# of a CLOSED set of platform-minted tokens that `_table_context` computes. Nothing uploader-typed
+# and nothing model-authored reaches them, so the prose grade's redactor would have nothing to scrub
+# and would misdocument the egress surface. They are LABELS, never permission: see `_table_context`.
+#
+# TASK 8b WIDENED THE VALUE SET AND ADDED NO KEY, which is why this list is unchanged. The tokens are
+# now `feature_assist.TABLE_FACT_STATUSES` — human_confirmed | source_declared | ai_proposed, an
+# AUTHORITY axis naming who asserted the value — replacing Task 8's "confirmed" | "declared", which
+# conflated a human endorsement with ingest's source-declared auto-confirm. Named here rather than
+# left stale because this file is the first thing a reviewer of the egress surface reads, and a
+# retired vocabulary documented at the classifier is how the next reader learns the wrong one.
 _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity",
                                           "data_role", "authority_role",
                                           "temporal_storage_model",
