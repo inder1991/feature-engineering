@@ -910,11 +910,15 @@ def test_the_source_declared_SENTENCE_is_true_in_the_state_that_degrades_to_it(d
     a weaker claim than the truth — it is a DIFFERENT and FALSE one: it asserts a fact about a file
     that never declared anything, and denies a review that actually happened.
 
-    The token is now defined by what is RECORDED, never by what occurred, so the sentence holds in
-    all three states that produce it. This test drives the hardest of the three — a real human
-    confirmation through the real four-eyes gate, with the read then forced to fail — and asserts
-    the label AND the sentence attached to it together, because the label alone was already green
-    while the sentence was false."""
+    This test drives the hardest of those states — a real human confirmation through the real
+    four-eyes gate, with the read then forced to fail — and asserts the label AND the sentence
+    attached to it together, because the label alone was already green while the sentence was false.
+
+    UPDATED IN ROUND 2, deliberately: this test pinned "NO HUMAN REVIEW IS RECORDED", which review
+    then showed was ITSELF false in a state neither round had walked — a REJECTED re-verification,
+    where a human review is emphatically recorded because it is the refusal. The claim is now about
+    a sign-off that STANDS. See `test_a_REJECTED_re_verification_is_NOT_called_human_confirmed` and
+    `test_the_source_declared_sentence_holds_for_a_REPUDIATED_signature`."""
     from datetime import UTC, datetime
 
     from tests.featuregen._helpers import mint_test_identity
@@ -953,12 +957,14 @@ def test_the_source_declared_SENTENCE_is_true_in_the_state_that_degrades_to_it(d
     block = fa._table_context(cols, authority=degraded)[0]
     assert block["grain_status"] == "source_declared"
 
-    # …and THIS is what the model is told that token means. The claim must be about the RECORD.
+    # …and THIS is what the model is told that token means. The claim must be one the platform can
+    # evidence — here, that no sign-off STANDS, which is true when none can be read.
     directive = fa._table_context_directive([block], cites_grounding=True)
-    assert "NO HUMAN REVIEW IS RECORDED" in directive
-    # The over-claims the first draft made, each false in the state just constructed.
+    assert "NO HUMAN SIGN-OFF STANDS" in directive
+    # Both superseded drafts, each false in a state that really produces this token.
     assert "NOBODY has reviewed it" not in directive
     assert "the uploaded catalog file asserted it, so" not in directive
+    assert "NO HUMAN REVIEW IS RECORDED" not in directive
 
 
 def test_an_unresolved_authority_never_claims_a_human_endorsement():
@@ -1248,6 +1254,16 @@ _SERVICE = IdentityEnvelope(subject="featuregen-overlay-enrichment", actor_kind=
                             authenticated=True, auth_method="internal", role_claims=())
 
 
+def _drain_overlay(conn) -> None:
+    """Bring the overlay read model to head — `resolve_fact` reads `overlay_fact_state`, which only
+    the projection populates (mirrors `conftest._drain`)."""
+    from featuregen.overlay.projection import OverlayProjection
+    from featuregen.projections.runner import run_projection
+
+    while run_projection(conn, OverlayProjection()) >= 500:
+        pass
+
+
 def _resolved_block(db, source: str, table_index: int = 0) -> dict:
     """The table block the REAL assembly would send: real candidate rows, real authority resolver."""
     cols = fa._candidate_columns(db, source, roles=())
@@ -1333,6 +1349,141 @@ def test_a_humanly_confirmed_grain_reads_human_confirmed_end_to_end(db):
 
     block = _resolved_block(db, "humanp")
     assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "human_confirmed")
+
+
+def _human_confirmed_grain(db, source: str, *, now):
+    """A grain a HUMAN signed through the real four-eyes gate, projected onto graph_node.
+
+    The shared setup for the lapse tests below: each one then drives the fact OUT of VERIFIED and
+    asserts what the block says about a signature that is still stamped on the row."""
+    from tests.featuregen._helpers import mint_test_identity
+    from tests.featuregen.overlay.upload.conftest import _confirm_grain
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
+
+    _sealed()
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+    rows = [CanonicalRow(source, "facility_limits", "cust_id", "text"),
+            CanonicalRow(source, "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, source, rows, actor=owner, now=now).status == "ingested"
+    _propose_ai_grain(db, source, "facility_limits", ["cust_id"])
+    _confirm_grain(db, source, "facility_limits", ["cust_id"], actor=admin)
+    project_table_facts_for_ref(db, source=source, table="facility_limits", now=now)
+    assert db.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND kind = 'column' AND is_grain "
+        "AND grain_fact_event_id IS NOT NULL", (source,)).fetchone() is not None
+    return admin
+
+
+def test_a_human_signed_grain_that_EXPIRED_still_says_a_human_signed_it(db):
+    """THE FOURTH PRODUCING STATE — the one two rounds of review and I all walked past.
+
+    A grain a human signs is stamped onto `graph_node` with THAT HUMAN'S confirmed-event id. When
+    the TTL timer armed at confirm time fires, the fact folds to REVERIFY — and NOTHING clears the
+    stamp: `expiry` demotes join edges and semantic bindings, the overlay projection touches only
+    `overlay_fact_state`/`overlay_proposal`, and `stamp_reconcile` says the drift is "left
+    drifted-and-visible rather than force-stamped or, worse, wiped" BY DESIGN.
+
+    So the row still carries the human's own signature, `_grain_block` still takes the confirmed
+    branch off it — and the first version of Task 8b answered `source_declared`, defined to the
+    model as "NO HUMAN REVIEW IS RECORDED for it, which usually means the uploaded catalog file
+    asserted it". Both halves false: the review IS recorded, and its event id is stamped on the very
+    row the block was built from.
+
+    Expiry is a TTL lapse, not a repudiation. The signature stands, so the label follows it. Whether
+    the fact can currently EXECUTE is the other axis, and `resolve_fact` — untouched — still says no.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.overlay.expiry import fire_due_overlay_expiries
+
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    _human_confirmed_grain(db, "expp", now=now)
+
+    assert fire_due_overlay_expiries(db, now=now + timedelta(days=4000)) >= 1
+    _drain_overlay(db)
+
+    cols = fa._candidate_columns(db, "expp", roles=())
+    authority = fa._table_fact_authority(db, cols)
+    assert authority[("expp", "facility_limits")]["grain"]["human"] is True
+    block = fa._table_context(cols, authority=authority)[0]
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "human_confirmed")
+
+
+def test_a_human_signed_grain_that_drift_STALED_still_says_a_human_signed_it(db):
+    """The other routine way a signed fact leaves VERIFIED — the background drift scan, which runs
+    outside any ingest. Same stamp, same rule."""
+    from datetime import UTC, datetime
+
+    from featuregen.overlay import facts
+    from featuregen.overlay.identity import fact_key
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import append_overlay_event, load_fact
+    from featuregen.overlay.upload.upload_catalog import table_ref
+
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    admin = _human_confirmed_grain(db, "stalep", now=now)
+
+    fk = fact_key(table_ref("stalep", "facility_limits"), "grain")
+    stream = load_fact(db, fk)
+    # The SAME event `catalog_changes._stale_one` appends, with the same payload key.
+    append_overlay_event(
+        db, fact_key=fk, type=facts.OVERLAY_FACT_STALED, actor=admin,
+        expected_version=stream[-1].stream_version,
+        payload={"catalog_change_ref": "public.facility_limits",
+                 "stales_confirmed_event_id": fold_overlay_state(stream).confirmed_event_id})
+    assert fold_overlay_state(load_fact(db, fk)).status == "STALE"
+
+    cols = fa._candidate_columns(db, "stalep", roles=())
+    block = fa._table_context(cols, authority=fa._table_fact_authority(db, cols))[0]
+    assert block["grain_status"] == "human_confirmed"
+
+
+def test_a_REJECTED_re_verification_is_NOT_called_human_confirmed(db):
+    """AND THE LINE THE FIX MUST NOT CROSS. `_AWAITING_CONFIRMATION` includes REVERIFY, so a human
+    can REFUSE the re-confirmation of a grain they once signed — and the stamp survives that too.
+
+    A lapse and a refusal are not the same event. Expiry retires a signature by the clock; rejection
+    is a person saying THIS VALUE IS WRONG. Following the stamp blindly would answer
+    `human_confirmed` — "a person reviewed and signed it" — for a value a person explicitly refused,
+    which is the strongest claim in the vocabulary attached to the weakest evidence for it.
+
+    So the endorsement must STAND, not merely have existed. This is the over-claim guard for the
+    fix to the two tests above."""
+    from datetime import UTC, datetime, timedelta
+
+    from tests.featuregen.overlay.upload.conftest import _reject_grain
+
+    from featuregen.overlay.expiry import fire_due_overlay_expiries
+
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    admin = _human_confirmed_grain(db, "rejvp", now=now)
+
+    assert fire_due_overlay_expiries(db, now=now + timedelta(days=4000)) >= 1
+    _drain_overlay(db)
+    _reject_grain(db, "rejvp", "facility_limits", actor=admin)
+
+    cols = fa._candidate_columns(db, "rejvp", roles=())
+    authority = fa._table_fact_authority(db, cols)
+    assert authority[("rejvp", "facility_limits")]["grain"]["human"] is False
+    block = fa._table_context(cols, authority=authority)[0]
+    assert block["grain_status"] == "source_declared", (
+        "a value a human REFUSED was labelled as one they signed")
+
+
+def test_the_source_declared_sentence_holds_for_a_REPUDIATED_signature():
+    """…and the sentence must then be true for THAT state too, which "no human review is recorded"
+    is not: for a rejected re-verification a review is very much recorded. The claim the token makes
+    is about a signature that STANDS, which is false in all three remaining producing states —
+    never-signed, unreadable, and withdrawn."""
+    directive = fa._table_context_directive(
+        [{"table": "t", "grain_status": "source_declared"}], cites_grounding=True)
+    assert "NO HUMAN SIGN-OFF STANDS" in directive
+    # the two phrasings that are false for a repudiated or lapsed signature
+    assert "NO HUMAN REVIEW IS RECORDED" not in directive
+    assert "NOBODY has reviewed it" not in directive
 
 
 def test_an_AI_PROPOSED_grain_now_REACHES_the_table_block(db):

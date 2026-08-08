@@ -687,6 +687,42 @@ TABLE_FACT_STATUSES = frozenset({STATUS_HUMAN_CONFIRMED, STATUS_SOURCE_DECLARED,
                                  STATUS_AI_PROPOSED})
 
 
+#: Folds on which a HUMAN confirmation, if the stream has one, STILL STANDS — so the label follows
+#: the signature stamped on the row rather than the fact's current servability.
+#:
+#: THE STAMP OUTLIVES VERIFIED, BY DESIGN. `graph_node.grain_fact_event_id` is written by
+#: `table_fact_projection` from the confirmed event, and NOTHING clears it when the fact leaves
+#: VERIFIED: `expiry` demotes join edges and semantic bindings, `catalog_changes._stale_one` appends
+#: the STALED event and calls no table-fact projection, and the overlay projection touches only
+#: `overlay_fact_state`/`overlay_proposal`. `stamp_reconcile` states the intent outright — a fact
+#: `resolve_fact` will not serve is "left drifted-and-visible rather than force-stamped or, worse,
+#: wiped". So `_grain_block`'s confirmed branch keeps firing off a human's own signature long after
+#: the fact stops being servable, and testing `status == "VERIFIED"` here answered
+#: `source_declared` — "no human review" — for a grain whose reviewer's event id is stamped on the
+#: very row the block was built from.
+#:
+#: EXPIRY AND STALING ARE LAPSES; REJECTION IS A REPUDIATION. A TTL firing or a drift scan retires a
+#: signature by the clock or by the catalog moving underneath it — nobody withdrew it. A human
+#: rejecting the re-verification is a person saying THIS VALUE IS WRONG, and `_AWAITING_CONFIRMATION`
+#: admits exactly REVERIFY and STALE to that command, so it is reachable. REJECTED is therefore
+#: excluded and the endorsement must STAND, not merely have existed.
+#:
+#: EVERY FOLD THAT CAN REACH `_grain_block`'s CONFIRMED BRANCH (i.e. the row is still stamped), and
+#: what it emits:
+#:
+#:   VERIFIED             -> human_confirmed | source_declared   (who authored the confirm)
+#:   REVERIFY             -> human_confirmed | source_declared   (TTL lapse; signature stands)
+#:   STALE                -> human_confirmed | source_declared   (drift lapse; signature stands)
+#:   REJECTED             -> source_declared                     (signature withdrawn)
+#:   PARTIALLY_CONFIRMED  -> source_declared                     (no confirmed_event_id to read)
+#:   DRAFT (re-proposed)  -> source_declared                     (PROPOSED clears confirmed_event_id)
+#:   no stream at all     -> source_declared                     (nothing to evidence)
+#:
+#: which is why the token's sentence is about a sign-off that STANDS: that is the one claim true of
+#: every state in the `source_declared` column above.
+_ENDORSEMENT_STANDS = ("VERIFIED", "REVERIFY", "STALE")
+
+
 @dataclass(frozen=True, slots=True)
 class _FactEvent:
     """The four fields the overlay lifecycle fold and the human-review rule read off an event.
@@ -794,7 +830,7 @@ def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]
         for key, stream in streams.items():
             table_key, fact_type = keyed[key]
             state = fold_overlay_state(stream)
-            if state.status == "VERIFIED":
+            if state.status in _ENDORSEMENT_STANDS:
                 out[table_key][fact_type]["human"] = _human_reviewed(
                     stream, state.confirmed_event_id)
             elif state.status == "DRAFT":
@@ -804,14 +840,14 @@ def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]
                 # governance already adjudicated back in front of the model wearing the wrong label.
                 out[table_key][fact_type]["proposed"] = _machine_proposal(
                     stream, state.draft_event_id, fact_type)
-            # EVERY OTHER FOLDED STATUS FALLS THROUGH ON PURPOSE, leaving `human=False,
-            # proposed=None`. PARTIALLY_CONFIRMED, REVERIFY, STALE and REJECTED then take whatever
-            # the candidate row says: a still-stamped column reads `source_declared` (true — no
-            # human review is recorded for the value being SERVED), and an unstamped one emits
-            # nothing. None of them may read `human_confirmed` (the endorsement is in flight, or
-            # lapsed, or refused) and none may read `ai_proposed` (they are not open proposals).
-            # Named here because a fall-through that is correct by omission reads like one nobody
-            # thought about.
+            # THE REMAINING FOLDS FALL THROUGH ON PURPOSE, leaving `human=False, proposed=None`.
+            # REJECTED is the one that matters: its `confirmed_event_id` SURVIVES the fold (the
+            # REJECTED branch sets only status and value), so following the stamp blindly would
+            # answer `human_confirmed` for a value a person explicitly REFUSED — the strongest claim
+            # in the vocabulary attached to the weakest evidence for it. PARTIALLY_CONFIRMED cannot
+            # reach a stale endorsement at all: the PROPOSED fold that precedes it clears
+            # `confirmed_event_id`, so `_human_reviewed` returns False on its own terms. Neither may
+            # read `ai_proposed` either — they are not open proposals.
         return out
     except Exception:  # noqa: BLE001 — prompt context must never take down feature generation
         logger.warning("table-fact authority unreadable for %d table(s) — the grain/as-of status "
@@ -2700,25 +2736,30 @@ def _grounding_directive() -> str:
 # siblings above it is a fixed PII-free constant appended after the redacted objective, so the
 # egress guard still scans it and the llm_call audit records exactly what was asked.
 # EVERY CLAUSE MUST BE TRUE IN EVERY STATE THAT PRODUCES ITS TOKEN, which is a stricter test than
-# "true in the normal case" and is where the first draft of this sentence failed. `source_declared`
-# is produced by THREE states, not two: ingest's source-declared auto-confirm, a file-declared flag
-# whose governed fact is not servable, and — because `_table_fact_authority` is fail-soft — a grain
-# a human REALLY DID endorse, whose stream could not be read. The draft said "the uploaded catalog
-# file asserted it, so NOBODY has reviewed it", which in that third state is not a weaker claim than
-# the truth but a DIFFERENT and FALSE one: it asserts a fact about a file that never declared
-# anything, and denies a review that happened.
+# "true in the normal case" and is where BOTH earlier drafts of this sentence failed. The full
+# enumeration lives on `_ENDORSEMENT_STANDS`; the drafts and why each was false:
 #
-# So the token is defined by what is RECORDED, never by what occurred. "No human review is recorded
-# for it" is true in all three, and it is also exactly what the platform can evidence.
+#   draft 1: "the uploaded catalog file asserted it, so NOBODY has reviewed it" — false for the
+#            FAIL-SOFT state, where a grain a human really did endorse degrades to this token. Not a
+#            weaker claim than the truth but a DIFFERENT one: it asserts a fact about a file that
+#            never declared anything and denies a review that happened.
+#   draft 2: "NO HUMAN REVIEW IS RECORDED for it" — fixed that, and was still false for a REJECTED
+#            re-verification, where a human review is emphatically recorded: it is the refusal.
+#
+# What is true of every state in the `source_declared` column — never signed, signature unreadable,
+# signature withdrawn — is that no human sign-off STANDS. The claim is about the standing of a
+# signature, which is what the platform can actually evidence; it is deliberately NOT about whether
+# the fact can currently execute, which is the other axis and which `resolve_fact` alone answers.
 _TABLE_CONTEXT_STATUS_DIRECTIVE = (
     "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name what the "
     "platform can EVIDENCE about that table's grain (what one row means) or its as-of column (when "
     "the row was true), and nothing else: `human_confirmed` — a person with authority over the "
-    "table reviewed and signed it; `source_declared` — NO HUMAN REVIEW IS RECORDED for it, which "
-    "usually means the uploaded catalog file asserted it and the platform recorded it "
-    "automatically; `ai_proposed` — a model inferred it from the schema and it is unconfirmed. Use "
-    "all three: an unreviewed grain is better information than none, and a feature resting on one is "
-    "still worth proposing — but only `human_confirmed` means a person checked it.")
+    "table reviewed and signed it, and that sign-off still stands; `source_declared` — NO HUMAN "
+    "SIGN-OFF STANDS for it, which usually means the uploaded catalog file asserted it and the "
+    "platform recorded it automatically; `ai_proposed` — a model inferred it from the schema and it "
+    "is unconfirmed. Use all three: an unreviewed grain is better information than none, and a "
+    "feature resting on one is still worth proposing — but only `human_confirmed` means a person "
+    "checked it.")
 # The one clause that mentions `grounding`, split out because a model must NEVER be asked for output
 # its schema forbids: below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding`
 # key, and a sentence telling the model to write one there is the same prompt/schema inversion
