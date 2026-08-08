@@ -538,7 +538,6 @@ _ALL: tuple[Concept, ...] = (
             description="Expected (positive) exposure — EPE, counterparty credit risk. A monetary "
                         "exposure STOCK: sum across netting sets, latest over time."),
     Concept("potential_future_exposure", "quantity_risk", additivity="non_additive",
-            is_a="monetary_stock",
             description="PFE — a high-quantile future exposure. Non-additive (a quantile; sub-additive "
                         "with diversification — never sum across netting sets, like var)."),
     Concept("expected_shortfall", "quantity_risk", additivity="non_additive",
@@ -779,7 +778,7 @@ _ALL: tuple[Concept, ...] = (
                         "observed. Leakage-risk when its target overlaps the feature target; also a "
                         "model-monitoring input."),
     Concept("data_quality_flag", "flag",
-            is_a="boolean_flag",
+            is_a="category_code",
             description="Data-quality marker (missing / imputed / stale / reconciliation-break). Gate "
                         "features on it; not a target."),
     Concept("source_system", "categorical",

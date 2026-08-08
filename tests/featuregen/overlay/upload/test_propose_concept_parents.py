@@ -14,9 +14,12 @@ touched, walks a terminating chain to a root.
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from featuregen.intake.llm import PROVIDER_OK, LLMResult
+from featuregen.overlay.upload import propose_concept_parents as pcp
 from featuregen.overlay.upload.concepts import _ALL, CONCEPT_REGISTRY, concept_path
 from featuregen.overlay.upload.propose_concept_parents import (
     OFFLINE_PROPOSALS,
@@ -163,13 +166,80 @@ def test_the_request_carries_registry_metadata_only() -> None:
 
 # ── the deterministic offline path (no provider call) ────────────────────────────────────────────
 
-def test_the_offline_proposals_all_survive_validation() -> None:
-    """Every curated pair must be a legal proposal in its own right — the offline path is held to
-    the SAME validator as a provider answer, not trusted because a human wrote it."""
-    kept, dropped = keep_valid(OFFLINE_PROPOSALS, _ALL)
-    already = {n for n in OFFLINE_PROPOSALS if CONCEPT_REGISTRY[n].is_a is not None}
-    assert dropped == {n: "already_parented" for n in already}
-    assert set(kept) == set(OFFLINE_PROPOSALS) - already
+def _pre_patch_registry() -> dict:
+    """The registry as it stood BEFORE this task's patch: every backfilled `is_a` cleared.
+
+    Without this, validating `OFFLINE_PROPOSALS` proves nothing. `keep_valid` checks
+    `already_parented` (rule 4) before `unknown_parent`, `self_parent`, `parent_is_legacy_alias` and
+    `cycle` (rules 6-9), so once the patch is applied EVERY curated name short-circuits on rule 4
+    and the interesting rules never execute. A first version of this test did exactly that and could
+    not fail: a review replaced every parent with a non-existent name, with the concept itself, and
+    with a legacy alias, and all three mutants survived it.
+    """
+    return {name: (dataclasses.replace(record, is_a=None) if name in OFFLINE_PROPOSALS else record)
+            for name, record in CONCEPT_REGISTRY.items()}
+
+
+def _validate_against_pre_patch(monkeypatch, proposals: dict[str, str]):
+    """Run `keep_valid` with the pre-patch registry in scope.
+
+    `propose_concept_parents` binds `CONCEPT_REGISTRY` at import, and `keep_valid` / `_parent_of`
+    read that module global at CALL time — so the patch must be applied to the proposer's namespace,
+    not to `concepts`.
+    """
+    monkeypatch.setattr(pcp, "CONCEPT_REGISTRY", _pre_patch_registry())
+    return keep_valid(proposals, _ALL)
+
+
+def test_the_offline_proposals_validate_against_a_pre_patch_registry(monkeypatch) -> None:
+    """Every curated pair must be a legal proposal in its OWN right — the offline path is held to
+    the same validator as a provider answer, not trusted because a human wrote it."""
+    kept, dropped = _validate_against_pre_patch(monkeypatch, dict(OFFLINE_PROPOSALS))
+    assert dropped == {}
+    assert kept == dict(OFFLINE_PROPOSALS)
+
+
+@pytest.mark.parametrize("corrupt,reason", [
+    (lambda p: p | {"pd": "no_such_concept_at_all"}, "unknown_parent"),
+    (lambda p: p | {"pd": "pd"}, "self_parent"),
+    (lambda p: p | {"pd": "rate_or_ratio"}, "parent_is_legacy_alias"),
+    # A hand-swap: `category_code` is the parent of 41 pairs, so pointing it at one of its own
+    # children closes a loop that no single pair reveals on its own.
+    (lambda p: p | {"category_code": "product_type"}, "cycle"),
+])
+def test_a_corrupted_offline_set_is_caught_by_that_same_check(monkeypatch, corrupt, reason) -> None:
+    """The mutants a review used to show the previous version of the check was vacuous. Each must
+    now be REJECTED, and rejected for the right reason — a test that cannot fail is not evidence."""
+    kept, dropped = _validate_against_pre_patch(monkeypatch, corrupt(dict(OFFLINE_PROPOSALS)))
+    assert reason in dropped.values(), dropped
+    assert kept != dict(OFFLINE_PROPOSALS)
+
+
+def test_no_curated_child_contradicts_its_parents_additivity() -> None:
+    """The rule that `potential_future_exposure is_a monetary_stock` broke, made enforceable.
+
+    PFE is `non_additive` and its own description says "never sum across netting sets"; it was
+    proposed as a child of `monetary_stock`, which is `semi_additive` and says "sum across
+    entities". A model reading that chain inherits the opposite summation licence. Where BOTH
+    concepts declare a real additivity, they must agree.
+    """
+    for name, parent in OFFLINE_PROPOSALS.items():
+        child_add = CONCEPT_REGISTRY[name].additivity
+        parent_add = CONCEPT_REGISTRY[parent].additivity
+        if child_add != "n/a" and parent_add != "n/a":
+            assert child_add == parent_add, (name, child_add, parent, parent_add)
+
+
+def test_the_whole_registry_agrees_with_itself_on_additivity() -> None:
+    """The same rule over all 324, not just the pairs this task added — an authored parent is not
+    exempt from a rule a proposed one has to meet."""
+    for record in _ALL:
+        if record.is_a is None:
+            continue
+        parent = CONCEPT_REGISTRY[record.is_a]
+        if record.additivity != "n/a" and parent.additivity != "n/a":
+            assert record.additivity == parent.additivity, (
+                record.name, record.additivity, parent.name, parent.additivity)
 
 
 def test_the_offline_path_is_idempotent_once_applied() -> None:
