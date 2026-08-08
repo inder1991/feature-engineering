@@ -1860,6 +1860,46 @@ registry and for cycles before landing; _validate_registry is the import-time ba
 
 ---
 
+### Task 9c: Make the dry run diagnostic
+
+**Files:** wherever each stage already logs or records — do not build a parallel telemetry system.
+**Test:** assert the record is emitted and carries no data value.
+
+**Why this task exists.** The human approved exactly ONE live catalog run, conditional on this landing first: *"have proper logging for everything that will help to find real issues"*. One run has to be enough. A run that reports "it worked" or "it failed" is close to useless for a pipeline this layered — sixteen tasks have shown that the interesting failures are silent.
+
+**The single hard rule: never log a data VALUE.** Lengths, counts, codes, refs, field names, statuses — never the content. This is the same discipline `_safe_reason` enforces on the LLM egress path (Task 2), and for the same reason. A log that leaks what the redactor scrubbed is worse than no log.
+
+**What the run must be able to answer from logs and DB alone, without a second run.** Each of these is a failure this plan actually found, so each is a thing that WILL happen and must not be invisible:
+
+| Question | Why — the finding that makes it necessary |
+|---|---|
+| Per stage: physical provider calls, items resolved / skipped / failed / not_attempted, wall clock, and **which bound stopped it** — call ceiling, stage deadline, token budget, or item count | Task 4b: a too-low ceiling does not slow enrichment, it silently STOPS enriching columns. The real per-stage call count has never been measured. |
+| Every truncation and escalation: which call, old → new `max_tokens`, whether the retry then succeeded | Task 1: a truncation retry used to replay identical bytes. Task 4b: at the old chunking a full-cap chunk was UNSERVABLE. |
+| Every egress refusal: which column, which key, which grade, which gate — **and that it refused the whole payload, not the field** | Task 6b's review: one over-budget value on one column kills feature generation for ALL columns, and the code comment claiming otherwise was wrong. |
+| Every `_bounded` / `_accept_*` rejection: which field, which rule (over-length / enumeration / list-prefix), and the value's **LENGTH** | Task 4b: a definition containing one newline was discarded WHOLE and looked like a provider blip. |
+| Evidence written vs skipped per stage, with the skip REASON | Task 4c: a glossary-less upload drafted synonyms for every column, stored none, and reported `succeeded`. |
+| The assembled feature-context payload: byte size, column count, trim level reached, and which fields were shed | Task 7b: the budget bands were blind to a whole block for three tasks. |
+| **Concept verdicts before and after, per column** — what the critic changed, what it refuted, and the resulting concept and namespace | **Task 9b: this run re-critiques every identifier column because the registry fingerprint moved. A REVISED verdict changes the namespace and therefore join candidacy; a REFUTED one costs the column its bridge candidacy. Without this, a different set of features is uninterpretable — new enrichment and re-rolled verdicts look identical in the output.** |
+| Which expanded objective terms matched which columns | Task 6d's review: the join is reconstructible (the terms are stored against the subject hash) but nothing surfaces it, so "why did this column surface" is unanswerable today. |
+
+**Prefer the record that already exists.** `llm_call`, `ingestion_run_stage`, `field_evidence`, `structured_result` and the dispatch-audit tables already carry much of this. Extending what a stage records beats adding a log line; a queryable row beats a string. Where a log line is the right answer, make it greppable and machine-parseable, not prose.
+
+**No new migrations.** If something genuinely cannot be recorded without a schema change, say so and record it as a gap rather than adding one — an unmeasured thing named is worth more than a migration smuggled in under an observability task.
+
+- [ ] **Step 1: Inventory what is already recorded**, per row of the table above, before writing anything. Report which questions are already answerable, which need a field added to an existing record, and which need a new log line. Several tasks in this plan discovered the thing they were about to build already existed.
+
+- [ ] **Step 2: Close the gaps**, cheapest first — existing record before new record, new record before log line.
+
+- [ ] **Step 3: Prove no value leaks.** A test that asserts every field emitted is a length, a count, a code, a ref or a status — and that a value containing a known marker never appears in any record this task adds.
+
+- [ ] **Step 4: Write the reading guide.** A short section in the report: for each question in the table, the exact query or grep that answers it after the run. This is the deliverable the human actually uses at 3am; the instrumentation is only its substrate.
+
+- [ ] **Step 5: Run** the suites your changes touch.
+
+- [ ] **Step 6: Commit** with a conventional-commit prefix.
+
+---
+
 ### Task 10: End-to-end verification against a real catalog
 
 **Files:** none — this is a verification gate, not a code change.
