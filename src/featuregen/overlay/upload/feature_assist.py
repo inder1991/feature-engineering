@@ -687,8 +687,14 @@ TABLE_FACT_STATUSES = frozenset({STATUS_HUMAN_CONFIRMED, STATUS_SOURCE_DECLARED,
                                  STATUS_AI_PROPOSED})
 
 
-#: Folds on which a HUMAN confirmation, if the stream has one, STILL STANDS — so the label follows
-#: the signature stamped on the row rather than the fact's current servability.
+#: Folds on which a HUMAN confirmation, if the stream has one, HAS NOT BEEN WITHDRAWN — so the label
+#: follows the signature stamped on the row rather than the fact's current servability.
+#:
+#: NAMED FOR "NOT WITHDRAWN", NOT "STANDS", and the rename is the finding: round 2 called this
+#: `_ENDORSEMENT_STANDS` and wrote "that sign-off still stands" into the model-facing sentence, which
+#: is FALSE for the two lapsed folds this very tuple admits. A constant whose name asserts more than
+#: its members support is the same defect as a token whose meaning lives only in a docstring — one
+#: level down, where the next reader copies it into prose without re-deriving it.
 #:
 #: THE STAMP OUTLIVES VERIFIED, BY DESIGN. `graph_node.grain_fact_event_id` is written by
 #: `table_fact_projection` from the confirmed event, and NOTHING clears it when the fact leaves
@@ -705,22 +711,37 @@ TABLE_FACT_STATUSES = frozenset({STATUS_HUMAN_CONFIRMED, STATUS_SOURCE_DECLARED,
 #: signature by the clock or by the catalog moving underneath it — nobody withdrew it. A human
 #: rejecting the re-verification is a person saying THIS VALUE IS WRONG, and `_AWAITING_CONFIRMATION`
 #: admits exactly REVERIFY and STALE to that command, so it is reachable. REJECTED is therefore
-#: excluded and the endorsement must STAND, not merely have existed.
+#: excluded: the endorsement must be UNWITHDRAWN, not merely have existed. It need NOT still be in
+#: force — a lapsed signature is admitted here on purpose, and the model-facing sentence claims
+#: exactly that much and no more.
 #:
 #: EVERY FOLD THAT CAN REACH `_grain_block`'s CONFIRMED BRANCH (i.e. the row is still stamped), and
 #: what it emits:
 #:
 #:   VERIFIED             -> human_confirmed | source_declared   (who authored the confirm)
-#:   REVERIFY             -> human_confirmed | source_declared   (TTL lapse; signature stands)
-#:   STALE                -> human_confirmed | source_declared   (drift lapse; signature stands)
+#:   REVERIFY             -> human_confirmed | source_declared   (TTL lapse; not a withdrawal)
+#:   STALE                -> human_confirmed | source_declared   (drift lapse; not a withdrawal)
 #:   REJECTED             -> source_declared                     (signature withdrawn)
-#:   PARTIALLY_CONFIRMED  -> source_declared                     (no confirmed_event_id to read)
+#:   PARTIALLY_CONFIRMED  -> source_declared                     (UNREACHABLE for a table fact —
+#:                                                                see below; NOT "no stamp to read")
 #:   DRAFT (re-proposed)  -> source_declared                     (PROPOSED clears confirmed_event_id)
 #:   no stream at all     -> source_declared                     (nothing to evidence)
 #:
-#: which is why the token's sentence is about a sign-off that STANDS: that is the one claim true of
-#: every state in the `source_declared` column above.
-_ENDORSEMENT_STANDS = ("VERIFIED", "REVERIFY", "STALE")
+#: PARTIALLY_CONFIRMED IS UNREACHABLE HERE, and the reason matters because this table is the
+#: checklist the next change to this surface works from. It would NOT be safe by the stamp being
+#: absent: reached from REVERIFY/STALE its fold branch touches only `status` and `partial_confirmers`
+#: (`state.py`), so `confirmed_event_id` — and the row's stamp — survive it exactly as they survive
+#: REJECTED. It is moot only because `OVERLAY_FACT_PARTIALLY_CONFIRMED` has exactly ONE emitter,
+#: `join_confirmation._confirm_approved_join`, which is dispatched for `approved_join` alone (the
+#: dual-owner path). Grain and availability_time are single-confirmer facts and never enter it. If a
+#: table fact ever gains dual authority, this row stops being moot and must be decided on its merits.
+#:
+#: which is why `source_declared`'s sentence is that no sign-off STANDS — the one claim true of every
+#: state in its column — while `human_confirmed` claims only that the sign-off has NOT BEEN
+#: WITHDRAWN, which is the one claim true of every state in ITS column. They are deliberately
+#: different predicates: REVERIFY and STALE have a signature that is not withdrawn but no longer
+#: stands, and saying "still stands" there was the third breach of the clause-truth rule.
+_ENDORSEMENT_NOT_WITHDRAWN = ("VERIFIED", "REVERIFY", "STALE")
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,7 +851,7 @@ def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]
         for key, stream in streams.items():
             table_key, fact_type = keyed[key]
             state = fold_overlay_state(stream)
-            if state.status in _ENDORSEMENT_STANDS:
+            if state.status in _ENDORSEMENT_NOT_WITHDRAWN:
                 out[table_key][fact_type]["human"] = _human_reviewed(
                     stream, state.confirmed_event_id)
             elif state.status == "DRAFT":
@@ -844,10 +865,11 @@ def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]
             # REJECTED is the one that matters: its `confirmed_event_id` SURVIVES the fold (the
             # REJECTED branch sets only status and value), so following the stamp blindly would
             # answer `human_confirmed` for a value a person explicitly REFUSED — the strongest claim
-            # in the vocabulary attached to the weakest evidence for it. PARTIALLY_CONFIRMED cannot
-            # reach a stale endorsement at all: the PROPOSED fold that precedes it clears
-            # `confirmed_event_id`, so `_human_reviewed` returns False on its own terms. Neither may
-            # read `ai_proposed` either — they are not open proposals.
+            # in the vocabulary attached to the weakest evidence for it. PARTIALLY_CONFIRMED is
+            # UNREACHABLE for a table fact rather than safe-by-construction — its one emitter is the
+            # dual-owner `approved_join` path — full reasoning on `_ENDORSEMENT_NOT_WITHDRAWN`,
+            # which is the table to update if that ever changes. Neither may read `ai_proposed`
+            # either: they are not open proposals.
         return out
     except Exception:  # noqa: BLE001 — prompt context must never take down feature generation
         logger.warning("table-fact authority unreadable for %d table(s) — the grain/as-of status "
@@ -2737,7 +2759,7 @@ def _grounding_directive() -> str:
 # egress guard still scans it and the llm_call audit records exactly what was asked.
 # EVERY CLAUSE MUST BE TRUE IN EVERY STATE THAT PRODUCES ITS TOKEN, which is a stricter test than
 # "true in the normal case" and is where BOTH earlier drafts of this sentence failed. The full
-# enumeration lives on `_ENDORSEMENT_STANDS`; the drafts and why each was false:
+# enumeration lives on `_ENDORSEMENT_NOT_WITHDRAWN`; the drafts and why each was false:
 #
 #   draft 1: "the uploaded catalog file asserted it, so NOBODY has reviewed it" — false for the
 #            FAIL-SOFT state, where a grain a human really did endorse degrades to this token. Not a
@@ -2745,29 +2767,47 @@ def _grounding_directive() -> str:
 #            never declared anything and denies a review that happened.
 #   draft 2: "NO HUMAN REVIEW IS RECORDED for it" — fixed that, and was still false for a REJECTED
 #            re-verification, where a human review is emphatically recorded: it is the refusal.
+#   draft 3: `human_confirmed` gained "and that sign-off STILL STANDS" — false in the two states the
+#            same change newly routed into that token. In REVERIFY/STALE the fold has moved the
+#            signed value to `prior_value`, the status is in `_AWAITING_CONFIRMATION`, a re-verify
+#            task is open and `resolve_fact` refuses to serve it: the platform can EVIDENCE that the
+#            sign-off has lapsed, and "still stands" reads as "still in force". The first over-claim
+#            of the three, and the task calls that the dangerous direction. The private definition
+#            ("stands" = not withdrawn) lived in the comment below and never reached the model —
+#            which is the ORIGINAL finding of this whole task, committed again one level down.
 #
-# What is true of every state in the `source_declared` column — never signed, signature unreadable,
-# signature withdrawn — is that no human sign-off STANDS. The claim is about the standing of a
-# signature, which is what the platform can actually evidence; it is deliberately NOT about whether
-# the fact can currently execute, which is the other axis and which `resolve_fact` alone answers.
+# So: `human_confirmed` claims only that the sign-off has NOT BEEN WITHDRAWN — true in all three of
+# its producing states, and it keeps the lapse/repudiation distinction `_ENDORSEMENT_NOT_WITHDRAWN` is
+# built on. `source_declared` claims that NO SIGN-OFF STANDS — true of never-signed, unreadable and
+# withdrawn alike. Neither says anything about whether the fact can currently EXECUTE; that is the
+# other axis and `resolve_fact` alone answers it.
 _TABLE_CONTEXT_STATUS_DIRECTIVE = (
     "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name what the "
     "platform can EVIDENCE about that table's grain (what one row means) or its as-of column (when "
     "the row was true), and nothing else: `human_confirmed` — a person with authority over the "
-    "table reviewed and signed it, and that sign-off still stands; `source_declared` — NO HUMAN "
-    "SIGN-OFF STANDS for it, which usually means the uploaded catalog file asserted it and the "
-    "platform recorded it automatically; `ai_proposed` — a model inferred it from the schema and it "
-    "is unconfirmed. Use all three: an unreviewed grain is better information than none, and a "
-    "feature resting on one is still worth proposing — but only `human_confirmed` means a person "
+    "table reviewed and signed it, and that sign-off has not been withdrawn; `source_declared` — NO "
+    "HUMAN SIGN-OFF STANDS for it, which usually means the uploaded catalog file asserted it and "
+    "the platform recorded it automatically; `ai_proposed` — a model inferred it from the schema "
+    "and it is unconfirmed. Use all three: an unreviewed grain is better information than none, and "
+    "a feature resting on one is still worth proposing — but only `human_confirmed` means a person "
     "checked it.")
 # The one clause that mentions `grounding`, split out because a model must NEVER be asked for output
 # its schema forbids: below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding`
 # key, and a sentence telling the model to write one there is the same prompt/schema inversion
 # `_grounding_directive` exists to avoid. Gated off `_grounding_directive()`'s OWN emptiness rather
 # than a second copy of the version test, so the two cannot drift apart.
+#
+# IT ASKS ABOUT ALL THREE, NOT ONLY THE WEAK ONES. The first version said "where a feature rests on
+# a grain that is NOT `human_confirmed`, say so", which made `human_confirmed` the silent default —
+# so a reader could not tell a signed grain from one whose status the model simply never mentioned,
+# and the review's second-order finding lands here: a signature that has lapsed would vanish from
+# the label AND from the audit trail in the same breath. Naming the status whichever it is costs one
+# short phrase and makes the absence of a claim mean something again.
 _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE = (
-    " Where a feature rests on a grain or as-of column that is not `human_confirmed`, say so in its "
-    "`grounding` entry — the reader needs to know which it was.")
+    " Where a feature rests on a table's grain or as-of column, name that column's status in its "
+    "`grounding` entry — whichever of the three it is. The reader needs to know what the feature is "
+    "standing on, and `human_confirmed` is worth stating explicitly rather than left as the "
+    "assumption when nothing is said.")
 
 
 def _table_context_directive(table_context: Iterable[Mapping] | None, *,

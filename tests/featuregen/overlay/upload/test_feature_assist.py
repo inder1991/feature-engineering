@@ -1196,6 +1196,26 @@ def test_the_recipe_call_is_not_told_to_write_a_grounding_entry(db, v5):
     assert "source_declared" in seen[-1]
 
 
+def test_the_grounding_clause_asks_about_ALL_THREE_statuses_not_only_the_weak_ones(v5):
+    """THE SECOND-ORDER HALF of review's third finding. The clause used to say "where a feature
+    rests on a grain that is NOT `human_confirmed`, say so", which made `human_confirmed` the SILENT
+    DEFAULT — a reader could not tell a signed grain from one whose status the model simply never
+    mentioned.
+
+    That mattered most in exactly the state the same round fixed: a human-signed grain whose fact has
+    lapsed is labelled `human_confirmed`, so under the old clause the lapse vanished from the label
+    AND from the audit trail in one breath. Naming the status whichever it is costs one short phrase
+    and makes silence mean something again."""
+    directive = fa._table_context_directive(
+        [{"table": "t", "grain_status": "human_confirmed"}], cites_grounding=True)
+    assert fa._TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE in directive
+    clause = fa._TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE
+    assert "whichever of the three it is" in clause
+    assert "is not `human_confirmed`" not in clause, (
+        "the clause once again asks only about the weak statuses, making a signed grain silent")
+    assert "`human_confirmed`" in clause   # …and says so explicitly rather than by omission
+
+
 def test_the_directives_grounding_clause_is_version_gated(v5, monkeypatch):
     """THE DEFECT THIS PIN EXISTS FOR, found by running the suite rather than by reading the code.
 
@@ -1411,6 +1431,18 @@ def test_a_human_signed_grain_that_EXPIRED_still_says_a_human_signed_it(db):
     block = fa._table_context(cols, authority=authority)[0]
     assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "human_confirmed")
 
+    # AND THE CLAUSE MUST BE TRUE HERE TOO — the third breach of the clause-truth rule, and the
+    # first in the OVER-claim direction, which this task calls the dangerous one. The fix that
+    # routed this state into `human_confirmed` also wrote "and that sign-off STILL STANDS", which is
+    # false in exactly the state it created: the fold has moved the signed value to `prior_value`,
+    # the status is in `_AWAITING_CONFIRMATION`, a re-verify task is open and `resolve_fact` refuses
+    # to serve it. The platform can EVIDENCE the lapse. What it may claim is only that nobody
+    # WITHDREW the signature.
+    directive = fa._table_context_directive([block], cites_grounding=True)
+    assert "has not been withdrawn" in directive
+    assert "still stands" not in directive, (
+        "the label tells the model a lapsed sign-off is still in force")
+
 
 def test_a_human_signed_grain_that_drift_STALED_still_says_a_human_signed_it(db):
     """The other routine way a signed fact leaves VERIFIED — the background drift scan, which runs
@@ -1472,18 +1504,70 @@ def test_a_REJECTED_re_verification_is_NOT_called_human_confirmed(db):
     assert block["grain_status"] == "source_declared", (
         "a value a human REFUSED was labelled as one they signed")
 
-
-def test_the_source_declared_sentence_holds_for_a_REPUDIATED_signature():
-    """…and the sentence must then be true for THAT state too, which "no human review is recorded"
-    is not: for a rejected re-verification a review is very much recorded. The claim the token makes
-    is about a signature that STANDS, which is false in all three remaining producing states —
-    never-signed, unreadable, and withdrawn."""
-    directive = fa._table_context_directive(
-        [{"table": "t", "grain_status": "source_declared"}], cites_grounding=True)
+    # …AND THE SENTENCE MUST BE TRUE FOR THE STATE JUST CONSTRUCTED. This assertion used to live in
+    # a test NAMED for a repudiated signature that hand-built a block and drove no such thing —
+    # review's finding, and a test named for a state it does not construct is precisely how "true in
+    # the states I enumerated" defects propagate. It is now attached to the real one.
+    directive = fa._table_context_directive([block], cites_grounding=True)
     assert "NO HUMAN SIGN-OFF STANDS" in directive
-    # the two phrasings that are false for a repudiated or lapsed signature
-    assert "NO HUMAN REVIEW IS RECORDED" not in directive
+    # Every superseded draft, each false in a state that really produces this token.
+    assert "NO HUMAN REVIEW IS RECORDED" not in directive   # false HERE: the refusal IS a review
     assert "NOBODY has reviewed it" not in directive
+
+
+def test_a_human_signed_AS_OF_that_lapsed_is_labelled_like_its_grain_twin(db):
+    """THE RESIDUAL I FLAGGED AND REVIEW ASKED ME TO CLOSE. `_as_of_block` reads the same `human`
+    flag `_grain_block` does, and `_table_fact_authority` branches on `state.status` alone with no
+    per-fact-type logic — so divergence between the two axes is structurally impossible. That is a
+    one-line invariant, and until now nothing tested it: every lapse test drove the GRAIN axis.
+
+    Drives the availability_time fact through the same TTL expiry and asserts the as-of column
+    reports what its grain twin reports."""
+    from datetime import UTC, datetime, timedelta
+
+    from tests.featuregen._helpers import mint_test_identity
+    from tests.featuregen.overlay.upload.conftest import _open_grain_task
+
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.commands import confirm_fact
+    from featuregen.overlay.expiry import fire_due_overlay_expiries
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
+
+    _sealed()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+    rows = [CanonicalRow("aslapse", "facility_limits", "cust_id", "text"),
+            CanonicalRow("aslapse", "facility_limits", "booked_at", "timestamp")]
+    assert ingest_upload(db, "aslapse", rows, actor=owner, now=now).status == "ingested"
+
+    # BOTH axes proposed by the service and signed by the same human, through the real gate.
+    _propose_ai_grain(db, "aslapse", "facility_limits", ["cust_id"], as_of="booked_at")
+    for fact_type, value in (("grain", {"columns": ["cust_id"], "is_unique": True}),
+                             ("availability_time", {"column": "booked_at", "basis": "posted_at"})):
+        _task, target, ref = _open_grain_task(db, "aslapse", "facility_limits", actor=admin,
+                                              fact_type=fact_type)
+        res = confirm_fact(db, Command(
+            "confirm_fact", "overlay_fact", None,
+            {"ref": ref, "fact_type": fact_type, "target_event_id": target, "value": value},
+            admin, f"confirm-{target}"))
+        assert res.accepted, res.denied_reason
+    _drain_overlay(db)
+    project_table_facts_for_ref(db, source="aslapse", table="facility_limits", now=now)
+
+    cols = fa._candidate_columns(db, "aslapse", roles=())
+    signed = fa._table_context(cols, authority=fa._table_fact_authority(db, cols))[0]
+    assert signed["grain_status"] == signed["as_of_status"] == "human_confirmed"
+
+    # …and after the TTL fires on BOTH facts the two axes still agree.
+    assert fire_due_overlay_expiries(db, now=now + timedelta(days=4000)) >= 2
+    _drain_overlay(db)
+    lapsed = fa._table_context(cols, authority=fa._table_fact_authority(db, cols))[0]
+    assert lapsed["as_of_column"] == "booked_at"
+    assert lapsed["grain_status"] == lapsed["as_of_status"] == "human_confirmed", (
+        "the two axes diverged — `_table_fact_authority` branches on status alone, so this can only "
+        "mean per-fact-type logic crept into one of them")
 
 
 def test_an_AI_PROPOSED_grain_now_REACHES_the_table_block(db):
