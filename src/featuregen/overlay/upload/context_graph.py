@@ -135,11 +135,20 @@ class ContextEdgeV1:
 def _value_dict(value: SemanticValueV1) -> dict:
     """One semantic value with its FULL authority attribution — the D2 triple of every backing
     record, leading with the strongest, plus the derived display label. The label is published for
-    the UI's chip; nothing may branch on it."""
+    the UI's chip; nothing may branch on it.
+
+    ``proposed_value`` is the LLM's own answer where it did NOT win resolution — the state a
+    ``field_policies`` rule that excludes the LLM produces by design (``_MEASURE_ANNOTATION`` for
+    ``unit``/``currency``, where ``graph_node`` never receives the model's answer at all). It is
+    carried BESIDE ``value``, never folded into it: ``value`` means "what the operational read model
+    resolved", and a reader that could not tell the two apart is how a guess clears a safety check.
+    Dropping it here left the screen rendering an em dash for a column the AI did have an answer
+    for — an unreviewed AI value shown as nothing, which is the one framing this surface forbids."""
     lead = value.evidence[0] if value.evidence else None
     return {
         "field": value.field_name,
         "value": value.value,
+        "proposed_value": value.proposed_value,
         "resolution_status": value.resolution_status,
         "operational_influence": value.operational_influence,
         "authority_label": value.display_label(),

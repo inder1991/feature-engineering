@@ -440,3 +440,48 @@ def test_source_and_resolved_meaning_are_reported_separately(overlay_conn):
     assert "definition" in source_fields
     assert all(v["resolution_status"] == "declared" for v in context["source_meaning"])
     assert {v["field"] for v in context["resolved_meaning"]}
+
+
+# ── what the SCREEN reads (Task 9) ──────────────────────────────────────────────────────────────
+
+
+def test_a_proposal_that_did_not_win_resolution_still_reaches_the_reader(overlay_conn):
+    """`field_policies._MEASURE_ANNOTATION` excludes the LLM from resolving `unit`/`currency`, so
+    `graph_node` never receives its answer — the evidence row is the ONLY place it survives.
+
+    `SemanticValueV1.proposed_value` carries it, but the section's `_value_dict` dropped it at the
+    payload boundary, so the Context tab rendered `—` for a column the AI did have an answer for.
+    That is the one thing the no-blocked rule forbids: an unreviewed AI value rendered as nothing at
+    all. The value stays SEPARATE from `value` (never a fallback inside it) so nothing downstream
+    can mistake a proposal for a resolution."""
+    _seed(overlay_conn)
+    _evidence(overlay_conn, _SRC, "unit", "dollars", producer="llm", strength="proposed")
+    context = _context(overlay_conn)
+    unit = next(v for v in context["resolved_meaning"] if v["field"] == "unit")
+    assert unit["value"] is None
+    assert unit["proposed_value"] == "dollars"
+    # A field with nothing proposed says so with a null, never by omitting the key — a client
+    # cannot tell an absent key from an old server.
+    definition = next(v for v in context["resolved_meaning"] if v["field"] == "definition")
+    assert definition["proposed_value"] is None
+
+
+def test_the_table_shape_reaches_the_column_dossier(overlay_conn):
+    """`table_role` / `event_or_snapshot` describe the anchor's TABLE, and the column page is where
+    a reviewer reads them — a dimension row and an event row are not the same column. They ride
+    `context.table_context` with their own authority, beside the table's own prose.
+
+    HONEST ABOUT WHAT THIS TEST IS: a CHARACTERIZATION test, not one that drove a change. Both axes
+    already reached `table_context` before Task 9 (`build_context_section` publishes it, and
+    `semantic_context._bundle_from_store` reads both columns off the table node). It is kept because
+    Task 9's asset-detail screen now RENDERS this payload, so the contract it depends on earns a
+    guard — but it never failed, and it must not be read as evidence that it did."""
+    _seed(overlay_conn)
+    overlay_conn.execute(
+        "UPDATE graph_node SET table_role = %s, event_or_snapshot = %s "
+        "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s",
+        ("dimension", "snapshot", _SRC, "trades"))
+    context = _context(overlay_conn)
+    shape = {v["field"]: v["value"] for v in context["table_context"]}
+    assert shape["table_role"] == "dimension"
+    assert shape["event_or_snapshot"] == "snapshot"
