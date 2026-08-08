@@ -1532,6 +1532,73 @@ git commit -m "feat(feature-gen): send declared grain/as-of with an honest confi
 
 ---
 
+### Task 8b: The AI's own grain and as-of reach generation
+
+**Files:**
+- Modify: `src/featuregen/overlay/upload/feature_assist.py` (`_table_context`)
+- Test: `tests/featuregen/overlay/upload/test_feature_assist.py`
+
+**Interfaces:**
+- Consumes: the PROPOSED overlay-fact stream (the same store `resolve_fact` reads, at its pre-VERIFIED state).
+- Produces: `grain_status` / `as_of_status` gain a third value for an AI proposal nobody has confirmed.
+
+**Why this task exists.** Task 8 was written on a false premise, and its review proved it. Two facts, both established from code:
+
+1. **A Pass-B AI grain proposal never sets `is_grain`.** It lands in a PROPOSED-only fact that `resolve_fact` will not serve, so nothing about it was ever in the candidate row `_table_context` reads. Pinned by `test_an_AI_PROPOSED_grain_still_reaches_no_table_block_at_all` (`test_feature_assist.py:408-452`), which builds a real PROPOSED fact, runs the real projection, and asserts the block comes back bare.
+2. **`ingest._assert_fact` auto-confirms every file-declared grain/as-of** with `authority_basis=source_declared` (`ingest.py:398,432`; `facts.py:218`). So an ordinary upload already arrives labelled `confirmed` with nobody having reviewed it.
+
+Task 8 therefore surfaced only the narrow set of tables whose file declared a grain and whose governed fact is not currently servable. The thing this plan was written for — *"we need to use them even if they are not human verified"* — is still not delivered. This task delivers it.
+
+**Read the PROPOSED stream, do not weaken the resolver.** `resolve_fact` refusing to serve a PROPOSED fact is correct and must stay correct — it is what keeps the execution path honest. This task reads the proposed state *beside* the resolved one and labels the difference. Do not change `resolve_fact`, `read_governed_grain`, `overlay_fact_state`, or anything `materialize/spine.py` depends on.
+
+**The vocabulary must distinguish three things, because the code knows three things.** Today's two tokens conflate a human endorsement with an auto-confirmed CSV flag — Task 8's review raised that as a live finding. Fix it here rather than layering a third value on a broken pair:
+
+| Situation | What the reader must be able to tell |
+|---|---|
+| A human endorsed it | someone with authority looked at this |
+| The uploader's file declared it, auto-confirmed | the source asserted it; nobody reviewed it |
+| The AI proposed it, unconfirmed | a model inferred it; nobody has checked |
+| Nothing | absent, as today |
+
+`bridge_assessment._human_reviewed` is the surface that can draw the human-vs-source line — check whether it is reachable here before assuming it is.
+
+**Precedence.** A confirmed value always wins over a proposed one; never emit both for the same field. If a human confirmed something the AI disagrees with, the human's value is what ships and the AI's proposal is not mentioned — the model is choosing features, not adjudicating governance.
+
+**The model must be told what the tokens mean.** Task 8's review found the payload carries these tokens as bare JSON with no prompt text defining them anywhere, so the model reads the English word and takes `confirmed` at face value. A token whose meaning lives only in a Python docstring is not labelling. Whatever vocabulary you land on, one sentence must reach the model with it.
+
+- [ ] **Step 1: Establish what is actually readable, before designing anything**
+
+Find where a Pass-B grain/as-of proposal is persisted and in what state. Confirm whether it is reachable from `_table_context`'s existing `conn` without a new query per table — `_table_context` is called once per assembly over all selected columns, and an N+1 here would land on the hot path. Report what you found and what the read costs **before** writing the emitting code. If the proposal is not reachable without a schema change, stop and report BLOCKED — this plan forbids migrations.
+
+- [ ] **Step 2: Write the failing tests first**, one per row of the table above, including the disagreement case. Assert the emitted status token, not merely that a key exists.
+
+- [ ] **Step 3: Split the confirmed token** so a human endorsement and a source-declared auto-confirm are distinguishable, and update Task 8's tests that pin the old two-value vocabulary. Those tests are correct about today's behaviour — they must be updated deliberately, not deleted.
+
+- [ ] **Step 4: Emit the AI proposal** with its own status, under the precedence rule above.
+
+- [ ] **Step 5: Classify any new key** and pin it with a removal-refusal test. If you only widen the value set of an existing key, say so — no new classification is needed, and the existing pins still hold.
+
+- [ ] **Step 6: Get the vocabulary to the model** — one sentence, wherever the generation instruction is assembled.
+
+- [ ] **Step 7: Measure the byte cost.** Task 8's review found the budget fixture has ZERO `is_grain`/`is_as_of` columns, so the pinned bands are blind to this block entirely. Either extend the fixture so the cost is measured, or record the hand-computed cost with its arithmetic — but do not leave a third case unmeasured behind pins that cannot see it.
+
+- [ ] **Step 8: Run** `uv run pytest tests/featuregen/overlay/upload/ -q` plus the budget and coverage suites.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git commit -m "feat(feature-gen): the AI's own grain and as-of reach generation, labelled
+
+Task 8 relaxed a gate that had nothing behind it: a Pass-B proposal never
+sets is_grain, and a file-declared grain is auto-confirmed at ingest. This
+reads the PROPOSED fact stream beside the resolved one and labels the
+difference, without weakening resolve_fact. The status vocabulary now
+separates human-endorsed, source-declared and AI-proposed, because the code
+knows all three and the model was being told only two."
+```
+
+---
+
 ### Task 9: The full column dossier on the asset-detail screen
 
 **Files:**
