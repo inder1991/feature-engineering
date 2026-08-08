@@ -185,7 +185,23 @@ def test_partial_enrichment_records_partial_not_succeeded(db, monkeypatch):
     assert res.status == "ingested"
     concept = _report(rec, "enrich_concept")
     assert concept.state == "partial"                        # NOT succeeded — 1 of 2 items failed
-    assert concept.detail == {"resolved": 1, "expected": 2, "unresolved": 1}
+    assert concept.reason_code == "items_failed"
+    # Task 9c attached the run's diagnostic account to the stage detail. Still pinned EXACTLY (a
+    # subset assertion would let a wrong key through unnoticed) — only the vocabulary fingerprint
+    # is pinned by shape, because it is a hash of the live concept registry.
+    detail = dict(concept.detail)
+    fingerprint = detail.pop("vocab_fingerprint", None)
+    assert isinstance(fingerprint, str) and fingerprint      # WHICH registry generation judged this
+    assert detail == {
+        "resolved": 1, "expected": 2, "unresolved": 1,
+        # The evidence writer never ran at all: a technical upload has no glossary, so there is no
+        # schema-preserving ref to key `field_evidence` on. Previously invisible — the stage
+        # reported a clean count of drafted values and said nothing about storing none of them.
+        "evidence": {"writer": "not_run:no_glossary"},
+        # The join-candidacy axis, before and after acceptance. `monetary_stock` is not an
+        # identifier concept, so it carries no namespace and lands in the `-` bucket.
+        "namespaces": {"before_critic": {"-": 1}, "after_critic": {"-": 1}},
+    }
     assert _report(rec, "enrich_definition").state == "succeeded"
     assert _report(rec, "enrich_domain").state == "succeeded"
 

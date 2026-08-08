@@ -358,9 +358,32 @@ def _bounded(val: str | None, max_len: int) -> str | None:
     structural-output model returning a JSON blob inside a JSON string field is a schema-level
     malfunction that a shape guard on this seam would only half-catch anyway.
     """
-    if not val or len(val) > max_len or val.startswith("[") or _is_enumeration(val):
-        return None
-    return val
+    return None if _bounded_reject(val, max_len) else val
+
+
+#: Task 9c — the closed rule vocabulary `_bounded` refuses under. Every member is a RULE NAME; none
+#: of them is derived from the value.
+BOUNDED_REJECT_CODES: tuple[str, ...] = ("blank", "over_length", "list_prefix", "enumeration")
+
+
+def _bounded_reject(val: str | None, max_len: int) -> str | None:
+    """WHICH of `_bounded`'s four rules refuses `val`, or None when it is accepted.
+
+    `_bounded` collapsed four distinct rules into one `None`, and `_accept_bounded` collapsed that
+    further into the single reason code `invalid_value`. From outside, a definition discarded for
+    one leading `[`, one discarded for being a bulleted list, and one discarded for exceeding a
+    32_000-char cap were the same event — and all three were indistinguishable from a provider
+    blip. This is the ONE place the rules are evaluated; `_bounded` delegates rather than
+    re-stating them, so the diagnosis can never drift from the decision."""
+    if not val:
+        return "blank"
+    if len(val) > max_len:
+        return "over_length"
+    if val.startswith("["):
+        return "list_prefix"
+    if _is_enumeration(val):
+        return "enumeration"
+    return None
 
 
 def _accept_concept(raw: str) -> tuple[str | None, str]:
@@ -377,7 +400,7 @@ def _accept_concept(raw: str) -> tuple[str | None, str]:
         return UNCLASSIFIED, "valid"
     if is_known_concept(v):
         return canonical_concept_name(v), "valid"
-    return None, "invalid_value"
+    return None, "off_vocabulary"
 
 
 def _accept_bounded(max_len: int):
@@ -385,8 +408,11 @@ def _accept_bounded(max_len: int):
     cached. NEWLINES ARE ALLOWED — see `_bounded`. A gate whose value must stay on ONE line uses
     `_accept_single_line` instead."""
     def _accept(raw: str) -> tuple[str | None, str]:
-        v = _bounded(raw, max_len)
-        return (v, "valid") if v is not None else (None, "invalid_value")
+        # Task 9c: the reason code names the RULE (`over_length` / `list_prefix` / `enumeration` /
+        # `blank`) rather than the catch-all `invalid_value`. The batch outcome STATUS is still
+        # `invalid_value` — only the reason narrowed — so nothing that switches on status moves.
+        code = _bounded_reject(raw, max_len)
+        return (None, code) if code else (raw, "valid")
     return _accept
 
 
@@ -413,7 +439,7 @@ def _accept_single_line(max_len: int):
         value, reason = bounded(raw)
         if value is None:
             return None, reason
-        return (None, "invalid_value") if "\n" in value else (value, "valid")
+        return (None, "multiline") if "\n" in value else (value, "valid")
     return _accept
 
 
@@ -454,7 +480,7 @@ def _accept_domain(max_len: int):
         if value is None:
             return None, reason
         if _is_task_echo(value):
-            return None, "invalid_value"
+            return None, "task_echo"
         return value, "valid"
     return _accept
 
@@ -599,10 +625,15 @@ _CURRENCY_CODE_RE = re.compile(r"[A-Za-z]{3}")
 
 def _accept_unit(raw: str) -> tuple[str | None, str]:
     """Accept ONE unit token (bounded, single-line, token-shaped, not a prompt/task echo)."""
-    value = _bounded(raw.strip(), _MAX_UNIT_LEN)
-    if value is None or not _UNIT_TOKEN_RE.fullmatch(value) or _is_task_echo(value):
-        return None, "invalid_value"
-    return value, "valid"
+    stripped = raw.strip()
+    code = _bounded_reject(stripped, _MAX_UNIT_LEN)
+    if code:
+        return None, code
+    if not _UNIT_TOKEN_RE.fullmatch(stripped):
+        return None, "unit_shape"
+    if _is_task_echo(stripped):
+        return None, "task_echo"
+    return stripped, "valid"
 
 
 def _accept_currency(raw: str) -> str | None:
@@ -952,7 +983,8 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
-                            cache_hit_hashes: frozenset[str] = frozenset()) -> int:
+                            cache_hit_hashes: frozenset[str] = frozenset(),
+                            counts: dict[str, int] | None = None) -> int:
     """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
     ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
     LLM producer must not bypass the machinery every other producer goes through).
@@ -980,18 +1012,35 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
     so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn.
 
     Returns the number of CONTAINED per-item write failures so the caller's stage report (#22) can
-    say ``partial`` — the swallowed except below must never be laundered into an outer success."""
+    say ``partial`` — the swallowed except below must never be laundered into an outer success.
+
+    ``counts`` (Task 9c, optional out-param — the return value is unchanged): the same
+    :data:`EVIDENCE_WRITE_DISPOSITIONS` account ``_write_llm_field_evidence`` keeps, which this
+    writer had no equivalent of at all. Its three designed non-writes below were entirely
+    invisible: a run could classify every column, store evidence for none of them, and report only
+    ``failures == 0``."""
     failures = 0
+
+    def _count(disposition: str, reason: str | None = None) -> None:
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            counts[f"{disposition}_{reason}"] = counts.get(f"{disposition}_{reason}", 0) + 1
+
     for h, concept in resolved.items():
         if concept == UNCLASSIFIED or not is_known_concept(concept):
+            _count("skipped", "not_a_proposal")
             continue   # C3: unclassified / invalid is not a proposal
         row = by_hash[h]
         rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
         if rec is None:
+            _count("skipped", "no_evidence_ref")
             continue   # not a glossary column term — no schema-preserving identity to key on
         if bindings is not None:
             binding = bindings.get(normalize_ref(row.source, None, row.table, row.column))
             if binding is None or not may_attach(binding):
+                _count("skipped", "unattachable_binding")
                 continue   # attachable columns only
         material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
         input_hash = field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
@@ -1014,8 +1063,12 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                         strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
                         producer_item_ref=item_ref, producer_configuration_hash=_vocab_fingerprint(),
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+            # Counted only AFTER the savepoint committed: an increment inside the `with` would
+            # survive a rollback and report a row that does not exist.
+            _count("reused" if reused else "written")
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
             failures += 1
+            _count("failed")
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
     return failures
@@ -1127,24 +1180,32 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
     counted."""
     failures = 0
 
-    def _count(disposition: str) -> None:
-        if counts is not None:
-            counts[disposition] = counts.get(disposition, 0) + 1
+    def _count(disposition: str, reason: str | None = None) -> None:
+        """Task 9c: the disposition AND, for a skip, WHICH of the three designed non-writes it was.
+        The disposition key is written unchanged so every existing reader is untouched; the reason
+        rides beside it under `skipped_<reason>`, because "126 skipped" and "126 skipped for want
+        of a glossary ref" are different findings and only the second is actionable."""
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            key = f"{disposition}_{reason}"
+            counts[key] = counts.get(key, 0) + 1
 
     for key, value in items.items():
         try:
             if valid_fn is not None and not valid_fn(value):
-                _count("skipped")              # skip — not a proposal, not a failure
+                _count("skipped", "invalid_value")   # skip — not a proposal, not a failure
                 continue
             resolved = ref_of(key)
             if resolved is None:
-                _count("skipped")
+                _count("skipped", "no_evidence_ref")
                 continue
             evidence_ref, binding_ref, material = resolved
             if bindings is not None:
                 binding = bindings.get(binding_ref)          # PUBLIC-flattened attachability lookup
                 if binding is None or not may_attach(binding):
-                    _count("skipped")          # attachable columns only
+                    _count("skipped", "unattachable_binding")   # attachable columns only
                     continue
             input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
                                           material=material)
@@ -1201,7 +1262,8 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
                                definitions: dict[str, str], glossary: GlossaryUpload,
                                concepts: dict[str, str] | None,
                                bindings: dict[str, ObjectBinding] | None,
-                               source_snapshot_id: str) -> int:
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's drafted definitions (E1a Task 2) out of the display-only
     ``graph_node.definition`` into governed ``llm/proposed`` ``field_evidence``, so asset-detail can
     honestly show the AI as their author. Returns the CONTAINED per-item failure count, which the
@@ -1241,7 +1303,7 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="definition", items=definitions, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
 
     # The set difference is computed here (never handed a ref written this run — that would silently
     # stale the fresh evidence): KEEP = written this run ∪ still an expected target. The expected set
@@ -1260,7 +1322,8 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
                             extras_by_hash: dict[str, dict] | None = None,
-                            bundles: dict[str, SemanticContextBundleV1] | None = None) -> int:
+                            bundles: dict[str, SemanticContextBundleV1] | None = None,
+                            counts: dict[str, int] | None = None) -> int:
     """Promote drafted summaries into governed ``llm/proposed`` ``field_evidence`` under
     ``ai_summary``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -1296,7 +1359,7 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="ai_summary", items=summaries, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
     keep = {ref[0] for h in set(summaries) | _summary_targets(rows, glossary)
             if (ref := ref_of(h)) is not None}
     _reconcile_llm_field_evidence(
@@ -1339,7 +1402,8 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
                            column_domains: dict[tuple[str, str], str],
                            glossary: GlossaryUpload,
                            bindings: dict[str, ObjectBinding] | None,
-                           source_snapshot_id: str) -> int:
+                           source_snapshot_id: str,
+                           counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's TWO-LEVEL domain classification (E1a T3) into governed ``llm/proposed``
     ``domain`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -1402,11 +1466,11 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="domain", items=dict(domains), ref_of=table_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=None)
+        bindings=None, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="domain", items=overrides, ref_of=column_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every still-target table in this upload (written OR transient-missed) ∪ the overrides
     # written this run ∪ every still-target column of a table whose classification MISSED (its
@@ -1432,7 +1496,8 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
                                column_sub_domains: dict[tuple[str, str], str],
                                glossary: GlossaryUpload,
                                bindings: dict[str, ObjectBinding] | None,
-                               source_snapshot_id: str) -> int:
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
     """Promote the D13.2 per-column SUB-DOMAINS into governed ``llm/proposed`` ``sub_domain``
     ``field_evidence``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -1468,7 +1533,7 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="sub_domain", items=items, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
     missed = tables_in_run - classified_tables
     keep = {ref[0] for k in items if (ref := ref_of(k)) is not None}
     keep |= {ref[0] for (table, column) in rec_by_tc
@@ -1548,7 +1613,8 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
                          units: dict[str, str], currencies: dict[str, str],
                          concepts: dict[str, str] | None, glossary: GlossaryUpload,
                          bindings: dict[str, ObjectBinding] | None,
-                         source_snapshot_id: str) -> int:
+                         source_snapshot_id: str,
+                         counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted measure annotation (E4a T2) as ``llm/proposed`` ``unit`` /
     ``currency`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -1606,11 +1672,11 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="unit", items=units, ref_of=unit_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="currency", items=currencies, ref_of=currency_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = written this run ∪ still an expected target, computed through the SAME `ref_of` the
     # write used (so a ref written this run is never handed to retirement, and a non-target is never
@@ -1660,6 +1726,40 @@ def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: st
         reason_codes=[f"concept_critic_{disposition}", *conflict_codes],
         field_policy_version=FIELD_POLICY_VERSION, resolver_version=RESOLVER_VERSION,
         actor_ref=None, supersedes_event_id=supersedes)
+
+
+#: Task 9c — the label used for "this concept has no identifier namespace" (a non-identifier
+#: concept, an unregistered name, or ``unclassified``). A JSON object key must be a string, and an
+#: explicit label is readable where a missing bucket is ambiguous.
+NO_NAMESPACE = "-"
+
+
+def _namespace_of(concept_name: str | None) -> str:
+    """The join-candidacy axis of a concept name — its identifier NAMESPACE, or ``-``.
+
+    Recorded per run because it is recorded NOWHERE else. ``namespace`` is a pure code-side
+    derivation from the in-code ``CONCEPT_REGISTRY``: no column stores it, so a later registry edit
+    silently rewrites the namespace of every historical verdict and nothing on disk shows that it
+    moved. Two columns are bridge candidates iff their concepts share a namespace, so this is the
+    axis a changed verdict actually moves — and the reason a run producing different features is
+    uninterpretable without it.
+
+    A concept name and a namespace are both controlled-vocabulary CODES from a registry in this
+    repo. Neither is column data, and neither is derived from any."""
+    rec = concept_record(concept_name) if concept_name else None
+    return (rec.namespace or NO_NAMESPACE) if rec is not None else NO_NAMESPACE
+
+
+def namespace_histogram(concepts: dict[str, str]) -> dict[str, int]:
+    """``{namespace: column count}`` over one run's resolved concepts — the join-candidacy shape of
+    the catalog as this run sees it, in counts only. Comparing this run's ``after_critic`` against
+    the previous run's is what separates "the LLM enriched more columns" from "the same columns
+    were re-judged into a different namespace" when a feature set changes."""
+    histogram: dict[str, int] = {}
+    for name in concepts.values():
+        key = _namespace_of(name)
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
 
 
 def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
@@ -1735,8 +1835,21 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
             context=context,
         )
         ref_to_hash[evidence_ref] = h
+    # Task 9c — `verdict_changes` is THE row this run has to leave behind. Task 9b moved the
+    # registry, which moves the critic's replay fingerprint, so this run re-critiques every
+    # identifier column instead of replaying stored verdicts. A REVISED column gets a different
+    # concept and therefore a different NAMESPACE (the join-candidacy axis); a REFUTED one becomes
+    # `unclassified` and loses bridge candidacy entirely. Without the before→after pair per column,
+    # a different set of features coming out of this run is uninterpretable: fresh enrichment and
+    # re-rolled verdicts look exactly the same from the outside.
+    #
+    # CHANGED refs only, and that is complete rather than partial: `accepted` and `abstained` leave
+    # the concept exactly as the classifier produced it, and that value is already durable in
+    # `graph_node.concept` and the column's `concept` `field_evidence`. The counts below say how
+    # many were judged; this map says which ones MOVED, and where from and to. Always present (an
+    # empty map means "nothing moved", an absent key means this code never ran).
     report: dict = {"items": len(items), "accepted": 0, "revised": 0, "refuted": 0,
-                    "abstained": 0, "conflicts": {}}
+                    "abstained": 0, "conflicts": {}, "verdict_changes": {}}
     if not items:
         return report
     # The replay identity of THIS catalog's content: a byte-identical re-upload replays every
@@ -1772,9 +1885,30 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
                 and outcome.resolved_concept is not None):
             report["revised"] += 1
             corrections.append((h, outcome.resolved_concept))
+            after = outcome.resolved_concept
         else:
             report["refuted"] += 1
             corrections.append((h, UNCLASSIFIED))
+            after = UNCLASSIFIED
+        # Recorded HERE, in the same pass that decides it, and only after the eviction writes above
+        # succeeded — so the map can never claim a change the savepoint did not keep.
+        #
+        # `before` is the concept the critic was ASKED about, which is the already-CANONICALIZED
+        # assignment (`_accept_concept` resolves a legacy alias to its successor before anything
+        # sees it — `counterparty_id` arrives here as `customer_id`). That is the right before: it
+        # is the value that would have been stored had the critic not moved it, so the pair reads
+        # as "what this column would have been" → "what it is".
+        #
+        # `conflict_codes` rides here as well as in `conflicts`, deliberately: a reader who has
+        # found the column that moved should not have to join two maps to learn why it moved.
+        before = items[ref].proposed_concept
+        report["verdict_changes"][ref] = {
+            "disposition": outcome.disposition.value,
+            "from": before, "to": after,
+            "from_namespace": _namespace_of(before), "to_namespace": _namespace_of(after),
+            "reason_codes": list(outcome.reason_codes),
+            "conflict_codes": list(outcome.conflict_codes),
+        }
     for h, corrected in corrections:       # in-memory only after every DB write succeeded
         result[h] = corrected
     return report
@@ -2052,7 +2186,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     if enrich_config.mode("concept") == "batch":
         misses = [BatchItem(h, payload_by_hash[h]) for h in miss_hashes]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -2104,6 +2240,10 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
     critic_report: dict = {"failed": True}
     critic_outcomes: dict[str, dict] = {}
+    # Task 9c: the join-candidacy shape BEFORE the critic touches anything. Taken here rather than
+    # reconstructed afterwards because `_apply_concept_critic` mutates `result` in place — once it
+    # returns, the pre-critic namespace picture no longer exists anywhere.
+    namespaces_before = namespace_histogram(result)
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(
@@ -2119,12 +2259,32 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     if stats is not None:
         stats["concept_critic"] = critic_report
         stats["concept_critic_outcomes"] = critic_outcomes
+        # Task 9c — the two run-level facts nothing else records.
+        #
+        # `namespaces`: counts per identifier namespace before and after acceptance. The per-column
+        # before→after pairs live on the critic stage (`verdict_changes`); this is the aggregate
+        # the next run can be diffed against, and it covers columns the critic never looked at
+        # (only the identifier GROUPS are criticised) as well as the ones it did.
+        #
+        # `vocab_fingerprint`: WHICH registry generation produced these verdicts. It is already
+        # folded into the classifier cache key and written as `producer_configuration_hash` on
+        # every concept `field_evidence` row, but never as a stage-level fact — so a run whose
+        # evidence writer was gated out (a technical upload) left no record of the vocabulary it
+        # classified under. Recording it here means the answer to "did the concepts move because
+        # the registry moved?" is one query, not an archaeology exercise.
+        stats["namespaces"] = {"before_critic": namespaces_before,
+                               "after_critic": namespace_histogram(result)}
+        stats["vocab_fingerprint"] = _vocab_fingerprint()
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
     # on the very next upload instead of leaving graph_node.concept populated with no supporting
     # field_evidence forever. `_write_concept_evidence`'s input_hash reuse check makes this a safe
     # no-op when the evidence already exists and is unchanged — no duplicate/stale rows.
+    # Task 9c: the evidence account rides on `stats` whether or not the writer runs. The gate below
+    # is the reason a TECHNICAL upload classifies every column and stores nothing — a divergence
+    # that `resolved`/`expected` cannot show, because both count the DRAFT.
+    ev_counts: dict[str, int] = {} if stats is None else stats.setdefault("evidence_counts", {})
     if glossary is not None and source_snapshot_id is not None:
         # Values come from the corrected ``result`` (never the pre-critic ``resolved``): a REVISED
         # column's evidence must carry the revision, a REFUTED one is ``unclassified`` and writes
@@ -2133,9 +2293,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
         failures = _write_concept_evidence(
             conn, resolved=evidence_targets, by_hash=by_hash, meta_by_hash=meta_by_hash,
             rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id,
-            cache_hit_hashes=hit_hashes)
+            cache_hit_hashes=hit_hashes, counts=ev_counts)
         if stats is not None:
             stats["evidence_write_failures"] = failures
+    elif stats is not None:
+        stats["evidence_writer"] = ("not_run:no_glossary" if glossary is None
+                                    else "not_run:no_source_snapshot")
     return result
 
 
@@ -2275,7 +2438,8 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     if not misses:
         return result
     items = [BatchItem(h, meta_by_hash[h]) for h in misses]
-    batch_report: dict = {}
+    # Task 9c: see the note at the other run_batched sites — the report rides on `stats`.
+    batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
     resolved = run_batched(
         conn, client, short="summary", task=_SUMMARY_TASK,
         prompt_id="overlay_summary_batch_v1", schema_id="overlay_summary_batch",
@@ -2336,7 +2500,9 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=blank[h], rec=rec_of(blank[h])))
                  for h in misses]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="definition", task=_DEF_TASK,
             prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
@@ -2456,7 +2622,9 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                                 "column_roster": sorted(roster_by_table.get(t, []),
                                                         key=lambda e: e["column"])})
                   for t, cols in by_table.items() if hash_of_table[t] not in cached]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v2",
             schema_id="overlay_domain_batch", prompt_version=2, schema_version=2,
@@ -2573,7 +2741,9 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=by_hash[h], rec=rec_of(by_hash[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="synonyms", task=_SYN_TASK,
             prompt_id="overlay_synonyms_batch_v1", schema_id="overlay_synonyms_batch",
@@ -2668,7 +2838,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=blank[h], rec=rec_of(blank[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="unit", task=_UNIT_TASK, prompt_id="overlay_unit_batch_v1",
             schema_id="overlay_unit_batch", shared_metadata={}, items=items, out_key="unit",

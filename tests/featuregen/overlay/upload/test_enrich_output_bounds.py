@@ -121,12 +121,14 @@ def test_a_definition_may_now_be_written_at_the_full_definition_length() -> None
     at_cap = at_cap[:llm.MAX_DEFINITION_LEN]
     value, reason = accept(at_cap)
     assert reason == "valid" and value == at_cap
-    # …and it is still a BOUND, not an absence of one.
+    # …and it is still a BOUND, not an absence of one. (Task 9c narrowed the REASON from the
+    # catch-all `invalid_value` to the rule that fired; the refusal itself is unchanged, and the
+    # named rule is what proves the LENGTH bound is what refused it rather than a shape guard.)
     over, reason_over = accept("x" * (llm.MAX_DEFINITION_LEN + 1))
-    assert over is None and reason_over == "invalid_value"
+    assert over is None and reason_over == "over_length"
     # The old bound would have refused a value the new one accepts — the regression this test exists
     # to catch is someone restoring it.
-    assert enrich._accept_bounded(500)(at_cap) == (None, "invalid_value")
+    assert enrich._accept_bounded(500)(at_cap) == (None, "over_length")
 
 
 def test_the_summary_bound_stays_below_the_definition_bound_and_at_its_egress_cap() -> None:
@@ -235,6 +237,10 @@ def test_a_LIST_SHAPED_answer_is_still_refused() -> None:
     `startswith("[")` catches the stringified `['a','b']` form INDEPENDENTLY. What the newline ban
     uniquely caught is a multi-LINE enumeration, and that is exactly what `_is_enumeration` now
     catches on its own.
+
+    Task 9c: the reason codes below are what make that claim TESTABLE. Under the old catch-all
+    `invalid_value` both forms reported the same string, so this test could assert that each was
+    refused but never that they were refused by DIFFERENT guards — which is the whole claim.
     """
     accept = enrich._accept_bounded(llm.MAX_DEFINITION_LEN)
     for listy in ("- the account number\n- the branch code\n- the currency",
@@ -242,9 +248,9 @@ def test_a_LIST_SHAPED_answer_is_still_refused() -> None:
                   "1) first thing\n2) second thing",
                   "(a) first thing\n(b) second thing",
                   "* alpha\n* beta\n* gamma"):
-        assert accept(listy) == (None, "invalid_value"), listy
+        assert accept(listy) == (None, "enumeration"), listy
     # The stringified-list form is refused by its OWN guard, with no help from the newline rule.
-    assert accept("['alpha', 'beta']") == (None, "invalid_value")
+    assert accept("['alpha', 'beta']") == (None, "list_prefix")
     assert enrich._is_enumeration("['alpha', 'beta']") is False   # …and not by this one
 
     # ONE marker-led line is prose, not a list: a sentence may legitimately open with a dash or a
@@ -270,12 +276,15 @@ def test_the_newline_relaxation_did_NOT_reach_the_comma_parsed_gates() -> None:
     """
     listy = "account number\nacct num\nacc #"
 
+    # Task 9c: `multiline` (not the old catch-all `invalid_value`) is what proves the SINGLE-LINE
+    # rule is doing the refusing here, rather than the length or list-shape guard happening to
+    # catch these particular strings — which is precisely what this test claims.
     syn = enrich._accept_single_line(enrich._MAX_SYNONYMS_LEN)
-    assert syn(listy) == (None, "invalid_value")
+    assert syn(listy) == (None, "multiline")
     assert syn("account number, acct num, acc #")[1] == "valid"     # the shape the prompt asks for
 
     dom = enrich._accept_domain(64)
-    assert dom("Compliance\nRetail Banking") == (None, "invalid_value")
+    assert dom("Compliance\nRetail Banking") == (None, "multiline")
     assert dom("Compliance")[1] == "valid"
 
     # …while the DEFINITION gate, the one the relaxation was for, still takes it.

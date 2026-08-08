@@ -80,6 +80,11 @@ class BatchItemOutcome:
     status: str
     value: str | None
     reason_codes: tuple[str, ...]
+    #: Task 9c — the LENGTH of the raw value the acceptor judged, never the value. Present on the
+    #: dispositions where a length is the diagnosis (``invalid_value``/``blank``); ``None`` on
+    #: ``missing`` (nothing came back to measure) and on the egress/valid paths. Defaulted so every
+    #: existing 4-positional construction (``enrich_llm``'s egress outcomes) is unchanged.
+    value_len: int | None = None
 
 
 @dataclass(frozen=True)
@@ -117,13 +122,16 @@ def validate_batch_results(items: list[BatchItem], results: list[dict], out_key:
             continue
         seen.add(ref)
         if not raw:
-            outcomes.append(BatchItemOutcome(ref, BLANK, None, (BLANK,)))
+            outcomes.append(BatchItemOutcome(ref, BLANK, None, (BLANK,), 0))
             continue
         value, reason = accept(raw, ref) if ref_aware else accept(raw)
         if value is None:
-            outcomes.append(BatchItemOutcome(ref, INVALID, None, (reason,)))
+            # Task 9c: the LENGTH of what the acceptor refused rides with the reason. A definition
+            # discarded WHOLE for one newline and one discarded for being 40_000 chars are the same
+            # `invalid_value` from outside; the length is what tells them apart without a re-run.
+            outcomes.append(BatchItemOutcome(ref, INVALID, None, (reason,), len(raw)))
         else:
-            outcomes.append(BatchItemOutcome(ref, VALID, value, (VALID,)))
+            outcomes.append(BatchItemOutcome(ref, VALID, value, (VALID,), len(raw)))
     for ref in expected - seen:
         outcomes.append(BatchItemOutcome(ref, MISSING, None, (MISSING,)))
     return outcomes
@@ -215,6 +223,26 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
     the guard fully inert, preserving today's behavior byte-for-byte; the enrichment entry points
     pass ``enrich_config.stage_deadline_s()`` so production has a concrete ceiling.
 
+    Task 9c — what ``report`` carries when one is supplied, all counts/codes and never a value:
+
+    * ``chunks_planned`` / ``chunks_issued`` / ``provider_calls`` / ``fallback_calls`` — the
+      PHYSICAL cost, which was previously in-memory counters only and never persisted.
+    * ``bounds`` (``{code: count}``) — EVERY time a bound withheld work, and which one:
+      ``call_ceiling`` | ``wallclock_budget`` | ``stage_deadline`` | ``fallback_cap`` |
+      ``fallback_schema_unregistered``. A dict, not a scalar, because a per-item ``fallback_cap``
+      (a few leftovers not individually retried) and a ``call_ceiling`` (whole chunks never sent)
+      have completely different severities and a run can hit both.
+    * ``stopped_by`` — the FIRST code in ``bounds``, or ``exception`` when the ladder raised, or
+      ``unattributed`` when items went undispatched and no guard claimed it. Read ``bounds`` when
+      ``stopped_by`` looks benign; a scalar alone can mask the worse of two bounds.
+    * ``outcomes`` (``{status: count}``) and ``rejects`` (``{reason code: count}``) — these count
+      REJECTION EVENTS, not distinct items. The ladder re-accounts a chunk it retries or splits, so
+      an item rejected twice counts twice and these can exceed the stage's item count. That is the
+      honest physical reading; ``detail["unresolved"]`` is the per-ITEM one.
+
+    The account is written AS IT HAPPENS and finalized in a ``finally``, so a ladder that raises
+    still leaves the caller a truthful account rather than a happy-path zero.
+
     C5-T5 — dispatch attribution: with ``ingestion_run_id`` set, every PHYSICAL call this ladder
     issues (each chunk, retry, split, and single fallback) carries a ``DispatchAuditContext`` built
     for exactly the items IN that call — ``dispatch_stage`` (falling back to ``task``) as the stage,
@@ -251,14 +279,91 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             ingestion_run_id=ingestion_run_id, stage=dispatch_stage or task,
             subjects=tuple(subs[it.ref] for it in call_items if it.ref in subs))
 
+    # Task 9c — the ledger reading at ENTRY, so `provider_calls` below reports what THIS ladder
+    # spent even when the caller handed it a shared ledger another stage had already charged.
+    calls_at_entry = ledger.calls
+
+    def _bound_hit() -> str | None:
+        """WHICH bound is currently blocking, as a closed code — the diagnostic `over_budget`'s
+        bare bool threw away. `over_budget()` conflated the call ceiling with the ladder's
+        wall-clock budget, and the stage deadline (checked separately, below) was a third. A run
+        that reports `truncated` is uninterpretable without knowing which of the three did it: a
+        too-low call ceiling does not slow enrichment, it silently STOPS enriching columns."""
+        if ledger.exhausted():
+            return "call_ceiling"
+        if (time.monotonic() - started) * 1000 >= b.wallclock_budget_ms:
+            return "wallclock_budget"
+        return None
+
+    def _note_stop(code: str) -> None:
+        """Record a bound that actually withheld work. Written into the caller's `report` AS IT
+        HAPPENS, never at the end: `run_batched` can raise (a provider fault escaping the seam),
+        and the caller reads this same dict from its `except` handler — an account only written on
+        the happy path would be absent from exactly the runs that need explaining.
+
+        EVERY hit is counted in `bounds`, and only the first also sets the `stopped_by` headline.
+        Recording only the first would let a benign per-item `fallback_cap` — which fires while
+        chunks are still being issued normally — permanently mask a `call_ceiling` that later
+        stopped whole chunks from going at all."""
+        if report is None:
+            return
+        counts: dict[str, int] = report.setdefault("bounds", {})
+        counts[code] = counts.get(code, 0) + 1
+        report.setdefault("stopped_by", code)
+
     def over_budget() -> bool:
-        return (ledger.exhausted()
-                or (time.monotonic() - started) * 1000 >= b.wallclock_budget_ms)
+        return _bound_hit() is not None
+
+    def _account(outcomes) -> None:
+        """Task 9c — the per-item DRAFTING account, aggregated into the caller's report and, for a
+        rejection, emitted as one greppable line.
+
+        `_enrichment_outcome` can only say how many items went unresolved; it cannot say WHY, and
+        the ways an item can fail (`missing` / `blank` / `duplicate` / `invalid_value` /
+        `egress_rejected`) have completely different causes. `rejects` breaks the acceptor's own
+        reason code out further — a definition discarded whole for one newline reads identically to
+        a provider blip without it. NOTHING here is a value: a ref, a closed status/reason code,
+        and a LENGTH.
+
+        These are EVENT counts, not distinct-item counts: the ladder re-accounts a chunk it retries
+        or splits, so an item rejected on two attempts contributes two. Deliberate — the physical
+        question ("how often did the provider hand back an enumeration?") is the one the counts can
+        answer honestly as-they-happen; the per-item question is answered by `detail["unresolved"]`,
+        which is computed from the returned resolution map."""
+        if report is None:
+            return
+        for o in outcomes:
+            if o.status == VALID:
+                continue
+            # The keys are created LAZILY, on the first rejection. An empty `outcomes: {}` on a
+            # clean run is not information — and it costs the reader the one cheap signal worth
+            # having, that an ABSENT key means the thing never happened at all.
+            statuses: dict[str, int] = report.setdefault("outcomes", {})
+            rejects: dict[str, int] = report.setdefault("rejects", {})
+            statuses[o.status] = statuses.get(o.status, 0) + 1
+            for code in o.reason_codes:
+                rejects[code] = rejects.get(code, 0) + 1
+            # One line per rejected item, machine-parseable (`key=value`, no prose in the fields):
+            # the stage detail can only carry counts, and "which column, which rule, how long" is
+            # the question a re-run would otherwise be needed to answer.
+            #
+            # An EXTRA ref is the ONE field here that is not ours: it is a ref the model returned
+            # that we never asked about, so it is unvalidated model output and could carry anything
+            # — including content. Every other status keys on a ref THIS code minted (a content
+            # hash or a table name). Suppressed rather than logged; the count in `outcomes` still
+            # says a hallucinated ref came back, which is the whole diagnostic value of it.
+            logger.info("enrich_reject stage=%s ref=%s status=%s reason=%s len=%s",
+                        dispatch_stage or short,
+                        "<unrecognized>" if o.status == EXTRA else o.ref, o.status,
+                        "|".join(o.reason_codes) or "-",
+                        "-" if o.value_len is None else o.value_len)
 
     def process(chunk: list[BatchItem], attempt: int) -> None:
         nonlocal fallback_used
         if not chunk or over_budget():
-            counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted") if chunk else None
+            if chunk:
+                counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted")
+                _note_stop(_bound_hit() or "call_ceiling")
             return
         dispatched.update(it.ref for it in chunk)   # this chunk is now being sent to the provider
         # RESERVE this chunk's call BEFORE issuing it (the guard above already cleared it), so a
@@ -276,6 +381,7 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                                  dispatch_audit=_ctx_for(chunk))
         ledger.settle(reserved=1, actual=res.provider_calls)
         counters.incr(f"overlay.enrich.{short}.batch.calls")
+        _account(res.outcomes)
         for o in res.outcomes:
             if o.status in (VALID,) and o.value is not None:
                 resolved[o.ref] = o.value
@@ -316,6 +422,12 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         for it in unresolved:
             if schema_unregistered or fallback_used >= b.max_single_fallback or over_budget():
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
+                # The per-item fallback has a FOURTH bound the chunk loop does not — its own cap.
+                # Naming it separately is the point: `left_uncached` under `fallback_cap` is a
+                # config ceiling, under `call_ceiling` it is the run's provider budget.
+                _note_stop("fallback_schema_unregistered" if schema_unregistered
+                           else ("fallback_cap" if fallback_used >= b.max_single_fallback
+                                 else (_bound_hit() or "call_ceiling")))
                 continue
             fallback_used += 1
             ledger.charge()          # one per-item call, reserved before it is issued (as before)
@@ -345,22 +457,55 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 resolved[it.ref] = value
 
     deadline_start = now()
-    for chunk in chunk_items(items, max_items=max_items, max_input_tokens=max_tokens):
-        # MF-4 — stage deadline: stop ISSUING new chunks once the ceiling is crossed. Facts already
-        # asserted and the rest of ingestion are unaffected — the run returns a partial result and the
-        # source advisory lock is released rather than held by a hung provider call.
-        if deadline_s is not None and now() - deadline_start >= deadline_s:
-            counters.incr(f"overlay.enrich.{short}.batch.timed_out")
-            if report is not None:
-                report["timed_out"] = True
-            break
-        process(chunk, 0)
-    # Honest truncation signal (#22): items the budget/deadline cutoff skipped WITHOUT dispatch — the
-    # complement of everything this ladder actually sent. The caller threads it into the stage detail
-    # so a truncated run is labeled `truncated`, not `items_failed`. (The in-memory `budget_exhausted`
-    # counter is metrics-only and never persisted; present only when non-zero.)
+    planned = chunk_items(items, max_items=max_items, max_input_tokens=max_tokens)
     if report is not None:
-        not_attempted = len({it.ref for it in items} - dispatched)
-        if not_attempted:
-            report["not_attempted"] = not_attempted
+        # Written BEFORE the loop so a mid-ladder raise still leaves the plan on the record; the
+        # item-count/token bound never STOPS the ladder, it only decides how many chunks the work
+        # was split into, so `chunks_planned` vs `chunks_issued` is how it shows up.
+        report["chunks_planned"] = len(planned)
+        report["chunks_issued"] = 0
+        report["provider_calls"] = 0
+    try:
+        for chunk in planned:
+            # MF-4 — stage deadline: stop ISSUING new chunks once the ceiling is crossed. Facts
+            # already asserted and the rest of ingestion are unaffected — the run returns a partial
+            # result and the source advisory lock is released rather than held by a hung call.
+            if deadline_s is not None and now() - deadline_start >= deadline_s:
+                counters.incr(f"overlay.enrich.{short}.batch.timed_out")
+                if report is not None:
+                    report["timed_out"] = True
+                _note_stop("stage_deadline")
+                break
+            process(chunk, 0)
+            if report is not None:
+                # Per chunk, not once at the end: an exception out of `process` must not erase the
+                # account of the chunks that already ran.
+                report["chunks_issued"] += 1
+    except BaseException:
+        # A fault ESCAPING the seam is not a bound — naming it `unattributed` below would read as
+        # "items were skipped and we don't know why" when in fact we do. The caller still gets the
+        # physical account, settled by the `finally`.
+        if report is not None:
+            report.setdefault("stopped_by", "exception")
+        raise
+    finally:
+        # Honest truncation signal (#22): items the budget/deadline cutoff skipped WITHOUT dispatch
+        # — the complement of everything this ladder actually sent. The caller threads it into the
+        # stage detail so a truncated run is labeled `truncated`, not `items_failed`. (The
+        # in-memory `budget_exhausted` counter is metrics-only, never persisted.)
+        #
+        # In a `finally` because the failure path is the one that needs explaining: a raise out of
+        # the first chunk previously left `provider_calls: 0` on the record though a call had
+        # already been charged — a false zero, which is worse than an absent field.
+        if report is not None:
+            not_attempted = len({it.ref for it in items} - dispatched)
+            if not_attempted:
+                report["not_attempted"] = not_attempted
+            report["provider_calls"] = ledger.calls - calls_at_entry
+            report["fallback_calls"] = fallback_used
+            if not_attempted:
+                # Items were skipped without dispatch and no guard claimed it. That is a real hole
+                # in the account, not a clean run — say so rather than leaving the field absent,
+                # which reads as "nothing stopped it".
+                report.setdefault("stopped_by", "unattributed")
     return resolved

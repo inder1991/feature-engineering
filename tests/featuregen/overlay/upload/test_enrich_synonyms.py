@@ -115,7 +115,9 @@ def test_the_instruction_still_asks_for_ONE_COMMA_SEPARATED_LINE() -> None:
     # the instruction now asks for.
     accept = enrich._accept_single_line(enrich._MAX_SYNONYMS_LEN)
     assert accept(_TWENTY_REAL_TERMS)[1] == "valid"
-    assert accept(_TWENTY_REAL_TERMS.replace(", ", "\n")) == (None, "invalid_value")
+    # `multiline` (Task 9c) rather than the old catch-all: the point of the assertion is that the
+    # per-LINE shape is what the gate refuses, and only a named rule can say so.
+    assert accept(_TWENTY_REAL_TERMS.replace(", ", "\n")) == (None, "multiline")
 
 
 # ── the instruction may only cite evidence the ITEM actually sends ───────────────────────────────
