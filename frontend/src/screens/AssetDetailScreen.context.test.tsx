@@ -778,6 +778,33 @@ it('does not name an author for an axis that resolved to nothing', async () => {
   expect(within(role).queryByText('source attested')).toBeNull()
 })
 
+it('keeps the table’s search projection off the page', async () => {
+  // `table_context` carries the table node's `semantic_terms` beside the two axes, and it is the
+  // SPACE-joined search blob — term name, every glossary synonym, BIAN, FIBO and the process path
+  // concatenated. It arrives with no evidence rows, so `display_label()` returns "system": the
+  // platform named as author of text the source glossary wrote. It is index material, and this
+  // section is not where index material goes.
+  await openContext(contextFixture({
+    table_context: [
+      ...TABLE_SHAPE,
+      {
+        field: 'semantic_terms',
+        value: 'Trade Amount notional consideration Payment Order fibo-fnd:MonetaryAmount',
+        proposed_value: null, resolution_status: 'current', operational_influence: null,
+        authority_label: 'system', producer: null, strength: null, lifecycle: null,
+        evidence_ids: [],
+      },
+    ],
+  }))
+  const section = screen.getByTestId('context-table-shape')
+  expect(section.textContent).not.toMatch(/fibo-fnd:MonetaryAmount/)
+  expect(section.textContent).not.toMatch(/notional consideration/)
+  expect(within(section).queryByText('system')).toBeNull()
+  expect(screen.queryByTestId('context-value-semantic_terms')).toBeNull()
+  // The axes beside it still render — the exclusion is one field, not the section.
+  expect(screen.getByTestId('context-table-role')).toHaveTextContent('dimension')
+})
+
 it('shows the table prose that only the table node carries', async () => {
   await openContext(contextFixture({
     table_context: [
@@ -813,6 +840,30 @@ it('renders the AI’s answer for a field it was never allowed to resolve', asyn
   // Distinguishable from a resolved value at the point it is read.
   expect(within(row).getByText('AI proposed · unconfirmed')).toBeInTheDocument()
   expect(row.textContent).not.toMatch(/blocked|invalid|failed|error/i)
+})
+
+it('names the model as the author of the model’s own proposal, not the strongest record', async () => {
+  // `proposed_value` is ALWAYS the LLM's row (`semantic_context` keys the lookup on
+  // `EvidenceProducer.LLM`), but `authority_label` is the STRONGEST active entry — a different
+  // record whenever a field resolved to nothing and two producers proposed at equal strength, where
+  // the lead is settled by `evidence_id` order. Reading the chip off `authority_label` displayed the
+  // model's value under somebody else's name.
+  await openContext(contextFixture({
+    resolved_meaning: [{
+      field: 'unit', value: null, proposed_value: 'dollars',
+      resolution_status: 'unresolved_pending_review', operational_influence: 'hint',
+      // The taxonomy row won the lead on evidence_id; the VALUE on screen is still the model's.
+      authority_label: 'source_proposed', producer: 'taxonomy', strength: 'proposed',
+      lifecycle: 'active', evidence_ids: ['ev-a', 'ev-b'],
+    }],
+  }))
+  const row = screen.getByTestId('context-value-unit')
+  expect(within(row).getByText('dollars')).toBeInTheDocument()
+  expect(within(row).getByText('AI proposed · unconfirmed')).toBeInTheDocument()
+  expect(within(row).queryByText(/source proposed/)).toBeNull()
+  // The strongest record is not hidden — it is named as what it is, in the tooltip.
+  expect(within(row).getByTitle(/strongest active record taxonomy\/proposed\/active/))
+    .toBeInTheDocument()
 })
 
 it('never lets a stale proposal displace a value the platform resolved', async () => {

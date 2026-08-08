@@ -439,7 +439,7 @@ it('omits the sub-domain row entirely when the server does not send the field', 
 
 // ── the AI's search terms ────────────────────────────────────────────────────────────────────────
 
-it('shows the AI-drafted search terms as separate terms, each with its author', async () => {
+it('shows the AI-proposed search terms as separate terms, each with its author', async () => {
   await renderDossier(detail(d => {
     d.evidence!.proposals_by_field.semantic_terms = {
       active: [{
@@ -475,6 +475,27 @@ it('does not present a retired draft as a current search term', async () => {
       active: [],
       stale: [{
         evidence_id: 'ev-old', producer: 'llm', strength: 'proposed',
+        proposed_value: 'former alias', confidence_band: null,
+      }],
+    }
+  }))
+  const section = screen.getByTestId('search-terms')
+  expect(within(section).queryByText('former alias')).toBeNull()
+  expect(within(section).getByText(/no longer active/i)).toBeInTheDocument()
+})
+
+it('counts a draft retired into any lifecycle, not only into stale', async () => {
+  // `stale` is the only bucket reachable for this field TODAY (`_reconcile_llm_field_evidence` →
+  // `stale_all_llm_field_evidence`; `superseded` is human-producer-scoped; `rejected` needs
+  // `apply_field_decision`, which 400s for `semantic_terms` — it has no `field_policies` entry).
+  // But `_evidence_section` creates a bucket for whatever lifecycle a row carries, so reading one
+  // name would turn a future lifecycle into a clean "nothing was ever drafted" claim over drafts
+  // that do exist.
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [],
+      quarantined: [{
+        evidence_id: 'ev-q', producer: 'llm', strength: 'proposed',
         proposed_value: 'former alias', confidence_band: null,
       }],
     }

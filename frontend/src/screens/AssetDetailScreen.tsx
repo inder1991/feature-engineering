@@ -710,7 +710,16 @@ function SearchTermsSection({ detail }: { detail: AssetDetail }) {
   // A RETIRED draft is never shown as a current term (re-enrichment retires the producer's prior
   // rows), but "there were none" and "the ones there were are no longer active" are different
   // answers and the second is the one that tells a reviewer where the terms went.
-  const retired = (buckets?.stale ?? []).length > 0
+  //
+  // ANY non-active bucket counts, not just `stale`. Today `stale` is the only one reachable for
+  // this field — `_reconcile_llm_field_evidence` → `stale_all_llm_field_evidence` writes it,
+  // `superseded` is scoped to human-producer rows, and `rejected` needs `apply_field_decision`,
+  // which 400s for `semantic_terms` because it has no `field_policies` entry. But `_evidence_section`
+  // buckets by whatever lifecycle the row carries and creates a bucket for any it does not know, so
+  // reading one name would turn a future lifecycle into a clean "nothing was ever drafted" claim
+  // over drafts that exist. Counting the complement of `active` cannot go stale that way.
+  const retired = Object.entries(buckets ?? {}).some(
+    ([lifecycle, rows]) => lifecycle !== 'active' && (rows ?? []).length > 0)
   return (
     <section className="adg-section" data-testid="search-terms">
       <h3 className="micro-label">Search terms</h3>
@@ -1174,6 +1183,22 @@ function contextProposalOnly(value: ContextValue): boolean {
     && value.proposed_value != null && value.proposed_value !== ''
 }
 
+// THE AUTHOR OF A `proposed_value` IS ALWAYS THE MODEL, and it is NOT `authority_label`.
+//
+// `semantic_context` fills `proposed_value` from a lookup keyed on `EvidenceProducer.LLM` — it is
+// the LLM's row or it is absent. `authority_label` is `display_label()`, which reads the STRONGEST
+// active entry (`_bulk_active_evidence` sorts strongest-first, ties broken by `evidence_id`). Those
+// are different records whenever a field resolved to nothing and carries proposals from more than
+// one producer: the row would then display the model's value under "rulebook proposed" — or, with a
+// human/confirmed row that never projected a display value, under "human confirmed · unconfirmed".
+// The suffix stops it reading as confirmed, but the value shown and the party named would be
+// different, which is its own lie.
+//
+// So the proposal branch names the model, from the same label map every other chip uses. If the
+// backend ever fills `proposed_value` from another producer, this becomes wrong — which is exactly
+// why the contract is restated on `ContextValue.proposed_value` in `api.ts`.
+const PROPOSAL_AUTHOR_LABEL = 'llm_proposed'
+
 function ContextValueRow({
   value,
   testId,
@@ -1196,13 +1221,18 @@ function ContextValueRow({
       <span
         className={`badge${proposalOnly ? ' gj-proposed' : ''}`}
         title={
-          value.producer
-            ? `${value.producer}/${value.strength}/${value.lifecycle}`
-            : 'no evidence record'
+          proposalOnly
+            // The lead triple describes the STRONGEST record, which is not the one whose value is
+            // on screen. It stays visible — a reader tracing authority needs it — but it is named
+            // as what it is rather than presented as this value's author.
+            ? `the model's own proposal; strongest active record ${value.producer ?? 'none'}/${value.strength ?? '—'}/${value.lifecycle ?? '—'}`
+            : value.producer
+              ? `${value.producer}/${value.strength}/${value.lifecycle}`
+              : 'no evidence record'
         }
       >
         {proposalOnly
-          ? `${authorityWords(value.authority_label)} · unconfirmed`
+          ? `${authorityWords(PROPOSAL_AUTHOR_LABEL)} · unconfirmed`
           : authorityWords(value.authority_label)}
       </span>
       {value.operational_influence === 'governed' && (
@@ -1227,12 +1257,21 @@ const TABLE_SHAPE_AXES: readonly [string, string][] = [
 // An axis nobody has established is SAID, not left blank — a blank cell reads as "not displayed"
 // and a reader then assumes the value exists somewhere. It is a state, never a fault: nothing here
 // implies a review would produce one.
+// `table_context` carries the table node's `semantic_terms` too (`semantic_context` reads it beside
+// the two axes, and `ingest` runs the same projection over the TABLE ref). That column is the
+// space-joined search blob this file refuses to render as terms for a column — the term name, every
+// glossary synonym and the BIAN/FIBO/process paths concatenated — and here it would arrive with no
+// evidence rows at all, so `display_label()` falls back to "system": the platform named as author of
+// text the source glossary wrote. It is excluded rather than rendered.
+const TABLE_SEARCH_PROJECTION_FIELDS = new Set(['semantic_terms'])
+
 function TableContextSection({ values }: { values: ContextValue[] }) {
   const byField = new Map(values.map(v => [v.field, v]))
   const shapeFields = new Set(TABLE_SHAPE_AXES.map(([field]) => field))
   // Whatever else the table node carries (its own definition, domain, AI summary) belongs here too
-  // — it is the table's prose and it has no other home on this page.
-  const prose = values.filter(v => !shapeFields.has(v.field))
+  // — it is the table's prose and it has no other home on this page. Index material does not.
+  const prose = values.filter(
+    v => !shapeFields.has(v.field) && !TABLE_SEARCH_PROJECTION_FIELDS.has(v.field))
   return (
     <section className="adg-section" data-testid="context-table-shape">
       <h3 className="micro-label">The table this column belongs to</h3>
