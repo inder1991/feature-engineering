@@ -762,6 +762,7 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                                        ingestion_run_id=ingestion_run_id,
                                        catalog_source=catalog_source,
                                        schema_by_table=schema_by_table, stats=stats,
+                                       phase="narrow",
                                        catalog_context_available=catalog_context_available,
                                        critic=critic))
     if wide:
@@ -837,6 +838,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                    catalog_source: str | None = None,
                    schema_by_table: dict[str, str] | None = None,
                    stats: dict | None = None,
+                   phase: str = "synthesis",
                    catalog_context_available: bool = False,
                    critic=None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
@@ -877,7 +879,13 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         source_context_by_table={ref: True for ref in source_definitions},
         catalog_context_available=catalog_context_available,
         narrative_refs_by_table=narrative_refs, critic=budgeted_critic)
-    batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+    # Task 9c: the ladder's account rides ON `stats`, keyed by PHASE — Pass B runs up to three
+    # ladders per ingest (narrow synthesis, wide phase-1 summary, wide phase-2 synthesis) and each
+    # has its own chunking, its own bounds and its own physical cost. A single flat slot would have
+    # the last ladder overwrite the others' `provider_calls`/`chunks_planned`. Aliased rather than
+    # copied after the call, so a ladder that RAISES still leaves its account behind.
+    batch_report: dict = ({} if stats is None
+                          else stats.setdefault("batch_by_phase", {}).setdefault(phase, {}))
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id=_SYNTH_PROMPT_ID, schema_id="overlay_table_synth_batch",
@@ -999,6 +1007,13 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
         dispatch_subjects=_dispatch_subjects_for(chunk_items, catalog_source=catalog_source,
                                                  schema_by_table=schema_by_table),
+        # Task 9c: this ladder had NO report at all, so its bounds and its physical cost were
+        # unmeasured — on a wide catalog it is the ladder that issues the most calls. Its
+        # `not_attempted` is deliberately still not folded into Pass B's (see below): that count is
+        # table-granular and these refs are CHUNKS. The account is kept under its own phase key so
+        # the two are never added together.
+        report=({} if stats is None
+                else stats.setdefault("batch_by_phase", {}).setdefault("wide_phase1", {})),
     )
 
     phase2_items: list[BatchItem] = []
@@ -1038,7 +1053,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
                           dispositions=dispositions, ingestion_run_id=ingestion_run_id,
                           catalog_source=catalog_source, schema_by_table=schema_by_table,
-                          stats=stats, catalog_context_available=catalog_context_available,
+                          stats=stats, phase="wide_phase2",
+                          catalog_context_available=catalog_context_available,
                           critic=critic)
 
 

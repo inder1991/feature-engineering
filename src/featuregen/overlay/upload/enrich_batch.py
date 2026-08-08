@@ -476,17 +476,31 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                     report["timed_out"] = True
                 _note_stop("stage_deadline")
                 break
+            sent_before = len(dispatched)
             process(chunk, 0)
-            if report is not None:
-                # Per chunk, not once at the end: an exception out of `process` must not erase the
-                # account of the chunks that already ran.
+            if report is not None and len(dispatched) > sent_before:
+                # Counted from the DISPATCH, not from `process` returning. `process` returns
+                # normally when its guard refused to dispatch at all (a bound was already hit), so
+                # incrementing on return reported every planned chunk as issued on exactly the run
+                # — a `call_ceiling` cutoff — this field exists to explain. `dispatched` growing is
+                # the fact that the chunk's items actually went to the provider.
+                #
+                # Per chunk, not once at the end: an exception out of a LATER `process` must not
+                # erase the account of the chunks that already ran.
                 report["chunks_issued"] += 1
     except BaseException:
         # A fault ESCAPING the seam is not a bound — naming it `unattributed` below would read as
         # "items were skipped and we don't know why" when in fact we do. The caller still gets the
         # physical account, settled by the `finally`.
+        #
+        # The headline is OVERWRITTEN, not `setdefault`: a run that hit a benign `fallback_cap` and
+        # then died would otherwise report `fallback_cap` with nothing anywhere saying it raised.
+        # What stopped this ladder was the exception; the earlier bound is not lost — every bound
+        # hit is still counted in `bounds`, which is now where the full picture lives.
         if report is not None:
-            report.setdefault("stopped_by", "exception")
+            bounds: dict[str, int] = report.setdefault("bounds", {})
+            bounds["exception"] = bounds.get("exception", 0) + 1
+            report["stopped_by"] = "exception"
         raise
     finally:
         # Honest truncation signal (#22): items the budget/deadline cutoff skipped WITHOUT dispatch

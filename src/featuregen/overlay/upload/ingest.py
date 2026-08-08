@@ -305,6 +305,20 @@ def _batch_detail(batch: dict | None) -> dict:
     return {k: batch[k] for k in _BATCH_DETAIL_KEYS if k in batch}
 
 
+def _passb_batch_detail(stats: dict | None) -> dict:
+    """Pass B's physical account, projected per PHASE.
+
+    Pass B runs up to three ladders per ingest — narrow synthesis, wide phase-1 summary, wide
+    phase-2 synthesis — each with its own chunking, bounds and cost. They are reported side by side
+    rather than summed: "which bound stopped it" has a different answer per phase, and adding a
+    chunk-granular phase-1 count to a table-granular phase-2 one would produce a number that means
+    nothing. A phase absent from the map never ran (a narrow-only catalog has no wide phases)."""
+    by_phase = (stats or {}).get("batch_by_phase") or {}
+    projected = {phase: account for phase, report in by_phase.items()
+                 if (account := _batch_detail(report))}
+    return {"batch": projected} if projected else {}
+
+
 def _evidence_detail(counts: dict | None, writer: str | None,
                      rolled_back: bool = False) -> dict:
     """The PERSISTENCE half of a stage's account, as ``detail["evidence"]``.
@@ -2927,13 +2941,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             state, reason, detail = _enrichment_outcome(
                 syntheses, len(items), not_attempted=passb_stats.get("not_attempted", 0))
             detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
+            detail.update(_passb_batch_detail(passb_stats))
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
             counters.incr("overlay.table_synth.error")
             logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
                            "intact", catalog_source, exc_info=True)
+            # Task 9c: the failed record used to carry NOTHING. Pass B's ladders write their
+            # account into `passb_stats` as they go, so the stage that died can still say which
+            # phase it died in and what it had spent — the state an observability record exists for.
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
+                         detail=_with_audit_degradations(_passb_batch_detail(passb_stats)) or None,
                          started_at=stage_started)
 
     # [13] `_retire_dropped_field_decisions` (invoked per-column below) also COLLECTS into
@@ -3510,6 +3529,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     summaries: dict[str, str] = {}
     summary_stats: dict = {}
     summary_evidence_failures = 0
+    # Task 9c: the summary stage drafts ONE value per column from the full enriched dossier, which
+    # makes it plausibly the largest single call cost of the run — and it was the one stage of the
+    # six the inventory named that reported neither which bound stopped it nor whether anything was
+    # stored. `_write_summary_evidence` already took a `counts=` parameter that no call site passed.
+    summary_ev_counts: dict[str, int] = {}
+    summary_ev_writer: str | None = None
+    summary_rolled_back = False
     if client is None:
         record_stage(stage_recorder, "enrich_summary", "skipped_no_client")
     elif glossary is None:
@@ -3538,7 +3564,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                             glossary=glossary, bindings=bindings,
                             source_snapshot_id=snapshot_id,
                             extras_by_hash=summary_extras,
-                            bundles=summary_context)
+                            bundles=summary_context, counts=summary_ev_counts)
                     except Exception:  # noqa: BLE001 — an escape past the writer's per-item
                         # guard would otherwise report `succeeded` for a run that wrote nothing.
                         summary_evidence_failures = 1
@@ -3556,10 +3582,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory summary enrichment failed for %r", catalog_source,
                            exc_info=True)
+            summary_rolled_back = True
+        else:
+            # This branch is only reached with a glossary AND a client (both gated above), so the
+            # snapshot is the only remaining way the writer can be gated out.
+            if snapshot_id is None:
+                summary_ev_writer = "not_run:no_source_snapshot"
         state, reason, detail = _enrichment_outcome(
             summaries, len(_summary_targets(vr.good, glossary)),
             internal_failures=summary_evidence_failures,
-            not_attempted=summary_stats.get("not_attempted", 0))
+            not_attempted=summary_stats.get("not_attempted", 0),
+            batch=summary_stats.get("batch"), evidence_counts=summary_ev_counts,
+            evidence_writer=summary_ev_writer, rolled_back=summary_rolled_back)
         record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 

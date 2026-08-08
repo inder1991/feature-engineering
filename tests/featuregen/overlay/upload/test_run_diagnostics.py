@@ -99,7 +99,10 @@ def test_the_call_ceiling_is_named_rather_than_conflated_with_the_wallclock_budg
     assert got == {"h1": "monetary_stock"}                 # chunks 2 and 3 never went
     assert report["stopped_by"] == "call_ceiling"
     assert report["bounds"] == {"call_ceiling": 2}          # BOTH withheld chunks, not just the first
-    assert report["chunks_planned"] == 3 and report["chunks_issued"] == 3
+    # `chunks_issued` counts DISPATCH, not `process()` returning. Chunks 2 and 3 were refused by
+    # the bound guard and returned normally, so counting on return reported 3-of-3 issued on
+    # exactly the run this field exists to explain — a false number in the physical account.
+    assert report["chunks_planned"] == 3 and report["chunks_issued"] == 1
     assert report["provider_calls"] == 1                    # what the run actually SPENT
     assert report["not_attempted"] == 2
 
@@ -145,6 +148,42 @@ def test_a_ladder_that_RAISES_still_reports_what_it_spent(db, monkeypatch):
     assert report["chunks_planned"] == 3 and report["chunks_issued"] == 0
     assert report["not_attempted"] == 2         # the two chunks that never got to dispatch
     assert report["fallback_calls"] == 0
+
+
+def test_a_raise_AFTER_a_bound_is_not_hidden_by_the_bound(db, monkeypatch):
+    """`stopped_by` is set, not `setdefault`, on the exception path.
+
+    A run that hit a benign per-item `fallback_cap` and then died would otherwise report
+    `fallback_cap` as its headline with nothing anywhere saying it raised — the reader investigates
+    a config ceiling instead of a provider fault. The earlier bound is not lost: `bounds` keeps
+    every hit, which is exactly why the headline can afford to name the terminal event."""
+    monkeypatch.setenv("OVERLAY_ENRICH_BATCH_CONCEPT_MAX_ITEMS", "1")
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_BATCH_ATTEMPTS", "0")
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", "0")   # every leftover hits the cap
+
+    class _RefusesThenDies:
+        def __init__(self):
+            self.n = 0
+            self._ok = FakeLLM(script={_CTASK: FakeResponse(output={"results": [
+                {"ref": "h1", "concept": "not_a_registered_concept"}]})})
+
+        def call(self, request):
+            self.n += 1
+            if self.n > 1:
+                raise RuntimeError("provider fault")
+            return self._ok.call(request)
+
+    report: dict = {}
+    try:
+        _run(db, _RefusesThenDies(), _items(2), report=report)
+    except Exception:          # noqa: BLE001
+        pass
+    else:
+        raise AssertionError("the provider fault must still escape run_batched")
+
+    assert report["stopped_by"] == "exception"          # the terminal event is the headline
+    assert report["bounds"]["fallback_cap"] >= 1        # …and the earlier bound is still on record
+    assert report["bounds"]["exception"] == 1
 
 
 def test_items_skipped_with_no_guard_claiming_it_are_named_a_hole_not_a_clean_run(db, monkeypatch):
@@ -261,9 +300,51 @@ def test_every_stage_reports_whether_its_evidence_writer_ran(db, monkeypatch):
     ingest_upload(db, "deposits", rows, actor=_actor(), client=client,
                   now=datetime(2026, 7, 31, tzinfo=UTC), stage_recorder=rec)
 
-    for stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_unit"):
+    # ALL of them, including `enrich_synonyms` (whose flat `skipped` key has a live consumer in
+    # `_enrichment_outcome`'s `evidence_skipped`). `enrich_summary` is asserted separately below:
+    # it is `not_applicable` without a glossary, so it never reaches an evidence account here.
+    for stage in ("enrich_concept", "enrich_definition", "enrich_domain", "enrich_unit",
+                  "enrich_synonyms"):
         detail = _stage(rec, stage).detail or {}
         assert detail.get("evidence", {}).get("writer") == "not_run:no_glossary", stage
+    assert _stage(rec, "enrich_summary").state == "not_applicable"
+
+
+def test_the_summary_stage_reports_its_bound_and_its_evidence_like_every_other(db, monkeypatch):
+    """`enrich_summary` drafts one value per column from the full enriched dossier — plausibly the
+    largest single call cost of the run — and was the one stage of the six the inventory named that
+    reported neither. `_write_summary_evidence` even TOOK a `counts=` parameter that no call site
+    passed, which made the gap read as wired."""
+    _seal_config()
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    csv = _HDR + "DPL.BO_CUST.CIF_ID,CIF,Customer CIF,Party,,,\n"
+    upload = read_glossary(csv, source="cib")
+    (row,) = upload.rows
+    h = content_hash(replace(row, table=row.table.lower(), column=row.column.lower()))
+    client = FakeLLM(script={
+        _CTASK: FakeResponse(output={"results": [{"ref": h, "concept": "customer_id"}]}),
+        "overlay.enrich.concept_critique": FakeResponse(
+            output={"verdict": "supported", "reason_codes": []}),
+        "overlay.enrich.definition": FakeResponse(output={"results": []}),
+        "overlay.enrich.domain": FakeResponse(output={"results": []}),
+        "overlay.enrich.synonyms": FakeResponse(output={"results": []}),
+        "overlay.enrich.unit": FakeResponse(output={"results": []}),
+        "overlay.enrich.summary": FakeResponse(output={"results": [
+            {"ref": h, "summary": "The customer information file identifier for this party."}]}),
+    })
+    rec = StageRecorder()
+    ingest_upload(db, "cib", upload.rows, actor=_actor(), client=client, glossary=upload,
+                  now=datetime(2026, 7, 31, tzinfo=UTC), stage_recorder=rec)
+
+    detail = _stage(rec, "enrich_summary").detail or {}
+    # The physical account of the summary ladder — previously computed into `stats["batch"]` and
+    # read by nobody.
+    assert detail["provider_calls"] >= 1
+    assert detail["chunks_planned"] == 1 and detail["chunks_issued"] == 1
+    # …and whether the drafted summary was actually STORED.
+    evidence = detail["evidence"]
+    assert evidence.get("written", 0) + evidence.get("reused", 0) >= 1
+    assert "rolled_back" not in evidence
 
 
 def test_a_glossary_run_accounts_for_every_evidence_item_it_did_not_write(db, monkeypatch):
@@ -466,3 +547,33 @@ def test_no_diagnostic_ever_carries_a_value(db, monkeypatch, caplog):
     # …and the run DID exercise the rejection paths, so the assertions above are not vacuous.
     rejects = (_stage(rec, "enrich_concept").detail or {}).get("rejects", {})
     assert rejects, "the concept stage recorded no rejection — the marker never travelled"
+
+
+def test_pass_B_reports_its_account_per_PHASE_rather_than_discarding_it(db, monkeypatch):
+    """Pass B computed a full account and forwarded only `not_attempted`.
+
+    Its ladders populate `bounds`, `stopped_by`, `provider_calls`, `outcomes` and `rejects` exactly
+    like Pass A's, and every one of them was dropped on the floor — so the stage that synthesizes
+    every table's grain and as-of semantics answered none of the guide's bound or cost questions.
+
+    Reported per PHASE, never summed: Pass B runs up to three ladders per ingest and "which bound
+    stopped it" has a different answer for each. Adding a chunk-granular phase-1 count to a
+    table-granular phase-2 one would produce a number that means nothing."""
+    _seal_config()
+    monkeypatch.setenv("OVERLAY_TABLE_SYNTH", "1")
+    rows = [CanonicalRow("passb_diag", "txn", "id", "integer"),
+            CanonicalRow("passb_diag", "txn", "posted_at", "timestamp")]
+    client = FakeLLM(script={"table_synth": FakeResponse(output={"results": [
+        {"ref": "txn", "synthesis": {"grain_columns": ["id"]}}]})})
+    rec = StageRecorder()
+    ingest_upload(db, "passb_diag", rows, actor=_actor(), client=client,
+                  now=datetime(2026, 7, 31, tzinfo=UTC), stage_recorder=rec)
+
+    detail = _stage(rec, "pass_b").detail or {}
+    # A narrow catalog runs the narrow ladder only; the two wide phases are ABSENT rather than
+    # zeroed, which is how a reader tells "did not run" from "ran and cost nothing".
+    assert set(detail["batch"]) == {"narrow"}
+    narrow = detail["batch"]["narrow"]
+    assert narrow["provider_calls"] >= 1
+    assert narrow["chunks_planned"] == 1 and narrow["chunks_issued"] == 1
+    assert "stopped_by" not in narrow          # nothing withheld work on this run

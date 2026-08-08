@@ -1794,11 +1794,18 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     ``{items, accepted, revised, refuted, abstained, conflicts}``.
 
     ``critic_outcomes`` (semantic Task 5, optional out-param — the return shape is unchanged):
-    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for every criticised
-    ref. It rides SEPARATELY from the returned report on purpose: the report becomes an ingest
-    STAGE DETAIL, which is contractually "a SMALL dict of counts", and a per-ref map over a wide
-    table is not that. The adjudication stage consumes this map as one of its deterministic
-    selection inputs."""
+    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for EVERY criticised
+    ref, changed or not. It rides separately from the returned report because the adjudication
+    stage consumes it as one of its deterministic selection inputs — a different consumer with a
+    different lifetime, not a size argument.
+
+    THE SIZE ARGUMENT, RESTATED (Task 9c changed the answer). This docstring used to say a per-ref
+    map must never become a stage detail, because a stage detail is contractually "a SMALL dict of
+    counts". ``report["conflicts"]`` was already a per-ref map when it said so, and Task 9c adds
+    ``report["verdict_changes"]``, so the rule as stated is not the one the code follows. The rule
+    the code actually follows: a stage detail carries counts over EVERY item, and a per-ref map
+    only over the items that CHANGED — bounded by the run's revisions and refutations, not by the
+    catalog's width. ``critic_outcomes`` stays out of the detail because it is the unbounded one."""
     items: dict[str, ConceptCriticItemV1] = {}
     ref_to_hash: dict[str, str] = {}
     bundles = bundles or {}
