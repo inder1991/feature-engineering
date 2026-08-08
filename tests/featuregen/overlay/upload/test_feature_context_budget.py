@@ -384,3 +384,64 @@ def test_measured_cost_of_the_catalog_narrative(wide_catalogs, record_property):
     assert worst // len(base) * 237 > 3_000_000
     # Headroom against the budget, stated as the real ratio rather than a comfortable-sounding one.
     assert _size(base) + worst < FEATURE_CONTEXT_BYTE_BUDGET // 40
+
+
+def test_measured_cost_of_the_grain_and_as_of_status_block(wide_catalogs, record_property):
+    """WHAT THE TASK-8b BLOCK COSTS, MEASURED — and the blindness that made measuring it necessary.
+
+    Task 8's review found this fixture carries ZERO `is_grain` / `is_as_of` columns, so the pinned
+    v3/v4 bands above never saw the grain/as-of block at all: they would have stayed green while it
+    doubled. That is ASSERTED here rather than described, so the day someone declares a grain in the
+    fixture this test says so instead of silently measuring a different thing.
+
+    The cost is bounded and does NOT scale with catalog width — it rides the per-TABLE block, like
+    the catalog narrative and for the same reason. Per table at most:
+
+      * `grain_columns` + `grain_status`   — the grain's column name(s) + one token
+      * `as_of_column`  + `as_of_status`   — one column name + one token
+
+    `ai_proposed` is the state this task genuinely ADDS (a table that previously carried nothing now
+    carries both axes), so it is the one measured. `human_confirmed` / `source_declared` replace
+    Task 8's `confirmed` / `declared` on tables that already emitted a block, moving the payload only
+    by the difference in token length.
+    """
+    import json
+
+    cols = _candidates(wide_catalogs)
+    tables = sorted({(c["catalog_source"], c["table"]) for c in cols})
+    assert len(tables) == 2
+
+    # THE BLINDNESS, PINNED. Not "the fixture happens to have no grain" as prose — asserted, so the
+    # bands above can never quietly start measuring something else.
+    assert not any(c["is_grain"] or c["is_as_of"] for c in cols), (
+        "the budget fixture now declares a grain/as-of — the v3/v4 bands above are no longer blind "
+        "to this block, and this test's baseline must be re-derived rather than re-pinned")
+
+    def _size(blocks):
+        return len(json.dumps(blocks, sort_keys=True, default=str).encode("utf-8"))
+
+    base = _size(_table_context(cols))
+    # Real columns of each table: the read-scope guard drops a proposal naming anything the caller
+    # was not offered, so an invented name would measure the EMPTY block and call it the full one.
+    first = {t: sorted(c["column"] for c in cols
+                       if (c["catalog_source"], c["table"]) == t)[:1] for t in tables}
+    assert all(first.values())
+    ai_both = _size(_table_context(cols, authority={
+        t: {"grain": {"human": False, "proposed": first[t]},
+            "availability_time": {"human": False, "proposed": first[t][0]}}
+        for t in tables})) - base
+
+    record_property("table_fact_base_bytes", base)
+    record_property("ai_proposed_block_bytes", ai_both)
+    # Nothing proposed and nothing declared: byte-identical to the pre-8b shape. This is the ordinary
+    # case for a catalog whose Pass B abstained, and it must cost exactly nothing.
+    empty = {t: {"grain": {"human": False, "proposed": None},
+                 "availability_time": {"human": False, "proposed": None}} for t in tables}
+    assert _size(_table_context(cols, authority=empty)) == base, (
+        "an empty authority map changed the payload")
+    # Both axes on both tables — the full new cost, bounded to a couple of names and tokens/table.
+    assert 0 < ai_both < 400, f"the ai_proposed block cost moved: {ai_both}"
+    # It does NOT scale with catalog width: 237 columns pay what 2 tables pay.
+    assert ai_both // len(tables) < 200
+    # …and it is negligible against the budget — the real ratio, not a comfortable-sounding one.
+    assert ai_both < FEATURE_CONTEXT_BYTE_BUDGET // 3_000

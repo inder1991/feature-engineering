@@ -1,5 +1,6 @@
 import pytest
 
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload import feature_assist as fa
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -709,7 +710,15 @@ def test_every_call_in_one_request_names_the_HUMAN_who_typed_the_question(db, v5
     assert any(t == fa.OBJECTIVE_EXPANSION_TASK for t, _s, _k in rows)
 
 
-def test_refine_at_v4_carries_the_human_instruction_untouched(db, v5, monkeypatch):
+def test_refine_at_v4_carries_the_human_instruction_with_no_grounding_rules(db, v5, monkeypatch):
+    """The GROUNDING rules do not ride at v4 — the wire item has no such key, so asking would demand
+    output the schema forbids.
+
+    UPDATED BY TASK 8b, deliberately: the human's instruction is no longer alone. v4 DOES send a
+    `table_context`, and those blocks carry `grain_status` / `as_of_status`, so the sentence
+    defining those tokens travels with them at every version that sends them. The distinction this
+    test protects is intact and is now asserted directly — the grounding clause stays behind its
+    version gate while the vocabulary the payload actually contains does not."""
     monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
     from featuregen.overlay.upload.feature_assist import refine_idea
 
@@ -725,16 +734,25 @@ def test_refine_at_v4_carries_the_human_instruction_untouched(db, v5, monkeypatc
 
     refine_idea(db, {"name": "orig", "derives_from": [_AMOUNT]}, "tighten it", _Client(),
                 catalog_source="bank")
-    assert seen[-1] == "tighten it"
+    assert seen[-1].startswith("tighten it")
+    assert "grounding" not in seen[-1]
+    assert seen[-1] == "tighten it" + fa._TABLE_CONTEXT_STATUS_DIRECTIVE
 
 
-# ── Task 8: an unconfirmed grain / as-of reaches the model, LABELLED ─────────────────────────────
+# ── Task 8/8b: an unconfirmed grain / as-of reaches the model, LABELLED BY WHO ASSERTED IT ───────
 #
-# `_table_context` used to require a non-null `grain_fact_event_id` / `availability_fact_event_id`,
-# so a table whose grain the FILE declares but no human has confirmed reached the generator with no
-# grain at all — and the model invented one. The declared value is now emitted with an honest
-# `grain_status` / `as_of_status`, because an unconfirmed grain is better information than a missing
-# one PROVIDED the reader is told which it is.
+# Task 8 relaxed `_table_context`'s non-null `grain_fact_event_id` / `availability_fact_event_id`
+# requirement so a file-declared grain no longer reached the generator as nothing. Its review then
+# proved the relaxation had almost nothing behind it and the vocabulary it shipped was wrong:
+#
+#   * `ingest._assert_fact` AUTO-CONFIRMS every file-declared grain/as-of, so `confirmed` was worn
+#     by an unreviewed CSV flag and by a human endorsement alike;
+#   * a Pass B AI proposal never sets `is_grain` at all, so the case the plan exists for — "use the
+#     AI's answer even though nobody has verified it" — still reached nothing.
+#
+# Task 8b replaces the pair with an AUTHORITY axis — WHO asserted this value — read from the fact
+# stream beside the resolved projection. `resolve_fact` is untouched: it still refuses to serve a
+# PROPOSED fact, which is what keeps the execution path honest.
 
 
 def _ctx_row(column: str, **over) -> dict:
@@ -747,42 +765,150 @@ def _ctx_row(column: str, **over) -> dict:
     return row
 
 
-def test_table_context_carries_declared_grain_with_its_status():
-    """A file-declared, unconfirmed grain reaches the model labelled — not omitted."""
-    cols = [
-        {"catalog_source": "cib", "table": "facility_limits", "column": "cust_id",
-         "is_grain": True, "grain_fact_event_id": None,
-         "is_as_of": False, "availability_fact_event_id": None,
-         "table_definition": None, "table_primary_entity": None},
-    ]
-    block = fa._table_context(cols)[0]
+def _authority(*, grain_human=False, grain_proposed=None,
+               as_of_human=False, as_of_proposed=None,
+               table="facility_limits", source="cib") -> dict:
+    """The resolved per-table fact authority in the shape `_table_fact_authority` returns."""
+    return {(source, table): {
+        "grain": {"human": grain_human, "proposed": grain_proposed},
+        "availability_time": {"human": as_of_human, "proposed": as_of_proposed}}}
+
+
+def test_a_human_endorsed_grain_says_so():
+    """The strongest statement the platform can make about a grain: a person with authority over
+    this table looked at it and signed. It is the ONLY one of the three tokens that means review."""
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1")],
+                              authority=_authority(grain_human=True))[0]
     assert block["grain_columns"] == ["cust_id"]
-    assert block["grain_status"] == "declared"
+    assert block["grain_status"] == "human_confirmed"
 
 
-def test_table_context_marks_a_confirmed_grain_confirmed():
-    cols = [
-        {"catalog_source": "cib", "table": "facility_limits", "column": "cust_id",
-         "is_grain": True, "grain_fact_event_id": "evt_1",
-         "is_as_of": False, "availability_fact_event_id": None,
-         "table_definition": None, "table_primary_entity": None},
-    ]
-    block = fa._table_context(cols)[0]
-    assert block["grain_status"] == "confirmed"
+def test_an_auto_confirmed_source_grain_is_never_labelled_human():
+    """THE FINDING TASK 8's REVIEW RAISED. A file-declared grain is auto-confirmed at ingest with
+    `authority_basis=source_declared`, so it carries a fact event id and is fully operational — and
+    nobody reviewed it. Task 8 called this `confirmed`, which is the word a reader takes for review.
+    """
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1")],
+                              authority=_authority(grain_human=False))[0]
+    assert block["grain_status"] == "source_declared"
 
 
-def test_table_context_carries_a_declared_as_of_with_its_status():
-    """The same relaxation on the OTHER axis. The as-of column decides point-in-time correctness,
-    so a table that has one and cannot say so is exactly as dangerous as one with no grain."""
-    block = fa._table_context([_ctx_row("booked_at", is_as_of=True)])[0]
-    assert block["as_of_column"] == "booked_at"
-    assert block["as_of_status"] == "declared"
+def test_a_file_declared_grain_with_no_servable_fact_is_also_source_declared():
+    """Task 8's `declared` case — the file's flag survived a drift-STALEd / never-projected fact.
+    It collapses onto `source_declared` deliberately: the axis is WHO ASSERTED the value, and the
+    answer is the same source in both. Whether the fact is currently SERVABLE is an execution
+    question, and the execution path answers it from the fact stream, never from this block."""
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True)],
+                              authority=_authority())[0]
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "source_declared")
 
 
-def test_table_context_marks_a_confirmed_as_of_confirmed():
-    block = fa._table_context([
-        _ctx_row("booked_at", is_as_of=True, availability_fact_event_id="evt_a")])[0]
-    assert (block["as_of_column"], block["as_of_status"]) == ("booked_at", "confirmed")
+def test_an_ai_proposed_grain_now_reaches_the_model_labelled():
+    """WHAT THIS TASK DELIVERS. Nothing on the candidate row carries it — `is_grain` is false on
+    every column — so the value comes from the PROPOSED fact stream, read beside the resolved one.
+    """
+    block = fa._table_context([_ctx_row("cust_id"), _ctx_row("limit_amt")],
+                              authority=_authority(grain_proposed=["cust_id"]))[0]
+    assert block["grain_columns"] == ["cust_id"]
+    assert block["grain_status"] == "ai_proposed"
+
+
+def test_an_ai_proposed_as_of_now_reaches_the_model_labelled():
+    block = fa._table_context([_ctx_row("booked_at"), _ctx_row("amount")],
+                              authority=_authority(as_of_proposed="booked_at"))[0]
+    assert (block["as_of_column"], block["as_of_status"]) == ("booked_at", "ai_proposed")
+
+
+def test_a_human_endorsed_as_of_says_so():
+    block = fa._table_context(
+        [_ctx_row("booked_at", is_as_of=True, availability_fact_event_id="evt_a")],
+        authority=_authority(as_of_human=True))[0]
+    assert (block["as_of_column"], block["as_of_status"]) == ("booked_at", "human_confirmed")
+
+
+def test_an_auto_confirmed_source_as_of_is_never_labelled_human():
+    block = fa._table_context(
+        [_ctx_row("booked_at", is_as_of=True, availability_fact_event_id="evt_a")],
+        authority=_authority(as_of_human=False))[0]
+    assert block["as_of_status"] == "source_declared"
+
+
+def test_a_file_declared_as_of_with_no_servable_fact_is_also_source_declared():
+    block = fa._table_context([_ctx_row("booked_at", is_as_of=True)], authority=_authority())[0]
+    assert (block["as_of_column"], block["as_of_status"]) == ("booked_at", "source_declared")
+
+
+# ── PRECEDENCE: a confirmed value always wins, and the loser is never mentioned ──────────────────
+
+
+def test_a_confirmed_grain_hides_the_ais_disagreeing_proposal():
+    """THE DISAGREEMENT CASE. A human confirmed grain=(cust_id); the AI worked out
+    (region, cust_id). The human's answer is what ships and the AI's is not mentioned at all — the
+    model is choosing FEATURES, not adjudicating governance, and a block carrying both would invite
+    it to pick. `region` must appear nowhere in the block, under any key."""
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1"),
+                               _ctx_row("region")],
+                              authority=_authority(grain_human=True,
+                                                   grain_proposed=["region", "cust_id"]))[0]
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "human_confirmed")
+    assert "region" not in repr(block)
+
+
+def test_a_file_declaration_outranks_an_ai_proposal():
+    """The other half of the same rule, and the one that decides which of the two UNREVIEWED
+    assertions travels. The source shipped the data; the model read its column names."""
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True), _ctx_row("region")],
+                              authority=_authority(grain_proposed=["region"]))[0]
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "source_declared")
+    assert "region" not in repr(block)
+
+
+def test_a_confirmed_as_of_hides_the_ais_disagreeing_proposal():
+    block = fa._table_context(
+        [_ctx_row("z_ts", is_as_of=True, availability_fact_event_id="evt_a"), _ctx_row("a_ts")],
+        authority=_authority(as_of_human=True, as_of_proposed="a_ts"))[0]
+    assert (block["as_of_column"], block["as_of_status"]) == ("z_ts", "human_confirmed")
+    assert "a_ts" not in repr(block)
+
+
+def test_the_two_axes_are_labelled_independently():
+    """A table can have a human-endorsed grain and only an AI guess at its time anchor. One status
+    per axis, never one verdict for the table."""
+    block = fa._table_context(
+        [_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1"), _ctx_row("booked_at")],
+        authority=_authority(grain_human=True, as_of_proposed="booked_at"))[0]
+    assert block["grain_status"] == "human_confirmed"
+    assert block["as_of_status"] == "ai_proposed"
+
+
+def test_an_ai_proposal_naming_a_column_the_caller_cannot_SEE_is_dropped_whole():
+    """M6 READ SCOPE — the one way this task could leak. The confirmed and file-declared grains are
+    built FROM the candidate rows, which are already read-scoped, so their column names can only be
+    names the caller was offered. The AI's proposal is the only value that arrives from OUTSIDE that
+    set: it was validated against the table at propose time, and a sensitivity tag added since (or a
+    thinner caller) can have removed one of its columns from the menu.
+
+    Emitting it anyway would put a column name the caller may not see into the prompt AND hand the
+    model a reference it cannot ground. The whole proposal drops — a compound grain half-emitted is
+    a different table."""
+    block = fa._table_context([_ctx_row("cust_id")],
+                              authority=_authority(grain_proposed=["cust_id", "secret_col"]))[0]
+    assert "grain_columns" not in block and "grain_status" not in block
+    assert "secret_col" not in repr(block)
+    # the single-column axis takes the same rule
+    hidden = fa._table_context([_ctx_row("cust_id")],
+                               authority=_authority(as_of_proposed="secret_ts"))[0]
+    assert "as_of_column" not in hidden and "secret_ts" not in repr(hidden)
+
+
+def test_an_unresolved_authority_never_claims_a_human_endorsement():
+    """THE DEGRADED PATH. The fact-stream read is fail-soft (an unreadable stream must not take
+    down feature generation), so the block can be built with no authority at all. It then falls to
+    the WEAKER claim, in the same direction `_human_reviewed` itself fails: unknown is not human.
+    Under-claiming makes a reviewed grain look unreviewed; over-claiming hands the model confidence
+    nobody earned, which is the defect this task exists to fix."""
+    block = fa._table_context([_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1")])[0]
+    assert block["grain_status"] == "source_declared"
 
 
 def test_a_table_with_neither_carries_neither_the_value_nor_a_status():
@@ -793,20 +919,23 @@ def test_a_table_with_neither_carries_neither_the_value_nor_a_status():
 
 
 def test_a_confirmed_grain_is_never_widened_by_a_file_declaration():
-    """THE CONFIGURATION THE RELAXATION COULD HAVE BROKEN — a human confirmed something the file
-    disagrees with. `project_table_facts_for_ref` SPARES file-declared columns from its clear, so a
-    table whose file declares (cust_id, region) while a human confirmed grain=(cust_id) really does
-    carry is_grain on both, one stamped and one not.
+    """THE CONFIGURATION TASK 8's RELAXATION COULD HAVE BROKEN — a human confirmed something the
+    file disagrees with. `project_table_facts_for_ref` SPARES file-declared columns from its clear,
+    so a table whose file declares (cust_id, region) while a human confirmed grain=(cust_id) really
+    does carry is_grain on both, one stamped and one not.
 
     Emitting the UNION there would assert a grain nobody attested — not the file's and not the
-    human's — and label the human's own answer `declared` on the way past. A confirmation is the
-    stronger statement, so where any confirmation exists the block is exactly what it was before
-    this task: the confirmed set, marked confirmed. The relaxation is additive, never a downgrade."""
+    human's — and would label the human's own answer as unreviewed on the way past. A confirmation
+    is the stronger statement, so where any confirmation exists the confirmed set wins.
+
+    UPDATED FOR 8b, deliberately: the assertion that used to read `confirmed` now reads
+    `human_confirmed`, because this test's own premise is that a HUMAN confirmed it. Task 8 could
+    not say that; it had only one word for both confirmers."""
     cols = [_ctx_row("cust_id", is_grain=True, grain_fact_event_id="evt_1"),
             _ctx_row("region", is_grain=True)]
-    block = fa._table_context(cols)[0]
+    block = fa._table_context(cols, authority=_authority(grain_human=True))[0]
     assert block["grain_columns"] == ["cust_id"]
-    assert block["grain_status"] == "confirmed"
+    assert block["grain_status"] == "human_confirmed"
 
 
 def test_a_confirmed_as_of_wins_over_a_declared_one():
@@ -814,17 +943,27 @@ def test_a_confirmed_as_of_wins_over_a_declared_one():
     `first as-of column` pick would hand the model the UNCONFIRMED one and call it the anchor."""
     cols = [_ctx_row("a_ts", is_as_of=True),
             _ctx_row("z_ts", is_as_of=True, availability_fact_event_id="evt_a")]
-    block = fa._table_context(cols)[0]
-    assert (block["as_of_column"], block["as_of_status"]) == ("z_ts", "confirmed")
+    block = fa._table_context(cols, authority=_authority(as_of_human=True))[0]
+    assert (block["as_of_column"], block["as_of_status"]) == ("z_ts", "human_confirmed")
 
 
-def test_a_multi_column_declared_grain_is_carried_whole_and_marked_declared():
+def test_a_multi_column_declared_grain_is_carried_whole_and_marked_source_declared():
     """Nothing is confirmed here, so the whole file-declared compound grain travels — sorted, and
     with one status for the set. A compound grain half-emitted is a different table."""
     cols = [_ctx_row("region", is_grain=True), _ctx_row("cust_id", is_grain=True)]
-    block = fa._table_context(cols)[0]
+    block = fa._table_context(cols, authority=_authority())[0]
     assert block["grain_columns"] == ["cust_id", "region"]
-    assert block["grain_status"] == "declared"
+    assert block["grain_status"] == "source_declared"
+
+
+def test_a_multi_column_ai_proposed_grain_is_carried_whole_and_sorted():
+    """The AI's compound grain travels under the same rule as the file's — whole, sorted, one
+    status for the set. The sort matters: the proposal arrives in the model's own order and two
+    equivalent grains must not read as two different tables."""
+    block = fa._table_context([_ctx_row("cust_id"), _ctx_row("region")],
+                              authority=_authority(grain_proposed=["region", "cust_id"]))[0]
+    assert block["grain_columns"] == ["cust_id", "region"]
+    assert block["grain_status"] == "ai_proposed"
 
 
 def test_the_two_status_keys_are_egress_classified(monkeypatch):
@@ -832,13 +971,22 @@ def test_the_two_status_keys_are_egress_classified(monkeypatch):
     `_TABLE_CONTEXT_*` classifier by default and the adapter's terminal branch returns None, so
     emitting one unclassified refuses the WHOLE payload — not the field. Each is pinned against the
     list it ACTUALLY belongs to, so this fails both if someone drops one and if someone re-grades
-    one."""
+    one.
+
+    Task 8b adds NO key — it widens the value set of these two — so this pin is the one that proves
+    the widening needed no new classification. The AI-proposed block is included so the assertion
+    covers the values that did not exist when the pin was written."""
     from featuregen.overlay.upload import enrich_llm
     from featuregen.overlay.upload.enrich_llm import sanitize_feature_context
 
     blocks = fa._table_context([_ctx_row("cust_id", is_grain=True),
                                _ctx_row("booked_at", is_as_of=True)])
+    blocks += fa._table_context(
+        [_ctx_row("cust_id", table="proposed_only"), _ctx_row("booked_at", table="proposed_only")],
+        authority=_authority(grain_proposed=["cust_id"], as_of_proposed="booked_at",
+                             table="proposed_only"))
     assert {"grain_status", "as_of_status"} <= set(blocks[0])
+    assert blocks[1]["grain_status"] == "ai_proposed"
     safe, _pii, _samples, _version = sanitize_feature_context({"table_context": blocks})
     assert safe is not None, "a status key is unclassified — egress blocked the whole payload"
     assert set(safe["table_context"][0]) == set(blocks[0])
@@ -857,20 +1005,90 @@ def test_the_two_status_keys_are_egress_classified(monkeypatch):
 
 
 def test_the_status_vocabulary_is_closed():
-    """Two values, both short tokens. Anything else on this key is a value the model cannot weigh."""
+    """THREE values, all short tokens, all naming an AUTHORITY. Anything else on this key is a value
+    the model cannot weigh — and one the directive below does not define, which is worse.
+
+    Driven across every state that can produce a status, not a hand-written list: whatever the
+    emitter can put on these keys has to be inside the closed set the module publishes."""
     blocks = fa._table_context([_ctx_row("cust_id", is_grain=True),
                                _ctx_row("booked_at", is_as_of=True,
                                         availability_fact_event_id="evt_a")])
+    blocks += fa._table_context(
+        [_ctx_row("cust_id", table="t2", is_grain=True, grain_fact_event_id="e"),
+         _ctx_row("booked_at", table="t2", is_as_of=True, availability_fact_event_id="e")],
+        authority=_authority(grain_human=True, as_of_human=True, table="t2"))
+    blocks += fa._table_context(
+        [_ctx_row("cust_id", table="t3"), _ctx_row("booked_at", table="t3")],
+        authority=_authority(grain_proposed=["cust_id"], as_of_proposed="booked_at", table="t3"))
     statuses = {b.get("grain_status") for b in blocks} | {b.get("as_of_status") for b in blocks}
-    assert statuses - {None} <= {"confirmed", "declared"}
+    assert statuses - {None} == fa.TABLE_FACT_STATUSES
+    assert fa.TABLE_FACT_STATUSES == {"human_confirmed", "source_declared", "ai_proposed"}
 
 
-# ── what "confirmed" ACTUALLY means, pinned against the real ingest path ─────────────────────────
+def test_every_status_token_is_defined_for_the_model_in_the_directive():
+    """A TOKEN WHOSE MEANING LIVES ONLY IN A PYTHON DOCSTRING IS NOT LABELLING. Task 8's review
+    found the payload carried these tokens as bare JSON with no prompt text defining them anywhere,
+    so the model read the English word and took `confirmed` at face value. Every member of the
+    closed vocabulary must appear in the sentence that travels with the payload."""
+    directive = fa._table_context_directive([{"table": "t", "grain_status": "ai_proposed"}])
+    assert directive, "the table-context directive is empty — the tokens reach the model undefined"
+    for token in fa.TABLE_FACT_STATUSES:
+        assert token in directive, f"{token} is emitted but never explained to the model"
+
+
+def test_the_directive_is_absent_when_no_table_context_travels():
+    """Flag-off (`feature_context_enabled()` false) sends NO table_context at all, and a sentence
+    explaining keys that are not in the payload is noise the egress scanner still has to walk. The
+    instruction is then BYTE-IDENTICAL to its pre-8b form — asserted against the composition, not
+    against itself."""
+    assert fa._table_context_directive([]) == ""
+    assert fa._generation_instruction("predict churn", table_context=[]) == (
+        "predict churn" + fa._DERIVES_FROM_DIRECTIVE + fa._grounding_directive())
+
+
+def test_the_directive_travels_when_a_table_context_does():
+    """…and when a block IS sent, the sentence rides with it, appended after the redacted objective
+    as a fixed PII-free constant so the egress guard still scans it and llm_call records it."""
+    instruction = fa._generation_instruction(
+        "predict churn", table_context=[{"table": "t", "grain_status": "source_declared"}])
+    assert instruction.startswith("predict churn")
+    assert fa._table_context_directive([{"table": "t"}]) in instruction
+
+
+def test_the_directives_grounding_clause_is_version_gated(v5, monkeypatch):
+    """THE DEFECT THIS PIN EXISTS FOR, found by running the suite rather than by reading the code.
+
+    The vocabulary sentence originally ended "…say which you relied on in `grounding`", which asks
+    for output the v4 wire item FORBIDS — the exact prompt/schema inversion `_grounding_directive`
+    was written to prevent, reintroduced through a different door. The clause is now split out and
+    gated off `_grounding_directive()`'s own emptiness, so the two cannot drift apart.
+
+    The token DEFINITIONS still travel at v4, because v4 does send `table_context` and those tokens
+    really are in the payload."""
+    blocks = [{"table": "t", "grain_status": "source_declared"}]
+    assert "grounding" in fa._table_context_directive(blocks)          # v5 (the `v5` fixture)
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
+    at_v4 = fa._table_context_directive(blocks)
+    assert "grounding" not in at_v4
+    assert fa.TABLE_FACT_STATUSES <= {t for t in fa.TABLE_FACT_STATUSES if t in at_v4}
+
+
+def test_the_directive_is_skipped_for_blocks_that_carry_no_status():
+    """A table_context can travel with no grain or as-of on ANY block (every table abstained). The
+    tokens are then not in the payload, so defining them is the same noise as flag-off."""
+    assert fa._table_context_directive([{"table": "t", "table_definition": "a table"}]) == ""
+
+
+# ── the FOUR states, each driven through REAL code against a REAL database ───────────────────────
 #
-# Both tests below were written because the task's premise — "a non-null grain_fact_event_id means a
-# HUMAN confirmed it" — is not true of this codebase. They are the honest record of what the token
-# means and of the gap it does NOT close. Neither asserts a behaviour introduced by Task 8; both
-# would have held before it, and that is the point.
+# The unit tests above hand `_table_context` a hand-built authority map. These build the state with
+# the real ingest / propose / confirm / project paths and read it back through the real resolver, so
+# a resolver that mislabels cannot pass by agreeing with a fixture.
+#
+#   human-endorsed  -> test_a_humanly_confirmed_grain_reads_human_confirmed_end_to_end
+#   source-declared -> test_an_ordinary_uploads_declared_grain_reads_source_declared_not_human
+#   AI-proposed     -> test_an_AI_PROPOSED_grain_now_REACHES_the_table_block
+#   absent          -> test_a_table_with_no_grain_and_no_proposal_still_carries_neither
 
 
 def _sealed() -> None:
@@ -885,15 +1103,38 @@ def _sealed() -> None:
         profiler_require_restricted_role=False))
 
 
-def test_an_ordinary_uploads_declared_grain_reads_confirmed_because_ingest_AUTO_confirms_it(db):
-    """`confirmed` is the LIFECYCLE sense — a CONFIRMED fact event is projected — NOT "a human
-    checked this". `ingest._assert_fact` auto-confirms a file-declared grain/as-of with
-    `authority_basis=source_declared` ("the fact is authoritative because the SOURCE declared it"),
-    so the ordinary upload below lands on `confirmed` with nobody having reviewed anything.
+#: The Pass B service proposer — a NON-human actor, exactly as `enrich_llm._ENRICH_ACTOR` is.
+_SERVICE = IdentityEnvelope(subject="featuregen-overlay-enrichment", actor_kind="service",
+                            authenticated=True, auth_method="internal", role_claims=())
 
-    Pinned because the whole point of the status is that a reader can weigh it, and a reader who
-    thinks this token means human review has been given confidence nobody earned. The surface that
-    DOES draw that line is `bridge_assessment._human_reviewed`, off the fact STREAM."""
+
+def _resolved_block(db, source: str, table_index: int = 0) -> dict:
+    """The table block the REAL assembly would send: real candidate rows, real authority resolver."""
+    cols = fa._candidate_columns(db, source, roles=())
+    return fa._table_context(cols, authority=fa._table_fact_authority(db, cols))[table_index]
+
+
+def _propose_ai_grain(db, source: str, table: str, columns: list[str], *,
+                      as_of: str | None = None) -> None:
+    """Seed a Pass B proposal through the REAL `_propose_table_facts` under the REAL service actor —
+    the same call `ingest`'s Pass B block makes (`ingest.py:2777`)."""
+    from featuregen.overlay.upload.table_synth import _propose_table_facts
+
+    syn = {"grain": {"columns": columns, "is_unique": True} if columns else None,
+           "availability_time": ({"column": as_of, "basis": "posted_at"} if as_of else None),
+           "table_role": None, "primary_entity": None}
+    _propose_table_facts(db, source, {table: syn}, actor=_SERVICE,
+                         source_snapshot_id="snap-8b")
+
+
+def test_an_ordinary_uploads_declared_grain_reads_source_declared_not_human(db):
+    """SOURCE-DECLARED, end to end. `ingest._assert_fact` auto-confirms a file-declared grain/as-of
+    with `authority_basis=source_declared` ("the fact is authoritative because the SOURCE declared
+    it"), so this upload's grain is VERIFIED and fully operational with nobody having reviewed it.
+
+    Task 8 labelled it `confirmed`, which is the word a reader takes for review. It now reads
+    `source_declared`, and the test asserts the STREAM says the same thing — the label and the
+    evidence for it are checked together."""
     from datetime import UTC, datetime
 
     from tests.featuregen._helpers import mint_test_identity
@@ -908,10 +1149,10 @@ def test_an_ordinary_uploads_declared_grain_reads_confirmed_because_ingest_AUTO_
     assert ingest_upload(db, "authp", rows, actor=owner,
                          now=datetime(2026, 8, 1, tzinfo=UTC)).status == "ingested"
 
-    block = fa._table_context(fa._candidate_columns(db, "authp", roles=()))[0]
-    assert (block["grain_columns"], block["grain_status"]) == (["bal_id"], "confirmed")
-    assert (block["as_of_column"], block["as_of_status"]) == ("snap_ts", "confirmed")
-    # …and no human ever confirmed it: the CONFIRMED event carries a source-declared authority basis
+    block = _resolved_block(db, "authp")
+    assert (block["grain_columns"], block["grain_status"]) == (["bal_id"], "source_declared")
+    assert (block["as_of_column"], block["as_of_status"]) == ("snap_ts", "source_declared")
+    # …and the label is not a guess: the CONFIRMED event carries a source-declared authority basis
     # and no confirmers at all, which is exactly what `_human_reviewed` refuses to call human.
     payloads = [p for (p,) in db.execute(
         "SELECT payload FROM events WHERE aggregate = 'overlay_fact' AND type = %s",
@@ -919,17 +1160,108 @@ def test_an_ordinary_uploads_declared_grain_reads_confirmed_because_ingest_AUTO_
     assert payloads, "the upload asserted no table facts — this test is not exercising the path"
     assert all(p.get("authority_basis") == facts.AUTHORITY_SOURCE_DECLARED for p in payloads)
     assert not any(p.get("confirmers") for p in payloads)
+    # The grain IS operational — this is not the unservable case. Both states say `source_declared`
+    # because the axis is WHO ASSERTED it, and the execution gate reads the fact, never this block.
+    assert db.execute("SELECT 1 FROM graph_node WHERE catalog_source = 'authp' AND kind = 'column' "
+                      "AND is_grain AND grain_fact_event_id IS NOT NULL").fetchone() is not None
 
 
-def test_an_AI_PROPOSED_grain_still_reaches_no_table_block_at_all(db):
-    """THE GAP TASK 8 DOES NOT CLOSE, pinned so nobody believes it did.
+def test_a_humanly_confirmed_grain_reads_human_confirmed_end_to_end(db):
+    """HUMAN-ENDORSED, end to end, through the REAL four-eyes gate: the service proposes, a
+    platform-admin HUMAN confirms via the real `confirm_fact` command, the projection stamps
+    `graph_node`. This is the ONLY state that may claim review, and it is the one Task 8 could not
+    distinguish from the test above."""
+    from datetime import UTC, datetime
 
-    Pass B routes its grain/availability candidates into PROPOSED-only governed facts
-    (`table_synth._propose_table_facts`); `resolve_fact` serves VERIFIED only; and `is_grain` is
-    written by exactly two things — the FILE (`build_graph`) and the VERIFIED projection
-    (`table_fact_projection`). So a grain the AI worked out and nobody confirmed sets no flag on
-    `graph_node`, and NO relaxation of the fact-event test can surface it: there is nothing in the
-    candidate row to relax. Reaching it needs a read of the PROPOSED stream."""
+    from tests.featuregen._helpers import mint_test_identity
+    from tests.featuregen.overlay.upload.conftest import _confirm_grain
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
+
+    _sealed()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+    rows = [CanonicalRow("humanp", "facility_limits", "cust_id", "text"),
+            CanonicalRow("humanp", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "humanp", rows, actor=owner, now=now).status == "ingested"
+
+    _propose_ai_grain(db, "humanp", "facility_limits", ["cust_id"])
+    _confirm_grain(db, "humanp", "facility_limits", ["cust_id"], actor=admin)
+    project_table_facts_for_ref(db, source="humanp", table="facility_limits", now=now)
+
+    block = _resolved_block(db, "humanp")
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "human_confirmed")
+
+
+def test_an_AI_PROPOSED_grain_now_REACHES_the_table_block(db):
+    """WHAT TASK 8b DELIVERS — the inverse of the Task-8 pin this replaces.
+
+    Pass B routes its grain/availability candidates into PROPOSED-only governed facts; `resolve_fact`
+    serves VERIFIED only; `is_grain` is written by exactly two things — the FILE (`build_graph`) and
+    the VERIFIED projection. So the candidate row is still bare, and this test asserts that. The
+    grain now travels anyway, read from the PROPOSED stream beside the resolved projection and
+    labelled `ai_proposed`."""
+    from datetime import UTC, datetime
+
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
+
+    _sealed()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    # The file declares NO grain and NO as-of — which is precisely when Pass B proposes them.
+    rows = [CanonicalRow("propp", "facility_limits", "cust_id", "text"),
+            CanonicalRow("propp", "facility_limits", "booked_at", "timestamp"),
+            CanonicalRow("propp", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "propp", rows, actor=owner, now=now).status == "ingested"
+
+    _propose_ai_grain(db, "propp", "facility_limits", ["cust_id"], as_of="booked_at")
+    project_table_facts_for_ref(db, source="propp", table="facility_limits", now=now)
+
+    # THE LINE THAT MUST NOT MOVE: the execution path is unchanged. A PROPOSED fact still sets no
+    # flag, so nothing that reads `graph_node` — the compiler, the spine, the binding projection —
+    # can see this grain. Only the prompt does.
+    assert not db.execute("SELECT 1 FROM graph_node WHERE catalog_source = 'propp' "
+                          "AND kind = 'column' AND (is_grain OR is_as_of)").fetchall()
+
+    block = _resolved_block(db, "propp")
+    assert (block["grain_columns"], block["grain_status"]) == (["cust_id"], "ai_proposed")
+    assert (block["as_of_column"], block["as_of_status"]) == ("booked_at", "ai_proposed")
+
+
+def test_a_table_with_no_grain_and_no_proposal_still_carries_neither(db):
+    """ABSENT, end to end. The fourth state, and the regression this task could most easily cause:
+    a resolver that invents an empty proposal would put a status on every table in the catalog."""
+    from datetime import UTC, datetime
+
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    _sealed()
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    rows = [CanonicalRow("barep", "facility_limits", "cust_id", "text"),
+            CanonicalRow("barep", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "barep", rows, actor=owner,
+                         now=datetime(2026, 8, 1, tzinfo=UTC)).status == "ingested"
+
+    block = _resolved_block(db, "barep")
+    assert not {"grain_columns", "grain_status", "as_of_column", "as_of_status"} & set(block)
+
+
+def test_a_HUMAN_proposed_draft_is_never_called_ai_proposed(db):
+    """THE CONFIGURATION NOBODY CONSIDERED. `ai_proposed` claims a MODEL inferred the value. Every
+    grain DRAFT in this codebase today comes from Pass B under the service actor, and
+    `table_fact_governance` already hard-codes that assumption (`origin = llm_proposed_not_profiled`)
+    — but a proposal is a generic governed command, and a human-actor DRAFT would wear a label that
+    is simply false about who wrote it.
+
+    The resolver checks the DRAFT event's own actor. A human-proposed draft is not surfaced at all,
+    which is exactly what shipped before this task — no regression, and no lie."""
     from datetime import UTC, datetime
 
     from tests.featuregen._helpers import mint_test_identity
@@ -938,31 +1270,88 @@ def test_an_AI_PROPOSED_grain_still_reaches_no_table_block_at_all(db):
     from featuregen.overlay.identity import fact_key
     from featuregen.overlay.store import append_overlay_event
     from featuregen.overlay.upload.ingest import ingest_upload
-    from featuregen.overlay.upload.table_fact_projection import project_table_facts_for_ref
     from featuregen.overlay.upload.upload_catalog import table_ref
 
     _sealed()
     now = datetime(2026, 8, 1, tzinfo=UTC)
     owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
-    service = mint_test_identity(subject="user:enrich_service", role_claims=("data_owner",))
-    # The file declares NO grain — which is precisely when Pass B proposes one.
-    rows = [CanonicalRow("propp", "facility_limits", "cust_id", "text"),
-            CanonicalRow("propp", "facility_limits", "limit_amt", "numeric")]
-    assert ingest_upload(db, "propp", rows, actor=owner, now=now).status == "ingested"
+    human = mint_test_identity(subject="user:steward", role_claims=("data_owner",))
+    assert human.actor_kind == "human", "this test needs a HUMAN proposer to mean anything"
+    rows = [CanonicalRow("humdraft", "facility_limits", "cust_id", "text"),
+            CanonicalRow("humdraft", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "humdraft", rows, actor=owner, now=now).status == "ingested"
 
-    fk = fact_key(table_ref("propp", "facility_limits"), "grain")
+    fk = fact_key(table_ref("humdraft", "facility_limits"), "grain")
     append_overlay_event(
-        db, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED, actor=service, expected_version=0,
-        payload={"catalog_object_ref": {"catalog_source": "propp", "object_kind": "table",
+        db, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED, actor=human, expected_version=0,
+        payload={"catalog_object_ref": {"catalog_source": "humdraft", "object_kind": "table",
                                         "schema": "public", "table": "facility_limits"},
                  "object_ref": "public.facility_limits", "fact_type": "grain",
                  "proposed_value": {"columns": ["cust_id"], "is_unique": True},
-                 "proposal_fingerprint": "fp", "proposed_by": service.subject})
-    project_table_facts_for_ref(db, source="propp", table="facility_limits", now=now)
+                 "proposal_fingerprint": "fp", "proposed_by": human.subject})
 
-    assert not db.execute("SELECT 1 FROM graph_node WHERE catalog_source = 'propp' "
-                          "AND kind = 'column' AND is_grain").fetchall()
-    block = fa._table_context(fa._candidate_columns(db, "propp", roles=()))[0]
-    assert block == {"table": "facility_limits"}, (
-        "an AI-proposed grain now reaches the table block — if that is deliberate, this test is the "
-        "place to say how")
+    block = _resolved_block(db, "humdraft")
+    assert "grain_status" not in block, "a HUMAN's draft was mislabelled as the AI's proposal"
+    assert "grain_columns" not in block
+
+
+def test_a_rejected_ai_proposal_does_not_travel(db):
+    """The other lifecycle state a naive `read the proposal value` would surface. A REJECTED grain
+    is a value a human looked at and REFUSED; putting it in the prompt labelled `ai_proposed` would
+    re-float an answer governance already killed. Only a folded DRAFT is an open proposal —
+    the same test `table_fact_governance._build_view` applies to its own queue."""
+    from datetime import UTC, datetime
+
+    from tests.featuregen._helpers import mint_test_identity
+    from tests.featuregen.overlay.upload.conftest import _reject_grain
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    _sealed()
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+    rows = [CanonicalRow("rejp", "facility_limits", "cust_id", "text"),
+            CanonicalRow("rejp", "facility_limits", "limit_amt", "numeric")]
+    assert ingest_upload(db, "rejp", rows, actor=owner, now=now).status == "ingested"
+
+    _propose_ai_grain(db, "rejp", "facility_limits", ["cust_id"])
+    _reject_grain(db, "rejp", "facility_limits", actor=admin)
+
+    block = _resolved_block(db, "rejp")
+    assert "grain_status" not in block, "a REJECTED proposal was re-floated to the model"
+
+
+def test_the_authority_read_is_ONE_query_however_many_tables(db):
+    """THE HOT-PATH GUARD. `_table_context` runs once per optional column as the budget loop
+    searches for a fit, so the read that feeds it is hoisted to ONE call per assembly — and that
+    call must not itself be an N+1 over tables. Driven at 4 tables so a per-table read shows up as
+    4-plus statements rather than hiding inside a single-table fixture."""
+    from datetime import UTC, datetime
+
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    _sealed()
+    owner = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
+    rows = [CanonicalRow("manyp", f"t{i}", "cust_id", "text", is_grain=True) for i in range(4)]
+    assert ingest_upload(db, "manyp", rows, actor=owner,
+                         now=datetime(2026, 8, 1, tzinfo=UTC)).status == "ingested"
+
+    cols = fa._candidate_columns(db, "manyp", roles=())
+    assert len({c["table"] for c in cols}) == 4
+    executed: list[str] = []
+    real_execute = type(db).execute
+
+    def _counting(self, sql, *a, **kw):
+        executed.append(str(sql))
+        return real_execute(self, sql, *a, **kw)
+
+    try:
+        type(db).execute = _counting
+        authority = fa._table_fact_authority(db, cols)
+    finally:
+        type(db).execute = real_execute
+    assert set(authority) == {("manyp", f"t{i}") for i in range(4)}
+    assert len(executed) == 1, f"the authority read fanned out per table: {executed}"

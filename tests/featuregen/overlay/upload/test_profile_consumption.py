@@ -240,7 +240,9 @@ def test_a_snapshot_table_earns_the_time_mismatch_advisory(db, profiles_on):
     advisories = " ".join(block["balances"]["advisories"])
     assert "SNAPSHOT" in advisories
     assert "counts snapshots, not activity" in advisories
-    assert block["balances"]["as_of_status"] == "confirmed"
+    # Task 8b: `source_declared`, not `confirmed`. This upload's as-of really was auto-confirmed by
+    # `_assert_fact` from the file's own flag, and no human ever saw it — the status now says which.
+    assert block["balances"]["as_of_status"] == "source_declared"
 
 
 def test_a_snapshot_table_earns_the_advisory_on_an_UNCONFIRMED_as_of_too(db, profiles_on):
@@ -251,12 +253,20 @@ def test_a_snapshot_table_earns_the_advisory_on_an_UNCONFIRMED_as_of_too(db, pro
     would silence it on exactly the tables whose anchor is least examined — and the sentence is true
     of the STORAGE MODEL, not of the fact lifecycle.
 
-    THE DECLARED STATE IS CONSTRUCTED, not assumed. `ingest_upload` AUTO-CONFIRMS a file-declared
-    grain/as-of (`_assert_fact`, `authority_basis=source_declared`), so an ordinary upload lands on
-    `confirmed`; the first draft of this test asserted `declared` off a plain upload and was wrong.
-    Nulling the stamps reproduces the real state that reaches here — the file's flag surviving a
-    governed fact that `resolve_fact` will not currently serve (drift-STALEd / expired), which is
-    what `project_table_facts_for_ref` leaves behind because its clear SPARES declared columns."""
+    THE UNSTAMPED STATE IS CONSTRUCTED, not assumed. `ingest_upload` AUTO-CONFIRMS a file-declared
+    grain/as-of (`_assert_fact`, `authority_basis=source_declared`), so an ordinary upload lands on a
+    STAMPED column; the first draft of this test asserted the unstamped state off a plain upload and
+    was wrong. Nulling the stamps reproduces the real state that reaches here — the file's flag
+    surviving a governed fact that `resolve_fact` will not currently serve (drift-STALEd / expired),
+    which is what `project_table_facts_for_ref` leaves behind because its clear SPARES declared
+    columns.
+
+    TASK 8b: the token is `source_declared` in BOTH configurations, and that is the point of the
+    change. Stamped or not, the uploader's file is who asserted this as-of and nobody reviewed it;
+    whether the governed fact is currently servable is an EXECUTION question, and the execution path
+    answers it from the fact stream rather than from this block. The state the two tests differ in is
+    still constructed and still exercised — it just no longer produces two different labels for one
+    assertion."""
     _seal()
     rows = [CanonicalRow(_SRC, "balances", "bal_id", "text", is_grain=True),
             CanonicalRow(_SRC, "balances", "snap_ts", "timestamp", as_of=True)]
@@ -267,8 +277,12 @@ def test_a_snapshot_table_earns_the_advisory_on_an_UNCONFIRMED_as_of_too(db, pro
                "grain_fact_event_id = NULL WHERE catalog_source = %s AND table_name = 'balances'",
                (_SRC,))
     block = {b["table"]: b for b in _table_context(_candidate_columns(db, _SRC, roles=()))}["balances"]
-    assert (block["as_of_column"], block["as_of_status"]) == ("snap_ts", "declared")
-    assert (block["grain_columns"], block["grain_status"]) == (["bal_id"], "declared")
+    assert not db.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = 'balances' "
+        "AND availability_fact_event_id IS NOT NULL", (_SRC,)).fetchall(), (
+        "the unstamped state this test exists for was not constructed")
+    assert (block["as_of_column"], block["as_of_status"]) == ("snap_ts", "source_declared")
+    assert (block["grain_columns"], block["grain_status"]) == (["bal_id"], "source_declared")
     assert "counts snapshots, not activity" in " ".join(block["advisories"])
 
 

@@ -209,11 +209,17 @@ def test_table_context_from_authorized_rows_requires_fact_event_id(db):
     # file-declared one (region), and a confirmation is never widened by a declaration: the union
     # would assert a grain nobody attested. So the confirmed set still wins, unchanged, and the
     # block says so.
+    #
+    # TASK 8b UPDATES THE TOKEN, DELIBERATELY, AND THIS TEST IS WHY THE FALLBACK IS THE WEAK ONE.
+    # The fact-event ids here are hand-written strings against no event stream at all, and no
+    # `authority=` is passed, so the resolver has nothing to read. `source_declared` is the honest
+    # answer: the platform cannot show an endorsement for this grain, and claiming one it cannot
+    # evidence is the precise defect Task 8's review raised.
     assert ctx["accounts"]["grain_columns"] == ["account_id"]
-    assert ctx["accounts"]["grain_status"] == "confirmed"
+    assert ctx["accounts"]["grain_status"] == "source_declared"
     assert "as_of_column" not in ctx["accounts"]
     assert ctx["transactions"]["as_of_column"] == "txn_date"
-    assert ctx["transactions"]["as_of_status"] == "confirmed"
+    assert ctx["transactions"]["as_of_status"] == "source_declared"
     assert "grain_columns" not in ctx["transactions"]      # no is_grain column at all — no key
 
 

@@ -663,32 +663,249 @@ def _trimmed(column: dict, level: int) -> dict:
     return {k: v for k, v in column.items() if k not in shed}
 
 
+# ── the table-fact AUTHORITY axis (Task 8b) ──────────────────────────────────────────────────────
+#
+# WHO ASSERTED THIS VALUE. Task 8 shipped `confirmed` | `declared`, and its review proved the pair
+# was wrong in both halves: `ingest._assert_fact` AUTO-CONFIRMS every file-declared grain/as-of with
+# `authority_basis=source_declared`, so `confirmed` was worn by an unreviewed CSV flag and by a human
+# endorsement alike; and a Pass B AI proposal never sets `is_grain` at all, so the value this whole
+# plan exists to surface reached nothing. These three tokens are the axis the CODE actually knows.
+#
+# THIS IS A LABEL, NEVER A PERMISSION. None of the three admits anything to the execution path: a
+# feature that runs against the warehouse still needs a VERIFIED fact, and the guards that say so
+# (`resolve_fact`, `read_governed_grain`, `semantic_bindings/projection.py`, `materialize/spine.py`)
+# read the fact stream and none of them reads this block. `resolve_fact` refusing to serve a PROPOSED
+# fact is what keeps that honest and is deliberately untouched here — this reads the proposed state
+# BESIDE the resolved one and labels the difference.
+STATUS_HUMAN_CONFIRMED = "human_confirmed"
+STATUS_SOURCE_DECLARED = "source_declared"
+STATUS_AI_PROPOSED = "ai_proposed"
+#: The CLOSED vocabulary. Every member must also be defined for the model in
+#: `_TABLE_CONTEXT_STATUS_DIRECTIVE` — a token whose meaning lives only in a docstring is not
+#: labelling, which is the finding Task 8's review raised about its own two.
+TABLE_FACT_STATUSES = frozenset({STATUS_HUMAN_CONFIRMED, STATUS_SOURCE_DECLARED,
+                                 STATUS_AI_PROPOSED})
+
+
+@dataclass(frozen=True, slots=True)
+class _FactEvent:
+    """The four fields the overlay lifecycle fold and the human-review rule read off an event.
+
+    `fold_overlay_state` states its own input contract in its docstring — "Each item exposes
+    `.type`, `.event_id`, `.payload`" — and `bridge_assessment._human_reviewed` adds
+    `.actor.actor_kind`. Selecting four columns rather than the nineteen `row_to_event` needs keeps
+    this a narrow read on the assembly path. The fold and the human-review rule themselves are
+    REUSED, never reimplemented: a second copy of an identity-bearing rule is a rule that drifts.
+    """
+
+    type: str
+    event_id: str
+    payload: Mapping[str, object]
+    actor: IdentityEnvelope
+
+
+def _machine_proposal(stream: list[_FactEvent], draft_event_id: str | None,
+                      fact_type: str) -> list[str] | str | None:
+    """The value of an OPEN, MACHINE-authored proposal — the grain's sorted column list or the
+    as-of column name — or None when this DRAFT is not one, or its value will not read.
+
+    THE ACTOR CHECK IS THE POINT. `ai_proposed` claims a MODEL inferred the value. Every grain
+    DRAFT this codebase writes today comes from Pass B under the service actor `_ENRICH_ACTOR`
+    (`table_synth._propose_table_facts`), and `table_fact_governance` already hard-codes that
+    assumption for its own queue (`origin = "llm_proposed_not_profiled"`). But `propose_fact` is a
+    generic governed command: a human-actor DRAFT would wear a label that is simply false about who
+    wrote it, so it is not surfaced at all — which is exactly what shipped before this task.
+
+    Mirrors `_human_reviewed`'s shape deliberately, including its failure direction: anything this
+    cannot positively establish returns the weaker answer rather than the flattering one.
+    """
+    draft = next((e for e in stream if e.event_id == draft_event_id), None)
+    if draft is None or draft.actor.actor_kind == "human":
+        return None
+    value = draft.payload.get("proposed_value")
+    if not isinstance(value, Mapping):
+        return None
+    if fact_type == "grain":
+        columns = value.get("columns")
+        if not (isinstance(columns, list) and columns
+                and all(isinstance(c, str) and c for c in columns)):
+            return None
+        return sorted(columns)
+    column = value.get("column")
+    return column if isinstance(column, str) and column else None
+
+
+def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]:
+    """Who asserted each candidate table's grain / availability fact, read ONCE per assembly.
+
+    Returns ``{(catalog_source, table): {fact_type: {"human": bool, "proposed": value|None}}}`` —
+    ``human`` says the VERIFIED fact carries a real human endorsement rather than ingest's
+    source-declared auto-confirm; ``proposed`` carries an open MACHINE proposal's value (a sorted
+    column list for ``grain``, a column name for ``availability_time``) and is None whenever a fact
+    is confirmed, rejected, expired, human-authored or absent.
+
+    ONE QUERY, AND IT MUST STAY ONE. `_table_context` is called once for the mandatory set and then
+    once per optional column as the budget loop searches for a fit, so this is resolved by
+    `select_relevant_context` BEFORE that loop — the same hoist, for the same reason, that Task 7b
+    applied to the catalog narrative. `fact_key` is a pure sha256 over the identity tuple, so the
+    2xN keys are computed with no query at all and the read is a single `aggregate_id = ANY(...)`
+    probe of `events_stream_idx (aggregate, aggregate_id, stream_version)`.
+
+    WHY THE EVENT STREAM AND NOT A READ MODEL. `overlay_proposal` would answer the proposal half in
+    one statement, but it carries no index on `catalog_source`/`fact_type` (a seq scan), it lags the
+    async projector, and it cannot answer the human-vs-source half at all — that needs the CONFIRMED
+    event's own actor and payload, which is precisely what `_human_reviewed` reads. One stream read
+    answers both, using the platform's own rules for both.
+
+    FAIL-SOFT. An unreadable stream returns an empty map, never an exception: this is prompt CONTEXT,
+    and a catalog must not lose feature generation over it (the same rule the catalog narrative was
+    given after it took a catalog down). `_table_context` then falls back to the weaker claim.
+    """
+    tables = sorted({(c["catalog_source"], c["table"]) for c in cols})
+    if not tables:
+        return {}
+    try:
+        from featuregen.events.serde import identity_from_jsonb
+        from featuregen.overlay.identity import fact_key
+        from featuregen.overlay.state import fold_overlay_state
+        from featuregen.overlay.upload.bridge_assessment import _human_reviewed
+
+        # The closed fact-type vocabulary READ FROM ITS OWNER rather than re-typed here — a second
+        # copy would let this surface and the projection that writes the flags disagree about what a
+        # table fact is.
+        from featuregen.overlay.upload.table_fact_projection import _TABLE_FACT_TYPES
+        from featuregen.overlay.upload.upload_catalog import table_ref
+
+        out = {t: {ft: {"human": False, "proposed": None} for ft in _TABLE_FACT_TYPES}
+               for t in tables}
+        keyed: dict[str, tuple[tuple[str, str], str]] = {}
+        for source, table in tables:
+            ref = table_ref(source, table)
+            for fact_type in _TABLE_FACT_TYPES:
+                keyed[fact_key(ref, fact_type)] = ((source, table), fact_type)
+        streams: dict[str, list[_FactEvent]] = {}
+        rows = conn.execute(
+            "SELECT aggregate_id, type, event_id, payload, actor FROM events "
+            "WHERE aggregate = 'overlay_fact' AND aggregate_id = ANY(%s) "
+            "ORDER BY aggregate_id, stream_version", (list(keyed),)).fetchall()
+        for aggregate_id, etype, event_id, payload, actor in rows:
+            streams.setdefault(aggregate_id, []).append(
+                _FactEvent(etype, event_id, payload, identity_from_jsonb(actor)))
+        for key, stream in streams.items():
+            table_key, fact_type = keyed[key]
+            state = fold_overlay_state(stream)
+            if state.status == "VERIFIED":
+                out[table_key][fact_type]["human"] = _human_reviewed(
+                    stream, state.confirmed_event_id)
+            elif state.status == "DRAFT":
+                # DRAFT ONLY — the same test `table_fact_governance._build_view` applies to its own
+                # queue. REJECTED is a value a human REFUSED, and REVERIFY/STALE are a once-confirmed
+                # value that lapsed; re-floating either as "the AI's proposal" would put an answer
+                # governance already adjudicated back in front of the model wearing the wrong label.
+                out[table_key][fact_type]["proposed"] = _machine_proposal(
+                    stream, state.draft_event_id, fact_type)
+        return out
+    except Exception:  # noqa: BLE001 — prompt context must never take down feature generation
+        logger.warning("table-fact authority unreadable for %d table(s) — the grain/as-of status "
+                       "falls back to source_declared", len(tables), exc_info=True)
+        return {}
+
+
+def _visible(columns: Iterable[str], members: list[dict]) -> list[str]:
+    """`columns` if EVERY one of them is a column the caller was actually offered, else ``[]``.
+
+    M6 READ SCOPE, and the one way this task could leak. The confirmed and file-declared values are
+    built FROM `members`, which `_candidate_columns` already read-scoped, so their names can only be
+    names the caller may see. An AI proposal is the only value arriving from OUTSIDE that set: it
+    was validated against the table at PROPOSE time (`table_synth.make_ref_accept` drops a grain
+    column the table lacks), but a sensitivity tag added since — or simply a thinner caller — can
+    have removed one of its columns from this menu.
+
+    ALL OR NOTHING. A compound grain half-emitted is a different table, and a name the model was not
+    offered is also a reference `_ground_refs` cannot resolve, so the feature resting on it would be
+    discarded UNGROUNDED after the call rather than never proposed.
+    """
+    wanted = list(columns)
+    offered = {m["column"] for m in members}
+    return wanted if wanted and all(c in offered for c in wanted) else []
+
+
+def _grain_block(members: list[dict], authority: Mapping | None) -> dict:
+    """The grain half of one table block: ``{}``, or ``grain_columns`` + ``grain_status``.
+
+    PRECEDENCE, strongest assertion first, and NEVER two values for one field. A confirmed grain
+    wins over a file declaration, which wins over the AI's proposal; the loser is not mentioned at
+    all. If a human confirmed something the AI disagrees with, the human's value is what ships —
+    the model is choosing FEATURES, not adjudicating governance, and a block carrying both would
+    invite it to pick.
+
+    A CONFIRMATION IS NEVER WIDENED BY A DECLARATION (Task 8). `project_table_facts_for_ref` SPARES
+    file-declared columns from its clear, so a table whose file declares (a, b) while the governed
+    grain is (a) genuinely carries `is_grain` on both, one stamped and one not. Emitting the UNION
+    would assert a grain nobody attested — not the file's and not the fact's.
+    """
+    confirmed = sorted(m["column"] for m in members if m["is_grain"] and m["grain_fact_event_id"])
+    declared = sorted(m["column"] for m in members if m["is_grain"])
+    if confirmed:
+        return {"grain_columns": confirmed,
+                "grain_status": (STATUS_HUMAN_CONFIRMED if (authority or {}).get("human")
+                                 else STATUS_SOURCE_DECLARED)}
+    if declared:
+        # Task 8's `declared`: the file's flag survived a drift-STALEd / expired / never-projected
+        # fact. It collapses onto source_declared because the axis is WHO ASSERTED the value, and
+        # the answer is the same source either way. Whether the fact is currently SERVABLE is an
+        # execution question, answered on the execution path from the fact stream, never from here.
+        return {"grain_columns": declared, "grain_status": STATUS_SOURCE_DECLARED}
+    # Sorted HERE, not only in the resolver that normally supplies it: the confirmed and declared
+    # sets above are sorted at this same emit site, and a compound grain must read identically
+    # whichever branch produced it — two spellings of one grain are two tables to a reader.
+    proposed = _visible(sorted(((authority or {}).get("proposed")) or ()), members)
+    return ({"grain_columns": proposed, "grain_status": STATUS_AI_PROPOSED} if proposed else {})
+
+
+def _as_of_block(members: list[dict], authority: Mapping | None) -> dict:
+    """The time half, under the same precedence. The ordering makes it bite: a plain "first as-of
+    column" pick would hand the model an UNCONFIRMED `a_ts` over a confirmed `z_ts` and call it the
+    anchor. The governed availability fact names exactly ONE column, so the confirmed branch is at
+    most one candidate anyway."""
+    by_name = sorted(members, key=lambda m: m["column"])
+    confirmed = next((m["column"] for m in by_name
+                      if m["is_as_of"] and m["availability_fact_event_id"]), None)
+    if confirmed:
+        return {"as_of_column": confirmed,
+                "as_of_status": (STATUS_HUMAN_CONFIRMED if (authority or {}).get("human")
+                                 else STATUS_SOURCE_DECLARED)}
+    declared = next((m["column"] for m in by_name if m["is_as_of"]), None)
+    if declared:
+        return {"as_of_column": declared, "as_of_status": STATUS_SOURCE_DECLARED}
+    proposed = (authority or {}).get("proposed")
+    visible = _visible([proposed] if isinstance(proposed, str) else (), members)
+    return ({"as_of_column": visible[0], "as_of_status": STATUS_AI_PROPOSED} if visible else {})
+
+
 def _table_context(cols: list[dict], *,
-                   narratives: Mapping[str, Mapping] | None = None) -> list[dict]:
+                   narratives: Mapping[str, Mapping] | None = None,
+                   authority: Mapping[tuple[str, str], Mapping] | None = None) -> list[dict]:
     """One context block per TABLE, assembled ONLY from the already-authorized candidate rows
     (spec §5): a table whose columns were all read-scope-excluded has no rows here and gets no
-    block. Grain and as-of are emitted whether governed-VERIFIED or merely file-declared, each with
-    a `grain_status` / `as_of_status` of "confirmed" or "declared" so the model can weigh them.
-    Omitting an unconfirmed grain made the model invent one; primary_entity is ADVISORY.
+    block. Grain and as-of are emitted whether a human endorsed them, the uploaded file declared
+    them, or the AI merely proposed them — each with a `grain_status` / `as_of_status` naming WHICH
+    (`TABLE_FACT_STATUSES`), so the model can weigh it. Omitting an unconfirmed grain made the model
+    invent one; primary_entity is ADVISORY.
 
-    WHAT "confirmed" MEANS HERE, stated precisely because the word oversells itself. It is the
-    LIFECYCLE sense: a CONFIRMED overlay-fact event is projected onto this column, so the platform
-    treats the value as operational and a contract bound to it can compile. It does NOT mean a human
-    reviewed it. `ingest._assert_fact` AUTO-CONFIRMS a file-declared grain/as-of with
-    `authority_basis=source_declared` (honest attribution: "the fact is authoritative because the
-    SOURCE declared it", never a fabricated confirmer), so an ordinary upload's declared grain lands
-    here as "confirmed". The surface that DOES separate a human endorsement from a source-declared
-    auto-confirm is `bridge_assessment._human_reviewed`, and it needs the fact STREAM — which this
-    function, called repeatedly inside the budget loop on plain candidate rows, deliberately does
-    not read. So "declared" means strictly "no governed fact is currently servable for this table":
-    the file's flag survived a drift-STALEd / expired / never-projected fact.
+    THE STATUS IS A LABEL, NOT PERMISSION. It admits nothing to the execution path: a feature that
+    runs against the warehouse still requires a VERIFIED fact, and the guards that enforce that
+    (`resolve_fact`, `read_governed_grain`, `semantic_bindings/projection.py`, `materialize/spine`)
+    read the fact stream — none of them reads this block. Task 8b did not weaken `resolve_fact`; it
+    reads the PROPOSED state BESIDE the resolved one and labels the difference.
 
-    AND WHAT THIS DOES NOT REACH: a grain the AI merely PROPOSED. Pass B routes its grain and
-    availability candidates into PROPOSED-only governed facts (`table_synth._propose_table_facts`),
-    `resolve_fact` serves VERIFIED only, and `is_grain` is written by exactly two things — the FILE
-    (`build_graph`) and the VERIFIED projection (`table_fact_projection`). An AI proposal therefore
-    never sets `is_grain` at all, so no relaxation of the fact-event test can surface it; it would
-    take a read of the PROPOSED fact stream.
+    `authority` is `{(catalog_source, table): {fact_type: {"human", "proposed"}}}` from
+    `_table_fact_authority`, RESOLVED BY THE CALLER in one query before the budget loop — this
+    function is called once per optional column as that loop searches for a fit, so a read in here
+    would be an N+1 on the hot path. Passing nothing is the honest degraded mode, not an error: the
+    block then falls back to the WEAKER claim (`source_declared` for a confirmed fact, and no AI
+    proposal at all), never to the flattering one. That is the same direction `_human_reviewed`
+    itself fails in — unknown is not human.
 
     `narratives` (Task 7b) is `{catalog_source: catalog_narrative_block}` — the prose a human typed
     about the CATALOG, which the upload form promises is "used by the AI when it interprets tables"
@@ -712,42 +929,14 @@ def _table_context(cols: list[dict], *,
         tdef = next((m["table_definition"] for m in members if m.get("table_definition")), None)
         if tdef:
             block["table_definition"] = tdef
-        # Grain and as-of reach the model whether or not a governed fact currently backs them — an
-        # unconfirmed grain is better information than a missing one, PROVIDED the model is told
-        # which it is. The status is ADVISORY CONTEXT, NOT PERMISSION: a `declared` grain still
-        # cannot compile, and the guard that says so lives on the execution path
-        # (`semantic_bindings/projection.py`, `governed_grain`, `materialize/spine`), each of which
-        # reads the fact stream and none of which reads this block.
-        #
-        # A CONFIRMATION IS NEVER WIDENED BY A DECLARATION. `project_table_facts_for_ref` SPARES
-        # file-declared columns from its clear, so a table whose file declares (a, b) while the
-        # governed grain is (a) genuinely carries is_grain on both, one stamped and one not.
-        # Emitting the UNION there would assert a grain nobody attested — not the file's and not
-        # the fact's — and would label the attested answer `declared` on the way past. So where ANY
-        # confirmation exists the confirmed set wins and the block is byte-identical to its
-        # pre-Task-8 shape; the relaxation only ever ADDS a table that had nothing.
-        # `confirmed_grain` is a subset of `declared_grain` by construction (both need is_grain),
-        # so the one emptiness test below covers both.
-        confirmed_grain = sorted(m["column"] for m in members
-                                 if m["is_grain"] and m["grain_fact_event_id"])
-        declared_grain = sorted(m["column"] for m in members if m["is_grain"])
-        if declared_grain:
-            block["grain_columns"] = confirmed_grain or declared_grain
-            block["grain_status"] = "confirmed" if confirmed_grain else "declared"
-        # Same rule on the time axis, and the ordering makes it bite: a plain "first as-of column"
-        # pick would hand the model an UNCONFIRMED `a_ts` over a confirmed `z_ts` and call it the
-        # anchor. The governed availability fact names exactly ONE column, so the confirmed branch
-        # is at most one candidate anyway.
-        by_name = sorted(members, key=lambda x: x["column"])
-        as_of = next((m["column"] for m in by_name
-                      if m["is_as_of"] and m["availability_fact_event_id"]), None)
-        as_of_status = "confirmed"
-        if as_of is None:
-            as_of = next((m["column"] for m in by_name if m["is_as_of"]), None)
-            as_of_status = "declared"
-        if as_of:
-            block["as_of_column"] = as_of
-            block["as_of_status"] = as_of_status
+        # Grain and as-of reach the model whether a human endorsed them, the file declared them, or
+        # only the AI proposed them — an unconfirmed grain is better information than a missing one,
+        # PROVIDED the model is told which it is. The precedence rule and the read-scope guard live
+        # in `_grain_block` / `_as_of_block`; the two axes are labelled INDEPENDENTLY, because a
+        # table can carry a human-endorsed grain and only a machine's guess at its time anchor.
+        table_authority = (authority or {}).get((_catalog, table)) or {}
+        block.update(_grain_block(members, table_authority.get("grain")))
+        block.update(_as_of_block(members, table_authority.get("availability_time")))
         pentity = next((m["table_primary_entity"] for m in members
                         if m.get("table_primary_entity")), None)
         if pentity:
@@ -1164,6 +1353,14 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     # `_table_context` is called repeatedly below as the budget loop searches for a fit.
     narratives = {source: block for source in sorted({c["catalog_source"] for c in cols})
                   if (block := current_catalog_narrative_block(conn, source))}
+    # Task 8b, hoisted for exactly the reason above: WHO asserted each table's grain / as-of, read
+    # in ONE indexed query over the FULL candidate set before the loop starts, so the loop's
+    # repeated `_table_context` calls are pure. Resolving it per call would be an N+1 over tables
+    # multiplied by the number of optional columns the budget considers.
+    authority = _table_fact_authority(conn, cols)
+
+    def _context(rows: list[dict]) -> list[dict]:
+        return _table_context(rows, narratives=narratives, authority=authority)
 
     mandatory = [c for c in cols if _is_mandatory(c, obj_entity)]
     optional = [c for c in cols if not _is_mandatory(c, obj_entity)]
@@ -1173,7 +1370,7 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     selected = list(mandatory)
     trim = 0
     while (_assembled_bytes(_enriched(selected, trim=trim),
-                            _table_context(selected, narratives=narratives)) > byte_budget):
+                            _context(selected)) > byte_budget):
         if trim >= len(_V4_TRIM_ORDER):
             raise ContextTooLarge(
                 f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
@@ -1187,14 +1384,14 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     for i, c in enumerate(scored):
         trial = selected + [c]
         if _assembled_bytes(_enriched(trial, trim=trim),
-                            _table_context(trial, narratives=narratives)) > byte_budget:
+                            _context(trial)) > byte_budget:
             dropped = len(scored) - i
             break
         selected = trial
     if dropped:
         logger.info("feature-context relevance dropped %d of %d optional columns (byte budget %d)",
                     dropped, len(optional), byte_budget)
-    return (_enriched(selected, trim=trim), _table_context(selected, narratives=narratives),
+    return (_enriched(selected, trim=trim), _context(selected),
             dropped)
 
 
@@ -2427,7 +2624,8 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", _generation_instruction(objective), inputs, actor=actor,
+                    "feature_ideas", _generation_instruction(objective, table_context=table_context),
+                        inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     for raw in out.get("features", []):
@@ -2483,12 +2681,58 @@ def _grounding_directive() -> str:
             if _feature_schema_version() >= _GROUNDING_SCHEMA_VERSION else "")
 
 
-def _generation_instruction(objective: str) -> str:
+# Task 8b. THE TOKENS MUST BE DEFINED WHERE THEY ARE READ. Task 8's review found `grain_status` /
+# `as_of_status` travelling as bare JSON with no prompt text defining them anywhere, so the model
+# read the English word and took `confirmed` at face value — which is exactly the confidence nobody
+# earned, since ingest auto-confirms an unreviewed CSV flag. A token whose meaning lives only in a
+# Python docstring is not labelling.
+#
+# Every member of `TABLE_FACT_STATUSES` is named here; `test_every_status_token_is_defined_for_the_
+# model_in_the_directive` fails if a fourth is ever added without its sentence. Like its two
+# siblings above it is a fixed PII-free constant appended after the redacted objective, so the
+# egress guard still scans it and the llm_call audit records exactly what was asked.
+_TABLE_CONTEXT_STATUS_DIRECTIVE = (
+    "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name WHO "
+    "asserted that table's grain (what one row means) or its as-of column (when the row was true), "
+    "and nothing else: `human_confirmed` — a person with authority over the table reviewed and "
+    "signed it; `source_declared` — the uploaded catalog file asserted it and the platform recorded "
+    "it automatically, so NOBODY has reviewed it; `ai_proposed` — a model inferred it from the "
+    "schema and it is unconfirmed. Use all three: an unreviewed grain is better information than "
+    "none, and a feature resting on one is still worth proposing — but only `human_confirmed` means "
+    "a person checked it.")
+# The one clause that mentions `grounding`, split out because a model must NEVER be asked for output
+# its schema forbids: below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding`
+# key, and a sentence telling the model to write one there is the same prompt/schema inversion
+# `_grounding_directive` exists to avoid. Gated off `_grounding_directive()`'s OWN emptiness rather
+# than a second copy of the version test, so the two cannot drift apart.
+_TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE = (
+    " Where a feature rests on a grain or as-of column that is not `human_confirmed`, say so in its "
+    "`grounding` entry — the reader needs to know which it was.")
+
+
+def _table_context_directive(table_context: Iterable[Mapping] | None) -> str:
+    """The status vocabulary, or "" when no block in this payload carries a status.
+
+    Gated on the PAYLOAD, not on a flag, and for the same reason `_grounding_directive` is gated on
+    the schema version: the prompt and the payload must agree about what is there. Flag-off sends no
+    `table_context` at all, and a catalog where every table abstained sends blocks with no status —
+    defining tokens that do not appear is noise the egress guard still has to walk, and it invites
+    the model to look for a key it will not find.
+    """
+    if not any(b.get("grain_status") or b.get("as_of_status") for b in (table_context or ())):
+        return ""
+    return _TABLE_CONTEXT_STATUS_DIRECTIVE + (
+        _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE if _grounding_directive() else "")
+
+
+def _generation_instruction(objective: str, *,
+                            table_context: Iterable[Mapping] | None = None) -> str:
     """The generation instruction: the (already-redacted) objective plus the fixed system
-    directives. Both are PII-free constants appended AFTER the objective, so the egress guard still
+    directives. All are PII-free constants appended AFTER the objective, so the egress guard still
     scans the whole string and the llm_call audit records exactly what was asked.
     """
-    return objective + _DERIVES_FROM_DIRECTIVE + _grounding_directive()
+    return (objective + _DERIVES_FROM_DIRECTIVE + _grounding_directive()
+            + _table_context_directive(table_context))
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -2534,7 +2778,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", _generation_instruction(objective), inputs, actor=actor,
+                        "feature_ideas", _generation_instruction(objective, table_context=table_context),
+                        inputs, actor=actor,
                         prompt_version=_feature_schema_version(),
                         schema_version=_feature_schema_version())
         proposed = out.get("features", [])
@@ -2703,7 +2948,9 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
     # `_grounding_directive`). A fixed PII-free constant appended after the human's instruction, so
     # the egress guard still scans the whole string and the llm_call records exactly what was asked.
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", instruction + _grounding_directive(), inputs, actor=actor,
+                    "feature_ideas",
+                    instruction + _grounding_directive()
+                    + _table_context_directive(table_context), inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     proposed = out.get("features", [])
