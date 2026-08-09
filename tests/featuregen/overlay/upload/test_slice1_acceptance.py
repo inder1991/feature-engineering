@@ -41,12 +41,22 @@ _AUDIT_ENTRY_KEYS = {"path", "sanitizer_version", "state", "removed_count"}
 
 
 def _captured_profiles(client) -> dict[str, dict]:
-    """Every per-column profile Pass B actually egressed (phase-1 chunk summaries), by column."""
+    """Every per-column profile Pass B actually egressed, by column — from WHICHEVER Pass-B request
+    carries them.
+
+    It used to read `table_synth_summary` only, because a 126-column table was WIDE
+    (`enrich_llm._MAX_COLUMN_PROFILES` was 64, and that constant is Pass B's narrow/wide router).
+    The 2026-08-06 zero-truncation raise took it to 512, so the fixture's table now takes the narrow
+    fast path and its profiles ride the single `table_synth` item instead. The property this gate
+    exists for — every column's profile egresses with its two type fields separate — is about the
+    profiles, not about which call carries them, so the helper reads both tasks.
+    """
     profiled: dict[str, dict] = {}
-    for req in client.requests_for("table_synth_summary"):
-        for item in req.inputs["catalog_metadata"]["items"]:
-            for prof in item["column_profiles"]:
-                profiled[prof["column"]] = prof
+    for task in _PASS_B_TASKS:
+        for req in client.requests_for(task):
+            for item in req.inputs["catalog_metadata"]["items"]:
+                for prof in item.get("column_profiles") or []:
+                    profiled[prof["column"]] = prof
     return profiled
 
 
@@ -70,13 +80,18 @@ def test_slice1_view_flows_into_pass_b_and_egress_audit_persists(db, synthetic_f
     items = [it for req in synth_reqs for it in req.inputs["catalog_metadata"]["items"]]
     table_item = next(it for it in items if it["table"] == _TABLE)
     assert "one row per posted transaction" in table_item["table_definition"]
-    # the structured roster in the same item is dual-typed for every column too
-    assert len(table_item["column_roster"]) == 126
-    for entry in table_item["column_roster"]:
+    # Every column of the table rides the SAME item as the definition, dual-typed.
+    #
+    # It used to be the compact `column_roster` (the wide two-phase item's names-and-types digest).
+    # Since `_MAX_COLUMN_PROFILES` went 64 -> 512 this table is narrow, so the item carries the FULL
+    # `column_profiles` instead — a superset: same identity keys, plus the concept and the business
+    # definition the roster had to drop. Read whichever the route produced, and assert the property.
+    inventory = table_item.get("column_profiles") or table_item["column_roster"]
+    assert len(inventory) == 126
+    for entry in inventory:
         # The three identity keys are always present; profile Task 4 additionally carries the
         # resolved `concept` where Pass A produced one (the crosswalk contradiction's only signal).
         assert {"column", "operational_type", "declared_type"} <= entry.keys()
-        assert entry.keys() <= {"column", "operational_type", "declared_type", "concept"}
         assert entry["operational_type"] == UNKNOWN_TYPE and entry["declared_type"]
 
     # ── 3. reconciled-away parser facets are WITHHELD from the captured profiles ──
@@ -101,20 +116,30 @@ def test_slice1_view_flows_into_pass_b_and_egress_audit_persists(db, synthetic_f
     rows = db.execute(
         "SELECT task, redacted_input, input_redaction FROM llm_call "
         "WHERE run_id = 'overlay-enrichment'").fetchall()
-    assert {row[0] for row in rows} >= set(_PASS_B_TASKS)   # both Pass B phases were audited
+    audited_tasks = {row[0] for row in rows}
+    # NAMED, not "at least one of": the narrow route is deterministic for this 126-column fixture,
+    # so exactly `table_synth` must be audited. `>= set(_PASS_B_TASKS)` became unsatisfiable when
+    # the route changed, but weakening it to an intersection would let a regression that drops the
+    # `table_synth` audit entirely still pass.
+    assert "table_synth" in audited_tasks
+    assert "table_synth_summary" not in audited_tasks   # the wide phase must not have run
     for task, redacted_input, _ in rows:
         blob = json.dumps(redacted_input)
         for token in _PLANTED_TOKENS:
             assert token not in blob, (task, token)         # never persisted, any task's egress
 
-    for task, definition_path in (("table_synth_summary", "column_profiles.business_definition"),
-                                  ("table_synth", "table_definition")):
-        strips = [a for _t, _ri, ir in rows if _t == task
-                  for a in (ir or {}).get("sample_strip", [])]
-        assert strips, f"no persisted sample_strip audit for {task}"
-        assert all(_AUDIT_ENTRY_KEYS <= a.keys() for a in strips)
-        by_path = [a for a in strips if a["path"] == definition_path]
-        assert by_path, f"no {definition_path} sample_strip entry for {task}"
+    # BOTH definition paths must be audited SOMEWHERE in Pass B. Which phase carries which is a
+    # ROUTE detail that moved on 2026-08-06: the column profiles used to ride `table_synth_summary`
+    # (the wide two-phase path) and now ride `table_synth` with the table definition, because
+    # `_MAX_COLUMN_PROFILES` 64 -> 512 made this 126-column table narrow. The audit coverage — every
+    # definition that egressed has a persisted sample_strip entry — is what this pins.
+    passb_strips = [a for _t, _ri, ir in rows if _t in _PASS_B_TASKS
+                    for a in (ir or {}).get("sample_strip", [])]
+    assert passb_strips, "no persisted sample_strip audit for any Pass B phase"
+    assert all(_AUDIT_ENTRY_KEYS <= a.keys() for a in passb_strips)
+    for definition_path in ("column_profiles.business_definition", "table_definition"):
+        by_path = [a for a in passb_strips if a["path"] == definition_path]
+        assert by_path, f"no {definition_path} sample_strip entry in any Pass B phase"
         # [F14](a): FTR definitions were sanitized AT READ, so the egress re-strip verifiably
         # found nothing more to remove — the audit entry exists with state "none".
         assert all(a["state"] == "none" and a["removed_count"] == 0 for a in by_path)

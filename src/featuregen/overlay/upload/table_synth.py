@@ -14,12 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload import enrich_config, table_vocab
 from featuregen.overlay.upload.attest.dataset_profile_critic import CRITIC_BUDGET_EXHAUSTED
+from featuregen.overlay.upload.catalog_profiles import CATALOG_NARRATIVE_KEYS
 from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES, ENRICHMENT_RUN_ID
 from featuregen.overlay.upload.object_ref import normalize_ref
@@ -45,9 +46,16 @@ def _descriptor(view: ColumnMetadataView) -> dict:
     synthesizer sees the distinction even when one is blank.
 
     M4 still holds by construction: the view sources `business_definition` ONLY from the curated
-    sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded to
-    the 600 egress window; the field-aware egress seam (`_redact_free_text_meta`) re-sanitizes it
-    (sample-clause strip + PII) at dispatch. Facets are bounded structural tokens (200 cap)."""
+    sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded by
+    `column_view._bounded` to the ONE `enrich_llm.MAX_DEFINITION_LEN` egress window (32_000 since
+    2026-08-06 — named rather than restated, so the two cannot drift); the field-aware egress seam
+    (`_redact_free_text_meta`) re-sanitizes it (sample-clause strip + PII) at dispatch.
+
+    [F4] `term_type` / `domain` / `process_path` are UPLOADER-AUTHORED PROSE, not structural tokens
+    — an earlier revision of this docstring called them "bounded structural tokens (200 cap)" and
+    that misreading is what let them egress unscanned. The 200-char slice below is a LENGTH bound;
+    it is not a safety property. They are graded `_COLUMN_PROFILE_PROSE_KEYS` and PII-scanned
+    per descriptor at dispatch, at the indexed path `column_profiles.<key>`."""
     desc: dict = {"column": view.column,
                   "operational_type": (view.operational_type or "")[:200],
                   "declared_type": (view.declared_type or "")[:200]}
@@ -248,19 +256,64 @@ def table_vocab_normalize_temporal(raw: object) -> str | None:
     return normalize_temporal_storage_model(raw)
 
 
-#: The bounded per-value length of a profile PROSE suggestion — the same 600-char window the
-#: sanitized business definition uses (`enrich_llm.MAX_DEFINITION_LEN`), so a description and a
-#: definition can never drift apart on what "bounded" means.
+#: The bounded per-value length of a profile PROSE suggestion.
+#:
+#: It USED to be pinned to `enrich_llm.MAX_DEFINITION_LEN` ("so a description and a definition can
+#: never drift apart"). The 2026-08-06 zero-truncation raises took that constant 600 -> 4000 ->
+#: 32_000 and this one deliberately did NOT follow either time, because the two answer different
+#: questions and the tie was coincidental. This value bounds Pass B's own OUTPUT, and that output
+#: can be re-threaded into ITEM metadata as `business_context`/`table_description`, where it meets
+#: the per-value egress ACCEPTANCE gate `enrich_llm._MAX_LEN_DEFAULT` (now 1000). So the
+#: load-bearing invariant is `_MAX_PROFILE_PROSE < _MAX_LEN_DEFAULT` — 600 against 1000 holds it
+#: with margin, and it is UNDISTURBED by the 32_000 raise precisely because that raise moved
+#: `MAX_DEFINITION_LEN` and not `_MAX_LEN_DEFAULT`. Raising this to 4000 (let alone 32_000) would
+#: make Pass B's own descriptions EXCLUDED-and-audited at the egress gate, which is the opposite of
+#: what the raise was for. Pinned by `test_table_synth_assemble.py`.
 _MAX_PROFILE_PROSE = 600
-#: The one non-column citation a suggestion may name: the table's own curated definition.
+#: The non-column citations a suggestion may name.
+#:
+#: `table_definition` is the table's own curated definition. The CATALOG-NARRATIVE keys (Task 7b)
+#: joined it at prompt v5, and without them the narrative was mechanically UNCITABLE: an honest
+#: citation of `catalog_description` was filtered out here, `_accept_profile_fields` then dropped the
+#: suggestion as `no_evidence_ref`, and the only route to acceptance was attaching a COLUMN citation
+#: the suggestion does not actually rest on. That made `table_description`, `business_context`,
+#: `authority_role` and `temporal_storage_model` incapable of resting on the prose this task exists
+#: to deliver — and it would have taught the model to cite dishonestly to get an answer accepted.
+#:
+#: (Grain, as-of, `primary_entity`, `table_role` and `event_or_snapshot` were never ref-gated — they
+#: are validated against column membership — so the narrative could already influence them. That is
+#: the brief's #1 leverage point and it worked from the first commit; this widens the rest.)
+#:
+#: CITABLE ONLY WHERE THE ITEM CARRIES THEM (review round 2). The first version of this admitted all
+#: five UNCONDITIONALLY, which is a forgery surface rather than a capability: `FEATUREGEN_DATASET_
+#: PROFILES` is OFF BY DEFAULT, so in the default deployment NO item carries a narrative key at all —
+#: yet a model emitting `{"field": "business_context", "refs": ["catalog_description"]}` would clear
+#: the `no_evidence_ref` gate and land its prose accepted, citing something that does not exist.
+#: That is exactly the "cite anything to get accepted" behaviour the gate exists to prevent, and it
+#: is the behaviour widening these refs was supposed to make UNNECESSARY. The presence signal is
+#: threaded per table from the items themselves (`_run_synthesis`), so the rule is now what the
+#: sentence above always claimed: the refs an item ACTUALLY carries.
+_NARRATIVE_CITATION_REFS: frozenset[str] = frozenset(CATALOG_NARRATIVE_KEYS)
 _TABLE_DEFINITION_REF = "table_definition"
 
 
-def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
+def narrative_refs_of(metadata: Mapping) -> frozenset[str]:
+    """The catalog-narrative keys ONE Pass-B item actually carries — the citable set for that table.
+    Empty for every item without a narrative, which is every item in a default deployment."""
+    return frozenset(k for k in metadata if k in _NARRATIVE_CITATION_REFS)
+
+
+def _cited_refs(synthesis: dict, field: str, *, cols: set[str],
+                narrative_refs: frozenset[str] = frozenset()) -> list[str]:
     """The refs this suggestion cites, filtered to the BOUNDED TABLE CONTEXT it was given: a real
-    column of THIS table, or the literal ``table_definition``. A hallucinated ref is dropped rather
-    than trusted, so "names existing evidence refs" is enforced, never assumed."""
-    allowed = {c.lower() for c in cols} | {_TABLE_DEFINITION_REF}
+    column of THIS table, the literal ``table_definition``, or a catalog-narrative key THIS ITEM
+    CARRIES. A hallucinated ref is dropped rather than trusted, so "names existing evidence refs" is
+    enforced, never assumed.
+
+    ``narrative_refs`` defaults to EMPTY, which is the fail-closed direction: a caller that has not
+    said which narrative the item carries has not established that any exists, so none is citable.
+    """
+    allowed = {c.lower() for c in cols} | {_TABLE_DEFINITION_REF} | narrative_refs
     out: list[str] = []
     for entry in synthesis.get("evidence_refs") or []:
         if not isinstance(entry, dict) or str(entry.get("field") or "").strip() != field:
@@ -275,7 +328,7 @@ def _cited_refs(synthesis: dict, field: str, *, cols: set[str]) -> list[str]:
 
 def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
                            contradictions: dict[str, str], put, source_definition: str | None,
-                           critic) -> dict:
+                           critic, narrative_refs: frozenset[str] = frozenset()) -> dict:
     """Validate the four profile suggestions, appending one disposition each (TOTAL over
     :data:`PROFILE_DISPOSITION_FIELDS`). Returns the accepted values, keyed by field.
 
@@ -306,7 +359,7 @@ def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
             put(ref, field, "abstained")
             return
         value = raw.strip()[:_MAX_PROFILE_PROSE]
-        refs = _cited_refs(synthesis, field, cols=cols)
+        refs = _cited_refs(synthesis, field, cols=cols, narrative_refs=narrative_refs)
         if not refs:
             put(ref, field, "dropped_invalid", "no_evidence_ref")
             return
@@ -331,7 +384,7 @@ def _accept_profile_fields(synthesis: dict, ref: str, *, cols: set[str],
         if value is None:
             put(ref, field, "dropped_invalid", f"{field}_off_vocab")
             return
-        refs = _cited_refs(synthesis, field, cols=cols)
+        refs = _cited_refs(synthesis, field, cols=cols, narrative_refs=narrative_refs)
         if not refs:
             put(ref, field, "dropped_invalid", "no_evidence_ref")
             return
@@ -365,6 +418,7 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
                     source_context_by_table: dict[str, bool] | None = None,
                     source_definition_by_table: dict[str, str] | None = None,
                     catalog_context_available: bool = False,
+                    narrative_refs_by_table: dict[str, frozenset[str]] | None = None,
                     critic=None):
     """A ref-aware accept for `validate_batch_results(..., ref_aware=True)`. `ref` is the table name;
     validate the serialized `synthesis` against THAT table's real columns and map a valid result onto
@@ -497,6 +551,7 @@ def make_ref_accept(columns_by_table: dict[str, set[str]], *,
         profile = _accept_profile_fields(
             s, ref, cols=cols, contradictions=contradictions, put=_put,
             source_definition=(source_definition_by_table or {}).get(ref),
+            narrative_refs=(narrative_refs_by_table or {}).get(ref) or frozenset(),
             critic=critic)
 
         # A parseable synthesis with neither grain nor availability is a VALID ABSTENTION (some tables
@@ -630,7 +685,8 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                       catalog_source: str | None = None,
                       schema_by_table: dict[str, str] | None = None,
                       stats: dict | None = None,
-                      catalog_context_available: bool = False) -> dict[str, dict]:
+                      catalog_context_available: bool = False,
+                      catalog_narrative: Mapping | None = None) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
@@ -643,8 +699,12 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 
     Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
     as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
-    single phase-2 synthesis over the summaries + a complete roster). NARROW tables (``<=64`` profiles)
-    keep today's single-call fast path byte-for-byte. A wide table synthesizes over whatever chunk
+    single phase-2 synthesis over the summaries + a complete roster). NARROW tables
+    (``<=_MAX_COLUMN_PROFILES`` profiles) keep today's single-call fast path byte-for-byte. Since the
+    2026-08-06 zero-truncation raise took that cap 64 -> 512, EVERY real bank table on this platform
+    (126/144 columns) is narrow and synthesizes in ONE call over its complete profiles; the two-phase
+    path is now the backstop for a pathological (>512-column) table rather than the normal route.
+    A wide table synthesizes over whatever chunk
     summaries LANDED (the roster is complete regardless); only a table with ZERO chunk summaries,
     or whose synthesis is invalid, simply never appears in the returned dict — the caller then reports
     the honest partial/failed outcome (no phantom "resolved").
@@ -662,7 +722,25 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     C5-T5 — ``ingestion_run_id`` + ``catalog_source`` (+ ``schema_by_table``, the Pass-B fact-key
     schema map): with a run id, every Pass B dispatch (chunk summaries AND syntheses) is pre-audited
     and attributed to the run + its TABLE subjects under stage ``pass_b``. ``ingestion_run_id=None``
-    (every direct/test caller) is byte-for-byte today's behavior."""
+    (every direct/test caller) is byte-for-byte today's behavior.
+
+    ``catalog_narrative`` (Task 7b) is the catalog's authored narrative as model context
+    (:func:`catalog_profiles.catalog_narrative_block`), joined onto EVERY item here. This is the
+    highest-leverage place that prose could go: Pass B decides grain, ``table_role``,
+    ``primary_entity`` and ``event_or_snapshot`` from column names and profiles alone, and a
+    sentence like "funds-transfer records — all outbound SWIFT/RTGS payments; Compliance-owned"
+    answers three of those four outright. Grain is the most expensive thing in this pipeline to get
+    wrong. It is CONTEXT and carries its own ``human/proposed`` authority label; it refutes nothing
+    and defaults nothing — the deterministic contradictions and the proposal-blind critic remain the
+    only things that can overturn a suggestion.
+
+    Joined BEFORE ``context_revision`` deliberately: the narrative is part of the QUESTION, so an
+    edit must re-ask it rather than replay an answer given to a different one. The item's OWN keys
+    win a collision, so no catalog-grain value can displace a table's identity; ``None`` (every
+    direct caller, and any catalog with no authored narrative) leaves every item byte-identical."""
+    if catalog_narrative:
+        items = [BatchItem(ref=it.ref, metadata={**catalog_narrative, **it.metadata})
+                 for it in items]
     narrow = [it for it in items
               if len(it.metadata.get("column_profiles") or []) <= _MAX_COLUMN_PROFILES]
     wide = [it for it in items
@@ -689,6 +767,7 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                                        ingestion_run_id=ingestion_run_id,
                                        catalog_source=catalog_source,
                                        schema_by_table=schema_by_table, stats=stats,
+                                       phase="narrow",
                                        catalog_context_available=catalog_context_available,
                                        critic=critic))
     if wide:
@@ -710,8 +789,16 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 
 #: The Pass-B synthesis contract, named once so the request, the replay identity and the tests read
 #: the same values.
-_SYNTH_PROMPT_ID = "overlay_table_synth_v4"
-_SYNTH_PROMPT_VERSION = 4
+#:
+#: v5 (Task 7b) — the CATALOG NARRATIVE. Two prompt changes that only make sense together, so they
+#: ship as one version: `_TYPE_FIELDS_NOTE` now says what the catalog-narrative keys ARE (whole
+#: catalog, not this table; context, never a fact about this table), and `_PROFILE_NOTE` names them
+#: as citable refs alongside `table_definition`. Widening `_cited_refs` without telling the model
+#: would have left the capability unreachable; telling the model without widening `_cited_refs`
+#: would have taught it to cite something the code silently discards. The SCHEMA is untouched — the
+#: response shape did not move, only the question.
+_SYNTH_PROMPT_ID = "overlay_table_synth_v5"
+_SYNTH_PROMPT_VERSION = 5
 _SYNTH_SCHEMA_VERSION = 3
 #: The phase-1 (wide-table) summary prompt id. Its VERSIONS are `_SYNTH_PROMPT_VERSION` /
 #: `_SYNTH_SCHEMA_VERSION` — one Pass B run stamps ONE contract generation across both phases.
@@ -756,6 +843,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                    catalog_source: str | None = None,
                    schema_by_table: dict[str, str] | None = None,
                    stats: dict | None = None,
+                   phase: str = "synthesis",
                    catalog_context_available: bool = False,
                    critic=None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
@@ -763,8 +851,9 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
 
     Ships the Pass B contract via the Task-1 version seam, read from `_SYNTH_PROMPT_VERSION` /
-    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v4** (the code-side `table_role` vocab is
-    enumerated in the instruction) over the **canonical v3 schema** — a REAL v3 body, because v2 is
+    `_SYNTH_SCHEMA_VERSION` (never re-typed): **prompt v5** (the code-side `table_role` vocab is
+    enumerated in the instruction; v5 adds the catalog-narrative context and its citability) over
+    the **canonical v3 schema** — a REAL v3 body, because v2 is
     a byte-alias of v1 with `additionalProperties: false` and would reject the profile suggestions.
     [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
     WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
@@ -778,6 +867,10 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                           or it.metadata.get("column_roster") or []) for it in items}
     source_definitions = {it.ref: it.metadata.get("table_definition") for it in items
                           if it.metadata.get("table_definition")}
+    # Review round 2: WHICH narrative keys each item actually carries, so a citation can only name
+    # context that reached the model. Built from the items themselves — the same place `inventory`
+    # and `source_definitions` come from — so it cannot disagree with what egressed.
+    narrative_refs = {it.ref: narrative_refs_of(it.metadata) for it in items}
     # ONE ledger for this synthesis run, shared by the batching ladder AND the critic it fires from
     # inside `accept`: a critique is a physical provider call, so it spends the SAME ceiling the
     # chunks spend (the finding — critic calls were invisible to `max_provider_calls`). The ledger
@@ -789,8 +882,15 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         columns_by_table, dispositions=dispositions, inventory_by_table=inventory,
         source_definition_by_table=source_definitions,
         source_context_by_table={ref: True for ref in source_definitions},
-        catalog_context_available=catalog_context_available, critic=budgeted_critic)
-    batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        catalog_context_available=catalog_context_available,
+        narrative_refs_by_table=narrative_refs, critic=budgeted_critic)
+    # Task 9c: the ladder's account rides ON `stats`, keyed by PHASE — Pass B runs up to three
+    # ladders per ingest (narrow synthesis, wide phase-1 summary, wide phase-2 synthesis) and each
+    # has its own chunking, its own bounds and its own physical cost. A single flat slot would have
+    # the last ladder overwrite the others' `provider_calls`/`chunks_planned`. Aliased rather than
+    # copied after the call, so a ladder that RAISES still leaves its account behind.
+    batch_report: dict = ({} if stats is None
+                          else stats.setdefault("batch_by_phase", {}).setdefault(phase, {}))
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id=_SYNTH_PROMPT_ID, schema_id="overlay_table_synth_batch",
@@ -849,7 +949,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
     advisory input keyed by chunk ref and record no per-field dispositions.
 
-    Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
+    Phase 1: split each wide table into consecutive ``<=_MAX_COLUMN_PROFILES``-profile chunks and
+    SUMMARIZE each chunk
     (no fact output) — every chunk item is egress-safe. Phase 2: for each table with AT LEAST ONE
     chunk summary, run ONE synthesis over whatever chunk summaries LANDED + a compact complete roster
     of STRUCTURED ``{column, operational_type, declared_type}`` entries + the table's
@@ -863,6 +964,7 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     columns_by_ref: dict[str, set[str]] = {}
     roster_by_table: dict[str, list[dict]] = {}
     table_def_by_table: dict[str, str] = {}
+    carried_narrative: dict[str, dict] = {}
     for it in wide_items:
         table = it.ref
         profiles = it.metadata.get("column_profiles") or []
@@ -874,6 +976,12 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         table_def = it.metadata.get("table_definition")
         if table_def:
             table_def_by_table[table] = table_def
+        # Task 7b: the CATALOG narrative rides the assembled item too, and the phase-2 item below is
+        # REBUILT from scratch — so it must be carried forward explicitly for exactly the reason
+        # `table_definition` is. Without this the wide path silently drops it, and a wide table is
+        # precisely the one whose grain the narrative helps most.
+        carried_narrative[table] = {k: v for k, v in it.metadata.items()
+                                    if k in CATALOG_NARRATIVE_KEYS}
         refs: list[str] = []
         for idx, chunk in enumerate(_chunk_profiles(profiles)):
             ref = f"{table}#chunk{idx}"
@@ -886,7 +994,7 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
         # The phase-1 summary is stamped with the SAME contract generation as the phase-2 synthesis
-        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v4 over the canonical
+        # it feeds (`_SYNTH_PROMPT_VERSION` / `_SYNTH_SCHEMA_VERSION` — prompt v5 over the canonical
         # v3 schema), so one Pass B run never egresses under two generations. Read from the
         # constants rather than re-typed: the previous literal 4/3 pair carried a comment still
         # claiming "prompt v3 / canonical schema v2", which is exactly how a drifted copy hides. The
@@ -904,6 +1012,13 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
         dispatch_subjects=_dispatch_subjects_for(chunk_items, catalog_source=catalog_source,
                                                  schema_by_table=schema_by_table),
+        # Task 9c: this ladder had NO report at all, so its bounds and its physical cost were
+        # unmeasured — on a wide catalog it is the ladder that issues the most calls. Its
+        # `not_attempted` is deliberately still not folded into Pass B's (see below): that count is
+        # table-granular and these refs are CHUNKS. The account is kept under its own phase key so
+        # the two are never added together.
+        report=({} if stats is None
+                else stats.setdefault("batch_by_phase", {}).setdefault("wide_phase1", {})),
     )
 
     phase2_items: list[BatchItem] = []
@@ -928,7 +1043,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
             logger.info("table_synth wide %r summarized %d/%d chunks — synthesizing on the partial "
                         "summaries (roster is complete)", table, len(present), len(refs))
         chunk_summaries = [json.loads(summaries[r]) for r in present]
-        metadata: dict = {"table": table, "chunk_summaries": chunk_summaries,
+        metadata: dict = {**carried_narrative.get(table, {}),
+                          "table": table, "chunk_summaries": chunk_summaries,
                           "column_roster": roster_by_table[table]}
         if table in table_def_by_table:
             metadata["table_definition"] = table_def_by_table[table]
@@ -942,7 +1058,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
                           dispositions=dispositions, ingestion_run_id=ingestion_run_id,
                           catalog_source=catalog_source, schema_by_table=schema_by_table,
-                          stats=stats, catalog_context_available=catalog_context_available,
+                          stats=stats, phase="wide_phase2",
+                          catalog_context_available=catalog_context_available,
                           critic=critic)
 
 
@@ -953,6 +1070,14 @@ _TYPE_FIELDS_NOTE = (
     "from documentation, not a confirmation of the physical type. Never treat declared_type as the "
     "operational type. When present, table_definition is the curated business definition of the "
     "whole table. "
+    # Prompt v5 (Task 7b): the model was being handed this prose with nothing saying what it is,
+    # what GRAIN it describes, or that it must not be treated as settled fact.
+    "When present, catalog_description / catalog_business_context / catalog_display_name / "
+    "catalog_business_domains describe the WHOLE CATALOG this table belongs to, not this table — "
+    "they are prose a person typed to say what the dataset is and why the business keeps it, and "
+    "catalog_narrative_authority names who said it. Use them to interpret what a row of this table "
+    "represents; they are CONTEXT, never a fact about this table and never a substitute for the "
+    "columns. "
 )
 
 # Prompt v3 ([F1]): the accepted table_role values are enumerated in the PROMPT (and enforced
@@ -981,8 +1106,10 @@ _PROFILE_NOTE = (
     "authority_role (how authoritative this COPY is); and temporal_storage_model (how it stores "
     "history). "
     "EVERY suggestion must cite its evidence in `evidence_refs` as {field, refs}, naming ONLY "
-    "columns from the provided list or the literal 'table_definition' — a suggestion citing nothing "
-    "is discarded. "
+    "columns from the provided list, the literal 'table_definition', or one of the catalog "
+    "narrative keys when the item carries them ('catalog_description', 'catalog_business_context', "
+    "'catalog_display_name', 'catalog_business_domains') — a suggestion citing nothing is "
+    "discarded. "
     "When a table_definition is already provided it is CURATED and stays current: offer a "
     "table_description only as an ALTERNATIVE for human review, never as a correction, and NEVER "
     "paraphrase the curated text back. Omit any field the evidence does not settle — an omission is "

@@ -240,6 +240,50 @@ def test_a_snapshot_table_earns_the_time_mismatch_advisory(db, profiles_on):
     advisories = " ".join(block["balances"]["advisories"])
     assert "SNAPSHOT" in advisories
     assert "counts snapshots, not activity" in advisories
+    # Task 8b: `source_declared`, not `confirmed`. This upload's as-of really was auto-confirmed by
+    # `_assert_fact` from the file's own flag, and no human ever saw it — the status now says which.
+    assert block["balances"]["as_of_status"] == "source_declared"
+
+
+def test_a_snapshot_table_earns_the_advisory_on_an_UNCONFIRMED_as_of_too(db, profiles_on):
+    """The advisory must track what the block EMITS, not whether a governed fact is servable.
+
+    Task 8 made `_table_context` emit a merely-DECLARED as-of column, so the identical table now
+    hands the model a time anchor where it used to hand it nothing. Suppressing the warning there
+    would silence it on exactly the tables whose anchor is least examined — and the sentence is true
+    of the STORAGE MODEL, not of the fact lifecycle.
+
+    THE UNSTAMPED STATE IS CONSTRUCTED, not assumed. `ingest_upload` AUTO-CONFIRMS a file-declared
+    grain/as-of (`_assert_fact`, `authority_basis=source_declared`), so an ordinary upload lands on a
+    STAMPED column; the first draft of this test asserted the unstamped state off a plain upload and
+    was wrong. Nulling the stamps reproduces the real state that reaches here — the file's flag
+    surviving a governed fact that `resolve_fact` will not currently serve (drift-STALEd / expired),
+    which is what `project_table_facts_for_ref` leaves behind because its clear SPARES declared
+    columns.
+
+    TASK 8b: the token is `source_declared` in BOTH configurations, and that is the point of the
+    change. Stamped or not, the uploader's file is who asserted this as-of and nobody reviewed it;
+    whether the governed fact is currently servable is an EXECUTION question, and the execution path
+    answers it from the fact stream rather than from this block. The state the two tests differ in is
+    still constructed and still exercised — it just no longer produces two different labels for one
+    assertion."""
+    _seal()
+    rows = [CanonicalRow(_SRC, "balances", "bal_id", "text", is_grain=True),
+            CanonicalRow(_SRC, "balances", "snap_ts", "timestamp", as_of=True)]
+    assert ingest_upload(db, _SRC, rows, actor=ACTOR, now=_NOW).status == "ingested"
+    _table_evidence(db, "balances", "table_role", "snapshot_fact")
+    resolve_and_project(db, source=_SRC, logical_refs=[normalize_ref(_SRC, None, "balances")])
+    db.execute("UPDATE graph_node SET availability_fact_event_id = NULL, "
+               "grain_fact_event_id = NULL WHERE catalog_source = %s AND table_name = 'balances'",
+               (_SRC,))
+    block = {b["table"]: b for b in _table_context(_candidate_columns(db, _SRC, roles=()))}["balances"]
+    assert not db.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = 'balances' "
+        "AND availability_fact_event_id IS NOT NULL", (_SRC,)).fetchall(), (
+        "the unstamped state this test exists for was not constructed")
+    assert (block["as_of_column"], block["as_of_status"]) == ("snap_ts", "source_declared")
+    assert (block["grain_columns"], block["grain_status"]) == (["bal_id"], "source_declared")
+    assert "counts snapshots, not activity" in " ".join(block["advisories"])
 
 
 def test_the_profile_keys_pass_the_real_egress_adapter(catalog, profiles_on):

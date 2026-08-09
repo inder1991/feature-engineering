@@ -399,6 +399,117 @@ it('a non-403 failure is an error, not an invented empty state', async () => {
   expect(await within(section).findByRole('alert')).toHaveTextContent(/could not load suggestions/i)
 })
 
+// ── the finer LLM axis beside the coarse source domain ───────────────────────────────────────────
+
+it('shows the sub-domain as its own axis, with the author of the value', async () => {
+  // `sub_domain` reached `effective_metadata` with the rest of the axes and was then dropped by
+  // the Overview's own field list, so the LLM's finer classification existed in the payload and
+  // appeared on no screen.
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.sub_domain = {
+      value: 'Operational Metadata', authority: 'hint', c1_status: 'no_decision',
+      provenance: null, evidence_provenance: 'AI proposed', selected_evidence_ids: [],
+      proposed_value: null,
+    }
+  }))
+  const row = screen.getByTestId('axis-sub_domain')
+  expect(within(row).getByText('Sub-domain')).toBeInTheDocument()
+  expect(within(row).getByText('Operational Metadata')).toBeInTheDocument()
+  expect(within(row).getByText('AI proposed')).toBeInTheDocument()
+})
+
+it('a sub-domain nobody proposed reads "nothing known yet", never a blank row', async () => {
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.sub_domain = {
+      value: null, authority: 'missing', c1_status: 'no_decision',
+      provenance: null, evidence_provenance: null, selected_evidence_ids: [],
+      proposed_value: null,
+    }
+  }))
+  expect(within(screen.getByTestId('axis-sub_domain')).getByText('nothing known yet'))
+    .toBeInTheDocument()
+})
+
+it('omits the sub-domain row entirely when the server does not send the field', async () => {
+  // A deployment whose backend predates the axis must look exactly like today's, not like a
+  // column whose sub-domain is missing.
+  await renderDossier(detail())
+  expect(screen.queryByTestId('axis-sub_domain')).toBeNull()
+})
+
+// ── the AI's search terms ────────────────────────────────────────────────────────────────────────
+
+it('shows the AI-proposed search terms as separate terms, each with its author', async () => {
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [{
+        evidence_id: 'ev-syn', producer: 'llm', strength: 'proposed',
+        proposed_value: 'audit user, created by, record creator, data steward',
+        confidence_band: null,
+      }],
+    }
+  }))
+  const section = screen.getByTestId('search-terms')
+  // Separate terms, not one run-on line: after Task 4c there are 15–20 of them.
+  expect(within(section).getByText('audit user')).toBeInTheDocument()
+  expect(within(section).getByText('created by')).toBeInTheDocument()
+  expect(within(section).getByText('record creator')).toBeInTheDocument()
+  expect(within(section).getByText('data steward')).toBeInTheDocument()
+  // Who drafted them, at the point they are read — in the word the rest of the platform uses for a
+  // `llm`/`proposed` evidence row (`asset_detail._EVIDENCE_PROVENANCE_LABELS`), not a third
+  // synonym for it.
+  expect(within(section).getByText('AI proposed')).toBeInTheDocument()
+  // And never framed as a fault.
+  expect(section.textContent).not.toMatch(/blocked|invalid|failed|error/i)
+})
+
+it('says a column has no search terms rather than showing an empty list', async () => {
+  await renderDossier(detail())
+  const section = screen.getByTestId('search-terms')
+  expect(within(section).getByText(/no search terms are recorded/i)).toBeInTheDocument()
+})
+
+it('does not present a retired draft as a current search term', async () => {
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [],
+      stale: [{
+        evidence_id: 'ev-old', producer: 'llm', strength: 'proposed',
+        proposed_value: 'former alias', confidence_band: null,
+      }],
+    }
+  }))
+  const section = screen.getByTestId('search-terms')
+  expect(within(section).queryByText('former alias')).toBeNull()
+  expect(within(section).getByText(/no longer active/i)).toBeInTheDocument()
+})
+
+it('counts a draft retired into any lifecycle, not only into stale', async () => {
+  // `stale` is the only bucket reachable for this field TODAY (`_reconcile_llm_field_evidence` →
+  // `stale_all_llm_field_evidence`; `superseded` is human-producer-scoped; `rejected` needs
+  // `apply_field_decision`, which 400s for `semantic_terms` — it has no `field_policies` entry).
+  // But `_evidence_section` creates a bucket for whatever lifecycle a row carries, so reading one
+  // name would turn a future lifecycle into a clean "nothing was ever drafted" claim over drafts
+  // that do exist.
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [],
+      quarantined: [{
+        evidence_id: 'ev-q', producer: 'llm', strength: 'proposed',
+        proposed_value: 'former alias', confidence_band: null,
+      }],
+    }
+  }))
+  const section = screen.getByTestId('search-terms')
+  expect(within(section).queryByText('former alias')).toBeNull()
+  expect(within(section).getByText(/no longer active/i)).toBeInTheDocument()
+})
+
+it('renders no search-terms section at all when the evidence section was not served', async () => {
+  await renderDossier(detail(d => { delete d.evidence }))
+  expect(screen.queryByTestId('search-terms')).toBeNull()
+})
+
 // ── dossier order: identity → meaning → semantics → governance → usage ──────────────────────────
 
 describe('section order', () => {

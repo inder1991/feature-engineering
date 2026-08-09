@@ -12,6 +12,7 @@ import hashlib
 import psycopg
 import logging
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
@@ -20,9 +21,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
 from featuregen.contracts.db import DbConn
 from featuregen.idgen import mint_id
+from featuregen.intake.redaction import INPUT_KEY_REPAIR_ERRORS
 
 # ---- shared-contract shapes (overview §9.1) -------------------------------------------------
 
@@ -48,6 +50,15 @@ class LLMRequest:
     # (compute_input_hash reads ``inputs``, not request fields), never stored on the llm_call audit,
     # and never removed from ``inputs`` — the redacted inputs the guard/audit see are unchanged.
     cacheable_metadata_keys: tuple[str, ...] = ()
+    # Multiplier the adapter applies to its CONFIGURED per-attempt wall clock (MF-4,
+    # FEATUREGEN_LLM_TIMEOUT) — 1.0 is every baseline call, i.e. exactly the configured value. Only
+    # `_escalated` raises it, by the SAME ratio it raises `max_tokens`: an attempt granted 4x the
+    # output tokens needs 4x the clock to spend them, or the retry is cut off mid-generation and the
+    # truncation is merely relabelled as a timeout. A WIRE hint like `cacheable_metadata_keys`:
+    # excluded from the idempotency key (compute_input_hash reads ``inputs``; find_llm_call compares
+    # ``generation_settings``) and never stored on the llm_call audit — the ESCALATION is audited as
+    # the `max_tokens` entry in repair_attempts, and the clock is derived from it.
+    timeout_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -95,7 +106,7 @@ DEFAULT_LLM_MODEL = "claude-sonnet-5"
 
 def compute_input_hash(inputs: Mapping[str, Any]) -> str:
     """sha256 of the exact redacted (LLM-safe) input — the dedup/identity component (§9.3).
-    Transient driver keys (`_`-prefixed, e.g. `_repair_errors`) are excluded so a repair re-call
+    Transient driver keys (`_`-prefixed, e.g. `INPUT_KEY_REPAIR_ERRORS`) are excluded so a re-call
     keeps the SAME identity as its parent (no double-charge, stable FakeLLM keying)."""
     material = {k: v for k, v in inputs.items() if not str(k).startswith("_")}
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -188,7 +199,7 @@ class StructuredCallOutcome:
     self_reported_scores: dict
     status: str                 # STATUS_*
     validation_result: dict     # {"result": status, "reason"?: str}
-    repair_attempts: tuple      # ({attempt, class, reason}, ...)
+    repair_attempts: tuple      # ({attempt, class, reason, max_tokens?}, ...) — max_tokens on an escalated retry
     cost_metadata: dict
     security_audit_reason: str | None
     # #21 — provider requests ACTUALLY issued (1 + repairs + retries), reported even on a FAILED
@@ -197,7 +208,31 @@ class StructuredCallOutcome:
     provider_calls: int = 1
 
 
+def _accrue(total: dict, resp: LLMResult) -> dict:
+    """Add ONE physical attempt's provider usage to the running total for this logical call.
+
+    Every arm used to report only the LAST response's `cost_metadata`, so a logical call that
+    repaired or retried before succeeding silently dropped the tokens it had ALREADY paid for, and
+    `_failed` reported `{}` — under-counting a run's spend by exactly its failures. Both are the
+    same mistake `provider_calls` avoids by construction: the requests were issued, so the spend was
+    incurred, whatever the outcome.
+
+    Usage is OPTIONAL and may be PARTIAL (`llm_claude._usage_cost`: a provider error yields no usage
+    at all), so a missing key is ZERO rather than an absent total — an attempt that reports nothing
+    must not erase the attempts that did. Only int/float values accumulate; anything else is carried
+    through unsummed rather than crashing the driver on a provider field this code has not seen."""
+    for key, value in resp.cost_metadata.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            total.setdefault(key, value)
+            continue
+        prior = total.get(key)
+        total[key] = value if not isinstance(prior, (int, float)) or isinstance(prior, bool) \
+            else prior + value
+    return total
+
+
 def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int,
+            cost_metadata: dict | None = None,
             security_audit: bool = False) -> StructuredCallOutcome:
     return StructuredCallOutcome(
         output=dict(resp.output),
@@ -205,10 +240,164 @@ def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int
         status=STATUS_FAILED,
         validation_result={"result": STATUS_FAILED, "reason": reason},
         repair_attempts=tuple(attempts),
-        cost_metadata={},
+        # The tokens this logical call actually spent before it failed — NOT `{}`. See `_accrue`.
+        cost_metadata=dict(cost_metadata or {}),
         security_audit_reason=reason if security_audit else None,
         provider_calls=provider_calls,
     )
+
+
+#: A provider 400s a `max_tokens` above the model's real output ceiling, so escalation is bounded —
+#: past the cap the retry budget is spent honestly rather than on a request that will be rejected.
+_TRUNCATION_ESCALATION = 2.0
+_MAX_TOKENS_CEILING = 64_000
+
+
+def _escalated(request: LLMRequest, provider_status: str) -> tuple[LLMRequest, int | None]:
+    """A retry that DIFFERS from the attempt it follows.
+
+    A `max_tokens` truncation is deterministic — sampling parameters are removed on current
+    models, so replaying identical bytes re-truncates. Raise the ceiling instead. Schema-fault and
+    transient retries ARE genuinely re-attemptable as-is and pass through unchanged.
+
+    ONE decision, two consequences: the ratio that raises the ceiling also raises `timeout_scale`,
+    because a ceiling the attempt has no TIME to fill is not a different attempt — it fails on the
+    adapter's per-attempt clock (MF-4) as an APITimeoutError, which maps to PROVIDER_NON_RETRYABLE
+    and ENDS the call on the spot, discarding the retry budget that was still left. Deriving both
+    from one ratio here is what stops the ceiling and the clock drifting apart.
+
+    Returns `(request, raised_to)`; `raised_to` is None when nothing changed, so the caller can
+    record the escalation in `attempts` without inventing a value.
+    """
+    if provider_status != PROVIDER_MAX_TOKENS:
+        return request, None
+    gs = dict(request.generation_settings)
+    current = int(gs.get("max_tokens") or 0)
+    if current <= 0:
+        return request, None
+    raised = min(int(current * _TRUNCATION_ESCALATION), _MAX_TOKENS_CEILING)
+    if raised <= current:
+        return request, None       # already at the cap — escalate no further, and do not re-scale
+    gs["max_tokens"] = raised
+    # The clock scales by the ACTUAL ratio applied, not by _TRUNCATION_ESCALATION: the attempt that
+    # lands on the cap gets a partial raise, and must get exactly that much more time.
+    return replace(request, generation_settings=gs,
+                   timeout_scale=request.timeout_scale * (raised / current)), raised
+
+
+#: Bounded backoff before a PROVIDER_TRANSIENT re-call. Doubling from 1s, capped at 5s per wait.
+#:
+#: This driver was the ONLY retry layer with no wait at all: `_RETRYABLE` re-called in the same tick,
+#: so three attempts against a rate-limited or overloaded provider completed inside a few
+#: milliseconds and were three guaranteed failures. That was survivable only while the Anthropic SDK
+#: was absorbing the class underneath us with its own backoff; `llm_claude._SDK_MAX_RETRIES = 0`
+#: removed that, so the wait has to exist at the layer that can actually see the disposition.
+#:
+#: TRANSIENT ONLY, deliberately. `_RETRYABLE` also covers PROVIDER_MAX_TOKENS and
+#: PROVIDER_SCHEMA_FAULT, and both are DETERMINISTIC — a truncation does not un-truncate because we
+#: waited, so sleeping there would buy nothing and add latency to the common escalation path.
+#:
+#: WHAT IT DOES NOT RECOVER, stated so nobody reads more into it: a long provider `retry-after`
+#: (a per-minute token quota is commonly 30-60s). The PROVIDER_* taxonomy is a bare status token
+#: with no metadata channel, so the header the provider sends cannot reach this decision — see
+#: DEFERRED-WORK A.49. What this does recover is the short blip: 529 `overloaded_error` and
+#: transient 5xx, which typically clear in seconds.
+_TRANSIENT_BACKOFF_BASE_S = 1.0
+_TRANSIENT_BACKOFF_CAP_S = 5.0
+
+
+def transient_backoff_s(retries_used: int) -> float:
+    """Seconds to wait before the Nth transient re-call (N is 1-based). Public and pure so the
+    deployment-bounds test can fold it into the worst-case chain instead of hard-coding a number."""
+    return min(_TRANSIENT_BACKOFF_BASE_S * (2 ** (retries_used - 1)), _TRANSIENT_BACKOFF_CAP_S)
+
+
+#: Bound on the rendered repair feedback — a pathological error list must not grow the payload.
+_MAX_REPAIR_FEEDBACK_CHARS = 2000
+
+#: Bound on ONE author-attested reason (see `AttestedSchemaValidationError`). Separate from
+#: `_MAX_REPAIR_FEEDBACK_CHARS` on purpose: that one bounds the JOINED string `_wire_prompt`
+#: renders, i.e. the WIRE only. The reason is also stored per attempt and un-joined in
+#: `llm_call.repair_attempts` — and, where the caller is dispatch-audited, verbatim in
+#: `llm_dispatch.redacted_input` — neither of which passes through that truncation. So the bound
+#: has to exist where the reason is minted. Generous: every attested reason in the tree is well
+#: under 200 chars, and this is a backstop against an author folding a whole vocabulary in, not a
+#: style rule.
+MAX_ATTESTED_REASON_CHARS = 300
+
+
+def _path_is_schema_declared(cause: object) -> bool:
+    """True when EVERY segment of the failing instance path came from the SCHEMA, not the data.
+
+    jsonschema records the instance path (`absolute_path`, which `json_path` renders) and the
+    schema path (`absolute_schema_path`) side by side. A DECLARED property name always appears in
+    the schema path immediately after the literal `properties`. A key that reached the validator
+    through `additionalProperties: <subschema>`, `patternProperties` or `propertyNames` never
+    appears there at all — those keywords descend carrying the MODEL-CHOSEN key in the instance
+    path only (`$.totals['Acme Corporation Ltd']` against a schema path of
+    `properties/totals/additionalProperties/type`). So the names following `properties` are exactly
+    the schema's own vocabulary, and an instance segment outside it is model-supplied text. Array
+    indices are integers and carry nothing.
+
+    A GUARD, not a schema walker: the vocabulary is pooled across the whole schema path rather than
+    matched level by level, so a model-chosen key that happens to equal a name declared elsewhere in
+    the schema is emitted. That is the accepted bound — the emitted token is still schema-authored
+    text drawn from a fixed vocabulary, never data. A cause that cannot show its instance path is
+    unverifiable, and unverifiable means unsafe.
+    """
+    instance_path = getattr(cause, "absolute_path", None)
+    if instance_path is None:
+        return False
+    schema_path = list(getattr(cause, "absolute_schema_path", None) or ())
+    declared = {name for keyword, name in zip(schema_path, schema_path[1:])
+                if keyword == "properties"}
+    return all(isinstance(seg, int) or seg in declared for seg in instance_path)
+
+
+def _safe_reason(exc: SchemaValidationError) -> str:
+    """A VALUE-FREE description of why the structure failed.
+
+    `jsonschema.ValidationError.message` embeds the offending INSTANCE VALUE, which derives from
+    the catalog metadata this call egressed and has NOT been through `assert_llm_safe` (that guard
+    scans `redacted_intent` and `catalog_metadata` only). Feeding the raw message back into the
+    repair prompt would re-egress content past the PII guard. Carry only the JSON pointer and the
+    failed keyword — enough for the model to fix its output. `registry.validate` raises `from exc`,
+    so the structured cause is always available.
+
+    The keyword is always a schema token. The POINTER is NOT, and this is the trap: `json_path` is
+    built from INSTANCE property names, so under an open object a key the MODEL chose rides out
+    verbatim. Every schema that reaches a `validate_output` today is closed
+    (`additionalProperties: false`), so nothing leaks — but that is an invariant of OTHER modules,
+    unenforced and undocumented there, and an egress boundary may not rest on it. So the guarantee
+    is re-derived here rather than assumed: a pointer is emitted ONLY when
+    `_path_is_schema_declared` proves every segment is an array index or a schema-declared name,
+    and anything else falls back to the value-free constant. The next author to register an open
+    document schema gets a duller repair complaint, never a leak.
+
+    ONE EXEMPTION, and it is a type: an :class:`AttestedSchemaValidationError` carries a reason its
+    AUTHOR attested is value-free, and that reason is preferred over everything below. It exists
+    because a HAND-WRITTEN validator (`analysis.intent.validate_intent`) raises with no jsonschema
+    `__cause__` at all, so the structural rebuild has nothing to work from and every such failure —
+    including deliberately actionable ones like "that is a table; entity_ref must be a column" —
+    collapsed into the generic constant. The attested reason is preferred over the structural
+    pointer even when both exist: an author who wrote one did so because it says something the
+    pointer cannot (which field, and what the field WANTED), and it is value-free by the same
+    attestation. `getattr` is deliberately NOT used to find it — only the declared type may claim
+    the exemption, so `grep AttestedSchemaValidationError` enumerates every claim ever made, and an
+    `llm_safe_reason` attribute stapled onto a plain error is ignored. Bounded by
+    `MAX_ATTESTED_REASON_CHARS` because the un-joined reason reaches audit columns that
+    `_wire_prompt`'s truncation never sees.
+    """
+    if isinstance(exc, AttestedSchemaValidationError):
+        attested = str(exc.llm_safe_reason or "").strip()
+        if attested:
+            return attested[:MAX_ATTESTED_REASON_CHARS]
+    cause = exc.__cause__
+    path = getattr(cause, "json_path", None)
+    validator = getattr(cause, "validator", None)
+    if path and validator and _path_is_schema_declared(cause):
+        return f"{path}: failed '{validator}'"
+    return "the structure did not match the required schema"
 
 
 def drive_structured_call(
@@ -218,6 +407,7 @@ def drive_structured_call(
     *,
     repair_budget: int = DEFAULT_REPAIR_BUDGET,
     retry_budget: int = DEFAULT_RETRY_BUDGET,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> StructuredCallOutcome:
     """Drive one structured LLM call to a fail-closed disposition (§9.2). Provider-agnostic:
     re-invokes `client.call` for repairs/retries. `validate_output(output)` raises
@@ -226,13 +416,20 @@ def drive_structured_call(
     Truncation/schema-fault/transient → bounded retry. Auth → fail closed + security-audit signal.
     Nothing proceeds on an unresolved outcome; an invalid structure is a doubt, not a value.
     The outcome's `provider_calls` counts every `client.call` issued (#21) so callers tallying a
-    provider-call budget account for repairs/retries, not just the initial request."""
+    provider-call budget account for repairs/retries, not just the initial request.
+
+    A TRANSIENT retry waits first (`transient_backoff_s`); the deterministic retry classes do not.
+    `sleep` is the seam that keeps that assertable without wall-clock — callers should leave it
+    alone, and the test suite zeroes the SCHEDULE rather than replacing the function, so the wait
+    still happens and can still be observed."""
     attempts: list[dict] = []
     repairs_used = 0
     retries_used = 0
     errors: list[str] = []
     resp = client.call(request)
     provider_calls = 1
+    # Running provider spend for this LOGICAL call, accrued per PHYSICAL attempt (see `_accrue`).
+    spend: dict = _accrue({}, resp)
     while True:
         ps = resp.status
         if ps == PROVIDER_OK:
@@ -240,7 +437,9 @@ def drive_structured_call(
                 validate_output(resp.output)
             except SchemaValidationError as exc:
                 ps = PROVIDER_INVALID
-                errors.append(str(exc))
+                # `_safe_reason`, never `str(exc)`: this text is re-prompted to the provider AND
+                # stored verbatim as audited request input, and the raw message carries a value.
+                errors.append(_safe_reason(exc))
             else:
                 status = (
                     STATUS_REPAIRED if repairs_used
@@ -253,7 +452,7 @@ def drive_structured_call(
                     status=status,
                     validation_result={"result": status},
                     repair_attempts=tuple(attempts),
-                    cost_metadata=dict(resp.cost_metadata),  # N9 — capture provider usage/cost
+                    cost_metadata=dict(spend),   # N9 — EVERY attempt's usage, not just this one
                     security_audit_reason=None,
                     provider_calls=provider_calls,
                 )
@@ -264,30 +463,41 @@ def drive_structured_call(
                 attempts.append({"attempt": repairs_used, "class": "repair", "reason": reason})
                 # re-prompt with the accumulated validation error, via a transient (`_`-prefixed)
                 # key EXCLUDED from the identity hash so the repair keeps its parent's identity.
-                request = replace(request, inputs={**request.inputs, "_repair_errors": list(errors)})
+                request = replace(request,
+                                  inputs={**request.inputs,
+                                          INPUT_KEY_REPAIR_ERRORS: list(errors)})
                 resp = client.call(request)
                 provider_calls += 1
+                _accrue(spend, resp)
                 continue
             return _failed(resp, attempts, "repair budget exhausted (malformed structure)",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps == PROVIDER_REFUSAL:
             return _failed(resp, attempts, "provider refusal (policy decline)",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps in _RETRYABLE:
             if retries_used < retry_budget:
                 retries_used += 1
-                attempts.append({"attempt": retries_used, "class": "retry", "reason": ps})
+                request, raised = _escalated(request, ps)
+                attempts.append({"attempt": retries_used, "class": "retry", "reason": ps,
+                                 **({"max_tokens": raised} if raised else {})})
+                # Wait only for the class a wait can help (see `_TRANSIENT_BACKOFF_BASE_S`). The
+                # ledger entry is appended BEFORE the wait, so an attempt is recorded as issued
+                # whether or not the process survives the sleep.
+                if ps == PROVIDER_TRANSIENT:
+                    sleep(transient_backoff_s(retries_used))
                 resp = client.call(request)
                 provider_calls += 1
+                _accrue(spend, resp)
                 continue
             return _failed(resp, attempts, f"{ps} retry budget exhausted",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps == PROVIDER_AUTH_ERROR:
             return _failed(resp, attempts, "provider auth failure", provider_calls=provider_calls,
-                           security_audit=True)
+                           cost_metadata=spend, security_audit=True)
         # PROVIDER_NON_RETRYABLE and any unknown token → fail closed
         return _failed(resp, attempts, f"non-retryable provider outcome ({ps})",
-                       provider_calls=provider_calls)
+                       provider_calls=provider_calls, cost_metadata=spend)
 
 
 # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------

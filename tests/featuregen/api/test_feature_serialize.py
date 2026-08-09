@@ -118,6 +118,26 @@ def test_v2_carries_h1a_fields_only_when_non_default():
         {"role": "entity", "authority": "governed", "ref": ["bank", "public.accounts.customer_id"]}]
 
 
+def test_grounding_reaches_v2_only_when_the_model_returned_some():
+    """Task 6c. The whole point of the field is that a reviewer READS it, so it must leave the
+    server — a stage that validates a value and then drops it before the wire has done nothing.
+    v1 never carries it (flag-off byte-identity) and v2 omits it when empty, so a candidate that
+    returned no grounding — every recipe/planner candidate and every pre-v5 response — serializes
+    byte-identically to before."""
+    from featuregen.overlay.upload.feature_assist import GroundingNote
+
+    plain = _idea_with_new_fields()
+    assert "grounding" not in serialize_feature_idea_v2(plain)
+    grounded = FeatureIdea(
+        name="n", description="", derives_from=["public.accounts.balance"], aggregation="avg",
+        grain_table="accounts",
+        grounding=(GroundingNote("public.accounts.balance", "measure", "monetary, llm/proposed"),))
+    assert serialize_feature_idea_v2(grounded)["grounding"] == [
+        {"column": "public.accounts.balance", "role": "measure", "why": "monetary, llm/proposed"}]
+    v1 = serialize_feature_idea_v1(grounded)
+    assert list(v1.keys()) == _PRE_SLICE3_KEYS and "grounding" not in v1
+
+
 def _recommend_fake() -> FakeLLM:
     return FakeLLM(script={
         "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),

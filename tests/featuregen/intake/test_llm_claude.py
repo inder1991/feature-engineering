@@ -90,18 +90,23 @@ def test_rejected_schema_keyword_is_token_only():
 # ---- finding #24: the adapter surfaces provider usage and applies the pinned settings ----------
 
 
-def _stub_adapter(monkeypatch, create):
+def _stub_adapter(monkeypatch, create, config=None):
     """A ClaudeLLM whose SDK surface is stubbed: `anthropic` in sys.modules is a bare module with
-    the two exception types `.call` references, and the constructed client is a create-capturing
-    fake — no SDK, no network."""
+    the three exception types `.call` references, and the constructed client is a create-capturing
+    fake — no SDK, no network.
+
+    `APITimeoutError` subclasses `APIConnectionError` here because it does in the real SDK; the
+    adapter's arm ordering depends on that, so a stub that flattened the hierarchy would let a
+    broken ordering pass. (The classification itself is exercised in `test_claude_timeout.py`.)"""
     import sys
     import types
 
     stub = types.ModuleType("anthropic")
     stub.APIStatusError = type("APIStatusError", (Exception,), {})
     stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
+    stub.APITimeoutError = type("APITimeoutError", (stub.APIConnectionError,), {})
     monkeypatch.setitem(sys.modules, "anthropic", stub)
-    adapter = ClaudeLLM(ClaudeConfig(enabled=True))
+    adapter = ClaudeLLM(config or ClaudeConfig(enabled=True))
     adapter._client = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
     return adapter
 
@@ -140,6 +145,73 @@ def test_claude_adapter_surfaces_provider_usage_and_pinned_settings(monkeypatch)
     assert captured["max_tokens"] == 1024
     assert captured["thinking"] == {"type": "adaptive"}
     assert captured["output_config"]["effort"] == "low"    # pinned setting wins over config default
+
+
+def test_escalated_timeout_reaches_messages_create(monkeypatch):
+    """The scaled wall clock must reach `messages.create`, not just `_effective_timeout`.
+
+    A truncation retry is granted a raised `max_tokens`; if the timeout kwarg is still the
+    un-scaled config value the attempt is cut off mid-generation and the truncation is merely
+    relabelled as an APITimeoutError -> PROVIDER_NON_RETRYABLE. This runs SDK-FREE via the `anthropic`
+    stub, so CI (which installs only the `dev` extra) actually guards the assembled kwarg — the
+    `_effective_timeout` unit tests alone cannot catch the helper being computed but not wired.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"concept": "monetary_amount"}')],
+        )
+
+    adapter = _stub_adapter(monkeypatch, _create, ClaudeConfig(enabled=True, timeout=60.0))
+    request = _schema_request({"provider": "anthropic", "model": "m", "max_tokens": 4096})
+
+    adapter.call(request)
+    assert (captured["max_tokens"], captured["timeout"]) == (4096, 60.0)  # baseline: as configured
+
+    # the 2nd truncation retry: 4x the ceiling AND 4x the clock, both on the wire
+    adapter.call(replace(request, timeout_scale=4.0,
+                         generation_settings={"provider": "anthropic", "model": "m",
+                                              "max_tokens": 16384}))
+    assert (captured["max_tokens"], captured["timeout"]) == (16384, 240.0)
+
+
+def test_the_sdk_client_is_constructed_with_retries_DISABLED(monkeypatch):
+    """`_stub_adapter` assigns `_client` directly, so nothing above exercises the CONSTRUCTION path
+    where `max_retries` is passed. This does.
+
+    The SDK defaults `max_retries` to 2 and retries APITimeoutError internally, so a bare
+    `anthropic.Anthropic()` makes every per-attempt ceiling cost up to 3x its configured value
+    inside a single `messages.create` — invisible to the driver, invisible in the log line, and
+    charged to the source advisory lock. Deleting the kwarg is a one-token edit that triples the
+    deployed bound, which is why it is asserted on the assembled call rather than trusted to review.
+    """
+    import sys
+    import types
+
+    captured = {}
+    stub = types.ModuleType("anthropic")
+    stub.APIStatusError = type("APIStatusError", (Exception,), {})
+    stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
+    stub.APITimeoutError = type("APITimeoutError", (stub.APIConnectionError,), {})
+
+    def _anthropic(**kwargs):
+        captured.update(kwargs)
+        return types.SimpleNamespace(messages=types.SimpleNamespace(create=None))
+
+    stub.Anthropic = _anthropic
+    monkeypatch.setitem(sys.modules, "anthropic", stub)
+
+    ClaudeLLM(ClaudeConfig(enabled=True))._ensure_client()
+
+    assert captured["max_retries"] == 0
+    assert captured == {"max_retries": 0}, (
+        "an extra constructor kwarg is a client-wide behaviour change; state it here deliberately")
 
 
 def test_claude_adapter_without_usage_still_returns_cleanly(monkeypatch):
@@ -200,6 +272,37 @@ def test_wire_prompt_without_cacheable_keys_is_a_single_user_message():
     system, user = _wire_prompt(_bare_request())              # cacheable_metadata_keys defaults to ()
     assert system is None
     assert user.startswith("Structure the following intent")
+
+
+def _repair_request(inputs):
+    from featuregen.intake.llm import LLMRequest
+
+    return LLMRequest(
+        task="t", prompt_id="p", prompt_version=1,
+        inputs=inputs,
+        output_schema_id="s", output_schema_version=1,
+        generation_settings={}, output_schema={"type": "object"})
+
+
+def test_wire_prompt_renders_repair_errors():
+    """A repair re-call must DIFFER on the wire from the answer it refutes. Without this the
+    repair sends byte-identical bytes and the budget buys nothing."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    request = _repair_request({"redacted_intent": "i", "catalog_metadata": {},
+                               "_repair_errors": ["$.items[3].ref: failed 'required'"]})
+    _system, user_content = _wire_prompt(request)
+    assert "$.items[3].ref: failed 'required'" in user_content
+    assert "did not validate" in user_content
+
+
+def test_wire_prompt_omits_the_repair_block_on_a_first_attempt():
+    """No previous answer, no complaint about one."""
+    from featuregen.intake.llm_claude import _wire_prompt
+
+    request = _repair_request({"redacted_intent": "i", "catalog_metadata": {}})
+    _system, user_content = _wire_prompt(request)
+    assert "did not validate" not in user_content
 
 
 def test_claude_adapter_sends_vocab_as_a_cached_system_block(monkeypatch):

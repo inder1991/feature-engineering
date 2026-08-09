@@ -284,8 +284,77 @@ class IngestResult:
         return payload
 
 
+#: Task 9c — the ``run_batched`` report keys that ride into the stage detail verbatim. Counts and
+#: closed codes only; ``not_attempted`` is deliberately absent because ``_enrichment_outcome``
+#: clamps and places it itself. A key here that the ladder did not write is simply not emitted.
+_BATCH_DETAIL_KEYS: tuple[str, ...] = (
+    "provider_calls", "fallback_calls", "chunks_planned", "chunks_issued", "stopped_by", "bounds",
+    "timed_out", "outcomes", "rejects")
+
+
+def _batch_detail(batch: dict | None) -> dict:
+    """The ladder's physical account, projected into stage-detail keys.
+
+    Correct on the FAILURE path by construction, which is the whole point: ``run_batched`` writes
+    these into the caller's dict as they happen, so a stage whose enrichment raised still reports
+    the calls it spent and the bound it hit — the states an observability record exists to explain.
+    An absent key means the ladder never got that far (batch mode not used, or it died before the
+    first chunk), never "zero"."""
+    if not batch:
+        return {}
+    return {k: batch[k] for k in _BATCH_DETAIL_KEYS if k in batch}
+
+
+def _passb_batch_detail(stats: dict | None) -> dict:
+    """Pass B's physical account, projected per PHASE.
+
+    Pass B runs up to three ladders per ingest — narrow synthesis, wide phase-1 summary, wide
+    phase-2 synthesis — each with its own chunking, bounds and cost. They are reported side by side
+    rather than summed: "which bound stopped it" has a different answer per phase, and adding a
+    chunk-granular phase-1 count to a table-granular phase-2 one would produce a number that means
+    nothing. A phase absent from the map never ran (a narrow-only catalog has no wide phases)."""
+    by_phase = (stats or {}).get("batch_by_phase") or {}
+    projected = {phase: account for phase, report in by_phase.items()
+                 if (account := _batch_detail(report))}
+    return {"batch": projected} if projected else {}
+
+
+def _evidence_detail(counts: dict | None, writer: str | None,
+                     rolled_back: bool = False) -> dict:
+    """The PERSISTENCE half of a stage's account, as ``detail["evidence"]``.
+
+    ``resolved``/``expected`` count what the MODEL produced. They say nothing about what was
+    stored, and the two diverge silently: a technical upload has no ``source_snapshot_id``, so the
+    evidence writer is gated out entirely and every drafted value is discarded after being paid
+    for. ``writer`` names that case (``not_run:<reason>``); ``counts`` is the per-disposition
+    account when the writer DID run, including ``skipped_*`` reason keys.
+
+    ``rolled_back`` is the failure-path correction, and it is not optional: these writers run
+    inside the stage's savepoint, so an escape rolls the rows back while the in-memory counters
+    keep their increments. Reporting ``written: 5`` for five rows that no longer exist would be
+    worse than reporting nothing, so the flag rides with the numbers.
+
+    It rides ONLY when there are numbers to qualify. The flag exists to say "do not believe these
+    counts"; on a stage that raised before the writer ever ran there are no counts to disbelieve,
+    and emitting it there would assert that evidence rows were lost when none were written. The
+    stage's own ``failed`` state already carries that the savepoint went down."""
+    if not counts:
+        return {"evidence": {"writer": writer}} if writer is not None else {}
+    account: dict = dict(counts)
+    if writer is not None:
+        account["writer"] = writer
+    if rolled_back:
+        account["rolled_back"] = True
+    return {"evidence": account}
+
+
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
-                        not_attempted: int = 0) -> tuple[str, str | None, dict]:
+                        not_attempted: int = 0,
+                        evidence_skipped: int = 0,
+                        batch: dict | None = None,
+                        evidence_counts: dict | None = None,
+                        evidence_writer: str | None = None,
+                        rolled_back: bool = False) -> tuple[str, str | None, dict]:
     """``(state, reason_code, detail)`` for a per-item stage (#22) — the honest account. ``None``
     (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING (and
     nothing merely truncated) is ``failed``; SOME items unresolved — or the stage caught per-item
@@ -302,10 +371,26 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     When unresolved is (partly) truncation, its count rides in ``detail["not_attempted"]`` and — if
     there is no GENUINE dispatched failure — the reason_code is the distinct, honest ``truncated``.
     ``items_failed`` stays reserved for items actually dispatched and rejected/failed (a run with
-    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``)."""
+    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``).
+
+    ``evidence_skipped`` (from an evidence writer's ``counts`` out-param) is the third way a stage
+    can resolve every item and still leave nothing behind: the items were drafted, and the WRITER
+    declined to store them by design — for ``enrich_synonyms``, every column without a glossary
+    record, because there is no schema-preserving ref to key evidence on. Like ``not_attempted``
+    this is NOT a failure and must not be laundered into ``items_failed``; unlike it, the items were
+    both dispatched AND resolved, so it cannot be inferred from ``unresolved`` either — a stage that
+    drafted all 126 columns and stored 0 has ``resolved == expected`` and zero failures, which is
+    exactly the shape that used to return a clean ``succeeded``. It reports ``partial`` /
+    ``evidence_not_stored`` instead. Ranked LAST of the three: a real failure outranks truncation,
+    which outranks a designed non-write."""
+    # Task 9c: the physical account and the evidence-writer account are attached FIRST, so they
+    # survive the early `failed` return. A stage that raised is exactly the one whose call cost and
+    # bound need explaining, and the old shape reported `{"expected": n}` and nothing else.
+    account = {**_batch_detail(batch),
+               **_evidence_detail(evidence_counts, evidence_writer, rolled_back)}
     if result is None:
-        return "failed", "exception", {"expected": expected}
-    detail: dict = {"resolved": len(result), "expected": expected}
+        return "failed", "exception", {"expected": expected, **account}
+    detail: dict = {"resolved": len(result), "expected": expected, **account}
     unresolved = max(expected - len(result), 0)
     if unresolved:
         detail["unresolved"] = unresolved
@@ -321,6 +406,10 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     not_attempted = min(max(not_attempted, 0), unresolved)
     if not_attempted:
         detail["not_attempted"] = not_attempted
+    # Clamped to what was actually resolved: a writer cannot decline more items than the stage drafted.
+    evidence_skipped = min(max(evidence_skipped, 0), len(result))
+    if evidence_skipped:
+        detail["evidence_skipped"] = evidence_skipped
     dispatched_failures = unresolved - not_attempted   # unresolved items that WERE tried
     if expected and not result and not not_attempted:
         return "failed", "no_items_resolved", detail
@@ -328,6 +417,8 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
         return "partial", "items_failed", detail
     if not_attempted:
         return "partial", "truncated", detail
+    if evidence_skipped:
+        return "partial", "evidence_not_stored", detail
     return "succeeded", None, detail
 
 
@@ -2304,6 +2395,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # (a failed call is simply absent from the returned dict; a contained concept-evidence
         # write failure is threaded out via `stats`), so an outer success is not evidence.
         concept_stats: dict = {}
+        # Task 9c: set by the advisory handler below. The stage's savepoint takes the evidence rows
+        # down with it, so the in-memory write counts must be labelled as describing rolled-back work.
+        concept_rolled_back = False
         consume_audit_degradations()   # #13 gap D: discard any stale count before the first stage
         stage_started = datetime.now(UTC)
         try:
@@ -2329,10 +2423,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
+            concept_rolled_back = True
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
             internal_failures=concept_stats.get("evidence_write_failures", 0),
-            not_attempted=concept_stats.get("not_attempted", 0))
+            not_attempted=concept_stats.get("not_attempted", 0),
+            batch=concept_stats.get("batch"),
+            evidence_counts=concept_stats.get("evidence_counts"),
+            evidence_writer=concept_stats.get("evidence_writer"),
+            rolled_back=concept_rolled_back)
+        # Task 9c: the run's join-candidacy shape and the registry generation that produced it.
+        # Attached AFTER the outcome so it rides the FAILED detail too — a stage that died holding
+        # a partial classification is exactly the one whose namespace picture needs reading.
+        for _key in ("namespaces", "vocab_fingerprint"):
+            if _key in concept_stats:
+                detail[_key] = concept_stats[_key]
         record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         # Stage honesty for the Pass-A ACCEPTANCE critic (ingestion-richness Task 2 step 6): the
@@ -2340,22 +2445,49 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # separate pipeline step), and its report rides out via `stats`. Zero identifier items ->
         # `not_applicable`, NEVER silent; a concept stage that died before acceptance -> `not_run`;
         # a contained critic fault -> `failed`.
+        #
+        # The critic's own START (final branch review, 2026-08-09). Every other stage passes
+        # `started_at`, so `ingestion_run_stage.started_at` is NULL for this one alone and it has no
+        # DURATION — while reporting a clean `succeeded`. That is the wrong stage to leave
+        # unmeasured: Task 9b's 102 added `is_a` parents move `_registry_fingerprint()`, so the
+        # FIRST run after merge re-critiques every stored identifier verdict. On a 144-column
+        # catalog that is ~70-100 sequential calls at up to 300s each.
+        #
+        # [A.54, fixed 2026-08-09] That loop is now BOUNDED — it shares the concept stage's
+        # `CallLedger` and deadline, and reports `not_attempted`/`stopped_by`. The duration below
+        # is what says whether either bound actually bit. `enrich_concepts` records the instant it
+        # started; absent (an older caller, or a fault before the critic block) it stays NULL, which
+        # is honest rather than a fabricated zero.
+        # The MARKER states below keep `started_at=None` per `StageRecorder.record`'s contract — a
+        # `not_run` never began, and a `not_applicable` critic dispatched nothing to time.
+        critic_started = concept_stats.get("concept_critic_started_at")
         critic_report = concept_stats.get("concept_critic")
         if concepts is None or critic_report is None:
             record_stage(stage_recorder, "enrich_concept_critic", "not_run",
                          reason_code="enrich_concept_failed")
         elif critic_report.get("failed"):
             record_stage(stage_recorder, "enrich_concept_critic", "failed",
-                         reason_code="exception")
+                         reason_code="exception", started_at=critic_started)
         elif not critic_report.get("items"):
             record_stage(stage_recorder, "enrich_concept_critic", "not_applicable",
                          reason_code="no_identifier_assignments")
         else:
+            # Task 9c: `critic_report` now carries `verdict_changes` — the per-column before→after
+            # concept and namespace for every assignment the critic MOVED. If the concept stage's
+            # savepoint went down after the critic's own committed (a commit-time fault at the
+            # `with` exit), those evictions are gone while the in-memory report still describes
+            # them; label the report rather than publish a verdict trail for rows that do not exist.
+            critic_detail = dict(critic_report)
+            if concept_rolled_back:
+                critic_detail["rolled_back"] = True
             record_stage(stage_recorder, "enrich_concept_critic", "succeeded",
-                         detail=dict(critic_report))
+                         detail=critic_detail, started_at=critic_started)
         stage_started = datetime.now(UTC)
         def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         def_evidence_failures = 0
+        def_ev_counts: dict[str, int] = {}   # Task 9c: written/reused/skipped_<reason>/failed
+        def_ev_writer: str | None = None     # set when the writer is GATED OUT (never ran)
+        def_rolled_back = False
         try:
             with conn.transaction():
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
@@ -2375,7 +2507,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         def_evidence_failures = _write_definition_evidence(
                             conn, source=catalog_source, rows=vr.good, definitions=definitions,
                             glossary=glossary, concepts=concepts, bindings=bindings,
-                            source_snapshot_id=snapshot_id)
+                            source_snapshot_id=snapshot_id, counts=def_ev_counts)
                     except Exception:  # noqa: BLE001 — T2-M2: an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise to
@@ -2384,6 +2516,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
+            def_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                def_ev_writer = ("not_run:no_glossary" if glossary is None
+                                 else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             definitions,
             # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
@@ -2391,7 +2528,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # target set the drafter selects with and the reconciler keeps — one definition, no drift.
             len(_definition_targets(vr.good, glossary)),
             internal_failures=def_evidence_failures,
-            not_attempted=def_stats.get("not_attempted", 0))
+            not_attempted=def_stats.get("not_attempted", 0),
+            batch=def_stats.get("batch"), evidence_counts=def_ev_counts,
+            evidence_writer=def_ev_writer, rolled_back=def_rolled_back)
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 
@@ -2403,6 +2542,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         domain_evidence_failures = 0
+        domain_ev_counts: dict[str, int] = {}   # Task 9c — covers BOTH domain and sub_domain
+        domain_ev_writer: str | None = None
+        domain_rolled_back = False
         try:
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor,
@@ -2422,13 +2564,14 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         domain_evidence_failures = _write_domain_evidence(
                             conn, source=catalog_source, rows=vr.good, domains=domains,
                             column_domains=domain_overrides, glossary=glossary, bindings=bindings,
-                            source_snapshot_id=snapshot_id)
+                            source_snapshot_id=snapshot_id, counts=domain_ev_counts)
                         # D13.2 — the finer axis rides the SAME stage/savepoint/report as the
                         # coarse one it refines: one call produced both, so one failure domain.
                         domain_evidence_failures += _write_sub_domain_evidence(
                             conn, source=catalog_source, rows=vr.good,
                             column_sub_domains=column_sub_domains, glossary=glossary,
-                            bindings=bindings, source_snapshot_id=snapshot_id)
+                            bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=domain_ev_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
@@ -2437,16 +2580,26 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
+            domain_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                domain_ev_writer = ("not_run:no_glossary" if glossary is None
+                                    else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             domains, len({r.table for r in vr.good}),
             internal_failures=domain_evidence_failures,
-            not_attempted=domain_stats.get("not_attempted", 0))
+            not_attempted=domain_stats.get("not_attempted", 0),
+            batch=domain_stats.get("batch"), evidence_counts=domain_ev_counts,
+            evidence_writer=domain_ev_writer, rolled_back=domain_rolled_back)
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         synonyms = None
         syn_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        syn_counts: dict[str, int] = {}   # honest-labeling: the WRITER's per-item dispositions
         syn_evidence_failures = 0
+        syn_ev_writer: str | None = None
+        syn_rolled_back = False
         try:
             with conn.transaction():
                 # E1a T4: the AI's synonyms are FIRST-CLASS `llm/proposed` `semantic_terms` evidence —
@@ -2463,19 +2616,41 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     try:
                         syn_evidence_failures = _write_synonym_evidence(
                             conn, source=catalog_source, rows=vr.good, synonyms=synonyms,
-                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
+                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=syn_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
                         # to the advisory handler below, which logs it.
                         syn_evidence_failures = 1
                         raise
+                elif synonyms:
+                    # THE WRITER NEVER RAN. `_write_synonym_evidence` is gated on a glossary AND a
+                    # snapshot id, so a TECHNICAL upload drafts synonyms for EVERY column — at full
+                    # LLM cost, since `draft_synonyms` above is gated only on `client` — and stores
+                    # none of them. On that path the drafted terms have no consumer at all: this
+                    # writer is skipped, `_project_semantic_terms` is unreachable (its only call
+                    # sites are inside `_ingest_glossary_evidence`), and the same-run summary
+                    # ride-along does not run either (`enrich_summary` is `not_applicable` when
+                    # `glossary is None`). Counting the whole draft as SKIPPED here is what stops
+                    # the stage reporting a clean `succeeded` for a run that persisted nothing.
+                    # It is honest labeling only — the fix for the drafting itself (a ref strategy
+                    # for non-glossary columns) is a design decision, deliberately not made here.
+                    syn_counts["skipped"] = len(synonyms)
         except Exception:  # noqa: BLE001
             logger.warning("advisory synonym enrichment failed for %r", catalog_source, exc_info=True)
+            syn_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                syn_ev_writer = ("not_run:no_glossary" if glossary is None
+                                 else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             synonyms, len({content_hash(r) for r in vr.good}),
             internal_failures=syn_evidence_failures,
-            not_attempted=syn_stats.get("not_attempted", 0))
+            not_attempted=syn_stats.get("not_attempted", 0),
+            evidence_skipped=syn_counts.get("skipped", 0),
+            batch=syn_stats.get("batch"), evidence_counts=syn_counts,
+            evidence_writer=syn_ev_writer, rolled_back=syn_rolled_back)
         record_stage(stage_recorder, "enrich_synonyms", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
@@ -2483,6 +2658,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         unit_stats: dict = {}      # honest-labeling: receives batch not_attempted (budget/deadline)
         unit_currencies: dict[str, str] = {}   # {content_hash: ISO-4217} — monetary measures only
         unit_evidence_failures = 0
+        unit_ev_counts: dict[str, int] = {}   # Task 9c — covers BOTH unit and currency
+        unit_ev_writer: str | None = None
+        unit_rolled_back = False
         try:
             with conn.transaction():
                 # E4a T2: the measure annotation the FILE never declared. The AI's unit/currency is
@@ -2503,7 +2681,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         unit_evidence_failures = _write_unit_evidence(
                             conn, source=catalog_source, rows=vr.good, units=units,
                             currencies=unit_currencies, concepts=concepts, glossary=glossary,
-                            bindings=bindings, source_snapshot_id=snapshot_id)
+                            bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=unit_ev_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
@@ -2512,13 +2691,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory unit enrichment failed for %r", catalog_source, exc_info=True)
+            unit_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                unit_ev_writer = ("not_run:no_glossary" if glossary is None
+                                  else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             # The SAME target set the drafter selects with and the reconciler keeps — a measure
             # column whose file declares no unit. A non-measure (or an already-declared) column was
             # never asked, so it must not count as an unresolved item degrading the stage.
             units, len(_unit_targets(vr.good, concepts)),
             internal_failures=unit_evidence_failures,
-            not_attempted=unit_stats.get("not_attempted", 0))
+            not_attempted=unit_stats.get("not_attempted", 0),
+            batch=unit_stats.get("batch"), evidence_counts=unit_ev_counts,
+            evidence_writer=unit_ev_writer, rolled_back=unit_rolled_back)
         record_stage(stage_recorder, "enrich_unit", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 
@@ -2699,16 +2885,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # "unknown" are indistinguishable and the rule abstains rather than refuting every
                 # claim in the catalog. Read fail-soft: an unavailable narrative store degrades to
                 # abstention, never to a wrong refutation.
+                #
+                # Task 7b: read the NARRATIVE ITSELF, not just whether one exists. This probe had
+                # the prose in reach and threw it away — Pass B was told "a human wrote something
+                # about this catalog" and never shown what, while the upload form promised the
+                # description is "used by the AI when it interprets tables". The boolean is now
+                # derived from the same read, so the contradiction rule's behaviour is unchanged.
                 try:
                     from featuregen.overlay.upload.profile_store import (
+                        current_catalog_narrative_block,
                         current_catalog_profile_revision_id,
                     )
                     _catalog_context = current_catalog_profile_revision_id(
                         conn, catalog_source) is not None
+                    _catalog_narrative = current_catalog_narrative_block(conn, catalog_source)
                 except Exception:  # noqa: BLE001 — advisory: abstain rather than misfire
                     logger.warning("advisory catalog-narrative probe failed for %r",
                                    catalog_source, exc_info=True)
                     _catalog_context = False
+                    _catalog_narrative = {}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
                                               dispositions=dispositions,
@@ -2716,7 +2911,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                                               ingestion_run_id=ingestion_run_id,
                                               catalog_source=catalog_source,
                                               schema_by_table=schema_by_table, stats=passb_stats,
-                                              catalog_context_available=_catalog_context)
+                                              catalog_context_available=_catalog_context,
+                                              catalog_narrative=_catalog_narrative)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
@@ -2761,13 +2957,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             state, reason, detail = _enrichment_outcome(
                 syntheses, len(items), not_attempted=passb_stats.get("not_attempted", 0))
             detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
+            detail.update(_passb_batch_detail(passb_stats))
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
             counters.incr("overlay.table_synth.error")
             logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
                            "intact", catalog_source, exc_info=True)
+            # Task 9c: the failed record used to carry NOTHING. Pass B's ladders write their
+            # account into `passb_stats` as they go, so the stage that died can still say which
+            # phase it died in and what it had spent — the state an observability record exists for.
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
+                         detail=_with_audit_degradations(_passb_batch_detail(passb_stats)) or None,
                          started_at=stage_started)
 
     # [13] `_retire_dropped_field_decisions` (invoked per-column below) also COLLECTS into
@@ -3344,6 +3545,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     summaries: dict[str, str] = {}
     summary_stats: dict = {}
     summary_evidence_failures = 0
+    # Task 9c: the summary stage drafts ONE value per column from the full enriched dossier, which
+    # makes it plausibly the largest single call cost of the run — and it was the one stage of the
+    # six the inventory named that reported neither which bound stopped it nor whether anything was
+    # stored. `_write_summary_evidence` already took a `counts=` parameter that no call site passed.
+    summary_ev_counts: dict[str, int] = {}
+    summary_ev_writer: str | None = None
+    summary_rolled_back = False
     if client is None:
         record_stage(stage_recorder, "enrich_summary", "skipped_no_client")
     elif glossary is None:
@@ -3372,7 +3580,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                             glossary=glossary, bindings=bindings,
                             source_snapshot_id=snapshot_id,
                             extras_by_hash=summary_extras,
-                            bundles=summary_context)
+                            bundles=summary_context, counts=summary_ev_counts)
                     except Exception:  # noqa: BLE001 — an escape past the writer's per-item
                         # guard would otherwise report `succeeded` for a run that wrote nothing.
                         summary_evidence_failures = 1
@@ -3390,10 +3598,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory summary enrichment failed for %r", catalog_source,
                            exc_info=True)
+            summary_rolled_back = True
+        else:
+            # This branch is only reached with a glossary AND a client (both gated above), so the
+            # snapshot is the only remaining way the writer can be gated out.
+            if snapshot_id is None:
+                summary_ev_writer = "not_run:no_source_snapshot"
         state, reason, detail = _enrichment_outcome(
             summaries, len(_summary_targets(vr.good, glossary)),
             internal_failures=summary_evidence_failures,
-            not_attempted=summary_stats.get("not_attempted", 0))
+            not_attempted=summary_stats.get("not_attempted", 0),
+            batch=summary_stats.get("batch"), evidence_counts=summary_ev_counts,
+            evidence_writer=summary_ev_writer, rolled_back=summary_rolled_back)
         record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 

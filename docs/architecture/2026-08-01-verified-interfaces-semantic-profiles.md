@@ -203,7 +203,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 | 1056 | PII allow-policy surface (user-directed 2026-08-04): `pii_use_policy` immutable revisions + CAS current pointer |
 | 1057 | Release C Task 11 — crosswalk observation store (`1057_crosswalk_observation.sql`), CONSUMED. The database-derivation unification shipped in the same task needs NO DDL: the inventory-derived writer (`bridge_assessment.resolve_and_record_endpoint_binding`) has zero `src/` callers, and the live writer (`binding_store.record_binding`) already derived `database` from the connection — so converging onto the connection's declaration re-addresses no stored row. Proven by `test_binding_derivation_unification`. |
 
-New needs append 1058+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
+| 1058 | Readiness wave (2026-08-09) — `graph_node.fibo_path` display projection (`1058_graph_node_fibo_path.sql`), CONSUMED. The third FTR sidecar taxonomy path, joining `bian_path`/`process_path` from 1051; it was captured as SOURCE evidence exactly like both siblings and then had no policy and no flat column, so it resolved nowhere — invisible precisely BECAUSE its siblings worked. Closes the last `UNCARRIED_GAPS` entry. Same rebuildable, never-authoritative contract as 1051/1052. |
+
+New needs append 1059+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
 
 ## D8. Flag matrix
 

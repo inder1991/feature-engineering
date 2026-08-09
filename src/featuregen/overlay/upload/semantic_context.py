@@ -107,9 +107,19 @@ from featuregen.overlay.upload.source_profile import (
 CONTRACT_VERSION = 1
 
 #: Bounded neighbour roster carried on the bundle itself (mirrors the Pass-B egress cap scale).
-NEIGHBOUR_LIMIT = 64
-#: Bounded list length inside every purpose-adapter payload.
-ADAPTER_LIST_LIMIT = 40
+#: ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 512, tracking `enrich_llm._MAX_COLUMN_PROFILES`. At 64
+#: a classifier looking at a 126- or 144-column bank table saw HALF its siblings, and which half
+#: was an ordering accident. THE ONE WITH A CALL-COUNT COST: a neighbour roster multiplies EVERY
+#: concept item, so `chunk_items` packs fewer items per chunk and the concept stage makes more
+#: provider calls. `enrich_config._DEFAULT_MAX_INPUT_TOKENS["concept"]` was raised in step to keep
+#: packing intact, and the packing itself is pinned by
+#: `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`.
+NEIGHBOUR_LIMIT = 512
+#: Bounded list length inside every purpose-adapter payload. ZERO-TRUNCATION RAISE (2026-08-06):
+#: 40 -> 256. This is the cap that actually reaches the prompt (the bundle holds up to
+#: `NEIGHBOUR_LIMIT`; the adapter slices to this), so it is the one that decided how much of a real
+#: table a classifier could see.
+ADAPTER_LIST_LIMIT = 256
 
 
 class SemanticContextError(ValueError):
@@ -310,13 +320,25 @@ class SemanticValueV1:
 
     `operational_influence` is the separate `governed | hint` operational-facts axis — READ from
     the shipped authority readers, never inferred from a producer; `None` for fields outside the
-    operational-facts surface."""
+    operational-facts surface.
+
+    `proposed_value` is the LLM's answer where it did NOT win resolution — the state a
+    `field_policies` rule that excludes the LLM produces by design (`_MEASURE_ANNOTATION` for
+    `unit`/`currency`). It is deliberately a SECOND attribute rather than a fallback inside
+    `value`: `value` means "what the operational read model resolved", and a consumer that could
+    not tell the two apart is exactly how a guess clears a safety check."""
 
     field_name: str
     value: object | None
     evidence: tuple[EvidenceAuthorityV1, ...]
     resolution_status: str
     operational_influence: str | None = None
+    proposed_value: object | None = None
+    #: [F7] The `producer/strength` of the row `proposed_value` CAME FROM. `proposed_value` is
+    #: always the LLM's row, but `semantic_authority[field]` names the STRONGEST producer with
+    #: evidence — so without this the payload captions the model's own guess with somebody
+    #: else's name, and a guess wearing `source/attested` gets weighted as a fact.
+    proposed_authority: str | None = None
 
     def __post_init__(self) -> None:
         if self.resolution_status not in RESOLUTION_STATUSES:
@@ -1253,8 +1275,11 @@ _EVIDENCE_FIELD = {"data_type": "logical_representation"}
 #: `read_column_facts`); every other semantic field carries `operational_influence=None`.
 _OPERATIONAL_FIELDS = ("additivity", "currency", "data_type", "declared_type", "entity",
                        "is_grain", "is_as_of", "unit")
-_DISPLAY_FIELDS = ("ai_summary", "concept", "definition", "domain", "party_role",
-                   "semantic_terms")
+# `bian_path` / `process_path` are the SOURCE's own taxonomy paths and `sub_domain` is the LLM's
+# finer axis beside `domain` — all three are display/recommendation tier (field_policies `_MEANING`
+# / `_GLOSSARY_TERM`), so they ride the same list as `domain` itself.
+_DISPLAY_FIELDS = ("ai_summary", "bian_path", "concept", "definition", "domain", "party_role",
+                   "process_path", "fibo_path", "semantic_terms", "sub_domain")
 
 
 def _render(raw: object) -> str | None:
@@ -1356,7 +1381,8 @@ def bundle_from_store(
     anchor = conn.execute(
         "SELECT object_ref, schema_name, table_name, column_name, data_type, declared_type, "
         "definition, domain, concept, semantic_terms, ai_summary, additivity, unit, currency, "
-        "entity, is_grain, is_as_of, party_role, grain_fact_event_id, availability_fact_event_id "
+        "entity, is_grain, is_as_of, party_role, grain_fact_event_id, availability_fact_event_id, "
+        "sub_domain, bian_path, process_path, fibo_path "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = %s "
         "AND kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s",
         (source, flat_ref, allowed)).fetchone()
@@ -1364,7 +1390,8 @@ def bundle_from_store(
         raise KeyError(f"no visible column {object_ref!r} in catalog {catalog_source!r}")
     (_ref, schema_name, table_name, column_name, data_type, declared_type, definition, domain,
      concept_name, semantic_terms, ai_summary, additivity, unit, currency, entity, is_grain,
-     is_as_of, party_role, grain_event, availability_event) = anchor
+     is_as_of, party_role, grain_event, availability_event,
+     sub_domain, bian_path, process_path, fibo_path) = anchor
     logical_ref = normalize_ref(source, schema_name or None, table_name, column_name)
     table_logical_ref = normalize_ref(source, schema_name or None, table_name)
 
@@ -1390,7 +1417,8 @@ def bundle_from_store(
     # The table anchor's visibility is DERIVED (D11): the caller provably sees >= 1 of its
     # columns (the anchor above), so the table row itself needs no second predicate.
     table_row = conn.execute(
-        "SELECT definition, domain, semantic_terms, ai_summary FROM graph_node "
+        "SELECT definition, domain, semantic_terms, ai_summary, table_role, event_or_snapshot "
+        "FROM graph_node "
         "WHERE catalog_source = %s AND kind = 'table' AND table_name = %s",
         (source, table_name)).fetchone()
 
@@ -1404,6 +1432,8 @@ def bundle_from_store(
         "ai_summary": ai_summary, "concept": concept_name, "definition": definition,
         "domain": domain, "semantic_terms": semantic_terms,
         "party_role": party_role or getattr(normalize_party_role(column_name), "value", None),
+        "sub_domain": sub_domain, "bian_path": bian_path, "process_path": process_path,
+        "fibo_path": fibo_path,
     }
     operational = {
         "additivity": additivity, "currency": currency, "data_type": data_type,
@@ -1456,20 +1486,36 @@ def bundle_from_store(
             influence = "governed" if (bool(is_as_of) and availability_event is not None) else "hint"
         else:
             influence = "hint"
+        # The LLM's own answer for this field, whether or not it won resolution. For a field whose
+        # policy excludes the LLM (`_MEASURE_ANNOTATION`: unit/currency) this is the ONLY place the
+        # proposal survives — `graph_node` never receives it, by design.
+        llm_proposed = evidence_values.get(
+            (logical_ref, _EVIDENCE_FIELD.get(field_name, field_name),
+             EvidenceProducer.LLM.value))
+        # [F7] The proposal's OWN attribution, read from the same LLM row rather than inferred
+        # from `entries[0]` (the strongest producer, which may be an entirely different one).
+        llm_entry = next((e for e in entries
+                          if e.producer == EvidenceProducer.LLM.value), None)
         resolved_values.append(SemanticValueV1(
             field_name=field_name,
             value=value,
             evidence=entries,
             resolution_status="current" if value is not None else UNRESOLVED_PENDING_REVIEW,
             operational_influence=influence,
+            proposed_value=llm_proposed,
+            proposed_authority=(f"{llm_entry.producer}/{llm_entry.strength}"
+                                if llm_entry is not None else None),
         ))
     resolved_values.sort(key=lambda v: v.field_name)
 
     table_values: list[SemanticValueV1] = []
     if table_row is not None:
-        t_definition, t_domain, t_semantic_terms, t_ai_summary = table_row
+        (t_definition, t_domain, t_semantic_terms, t_ai_summary,
+         t_table_role, t_event_or_snapshot) = table_row
         for field_name, raw in (("ai_summary", t_ai_summary), ("definition", t_definition),
-                                ("domain", t_domain), ("semantic_terms", t_semantic_terms)):
+                                ("domain", t_domain), ("semantic_terms", t_semantic_terms),
+                                ("table_role", t_table_role),
+                                ("event_or_snapshot", t_event_or_snapshot)):
             value = _render(raw)
             entries = tuple(evidence_by_field.get((table_logical_ref, field_name), ()))
             if value is None and not entries:
@@ -1478,6 +1524,11 @@ def bundle_from_store(
                 field_name=field_name, value=value, evidence=entries,
                 resolution_status="current" if value is not None else
                 UNRESOLVED_PENDING_REVIEW))
+    # Sorted like `resolved_values` above and like `bundle_from_upload`'s own table context: the
+    # emission order is hashed, so leaving it as the loop's literal order would make the two
+    # builders hash IDENTICAL table facts differently. A no-op for the four legacy fields (their
+    # loop order was already alphabetical); it is the two axes added beside them that need it.
+    table_values.sort(key=lambda v: v.field_name)
 
     relationship = _scoped_relationship_context(
         conn, flat_ref, allowed, logical_ref=logical_ref, roles=roles, omitted=omitted)
@@ -1647,7 +1698,7 @@ def _roster(bundle: SemanticContextBundleV1) -> list[dict]:
 #: which is the shape the egress layer classifies `related_terms` under (`_LIST_PROSE_META_KEYS`):
 #: each term is then PII-scanned at its own indexed path (`related_terms[0]`) and length-bounded
 #: per TERM rather than per joined blob — a 40-term glossary column whose joined string exceeds the
-#: 200-char per-value cap would otherwise have its WHOLE item egress-excluded.
+#: per-value cap (`enrich_llm._MAX_LEN_DEFAULT`) would otherwise have its WHOLE item egress-excluded.
 _RELATED_TERMS_JOIN = ", "
 
 
@@ -1684,6 +1735,32 @@ def _with_extra(payload: dict, extra: Mapping | None) -> dict:
             continue
         payload[key] = list(value) if isinstance(value, (list, tuple)) else value
     return payload
+
+
+def _outbound_cardinality(bundle: SemanticContextBundleV1,
+                          link: RelationshipContextV1) -> str | None:
+    """The cardinality of the hop AWAY from THIS bundle's own table, or None.
+
+    "Does this join fan out?" separates a correct aggregate from a silently multiplied one, so the
+    generator needs the answer — but cardinality is not a property of a LINK. It lives on each
+    directional realization (:attr:`DirectionalRealizationContextV1.cardinality`) and on each named
+    crosswalk direction, and this module refuses to collapse them into one verdict for the pair:
+    "a crosswalk that is 1:1 forward and N:1 in reverse is ordinary, and a surface that showed one
+    verdict for the pair would either hide a usable direction or imply an unusable one"
+    (:class:`CrosswalkDirectionContextV1`).
+
+    So this answers ONE named question, and the payload key is named for it
+    (`outbound_cardinality`) so it cannot be read as symmetric. The same link read from the other
+    end legitimately answers differently.
+
+    ``None`` means NOBODY HAS ESTABLISHED IT — a state, never a failure, and the signal that
+    `plan_join` will refuse the hop later. It arises three ways, all honest: a crosswalk carries no
+    realizations at all (by construction); a realization whose cardinality is unknown carries
+    ``None``; and realizations that DISAGREE for this direction are reported unknown rather than
+    resolved by an arbitrary pick."""
+    seen = {r.cardinality for r in link.realizations if r.from_ref == bundle.table_ref}
+    seen.discard(None)
+    return seen.pop() if len(seen) == 1 else None
 
 
 def _namespace_dict(bundle: SemanticContextBundleV1) -> dict | None:
@@ -1792,8 +1869,14 @@ def for_summary(bundle: SemanticContextBundleV1, *, extra: Mapping | None = None
 def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
     """Feature-generation context (the v4 shape's raw material). Fact keys reuse the
     `_FEATURE_COLUMN_FACT_KEYS` wrapper convention: `{value, authority}` with authority the
-    OPERATIONAL `governed|hint` axis — an LLM-proposed semantic value NEVER rides this wrapper
-    (its authority is the D2 triple on the bundle, visible separately)."""
+    OPERATIONAL `governed|hint` axis — an LLM-proposed semantic value NEVER rides `value`
+    (its authority is the D2 triple on the bundle, visible separately).
+
+    Task 6 adds an OPTIONAL third subkey, `proposed_value`, present only where `value` is null and
+    the LLM proposed one. It is the same rule stated positively: the proposal is INCLUDED rather
+    than merely announced, and it is unmistakably not the resolved value because it is not under
+    `value`. `_MEASURE_ANNOTATION` and `graph_node.unit` are untouched — nothing here can clear a
+    safety check that reads the projected fact."""
     table, column = _identity_parts(bundle)
     resolved = {v.field_name: v for v in bundle.resolved_semantics}
     out: dict = {
@@ -1811,13 +1894,49 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
         got = resolved.get(fact_key)
         value = _render(got.value) if got is not None else None
         authority = got.operational_influence if got is not None else "hint"
-        out[fact_key] = {"value": value, "authority": authority or "hint"}
+        entry = {"value": value, "authority": authority or "hint"}
+        # The LLM's answer where it did NOT win resolution (unit/currency under
+        # `_MEASURE_ANNOTATION`). A SEPARATE key: `value` still means "operationally resolved", so
+        # no existing consumer changes behaviour and no safety check can be cleared by it. Without
+        # this the payload ANNOUNCED the proposal — `semantic_authority` says `unit: llm/proposed` —
+        # while sending `{"value": null}`, which is strictly worse than either alternative.
+        if got is not None and got.proposed_value is not None and value is None:
+            entry["proposed_value"] = _render(got.proposed_value)
+            # [F7] captioned with the proposal's OWN producer, never the lead's.
+            if got.proposed_authority:
+                entry["proposed_authority"] = got.proposed_authority
+        out[fact_key] = entry
     out["concept_path"] = list(bundle.concept_path)
     out["identifier_namespace"] = _namespace_dict(bundle)
     out["party_role"] = _value_of(bundle, "party_role")
+    # D13.1/D13.2 axes. `sub_domain` refines `domain`; `bian_path` / `process_path` are the
+    # SOURCE's own taxonomy, which the generator should weigh above anything the model inferred.
+    out["sub_domain"] = _value_of(bundle, "sub_domain")
+    out["bian_path"] = _value_of(bundle, "bian_path")
+    out["fibo_path"] = _value_of(bundle, "fibo_path")
+    out["process_path"] = _value_of(bundle, "process_path")
+    # The GLOSSARY's curated vocabulary (Task 7b). `for_concept_enrichment` and `for_summary` have
+    # always sent both — the feature seam sent neither, so a generator was shown `CPTY_EXPSR_AMT`
+    # with no access to the bank's own name for it ("Counterparty Exposure Amount") or to the
+    # related vocabulary a human already curated, while Task 6d paid a provider to invent the same
+    # kind of vocabulary for the objective. Both are uploader-authored and PROSE-graded on egress
+    # (`_FEATURE_COLUMN_PROSE_KEYS` / `_FEATURE_COLUMN_PROSE_LIST_KEYS`), never identity.
+    out["business_term"] = _value_of(bundle, "business_term")
+    # ALWAYS A LIST. `_token_list_ok`/`_prose_list` both refuse a None, and the refusal is the WHOLE
+    # column, so emitting None for a column with no curated related terms — i.e. every column of
+    # every technical catalog — would have silently killed the payload rather than omitted a field.
+    out["related_terms"] = _related_terms(bundle) or []
+    # Table SHAPE. A windowed count is right on an event log and wrong on a snapshot; the
+    # generator cannot make that call without being told which it is. These two ride
+    # `table_context` (not `resolved_semantics`), so they are read through `_table_value`.
+    out["table_role"] = _table_value(bundle, "table_role")
+    out["event_or_snapshot"] = _table_value(bundle, "event_or_snapshot")
     out["relationships"] = [
         {"relationship_ref": link.relationship_ref, "kind": link.kind,
-         "availability": link.availability, "review_status": link.review_status}
+         "availability": link.availability, "review_status": link.review_status,
+         # DIRECTIONAL, and named for its direction. None == nobody has established it, and that
+         # IS the signal — see `_outbound_cardinality` for why this is not a verdict on the pair.
+         "outbound_cardinality": _outbound_cardinality(bundle, link)}
         for link in bundle.relationship_context[:ADAPTER_LIST_LIMIT]
     ]
     out["missing_context"] = list(bundle.missing_context)

@@ -32,7 +32,7 @@ import os
 from dataclasses import dataclass, field
 
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.intake.llm import (
@@ -279,63 +279,123 @@ class IntentExtraction:
 
 
 def validate_intent(output: dict, candidates: IntentCandidates) -> None:
-    """Raise :class:`SchemaValidationError` when the model chose something it was not offered.
+    """Raise :class:`AttestedSchemaValidationError` when the model chose something it was not offered.
 
     Driving this through the repair loop rather than refusing outright is deliberate: the complaint
     names the offending ref, so a second attempt can correct it. What must never happen is a ref
     passing through — it would ground against nothing and read as a catalog gap rather than a model
     error.
+
+    **Two complaints, and they are not the same string.** The MESSAGE stays as informative as it
+    has always been — it interpolates the ref, and it is read by a human looking at a traceback,
+    which no wire and no audit column ever sees. The ATTESTED reason
+    (:class:`AttestedSchemaValidationError`) is the one `intake.llm._safe_reason` sends back to the
+    provider and writes to `llm_call.repair_attempts`, so it is built from THIS FILE'S literals and
+    the closed vocabularies declared at the top of it, and from nothing else.
+
+    Every one of these raises used to reach `_safe_reason` with no jsonschema `__cause__`, so the
+    whole intent flow complained with one generic constant — the repair budget bought a
+    differently-shaped prompt carrying no information. Each site now attests.
+
+    **What is deliberately NOT attested, at every site.**
+
+    * The ref itself (`{ref!r}`, `{op!r}`, `{code!r}`, …). It is model-supplied text on an egress
+      path. "The model already knows it" is a claim about ONE of the four sinks: the reason also
+      lands in audit columns that store verbatim and never re-scan, and a model that was shown a
+      question whose PII the scanner missed can echo it straight back into `entity_ref`. Task 2's
+      `_path_is_schema_declared` suppresses exactly this class of text from the structural pointer;
+      attesting it here would re-admit through the front door what that guard turns away at the
+      back, two commits later, on the same function.
+    * The offered-column `sample`. It is CATALOG text. It already egresses inside
+      `catalog_metadata` — but that is a property of the CALLER, and `validate_intent` is public,
+      so the safety of an egress string would rest on an invariant nothing enforces. It also buys
+      nothing: `_wire_prompt` re-renders the full `catalog_metadata`, including every offered
+      `column_refs` entry, in the repair turn itself. The model is already holding the list.
+
+    What the shape-only reason costs: the model is told which field failed and what that field
+    wants, not which of its refs was wrong. It has one answer in front of it and one named field to
+    fix, which is what the repair loop needed and never had.
     """
     offered = sorted(candidates.column_refs)
     # Bounded: enough to correct the answer, not so many that the complaint becomes another prompt.
     sample = ", ".join(offered[:12]) + ("" if len(offered) <= 12 else ", ...")
 
-    def _require_column(ref: str, what: str) -> None:
+    def _require_column(ref: str, what: str, field: str) -> None:
+        # TWO namings on purpose. `what` is the prose the MESSAGE has always used, read by a human
+        # in a traceback. `field` is the JSON field path the attested reason uses, read by the model
+        # and by whoever queries `llm_call.repair_attempts`. Both are author literals at all four
+        # call sites — which are the only ones there can be, this closure being local to
+        # `validate_intent` — and that locality is the whole reason attesting them is safe.
         if ref and ref not in candidates.column_refs:
             hint = ""
+            attested = f"{field}: not one of the offered column_refs"
             if ref in candidates.table_refs:
                 # The observed failure: the customer TABLE was given where a column identifying the
-                # customer was required. Naming the confusion is what lets one repair fix it.
+                # customer was required. Naming the confusion is what lets one repair fix it — and
+                # the confusion is a SHAPE, so it survives into the attested reason intact.
                 hint = (f" — that is a TABLE. {what} must be a COLUMN, one of the offered "
                         f"column_refs")
-            raise SchemaValidationError(
+                attested = (f"{field}: that is one of the offered table_refs; it must be one of "
+                            f"the offered column_refs")
+            raise AttestedSchemaValidationError(
                 f"{what} {ref!r} is not one of the columns offered for this question{hint}. "
-                f"Choose from: {sample}")
+                f"Choose from: {sample}",
+                llm_safe_reason=attested)
 
-    _require_column(str(output.get("entity_ref", "")), "entity_ref")
+    _require_column(str(output.get("entity_ref", "")), "entity_ref", "entity_ref")
     table = str(output.get("base_table_ref", ""))
     if table and table not in candidates.table_refs:
-        raise SchemaValidationError(
-            f"base_table_ref {table!r} is not one of the tables offered for this question")
+        raise AttestedSchemaValidationError(
+            f"base_table_ref {table!r} is not one of the tables offered for this question",
+            llm_safe_reason="base_table_ref: not one of the offered table_refs")
 
     measure = output.get("measure") or {}
     op = str(measure.get("op", ""))
     if op not in MEASURE_OPS:
-        raise SchemaValidationError(f"measure op {op!r} is not one of {sorted(MEASURE_OPS)}")
+        # MEASURE_OPS is an in-code closed vocabulary that ALREADY egresses — `INTENT_SCHEMA`
+        # carries it verbatim as the `measure.op` enum on every call. Author text, not data.
+        raise AttestedSchemaValidationError(
+            f"measure op {op!r} is not one of {sorted(MEASURE_OPS)}",
+            llm_safe_reason=("measure.op: not one of the operations this contract defines: "
+                             f"{sorted(MEASURE_OPS)}"))
     # count(*) needs no column; every other op aggregates one, and an op with no ref is not a measure.
     measure_ref = str(measure.get("logical_ref", ""))
     if op != "count" and not measure_ref:
-        raise SchemaValidationError(f"measure op {op!r} needs a column to aggregate")
-    _require_column(measure_ref, "measure logical_ref")
+        raise AttestedSchemaValidationError(
+            f"measure op {op!r} needs a column to aggregate",
+            llm_safe_reason=("measure.logical_ref: required for every op except 'count', which "
+                             "counts rows and takes no column"))
+    _require_column(measure_ref, "measure logical_ref", "measure.logical_ref")
 
     for window in output.get("windows") or ():
-        _require_column(str(window.get("anchor_ref", "")), "window anchor_ref")
+        _require_column(str(window.get("anchor_ref", "")), "window anchor_ref",
+                        "windows[].anchor_ref")
         if not str(window.get("label", "")).strip():
-            raise SchemaValidationError(
+            # The only site whose message was already value-free. Attested anyway: the seam is the
+            # TYPE, and one site left generic because its message happened to be safe is a trap for
+            # whoever edits it next.
+            raise AttestedSchemaValidationError(
                 "every window needs a label: partition values are matched to windows by label, and "
-                "position would swap two periods and invert the answer")
+                "position would swap two periods and invert the answer",
+                llm_safe_reason="windows[].label: every window needs a non-empty label")
     for dimension in output.get("dimensions") or ():
-        _require_column(str(dimension.get("logical_ref", "")), "dimension logical_ref")
+        _require_column(str(dimension.get("logical_ref", "")), "dimension logical_ref",
+                        "dimensions[].logical_ref")
 
     comparison = str(output.get("comparison", ""))
     if comparison not in COMPARISONS:
-        raise SchemaValidationError(f"comparison {comparison!r} is not one of {sorted(COMPARISONS)}")
+        raise AttestedSchemaValidationError(
+            f"comparison {comparison!r} is not one of {sorted(COMPARISONS)}",
+            llm_safe_reason=("comparison: not one of the values this contract defines: "
+                             f"{sorted(COMPARISONS)}"))
 
     for code in output.get("unresolved") or ():
         if code not in MODEL_UNRESOLVED_CODES:
-            raise SchemaValidationError(
+            raise AttestedSchemaValidationError(
                 f"unresolved code {code!r} is not actionable; use one of "
-                f"{sorted(MODEL_UNRESOLVED_CODES)}")
+                f"{sorted(MODEL_UNRESOLVED_CODES)}",
+                llm_safe_reason=("unresolved[]: not an actionable abstention code; use one of "
+                                 f"{sorted(MODEL_UNRESOLVED_CODES)}"))
 
 
 def _plan_from(output: dict, question: str) -> AnalysisPlanV1:

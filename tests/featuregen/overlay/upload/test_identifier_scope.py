@@ -74,7 +74,10 @@ def test_new_selection_attempts_canonicalize_to_customer_id() -> None:
     assert _accept_concept("counterparty_id") == ("customer_id", "valid")
     assert _accept_concept("bank_bic") == ("bank_bic", "valid")
     assert _accept_concept("unclassified") == ("unclassified", "valid")
-    assert _accept_concept("not_a_concept") == (None, "invalid_value")
+    # `off_vocabulary` (Task 9c) rather than the old catch-all `invalid_value`: the refusal is
+    # unchanged, and the named rule is what distinguishes "the model named a word that is not in
+    # the registry" from every other way a concept answer can be rejected.
+    assert _accept_concept("not_a_concept") == (None, "off_vocabulary")
 
 
 def test_display_entity_resolves_through_the_alias_seam() -> None:

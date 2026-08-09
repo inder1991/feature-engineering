@@ -25,6 +25,7 @@ from featuregen.contracts.envelopes import (
     SignalResult,
 )
 from featuregen.contracts.errors import (
+    AttestedSchemaValidationError,
     ConcurrencyError,
     ProjectionApplyError,
     SchemaValidationError,
@@ -62,6 +63,7 @@ __all__ = [
     "NewTimer",
     "ProvenanceEnvelope",
     "SignalResult",
+    "AttestedSchemaValidationError",
     "ConcurrencyError",
     "ProjectionApplyError",
     "SchemaValidationError",

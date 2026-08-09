@@ -22,7 +22,7 @@ from featuregen.analysis.intent import (
     extract_intent,
     validate_intent,
 )
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import (
     PROVIDER_REFUSAL,
@@ -388,6 +388,166 @@ def test_the_complaint_lists_valid_choices_but_stays_bounded():
         validate_intent(_output(entity_ref="ftr::t.nope"), many)
     assert str(exc.value).count("ftr::t.c") <= 12
     assert "..." in str(exc.value)
+
+
+# ── Task 2b: the complaint reaches the model again, value-free ──────────────────────────────────
+#
+# `validate_intent` raises by hand, so there is no jsonschema `__cause__` for `_safe_reason` to
+# rebuild a pointer from, and every one of these seven failures used to collapse into one generic
+# constant on the way to the provider — the repair budget bought a differently-shaped prompt with
+# nothing in it. Each site now ATTESTS a value-free reason. The attested string is author literal
+# plus in-code closed vocabulary ONLY: the interpolated `{ref!r}` in the exception MESSAGE is
+# model-supplied text and stays out, and so does the offered-column `sample`.
+
+_MODEL_TEXT = "ftr::dpl_eib.tran_repos.Ahmed_Al_Mansouri"
+
+
+def _attested(output) -> str:
+    from featuregen.intake.llm import _safe_reason
+
+    with pytest.raises(AttestedSchemaValidationError) as exc:
+        validate_intent(output, _candidates())
+    return _safe_reason(exc.value)
+
+
+@pytest.mark.parametrize("output,expect", [
+    ({"entity_ref": _MODEL_TEXT}, "entity_ref"),
+    ({"measure": {"op": "sum", "logical_ref": _MODEL_TEXT}}, "measure.logical_ref"),
+    ({"windows": [{"label": "current", "anchor_ref": _MODEL_TEXT,
+                   "calendar_unit": "month", "calendar_length": 1, "calendar_offset": 0}]},
+     "windows[].anchor_ref"),
+    ({"dimensions": [{"logical_ref": _MODEL_TEXT}]}, "dimensions[].logical_ref"),
+])
+def test_every_offered_column_complaint_names_its_field_without_the_ref(output, expect):
+    reason = _attested(_output(**output))
+    assert reason.startswith(expect)
+    assert "column_refs" in reason
+    assert "Ahmed_Al_Mansouri" not in reason
+
+
+def test_the_TABLE_confusion_survives_as_a_shape_not_a_ref():
+    """The one the whole task exists for. The message says "that is a TABLE. entity_ref must be a
+    COLUMN. Choose from: ..." — actionable, and unsendable, because it interpolates the ref the
+    model chose and twelve offered column refs. The attested reason keeps the SHAPE of the
+    complaint (a table was named where a column belongs) and drops both."""
+    reason = _attested(_output(entity_ref="ftr::dpl_eib.tran_repos"))
+    assert reason == ("entity_ref: that is one of the offered table_refs; it must be one of the "
+                      "offered column_refs")
+    assert "ftr::dpl_eib.tran_repos" not in reason
+
+
+def test_the_offered_column_sample_never_rides_out_on_the_attested_reason():
+    """`sample` is CATALOG text. It already egresses inside `catalog_metadata`, and the repair turn
+    re-renders that metadata in full — so re-listing twelve refs in the complaint buys the model
+    nothing it is not already holding, while resting the safety of an egress string on an invariant
+    of the CALLER (that `candidates` and the egressed `column_refs` are the same set). Dropped."""
+    reason = _attested(_output(entity_ref="ftr::dpl_eib.tran_repos.nope"))
+    for ref in _COLUMNS:
+        assert ref not in reason
+
+
+def test_the_base_table_complaint_names_its_field_without_the_ref():
+    reason = _attested(_output(base_table_ref="ftr::dpl_eib.secret_table"))
+    assert reason == "base_table_ref: not one of the offered table_refs"
+    assert "secret_table" not in reason
+
+
+def test_an_unknown_measure_op_is_attested_with_the_in_code_vocabulary():
+    """`MEASURE_OPS` is a module constant that ALREADY egresses — `INTENT_SCHEMA` carries it as the
+    `measure.op` enum on every call. Author text, not data, so it may ride."""
+    reason = _attested(_output(measure={"op": "median", "logical_ref": ""}))
+    assert reason.startswith("measure.op: not one of the operations this contract defines")
+    assert "'sum'" in reason and "'count_distinct'" in reason
+    assert "median" not in reason
+
+
+def test_an_aggregate_with_no_column_is_attested_as_a_missing_field():
+    reason = _attested(_output(measure={"op": "sum", "logical_ref": ""}))
+    assert reason == ("measure.logical_ref: required for every op except 'count', which counts "
+                      "rows and takes no column")
+
+
+def test_an_unlabelled_window_is_attested():
+    """The only one of the seven whose MESSAGE was already value-free — it interpolates nothing.
+    It is attested anyway: the seam is the type, and leaving one site generic because its message
+    happened to be safe would make the next author guess."""
+    reason = _attested(_output(windows=[
+        {"label": "  ", "anchor_ref": "ftr::dpl_eib.tran_repos.tran_month",
+         "calendar_unit": "month", "calendar_length": 1, "calendar_offset": 0}]))
+    assert reason == "windows[].label: every window needs a non-empty label"
+
+
+def test_an_unknown_comparison_is_attested_with_the_in_code_vocabulary():
+    reason = _attested(_output(comparison="plummeted"))
+    assert reason.startswith("comparison: not one of the values this contract defines")
+    assert "'decrease'" in reason
+    assert "plummeted" not in reason
+
+
+def test_an_unactionable_abstention_code_is_attested_with_the_in_code_vocabulary():
+    reason = _attested(_output(unresolved=["dunno about Ahmed Al-Mansouri"]))
+    assert reason.startswith("unresolved[]: not an actionable abstention code")
+    assert "'population'" in reason
+    assert "Ahmed" not in reason
+
+
+def test_no_attested_reason_from_this_module_carries_model_or_catalog_text():
+    """One sweep over all seven, so a NEW site cannot be added without meeting the rule. The probe
+    ref is planted in every model-supplied slot at once and must survive nowhere."""
+    from featuregen.intake.llm import MAX_ATTESTED_REASON_CHARS, _safe_reason
+
+    probes = [
+        _output(entity_ref=_MODEL_TEXT),
+        _output(base_table_ref=_MODEL_TEXT),
+        _output(measure={"op": _MODEL_TEXT, "logical_ref": ""}),
+        _output(measure={"op": "sum", "logical_ref": ""}),
+        _output(measure={"op": "sum", "logical_ref": _MODEL_TEXT}),
+        _output(windows=[{"label": "", "anchor_ref": "ftr::dpl_eib.tran_repos.tran_month",
+                          "calendar_unit": "month", "calendar_length": 1, "calendar_offset": 0}]),
+        _output(comparison=_MODEL_TEXT),
+        _output(unresolved=[_MODEL_TEXT]),
+    ]
+    for probe in probes:
+        with pytest.raises(SchemaValidationError) as exc:
+            validate_intent(probe, _candidates())
+        assert isinstance(exc.value, AttestedSchemaValidationError), probe
+        reason = _safe_reason(exc.value)
+        assert "Ahmed_Al_Mansouri" not in reason, reason
+        for ref in _COLUMNS | _TABLES:
+            assert ref not in reason, reason
+        # Un-truncated: `_safe_reason` clips at the bound, so a widened vocabulary would otherwise
+        # be silently cut mid-list rather than noticed here.
+        assert 0 < len(reason) < MAX_ATTESTED_REASON_CHARS, reason
+
+
+def test_the_full_message_still_names_the_ref_for_a_human_reading_a_traceback():
+    """The attestation ADDS a sendable reason; it does not gut the exception. `str(exc)` is an
+    in-process artefact — it reaches no wire, no audit column and no log (traced in the task-2b
+    report) — and a developer staring at a traceback wants the ref."""
+    with pytest.raises(SchemaValidationError) as exc:
+        validate_intent(_output(entity_ref="ftr::dpl_eib.tran_repos"), _candidates())
+    message = str(exc.value)
+    assert "TABLE" in message and "must be a COLUMN" in message and "Choose from:" in message
+
+
+def test_the_attested_reason_reaches_a_real_repair_turn(db):
+    """End to end through the driver: what the SECOND provider request actually carries."""
+    seen: list = []
+
+    class _Capture:
+        def __init__(self):
+            self._inner = _llm(FakeResponse(output=_output(entity_ref="ftr::dpl_eib.tran_repos")),
+                               FakeResponse(output=_output()))
+
+        def call(self, request):
+            seen.append(dict(request.inputs))
+            return self._inner.call(request)
+
+    got = _extract(db, _Capture())
+    assert got.status == STATUS_REPAIRED
+    assert seen[1]["_repair_errors"] == [
+        "entity_ref: that is one of the offered table_refs; it must be one of the offered "
+        "column_refs"]
 
 
 def test_every_ref_field_in_the_schema_says_whether_it_wants_a_column_or_a_table():

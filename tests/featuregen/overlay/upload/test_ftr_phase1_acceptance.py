@@ -124,10 +124,24 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
     assert concept_items["settlement_dbl"]["type"] == "double"
     assert concept_items["cust_acct_no"]["type"] == "varchar"
     assert all(item["type"] != UNKNOWN_TYPE for item in concept_items.values())
-    # Sanitized business definitions egressed (sample clause stripped) and are 600-capped (Task 4):
-    # NARRATIVE_MEMO's raw definition is >600 chars, but its egressed business_definition is bounded.
+    # Sanitized business definitions egressed (sample clause stripped) and are bounded, never cut.
+    #
+    # THE ZERO-TRUNCATION ACCEPTANCE (2026-08-06). NARRATIVE_MEMO's fixture definition is 802 chars.
+    # At the old MAX_DEFINITION_LEN = 600 the classifier saw it CLIPPED — this assertion used to
+    # read `<= 600` and was passing on a truncated payload. At 4000, and now at 32_000, the whole
+    # definition reaches the model, so what is asserted is that it arrives INTACT.
+    #
+    # THE TWO FILES ARE DIFFERENT MEASUREMENTS — an earlier revision of this comment claimed "41 of
+    # the fixture's 127 rows were in the same state", which is false. In THIS committed fixture
+    # exactly **1** of 127 exceeded 600 (this one, at 802). The **41** is the REAL FTR export's
+    # count (`FTR_Column_Mapping_final.csv`, gitignored: raw max 960, post-sanitize max 727), i.e.
+    # roughly a third of a real bank catalog. Never attribute the 41 to the fixture.
+    from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
+
     memo_def = concept_items["narrative_memo"]["business_definition"]
-    assert 0 < len(memo_def) <= 600
+    assert 0 < len(memo_def) <= MAX_DEFINITION_LEN
+    assert len(memo_def) == 802, "the fixture's longest definition must egress UNCUT"
+    assert memo_def.endswith("."), "a clipped definition would not end on its own sentence"
     assert concept_items["cust_acct_no"].get("business_definition")
 
     # No planted token in ANY outbound LLM request (Pass A or Pass B).
@@ -136,13 +150,23 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
         for token in _PLANTED_TOKENS:
             assert token not in blob, (req.task, token)
 
-    # ── Pass B received the COMPLETE column metadata (two-phase wide-table path) ──
-    summary_reqs = client.requests_for("table_synth_summary")
-    assert summary_reqs, "Pass B wide-table summary phase never ran"
+    # ── Pass B received the COMPLETE column metadata ──
+    #
+    # ROUTE CHANGE (2026-08-06): `_MAX_COLUMN_PROFILES` went 64 -> 512, and it is Pass B's
+    # narrow/wide ROUTER as well as an egress cap. This 126-column table used to be WIDE — split
+    # into 64-column chunks, each summarized, with the synthesis then reasoning over lossy summaries
+    # plus a names-and-types roster. It is now NARROW: one synthesis call carrying all 126 FULL
+    # column profiles. That is strictly more context in strictly fewer calls, and it is the reason
+    # `_MAX_COLUMN_PROFILES` was raised. What this gate asserts is unchanged — every column's
+    # descriptor reaches Pass B with its two type fields separate — only which request carries them.
+    assert not client.requests_for("table_synth_summary"), (
+        "a 126-column table should now take the narrow fast path, not the two-phase summary path")
+    synth_reqs = client.requests_for("table_synth")
+    assert synth_reqs, "Pass B synthesis never ran"
     profiled: dict[str, dict] = {}
-    for req in summary_reqs:
+    for req in synth_reqs:
         for item in req.inputs["catalog_metadata"]["items"]:
-            for prof in item["column_profiles"]:
+            for prof in item.get("column_profiles") or []:
                 profiled[prof["column"]] = prof
     assert len(profiled) == 126                     # every column's descriptor reached Pass B
     # Task 4 (Phase-2 Slice 1): the DECLARED type rides its own field — never a conflated `type`.
@@ -151,16 +175,9 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
     assert "type" not in profiled["event_ts"]
     assert all(p["declared_type"] != UNKNOWN_TYPE for p in profiled.values())
     assert all(p["operational_type"] == UNKNOWN_TYPE for p in profiled.values())
-    # The phase-2 synthesis got a COMPLETE STRUCTURED roster (one entry per column).
-    synth_reqs = client.requests_for("table_synth")
-    assert synth_reqs, "Pass B phase-2 synthesis never ran"
-    roster = synth_reqs[0].inputs["catalog_metadata"]["items"][0]["column_roster"]
-    assert len(roster) == 126
-    # Profile Task 4 widened the compact roster by the resolved CONCEPT (present only where Pass A
-    # classified one) — the sole signal the crosswalk contradiction can key on, which would
-    # otherwise have to abstain on every wide table. The three identity keys are always present.
-    assert {"column", "operational_type", "declared_type"} <= roster[0].keys()
-    assert roster[0].keys() <= {"column", "operational_type", "declared_type", "concept"}
+    # On the narrow path the FULL profile replaces the compact roster, so the synthesizer sees the
+    # resolved concept AND the business definition rather than a name/type pair.
+    assert {"column", "operational_type", "declared_type"} <= profiled["event_ts"].keys()
 
     # Pass B abstained on the one table (the required abstaining synthesis) — no proposed facts.
     assert r.passb_abstained == 1

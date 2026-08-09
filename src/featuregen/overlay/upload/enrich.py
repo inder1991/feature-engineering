@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
@@ -40,7 +41,7 @@ from featuregen.overlay.upload.concepts import (
 )
 from featuregen.overlay.upload.concepts import concept as concept_record
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
-from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
+from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
     MAX_DEFINITION_LEN,
@@ -61,21 +62,45 @@ _TASK = "overlay.enrich.concept"
 # Cap on any single glossary-sidecar metadata value placed in an LLM request. Matches the per-value
 # bound the metadata-only egress filter (`enrich_llm._item_egress_ok`) enforces, so a long business
 # definition is trimmed to its leading meaning rather than silently excluding the whole column.
-_MAX_META_LEN = 200
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000, tracking `enrich_llm._MAX_LEN_DEFAULT`. The two
+# must move TOGETHER: this one truncates, that one excludes, so this being the larger of the pair
+# would turn a trim into a dropped column.
+_MAX_META_LEN = 1000
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 _SYN_TASK = "overlay.enrich.synonyms"
 _UNIT_TASK = "overlay.enrich.unit"
 _SUMMARY_TASK = "overlay.enrich.summary"
 
-# Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
-_MAX_SYNONYMS_LEN = 200
+# Cap on ONE column's drafted SUMMARY — the accept gate on what the model may WRITE, paired with
+# `overlay_summary_batch`'s schema maxLength (pinned equal by `test_enrich_output_bounds.py`).
+#
+# ZERO-TRUNCATION RAISE (2026-08-06): 400 -> 1000. It is an ACCEPT gate, so 400 did not shorten a
+# long sentence, it DISCARDED the whole summary — the column then has none at all. 1000 is
+# deliberately `enrich_llm._MAX_LEN_DEFAULT` and not `MAX_DEFINITION_LEN`: a summary is ONE sentence
+# by instruction, and `ai_summary` is graded under `_MAX_LEN_DEFAULT` when it is re-threaded into
+# item metadata, so accepting above 1000 would mint a value its own egress gate later EXCLUDES —
+# the same inversion documented at `table_synth._MAX_PROFILE_PROSE`.
+_MAX_SUMMARY_LEN = 1000
 
-# Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
-# definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
+# Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPT gate on MODEL OUTPUT
+# (`_accept_bounded`), so the old 200 silently REJECTED a rich alias line rather than shortening it;
+# the widest real `synonyms_aliases` value in the FTR export is 54 chars, so 1000 is far past any
+# legitimate list while still refusing a model that starts writing paragraphs.
+_MAX_SYNONYMS_LEN = 1000
+
+# Larger bound for a SANITIZED business definition specifically. The `_MAX_META_LEN` default cut
+# every real definition mid-sentence; sanitized definitions are the intended payload, so allow a bigger
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
 # DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
 # B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
+# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 -> 32_000, so this
+# window follows it with no edit here. MEASURED, and the two files are DIFFERENT measurements (an
+# earlier revision of this comment merged them): the committed fixture's widest definition is 802
+# chars with **1** of its 127 rows over the shipped 600; the REAL FTR export
+# (`FTR_Column_Mapping_final.csv`, gitignored) has a raw max of 960 (727 post-sanitize) with **41**
+# of its 127 over 600. The 41 is the real export's number, never the fixture's.
 _MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 
@@ -289,12 +314,77 @@ def _single_ctx(ingestion_run_id: str | None, stage: str,
                                 subjects=(subject,))
 
 
+#: A line that opens with an ENUMERATION marker — `- x`, `* x`, `• x`, `1. x`, `2) x`, `(3) x`,
+#: `a. x`. Anchored at line start, so prose that merely contains a dash or a number is untouched.
+_ENUMERATION_LINE_RE = re.compile(r"[ \t]*(?:[-*•·–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)])[ \t]+\S")
+
+
+def _is_enumeration(val: str) -> bool:
+    """True when the value is a multi-line LIST rather than multi-paragraph PROSE.
+
+    M9's newline ban used to catch this, at the cost of also refusing every legitimate paragraphed
+    definition. Two or more marker-led lines is the signal: one is an ordinary sentence that happens
+    to start with a dash or a numeral, several is a model answering with a bulleted list.
+    """
+    lines = [ln for ln in val.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    return sum(1 for ln in lines if _ENUMERATION_LINE_RE.match(ln)) >= 2
+
+
 def _bounded(val: str | None, max_len: int) -> str | None:
-    """Accept a plausible short single-line label/definition; reject empty, over-long, multiline,
-    or list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching."""
-    if not val or len(val) > max_len or "\n" in val or val.startswith("["):
-        return None
-    return val
+    """Accept a plausible label/definition; reject empty, over-long, LIST-SHAPED, or
+    list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching.
+
+    NEWLINES ARE ALLOWED (2026-08-06, human decision). The blanket `"\\n" in val` ban was written
+    when the definition cap was 200-600 chars, where "a definition is one line" was a fair
+    description. At `MAX_DEFINITION_LEN` = 32_000 it had become the binding ceiling on ACHIEVABLE
+    length: a model writing a long definition paragraphs it, and the whole value was DISCARDED —
+    not shortened, not salvaged — leaving the column with no AI definition and a failure that looked
+    like a provider blip.
+
+    M9's intent is kept by two narrower guards:
+      * `startswith("[")` catches the stringified-list form INDEPENDENTLY — relaxing newlines never
+        weakened it (the earlier claim that it did was wrong);
+      * `_is_enumeration` catches the multi-line bulleted or numbered answer.
+
+    WHAT IS NOW ADMISSIBLE AND WAS NOT — stated rather than glossed, because an earlier revision of
+    this note claimed the enumeration was the ONLY thing the newline ban uniquely caught, and it was
+    not: a multi-line JSON OBJECT or YAML dump (`{\\n  "definition": "..."\\n}`) now passes every
+    relaxed gate. `startswith("[")` covers arrays only, so nothing refuses an object.
+
+    DELIBERATELY NOT GUARDED. The asymmetry decides it: a false negative caches an ugly but VISIBLE
+    value that a human can see and fix, while a false positive leaves the column with NO definition
+    and a silent failure indistinguishable from a provider blip. Erring loose is right here, and a
+    structural-output model returning a JSON blob inside a JSON string field is a schema-level
+    malfunction that a shape guard on this seam would only half-catch anyway.
+    """
+    return None if _bounded_reject(val, max_len) else val
+
+
+#: Task 9c — the closed rule vocabulary `_bounded` refuses under. Every member is a RULE NAME; none
+#: of them is derived from the value.
+BOUNDED_REJECT_CODES: tuple[str, ...] = ("blank", "over_length", "list_prefix", "enumeration")
+
+
+def _bounded_reject(val: str | None, max_len: int) -> str | None:
+    """WHICH of `_bounded`'s four rules refuses `val`, or None when it is accepted.
+
+    `_bounded` collapsed four distinct rules into one `None`, and `_accept_bounded` collapsed that
+    further into the single reason code `invalid_value`. From outside, a definition discarded for
+    one leading `[`, one discarded for being a bulleted list, and one discarded for exceeding a
+    32_000-char cap were the same event — and all three were indistinguishable from a provider
+    blip. This is the ONE place the rules are evaluated; `_bounded` delegates rather than
+    re-stating them, so the diagnosis can never drift from the decision."""
+    if not val:
+        return "blank"
+    if len(val) > max_len:
+        return "over_length"
+    if val.startswith("["):
+        return "list_prefix"
+    if _is_enumeration(val):
+        return "enumeration"
+    return None
 
 
 def _accept_concept(raw: str) -> tuple[str | None, str]:
@@ -311,14 +401,46 @@ def _accept_concept(raw: str) -> tuple[str | None, str]:
         return UNCLASSIFIED, "valid"
     if is_known_concept(v):
         return canonical_concept_name(v), "valid"
-    return None, "invalid_value"
+    return None, "off_vocabulary"
 
 
 def _accept_bounded(max_len: int):
-    """Accept a plausible short single-line value (reuses _bounded); else invalid -> not cached."""
+    """Accept a plausible bounded, non-list-shaped value (reuses `_bounded`); else invalid -> not
+    cached. NEWLINES ARE ALLOWED — see `_bounded`. A gate whose value must stay on ONE line uses
+    `_accept_single_line` instead."""
     def _accept(raw: str) -> tuple[str | None, str]:
-        v = _bounded(raw, max_len)
-        return (v, "valid") if v is not None else (None, "invalid_value")
+        # Task 9c: the reason code names the RULE (`over_length` / `list_prefix` / `enumeration` /
+        # `blank`) rather than the catch-all `invalid_value`. The batch outcome STATUS is still
+        # `invalid_value` — only the reason narrowed — so nothing that switches on status moves.
+        code = _bounded_reject(raw, max_len)
+        return (None, code) if code else (raw, "valid")
+    return _accept
+
+
+def _accept_single_line(max_len: int):
+    """`_accept_bounded` PLUS the single-line rule `_bounded` no longer enforces globally.
+
+    `_bounded` stopped rejecting newlines so a long DEFINITION could be paragraphed. Two gates must
+    NOT inherit that relaxation, and both keep their pre-relaxation behaviour byte-for-byte:
+
+      * `domain` — a grouping-key LABEL, never prose. A multi-line label mints a malformed group,
+        and it flows into `_accept_domain_result` as both the table default and the column overrides.
+      * `synonyms` — the answer is parsed by splitting on COMMAS
+        (`ingest._project_semantic_terms`: `for term in (ev.proposed_value or "").split(",")`), and
+        `_SYN_INSTRUCTION` asks for "ONE comma-separated line per item". A newline-separated answer
+        would be cached and projected as a SINGLE term ("account number\\nacct num\\nacc #") rather
+        than three, with the whole blob as its dedupe key — silently worse than the rejection it
+        replaced, because a rejected item is retried.
+
+    `unit` needs no equivalent: `_UNIT_TOKEN_RE.fullmatch` excludes newlines by construction.
+    """
+    bounded = _accept_bounded(max_len)
+
+    def _accept(raw: str) -> tuple[str | None, str]:
+        value, reason = bounded(raw)
+        if value is None:
+            return None, reason
+        return (None, "multiline") if "\n" in value else (value, "valid")
     return _accept
 
 
@@ -350,14 +472,16 @@ def _accept_domain(max_len: int):
     rejects a prompt/task echo or an internal dotted identifier (``_is_task_echo``). A rejected value
     is invalid -> treated as failure -> NOT cached (M3), same as any other reject. Domains stay
     open-vocabulary: no controlled list — only our own task/namespace identifiers are filtered out."""
-    bounded = _accept_bounded(max_len)
+    # `_accept_single_line`, not `_accept_bounded`: a domain is a grouping-key LABEL and must not
+    # inherit the newline relaxation made for paragraphed definitions. See that helper for why.
+    bounded = _accept_single_line(max_len)
 
     def _accept(raw: str) -> tuple[str | None, str]:
         value, reason = bounded(raw)
         if value is None:
             return None, reason
         if _is_task_echo(value):
-            return None, "invalid_value"
+            return None, "task_echo"
         return value, "valid"
     return _accept
 
@@ -479,9 +603,13 @@ def _parse_domain_result(raw: str) -> tuple[str, dict[str, str], dict[str, str]]
 
 # ── E4a T2: the MEASURE ANNOTATION accept gate ────────────────────────────────────────────────────
 # A unit is a short measurement TOKEN, never prose — "AED", "fils", "%", "bps", "days", "shares",
-# "transactions", "USD per share". 32 chars is generous for every real one and far too small for a
+# "transactions", "USD per share". 64 chars is generous for every real one and far too small for a
 # sentence, so a model that starts explaining itself is rejected rather than stored as a unit.
-_MAX_UNIT_LEN = 32
+# ZERO-TRUNCATION RAISE (2026-08-06): 32 -> 64. This one is an ACCEPT gate, so 32 did not shorten a
+# long unit, it DISCARDED the whole proposal — and a compound unit ("basis points per annum on
+# average daily balance") is a legitimate answer that 32 refused. The read-side display bound in
+# `feature_assist._MAX_SUGGESTION_LEN` moves with it and stays the larger of the two.
+_MAX_UNIT_LEN = 64
 # Starts with a letter/digit/% (never punctuation or a list-stringified `['a','b']`) and continues
 # with the characters real units use. Deliberately NOT a closed vocabulary: units are open (every
 # commodity, rate basis and count noun is one), so a closed list would reject legitimate values
@@ -498,10 +626,15 @@ _CURRENCY_CODE_RE = re.compile(r"[A-Za-z]{3}")
 
 def _accept_unit(raw: str) -> tuple[str | None, str]:
     """Accept ONE unit token (bounded, single-line, token-shaped, not a prompt/task echo)."""
-    value = _bounded(raw.strip(), _MAX_UNIT_LEN)
-    if value is None or not _UNIT_TOKEN_RE.fullmatch(value) or _is_task_echo(value):
-        return None, "invalid_value"
-    return value, "valid"
+    stripped = raw.strip()
+    code = _bounded_reject(stripped, _MAX_UNIT_LEN)
+    if code:
+        return None, code
+    if not _UNIT_TOKEN_RE.fullmatch(stripped):
+        return None, "unit_shape"
+    if _is_task_echo(stripped):
+        return None, "task_echo"
+    return stripped, "valid"
 
 
 def _accept_currency(raw: str) -> str | None:
@@ -636,7 +769,7 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
         meta_defn = strip_sample_values(rec.definition)
         if meta_defn:
             # The sanitized business definition is the payload we WANT the classifier to see, so give
-            # it the larger word-bounded window instead of the 200-char default that cut it mid-sentence.
+            # it the larger word-bounded window instead of the `_MAX_META_LEN` default.
             meta["business_definition"] = bounded_definition(meta_defn, _MAX_DEFINITION_LEN)
         for key, val in (("term_name", rec.term_name), ("data_domain", rec.domain),
                          ("bian_path", rec.bian_path), ("fibo_path", rec.fibo_path)):
@@ -851,7 +984,8 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
-                            cache_hit_hashes: frozenset[str] = frozenset()) -> int:
+                            cache_hit_hashes: frozenset[str] = frozenset(),
+                            counts: dict[str, int] | None = None) -> int:
     """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
     ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
     LLM producer must not bypass the machinery every other producer goes through).
@@ -879,18 +1013,35 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
     so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn.
 
     Returns the number of CONTAINED per-item write failures so the caller's stage report (#22) can
-    say ``partial`` — the swallowed except below must never be laundered into an outer success."""
+    say ``partial`` — the swallowed except below must never be laundered into an outer success.
+
+    ``counts`` (Task 9c, optional out-param — the return value is unchanged): the same
+    :data:`EVIDENCE_WRITE_DISPOSITIONS` account ``_write_llm_field_evidence`` keeps, which this
+    writer had no equivalent of at all. Its three designed non-writes below were entirely
+    invisible: a run could classify every column, store evidence for none of them, and report only
+    ``failures == 0``."""
     failures = 0
+
+    def _count(disposition: str, reason: str | None = None) -> None:
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            counts[f"{disposition}_{reason}"] = counts.get(f"{disposition}_{reason}", 0) + 1
+
     for h, concept in resolved.items():
         if concept == UNCLASSIFIED or not is_known_concept(concept):
+            _count("skipped", "not_a_proposal")
             continue   # C3: unclassified / invalid is not a proposal
         row = by_hash[h]
         rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
         if rec is None:
+            _count("skipped", "no_evidence_ref")
             continue   # not a glossary column term — no schema-preserving identity to key on
         if bindings is not None:
             binding = bindings.get(normalize_ref(row.source, None, row.table, row.column))
             if binding is None or not may_attach(binding):
+                _count("skipped", "unattachable_binding")
                 continue   # attachable columns only
         material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
         input_hash = field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
@@ -913,8 +1064,12 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                         strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
                         producer_item_ref=item_ref, producer_configuration_hash=_vocab_fingerprint(),
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+            # Counted only AFTER the savepoint committed: an increment inside the `with` would
+            # survive a rollback and report a row that does not exist.
+            _count("reused" if reused else "written")
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
             failures += 1
+            _count("failed")
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
     return failures
@@ -1026,24 +1181,32 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
     counted."""
     failures = 0
 
-    def _count(disposition: str) -> None:
-        if counts is not None:
-            counts[disposition] = counts.get(disposition, 0) + 1
+    def _count(disposition: str, reason: str | None = None) -> None:
+        """Task 9c: the disposition AND, for a skip, WHICH of the three designed non-writes it was.
+        The disposition key is written unchanged so every existing reader is untouched; the reason
+        rides beside it under `skipped_<reason>`, because "126 skipped" and "126 skipped for want
+        of a glossary ref" are different findings and only the second is actionable."""
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            key = f"{disposition}_{reason}"
+            counts[key] = counts.get(key, 0) + 1
 
     for key, value in items.items():
         try:
             if valid_fn is not None and not valid_fn(value):
-                _count("skipped")              # skip — not a proposal, not a failure
+                _count("skipped", "invalid_value")   # skip — not a proposal, not a failure
                 continue
             resolved = ref_of(key)
             if resolved is None:
-                _count("skipped")
+                _count("skipped", "no_evidence_ref")
                 continue
             evidence_ref, binding_ref, material = resolved
             if bindings is not None:
                 binding = bindings.get(binding_ref)          # PUBLIC-flattened attachability lookup
                 if binding is None or not may_attach(binding):
-                    _count("skipped")          # attachable columns only
+                    _count("skipped", "unattachable_binding")   # attachable columns only
                     continue
             input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
                                           material=material)
@@ -1100,7 +1263,8 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
                                definitions: dict[str, str], glossary: GlossaryUpload,
                                concepts: dict[str, str] | None,
                                bindings: dict[str, ObjectBinding] | None,
-                               source_snapshot_id: str) -> int:
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's drafted definitions (E1a Task 2) out of the display-only
     ``graph_node.definition`` into governed ``llm/proposed`` ``field_evidence``, so asset-detail can
     honestly show the AI as their author. Returns the CONTAINED per-item failure count, which the
@@ -1140,7 +1304,7 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="definition", items=definitions, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
 
     # The set difference is computed here (never handed a ref written this run — that would silently
     # stale the fresh evidence): KEEP = written this run ∪ still an expected target. The expected set
@@ -1159,7 +1323,8 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
                             extras_by_hash: dict[str, dict] | None = None,
-                            bundles: dict[str, SemanticContextBundleV1] | None = None) -> int:
+                            bundles: dict[str, SemanticContextBundleV1] | None = None,
+                            counts: dict[str, int] | None = None) -> int:
     """Promote drafted summaries into governed ``llm/proposed`` ``field_evidence`` under
     ``ai_summary``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -1195,7 +1360,7 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="ai_summary", items=summaries, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
     keep = {ref[0] for h in set(summaries) | _summary_targets(rows, glossary)
             if (ref := ref_of(h)) is not None}
     _reconcile_llm_field_evidence(
@@ -1238,7 +1403,8 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
                            column_domains: dict[tuple[str, str], str],
                            glossary: GlossaryUpload,
                            bindings: dict[str, ObjectBinding] | None,
-                           source_snapshot_id: str) -> int:
+                           source_snapshot_id: str,
+                           counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's TWO-LEVEL domain classification (E1a T3) into governed ``llm/proposed``
     ``domain`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -1301,11 +1467,11 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="domain", items=dict(domains), ref_of=table_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=None)
+        bindings=None, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="domain", items=overrides, ref_of=column_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every still-target table in this upload (written OR transient-missed) ∪ the overrides
     # written this run ∪ every still-target column of a table whose classification MISSED (its
@@ -1331,7 +1497,8 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
                                column_sub_domains: dict[tuple[str, str], str],
                                glossary: GlossaryUpload,
                                bindings: dict[str, ObjectBinding] | None,
-                               source_snapshot_id: str) -> int:
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
     """Promote the D13.2 per-column SUB-DOMAINS into governed ``llm/proposed`` ``sub_domain``
     ``field_evidence``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -1367,7 +1534,7 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="sub_domain", items=items, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
     missed = tables_in_run - classified_tables
     keep = {ref[0] for k in items if (ref := ref_of(k)) is not None}
     keep |= {ref[0] for (table, column) in rec_by_tc
@@ -1381,10 +1548,19 @@ def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
 def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             synonyms: dict[str, str], glossary: GlossaryUpload,
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> int:
+                            source_snapshot_id: str,
+                            counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted synonyms (E1a T4) as FIRST-CLASS ``llm/proposed`` ``semantic_terms``
     ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller MUST propagate
     into its stage report (``partial``/``items_failed``).
+
+    ``counts`` (optional out-param) receives the writer's per-item dispositions
+    (:data:`EVIDENCE_WRITE_DISPOSITIONS`). It is not optional in PRACTICE for the ingest caller, and
+    the reason is `skipped`: ``ref_of`` returns ``None`` for every column WITHOUT a glossary record,
+    so those items are drafted at full LLM cost and stored nowhere. Skips are deliberately NOT
+    failures, so a caller reading only the failure count sees zero and reports a clean ``succeeded``
+    for a run that persisted nothing. Passing ``counts`` is how that stops being invisible — the
+    count was previously not merely unreported but never COMPUTED.
 
     NOT search-only and NOT human-confirmed: an AI synonym may be the ONLY semantic signal that
     selects a column — it needs no corroboration and passes no new gate. What makes that safe is that
@@ -1422,7 +1598,7 @@ def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="semantic_terms", items=synonyms, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every glossary column still in this upload (written this run OR transient-missed);
     # computed through the SAME `ref_of` the write used, so a fresh row is never handed to retirement.
@@ -1438,7 +1614,8 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
                          units: dict[str, str], currencies: dict[str, str],
                          concepts: dict[str, str] | None, glossary: GlossaryUpload,
                          bindings: dict[str, ObjectBinding] | None,
-                         source_snapshot_id: str) -> int:
+                         source_snapshot_id: str,
+                         counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted measure annotation (E4a T2) as ``llm/proposed`` ``unit`` /
     ``currency`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -1496,11 +1673,11 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="unit", items=units, ref_of=unit_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="currency", items=currencies, ref_of=currency_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = written this run ∪ still an expected target, computed through the SAME `ref_of` the
     # write used (so a ref written this run is never handed to retirement, and a non-target is never
@@ -1552,11 +1729,47 @@ def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: st
         actor_ref=None, supersedes_event_id=supersedes)
 
 
+#: Task 9c — the label used for "this concept has no identifier namespace" (a non-identifier
+#: concept, an unregistered name, or ``unclassified``). A JSON object key must be a string, and an
+#: explicit label is readable where a missing bucket is ambiguous.
+NO_NAMESPACE = "-"
+
+
+def _namespace_of(concept_name: str | None) -> str:
+    """The join-candidacy axis of a concept name — its identifier NAMESPACE, or ``-``.
+
+    Recorded per run because it is recorded NOWHERE else. ``namespace`` is a pure code-side
+    derivation from the in-code ``CONCEPT_REGISTRY``: no column stores it, so a later registry edit
+    silently rewrites the namespace of every historical verdict and nothing on disk shows that it
+    moved. Two columns are bridge candidates iff their concepts share a namespace, so this is the
+    axis a changed verdict actually moves — and the reason a run producing different features is
+    uninterpretable without it.
+
+    A concept name and a namespace are both controlled-vocabulary CODES from a registry in this
+    repo. Neither is column data, and neither is derived from any."""
+    rec = concept_record(concept_name) if concept_name else None
+    return (rec.namespace or NO_NAMESPACE) if rec is not None else NO_NAMESPACE
+
+
+def namespace_histogram(concepts: dict[str, str]) -> dict[str, int]:
+    """``{namespace: column count}`` over one run's resolved concepts — the join-candidacy shape of
+    the catalog as this run sees it, in counts only. Comparing this run's ``after_critic`` against
+    the previous run's is what separates "the LLM enriched more columns" from "the same columns
+    were re-judged into a different namespace" when a feature set changes."""
+    histogram: dict[str, int] = {}
+    for name in concepts.values():
+        key = _namespace_of(name)
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
 def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
                           by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
                           rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor,
                           bundles: dict[str, SemanticContextBundleV1] | None = None,
-                          critic_outcomes: dict[str, dict] | None = None) -> dict:
+                          critic_outcomes: dict[str, dict] | None = None,
+                          call_ledger: CallLedger | None = None,
+                          deadline_s: float | None = None) -> dict:
     """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
     concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
     ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
@@ -1584,11 +1797,18 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     ``{items, accepted, revised, refuted, abstained, conflicts}``.
 
     ``critic_outcomes`` (semantic Task 5, optional out-param — the return shape is unchanged):
-    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for every criticised
-    ref. It rides SEPARATELY from the returned report on purpose: the report becomes an ingest
-    STAGE DETAIL, which is contractually "a SMALL dict of counts", and a per-ref map over a wide
-    table is not that. The adjudication stage consumes this map as one of its deterministic
-    selection inputs."""
+    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for EVERY criticised
+    ref, changed or not. It rides separately from the returned report because the adjudication
+    stage consumes it as one of its deterministic selection inputs — a different consumer with a
+    different lifetime, not a size argument.
+
+    THE SIZE ARGUMENT, RESTATED (Task 9c changed the answer). This docstring used to say a per-ref
+    map must never become a stage detail, because a stage detail is contractually "a SMALL dict of
+    counts". ``report["conflicts"]`` was already a per-ref map when it said so, and Task 9c adds
+    ``report["verdict_changes"]``, so the rule as stated is not the one the code follows. The rule
+    the code actually follows: a stage detail carries counts over EVERY item, and a per-ref map
+    only over the items that CHANGED — bounded by the run's revisions and refutations, not by the
+    catalog's width. ``critic_outcomes`` stays out of the detail because it is the unbounded one."""
     items: dict[str, ConceptCriticItemV1] = {}
     ref_to_hash: dict[str, str] = {}
     bundles = bundles or {}
@@ -1625,16 +1845,33 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
             context=context,
         )
         ref_to_hash[evidence_ref] = h
+    # Task 9c — `verdict_changes` is THE row this run has to leave behind. Task 9b moved the
+    # registry, which moves the critic's replay fingerprint, so this run re-critiques every
+    # identifier column instead of replaying stored verdicts. A REVISED column gets a different
+    # concept and therefore a different NAMESPACE (the join-candidacy axis); a REFUTED one becomes
+    # `unclassified` and loses bridge candidacy entirely. Without the before→after pair per column,
+    # a different set of features coming out of this run is uninterpretable: fresh enrichment and
+    # re-rolled verdicts look exactly the same from the outside.
+    #
+    # CHANGED refs only, and that is complete rather than partial: `accepted` and `abstained` leave
+    # the concept exactly as the classifier produced it, and that value is already durable in
+    # `graph_node.concept` and the column's `concept` `field_evidence`. The counts below say how
+    # many were judged; this map says which ones MOVED, and where from and to. Always present (an
+    # empty map means "nothing moved", an absent key means this code never ran).
     report: dict = {"items": len(items), "accepted": 0, "revised": 0, "refuted": 0,
-                    "abstained": 0, "conflicts": {}}
+                    "abstained": 0, "conflicts": {}, "verdict_changes": {}}
     if not items:
         return report
     # The replay identity of THIS catalog's content: a byte-identical re-upload replays every
     # stored critique for free, while any content change re-asks the affected questions.
     catalog_revision = hashlib.sha256(
         json.dumps(sorted(by_hash)).encode("utf-8")).hexdigest()[:16]
+    # [A.54] The bound. `not_attempted`/`stopped_by` land on the report so the stage can say
+    # `truncated` rather than a laundered `succeeded` over a run that criticised a fraction of
+    # its columns. A skipped item ABSTAINS — the classifier's concept stands, un-refuted.
     outcomes = critique_concept_batch(
-        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor)
+        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor,
+        call_ledger=call_ledger, deadline_s=deadline_s, stats=report)
     corrections: list[tuple[str, str]] = []
     for ref, outcome in outcomes.items():
         h = ref_to_hash.get(ref)
@@ -1662,9 +1899,30 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
                 and outcome.resolved_concept is not None):
             report["revised"] += 1
             corrections.append((h, outcome.resolved_concept))
+            after = outcome.resolved_concept
         else:
             report["refuted"] += 1
             corrections.append((h, UNCLASSIFIED))
+            after = UNCLASSIFIED
+        # Recorded HERE, in the same pass that decides it, and only after the eviction writes above
+        # succeeded — so the map can never claim a change the savepoint did not keep.
+        #
+        # `before` is the concept the critic was ASKED about, which is the already-CANONICALIZED
+        # assignment (`_accept_concept` resolves a legacy alias to its successor before anything
+        # sees it — `counterparty_id` arrives here as `customer_id`). That is the right before: it
+        # is the value that would have been stored had the critic not moved it, so the pair reads
+        # as "what this column would have been" → "what it is".
+        #
+        # `conflict_codes` rides here as well as in `conflicts`, deliberately: a reader who has
+        # found the column that moved should not have to join two maps to learn why it moved.
+        before = items[ref].proposed_concept
+        report["verdict_changes"][ref] = {
+            "disposition": outcome.disposition.value,
+            "from": before, "to": after,
+            "from_namespace": _namespace_of(before), "to_namespace": _namespace_of(after),
+            "reason_codes": list(outcome.reason_codes),
+            "conflict_codes": list(outcome.conflict_codes),
+        }
     for h, corrected in corrections:       # in-memory only after every DB write succeeded
         result[h] = corrected
     return report
@@ -1906,7 +2164,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     the distinct ``truncated``) instead of a laundered success. It also receives
     ``concept_critic`` — the acceptance hook's report (``_apply_concept_critic``; ``{"failed":
     True}`` when the contained critic faulted) — which ingest records as the
-    ``enrich_concept_critic`` stage.
+    ``enrich_concept_critic`` stage, plus ``concept_critic_started_at``, that stage's own start
+    instant (the critic runs INSIDE this function, so the concept stage's timer measures the
+    classifier and the critic together and can report neither on its own).
 
     ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
     dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
@@ -1940,9 +2200,18 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     miss_hashes = [h for h in by_hash if h not in result]
     resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (a MISS only)
 
+    # [A.54] ONE ledger for the WHOLE concept stage. `run_batched` would build its own, which is
+    # correct only while every provider call of the stage is issued by the ladder — and the critic
+    # below issues up to two more PER IDENTIFIER COLUMN from outside it. Sharing the ledger is
+    # exactly what `CallLedger` prescribes, and what stops the critic spending a ceiling it was
+    # never counted against. Built unconditionally so BOTH modes hand the critic the same object.
+    stage_ledger = CallLedger(enrich_config.budget("concept").max_provider_calls)
+    stage_deadline = enrich_config.stage_deadline_s()
     if enrich_config.mode("concept") == "batch":
         misses = [BatchItem(h, payload_by_hash[h]) for h in miss_hashes]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -1951,8 +2220,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor,
-            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
-            report=batch_report,
+            deadline_s=stage_deadline,                     # MF-4 — bound the source-lock hold
+            call_ledger=stage_ledger, report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_concept",
             dispatch_subjects=({h: _column_subject(by_hash[h]) for h in miss_hashes}
                                if ingestion_run_id is not None else None))
@@ -1994,12 +2263,29 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
     critic_report: dict = {"failed": True}
     critic_outcomes: dict[str, dict] = {}
+    # Task 9c: the join-candidacy shape BEFORE the critic touches anything. Taken here rather than
+    # reconstructed afterwards because `_apply_concept_critic` mutates `result` in place — once it
+    # returns, the pre-critic namespace picture no longer exists anywhere.
+    namespaces_before = namespace_histogram(result)
+    # The critic's OWN clock. It runs inside `enrich_concepts`, so `enrich_concept`'s stage timer
+    # covers the classifier too and cannot say what the critic cost.
+    #
+    # [A.54, fixed 2026-08-09] It is no longer unbounded. The critic now shares this stage's
+    # `stage_ledger` and `stage_deadline`, and an item either bound skipped ABSTAINS with a
+    # `skipped_reason` — the classifier's concept stands un-refuted — while `not_attempted` /
+    # `stopped_by` land on the critic report. The clock below still matters: the deadline is
+    # checked BEFORE each item and cannot interrupt a call already in flight.
+    # Recorded on `stats` BEFORE the try, so a fault still leaves the stage a start time to report.
+    critic_started = datetime.now(UTC)
+    if stats is not None:
+        stats["concept_critic_started_at"] = critic_started
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(
                 conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
                 rec_by_tc=rec_by_tc, actor=actor, bundles=bundles,
-                critic_outcomes=critic_outcomes)
+                critic_outcomes=critic_outcomes,
+                call_ledger=stage_ledger, deadline_s=stage_deadline)
     except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
         logger.warning("advisory concept critic failed", exc_info=True)
         # The savepoint rolled the critic's writes back, so its per-ref verdicts describe state
@@ -2009,12 +2295,32 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     if stats is not None:
         stats["concept_critic"] = critic_report
         stats["concept_critic_outcomes"] = critic_outcomes
+        # Task 9c — the two run-level facts nothing else records.
+        #
+        # `namespaces`: counts per identifier namespace before and after acceptance. The per-column
+        # before→after pairs live on the critic stage (`verdict_changes`); this is the aggregate
+        # the next run can be diffed against, and it covers columns the critic never looked at
+        # (only the identifier GROUPS are criticised) as well as the ones it did.
+        #
+        # `vocab_fingerprint`: WHICH registry generation produced these verdicts. It is already
+        # folded into the classifier cache key and written as `producer_configuration_hash` on
+        # every concept `field_evidence` row, but never as a stage-level fact — so a run whose
+        # evidence writer was gated out (a technical upload) left no record of the vocabulary it
+        # classified under. Recording it here means the answer to "did the concepts move because
+        # the registry moved?" is one query, not an archaeology exercise.
+        stats["namespaces"] = {"before_critic": namespaces_before,
+                               "after_critic": namespace_histogram(result)}
+        stats["vocab_fingerprint"] = _vocab_fingerprint()
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
     # on the very next upload instead of leaving graph_node.concept populated with no supporting
     # field_evidence forever. `_write_concept_evidence`'s input_hash reuse check makes this a safe
     # no-op when the evidence already exists and is unchanged — no duplicate/stale rows.
+    # Task 9c: the evidence account rides on `stats` whether or not the writer runs. The gate below
+    # is the reason a TECHNICAL upload classifies every column and stores nothing — a divergence
+    # that `resolved`/`expected` cannot show, because both count the DRAFT.
+    ev_counts: dict[str, int] = {} if stats is None else stats.setdefault("evidence_counts", {})
     if glossary is not None and source_snapshot_id is not None:
         # Values come from the corrected ``result`` (never the pre-critic ``resolved``): a REVISED
         # column's evidence must carry the revision, a REFUTED one is ``unclassified`` and writes
@@ -2023,9 +2329,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
         failures = _write_concept_evidence(
             conn, resolved=evidence_targets, by_hash=by_hash, meta_by_hash=meta_by_hash,
             rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id,
-            cache_hit_hashes=hit_hashes)
+            cache_hit_hashes=hit_hashes, counts=ev_counts)
         if stats is not None:
             stats["evidence_write_failures"] = failures
+    elif stats is not None:
+        stats["evidence_writer"] = ("not_run:no_glossary" if glossary is None
+                                    else "not_run:no_source_snapshot")
     return result
 
 
@@ -2165,7 +2474,8 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     if not misses:
         return result
     items = [BatchItem(h, meta_by_hash[h]) for h in misses]
-    batch_report: dict = {}
+    # Task 9c: see the note at the other run_batched sites — the report rides on `stats`.
+    batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
     resolved = run_batched(
         conn, client, short="summary", task=_SUMMARY_TASK,
         prompt_id="overlay_summary_batch_v1", schema_id="overlay_summary_batch",
@@ -2176,7 +2486,7 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     "if so, say what THIS column specifically is, do not repeat it. Treat each item "
                     "independently; never reuse another item's facts; return exactly one result per "
                     "input ref.",
-        accept=_accept_bounded(400), actor=actor,
+        accept=_accept_bounded(_MAX_SUMMARY_LEN), actor=actor,
         deadline_s=enrich_config.stage_deadline_s(), report=batch_report,
         ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_summary",
         dispatch_subjects=({h: _column_subject(by_hash[h]) for h in misses}
@@ -2226,15 +2536,31 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=blank[h], rec=rec_of(blank[h])))
                  for h in misses]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="definition", task=_DEF_TASK,
             prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
             shared_metadata={}, items=items, out_key="definition",
-            instruction="Draft a one-line business definition for EACH column. Treat each item "
+            # The instruction USED to say "one-line", which stopped being coherent when
+            # MAX_DEFINITION_LEN reached 32_000 and the accept gate began allowing paragraphs: it
+            # asked for exactly the shape the caps were widened to stop forcing. It now asks for a
+            # complete definition and names the ONE shape still refused (`_is_enumeration`), so the
+            # prompt and the gate agree — a model is never invited to produce output we discard.
+            instruction="Draft a complete business definition for EACH column. Write as much as the "
+                        "column genuinely needs — one sentence for an obvious field, several "
+                        "paragraphs where the meaning, derivation or caveats warrant it. Write "
+                        "flowing PROSE, not a bulleted or numbered list. Treat each item "
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
-                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
+                        "exactly one result per input ref.",
+            # ZERO-TRUNCATION RAISE (2026-08-06): 500 -> MAX_DEFINITION_LEN. The 32_000 raise
+            # widened only the OUTBOUND side (`_MAX_LEN_BY_KEY` is an egress cap); this is the gate
+            # that decided how long a definition the model may WRITE, and at 500 it sat below even
+            # the original 600 — a drafted definition over 500 chars was DISCARDED, not shortened.
+            # Paired with `overlay_definition_batch`'s schema maxLength; pinned equal by test.
+            accept=_accept_bounded(MAX_DEFINITION_LEN), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_definition",
@@ -2256,10 +2582,14 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                                      "table": row.table, "column": row.column, "type": row.type},
                                      row=row, rec=rec_of(row)),
                                  "definition",
-                                 "Draft a one-line business definition for this column.",
+                                 # Kept in step with the batch instruction above: prose, any
+                                 # length up to the cap, never a bulleted list.
+                                 "Draft a complete business definition for this column. Write as "
+                                 "much as it genuinely needs, as flowing prose — never a bulleted "
+                                 "or numbered list.",
                                  actor,
                                  _single_ctx(ingestion_run_id, "enrich_definition",
-                                             _column_subject(row))), 500)
+                                             _column_subject(row))), MAX_DEFINITION_LEN)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", key_of[h], drafted, _DEFINITION_CACHE_VERSION)
@@ -2328,7 +2658,9 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                                 "column_roster": sorted(roster_by_table.get(t, []),
                                                         key=lambda e: e["column"])})
                   for t, cols in by_table.items() if hash_of_table[t] not in cached]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v2",
             schema_id="overlay_domain_batch", prompt_version=2, schema_version=2,
@@ -2383,10 +2715,39 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
     return result
 
 
-_SYN_INSTRUCTION = ("List the business SYNONYMS and common aliases for EACH column — the other names "
-                    "a business user would search for it by. Return ONE comma-separated line per "
-                    "item, terms only, no explanation. Treat each item independently: use only that "
-                    "item's table/column/type/concept; return exactly one result per input ref.")
+# Synonyms are the ONLY semantic handle an UNCLASSIFIED column has: with no concept it cannot be
+# found by meaning, so its aliases are the entire basis on which anyone can search for it. The prior
+# wording undermined that twice — it asked for no COUNT (the model returned whatever it felt like,
+# typically three or four) and it told the model to "use only that item's table/column/type/concept",
+# which FORBADE the business definition, the single richest source of aliases in the payload.
+#
+# The definition is already IN the item (`_drafting_payload` -> `for_summary`, restored by
+# `_definition_egress_guard` for a curated column): this instruction stops refusing the model
+# permission to read what it is being shown. On a TECHNICAL column the guard withholds it (M4) and
+# the model simply has one fewer source — the instruction names it, it does not require it.
+#
+# "ONE comma-separated LINE" is LOAD-BEARING, not style: the consumer `ingest._project_semantic_terms`
+# splits on COMMAS only, so a newline-separated answer projects as ONE term with the whole blob as
+# its dedupe key. The `_accept_single_line` gate below refuses that shape, and an instruction must
+# never ask for output the gate discards — so asking for MORE terms must never become asking for a
+# term per line.
+# [F10] The character budget is INTERPOLATED from `_MAX_SYNONYMS_LEN`, never typed as a literal.
+# A schema `maxLength` cannot carry this bound to the model: `schema_projection` strips it from the
+# wire (Anthropic's `json_schema` format rejects it) while `validate_output` still checks it on the
+# response — so the instruction is the ONLY channel the bound has, and an over-run fails the whole
+# chunk rather than one item. Asking for "15 to 20 terms" without a length put ~20 x ~50 chars right
+# at the cap. Pinned by `test_the_prompt_and_the_gate_AGREE_about_LENGTH_not_just_shape`.
+_SYN_INSTRUCTION = (
+    "List the business SYNONYMS and common aliases for EACH column — the other names a business "
+    "user would search for it by. Give 15 to 20 terms where the evidence supports them; give fewer "
+    "only when the column is genuinely narrow. Use the item's table, column name, type, concept AND "
+    "its business definition — the definition is usually the richest source of aliases, so read it. "
+    "If the concept is the literal value 'unclassified', ignore it: it is the absence of a "
+    "classification, not a hint. Return ONE comma-separated line per item, terms only, no "
+    f"explanation. HARD LIMIT: the line for each item must be at most {_MAX_SYNONYMS_LEN} "
+    "characters INCLUDING the separators — if the terms you have would exceed it, return fewer "
+    "terms rather than a longer line, keeping the ones a business user is most likely to search "
+    "for. Treat each item independently; return exactly one result per input ref.")
 
 
 def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
@@ -2410,7 +2771,11 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     by_hash = {content_hash(r): r for r in rows}
     bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
     rec_of = _rec_lookup(glossary)
-    accept = _accept_bounded(_MAX_SYNONYMS_LEN)
+    # SINGLE LINE, not merely bounded: the consumer splits this on COMMAS
+    # (`ingest._project_semantic_terms`) and `_SYN_INSTRUCTION` asks for one comma-separated line,
+    # so a newline-separated answer would be projected as ONE term instead of several. The 2026-08-06
+    # newline relaxation was for paragraphed DEFINITIONS and must not reach this gate.
+    accept = _accept_single_line(_MAX_SYNONYMS_LEN)
 
     if enrich_config.mode("synonyms") == "batch":
         # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
@@ -2421,7 +2786,9 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=by_hash[h], rec=rec_of(by_hash[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="synonyms", task=_SYN_TASK,
             prompt_id="overlay_synonyms_batch_v1", schema_id="overlay_synonyms_batch",
@@ -2516,7 +2883,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                      **({"concept": concepts[h]} if concepts.get(h) else {})},
                      row=blank[h], rec=rec_of(blank[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="unit", task=_UNIT_TASK, prompt_id="overlay_unit_batch_v1",
             schema_id="overlay_unit_batch", shared_metadata={}, items=items, out_key="unit",

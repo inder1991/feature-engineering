@@ -249,3 +249,76 @@ def test_deterministic_conflicts_refute_without_any_client(db) -> None:
     assert abstained.resolved_concept == "customer_id"
     assert abstained.skipped_reason == "llm_critic_unavailable"
     assert _llm_calls(db) == 0
+
+
+# ---- A.54: the loop is BOUNDED, and a bound never evicts a concept --------------------------------
+
+
+def test_the_call_ceiling_stops_dispatch_and_the_item_ABSTAINS(db) -> None:
+    """[A.54] `critique_concept_batch` was a plain per-item loop: no call ceiling, no deadline, no
+    `not_attempted` accounting. On a 144-column catalog that is ~70-100 sequential provider calls at
+    up to 300s each — and by A.53 it is exactly the stage the first run after merge runs hardest.
+
+    FAIL-OPEN is the disposition, deliberately. The critic is refute-oriented ("absence of support
+    is not an eviction"), so an item the bound skipped keeps the classifier's proposal and says so
+    via `skipped_reason` — it must never be silence, and it must never be a refutation."""
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+
+    items = [_item(ref=f"cib::t.c.col{i}") for i in range(3)]
+    ledger = CallLedger(max_provider_calls=0)          # nothing may dispatch
+    results = critique_concept_batch(db, _supported_client(), items, catalog_revision="r1",
+                                     call_ledger=ledger)
+
+    assert len(results) == 3                            # EVERY item still resolves to a disposition
+    for item in items:
+        r = results[item.logical_ref]
+        assert r.disposition is ConceptDisposition.ABSTAINED
+        assert r.resolved_concept == item.proposed_concept       # the proposal STANDS
+        assert r.skipped_reason == "critic_call_ceiling"
+    assert _llm_calls(db) == 0                          # and nothing was dispatched
+
+
+def test_the_deadline_stops_dispatch_midway_and_earlier_items_keep_their_verdicts(db) -> None:
+    """The time bound, which is the one that matters for the advisory lock. A fake clock keeps this
+    assertable without wall-clock, the way `run_batched`'s own deadline tests do."""
+    ticks = iter([0.0, 0.0, 100.0, 100.0, 100.0, 100.0])
+    items = [_item(ref="cib::t.c.first"), _item(ref="cib::t.c.second")]
+    results = critique_concept_batch(db, _supported_client(), items, catalog_revision="r1",
+                                     deadline_s=10.0, now=lambda: next(ticks))
+
+    assert results["cib::t.c.first"].disposition is ConceptDisposition.ACCEPTED
+    second = results["cib::t.c.second"]
+    assert second.disposition is ConceptDisposition.ABSTAINED
+    assert second.skipped_reason == "critic_deadline"
+    assert second.resolved_concept == "customer_id"
+
+
+def test_a_budget_STOP_can_never_refute_a_concept(db) -> None:
+    """The trap this bound walks into if written naively. `_critique_one` ends
+    `REVISED if revised else REFUTED`, so a deterministically-conflicted item whose ONE revise pass
+    cannot be funded would come out REFUTED — evicting a concept, and its bridge candidacy, for a
+    BUDGET reason. A refutation must always be a judgement, never an accounting outcome."""
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+
+    item = _desc_item()                                 # deterministically conflicted -> revise pass
+    ledger = CallLedger(max_provider_calls=0)
+    result = critique_concept_batch(db, FakeLLM(), [item], catalog_revision="r1",
+                                    call_ledger=ledger)[item.logical_ref]
+
+    assert result.disposition is not ConceptDisposition.REFUTED
+    assert result.resolved_concept == item.proposed_concept
+    assert result.skipped_reason == "critic_call_ceiling"
+
+
+def test_the_batch_reports_how_many_items_it_SKIPPED(db) -> None:
+    """`not_attempted` is the third thing A.54 says is missing. Without it the stage reports a clean
+    `succeeded` over a run that silently criticised a fraction of its columns."""
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+
+    items = [_item(ref=f"cib::t.c.col{i}") for i in range(4)]
+    stats: dict = {}
+    critique_concept_batch(db, _supported_client(), items, catalog_revision="r1",
+                           call_ledger=CallLedger(max_provider_calls=2), stats=stats)
+
+    assert stats["not_attempted"] == 2
+    assert stats["stopped_by"] == "critic_call_ceiling"

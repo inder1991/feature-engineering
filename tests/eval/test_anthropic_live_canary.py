@@ -177,10 +177,12 @@ def test_anthropic_live_canary(db, monkeypatch, schema_id: str, version: int) ->
 
     # (a) No schema-rejection 400: `ClaudeLLM.call` maps a 400 to PROVIDER_NON_RETRYABLE with an empty
     # body, so a PROVIDER_OK status proves the projected wire schema was accepted end to end.
+    # `non_retryable` is NOT unique to a 400 — a request timeout maps there too — so the message
+    # points at the adapter's WARNING log rather than asserting which of the two it was.
     assert result.status == PROVIDER_OK, (
-        f"{schema_id} v{version}: provider status {result.status!r} (a 400 schema rejection maps to "
-        f"non_retryable with an empty body) — the projected wire schema was likely rejected: "
-        f"{result.output}")
+        f"{schema_id} v{version}: provider status {result.status!r} — for 'non_retryable' with an "
+        f"empty body, check the featuregen.intake.llm_claude log to tell a 400 schema rejection "
+        f"(the projected wire schema was refused) from a timeout: {result.output}")
     # (b) The live response validates against the strict CANONICAL schema at the SAME version (the
     # wire projection only dropped constraints the canonical schema still enforces on the RESPONSE).
     # Raises on mismatch.

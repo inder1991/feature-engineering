@@ -2245,6 +2245,12 @@ export interface SemanticAdjudicationSection {
 export interface ContextValue {
   field: string
   value: unknown
+  // The LLM's own answer where it did NOT win resolution — the normal state for a field whose
+  // policy excludes the model (`_MEASURE_ANNOTATION`: unit/currency), where `graph_node` never
+  // receives the proposal at all. Carried BESIDE `value`, never folded into it: `value` is what the
+  // operational read model resolved, and a reader that cannot tell the two apart is how a guess
+  // clears a safety check. Optional: an older backend omits the key entirely.
+  proposed_value?: unknown
   resolution_status: string
   operational_influence: string | null
   // The DERIVED D2 display label (source_attested | source_proposed | human | llm_proposed |

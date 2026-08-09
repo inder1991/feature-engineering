@@ -109,7 +109,10 @@ def test_flag_on_menu_enriched_with_context_and_relevance(db, monkeypatch):
     captured: list = []
     fa.recommend_features(db, "predict churn", _capture_client(captured), catalog_source="bank",
                           budget=1, critic=False)
-    meta = captured[0]
+    # Task 6d: the menu assembly asks the model to expand the objective BEFORE the ranking, so the
+    # first captured request is that tiny `{"objective": ...}` call. Select the generation request
+    # by its shape — position was never the property under test here.
+    meta = next(m for m in captured if "columns" in m)
     assert "table_context" in meta
     amount = next(m for m in meta["columns"] if m["object_ref"] == "public.accounts.churn_flag")
     assert amount["additivity"]["authority"] in ("governed", "hint")  # wrapped fact

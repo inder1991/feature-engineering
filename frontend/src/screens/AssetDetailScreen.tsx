@@ -485,6 +485,8 @@ function OverviewTab({
 
       <SourceGlossarySection detail={detail} />
 
+      <SearchTermsSection detail={detail} />
+
       <section className="adg-section">
         <h3 className="micro-label">Semantics — what this column means operationally</h3>
         {isUnavailable('effective_metadata') ? (
@@ -532,6 +534,13 @@ function OverviewTab({
 const AXIS_FIELDS: readonly [string, string][] = [
   ['concept', 'Business concept'],
   ['domain', 'Data domain'],
+  // D13.2 — the FINER axis the LLM proposes BESIDE the coarse source domain, never in place of it.
+  // It reached `effective_metadata` with every other axis and was dropped by this list alone, so
+  // the classification existed in the payload and appeared on no screen. It renders through the
+  // same tri-state row as every other axis: a value with its author, else a live proposal marked
+  // unconfirmed, else "nothing known yet" — and NO row at all when the server does not send it, so
+  // a deployment whose backend predates the axis looks exactly like today.
+  ['sub_domain', 'Sub-domain'],
   ['additivity', 'Aggregation behavior'],
   ['unit', 'Unit'],
   ['currency', 'Currency'],
@@ -657,6 +666,89 @@ function SourceGlossarySection({ detail }: { detail: AssetDetail }) {
           </li>
         )}
       </ul>
+    </section>
+  )
+}
+
+// ---- the AI's search terms (Task 9) -----------------------------------------------------------
+// WHY THE EVIDENCE AND NOT `graph_node.semantic_terms`: that column is a SEARCH PROJECTION built by
+// `ingest._project_semantic_terms` as `join_path(parts, sep=" ")` — a SPACE-joined bag of the term
+// name, the glossary synonyms, the BIAN/FIBO/process paths and the AI's terms. Its own docstring
+// calls it index material, "NOT an evidence-resolved authority field". Individual terms are
+// multi-word ("audit user"), so the concatenation cannot be split back into terms and has no single
+// author to attribute. The AI's synonyms, by contrast, are stored as first-class `llm`/`proposed`
+// `semantic_terms` field evidence whose value is ONE comma-separated line — the format
+// `_project_semantic_terms` itself splits on — so they are recoverable AND attributable.
+//
+// Consequently this section is the AI's terms ONLY and says so. The glossary's own term and related
+// terms are shown above under "From the source glossary"; its raw `synonyms` cell is persisted
+// nowhere but that space-joined projection, so nothing here may claim to be the complete list of
+// what makes this column findable.
+function searchTerms(proposals: EvidenceProposal[]): string[] {
+  const seen = new Set<string>()
+  const terms: string[] = []
+  for (const proposal of proposals) {
+    for (const raw of (proposal.proposed_value ?? '').split(',')) {
+      const term = raw.trim()
+      if (term && !seen.has(term.toLowerCase())) {
+        seen.add(term.toLowerCase())
+        terms.push(term)
+      }
+    }
+  }
+  return terms
+}
+
+function SearchTermsSection({ detail }: { detail: AssetDetail }) {
+  // The whole section is absent when the evidence section was not served — a subset `include=` or a
+  // role that cannot read it. Rendering "no terms" for a section nobody asked for would state an
+  // absence the page has not established.
+  const evidence = detail.evidence
+  if (!evidence) return null
+  const buckets = evidence.proposals_by_field?.semantic_terms
+  const terms = searchTerms(buckets?.active ?? [])
+  // A RETIRED draft is never shown as a current term (re-enrichment retires the producer's prior
+  // rows), but "there were none" and "the ones there were are no longer active" are different
+  // answers and the second is the one that tells a reviewer where the terms went.
+  //
+  // ANY non-active bucket counts, not just `stale`. Today `stale` is the only one reachable for
+  // this field — `_reconcile_llm_field_evidence` → `stale_all_llm_field_evidence` writes it,
+  // `superseded` is scoped to human-producer rows, and `rejected` needs `apply_field_decision`,
+  // which 400s for `semantic_terms` because it has no `field_policies` entry. But `_evidence_section`
+  // buckets by whatever lifecycle the row carries and creates a bucket for any it does not know, so
+  // reading one name would turn a future lifecycle into a clean "nothing was ever drafted" claim
+  // over drafts that exist. Counting the complement of `active` cannot go stale that way.
+  const retired = Object.entries(buckets ?? {}).some(
+    ([lifecycle, rows]) => lifecycle !== 'active' && (rows ?? []).length > 0)
+  return (
+    <section className="adg-section" data-testid="search-terms">
+      <h3 className="micro-label">Search terms</h3>
+      {terms.length > 0 ? (
+        <>
+          <ul className="rows adg-fieldsum">
+            <li className="row">
+              {terms.map(term => (
+                <span key={term.toLowerCase()} className="badge gj-proposed">
+                  {term}
+                </span>
+              ))}
+            </li>
+          </ul>
+          <p className="hint">
+            <span className="badge gj-proposed">AI proposed</span> The model drafted these so this
+            column can be found by the words a business reader would use. Nobody has confirmed them,
+            and they carry no authority over what the column means. The source glossary's own term
+            and related terms are above.
+          </p>
+        </>
+      ) : (
+        <p className="hint">
+          {'No search terms are recorded for this column'}
+          {retired
+            ? ' — earlier drafts are no longer active, so they are not shown as current terms.'
+            : '.'}
+        </p>
+      )}
     </section>
   )
 }
@@ -1077,28 +1169,136 @@ function humanizeCode(code: string): string {
   return code.replaceAll('_', ' ').replaceAll(':', ' — ')
 }
 
-function ContextValueRow({ value }: { value: ContextValue }) {
-  const shown = value.value
+function authorityWords(label: string): string {
+  return AUTHORITY_WORDS[label] ?? label
+}
+
+// A resolved value ALWAYS wins the display. Only when nothing resolved does the row fall through to
+// the model's own proposal — and then the chip says so ("… · unconfirmed"), because a proposal that
+// reads like a resolution is how a guess clears a safety check. The two are never merged and the
+// proposal is never shown alongside a resolved value: a stale `AED` sitting beside a governed `USD`
+// reads as disagreement about the answer, when it is only the record of a proposal that lost.
+function contextProposalOnly(value: ContextValue): boolean {
+  return (value.value == null || value.value === '')
+    && value.proposed_value != null && value.proposed_value !== ''
+}
+
+// THE AUTHOR OF A `proposed_value` IS ALWAYS THE MODEL, and it is NOT `authority_label`.
+//
+// `semantic_context` fills `proposed_value` from a lookup keyed on `EvidenceProducer.LLM` — it is
+// the LLM's row or it is absent. `authority_label` is `display_label()`, which reads the STRONGEST
+// active entry (`_bulk_active_evidence` sorts strongest-first, ties broken by `evidence_id`). Those
+// are different records whenever a field resolved to nothing and carries proposals from more than
+// one producer: the row would then display the model's value under "rulebook proposed" — or, with a
+// human/confirmed row that never projected a display value, under "human confirmed · unconfirmed".
+// The suffix stops it reading as confirmed, but the value shown and the party named would be
+// different, which is its own lie.
+//
+// So the proposal branch names the model, from the same label map every other chip uses. If the
+// backend ever fills `proposed_value` from another producer, this becomes wrong — which is exactly
+// why the contract is restated on `ContextValue.proposed_value` in `api.ts`.
+const PROPOSAL_AUTHOR_LABEL = 'llm_proposed'
+
+function ContextValueRow({
+  value,
+  testId,
+  label,
+}: {
+  value: ContextValue
+  testId?: string
+  label?: string
+}) {
+  // A field the model answered and the platform did not resolve is NOT a blank. Rendering `—` there
+  // says nobody has an answer, which is false — and it is the one framing this surface forbids.
+  const proposalOnly = contextProposalOnly(value)
+  const shown = proposalOnly ? value.proposed_value : value.value
   return (
-    <li className="row adg-field" data-testid={`context-value-${value.field}`}>
-      <span className="adg-field-label">{humanizeField(value.field)}</span>
+    <li className="row adg-field" data-testid={testId ?? `context-value-${value.field}`}>
+      <span className="adg-field-label">{label ?? humanizeField(value.field)}</span>
       <span className="adg-field-value mono">
         {shown == null || shown === '' ? '—' : String(shown)}
       </span>
       <span
-        className="badge"
+        className={`badge${proposalOnly ? ' gj-proposed' : ''}`}
         title={
-          value.producer
-            ? `${value.producer}/${value.strength}/${value.lifecycle}`
-            : 'no evidence record'
+          proposalOnly
+            // The lead triple describes the STRONGEST record, which is not the one whose value is
+            // on screen. It stays visible — a reader tracing authority needs it — but it is named
+            // as what it is rather than presented as this value's author.
+            ? `the model's own proposal; strongest active record ${value.producer ?? 'none'}/${value.strength ?? '—'}/${value.lifecycle ?? '—'}`
+            : value.producer
+              ? `${value.producer}/${value.strength}/${value.lifecycle}`
+              : 'no evidence record'
         }
       >
-        {AUTHORITY_WORDS[value.authority_label] ?? value.authority_label}
+        {proposalOnly
+          ? `${authorityWords(PROPOSAL_AUTHOR_LABEL)} · unconfirmed`
+          : authorityWords(value.authority_label)}
       </span>
       {value.operational_influence === 'governed' && (
         <span className="badge grain">load-bearing</span>
       )}
     </li>
+  )
+}
+
+// ---- the table this column belongs to (Task 9) ------------------------------------------------
+// `table_role` and `event_or_snapshot` are facts about the anchor's TABLE, not about the column,
+// and they change what the column MEANS: the same `amount` on an event table and on a daily
+// snapshot are different numbers. They ride `context.table_context` with their own authority, so
+// they render through the SAME row as every other context value — one row idiom on this tab.
+//
+// The labels lead with "Table" so a reader can never mistake them for column-level facts.
+const TABLE_SHAPE_AXES: readonly [string, string][] = [
+  ['table_role', 'Table role'],
+  ['event_or_snapshot', 'Table shape'],
+]
+
+// An axis nobody has established is SAID, not left blank — a blank cell reads as "not displayed"
+// and a reader then assumes the value exists somewhere. It is a state, never a fault: nothing here
+// implies a review would produce one.
+// `table_context` carries the table node's `semantic_terms` too (`semantic_context` reads it beside
+// the two axes, and `ingest` runs the same projection over the TABLE ref). That column is the
+// space-joined search blob this file refuses to render as terms for a column — the term name, every
+// glossary synonym and the BIAN/FIBO/process paths concatenated — and here it would arrive with no
+// evidence rows at all, so `display_label()` falls back to "system": the platform named as author of
+// text the source glossary wrote. It is excluded rather than rendered.
+const TABLE_SEARCH_PROJECTION_FIELDS = new Set(['semantic_terms'])
+
+function TableContextSection({ values }: { values: ContextValue[] }) {
+  const byField = new Map(values.map(v => [v.field, v]))
+  const shapeFields = new Set(TABLE_SHAPE_AXES.map(([field]) => field))
+  // Whatever else the table node carries (its own definition, domain, AI summary) belongs here too
+  // — it is the table's prose and it has no other home on this page. Index material does not.
+  const prose = values.filter(
+    v => !shapeFields.has(v.field) && !TABLE_SEARCH_PROJECTION_FIELDS.has(v.field))
+  return (
+    <section className="adg-section" data-testid="context-table-shape">
+      <h3 className="micro-label">The table this column belongs to</h3>
+      <ul className="rows adg-fieldsum">
+        {TABLE_SHAPE_AXES.map(([field, label]) => {
+          const value = byField.get(field)
+          const testId = `context-${field.replaceAll('_', '-')}`
+          // "Not established" covers BOTH ways this axis can be unanswered: no entry at all, and an
+          // entry the bundle carried for its evidence alone with nothing resolved and nothing
+          // proposed. The second would otherwise render an em dash wearing an author chip — a row
+          // that names somebody as the author of nothing.
+          const shown = value && (contextProposalOnly(value) ? value.proposed_value : value.value)
+          if (value && shown != null && shown !== '') {
+            return <ContextValueRow key={field} value={value} testId={testId} label={label} />
+          }
+          return (
+            <li className="row adg-field" key={field} data-testid={testId}>
+              <span className="adg-field-label">{label}</span>
+              <span className="adg-field-value hint">not established</span>
+            </li>
+          )
+        })}
+        {prose.map(v => (
+          <ContextValueRow key={`table-${v.field}`} value={v} />
+        ))}
+      </ul>
+    </section>
   )
 }
 
@@ -1305,15 +1505,27 @@ function ContextRelationshipRow({ link }: { link: ContextRelationship }) {
           )}
         </p>
       )}
+      {link.realizations.length === 0 && (
+        // A link with no directional realization has NOTHING that could carry a cardinality, so the
+        // row says so rather than simply not mentioning it — a reader who sees no cardinality
+        // assumes it is merely undisplayed. It is a measurement nobody has taken: a state, not a
+        // fault, and not something a review would produce.
+        <p className="hint" data-testid={`context-cardinality-${link.relationship_ref}`}>
+          Cardinality not established — nobody has measured how many rows on one side match a row
+          on the other. A hop whose fan-out is unmeasured can multiply rows and inflate every
+          aggregate over them, so it is not one a governed traversal can stand on yet.
+        </p>
+      )}
       {link.realizations.length > 0 && (
         <ul className="rows">
           {link.realizations.map(r => (
             <li key={r.realization_revision_id} className="hint">
-              {/* Fan-out never renders without its direction and scope. */}
+              {/* Fan-out never renders without its direction and scope. "Not established" rather
+                  than a blank or "unknown": the direction exists, the measurement does not. */}
               <span className="mono">
                 {r.from_ref} → {r.to_ref}
               </span>{' '}
-              · {r.cardinality ?? 'cardinality unknown'} · scope {r.scope_id ?? 'none'} ·{' '}
+              · {r.cardinality ?? 'cardinality not established'} · scope {r.scope_id ?? 'none'} ·{' '}
               {humanizeCode(r.safety_status)}
             </li>
           ))}
@@ -1373,6 +1585,14 @@ function ContextTab({ detail }: { detail: AssetDetail }) {
             ))}
           </ul>
         </section>
+      )}
+
+      {/* Rendered whenever the payload CARRIES the key — an empty list is a column anchor whose
+          table asserted nothing, and it renders rows saying so. An absent key is a table anchor, a
+          lagged projection, or an older server: no section at all, because there is nothing this
+          page knows to report. */}
+      {context.table_context !== undefined && (
+        <TableContextSection values={context.table_context} />
       )}
 
       {context.concept_path && context.concept_path.length > 0 && (
@@ -1483,6 +1703,15 @@ function ContextTab({ detail }: { detail: AssetDetail }) {
           <p>
             <span className="mono">{adjudication.selected_concept}</span>{' '}
             <span className="badge">AI proposed</span>
+          </p>
+          {/* HOW SURE THE ADJUDICATOR WAS — explanation, never authority. The concept it selected is
+              llm/proposed evidence like any other and its authority is shown by the rows above; the
+              band only says how confidently the model read the evidence it had. A low band is a
+              reason to look, not a fault and not a refusal. */}
+          <p className="hint" data-testid="context-confidence-band">
+            {adjudication.confidence_band
+              ? `The adjudicator read this with ${adjudication.confidence_band} confidence — how sure it was, not who says it is right.`
+              : 'The adjudicator recorded no confidence for this reading.'}
           </p>
           {adjudication.alternatives && adjudication.alternatives.length > 0 && (
             <ul className="rows">

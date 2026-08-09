@@ -45,6 +45,15 @@ from featuregen.intake.redaction import (
     build_llm_inputs,
     redact_free_text,
 )
+from featuregen.overlay.upload.catalog_profiles import (
+    CATALOG_NARRATIVE_KEYS,
+)
+from featuregen.overlay.upload.catalog_profiles import (
+    MAX_BUSINESS_CONTEXT as MAX_CATALOG_BUSINESS_CONTEXT,
+)
+from featuregen.overlay.upload.catalog_profiles import (
+    MAX_DESCRIPTION as MAX_CATALOG_DESCRIPTION,
+)
 from featuregen.overlay.upload.dispatch_audit import (
     AuditingClient,
     DispatchAuditContext,
@@ -104,15 +113,27 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 # with no gate for a data marker at all. The strictly-stronger direction, so nothing that used to
 # egress cleanly is newly leaked; a value carrying an unconsumable marker now BLOCKS its item
 # (audited) instead of egressing.
+# * `catalog_description` / `catalog_business_context` (Task 7b) — the CATALOG narrative a human
+#   typed in the upload form (migration 1047). Same class again: uploader-authored narrative prose,
+#   up to 4000 characters, written while looking at the real dataset — so it can embed a sample
+#   clause in a sentence exactly as a table description can. Prose grade would give it the PII
+#   backstop only; the definition grade adds the sample-clause strip and the fail-closed
+#   data-marker scan, which is the strictly-stronger direction.
 _DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition",
-                                   "table_description", "business_context", "semantic_terms"})
+                                   "table_description", "business_context", "semantic_terms",
+                                   "catalog_description", "catalog_business_context"})
 # [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
 # PII-scanned per item and audited at an indexed path (`synonyms[0]`).
 # `source_attributes` joins `synonyms` here deliberately: these are uploader-authored values, so
 # they are never presumable-clean and each entry is PII-scanned at an indexed path.
 # `related_terms` (richness Task 3 Step 6c) is the sidecar's uploader-authored term list — same
 # never-presumable-clean rule, per-item PII scan at an indexed path.
-_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_terms"})
+# `catalog_business_domains` (Task 7b) is the uploader's own list of business domains for the whole
+# catalog — free text a person typed into a form, bounded at 32 items of 200 chars. It is here and
+# NOT with the structural lists for the same reason `source_attributes` is: a list shape is not a
+# safety property, and grading uploader text as structural gives it no redaction at all.
+_LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_terms",
+                                   "catalog_business_domains"})
 # `term_type`/`process_path` are sidecar (uploader-authored) scalars; `ai_synonyms` is the AI's
 # comma-joined synonym draft riding the tail summary payload — all PII-scanned as prose. The
 # remaining Step-6c summary keys (`concept`, `party_role`, `grain_role`, `table_role`) are
@@ -122,8 +143,12 @@ _LIST_PROSE_META_KEYS = frozenset({"synonyms", "source_attributes", "related_ter
 # above for why. What stays prose is genuinely short, non-narrative field text: a term name, a
 # domain, a taxonomy/process path, a term type, and the AI's comma-joined synonym draft. None of
 # those is authored against real rows, so none carries a sample clause by contract.
+# `catalog_display_name` (Task 7b) is the catalog's human-readable NAME (bounded at 200) — short,
+# non-narrative uploader text, the same shape as `term_name`. Not definition-kind: a name is not
+# authored against rows, so it carries no sample clause by contract.
 _SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path",
-                                     "term_type", "process_path", "ai_synonyms"})
+                                     "term_type", "process_path", "ai_synonyms",
+                                     "catalog_display_name"})
 _PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
 _FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
@@ -155,6 +180,10 @@ _STRUCTURAL_META_KEYS = frozenset({
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
+    # Task 7b — the catalog narrative's AUTHORITY label. `producer/strength` read from the
+    # revision's own stored D2 axes (`human/proposed`), so it is a closed-vocabulary pair the
+    # platform minted, never uploader text. The narrative PROSE beside it is free-text-classified.
+    "catalog_narrative_authority",
     # concept critic (attest/concept_critic.py)
     "logical_ref", "proposed_concept", "shape_conflicts", "proposed_concept_meaning",
     # semantic Task 5 — targeted adjudication. Both are CLOSED-VOCABULARY token lists computed by
@@ -201,6 +230,39 @@ _ROUNDTRIP_PROSE_KEYS = frozenset({
 })
 
 
+# ── DROPPABLE ADVISORY CONTEXT (Task 7b review, Important-1) ─────────────────────────────────────
+#
+# Free text whose content is CONTEXT ABOUT the subject rather than the subject itself. A value the
+# sanitizer BLANKS is dropped from the payload; it does not fail the payload closed.
+#
+# The rule everywhere else — blanked means block — is right where the field IS the subject. A column
+# `business_definition` the sanitizer blanks must block its item: silently egressing the column
+# without the meaning the model was asked to reason about produces a confident answer to a question
+# nobody could answer. The catalog narrative is not that. Losing it DEGRADES the payload; it cannot
+# falsify it, and the model is never told a narrative exists.
+#
+# WHAT MADE THIS LOAD-BEARING: BLAST RADIUS. `sanitize_definition` fails closed on five literal
+# phrases (`sample values`, `example values`, `observed values`, `representative values`, `values
+# such as` — sanitize.py:55-62), and a business user types the narrative into a form that validates
+# LENGTH AND TYPE ONLY (`catalog_profiles.parse_narrative_payload`). "The description gives example
+# values for each payment type" is ordinary phrasing. The narrative rides EVERY table block and
+# EVERY Pass-B item, so under the ordinary rule that one sentence would refuse every
+# feature-generation call for the catalog AND exclude every table from Pass B — no grain, no
+# table_role, no primary_entity, no event_or_snapshot, audited only as an egress block. One
+# sentence, whole catalog. A bad phrase in one `table_definition` costs one table; this cost
+# everything.
+#
+# NOT SOLVED BY DOWNGRADING TO THE PROSE GRADE. Prose has no such failure mode precisely because it
+# has no sample-clause strip and no marker gate — so `values such as 3708484836801` would egress
+# intact, which is the leak the definition grade exists to stop and which real FTR prose demonstrably
+# contains. Dropping keeps the strong scan AND removes the kill switch: the marker-bearing value
+# never egresses, and everything else still does.
+#
+# The drop is NOT silent: the `sample_audits` entry (state `suspected_unhandled`) is recorded exactly
+# as before, so `llm_call.input_redaction` still says what was removed and why, and both seams log.
+_ADVISORY_CONTEXT_KEYS = frozenset(CATALOG_NARRATIVE_KEYS)
+
+
 def _meta_field_kind(key: str) -> str:
     """The egress KIND of one free-text metadata key: ``definition`` (sample-strip + PII via
     `sanitize_definition`), ``prose`` (PII-only via `redact_free_text`), or ``list_of_prose``
@@ -238,6 +300,7 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     pii_spans: list[dict] = []
     sample_audits: list[dict] = []
     version: str | None = None
+    dropped = False
 
     # D10: fail CLOSED on any top-level key with NO declared classification — the intersection loop
     # below only visits the free-text keys, so an unclassified key would otherwise egress unscanned
@@ -279,33 +342,92 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     for key in sorted(_FREE_TEXT_META_KEYS & out.keys()):
         kind = _meta_field_kind(key)                       # ValueError on an unclassified key
         scrub = _definition if kind == "definition" else _prose
+        # Advisory context DROPS rather than blocking — see `_ADVISORY_CONTEXT_KEYS`. The audits and
+        # spans already appended by the scrubber are kept: the record must say what was removed.
+        droppable = key in _ADVISORY_CONTEXT_KEYS
         val = out[key]
+        if droppable and not isinstance(val, (str, list)):
+            # UNSCANNABLE. Neither branch below can run on it, so leaving it in place would egress
+            # advisory free text that NO scrubber ever looked at — the batch path is protected by
+            # `_item_shape_ok`, the single-call path is not. Dropping is the fail-closed direction
+            # and costs only context. (Deliberately scoped to the advisory keys: the same shape
+            # under an ordinary free-text key is pre-existing behaviour this task does not own.)
+            logger.warning("advisory context %r is not scannable free text (%s) — DROPPED from the "
+                           "item", key, type(val).__name__)
+            del out[key]
+            dropped = True
+            continue
         if isinstance(val, str):
             redacted = scrub(val, key)
             if redacted is None:
-                return None, pii_spans, sample_audits, version
+                if not droppable:
+                    return None, pii_spans, sample_audits, version
+                logger.warning("advisory context %r failed its egress scan — DROPPED from the item "
+                               "(the item still egresses)", key)
+                del out[key]
+                dropped = True
+                continue
             out[key] = redacted
         elif isinstance(val, list):
             new_list = []
             for i, v in enumerate(val):
                 nv = scrub(v, f"{key}[{i}]") if isinstance(v, str) else v
                 if nv is None:
-                    return None, pii_spans, sample_audits, version
+                    if not droppable:
+                        return None, pii_spans, sample_audits, version
+                    logger.warning("advisory context %r[%d] failed its egress scan — that ITEM "
+                                   "dropped", key, i)
+                    dropped = True
+                    continue
                 new_list.append(nv)
+            # An advisory list scrubbed empty carries nothing; a fabricated `[]` is not context.
+            if droppable and not new_list:
+                del out[key]
+                dropped = True
+                continue
             out[key] = new_list
     profiles = out.get("column_profiles")
     if isinstance(profiles, list):
         new_profiles = []
         for desc in profiles:
-            if isinstance(desc, dict) and isinstance(desc.get("business_definition"), str):
-                nv = _definition(desc["business_definition"],
-                                 "column_profiles.business_definition")
+            if not isinstance(desc, dict):
+                new_profiles.append(desc)
+                continue
+            # [F4] Same D10 fail-closed rule the top-level loop applies, one level down: this scan
+            # used to name `business_definition` and let every sibling key ride unscanned, so the
+            # descriptor namespace had no gate at all. The batch path's `_item_shape_ok` rejects an
+            # unknown descriptor key, but the SINGLE-CALL path has no such gate — exactly the
+            # asymmetry D10 closed above.
+            unknown_desc = sorted(k for k in desc if k not in _COLUMN_PROFILE_KEYS)
+            if unknown_desc:
+                logger.warning("column_profiles descriptor key(s) with no declared egress "
+                               "classification: %s — failing closed", unknown_desc)
+                return None, pii_spans, sample_audits, version
+            updated = dict(desc)
+            for key in sorted(desc):
+                if key in _COLUMN_PROFILE_DEFINITION_KEYS:
+                    scrub = _definition
+                elif key in _COLUMN_PROFILE_PROSE_KEYS:
+                    scrub = _prose
+                else:
+                    continue                                   # structural: no scan by contract
+                if not isinstance(desc[key], str):
+                    continue
+                nv = scrub(desc[key], f"column_profiles.{key}")
                 if nv is None:
+                    # A descriptor field IS the subject the model reasons about, so a blanked value
+                    # blocks the item rather than dropping (the `_ADVISORY_CONTEXT_KEYS` argument
+                    # does not reach here) — the contract `business_definition` already had.
                     return None, pii_spans, sample_audits, version
-                desc = {**desc, "business_definition": nv}
-            new_profiles.append(desc)
+                updated[key] = nv
+            new_profiles.append(updated)
         out["column_profiles"] = new_profiles
-    if version is None:
+    # `dropped` guards the passthrough (review round 2). A value the scrubber REFUSED without ever
+    # setting `version` — a non-`str` under a free-text key, so no scrubber body ran — would
+    # otherwise be handed back inside the ORIGINAL `metadata`, egressing the exact value the log
+    # line above says was dropped. "Never silent" is the contract this drop mechanism rests on; a
+    # warning that is not true is worse than no warning.
+    if version is None and not dropped:
         return metadata, [], [], None                      # no free-text — metadata untouched
     return out, pii_spans, sample_audits, version
 
@@ -324,15 +446,138 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
 # descriptor — wiring the query alone would have removed columns from the menu, not enriched them.
 _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semantic_terms"})
 # Identity strings: `catalog_source` is deliberately NOT emitted by the enriched menu (RF-I7
-# handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
+# handoff) and `concept` may be None — absence/None is structural-optional, never a block.
 # `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
 # of structural identity as `concept`.
-_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain",
-                                           "party_role"})
+#
+# TWO of the five D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here:
+#
+#   * `table_role` / `event_or_snapshot` are platform-derived `_TABLE_ADVISORY` tokens — the same
+#     grade `_TABLE_CONTEXT_IDENTITY_KEYS` gives `data_role`/`primary_entity`, and `table_role` is
+#     already `_STRUCTURAL_META_KEYS` on the enrichment seam.
+#
+# `domain` / `sub_domain` / `bian_path` / `process_path` are DELIBERATELY NOT here — see
+# `_FEATURE_COLUMN_PROSE_KEYS`.
+#
+# THE RULE, RESTATED (2026-08-09, final branch review — it used to read "the grade follows who
+# TYPED the value", and `sub_domain` was graded identity on that reading). Who typed the value is
+# not the question; whether the value is drawn from a CLOSED SET is. A closed-vocabulary token
+# (`concept`, `party_role`, `confidence_band`) cannot carry an arbitrary span, so a type-and-length
+# check is the whole of its safety. Free text cannot be made safe that way whoever authored it —
+# and a model drafting from a payload that carries uploader definitions can echo an uploader's
+# account number as readily as the uploader can type one. See `_FEATURE_COLUMN_PROSE_KEYS` for the
+# failure-direction argument that decides it.
+#
+# These are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`, and the gate is WHOLE-PAYLOAD
+# FAIL-CLOSED, not per column: an over-long value makes `sanitize_feature_context` return None, the
+# caller blocks dispatch and audits EGRESS_BLOCKED, and NO column is enriched on that call. It is
+# never truncated into a different classification token, and never quietly dropped either. `_refuse`
+# logs which element and which key did it, because on a 237-column catalog that is the difference
+# between a diagnosis and an opaque failure. (An earlier version of this comment claimed the value
+# "excludes the column and is audited" — it excluded the whole payload and logged nothing.)
+#
+# `confidence_band` (Task 6b) is the ADJUDICATOR's grade — a member of the closed
+# `semantic_adjudication.CONFIDENCE_BANDS` vocabulary (`high|medium|low`), validated on the way in
+# (`adjudication_from_output` invalidates the whole result for an off-vocabulary band) and AGAIN on
+# the re-validating current-pointer read. It is PLATFORM-generated, never uploader-typed, so the
+# two-origin argument that moved `domain` to prose does not reach it and the prose grade's redactor
+# would have nothing to scrub. It is EXPLANATION, never authority: nothing branches on it.
+_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept",
+                                           "party_role",
+                                           "table_role", "event_or_snapshot",
+                                           "confidence_band"})
+# PROSE grade for the feature menu: PII-redacted via `redact_free_text` (no sample-clause strip and
+# no data-marker gate — that is the DEFINITION grade), then length-bounded like any structural
+# value. This is the grade `_SCALAR_PROSE_META_KEYS` (line ~125) already gives these exact three
+# keys on the ENRICHMENT seam (as `data_domain`, `bian_path`, `process_path`), and the two seams now
+# agree — the principle stated in this file's egress header. Three reasons they are prose and not
+# identity, in the order they were established:
+#
+#   1. `redact_free_text`'s own docstring names its subject as "an uploaded glossary's curated
+#      business definitions / synonyms / TAXONOMY PATHS". These are the values it was written for.
+#   2. "They are already redacted at ingest" is NOT true. `bian_path` has TWO origins:
+#      `ftr_adapter` builds it through `_redact` (`ftr_adapter.py:482`), but the generic
+#      `glossary_reader.read_glossary` — a live upload branch via `api/routes/uploads.py:155` —
+#      builds the same `GlossaryRecord` with a bare `_cell(...)` and NO redaction, and
+#      `ingest._write_glossary_source_evidence` persists either one identically. `domain` is the
+#      same shape (`glossary_reader.py:242`), and from there it is projected onto
+#      `graph_node.domain` (`field_resolution.py`) and emitted by
+#      `semantic_context.for_feature_generation`. (`process_path` IS single-origin — only the FTR
+#      adapter populates it — but grading the trio apart on that difference would be a trap for the
+#      next reader.)
+#   3. Identity grade applies `_structural_ok` ONLY: a type-and-length check, no redaction and no
+#      audit trail.
+#
+# WHAT THE PROSE GRADE ACTUALLY BUYS, stated precisely so nobody reads more into it. It does NOT add
+# detection: `redact_free_text`'s `_scan` and `assert_llm_safe`'s `_first_pii` walk the SAME
+# `_PII_PATTERNS` tuple, and NO `IntentRedactor` is registered anywhere in `src/` (only the
+# `register_intent_redactor` helper exists), so `redact_free_text` falls back to
+# `DefaultIntentRedactor` and the pattern set is identical on both seams. A personal NAME in a
+# `domain` still egresses today, at either grade — closing that needs a registered NER redactor, not
+# this list. What it buys is three concrete things:
+#
+#   a. FAILURE DIRECTION. At identity grade a detectable PII token sails past `_structural_ok` and
+#      then trips `assert_llm_safe`, which raises `EgressViolation` and kills the WHOLE feature-
+#      generation call. Prose grade scrubs the span and the call proceeds.
+#   b. AUDIT. The scrub is reported as a `pii_spans` entry keyed `columns[N].domain` with a
+#      redaction_version, so `llm_call.input_redaction` records what left and under which version.
+#      Identity grade records nothing.
+#   c. The DI SEAM. When a NER-backed `IntentRedactor` IS registered, prose-graded values route
+#      through it; identity-graded values never would. This is the line that makes (3) closeable
+#      later without touching this list again.
+#
+# `business_term` (Task 7b) joins them: the glossary's curated business NAME for the column
+# ("Counterparty Exposure Amount" for `CPTY_EXPSR_AMT`). Uploader-authored through the SAME
+# unredacted `glossary_reader` branch reason (2) names for `domain`, and already prose-graded on the
+# enrichment seam as `term_name` (`_SCALAR_PROSE_META_KEYS`) — so the two seams agree, which is this
+# file's stated principle.
+#
+# `sub_domain` (D13.2) joins them too — DECIDED 2026-08-09 at the final branch review, reversing
+# Task 6, which added it at identity grade in the very commit that moved `bian_path`/`process_path`
+# OUT of identity grade for this exact reason. The argument it rested on ("the grade follows who
+# TYPED the value"; `sub_domain`'s only producer is `enrich._write_sub_domain_evidence`) is true and
+# does not decide the question:
+#
+#   * Reason (a) below is ORIGIN-INDEPENDENT. It is about what happens when a detectable token
+#     reaches the wire, not about who put it there. At identity grade one such token on one column
+#     kills the whole call, for all 237 columns; at prose grade it is scrubbed and the call
+#     proceeds. Availability is the whole of the difference, and Task 6 accepted precisely that
+#     argument for the other two axes.
+#   * `sub_domain` is NOT a closed vocabulary. It is the model's free-text refinement of `domain`,
+#     admitted by `accept_label` — a length-and-shape gate, not a member check — and it is drafted
+#     from a payload carrying uploader definitions, so an uploader's account number can arrive in
+#     it by echo. That is what separates it from `concept` / `party_role` / `confidence_band`,
+#     which are validated against registries and cannot carry an arbitrary span at all.
+#   * It carries the SAME `field_policies._MEANING` policy as `domain`, which is prose-graded by an
+#     explicit human decision (2026-08-07). Grading a parent and its refinement differently is a
+#     trap for the next reader, and the pair reads identically at every other seam.
+#
+# Cost of the move: one `redact_free_text` pass per column. The wire is byte-identical for a clean
+# value (the redactor returns unchanged text), and the bound is the same `_FEATURE_STRUCTURAL_MAX_LEN`
+# — applied AFTER redaction, so a near-budget value carrying PII can now be refused where an
+# un-scrubbed one of the same length was admitted. That is the fail-closed direction.
+# `fibo_path` joins its two sidecar siblings here (readiness wave). Uploader-authored, unredacted
+# at origin (`glossary_reader`), so it takes the same prose grade `domain` does — a length bound
+# is not a safety property.
+_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "sub_domain", "bian_path", "process_path",
+                                        "fibo_path", "business_term"})
+# The LIST form of the same grade (Task 7b): each item PII-redacted at its own indexed path
+# (`related_terms[1]`) and bounded per TERM, mirroring `_LIST_PROSE_META_KEYS` on the enrichment
+# seam. `related_terms` is uploader-authored curated vocabulary, so the token-list grade its SHAPE
+# suggests would be wrong twice over — no redaction, and no audit of what left.
+_FEATURE_COLUMN_PROSE_LIST_KEYS = frozenset({"related_terms"})
 _FEATURE_COLUMN_FACT_KEYS = frozenset({
     "data_type", "declared_type", "entity", "additivity", "unit", "currency",
     "is_grain", "is_as_of"})
-_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
+# `proposed_value` (Task 6) is the LLM's answer for a fact it could not win — present ONLY where
+# `value` is null, and a bounded token exactly like `value`. It is a SUBKEY of the wrapper rather
+# than a sibling column key so it cannot be read as an operationally-resolved fact by anything that
+# reads `.value`; classifying it here is what stops the whole column failing closed.
+# [F7] `proposed_authority` is the `producer/strength` of the row `proposed_value` came from —
+# a platform-minted closed-vocabulary pair, exactly like `authority`, never model or uploader
+# text. Classified here or the whole column fails closed on an unknown subkey.
+_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value",
+                                   "proposed_authority"})
 # ── feature-context v4 (semantic Task 8, D10) ────────────────────────────────────────────────────
 # Every NEW key ships with an explicit classification here plus a golden egress test; unclassified
 # stays BLOCKED, and now loudly. All four groups carry closed-vocabulary tokens or platform-minted
@@ -341,6 +586,11 @@ _FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
 #
 #   * `concept_path` / `missing_context` — lists of closed-vocabulary tokens (registry concept
 #     names; `semantic_context.MISSING_CONTEXT_CODES`).
+#   * `concept_alternatives` (Task 6b) — the adjudicator's shortlist: at most
+#     `semantic_adjudication.MAX_ALTERNATIVES` (3) names, each filtered to `CONCEPT_REGISTRY`
+#     membership on the way in and again on the re-validating read, so it is the SAME closed
+#     vocabulary `concept_path` carries and takes the same grade. It is CONTEXT for the model to
+#     weigh, never a classification and never an authority claim of its own.
 #   * `identifier_namespace` — {scheme, issuer_scope, basis}: the value space an identifier lives
 #     in. `scheme` is a registry namespace, `basis` is the closed NAMESPACE_BASES vocabulary and
 #     `issuer_scope` is a catalog-scope token.
@@ -351,32 +601,85 @@ _FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
 #   * `relationships` — the current cross-catalog links: platform-minted refs plus the closed
 #     availability/review vocabularies. NEVER a claim of executability (that answer needs a
 #     revalidating reader and does not belong in a prompt).
-_FEATURE_COLUMN_TOKEN_LIST_KEYS = frozenset({"concept_path", "missing_context"})
+_FEATURE_COLUMN_TOKEN_LIST_KEYS = frozenset({"concept_path", "missing_context",
+                                             "concept_alternatives"})
 _FEATURE_COLUMN_OBJECT_KEYS: dict[str, frozenset[str]] = {
     "identifier_namespace": frozenset({"scheme", "issuer_scope", "basis"}),
 }
 _FEATURE_COLUMN_MAPPING_KEYS = frozenset({"semantic_authority"})
 _FEATURE_COLUMN_DICT_LIST_KEYS: dict[str, frozenset[str]] = {
-    "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status"}),
+    # `outbound_cardinality` (Task 6) is the closed `Cardinality` vocabulary or None — a token like
+    # its siblings, so the existing `_dict_list_ok` shape still holds. It is DIRECTIONAL (the hop
+    # away from the anchor's own table) and named for its direction; a bare `cardinality` here
+    # would read as a verdict on the pair, which `semantic_context` explicitly refuses to publish.
+    "relationships": frozenset({"relationship_ref", "kind", "availability", "review_status",
+                                "outbound_cardinality"}),
 }
 # `business_context` is PROSE (a data owner wrote it), so it routes through the definition
 # sanitizer exactly like `table_definition` — sample-clause stripped, data-marker scanned, PII
 # redacted. Classifying it as an identity string would have let an uploader's paragraph egress
 # unscanned, which is the whole reason the definition grade exists.
-_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_context"})
+#
+# Task 7b adds the two long CATALOG-narrative fields at the same grade and for the same reason —
+# see `_DEFINITION_META_KEYS`. Note the DELIBERATE key names: `catalog_business_context` is the
+# narrative a human typed about the CATALOG (migration 1047); the unprefixed `business_context`
+# beside it is the per-TABLE narrative Pass B writes (migration 1052). Two different values, two
+# grains, one block — the prefix is what keeps them apart on the wire.
+#
+# There is no length ceiling on this grade, which is why the 4000-character fields take it: an
+# acceptance gate that refused a legitimately-authored narrative would refuse the WHOLE payload,
+# not the field.
+_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition", "business_context",
+                                            "catalog_description", "catalog_business_context"})
 # The Release-A profile classifications are CLOSED-vocabulary tokens (profile_vocab), not prose.
+# `catalog_narrative_authority` is the `producer/strength` pair read off the narrative revision's
+# own stored D2 axes — platform-minted, never uploader text.
+#
+# Task 8 adds `grain_status` / `as_of_status` at the SAME grade and for the same reason: each is one
+# of a CLOSED set of platform-minted tokens that `_table_context` computes. Nothing uploader-typed
+# and nothing model-authored reaches them, so the prose grade's redactor would have nothing to scrub
+# and would misdocument the egress surface. They are LABELS, never permission: see `_table_context`.
+#
+# TASK 8b WIDENED THE VALUE SET AND ADDED NO KEY, which is why this list is unchanged. The tokens are
+# now `feature_assist.TABLE_FACT_STATUSES` — human_confirmed | source_declared | ai_proposed, an
+# AUTHORITY axis naming who asserted the value — replacing Task 8's "confirmed" | "declared", which
+# conflated a human endorsement with ingest's source-declared auto-confirm. Named here rather than
+# left stale because this file is the first thing a reviewer of the egress surface reads, and a
+# retired vocabulary documented at the classifier is how the next reader learns the wrong one.
 _TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity",
                                           "data_role", "authority_role",
-                                          "temporal_storage_model"})
+                                          "temporal_storage_model",
+                                          "catalog_narrative_authority",
+                                          "grain_status", "as_of_status"})
+# The table block's PROSE grade (Task 7b) — the missing half of this seam. The column side has had
+# `_FEATURE_COLUMN_PROSE_KEYS` since `domain` moved off identity grade in `c62ab49d`; the table side
+# had only DEFINITION (sample-strip + marker gate) and LIST/IDENTITY (no redaction at all), so a
+# short uploader-typed label had nowhere honest to go. `catalog_display_name` is bounded at 200 by
+# `catalog_profiles.MAX_DISPLAY_NAME`, well inside `_FEATURE_STRUCTURAL_MAX_LEN`, with room for
+# redaction to LENGTHEN it.
+_TABLE_CONTEXT_PROSE_KEYS = frozenset({"catalog_display_name"})
+# The list form: each item redacted and bounded on its own, at its own indexed audit path. NOT
+# `_TABLE_CONTEXT_LIST_KEYS`, which is for PLATFORM-authored sentences (`advisories`) and structural
+# refs (`grain_columns`) and applies no redaction — grading uploader text there was the exposure
+# `c62ab49d` fixed one seam over.
+_TABLE_CONTEXT_PROSE_LIST_KEYS = frozenset({"catalog_business_domains"})
 # `advisories` are PLATFORM-authored sentences from a closed table in this repo — never uploader
 # text and never model output — so they are length-bounded like any other structural list.
 _TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns", "advisories"})
 #: Advisory sentences are longer than a ref; bounded so a mutated table cannot smuggle a payload.
-_TABLE_ADVISORY_MAX_LEN = 400
-_FEATURE_STRUCTURAL_MAX_LEN = 200
+#: ZERO-TRUNCATION RAISE (2026-08-06): 400 -> 2000, ~10x the longest advisory this repo's closed
+#: advisory table emits. Still a bound — a mutated table cannot smuggle an unbounded payload.
+_TABLE_ADVISORY_MAX_LEN = 2000
+#: ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPTANCE gate, not a formatter: a
+#: value over it is EXCLUDED from egress and audited, never truncated. So values of 201–1000 chars
+#: are now ADMITTED where they were previously refused — a deliberate widening of the egress
+#: SURFACE. Redaction (`_redact_free_text_meta` / `sanitize_feature_context`) still runs first, so
+#: this is a size decision, not a PII one.
+_FEATURE_STRUCTURAL_MAX_LEN = 1000
 #: Bound on a v4 list/mapping so one column cannot carry an unbounded payload past the byte budget
-#: into the egress scanner.
-_FEATURE_COLLECTION_MAX_ITEMS = 40
+#: into the egress scanner. ZERO-TRUNCATION RAISE (2026-08-06): 40 -> 256, above the widest real
+#: table this platform ingests (144 columns) so a per-column collection is never clipped.
+_FEATURE_COLLECTION_MAX_ITEMS = 256
 
 
 def _token(v: object) -> bool:
@@ -413,14 +716,18 @@ def _dict_list_ok(v: object, allowed: frozenset[str]) -> bool:
 
 
 def _fact_wrapper_ok(v: object) -> bool:
-    """A governed/hint fact wrapper: exactly {value, authority}; value a bounded str or None
-    (RF-I7: is_grain/is_as_of booleans arrive RENDERED as "true"/"false" strings); authority in
-    {governed, hint}. Enum-ish tokens, never sample-bearing prose."""
+    """A governed/hint fact wrapper: {value, authority} plus the optional `proposed_value`; both
+    values a bounded str or None (RF-I7: is_grain/is_as_of booleans arrive RENDERED as
+    "true"/"false" strings); authority in {governed, hint}. Enum-ish tokens, never sample-bearing
+    prose. `proposed_value` is bounded on the SAME gate as `value` — it is a model-authored token,
+    so an unbounded one would be the one place a wrapper could smuggle a payload."""
     if not isinstance(v, dict) or any(k not in _FEATURE_FACT_SUBKEYS for k in v):
         return False
-    val = v.get("value")
-    if val is not None and not (isinstance(val, str) and len(val) <= _FEATURE_STRUCTURAL_MAX_LEN):
-        return False
+    for key in ("value", "proposed_value"):
+        val = v.get(key)
+        if val is not None and not (isinstance(val, str)
+                                    and len(val) <= _FEATURE_STRUCTURAL_MAX_LEN):
+            return False
     return v.get("authority") in ("governed", "hint")
 
 
@@ -448,6 +755,7 @@ def sanitize_feature_context(
     pii_spans: list[dict] = []
     sample_audits: list[dict] = []
     version: str | None = None
+    dropped = False
 
     def _defn(text: object, path: str) -> str | None:  # None ⟹ fail closed
         nonlocal version
@@ -462,8 +770,78 @@ def sanitize_feature_context(
         pii_spans.extend({"key": path, **dict(s)} for s in d.redacted_spans)
         return d.clean
 
-    def _structural_ok(v: object) -> bool:  # identity strings may be None (concept/domain nullable)
+    def _prose(text: object, path: str) -> str | None:  # None ⟹ fail closed
+        """PII-only redaction for the uploader-authored short labels — the taxonomy paths and the
+        business `domain`. The `_prose` half of the enrichment seam's grade, applied here. Bounded
+        AFTER redaction, like the enrichment seam's own length gate, so the cap applies to what
+        would actually egress rather than to what arrived.
+
+        Redaction is NOT length-preserving in the shrinking direction: `DefaultIntentRedactor`
+        substitutes a `[REDACTED:LABEL]` placeholder, which is LONGER than several of the tokens it
+        replaces (a 6-char email becomes 16 chars). So a near-budget value carrying PII can cross
+        `_FEATURE_STRUCTURAL_MAX_LEN` after scrubbing and be refused where an un-scrubbed one of the
+        same length was admitted. That is the fail-closed direction and it is deliberate — bounding
+        BEFORE redaction would bound a string that is not the one egressing."""
+        nonlocal version
+        if not isinstance(text, str):
+            return None
+        res = redact_free_text(text)
+        version = version or res.redaction_version
+        if res.text is None or len(res.text) > _FEATURE_STRUCTURAL_MAX_LEN:
+            return None
+        pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
+        return res.text
+
+    def _prose_list(v: object, path: str, *, droppable: bool = False) -> list | None:
+        """A LIST of uploader-authored prose — `_prose` per item, at that item's own indexed path
+        (`related_terms[1]`), so the audit keeps per-term granularity and one long term is bounded
+        on its own rather than as part of a joined blob. A non-list, or a list over the collection
+        cap, fails closed like any other shape violation (``None``).
+
+        ``droppable`` (the `_ADVISORY_CONTEXT_KEYS` contract): a single item that fails its scan is
+        DROPPED and the rest of the list still egresses, rather than the failure escalating to the
+        whole payload. The shape violations above still fail closed either way — a non-list is a
+        producer bug, not a scrubbing outcome."""
+        if not isinstance(v, list) or len(v) > _FEATURE_COLLECTION_MAX_ITEMS:
+            return None
+        cleaned: list[str] = []
+        for i, item in enumerate(v):
+            clean = _prose(item, f"{path}[{i}]")
+            if clean is None:
+                if not droppable:
+                    return None
+                _drop_advisory(f"{path}[{i}]")
+                continue
+            cleaned.append(clean)
+        return cleaned
+
+    def _drop_advisory(path: str) -> None:
+        """Record an advisory-context value removed by its own scan. Never silent: the
+        `sample_audits` entry the scrubber already appended says WHAT was removed and why, and
+        `dropped` keeps the structural-passthrough below from handing the original back."""
+        nonlocal dropped
+        dropped = True
+        logger.warning("advisory context %s failed its egress scan — DROPPED from the block (the "
+                       "payload still egresses)", path)
+
+    def _structural_ok(v: object) -> bool:  # identity strings may be None (`concept` is nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
+
+    def _refuse(path: str, rule: str) -> tuple[None, list[dict], list[dict], str | None]:
+        """Refuse the WHOLE payload, and say which element and which key did it.
+
+        Every branch below fails closed to the same `(None, ...)`, and the caller turns that into a
+        blocked call with no dispatch — so ONE over-long `sub_domain` on ONE column costs feature
+        generation for every column in the catalog. That is the intended direction (the alternative
+        is egressing a value nobody scanned), but until now it was also OPAQUE: a 237-column run
+        returned nothing with no record of which key tripped it, and re-running does not narrow it.
+
+        VALUE-FREE by construction, exactly like the `enrich_reject` line: the `path` is a key name
+        and a list index this code minted, `rule` is a member of the closed set below, and the value
+        itself is never read here. Lengths, counts, codes, refs — never content."""
+        logger.warning("feature-context egress REFUSED the whole payload at %s (rule=%s) — the "
+                       "call is blocked and NO column is dispatched", path, rule)
+        return None, pii_spans, sample_audits, version
 
     new_columns = columns
     if has_cols:
@@ -481,34 +859,58 @@ def sanitize_feature_context(
                         continue
                     clean = _defn(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "definition_scan")
                     out[k] = clean
+                elif k in _FEATURE_COLUMN_PROSE_KEYS:
+                    if v is None:                # absent taxonomy path — no content to scan
+                        out[k] = v
+                        continue
+                    clean = _prose(v, path)
+                    if clean is None:
+                        # [A.55] DROP the key, do not refuse the catalog. These are FACETS —
+                        # context ABOUT the column, beside the `definition` that IS its meaning —
+                        # so this is the same argument `_ADVISORY_CONTEXT_KEYS` made for the
+                        # catalog narrative: losing one degrades the payload and cannot falsify
+                        # it, and the model is never told a facet exists. Refusing cost feature
+                        # generation for all 237 columns over one column's `domain`.
+                        #
+                        # The safety property is UNCHANGED — the value that failed its scan never
+                        # egresses. Only the blast radius narrows, and the drop is audited exactly
+                        # like the advisory one, so it is degradation the record can name.
+                        _drop_advisory(path)
+                        continue
+                    out[k] = clean
+                elif k in _FEATURE_COLUMN_PROSE_LIST_KEYS:
+                    cleaned = _prose_list(v, path)
+                    if cleaned is None:
+                        return _refuse(path, "prose_list_scan")
+                    out[k] = cleaned
                 elif k in _FEATURE_COLUMN_IDENTITY_KEYS:
                     if not _structural_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "identity_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_FACT_KEYS:
                     if not _fact_wrapper_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "fact_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_TOKEN_LIST_KEYS:
                     if not _token_list_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "token_list_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_OBJECT_KEYS:
                     if not _token_object_ok(v, _FEATURE_COLUMN_OBJECT_KEYS[k]):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "object_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_MAPPING_KEYS:
                     if not _mapping_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "mapping_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_DICT_LIST_KEYS:
                     if not _dict_list_ok(v, _FEATURE_COLUMN_DICT_LIST_KEYS[k]):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "dict_list_shape")
                     out[k] = v
                 else:
-                    return None, pii_spans, sample_audits, version   # unclassified — fail closed
+                    return _refuse(path, "unclassified_key")     # fail closed
             rebuilt.append(out)
         new_columns = rebuilt
 
@@ -517,7 +919,7 @@ def sanitize_feature_context(
         rebuilt_ctx: list = []
         for idx, block in enumerate(table_context):
             if not isinstance(block, dict):
-                return None, pii_spans, sample_audits, version
+                return _refuse(f"table_context[{idx}]", "block_not_a_dict")
             out = {}
             for k, v in block.items():
                 path = f"table_context[{idx}].{k}"
@@ -527,25 +929,52 @@ def sanitize_feature_context(
                         continue
                     clean = _defn(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        if k not in _ADVISORY_CONTEXT_KEYS:
+                            return _refuse(path, "definition_scan")
+                        _drop_advisory(path)
+                        continue
                     out[k] = clean
+                elif k in _TABLE_CONTEXT_PROSE_KEYS:
+                    if v is None:                # unauthored label — no content to scan
+                        out[k] = v
+                        continue
+                    clean = _prose(v, path)
+                    if clean is None:
+                        if k not in _ADVISORY_CONTEXT_KEYS:
+                            return _refuse(path, "prose_scan")
+                        _drop_advisory(path)
+                        continue
+                    out[k] = clean
+                elif k in _TABLE_CONTEXT_PROSE_LIST_KEYS:
+                    advisory = k in _ADVISORY_CONTEXT_KEYS
+                    cleaned = _prose_list(v, path, droppable=advisory)
+                    if cleaned is None:
+                        return _refuse(path, "prose_list_scan")
+                    if advisory and not cleaned:
+                        # Scrubbed empty — a fabricated `[]` is not context, so drop the key.
+                        _drop_advisory(path)
+                        continue
+                    out[k] = cleaned
                 elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
                     if not _structural_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "identity_shape")
                     out[k] = v
                 elif k in _TABLE_CONTEXT_LIST_KEYS:
                     cap = (_TABLE_ADVISORY_MAX_LEN if k == "advisories"
                            else _FEATURE_STRUCTURAL_MAX_LEN)
                     if not (isinstance(v, list) and len(v) <= _FEATURE_COLLECTION_MAX_ITEMS
                             and all(isinstance(x, str) and len(x) <= cap for x in v)):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "list_shape")
                     out[k] = v
                 else:
-                    return None, pii_spans, sample_audits, version
+                    return _refuse(path, "unclassified_key")
             rebuilt_ctx.append(out)
         new_ctx = rebuilt_ctx
 
-    if version is None:
+    # `dropped` guards the passthrough (review round 2): a refused value that never ran a scrubber
+    # body — a non-`str` under a prose/definition key — leaves `version` None, and returning the
+    # ORIGINAL `metadata` would egress the very value the log line said was dropped.
+    if version is None and not dropped:
         return metadata, [], [], None            # structural passthrough only — untouched
     safe = dict(metadata)
     safe["columns"] = new_columns
@@ -691,31 +1120,43 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "concept": {"type": "string", "maxLength": 128}},
                       "required": ["ref", "concept"]}}},
         "required": ["results"]},
+    # `definition` raised 500 -> 32_000 (2026-08-06), PAIRED with `enrich.draft_definitions`'
+    # `_accept_bounded(MAX_DEFINITION_LEN)`. This is the INBOUND half the first raise missed:
+    # `MAX_DEFINITION_LEN` widened only what we SEND, while a drafted definition over 500 chars was
+    # still refused coming back — below even the original 600. Every schema bound in this block is
+    # equal-by-test to its code-side accept gate (`test_enrich_output_bounds.py`), and they must
+    # move together: the schema rejects the WHOLE CHUNK where the code gate drops one item.
     ("overlay_definition_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "definition": {"type": "string", "maxLength": 500}},
+                                     "definition": {"type": "string", "maxLength": 32_000}},
                       "required": ["ref", "definition"]}}},
         "required": ["results"]},
-    # One plain-English sentence per column, for a human reading the catalog. Bounded at 400 to keep
-    # a wide table's chunk inside its input budget; the CODE-side `_accept_bounded(400)` is the real
-    # gate (a schema maxLength failure would reject the WHOLE chunk over one long answer).
+    # One plain-English sentence per column, for a human reading the catalog. Raised 400 -> 1000
+    # (2026-08-06): 400 REJECTED a legitimately long sentence outright rather than shortening it.
+    # 1000 is `_MAX_LEN_DEFAULT`, the per-value egress cap `ai_summary` is graded under when it is
+    # re-threaded — accepting above it would mint a value its own egress gate then EXCLUDES.
+    # The CODE-side `_accept_bounded` is the per-item gate (a schema maxLength failure would reject
+    # the WHOLE chunk over one long answer); the two are pinned equal by test.
     ("overlay_summary_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "summary": {"type": "string", "maxLength": 400}},
+                                     "summary": {"type": "string", "maxLength": 1000}},
                       "required": ["ref", "summary"]}}},
         "required": ["results"]},
     ("overlay_synonyms_batch", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
+                      # Raised 200 -> 1000 (2026-08-06) to REJOIN `enrich._MAX_SYNONYMS_LEN`, which
+                      # had already gone 200 -> 1000. The pair had silently split: the code gate
+                      # accepted 1000 while this schema still failed the whole chunk at 201.
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "synonyms": {"type": "string", "maxLength": 200}},
+                                     "synonyms": {"type": "string", "maxLength": 1000}},
                       "required": ["ref", "synonyms"]}}},
         "required": ["results"]},
     # E4a T2 — one measure annotation per column: the `unit` (required — it is the whole question)
@@ -727,8 +1168,12 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "type": "object", "additionalProperties": False,
         "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
+                      # `unit` raised 32 -> 64 (2026-08-06) to REJOIN `enrich._MAX_UNIT_LEN`, which
+                      # had already gone 32 -> 64; the pair had silently split the same way
+                      # `synonyms` did. `currency` stays 8: ISO-4217 is exactly three ASCII letters
+                      # and `_CURRENCY_CODE_RE` enforces that, so 8 is already slack, not a bound.
                       "properties": {"ref": {"type": "string", "maxLength": 128},
-                                     "unit": {"type": "string", "maxLength": 32},
+                                     "unit": {"type": "string", "maxLength": 64},
                                      "currency": {"type": "string", "maxLength": 8}},
                       "required": ["ref", "unit"]}}},
         "required": ["results"]},
@@ -1127,6 +1572,46 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         },
         "required": ["concept", "reason_codes"],
     },
+    # Objective expansion (feature-gen Task 6d). The question is ten words and the catalog is
+    # hundreds of columns, so the relevance intersection is widened by expanding the SMALL side:
+    # one tiny call returns the related business vocabulary ("obligor" for "counterparty"), the
+    # match afterwards stays a deterministic set intersection, and an identical question replays
+    # from the 1039 store rather than re-billing.
+    #
+    # BOTH BOUNDS ARE CODE-ONLY (`feature_assist._MAX_EXPANSION_TERMS` = 40 and
+    # `_MAX_EXPANSION_TERM_LEN` = 64), and this schema deliberately carries NEITHER. The task brief
+    # asked for `maxItems: 40` and `items.maxLength: 64` here; both were tried and both are wrong,
+    # for two different reasons that happen to point the same way:
+    #
+    #   * `maxItems` may not appear in ANY schema in this dict — the Anthropic structured-output
+    #     API rejects it with HTTP 400, pinned repo-wide by
+    #     `test_enrich_llm.test_no_output_schema_carries_array_minitems_or_maxitems`.
+    #   * `maxLength` is legal but WRONG HERE, and the reason is `feature_ideas`' grounding array's
+    #     reason verbatim: it is stripped from the wire by `project_for_anthropic` (so the model is
+    #     never TOLD 64) yet still validated against the RESPONSE — so it fires FIRST, before the
+    #     per-entry code gate, and one 65-char term destroys the whole expansion. The terms in this
+    #     list are siblings exactly as grounding entries are, and the cost is worse than a lost
+    #     answer: a failed call caches NOTHING, so a question whose answer reliably contains one
+    #     long term would re-bill on every request forever. The code gate drops that ONE term,
+    #     keeps its 39 siblings, and caches. `test_enrich_output_bounds.py` pins the absence.
+    #
+    # STRUCTURE is a different matter and IS validated: `items: {"type": "string"}` survives the
+    # projection, so the model is told it and a null/number entry legitimately fails the response —
+    # the same bargain `derives_from` already takes.
+    ("objective_expansion", 1): {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "terms": {
+                "type": "array",
+                "description": "Related business terms for the analyst's objective — synonyms and "
+                               "industry vocabulary naming the same ideas. Single words or short "
+                               "noun phrases only.",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["terms"],
+    },
 }
 
 # Pass B v2 (Phase-2 Slice 1, Task 4): the OUTPUT contract is byte-for-byte v1 — v2 exists because
@@ -1165,10 +1650,74 @@ for _synth_alias_id in ("overlay_table_synth", "overlay_table_synth_summary_batc
 # version identifies the INPUT contract — but D10 makes registration a PRECONDITION, not a
 # follow-up: `_feature_schema_version()` may not return 4 until this loop has run, or
 # `_require_schema` refuses the dispatch and feature generation returns nothing with the flag on.
+# v5 (Task 6c) is the FIRST feature-gen version whose OUTPUT contract differs: every proposed
+# feature returns `grounding` — its own account of which offered column it used, in what role, and
+# on what evidence. Everything the request may ALSO stamp (recipe / leakage / set-rec) keeps the
+# v1 alias, because only `feature_ideas` gained a field and `_feature_schema_version()` stamps one
+# number across all four.
 for _feature_schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
     _SCHEMAS[(_feature_schema_id, 2)] = _SCHEMAS[(_feature_schema_id, 1)]
     _SCHEMAS[(_feature_schema_id, 3)] = _SCHEMAS[(_feature_schema_id, 1)]
     _SCHEMAS[(_feature_schema_id, 4)] = _SCHEMAS[(_feature_schema_id, 1)]
+    if _feature_schema_id != "feature_ideas":
+        _SCHEMAS[(_feature_schema_id, 5)] = _SCHEMAS[(_feature_schema_id, 1)]
+
+#: The v5 `grounding` array: WHY this feature, in the model's own words, against columns that
+#: really exist. EXPLANATORY ONLY — `feature_assist` reads it for display and pins that nothing
+#: branches on its content.
+#:
+#: WHAT IS *NOT* HERE IS THE POINT. `maxItems`, `maxLength` and `minItems` are stripped from the
+#: wire by `project_for_anthropic` but STILL validated against the response, so a bound here would
+#: fail the WHOLE call for one long clause the model was never told to shorten — the failure mode
+#: `test_enrich_output_bounds` exists to describe. `required` and `enum` are carried WIRE-ONLY
+#: (`x-wire-required` / `x-wire-enum`) for the same reason the feature item itself is: the canonical
+#: stays permissive so one malformed entry cannot take its siblings' good answers with it, and the
+#: deterministic gauntlet filters per entry. Every bound that matters lives in
+#: `feature_assist._ground_notes`, where it drops ONE entry instead of one call.
+_FEATURE_GROUNDING_SCHEMA: dict = {
+    "type": "array",
+    "description": "REQUIRED. One entry per column from the provided columns menu that you actually "
+                   "used in this feature — what it contributed and the evidence you relied on.",
+    "items": {
+        "type": "object",
+        # Open on the canonical (the projection closes it on the wire) — exactly as the feature
+        # item above is, and for the same leniency reason.
+        "additionalProperties": True,
+        "properties": {
+            "column": {"type": "string",
+                       "description": "the EXACT object_ref from the provided columns menu "
+                                      "(format public.<table>.<column>). A column that was never "
+                                      "offered is not a valid answer, and naming one discards the "
+                                      "whole feature."},
+            "role": {"type": "string",
+                     "x-wire-enum": ["measure", "grain", "time_anchor", "filter", "currency",
+                                     "dimension"],
+                     "description": "what this column contributes to the feature."},
+            "why": {"type": "string",
+                    "description": "ONE short clause naming the evidence you relied on."},
+        },
+        "x-wire-required": ["column", "role", "why"],
+    },
+}
+
+
+def _feature_ideas_with_grounding() -> dict:
+    """v5 = the v1 body plus one key. DERIVED from v1 rather than restated so the two cannot drift:
+    every earlier version is an alias of v1, so a v1 edit that v5 did not inherit would silently
+    split the contract in half."""
+    import copy
+
+    body = copy.deepcopy(_SCHEMAS[("feature_ideas", 1)])
+    item = body["properties"]["features"]["items"]
+    item["properties"]["grounding"] = copy.deepcopy(_FEATURE_GROUNDING_SCHEMA)
+    # Wire-required for the reason `derives_from` is: measured on Opus, a merely-DECLARED key on a
+    # nested array item is silently omitted. An absent array is still ACCEPTED by the code (honest
+    # absence, never a call failure) — this asks, it does not enforce.
+    item["x-wire-required"] = [*item["x-wire-required"], "grounding"]
+    return body
+
+
+_SCHEMAS[("feature_ideas", 5)] = _feature_ideas_with_grounding()
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads
@@ -1517,6 +2066,11 @@ _ITEM_META_ALLOWED = frozenset({
     # 200 default otherwise) and the item builder normalizes/validates them before egress.
     "recipe_family", "recipe_intent", "recipe_aggregation", "funnel_stage",
     "legacy_use_case_tags",
+    # Task 7b — the CATALOG narrative on the per-TABLE Pass-B synthesis item. Per table, never per
+    # column: a 4000-character description multiplied across a 144-column table would dominate the
+    # payload it is meant to inform. The four prose fields are free-text-classified above
+    # (definition / prose / list-of-prose); the authority label is structural.
+    *CATALOG_NARRATIVE_KEYS,
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -1536,10 +2090,58 @@ _COLUMN_PROFILE_KEYS = frozenset({
     "identifier_role", "temporal_role", "semantic_type", "entity",
     "term_type", "domain", "process_path",
 })
-_MAX_COLUMN_PROFILES = 64
+
+# [F4] The descriptor's OWN egress classification — the nested mirror of the three top-level classes,
+# and the gate whose absence made this a leak. `_redact_free_text_meta` scanned exactly ONE nested
+# key (`business_definition`) by name, so every OTHER admitted key rode to the provider unscanned,
+# and widening `_COLUMN_PROFILE_KEYS` opened a new unscanned path with nothing to notice.
+#
+# WHY DESCRIPTOR-LOCAL AND NOT `_FREE_TEXT_META_KEYS`. The two namespaces are genuinely different:
+# `_ITEM_META_ALLOWED` admits `data_domain` at the top level and never a bare `domain`, so folding
+# these names into the top-level set would let a top-level `domain` egress as prose where it fails
+# CLOSED today — a widening bought for no producer that exists. `_FEATURE_COLUMN_PROSE_KEYS` is the
+# precedent: the feature MENU's nested column dicts already carry their own per-key grade, including
+# `domain` and `process_path` under the same names.
+#
+# WHY PROSE AND NOT DEFINITION. `sanitize_definition` fails CLOSED on five literal sample-clause
+# phrases, and these facets ride EVERY Pass-B item — so the definition grade would hand one ordinary
+# uploader sentence ("Values Such As Payments" as a domain label) a kill switch over the whole
+# table's synthesis. That is precisely the blast radius `_ADVISORY_CONTEXT_KEYS` was created to
+# avoid. Prose scans for PII without the marker gate, which is the grade these already carry at the
+# top level (`_SCALAR_PROSE_META_KEYS`) and on the feature seam.
+_COLUMN_PROFILE_DEFINITION_KEYS = frozenset({"business_definition"})
+# Uploader-authored sidecar text. `table_synth._descriptor` truncates each to 200 chars and its
+# docstring called them "bounded structural tokens" — a length bound is not a safety property, and
+# `_SCALAR_PROSE_META_KEYS` already grades `term_type`/`process_path` as prose one namespace up.
+_COLUMN_PROFILE_PROSE_KEYS = frozenset({"term_type", "domain", "process_path"})
+# Platform-derived: physical/declared type tokens, registry concept + entity links, and the closed
+# `identifier_role`/`temporal_role`/`semantic_type` role vocabularies. None can carry uploader text.
+_COLUMN_PROFILE_STRUCTURAL_KEYS = frozenset({
+    "column", "type", "operational_type", "declared_type", "concept", "entity",
+    "identifier_role", "temporal_role", "semantic_type",
+})
+#: ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 512.
+#:
+#: READ THIS BEFORE MOVING IT AGAIN — it is not only an egress cap, it is Pass B's NARROW/WIDE
+#: ROUTER (`table_synth.synthesize_tables`). At 64 every real bank table (126 FTR / 144 CIB
+#: columns) took the TWO-PHASE path: its profiles were split into 64-column chunks, each chunk was
+#: SUMMARIZED, and the single phase-2 synthesis then decided grain / table_role / primary_entity /
+#: event_or_snapshot from those lossy summaries plus a names-and-types roster — never from the
+#: columns' own definitions. The two-phase path exists BECAUSE of this cap (a wider item was
+#: egress-REJECTED), not because summarizing is better. At 512 a real table synthesizes in ONE call
+#: over its COMPLETE profiles, and the two-phase path remains as the backstop for a genuinely
+#: pathological (>512-column) table. Fewer provider calls, strictly richer context.
+_MAX_COLUMN_PROFILES = 512
 #: Breadth is the point of `source_attributes`; unboundedness is not. A file with hundreds of columns
-#: must not push the real signal out of a batch.
-_MAX_SOURCE_ATTRIBUTES = 40
+#: must not push the real signal out of a batch. ZERO-TRUNCATION RAISE (2026-08-06): 40 -> 256.
+#: THIS IS THE EFFECTIVE LIMIT. An earlier revision of this note said the producer still bound first
+#: at 40 — true when written, false since `ftr_adapter._MAX_SOURCE_ATTRIBUTES` was raised to 256 in
+#: the same round to stop it making this cap inert. The two are now EQUAL BY INTENT and pinned equal
+#: by `test_the_producer_caps_no_longer_bind_before_the_egress_caps_they_feed`: the producer must
+#: never exceed this (a longer list is egress-REJECTED here) and must never sit below it (that is
+#: silent truncation at the reader). No real mapping export comes near either — FTR has 17 headers
+#: in total — so the binding constraint in practice is the file, not this number.
+_MAX_SOURCE_ATTRIBUTES = 256
 
 # A STRUCTURED wide-roster entry (Task 4): only the identity keys, short strings only —
 # structured (never the old `name:type` flat string) because a column name may itself contain
@@ -1579,28 +2181,78 @@ _MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 # `table_synth._descriptor` — so `enrich.bounded_definition`'s window, the metadata-only egress cap,
 # and Pass B's descriptor bound can never drift apart. Defined HERE (not in `enrich`) because `enrich`
 # imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
-MAX_DEFINITION_LEN = 600
-
-# Per-value egress length cap. Every scalar is capped at 200 EXCEPT the two sanitized DEFINITION
-# fields — the intended metadata payload — which get a larger (still-bounded) window so a real
-# definition is not cut mid-sentence before it egresses. `business_definition` matches
-# `enrich.bounded_definition`'s bound (same constant); [F7] gives the table-level
-# `table_definition` the SAME 600 window (it previously inherited the 200 default).
+# ZERO-TRUNCATION RAISE (2026-08-06): 600 -> 4000 -> 32_000.
 #
-# DELIBERATELY not widened for the three keys that joined `_DEFINITION_META_KEYS` later
-# (`table_description`, `business_context`, `semantic_terms`): the sanitize PIPELINE and the length
-# WINDOW are separate knobs, and widening what may egress is not part of grading them. They keep
-# the tight 200 default they had as prose. Note the direction of the mismatch is safe: Pass B bounds
-# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), so a future producer threading
-# a full-length `business_context` back into ITEM metadata would have the item EXCLUDED + audited by
-# `_item_len_ok`, never silently truncated — at which point widening this map is the deliberate
-# decision to make.
-_MAX_LEN_DEFAULT = 200
+# MEASURED — and the two files are DIFFERENT measurements, kept apart here because an earlier
+# revision of this comment merged them into one false sentence:
+#   * committed fixture (`tests/.../fixtures/ftr_sample_synthetic.csv`, 127 rows): widest
+#     `description_business_definition` 802 chars; **1** of the 127 exceeded the shipped 600.
+#   * REAL FTR export (`FTR_Column_Mapping_final.csv`, 127 rows, gitignored): widest raw value 960
+#     chars, 727 after the adapter's read-time sanitization; **41** of its 127 definitions exceeded
+#     600 — i.e. roughly a third of a real bank catalog's definitions were reaching the model CUT
+#     mid-sentence. That 41 is the real export's number, never the fixture's.
+# 32_000 is ~33x the widest real value and 53x the original 600 — deliberately far past any observed
+# input, and still a bound, so a 1 MB "definition" is caught rather than egressed.
+#
+# BOTH DIRECTIONS ARE INTENDED, AND BOTH ARE NOW WIRED. This constant is the egress cap on what we
+# SEND (`_MAX_LEN_BY_KEY` -> `_item_len_ok`, and `enrich.bounded_definition`'s window), the
+# admissibility bound on Pass-B/Pass-A material RE-THREADED into a later stage's item metadata, AND
+# — since the inbound fix — the ACCEPT gate on what the model may WRITE back: `draft_definitions`
+# passes exactly this constant to `_accept_bounded`, and `_SCHEMAS["overlay_definition_batch"]`
+# carries it as `definition.maxLength`.
+#
+# (An earlier revision of this note said the opposite — "it is NOT an accept gate on model OUTPUT …
+# so raising this does not by itself let a model write a longer definition". That was TRUE when
+# written and is the exact half-finished state the inbound fix closed: the accept gate then read
+# `_accept_bounded(500)`, below even the original 600. Raising this constant now moves both
+# directions, which is why the schema/code pairs are pinned equal by `test_enrich_output_bounds.py`
+# — the two fail differently, per-item vs whole-chunk, so they must never drift apart again.)
+#
+# WHAT HAD TO MOVE WITH IT — `enrich_config._DEFAULT_MAX_INPUT_TOKENS`. A definition at this cap is
+# 8_000 estimated tokens (the estimator is exactly `len(json)//4`), so `max_items` of them no longer
+# shared a chunk at the old budgets and the stage's call count rose. See the derivation block in
+# `enrich_config`. Measured items/chunk at this cap, against the real `chunk_items`, are pinned by
+# `test_enrichment_context_wiring.py`.
+MAX_DEFINITION_LEN = 32_000
+
+# Per-value egress length cap. ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. MEASURED against the
+# real FTR export, the widest non-definition value is 105 chars (`related_terms`; then 84 for the
+# FQN, 54 for synonyms), so the old 200 sat at less than 2x the observed maximum — one wider export
+# away from excluding items. 1000 is ~10x it. The two sanitized DEFINITION fields keep their own,
+# larger window (`MAX_DEFINITION_LEN`) so a full definition is never cut mid-sentence.
+#
+# This is an ACCEPTANCE gate, not a formatter: an over-cap value has its whole ITEM excluded from
+# egress and audited, never truncated. Raising it therefore ADMITS shapes previously refused; it
+# does not silently lengthen anything already flowing.
+#
+# The three keys that joined `_DEFINITION_META_KEYS` later (`table_description`, `business_context`,
+# `semantic_terms`) still take this default rather than the definition window — but the safety
+# property that used to justify the tight 200 has INVERTED, and that is deliberate: Pass B bounds
+# its own narrative OUTPUT at 600 (`table_synth._MAX_PROFILE_PROSE`), which at a 200 default meant a
+# re-threaded `business_context` had its item EXCLUDED + audited. At 1000 it is ADMITTED instead,
+# which is the outcome this task wants. `_MAX_PROFILE_PROSE` must stay BELOW this default; see the
+# note beside it.
+_MAX_LEN_DEFAULT = 1000
+#: The CATALOG-narrative acceptance bound (Task 7b), on the two fields `catalog_profiles` accepts at
+#: 4000 characters. Left to inherit `_MAX_LEN_DEFAULT` a legitimately-authored description would
+#: EXCLUDE its whole Pass-B item — that table would lose its synthesis (grain, table_role,
+#: primary_entity, event_or_snapshot), silently, audited only as an egress block. Set at TWICE the
+#: authored bound rather than exactly at it, because this gate runs AFTER redaction and redaction is
+#: not length-preserving in the shrinking direction: `DefaultIntentRedactor` substitutes a
+#: `[REDACTED:LABEL]` placeholder that is LONGER than several tokens it replaces, so a
+#: maximum-length narrative carrying PII would otherwise be refused for having been scrubbed.
+#: DERIVED from the authored bounds, never re-typed, so raising them cannot leave this behind.
+_CATALOG_NARRATIVE_MAX_LEN = 2 * max(MAX_CATALOG_DESCRIPTION, MAX_CATALOG_BUSINESS_CONTEXT)
 _MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
                    "table_definition": MAX_DEFINITION_LEN,
+                   "catalog_description": _CATALOG_NARRATIVE_MAX_LEN,
+                   "catalog_business_context": _CATALOG_NARRATIVE_MAX_LEN,
                    # Task 1: the authored one-line recipe intent (longest authored value is 323
-                   # chars at the 0F-2 baseline) — bounded above the 200 default, still closed.
-                   "recipe_intent": 400}
+                   # chars at the 0F-2 baseline). Kept as an EXPLICIT entry rather than left to
+                   # inherit the default, so lowering `_MAX_LEN_DEFAULT` later cannot silently
+                   # re-truncate an authored field; raised 400 -> 1000 with the default because a
+                   # per-key cap BELOW the default is an incoherence, not a control.
+                   "recipe_intent": 1000}
 
 
 def _max_len_for(key: str) -> int:

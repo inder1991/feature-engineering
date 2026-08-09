@@ -120,6 +120,9 @@ _DISPLAY_COLUMN: dict[str, str] = {
     "bian_path": "bian_path",
     "process_path": "process_path",
     "sub_domain": "sub_domain",
+    # Migration 1058 — the third sidecar taxonomy path, projected on the same rebuildable,
+    # never-authoritative contract as the two above.
+    "fibo_path": "fibo_path",
 }
 
 # The projected columns ``graph.build_graph`` ALSO populates, straight from the uploaded file — so

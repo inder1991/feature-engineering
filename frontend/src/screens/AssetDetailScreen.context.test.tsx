@@ -715,3 +715,234 @@ it('keeps the scan honest when a store HAS counted a dependency', async () => {
     expect(row.textContent ?? '').not.toMatch(forbidden)
   }
 })
+
+// ── the table this column belongs to (Task 9) ────────────────────────────────────────────────────
+
+const TABLE_SHAPE: api.ContextValue[] = [
+  {
+    field: 'table_role', value: 'dimension', proposed_value: null,
+    resolution_status: 'current', operational_influence: null,
+    authority_label: 'llm_proposed', producer: 'llm', strength: 'proposed',
+    lifecycle: 'active', evidence_ids: ['ev-tr'],
+  },
+  {
+    field: 'event_or_snapshot', value: 'snapshot', proposed_value: null,
+    resolution_status: 'current', operational_influence: null,
+    authority_label: 'source_attested', producer: 'source', strength: 'attested',
+    lifecycle: 'active', evidence_ids: ['ev-eos'],
+  },
+]
+
+it('shows the table role and the table shape, each with who said it', async () => {
+  // The same amount column means different things on an event table and on a daily snapshot, so a
+  // reviewer cannot judge the column without them. They rode `context.table_context` from the day
+  // the section shipped and the screen rendered none of it.
+  await openContext(contextFixture({ table_context: TABLE_SHAPE }))
+  const role = screen.getByTestId('context-table-role')
+  expect(role).toHaveTextContent('Table role')
+  expect(role).toHaveTextContent('dimension')
+  expect(within(role).getByText('AI proposed')).toBeInTheDocument()
+  const shape = screen.getByTestId('context-event-or-snapshot')
+  expect(shape).toHaveTextContent('snapshot')
+  // A source-attested axis must not read like the AI-proposed one beside it.
+  expect(within(shape).getByText('source attested')).toBeInTheDocument()
+})
+
+it('says the table shape is not established rather than leaving the row blank', async () => {
+  await openContext(contextFixture({ table_context: [] }))
+  expect(screen.getByTestId('context-table-role')).toHaveTextContent(/not established/i)
+  expect(screen.getByTestId('context-event-or-snapshot')).toHaveTextContent(/not established/i)
+})
+
+it('renders no table section for an anchor whose payload carries no table context', async () => {
+  await openContext(contextFixture())
+  expect(screen.queryByTestId('context-table-shape')).toBeNull()
+})
+
+it('does not name an author for an axis that resolved to nothing', async () => {
+  // The fourth state, and the one nobody lists: the bundle CARRIES the field because evidence rows
+  // exist for it, but nothing resolved and nothing is proposed (`semantic_context` keeps a
+  // table value whenever `value is None and not entries` is false). Rendering an em dash beside a
+  // "source attested" chip would name somebody as the author of nothing.
+  await openContext(contextFixture({
+    table_context: [{
+      field: 'table_role', value: null, proposed_value: null,
+      resolution_status: 'unresolved_pending_review', operational_influence: null,
+      authority_label: 'source_attested', producer: 'source', strength: 'attested',
+      lifecycle: 'active', evidence_ids: ['ev-tr'],
+    }],
+  }))
+  const role = screen.getByTestId('context-table-role')
+  expect(role).toHaveTextContent(/not established/i)
+  expect(role.textContent).not.toContain('—')
+  expect(within(role).queryByText('source attested')).toBeNull()
+})
+
+it('keeps the table’s search projection off the page', async () => {
+  // `table_context` carries the table node's `semantic_terms` beside the two axes, and it is the
+  // SPACE-joined search blob — term name, every glossary synonym, BIAN, FIBO and the process path
+  // concatenated. It arrives with no evidence rows, so `display_label()` returns "system": the
+  // platform named as author of text the source glossary wrote. It is index material, and this
+  // section is not where index material goes.
+  await openContext(contextFixture({
+    table_context: [
+      ...TABLE_SHAPE,
+      {
+        field: 'semantic_terms',
+        value: 'Trade Amount notional consideration Payment Order fibo-fnd:MonetaryAmount',
+        proposed_value: null, resolution_status: 'current', operational_influence: null,
+        authority_label: 'system', producer: null, strength: null, lifecycle: null,
+        evidence_ids: [],
+      },
+    ],
+  }))
+  const section = screen.getByTestId('context-table-shape')
+  expect(section.textContent).not.toMatch(/fibo-fnd:MonetaryAmount/)
+  expect(section.textContent).not.toMatch(/notional consideration/)
+  expect(within(section).queryByText('system')).toBeNull()
+  expect(screen.queryByTestId('context-value-semantic_terms')).toBeNull()
+  // The axes beside it still render — the exclusion is one field, not the section.
+  expect(screen.getByTestId('context-table-role')).toHaveTextContent('dimension')
+})
+
+it('shows the table prose that only the table node carries', async () => {
+  await openContext(contextFixture({
+    table_context: [
+      ...TABLE_SHAPE,
+      {
+        field: 'ai_summary', value: 'One row per account per day.', proposed_value: null,
+        resolution_status: 'current', operational_influence: null,
+        authority_label: 'llm_proposed', producer: 'llm', strength: 'proposed',
+        lifecycle: 'active', evidence_ids: [],
+      },
+    ],
+  }))
+  const section = screen.getByTestId('context-table-shape')
+  expect(within(section).getByText('One row per account per day.')).toBeInTheDocument()
+})
+
+// ── a proposal that did not win resolution (Task 9) ──────────────────────────────────────────────
+
+it('renders the AI’s answer for a field it was never allowed to resolve', async () => {
+  // `field_policies._MEASURE_ANNOTATION` keeps the LLM out of resolving unit/currency, so
+  // `graph_node` never receives its answer and `value` is null by design. Rendering an em dash for
+  // that column tells a reader nobody has an answer, which is false.
+  await openContext(contextFixture({
+    resolved_meaning: [{
+      field: 'unit', value: null, proposed_value: 'dollars',
+      resolution_status: 'unresolved_pending_review', operational_influence: 'hint',
+      authority_label: 'llm_proposed', producer: 'llm', strength: 'proposed',
+      lifecycle: 'active', evidence_ids: ['ev-unit'],
+    }],
+  }))
+  const row = screen.getByTestId('context-value-unit')
+  expect(within(row).getByText('dollars')).toBeInTheDocument()
+  // Distinguishable from a resolved value at the point it is read.
+  expect(within(row).getByText('AI proposed · unconfirmed')).toBeInTheDocument()
+  expect(row.textContent).not.toMatch(/blocked|invalid|failed|error/i)
+})
+
+it('names the model as the author of the model’s own proposal, not the strongest record', async () => {
+  // `proposed_value` is ALWAYS the LLM's row (`semantic_context` keys the lookup on
+  // `EvidenceProducer.LLM`), but `authority_label` is the STRONGEST active entry — a different
+  // record whenever a field resolved to nothing and two producers proposed at equal strength, where
+  // the lead is settled by `evidence_id` order. Reading the chip off `authority_label` displayed the
+  // model's value under somebody else's name.
+  await openContext(contextFixture({
+    resolved_meaning: [{
+      field: 'unit', value: null, proposed_value: 'dollars',
+      resolution_status: 'unresolved_pending_review', operational_influence: 'hint',
+      // The taxonomy row won the lead on evidence_id; the VALUE on screen is still the model's.
+      authority_label: 'source_proposed', producer: 'taxonomy', strength: 'proposed',
+      lifecycle: 'active', evidence_ids: ['ev-a', 'ev-b'],
+    }],
+  }))
+  const row = screen.getByTestId('context-value-unit')
+  expect(within(row).getByText('dollars')).toBeInTheDocument()
+  expect(within(row).getByText('AI proposed · unconfirmed')).toBeInTheDocument()
+  expect(within(row).queryByText(/source proposed/)).toBeNull()
+  // The strongest record is not hidden — it is named as what it is, in the tooltip.
+  expect(within(row).getByTitle(/strongest active record taxonomy\/proposed\/active/))
+    .toBeInTheDocument()
+})
+
+it('never lets a stale proposal displace a value the platform resolved', async () => {
+  await openContext(contextFixture({
+    resolved_meaning: [{
+      field: 'unit', value: 'USD', proposed_value: 'AED',
+      resolution_status: 'current', operational_influence: 'governed',
+      authority_label: 'human', producer: 'human', strength: 'confirmed',
+      lifecycle: 'active', evidence_ids: ['ev-unit'],
+    }],
+  }))
+  const row = screen.getByTestId('context-value-unit')
+  expect(within(row).getByText('USD')).toBeInTheDocument()
+  expect(within(row).queryByText('AED')).toBeNull()
+  expect(within(row).queryByText(/unconfirmed/)).toBeNull()
+  expect(within(row).getByText('human confirmed')).toBeInTheDocument()
+})
+
+// ── how sure the adjudicator was (Task 9) ────────────────────────────────────────────────────────
+
+it('shows the adjudicator’s confidence as explanation, never as authority', async () => {
+  await openContext(contextFixture(), d => {
+    d.semantic_adjudication = {
+      status: 'available', structured_result_id: 'sr-1', selected_concept: 'monetary_stock',
+      alternatives: ['monetary_flow', 'balance'], confidence_band: 'low',
+      reason_codes: [], missing_context: [], ontology_gap: null,
+    }
+  })
+  const band = screen.getByTestId('context-confidence-band')
+  expect(band).toHaveTextContent(/low confidence/i)
+  // It EXPLAINS the reading; it is not a claim that anybody attested it. Said positively, because
+  // the assertion this replaced (`not.toMatch(/authorit(y|ative)\b(?!.*not)/i)`) had a lookahead
+  // over the whole remaining string and passed on any later "not" anywhere in the row.
+  expect(band).toHaveTextContent(/how sure it was, not who says it is right/i)
+  // And it lives inside the adjudication section, under the heading that frames the whole block as
+  // alternatives considered — never beside the value as if it were the value's authority.
+  expect(within(screen.getByTestId('context-adjudication')).getByTestId('context-confidence-band'))
+    .toBeInTheDocument()
+  expect(band.textContent).not.toMatch(/blocked|invalid|failed|error/i)
+})
+
+it('says the adjudicator recorded no confidence rather than implying certainty', async () => {
+  // A reading with no band must not render as a reading nobody doubted. Absence is spoken.
+  await openContext(contextFixture(), d => {
+    d.semantic_adjudication = {
+      status: 'available', structured_result_id: 'sr-2', selected_concept: 'monetary_stock',
+      alternatives: [], reason_codes: [], missing_context: [], ontology_gap: null,
+    }
+  })
+  expect(screen.getByTestId('context-confidence-band'))
+    .toHaveTextContent(/recorded no confidence/i)
+})
+
+// ── cardinality: a hop nobody has established (Task 9) ───────────────────────────────────────────
+
+it('says a link with no directional realization has no established cardinality', async () => {
+  await openContext(contextFixture({ relationships: [directRelationship()] }))
+  const note = screen.getByTestId('context-cardinality-bfk_1')
+  expect(note).toHaveTextContent(/cardinality not established/i)
+  // "Nobody has measured it" is a state, not a fault — and never a claim a review would change it.
+  expect(note.textContent).not.toMatch(/blocked|invalid|failed|error/i)
+  for (const forbidden of FORBIDDEN_ON_A_CROSSWALK_ROW) {
+    expect(note.textContent ?? '').not.toMatch(forbidden)
+  }
+})
+
+it('states a realization’s missing cardinality as not established, never as a blank', async () => {
+  await openContext(contextFixture({
+    relationships: [{
+      ...directRelationship(),
+      realizations: [{
+        realization_revision_id: 'brr_1', from_ref: 'deposits::public.accounts',
+        to_ref: 'cards::public.cust', lifecycle: 'active', safety_status: 'unmeasured',
+        cardinality: null, scope_id: null, sandbox_eligible: false,
+        production_eligible: false, executable_now: false,
+      }],
+    }],
+  }))
+  expect(screen.getByTestId('context-link-bfk_1')).toHaveTextContent(/cardinality not established/i)
+  // The link-level note belongs to links with NO realization at all; this one has one.
+  expect(screen.queryByTestId('context-cardinality-bfk_1')).toBeNull()
+})

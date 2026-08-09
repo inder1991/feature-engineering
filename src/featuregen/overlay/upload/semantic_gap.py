@@ -29,6 +29,15 @@ from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, UNCLASSIFIED
 #: Bounds on one suggestion. A label is a concept NAME (a token), a definition is one or two
 #: sentences of rationale, and the alias list is a handful of spellings — anything larger is prose
 #: the reviewer would not read and egress the audit would not want.
+#:
+#: NOT `enrich_llm.MAX_DEFINITION_LEN`, despite the identical name, and deliberately NOT moved with
+#: it when that one went 600 -> 4000 -> 32_000 (2026-08-06). That constant bounds a COLUMN's curated
+#: business definition on the enrichment egress path, where the goal is that a real bank definition
+#: reaches the model uncut. This one bounds a MODEL-AUTHORED rationale for a proposed vocabulary
+#: addition, which a human reads in a review queue: it is a "keep it to two sentences" editorial
+#: bound, and widening it 80x would admit an essay nobody reviews rather than preserve a fact
+#: somebody wrote. Different question, different direction of risk — the shared spelling is a
+#: coincidence, not a coupling.
 MAX_LABEL_LEN = 64
 MAX_DEFINITION_LEN = 400
 MAX_ALIASES = 8

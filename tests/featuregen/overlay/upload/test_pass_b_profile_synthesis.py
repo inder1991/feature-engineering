@@ -96,8 +96,10 @@ def test_pass_b_v3_is_a_real_registered_body_not_an_alias(db) -> None:
 
 
 def test_the_synthesis_request_stamps_the_v3_contract() -> None:
+    # Task 7b moved the PROMPT to v5 (the catalog narrative: what it is, and that it is citable).
+    # The SCHEMA stays v3 — the response shape did not move, only the question.
     assert (ts._SYNTH_PROMPT_ID, ts._SYNTH_PROMPT_VERSION, ts._SYNTH_SCHEMA_VERSION) == (
-        "overlay_table_synth_v4", 4, 3)
+        "overlay_table_synth_v5", 5, 3)
 
 
 def test_the_disposition_set_is_total_and_closed() -> None:

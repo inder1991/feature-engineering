@@ -9,6 +9,9 @@ Subcommands:
                         feature with --feature-id). Deterministic + idempotent + advisory-locked.
   * `backfill-projections` -> rebuild migration 1052's display projections (`graph_node.data_role`
                         and the TABLE search-document prose slots) for an ALREADY-uploaded catalog.
+  * `propose-concept-parents` -> Task 9b one-off: propose an `is_a` parent for the registry concepts
+                        that declare none, and EMIT a source patch. Never edits `concepts.py`, never
+                        touches the database, and `--offline` completes with no provider call.
 
 `main(argv)` returns an int exit code (it never calls sys.exit itself) so it is directly testable;
 the `__main__` guard translates the code into a process exit.
@@ -56,6 +59,15 @@ def _build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--dsn", default=os.environ.get("FEATUREGEN_DSN"))
     backfill.add_argument("--source", default=None,
                           help="rebuild only this catalog source; omit for every catalog")
+
+    parents = sub.add_parser(
+        "propose-concept-parents",
+        help="Task 9b one-off: propose an is_a parent for the concepts that declare none and emit "
+             "a source patch (never edits concepts.py, never connects to the database)")
+    parents.add_argument("--out", default=None,
+                         help="write the patch here; omit to print it on stdout")
+    parents.add_argument("--offline", action="store_true",
+                         help="replay the curated OFFLINE_PROPOSALS instead of calling a provider")
 
     return parser
 
@@ -148,6 +160,61 @@ def _run_backfill_projections(dsn: str, source: str | None) -> int:
     return 1 if failed else 0
 
 
+def _run_propose_concept_parents(out: str | None, offline: bool) -> int:
+    """Task 9b: emit the `is_a=` additions for the concepts that declare no parent.
+
+    NO database and NO catalog — the registry is a Python module, so the only input is
+    platform-authored vocabulary and nothing customer-owned can reach a provider. It EMITS a patch
+    and never edits `concepts.py`: the registry is source code, so this lands as a reviewed code
+    change rather than as a governance approval step.
+
+    `--offline` replays the curated proposal set with no provider call at all; without it, a Claude
+    client is built from the environment exactly as `worker` does, and a disabled/unconfigured LLM
+    is a refusal (exit 1) rather than a silent empty patch.
+
+    Every proposal — model-generated or curated — passes `keep_valid` before it is rendered, so the
+    patch cannot contain an unresolved parent, a self-parent, an overwrite of one of the authored
+    parents, or a cycle (including one formed jointly by two proposals in the same run).
+    `_validate_registry` remains the import-time backstop after the patch is applied.
+    """
+    from featuregen.overlay.upload.propose_concept_parents import (
+        OFFLINE_PROPOSALS,
+        keep_valid,
+        parentless_records,
+        propose_parents_with_reasons,
+        render_patch,
+    )
+
+    records = parentless_records()
+    if offline:
+        proposed = len(OFFLINE_PROPOSALS)
+        kept, dropped = keep_valid(OFFLINE_PROPOSALS, records)
+    else:
+        from featuregen.intake.llm_claude import ClaudeConfig, build_claude_llm
+
+        llm_config = ClaudeConfig.from_env()
+        if not llm_config.enabled:
+            log("propose-concept-parents.no-llm", level="error",
+                detail="no LLM configured; set the provider env or pass --offline")
+            return 1
+        kept, dropped = propose_parents_with_reasons(build_claude_llm(llm_config), list(records))
+        proposed = len(kept) + len(dropped)
+
+    patch = render_patch(kept, dropped)
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write(patch)
+    else:
+        print(patch, end="")
+    reasons: dict[str, int] = {}
+    for reason in dropped.values():
+        reasons[reason] = reasons.get(reason, 0) + 1
+    log("propose-concept-parents.done", source="offline" if offline else "llm",
+        parentless=len(records), proposed=proposed, kept=len(kept), dropped=len(dropped),
+        out=out or "-", **{f"dropped_{k}": v for k, v in sorted(reasons.items())})
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.command == "worker":
@@ -165,6 +232,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_pointer_repair(_require_dsn(args.dsn), args.feature_id)
     if args.command == "backfill-projections":
         return _run_backfill_projections(_require_dsn(args.dsn), args.source)
+    if args.command == "propose-concept-parents":
+        return _run_propose_concept_parents(args.out, args.offline)
     return 2  # unreachable: argparse enforces a known subcommand
 
 

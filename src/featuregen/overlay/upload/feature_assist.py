@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
@@ -33,7 +33,7 @@ from featuregen.contracts.evidence_axes import EvidenceAuthorityV1
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.evidence import EvidenceProducer
-from featuregen.overlay.field_evidence import read_active_field_evidence
+from featuregen.overlay.field_evidence import canonical_hash, read_active_field_evidence
 from featuregen.overlay.upload import grounding_trace as _gt
 from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
@@ -46,7 +46,10 @@ from featuregen.overlay.upload.concepts import (
     is_personal_data,
     is_protected_characteristic,
 )
-from featuregen.overlay.upload.enrich_llm import audited_structured_call
+from featuregen.overlay.upload.enrich_llm import (
+    audited_structured_call,
+    drive_audited_structured_call,
+)
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CATALOG_PROJECTION_UNAVAILABLE,
     CatalogProjectionUnavailable,
@@ -64,9 +67,11 @@ from featuregen.overlay.upload.join_path import (
     join_outcome_relationship_path,
 )
 from featuregen.overlay.upload.need_metadata import is_measure_need_role
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.pii_policy_store import active_pii_use_policies
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+from featuregen.overlay.upload.profile_store import current_catalog_narrative_block
 from featuregen.overlay.upload.read_scope import (
     allowed_sensitivities,
     read_scope_rule_content_hash,
@@ -74,6 +79,10 @@ from featuregen.overlay.upload.read_scope import (
 from featuregen.overlay.upload.semantic_context import (
     bundle_from_store,
     for_feature_generation,
+)
+from featuregen.overlay.upload.structured_results import (
+    find_structured_result,
+    record_structured_result,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
@@ -110,6 +119,13 @@ class RejectCode:
     MALFORMED_ITEM = "MALFORMED_ITEM"       # LLM returned a non-object feature item (guarded, not fatal)
     AMBIGUOUS_CATALOG = "AMBIGUOUS_CATALOG"
     UNKNOWN_COLUMN = "UNKNOWN_COLUMN"
+    # The model's own `grounding` array named a column that matches NOTHING the catalog offered
+    # (Task 6c). The feature may still compute — its `derives_from` grounded — but the account it
+    # gives of itself cites something that does not exist, so the proposal is discarded rather than
+    # shown with a fabricated explanation attached. Narrow by construction: an AMBIGUOUS name, a
+    # missing one and an unreadable role all cost their own entry and never the feature
+    # (`_ground_notes`), because none of those is a false claim about the catalog.
+    UNKNOWN_GROUNDING_COLUMN = "UNKNOWN_GROUNDING_COLUMN"
     LEAKAGE = "LEAKAGE"
     STALE = "STALE"
     ADDITIVITY = "ADDITIVITY"
@@ -154,6 +170,9 @@ FEATURE_REFUSAL_FAMILIES: dict[str, str] = {
     RejectCode.MALFORMED_ITEM: STRUCTURALLY_UNSUITABLE,
     RejectCode.AMBIGUOUS_CATALOG: STRUCTURALLY_UNSUITABLE,
     RejectCode.UNKNOWN_COLUMN: STRUCTURALLY_UNSUITABLE,
+    # Same family as UNGROUNDED / UNKNOWN_COLUMN: the proposal, AS STATED, cannot be audited. No
+    # setting a human could change would make a citation of a non-existent column true.
+    RejectCode.UNKNOWN_GROUNDING_COLUMN: STRUCTURALLY_UNSUITABLE,
     RejectCode.LEAKAGE: STRUCTURALLY_UNSUITABLE,
     RejectCode.NON_NUMERIC: STRUCTURALLY_UNSUITABLE,
     RejectCode.NO_JOIN_PATH: STRUCTURALLY_UNSUITABLE,
@@ -281,7 +300,12 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
            # join — never a second unscoped fetch. Display projections, so they inform the model
            # and change no gate: the numeric, currency, grain, availability and join checks stay
            # exactly as authoritative as they were.
-           "t.data_role, t.authority_role, t.temporal_storage_model, t.business_context "
+           "t.data_role, t.authority_role, t.temporal_storage_model, t.business_context, "
+           # Task 7b: `schema_name` is not payload — it is the key `_business_terms` rebuilds each
+           # row's SCHEMA-PRESERVING logical ref from, because `field_evidence` is keyed by that ref
+           # while `graph_node.object_ref` is the public-flattened one. Selected here so the term
+           # lookup needs no second graph query.
+           "c.schema_name "
            "FROM graph_node c "
            "LEFT JOIN graph_node t ON t.catalog_source = c.catalog_source AND t.kind = 'table' "
            "AND t.table_name = c.table_name "
@@ -297,17 +321,68 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
         sql += " AND c.catalog_source = %s"
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
-    return [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
-             "concept": r[4], "domain": r[5], "definition": r[6], "ai_summary": r[7],
-             "data_type": r[8], "declared_type": r[9], "semantic_terms": r[10], "entity": r[11],
-             "additivity": r[12], "unit": r[13], "currency": r[14], "is_grain": r[15],
-             "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
-             # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
-             # shifted every index past it, and these two were the tail I missed first time.
-             "table_definition": r[19], "table_primary_entity": r[20],
-             "table_data_role": r[21], "table_authority_role": r[22],
-             "table_temporal_storage_model": r[23], "table_business_context": r[24]}
-            for r in rows]
+    out = [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
+            "concept": r[4], "domain": r[5], "definition": r[6], "ai_summary": r[7],
+            "data_type": r[8], "declared_type": r[9], "semantic_terms": r[10], "entity": r[11],
+            "additivity": r[12], "unit": r[13], "currency": r[14], "is_grain": r[15],
+            "is_as_of": r[16], "grain_fact_event_id": r[17], "availability_fact_event_id": r[18],
+            # The LEFT JOIN's table fields sit AFTER the column fields — inserting `ai_summary`
+            # shifted every index past it, and these two were the tail I missed first time.
+            "table_definition": r[19], "table_primary_entity": r[20],
+            "table_data_role": r[21], "table_authority_role": r[22],
+            "table_temporal_storage_model": r[23], "table_business_context": r[24],
+            "schema_name": r[25]}
+           for r in rows]
+    terms = _business_terms(conn, out)
+    for row in out:
+        row["business_term"] = terms.get(_logical_ref_of_row(row))
+    return out
+
+
+def _logical_ref_of_row(row: dict) -> str:
+    """The row's SCHEMA-PRESERVING logical ref — the key every evidence store uses. `object_ref` on
+    the menu is the PUBLIC-FLATTENED graph ref (see `_context_v4_column`), and looking evidence up
+    by that spelling matches no row: the field would populate for a public-schema catalog and
+    silently never populate for a glossary catalog, which is the harder half of that bug to notice.
+    """
+    return normalize_ref(row["catalog_source"], row.get("schema_name") or None,
+                         row["table"], row["column"])
+
+
+def _business_terms(conn, rows: list[dict]) -> dict[str, str]:
+    """`{logical_ref: business_term}` for these candidates, in ONE batched read (Task 7b).
+
+    The glossary's curated business NAME for a column has no `field_resolution._DISPLAY_COLUMN`
+    entry, so it reaches no flat `graph_node` column and the candidate query cannot join it. It
+    lives as SOURCE evidence, which is exactly where `semantic_context.bundle_from_store` reads it
+    from for the payload — this read exists because `_column_tokens` scores the CANDIDATE row, not
+    the (lazily built, budget-gated) enriched payload, so a payload-only fix would leave the
+    objective/column intersection as blind to the bank's own vocabulary as it was.
+
+    PRODUCER-SCOPED TO `source`, and that is not caution — it is what keeps the ranking and the
+    PAYLOAD looking at the same value. `bundle_from_store` builds `source_semantics` from SOURCE
+    rows only, so that is exactly the `business_term` `for_feature_generation` emits; an unscoped
+    read here would let the ranking match a term the model is never shown. (A HUMAN-corrected
+    business term reaches neither surface today — the bundle carries no resolved projection for a
+    field with no `_DISPLAY_COLUMN` entry. That is a pre-existing gap in the bundle, and closing it
+    HERE alone would create the divergence this scope exists to prevent.)
+
+    Read scope needs no predicate here: `rows` are already the scoped candidates, and this reads
+    only their own refs. Fail-soft — a term is ranking colour, never a gate."""
+    if not rows:
+        return {}
+    refs = sorted({_logical_ref_of_row(r) for r in rows})
+    try:
+        found = conn.execute(
+            "SELECT DISTINCT ON (logical_ref) logical_ref, proposed_value FROM field_evidence "
+            "WHERE field_name = 'business_term' AND lifecycle = 'active' AND producer = 'source' "
+            "AND logical_ref = ANY(%s) ORDER BY logical_ref, created_at DESC, evidence_id DESC",
+            (refs,)).fetchall()
+    except Exception:  # noqa: BLE001 — advisory: a curated term never fails the request
+        logger.warning("advisory business_term read failed for %d candidates", len(rows),
+                       exc_info=True)
+        return {}
+    return {ref: value for ref, value in found if isinstance(value, str) and value}
 
 
 def _menu(cols: list[dict]) -> list[dict]:
@@ -331,21 +406,29 @@ def feature_context_enabled() -> bool:
 #:   4 — the shared `SemanticContextBundleV1` contract (semantic Task 8): v3 plus concept ancestry,
 #:       identifier namespace/issuer, party role, the D2 (producer, strength) axes per semantic
 #:       field, current cross-catalog links and the closed missing-context codes.
+#:   5 — Task 6c. The first version whose OUTPUT contract moved rather than its input: every
+#:       proposed feature returns `grounding`, its own account of which offered column it used.
 #: Bumped because the record must identify WHICH contract egressed. Adding a field to the payload
 #: while leaving the version at 2 makes a v2 record ambiguous — with or without summaries — which
 #: defeats the reason the version is stamped at all.
-_FEATURE_CONTEXT_SCHEMA_VERSION = 4
+_FEATURE_CONTEXT_SCHEMA_VERSION = 5
+
+#: The version from which the OUTPUT carries `grounding`. Below it the wire item is CLOSED without
+#: a `grounding` key, so the generation instruction must not ask for one — a model is never asked
+#: for output its schema forbids.
+_GROUNDING_SCHEMA_VERSION = 5
 
 #: The D8 ROLLBACK LADDER, in one place:
 #:   flag off                              -> v1, the thin pre-Slice-3 menu, byte-for-byte;
 #:   flag on + FEATUREGEN_FEATURE_CONTEXT_VERSION=3 -> today's SHIPPED v3 behaviour;
-#:   flag on (default)                     -> v4.
+#:   flag on + FEATUREGEN_FEATURE_CONTEXT_VERSION=4 -> v4, the rich menu with NO returned grounding;
+#:   flag on (default)                     -> v5.
 #: The env override exists precisely so v3 stays REACHABLE after Task 8 — a rollback that dropped
 #: to the v1 thin menu would be a functional regression dressed as a safety valve. Only versions
 #: this module can actually render are honoured; anything else falls back to the default and warns,
 #: because a typo in a deploy manifest must not silently downgrade the contract.
 FEATURE_CONTEXT_VERSION_ENV = "FEATUREGEN_FEATURE_CONTEXT_VERSION"
-_SELECTABLE_CONTEXT_VERSIONS = (3, 4)
+_SELECTABLE_CONTEXT_VERSIONS = (3, 4, 5)
 
 
 def _feature_schema_version() -> int:
@@ -438,9 +521,30 @@ def _enriched_menu(conn, cols: list[dict], *, roles: Iterable[str] = ()) -> list
 #: budget. Prose goes first (it is the largest and the least load-bearing), then the discovery
 #: extras. `missing_context`, the governed|hint fact wrappers and `semantic_authority` are NOT
 #: trimmable: they are what stop the model treating an AI proposal as a governed fact, and a
-#: context that dropped them to fit would be smaller and less safe.
+#: context that dropped them to fit would be smaller and less safe. The adjudication signals
+#: (`confidence_band` / `concept_alternatives`, Task 6b) are absent for the same reason and one
+#: more: they exist ONLY on the columns the platform could not settle, they cost ~27-92 bytes
+#: there, and shedding them would remove the uncertainty marker from exactly the columns whose
+#: uncertainty the model most needs to see.
 _V4_TRIM_ORDER: tuple[str, ...] = ("semantic_terms", "ai_summary", "definition", "relationships",
                                    "concept_path")
+
+
+#: The TABLE-context field names the v4 payload emits per column (`table_role`,
+#: `event_or_snapshot` — Task 6). Their authority is folded into `semantic_authority` below;
+#: `table_context`'s OTHER fields (`definition`, `domain`, `ai_summary`, `semantic_terms`) share
+#: their names with the COLUMN's own fields, and folding those in would label the column's value
+#: with the table's authority. Hence an explicit list, not "everything on table_context".
+_V4_TABLE_AUTHORITY_FIELDS: frozenset[str] = frozenset({"table_role", "event_or_snapshot"})
+
+#: The SOURCE-only semantic fields the v4 payload emits (Task 7b). Both are curated glossary values
+#: that reach no `graph_node` display column, so they ride `bundle.source_semantics` alone and the
+#: `resolved_semantics` loop below never sees them — a value would have egressed with nothing beside
+#: it saying who vouched for it. Named EXPLICITLY, exactly like `_V4_TABLE_AUTHORITY_FIELDS`, and not
+#: "everything on source_semantics": most source fields share a name with the column's own resolved
+#: field (`definition`, `domain`, `entity`…), and folding those in would label the resolved value
+#: with the DECLARED value's authority.
+_V4_SOURCE_AUTHORITY_FIELDS: frozenset[str] = frozenset({"business_term", "related_terms"})
 
 
 def _semantic_authority(bundle) -> dict[str, str]:
@@ -457,6 +561,25 @@ def _semantic_authority(bundle) -> dict[str, str]:
             continue
         lead = value.evidence[0]
         out[value.field_name] = f"{lead.producer}/{lead.strength}"
+    # The two TABLE axes the payload also emits live on `table_context`, which the loop above never
+    # walks — without this they would egress with nothing beside them saying who proposed them. A
+    # column field of the same name always wins: the column's own authority is never overwritten.
+    for value in bundle.table_context:
+        if value.field_name not in _V4_TABLE_AUTHORITY_FIELDS or value.field_name in out:
+            continue
+        if not value.evidence:
+            continue
+        lead = value.evidence[0]
+        out[value.field_name] = f"{lead.producer}/{lead.strength}"
+    # The two SOURCE-only glossary fields (Task 7b), same rule and same precedence: a resolved field
+    # of the same name always wins, so a column's own authority is never overwritten.
+    for value in bundle.source_semantics:
+        if value.field_name not in _V4_SOURCE_AUTHORITY_FIELDS or value.field_name in out:
+            continue
+        if not value.evidence:
+            continue
+        lead = value.evidence[0]
+        out[value.field_name] = f"{lead.producer}/{lead.strength}"
     return out
 
 
@@ -465,9 +588,13 @@ def _context_v4_column(conn, c: dict, *, roles: Iterable[str]) -> dict:
 
     The bundle is the ONE assembly (semantic Task 1) — read-scoped and batched at that seam — so
     this path cannot drift from the Context tab or from data-agent retrieval, which read the same
-    contract. Everything the adapter emits is already egress-classified (D10); the two keys added
-    here (`semantic_authority`, and `party_role` promoted out of the adapter's identity block) are
-    classified alongside them.
+    contract. Everything the adapter emits is already egress-classified (D10); the keys added here
+    (`semantic_authority`, `party_role` promoted out of the adapter's identity block, and the
+    adjudication's `confidence_band` / `concept_alternatives`) are classified alongside them.
+
+    The two ADJUDICATION keys are joined here rather than in the bundle on purpose — see the note
+    at the join. They ride the anchor's own read scope: a column whose bundle `roles` refuses never
+    reaches that read at all, because the fallback below returns first.
 
     A column whose bundle cannot be assembled (it vanished between the candidate read and here, or
     read scope narrowed) falls back to the v3 shape rather than dropping the column: a MISSING
@@ -490,8 +617,33 @@ def _context_v4_column(conn, c: dict, *, roles: Iterable[str]) -> dict:
     # `missing_context` is read-scoped ABSENCE, not a data-quality verdict — it tells the model
     # what this view does not carry so it stops inferring from silence.
     out["semantic_authority"] = _semantic_authority(bundle)
+    # The adjudicator's JUDGEMENT signals. Deliberately joined HERE and NOT in the bundle:
+    # `semantic_context`'s own docstring draws that line — an adjudication is a judgement ABOUT the
+    # semantics, not one of them, so it is served BESIDE the bundle — and this keeps it. Both are
+    # ADVISORY: nothing here or downstream branches on `confidence_band` (the Task-5 contract:
+    # explanation, never authority — it cannot turn an `llm/proposed` concept into a stronger
+    # assertion), and `concept_alternatives` is context for the model to weigh, never a
+    # classification. Neither carries or implies an authority of its own; the concept's authority is
+    # `semantic_authority` above, unchanged.
+    #
+    # READ IT BY `bundle.object_ref`, NOT `c["object_ref"]`. The 1046 adjudication subject pointer is
+    # keyed by the SCHEMA-PRESERVING logical ref, which is what the bundle carries; `c` and the
+    # emitted payload carry the PUBLIC-FLATTENED graph ref (see the note on `out["object_ref"]`
+    # above). Passing the flattened form matches no pointer row, so every column would silently come
+    # back unadjudicated — the keys would simply never appear and the feature would look implemented.
+    #
+    # Deferred import, matching `asset_detail._semantic_adjudication_section`, to keep the
+    # module-import cycle that module already avoids (`semantic_adjudication` imports `enrich_llm`).
+    from featuregen.overlay.upload.semantic_adjudication import load_current_adjudication
+
+    adjudication, _result_id = load_current_adjudication(conn, bundle.object_ref)
+    if adjudication is not None:
+        out["confidence_band"] = adjudication.confidence_band
+        out["concept_alternatives"] = list(adjudication.alternatives)
     # The adapter emits `null` for anything the bundle does not hold; a null in a prompt is noise
-    # the egress scanner still has to walk. Drop the empties — absence IS the honest signal.
+    # the egress scanner still has to walk. Drop the empties — absence IS the honest signal, and it
+    # is what a never-adjudicated column (the NORMAL case: adjudication is the exception path) and
+    # an adjudication with no shortlist both carry.
     return {k: v for k, v in out.items() if v not in (None, "", [], {})}
 
 
@@ -511,29 +663,346 @@ def _trimmed(column: dict, level: int) -> dict:
     return {k: v for k, v in column.items() if k not in shed}
 
 
-def _table_context(cols: list[dict]) -> list[dict]:
+# ── the table-fact AUTHORITY axis (Task 8b) ──────────────────────────────────────────────────────
+#
+# WHO ASSERTED THIS VALUE. Task 8 shipped `confirmed` | `declared`, and its review proved the pair
+# was wrong in both halves: `ingest._assert_fact` AUTO-CONFIRMS every file-declared grain/as-of with
+# `authority_basis=source_declared`, so `confirmed` was worn by an unreviewed CSV flag and by a human
+# endorsement alike; and a Pass B AI proposal never sets `is_grain` at all, so the value this whole
+# plan exists to surface reached nothing. These three tokens are the axis the CODE actually knows.
+#
+# THIS IS A LABEL, NEVER A PERMISSION. None of the three admits anything to the execution path: a
+# feature that runs against the warehouse still needs a VERIFIED fact, and the guards that say so
+# (`resolve_fact`, `read_governed_grain`, `semantic_bindings/projection.py`, `materialize/spine.py`)
+# read the fact stream and none of them reads this block. `resolve_fact` refusing to serve a PROPOSED
+# fact is what keeps that honest and is deliberately untouched here — this reads the proposed state
+# BESIDE the resolved one and labels the difference.
+STATUS_HUMAN_CONFIRMED = "human_confirmed"
+STATUS_SOURCE_DECLARED = "source_declared"
+STATUS_AI_PROPOSED = "ai_proposed"
+#: The CLOSED vocabulary. Every member must also be defined for the model in
+#: `_TABLE_CONTEXT_STATUS_DIRECTIVE` — a token whose meaning lives only in a docstring is not
+#: labelling, which is the finding Task 8's review raised about its own two.
+TABLE_FACT_STATUSES = frozenset({STATUS_HUMAN_CONFIRMED, STATUS_SOURCE_DECLARED,
+                                 STATUS_AI_PROPOSED})
+
+
+#: Folds on which a HUMAN confirmation, if the stream has one, HAS NOT BEEN WITHDRAWN — so the label
+#: follows the signature stamped on the row rather than the fact's current servability.
+#:
+#: NAMED FOR "NOT WITHDRAWN", NOT "STANDS", and the rename is the finding: round 2 called this
+#: `_ENDORSEMENT_STANDS` and wrote "that sign-off still stands" into the model-facing sentence, which
+#: is FALSE for the two lapsed folds this very tuple admits. A constant whose name asserts more than
+#: its members support is the same defect as a token whose meaning lives only in a docstring — one
+#: level down, where the next reader copies it into prose without re-deriving it.
+#:
+#: THE STAMP OUTLIVES VERIFIED, BY DESIGN. `graph_node.grain_fact_event_id` is written by
+#: `table_fact_projection` from the confirmed event, and NOTHING clears it when the fact leaves
+#: VERIFIED: `expiry` demotes join edges and semantic bindings, `catalog_changes._stale_one` appends
+#: the STALED event and calls no table-fact projection, and the overlay projection touches only
+#: `overlay_fact_state`/`overlay_proposal`. `stamp_reconcile` states the intent outright — a fact
+#: `resolve_fact` will not serve is "left drifted-and-visible rather than force-stamped or, worse,
+#: wiped". So `_grain_block`'s confirmed branch keeps firing off a human's own signature long after
+#: the fact stops being servable, and testing `status == "VERIFIED"` here answered
+#: `source_declared` — "no human review" — for a grain whose reviewer's event id is stamped on the
+#: very row the block was built from.
+#:
+#: EXPIRY AND STALING ARE LAPSES; REJECTION IS A REPUDIATION. A TTL firing or a drift scan retires a
+#: signature by the clock or by the catalog moving underneath it — nobody withdrew it. A human
+#: rejecting the re-verification is a person saying THIS VALUE IS WRONG, and `_AWAITING_CONFIRMATION`
+#: admits exactly REVERIFY and STALE to that command, so it is reachable. REJECTED is therefore
+#: excluded: the endorsement must be UNWITHDRAWN, not merely have existed. It need NOT still be in
+#: force — a lapsed signature is admitted here on purpose, and the model-facing sentence claims
+#: exactly that much and no more.
+#:
+#: EVERY FOLD THAT CAN REACH `_grain_block`'s CONFIRMED BRANCH (i.e. the row is still stamped), and
+#: what it emits:
+#:
+#:   VERIFIED             -> human_confirmed | source_declared   (who authored the confirm)
+#:   REVERIFY             -> human_confirmed | source_declared   (TTL lapse; not a withdrawal)
+#:   STALE                -> human_confirmed | source_declared   (drift lapse; not a withdrawal)
+#:   REJECTED             -> source_declared                     (signature withdrawn)
+#:   PARTIALLY_CONFIRMED  -> source_declared                     (UNREACHABLE for a table fact —
+#:                                                                see below; NOT "no stamp to read")
+#:   DRAFT (re-proposed)  -> source_declared                     (PROPOSED clears confirmed_event_id)
+#:   no stream at all     -> source_declared                     (nothing to evidence)
+#:
+#: PARTIALLY_CONFIRMED IS UNREACHABLE HERE, and the reason matters because this table is the
+#: checklist the next change to this surface works from. It would NOT be safe by the stamp being
+#: absent: reached from REVERIFY/STALE its fold branch touches only `status` and `partial_confirmers`
+#: (`state.py`), so `confirmed_event_id` — and the row's stamp — survive it exactly as they survive
+#: REJECTED. It is moot only because `OVERLAY_FACT_PARTIALLY_CONFIRMED` has exactly ONE emitter,
+#: `join_confirmation._confirm_approved_join`, which is dispatched for `approved_join` alone (the
+#: dual-owner path). Grain and availability_time are single-confirmer facts and never enter it. If a
+#: table fact ever gains dual authority, this row stops being moot and must be decided on its merits.
+#:
+#: which is why `source_declared`'s sentence is that no sign-off STANDS — the one claim true of every
+#: state in its column — while `human_confirmed` claims only that the sign-off has NOT BEEN
+#: WITHDRAWN, which is the one claim true of every state in ITS column. They are deliberately
+#: different predicates: REVERIFY and STALE have a signature that is not withdrawn but no longer
+#: stands, and saying "still stands" there was the third breach of the clause-truth rule.
+_ENDORSEMENT_NOT_WITHDRAWN = ("VERIFIED", "REVERIFY", "STALE")
+
+
+@dataclass(frozen=True, slots=True)
+class _FactEvent:
+    """The four fields the overlay lifecycle fold and the human-review rule read off an event.
+
+    `fold_overlay_state` states its own input contract in its docstring — "Each item exposes
+    `.type`, `.event_id`, `.payload`" — and `bridge_assessment._human_reviewed` adds
+    `.actor.actor_kind`. Selecting four columns rather than the nineteen `row_to_event` needs keeps
+    this a narrow read on the assembly path. The fold and the human-review rule themselves are
+    REUSED, never reimplemented: a second copy of an identity-bearing rule is a rule that drifts.
+    """
+
+    type: str
+    event_id: str
+    payload: Mapping[str, object]
+    actor: IdentityEnvelope
+
+
+def _machine_proposal(stream: list[_FactEvent], draft_event_id: str | None,
+                      fact_type: str) -> list[str] | str | None:
+    """The value of an OPEN, MACHINE-authored proposal — the grain's sorted column list or the
+    as-of column name — or None when this DRAFT is not one, or its value will not read.
+
+    THE ACTOR CHECK IS THE POINT. `ai_proposed` claims a MODEL inferred the value. Every grain
+    DRAFT this codebase writes today comes from Pass B under the service actor `_ENRICH_ACTOR`
+    (`table_synth._propose_table_facts`), and `table_fact_governance` already hard-codes that
+    assumption for its own queue (`origin = "llm_proposed_not_profiled"`). But `propose_fact` is a
+    generic governed command: a human-actor DRAFT would wear a label that is simply false about who
+    wrote it, so it is not surfaced at all — which is exactly what shipped before this task.
+
+    Mirrors `_human_reviewed`'s shape deliberately, including its failure direction: anything this
+    cannot positively establish returns the weaker answer rather than the flattering one.
+    """
+    draft = next((e for e in stream if e.event_id == draft_event_id), None)
+    if draft is None or draft.actor.actor_kind == "human":
+        return None
+    value = draft.payload.get("proposed_value")
+    if not isinstance(value, Mapping):
+        return None
+    if fact_type == "grain":
+        columns = value.get("columns")
+        if not (isinstance(columns, list) and columns
+                and all(isinstance(c, str) and c for c in columns)):
+            return None
+        return sorted(columns)
+    column = value.get("column")
+    return column if isinstance(column, str) and column else None
+
+
+def _table_fact_authority(conn, cols: list[dict]) -> dict[tuple[str, str], dict]:
+    """Who asserted each candidate table's grain / availability fact, read ONCE per assembly.
+
+    Returns ``{(catalog_source, table): {fact_type: {"human": bool, "proposed": value|None}}}`` —
+    ``human`` says the VERIFIED fact carries a real human endorsement rather than ingest's
+    source-declared auto-confirm; ``proposed`` carries an open MACHINE proposal's value (a sorted
+    column list for ``grain``, a column name for ``availability_time``) and is None whenever a fact
+    is confirmed, rejected, expired, human-authored or absent.
+
+    ONE QUERY, AND IT MUST STAY ONE. `_table_context` is called once for the mandatory set and then
+    once per optional column as the budget loop searches for a fit, so this is resolved by
+    `select_relevant_context` BEFORE that loop — the same hoist, for the same reason, that Task 7b
+    applied to the catalog narrative. `fact_key` is a pure sha256 over the identity tuple, so the
+    2xN keys are computed with no query at all and the read is a single `aggregate_id = ANY(...)`
+    probe of `events_stream_idx (aggregate, aggregate_id, stream_version)`.
+
+    WHY THE EVENT STREAM AND NOT A READ MODEL. `overlay_proposal` would answer the proposal half in
+    one statement, but it carries no index on `catalog_source`/`fact_type` (a seq scan), it lags the
+    async projector, and it cannot answer the human-vs-source half at all — that needs the CONFIRMED
+    event's own actor and payload, which is precisely what `_human_reviewed` reads. One stream read
+    answers both, using the platform's own rules for both.
+
+    FAIL-SOFT. An unreadable stream returns an empty map, never an exception: this is prompt CONTEXT,
+    and a catalog must not lose feature generation over it (the same rule the catalog narrative was
+    given after it took a catalog down). `_table_context` then falls back to the weaker claim.
+    """
+    tables = sorted({(c["catalog_source"], c["table"]) for c in cols})
+    if not tables:
+        return {}
+    try:
+        from featuregen.events.serde import identity_from_jsonb
+        from featuregen.overlay.identity import fact_key
+        from featuregen.overlay.state import fold_overlay_state
+        from featuregen.overlay.upload.bridge_assessment import _human_reviewed
+
+        # The closed fact-type vocabulary READ FROM ITS OWNER rather than re-typed here — a second
+        # copy would let this surface and the projection that writes the flags disagree about what a
+        # table fact is.
+        from featuregen.overlay.upload.table_fact_projection import _TABLE_FACT_TYPES
+        from featuregen.overlay.upload.upload_catalog import table_ref
+
+        out = {t: {ft: {"human": False, "proposed": None} for ft in _TABLE_FACT_TYPES}
+               for t in tables}
+        keyed: dict[str, tuple[tuple[str, str], str]] = {}
+        for source, table in tables:
+            ref = table_ref(source, table)
+            for fact_type in _TABLE_FACT_TYPES:
+                keyed[fact_key(ref, fact_type)] = ((source, table), fact_type)
+        streams: dict[str, list[_FactEvent]] = {}
+        rows = conn.execute(
+            "SELECT aggregate_id, type, event_id, payload, actor FROM events "
+            "WHERE aggregate = 'overlay_fact' AND aggregate_id = ANY(%s) "
+            "ORDER BY aggregate_id, stream_version", (list(keyed),)).fetchall()
+        for aggregate_id, etype, event_id, payload, actor in rows:
+            streams.setdefault(aggregate_id, []).append(
+                _FactEvent(etype, event_id, payload, identity_from_jsonb(actor)))
+        for key, stream in streams.items():
+            table_key, fact_type = keyed[key]
+            state = fold_overlay_state(stream)
+            if state.status in _ENDORSEMENT_NOT_WITHDRAWN:
+                out[table_key][fact_type]["human"] = _human_reviewed(
+                    stream, state.confirmed_event_id)
+            elif state.status == "DRAFT":
+                # DRAFT ONLY — the same test `table_fact_governance._build_view` applies to its own
+                # queue. REJECTED is a value a human REFUSED, and REVERIFY/STALE are a once-confirmed
+                # value that lapsed; re-floating either as "the AI's proposal" would put an answer
+                # governance already adjudicated back in front of the model wearing the wrong label.
+                out[table_key][fact_type]["proposed"] = _machine_proposal(
+                    stream, state.draft_event_id, fact_type)
+            # THE REMAINING FOLDS FALL THROUGH ON PURPOSE, leaving `human=False, proposed=None`.
+            # REJECTED is the one that matters: its `confirmed_event_id` SURVIVES the fold (the
+            # REJECTED branch sets only status and value), so following the stamp blindly would
+            # answer `human_confirmed` for a value a person explicitly REFUSED — the strongest claim
+            # in the vocabulary attached to the weakest evidence for it. PARTIALLY_CONFIRMED is
+            # UNREACHABLE for a table fact rather than safe-by-construction — its one emitter is the
+            # dual-owner `approved_join` path — full reasoning on `_ENDORSEMENT_NOT_WITHDRAWN`,
+            # which is the table to update if that ever changes. Neither may read `ai_proposed`
+            # either: they are not open proposals.
+        return out
+    except Exception:  # noqa: BLE001 — prompt context must never take down feature generation
+        logger.warning("table-fact authority unreadable for %d table(s) — the grain/as-of status "
+                       "falls back to source_declared", len(tables), exc_info=True)
+        return {}
+
+
+def _visible(columns: Iterable[str], members: list[dict]) -> list[str]:
+    """`columns` if EVERY one of them is a column the caller was actually offered, else ``[]``.
+
+    M6 READ SCOPE, and the one way this task could leak. The confirmed and file-declared values are
+    built FROM `members`, which `_candidate_columns` already read-scoped, so their names can only be
+    names the caller may see. An AI proposal is the only value arriving from OUTSIDE that set: it
+    was validated against the table at PROPOSE time (`table_synth.make_ref_accept` drops a grain
+    column the table lacks), but a sensitivity tag added since — or simply a thinner caller — can
+    have removed one of its columns from this menu.
+
+    ALL OR NOTHING. A compound grain half-emitted is a different table, and a name the model was not
+    offered is also a reference `_ground_refs` cannot resolve, so the feature resting on it would be
+    discarded UNGROUNDED after the call rather than never proposed.
+    """
+    wanted = list(columns)
+    offered = {m["column"] for m in members}
+    return wanted if wanted and all(c in offered for c in wanted) else []
+
+
+def _grain_block(members: list[dict], authority: Mapping | None) -> dict:
+    """The grain half of one table block: ``{}``, or ``grain_columns`` + ``grain_status``.
+
+    PRECEDENCE, strongest assertion first, and NEVER two values for one field. A confirmed grain
+    wins over a file declaration, which wins over the AI's proposal; the loser is not mentioned at
+    all. If a human confirmed something the AI disagrees with, the human's value is what ships —
+    the model is choosing FEATURES, not adjudicating governance, and a block carrying both would
+    invite it to pick.
+
+    A CONFIRMATION IS NEVER WIDENED BY A DECLARATION (Task 8). `project_table_facts_for_ref` SPARES
+    file-declared columns from its clear, so a table whose file declares (a, b) while the governed
+    grain is (a) genuinely carries `is_grain` on both, one stamped and one not. Emitting the UNION
+    would assert a grain nobody attested — not the file's and not the fact's.
+    """
+    confirmed = sorted(m["column"] for m in members if m["is_grain"] and m["grain_fact_event_id"])
+    declared = sorted(m["column"] for m in members if m["is_grain"])
+    if confirmed:
+        return {"grain_columns": confirmed,
+                "grain_status": (STATUS_HUMAN_CONFIRMED if (authority or {}).get("human")
+                                 else STATUS_SOURCE_DECLARED)}
+    if declared:
+        # Task 8's `declared`: the file's flag survived a drift-STALEd / expired / never-projected
+        # fact. It collapses onto source_declared because the axis is WHO ASSERTED the value, and
+        # the answer is the same source either way. Whether the fact is currently SERVABLE is an
+        # execution question, answered on the execution path from the fact stream, never from here.
+        return {"grain_columns": declared, "grain_status": STATUS_SOURCE_DECLARED}
+    # Sorted HERE, not only in the resolver that normally supplies it: the confirmed and declared
+    # sets above are sorted at this same emit site, and a compound grain must read identically
+    # whichever branch produced it — two spellings of one grain are two tables to a reader.
+    proposed = _visible(sorted(((authority or {}).get("proposed")) or ()), members)
+    return ({"grain_columns": proposed, "grain_status": STATUS_AI_PROPOSED} if proposed else {})
+
+
+def _as_of_block(members: list[dict], authority: Mapping | None) -> dict:
+    """The time half, under the same precedence. The ordering makes it bite: a plain "first as-of
+    column" pick would hand the model an UNCONFIRMED `a_ts` over a confirmed `z_ts` and call it the
+    anchor. The governed availability fact names exactly ONE column, so the confirmed branch is at
+    most one candidate anyway."""
+    by_name = sorted(members, key=lambda m: m["column"])
+    confirmed = next((m["column"] for m in by_name
+                      if m["is_as_of"] and m["availability_fact_event_id"]), None)
+    if confirmed:
+        return {"as_of_column": confirmed,
+                "as_of_status": (STATUS_HUMAN_CONFIRMED if (authority or {}).get("human")
+                                 else STATUS_SOURCE_DECLARED)}
+    declared = next((m["column"] for m in by_name if m["is_as_of"]), None)
+    if declared:
+        return {"as_of_column": declared, "as_of_status": STATUS_SOURCE_DECLARED}
+    proposed = (authority or {}).get("proposed")
+    visible = _visible([proposed] if isinstance(proposed, str) else (), members)
+    return ({"as_of_column": visible[0], "as_of_status": STATUS_AI_PROPOSED} if visible else {})
+
+
+def _table_context(cols: list[dict], *,
+                   narratives: Mapping[str, Mapping] | None = None,
+                   authority: Mapping[tuple[str, str], Mapping] | None = None) -> list[dict]:
     """One context block per TABLE, assembled ONLY from the already-authorized candidate rows
     (spec §5): a table whose columns were all read-scope-excluded has no rows here and gets no
-    block. Confirmed grain columns require a non-null grain_fact_event_id and the as-of column a
-    non-null availability_fact_event_id (governed-VERIFIED, not merely file-declared);
-    primary_entity is ADVISORY."""
+    block. Grain and as-of are emitted whether a human endorsed them, the uploaded file declared
+    them, or the AI merely proposed them — each with a `grain_status` / `as_of_status` naming WHICH
+    (`TABLE_FACT_STATUSES`), so the model can weigh it. Omitting an unconfirmed grain made the model
+    invent one; primary_entity is ADVISORY.
+
+    THE STATUS IS A LABEL, NOT PERMISSION. It admits nothing to the execution path: a feature that
+    runs against the warehouse still requires a VERIFIED fact, and the guards that enforce that
+    (`resolve_fact`, `read_governed_grain`, `semantic_bindings/projection.py`, `materialize/spine`)
+    read the fact stream — none of them reads this block. Task 8b did not weaken `resolve_fact`; it
+    reads the PROPOSED state BESIDE the resolved one and labels the difference.
+
+    `authority` is `{(catalog_source, table): {fact_type: {"human", "proposed"}}}` from
+    `_table_fact_authority`, RESOLVED BY THE CALLER in one query before the budget loop — this
+    function is called once per optional column as that loop searches for a fit, so a read in here
+    would be an N+1 on the hot path. Passing nothing is the honest degraded mode, not an error: the
+    block then falls back to the WEAKER claim (`source_declared` for a confirmed fact, and no AI
+    proposal at all), never to the flattering one. That is the same direction `_human_reviewed`
+    itself fails in — unknown is not human.
+
+    `narratives` (Task 7b) is `{catalog_source: catalog_narrative_block}` — the prose a human typed
+    about the CATALOG, which the upload form promises is "used by the AI when it interprets tables"
+    and which reached no model-facing payload at all. RESOLVED BY THE CALLER, and keyed by catalog
+    because an entity-scoped gather legitimately spans several: `select_relevant_context` resolves
+    it once per catalog rather than once per table. Passing nothing means the caller resolved no
+    narrative, and the block is then byte-identical to its pre-Task-7b shape — which is also what a
+    catalog with no authored narrative gets, honestly, with `catalog_profile_absent` already saying
+    so in the column payload's missing-context codes.
+
+    It rides the TABLE block and not the column payload on purpose: it is one fact about the whole
+    catalog, and a 4000-character description repeated across 144 columns would crowd out the column
+    context it exists to interpret."""
     by_table: dict[tuple[str, str], list[dict]] = {}
     for c in cols:
         by_table.setdefault((c["catalog_source"], c["table"]), []).append(c)
     blocks: list[dict] = []
     for (_catalog, table), members in sorted(by_table.items()):
         block: dict = {"table": table}
+        block.update((narratives or {}).get(_catalog) or {})
         tdef = next((m["table_definition"] for m in members if m.get("table_definition")), None)
         if tdef:
             block["table_definition"] = tdef
-        grain_cols = sorted(m["column"] for m in members
-                            if m["is_grain"] and m["grain_fact_event_id"])
-        if grain_cols:
-            block["grain_columns"] = grain_cols
-        as_of = next((m["column"] for m in sorted(members, key=lambda x: x["column"])
-                      if m["is_as_of"] and m["availability_fact_event_id"]), None)
-        if as_of:
-            block["as_of_column"] = as_of
+        # Grain and as-of reach the model whether a human endorsed them, the file declared them, or
+        # only the AI proposed them — an unconfirmed grain is better information than a missing one,
+        # PROVIDED the model is told which it is. The precedence rule and the read-scope guard live
+        # in `_grain_block` / `_as_of_block`; the two axes are labelled INDEPENDENTLY, because a
+        # table can carry a human-endorsed grain and only a machine's guess at its time anchor.
+        table_authority = (authority or {}).get((_catalog, table)) or {}
+        block.update(_grain_block(members, table_authority.get("grain")))
+        block.update(_as_of_block(members, table_authority.get("availability_time")))
         pentity = next((m["table_primary_entity"] for m in members
                         if m.get("table_primary_entity")), None)
         if pentity:
@@ -583,10 +1052,15 @@ def _profile_advisories(members: list[dict]) -> dict:
     advisory = _DATA_ROLE_ADVISORIES.get(str(out.get("data_role") or ""))
     if advisory:
         out["advisories"] = [advisory]
-    # A SNAPSHOT table that also carries a governed as-of column is the mismatch worth naming: the
-    # time column reads like an event stream and the storage model says it is not one.
-    if out.get("data_role") == "snapshot_fact" and any(
-            m["is_as_of"] and m["availability_fact_event_id"] for m in members):
+    # A SNAPSHOT table that also carries an as-of column is the mismatch worth naming: the time
+    # column reads like an event stream and the storage model says it is not one.
+    #
+    # TRACKS WHAT THE BLOCK EMITS (Task 8), which is why the confirmation test that used to be here
+    # is gone. `_table_context` now emits a merely-DECLARED as-of column too, and suppressing the
+    # warning for exactly those tables would silence it where the anchor is least examined. The
+    # sentence is true of the storage model, not of the confirmation: a snapshot's time column marks
+    # when the snapshot was taken whether or not a human has signed for it.
+    if out.get("data_role") == "snapshot_fact" and any(m["is_as_of"] for m in members):
         out.setdefault("advisories", []).append(
             "its as-of column marks WHEN the snapshot was taken, not when an event happened — a "
             "windowed count over it counts snapshots, not activity")
@@ -602,8 +1076,35 @@ def _profile_advisories(members: list[dict]) -> dict:
 # all 237 are mandatory (`test_feature_context_budget.py` builds both and records the numbers):
 #
 #   v3 mandatory bytes, 237 columns:  175_520   (~740 bytes/column)
-#   v4 mandatory bytes, 237 columns:  248_601   (~1_048 bytes/column)
-#   v4 with every trimmable field shed: 203_629
+#   v4 mandatory bytes, 237 columns:  268_902   (~1_135 bytes/column)
+#   v4 with every trimmable field shed: 223_930   (~945 bytes/column)
+#
+# ...and the SATURATED shape — every field the branch added actually populated, which the fixture
+# above does NOT do (see below):
+#
+#   v4 saturated, 237 columns:          405_863   (~1_712 bytes/column)
+#   v4 saturated, fully shed:           360_891   (~1_523 bytes/column)
+#
+# THESE NUMBERS ARE PINNED, NOT DESCRIBED: `test_the_floor_rose_by_exactly_what_the_payload_rose_by`
+# asserts `(floor, untrimmed) == (223_930, 268_902)` and
+# `test_the_SATURATED_catalog_is_measured_and_still_clears_the_budget` asserts the saturated pair,
+# so this comment cannot drift from the measurement without a red test. Read them there, not here,
+# if the two ever disagree.
+#
+# WHY TWO PAIRS. `wide_catalogs` leaves 8 of the 11 fields this branch added at exactly 0, so the
+# first pair measures a catalog thinner than any real one. That was not theoretical: a new
+# `proposed_authority` subkey grew the payload and the pinned test passed COMPLETELY UNCHANGED,
+# because the field it sits beside was empty in the fixture. `saturated_catalogs` populates each
+# field through its real writer and costs ~51% more. Two fields stay structurally low and that is
+# a product fact, not a gap: adjudication (`confidence_band`/`concept_alternatives`) is capped at
+# `adjudication_bounds().max_provider_calls` = 12 columns per run because it is the EXCEPTION path,
+# and `relationships` needs cross-catalog link rows the fixture does not stand up.
+#
+# The v4 figure has been RE-MEASURED four times (248_601 when v4 landed -> 241_491 on 2026-08-06 ->
+# 250_982 with the Task-6 axes -> 259_405 with Task 7b's curated vocabulary -> 268_902 when
+# `fibo_path` finally reached the payload, migration 1058). Twice the recorded number had quietly
+# stopped being true while staying inside the test's tolerance band — which is exactly how a
+# "measured" number stops being one, and why the pins above exist.
 #
 # The finding that matters: at 60_000 the SHIPPED v3 payload ALREADY raised ContextTooLarge on
 # these catalogs — nearly 3x over. v4 did not create that cliff; it would have deepened it. So the
@@ -616,12 +1117,46 @@ def _profile_advisories(members: list[dict]) -> dict:
 # WHAT THIS BUDGET DOES NOT BOUND — the COST. This is the assembly's own byte ceiling and nothing
 # downstream caps input size: the provider call carries no input-token limit, so raising the budget
 # from 60_000 to 300_000 removed a refusal, not a spend control. On the measured catalogs above v4
-# sends ~2.2x the v3 prompt bytes for the same 237 columns (248_601 vs 175_520), and a mid-size
+# sends ~1.5x the v3 prompt bytes for the same 237 columns (268_902 vs 175_520), and a mid-size
 # catalog that previously refused now succeeds at ~4x the bytes it used to attempt. Input tokens are
 # the cheaper half of a call and this is metadata, not data — but "cheaper" is not "free", and the
 # number belongs beside the constant that produces it rather than in a review nobody re-reads.
 # `FEATUREGEN_FEATURE_CONTEXT_VERSION=3` is the lever that takes it back (the D8 ladder above).
-FEATURE_CONTEXT_BYTE_BUDGET = 300_000
+#
+# ── ZERO-TRUNCATION RAISE, 300_000 -> 1_500_000 (2026-08-06) ─────────────────────────────────────
+#
+# STATED HONESTLY, because the measurement did not say what the change expected it to say: raising
+# every prose and item cap did NOT move these numbers. The assembled `definition` is read straight
+# out of `graph_node` (see `_candidate_columns`' query), so it never passes through
+# `enrich_llm.MAX_DEFINITION_LEN` at all — that cap governs the ENRICHMENT egress path, not this
+# assembly. v4 measured 241_491 both before and after the raise (it has since moved to 268_902 for
+# reasons unrelated to the caps — the Task-6 axes, Task 7b's vocabulary and `fibo_path`; see the
+# ladder above).
+#
+# The raise is still the right change, for a reason that is about CATALOG SIZE rather than per-value
+# length. At ~1_135 bytes/column, 300_000 bytes is roughly 264 columns — so a catalog past ~265
+# mandatory columns starts shedding prose through `_V4_TRIM_ORDER` (definition first) and, past the
+# trimmed floor, refuses outright. That trim IS truncation on the feature-generation path, arriving
+# by a different door than the caps.
+#
+# At 1_500_000 the two rungs are, DERIVED from the pinned per-column rates above:
+#   first shed  ~1_322 mandatory columns  (1_500_000 / ~1_135 B per column, untrimmed)
+#   refusal     ~1_588 mandatory columns  (1_500_000 /   ~945 B per column, fully shed)
+# On the SATURATED rate those rungs come in to ~876 and ~985 columns — still unreachable, and the
+# honest pair to quote for a richly-enriched catalog.
+# A 144-column catalog therefore assembles ~163_000 B sparse / ~247_000 B saturated (144 x the
+# rates above, DERIVED — not measured; the pinned fixtures are the 237-column pairs, and no
+# 144-column shape is measured anywhere in this repo). NEITHER RUNG IS REACHABLE ON ANY REALISTIC CATALOG, which is the honest
+# reading of this constant: it is a runaway backstop, not a working constraint. Both rungs assume
+# the mandatory set scales linearly at the measured per-column rate; a catalog with markedly longer
+# prose per column reaches them sooner. (An earlier revision of this paragraph put the first shed at
+# ~1_470 columns and quoted a 203_629 floor — that floor matched no rung of any ladder and was never
+# true. Both numbers understated cost while overstating headroom.)
+#
+# The cost is the same cost as before, five times over: nothing downstream bounds the prompt, so on
+# a catalog large enough to use this headroom the request is correspondingly larger. It buys the
+# absence of silent shedding, not free context.
+FEATURE_CONTEXT_BYTE_BUDGET = 1_500_000
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -638,19 +1173,198 @@ def _tokenize(text: str | None) -> set[str]:
     return set(_TOKEN_RE.findall((text or "").lower()))
 
 
-def _objective_tokens(objective: str | None, entity: str | None, scope) -> set[str]:
-    """The objective token set, by source priority (spec §6): the GOVERNED confirmed scope (leaf ids
-    + target_entity + modelling_contexts) when present and not unscoped; else the DIRECT-ASSIST
-    objective free-text + explicit entity; else the LEXICAL objective alone. NO LLM call."""
+def _objective_source(objective: str | None, entity: str | None, scope) -> str:
+    """The TEXT the objective tokens come from, by source priority (spec §6): the GOVERNED confirmed
+    scope (leaf ids + target_entity + modelling_contexts) when present and not unscoped; else the
+    DIRECT-ASSIST objective free-text + explicit entity; else the LEXICAL objective alone.
+
+    ONE function decides the priority, and both the literal tokenisation and the Task-6d expansion
+    read it. That is the whole reason it exists: expanding the raw `objective` instead would put the
+    free text back into the governed route through the side door — a governed scope of
+    `retail_churn` with a stale `"weather forecast"` objective would start matching weather columns
+    via LLM-derived synonyms, which is precisely the substitution the source priority forbids
+    (`test_tokenize_and_objective_source_priority` pins the literal half of that rule)."""
     if scope is not None and not scope.unscoped:
-        toks: set[str] = set()
-        for uid in ([scope.primary] if scope.primary else []) + list(scope.secondary):
-            toks |= _tokenize(uid)
-        toks |= _tokenize(scope.target_entity)
-        for mc in scope.modelling_contexts:
-            toks |= _tokenize(mc)
+        parts = [
+            *([scope.primary] if scope.primary else []),
+            *scope.secondary,
+            scope.target_entity,
+            *scope.modelling_contexts,
+        ]
+    else:
+        parts = [objective, entity]
+    return " ".join(p for p in parts if p)
+
+
+def _literal_tokens(objective: str | None, entity: str | None, scope) -> set[str]:
+    """Today's tokenisation, byte-for-byte: the tokens of `_objective_source`. NO LLM call."""
+    return _tokenize(_objective_source(objective, entity, scope))
+
+
+#: The replay identity of one expansion. Bump to retire every stored expansion explicitly — a
+#: reworded instruction, a different accept gate, or a changed subject derivation all reach the
+#: model with a DIFFERENT question, and replaying a v1 answer against a v2 question is the trap
+#: `CONCEPT_CRITIC_VERSION` documents. The version is the ONLY lever: the prompt text is
+#: deliberately NOT hashed, so an editorial re-wording is a decision somebody makes here.
+OBJECTIVE_EXPANSION_VERSION = 1
+OBJECTIVE_EXPANSION_RESULT_TYPE = "objective_expansion"
+OBJECTIVE_EXPANSION_TASK = "overlay.feature.objective_expansion"
+OBJECTIVE_EXPANSION_PROMPT_ID = "objective_expansion_v1"
+OBJECTIVE_EXPANSION_SCHEMA_ID = "objective_expansion"
+
+#: BOTH bounds are CODE-ONLY, and the expansion schema carries NEITHER — see the long note beside
+#: `_SCHEMAS[("objective_expansion", 1)]`. Short version: `maxItems` is repo-wide forbidden (the
+#: provider 400s on it), and a `maxLength` there is stripped from the wire yet validated on the
+#: response, so it would fire before this gate and let ONE long term destroy the whole expansion
+#: — the resolution `feature_ideas`' grounding array already reached. Over-bound terms are
+#: DROPPED here, one at a time. `test_enrich_output_bounds.py` pins the schema's silence.
+_MAX_EXPANSION_TERMS = 40
+_MAX_EXPANSION_TERM_LEN = 64
+#: What we SEND. The objective is user-typed and otherwise unbounded on this seam (the per-item
+#: `_MAX_LEN_BY_KEY` gate governs the BATCH path, not a single call's metadata), so it is bounded
+#: here — and bounded BEFORE the cache key is computed, so the key always names exactly the bytes
+#: that egressed.
+_MAX_EXPANSION_SUBJECT_LEN = 2_000
+
+_EXPANSION_INSTRUCTION = (
+    "You are widening a search over a data catalog's COLUMN METADATA. Given the analyst's "
+    "objective below, return the related business terms that a bank's catalog might use for the "
+    "same ideas — synonyms, standard industry vocabulary, and the words another house style would "
+    "use for the same thing (for example 'obligor' for 'counterparty', 'facility' for 'credit "
+    "line'). Return single words or short noun phrases only: no sentences, no explanations, no "
+    "column names, and nothing invented about this particular catalog. Repeating the objective's "
+    "own words is wasted — they are already searched for."
+)
+
+
+def _expansion_input_hash(subject: str) -> str:
+    """THE CACHE KEY. Content-addressed on the expansion version and the NORMALIZED subject text,
+    and on nothing else.
+
+    What is deliberately absent is the point: no catalog, no catalog revision, no role scope, no
+    entity beyond what the subject already carries. The expansion is about the QUESTION, not the
+    corpus — "counterparty" relates to "obligor" whichever catalog is loaded — so folding a catalog
+    identity in would mint a fresh provider call per upload for an answer that cannot vary. The
+    same question is the same answer, forever, until the version moves."""
+    return canonical_hash({
+        "expansion_version": OBJECTIVE_EXPANSION_VERSION,
+        "subject": subject,
+    })
+
+
+def _expansion_subject(objective: str | None, entity: str | None, scope) -> str:
+    """The bounded, normalized text we both KEY on and SEND. Normalizing (whitespace-collapsed,
+    lower-cased) before hashing is what makes "Total Counterparty Exposure" and "total counterparty
+    exposure" one cached question rather than two: the terms are consumed through `_tokenize`,
+    which lower-cases anyway, so the two can never want different answers."""
+    return " ".join(_objective_source(objective, entity, scope).split()).lower()[
+        :_MAX_EXPANSION_SUBJECT_LEN]
+
+
+def _accept_expansion_terms(raw: object) -> tuple[str, ...]:
+    """The CODE-side gate on the model's answer: strings only, non-blank, within the per-term
+    length bound, case-insensitively de-duplicated, capped. Anything else is dropped ENTRY-wise —
+    a malformed list costs the terms it malformed, never the expansion."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        term = item.strip()
+        if not term or len(term) > _MAX_EXPANSION_TERM_LEN or term.lower() in seen:
+            continue
+        seen.add(term.lower())
+        out.append(term)
+        if len(out) >= _MAX_EXPANSION_TERMS:
+            break
+    return tuple(out)
+
+
+def _expand_objective(conn, client: LLMClient, subject: str, *,
+                      actor: IdentityEnvelope | None = None) -> tuple[str, ...]:
+    """One tiny audited call returning the business vocabulary related to `subject`, replayed from
+    the content-addressed 1039 store for a question already asked.
+
+    REPLAY FIRST, ALWAYS: `find_structured_result` is consulted before any dispatch, so the second
+    identical objective costs nothing. A VALIDATED answer is stored even when it is EMPTY — "this
+    question has no useful expansion" is an answer, and not storing it would re-bill that question
+    on every request forever, which is the cache-shaped-thing failure mode.
+
+    `actor` is the HUMAN subject the route threaded in, exactly as `_call_raw` takes it. It is NOT
+    optional in spirit: this call's payload is a BARE USER SENTENCE, so it is the one row in the
+    whole feature-generation flow that most needs to name who typed it. Absent, the seam falls back
+    to the unauthenticated service identity, which would attribute a human's question to
+    `featuregen-overlay-enrichment` while the three sibling calls carrying the SAME sentence name
+    the human.
+
+    Nothing here is caught: the ONE containment site is `_objective_tokens`, so every failure —
+    provider throw, egress block, repair exhaustion, store fault — lands on the same fallback."""
+    input_hash = _expansion_input_hash(subject)
+    stored = find_structured_result(
+        conn, result_type=OBJECTIVE_EXPANSION_RESULT_TYPE,
+        result_version=OBJECTIVE_EXPANSION_VERSION, input_content_hash=input_hash)
+    if stored is not None:
+        return _accept_expansion_terms(dict(stored.output).get("terms"))
+    call = drive_audited_structured_call(
+        conn, client, task=OBJECTIVE_EXPANSION_TASK, prompt_id=OBJECTIVE_EXPANSION_PROMPT_ID,
+        schema_id=OBJECTIVE_EXPANSION_SCHEMA_ID,
+        # `objective` is an ALREADY-CLASSIFIED key on the enrichment seam
+        # (`enrich_llm._ROUNDTRIP_PROSE_KEYS`) — the same grade the generation call's own
+        # `objective` rides under — so this adds NO new key to the egress surface and cannot trip
+        # the fail-closed classifier. On the governed route the subject is platform-derived scope
+        # vocabulary, which is strictly safer than the human text the class was written for.
+        catalog_metadata={"objective": subject},
+        instruction=_EXPANSION_INSTRUCTION, actor=actor)
+    if call.output is None:
+        # Egress block, provider failure, or a response that failed repair. The call is audited;
+        # NOTHING is cached, so a transient fault does not freeze an empty expansion in place.
+        return ()
+    terms = _accept_expansion_terms(call.output.get("terms"))
+    if call.llm_call_ref:
+        record_structured_result(
+            conn, result_type=OBJECTIVE_EXPANSION_RESULT_TYPE,
+            result_version=OBJECTIVE_EXPANSION_VERSION, input_content_hash=input_hash,
+            output={"terms": list(terms)},
+            producer_kind="llm_call", producer_ref=call.llm_call_ref,
+            authority={"authority": "llm_advisory", "subject_hash": input_hash})
+    return terms
+
+
+def _objective_tokens(objective: str | None, entity: str | None, scope, *,
+                      conn=None, client: LLMClient | None = None,
+                      actor: IdentityEnvelope | None = None) -> set[str]:
+    """The objective's own words, plus LLM-derived related business terms.
+
+    ADVISORY and additive: the literal tokens are always retained, so expansion can only widen the
+    candidate set, never narrow it. `client=None` (every pure caller, and any degraded deployment)
+    returns exactly today's literal tokenisation — byte-for-byte unchanged.
+
+    WHAT CONSUMES THIS: `select_relevant_context`'s ranking key,
+    `-len(_column_tokens(c) & obj_tokens)`, and nothing else. The tokens never reach the model, are
+    never persisted against a column, and cannot promote a column past the MANDATORY set or past
+    the byte budget — a wrong expansion re-orders the optional tail of one menu and costs nothing
+    beyond that. That bounded blast radius is why a failed expansion is a shrug rather than an
+    error."""
+    toks = _literal_tokens(objective, entity, scope)
+    subject = _expansion_subject(objective, entity, scope)
+    if conn is None or client is None or not subject:
         return toks
-    return _tokenize(objective) | _tokenize(entity)
+    try:
+        expanded = _expand_objective(conn, client, subject, actor=actor)
+    except Exception:  # noqa: BLE001 — advisory: a failed expansion must never fail the request
+        logger.warning("objective expansion failed; falling back to literal tokens", exc_info=True)
+        return toks
+    derived = {t for term in expanded for t in _tokenize(term)} - toks
+    if derived:
+        # The reviewer's answer to "why did `obligor` match my question about counterparties?" —
+        # the derivation is otherwise invisible, because what the ranking consumes is a flat set.
+        # The subject is elided at the same 80 chars `_generate` already elides the objective to.
+        logger.info("objective expansion widened [%s] by %d term(s): %s",
+                    subject if len(subject) <= 80 else subject[:79] + "…",
+                    len(expanded), ", ".join(sorted(derived)))
+    return toks | derived
 
 
 def _objective_entity(entity: str | None, scope) -> str | None:
@@ -665,8 +1379,11 @@ def _column_tokens(col: dict) -> set[str]:
     toks: set[str] = set()
     # `ai_summary` included so the agent finds a column by the same words SEARCH finds it by —
     # otherwise the two surfaces disagree about what the catalog contains.
+    # `business_term` (Task 7b) is the GLOSSARY's curated business NAME — for a bank whose physical
+    # columns are `CPTY_EXPSR_AMT`, it is the only readable English the column has, and without it
+    # an objective phrased in the bank's own vocabulary could not match the bank's own term.
     for k in ("object_ref", "table", "column", "concept", "domain", "semantic_terms", "entity",
-              "ai_summary"):
+              "ai_summary", "business_term"):
         v = col.get(k)
         if isinstance(v, str):
             toks |= _tokenize(v)
@@ -693,7 +1410,10 @@ def _assembled_bytes(columns: list[dict], table_context: list[dict]) -> int:
 def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
                             entity: str | None, scope=None,
                             byte_budget: int | None = None,
-                            roles: Iterable[str] = ()) -> tuple[list[dict], list[dict], int]:
+                            roles: Iterable[str] = (),
+                            client: LLMClient | None = None,
+                            actor: IdentityEnvelope | None = None,
+                            ) -> tuple[list[dict], list[dict], int]:
     """Deterministic relevance selection ([F13], spec §6). Returns
     (selected_enriched_columns, table_context, dropped_count). Mandatory columns (confirmed grain,
     as-of, entity-match) are ALWAYS included; the rest are added by descending shared-token score,
@@ -711,10 +1431,17 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     is shed first, level by level, and the level that fits is used; `ContextTooLarge` is raised only
     when even the fully trimmed mandatory set exceeds the budget. Dropping a mandatory column
     instead would silently remove the grain or the time anchor and produce a confidently wrong
-    feature."""
+    feature.
+
+    `client` (Task 6d) is OPTIONAL and ADVISORY: given one, the objective is expanded with related
+    business terms before the intersection, so a question about "counterparty exposure" can reach a
+    column whose vocabulary says "obligor". Omitted (every pure caller, and any degraded
+    deployment) the ranking is byte-for-byte today's literal token intersection. `actor` rides with
+    it for the same reason `_call_raw` takes one — that expansion call egresses the human's own
+    sentence, so the immutable llm_call must name the human and not the service default."""
     if byte_budget is None:
         byte_budget = FEATURE_CONTEXT_BYTE_BUDGET
-    obj_tokens = _objective_tokens(objective, entity, scope)
+    obj_tokens = _objective_tokens(objective, entity, scope, conn=conn, client=client, actor=actor)
     obj_entity = _objective_entity(entity, scope)
     enriched_by_ref: dict[tuple[str, str], dict] = {}
 
@@ -727,6 +1454,20 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
             out.append(_trimmed(enriched_by_ref[key], trim))
         return out
 
+    # The catalog narrative, resolved ONCE per catalog present in the candidate set (Task 7b). Not
+    # once per table and not once per column: it is one fact about the whole catalog, and
+    # `_table_context` is called repeatedly below as the budget loop searches for a fit.
+    narratives = {source: block for source in sorted({c["catalog_source"] for c in cols})
+                  if (block := current_catalog_narrative_block(conn, source))}
+    # Task 8b, hoisted for exactly the reason above: WHO asserted each table's grain / as-of, read
+    # in ONE indexed query over the FULL candidate set before the loop starts, so the loop's
+    # repeated `_table_context` calls are pure. Resolving it per call would be an N+1 over tables
+    # multiplied by the number of optional columns the budget considers.
+    authority = _table_fact_authority(conn, cols)
+
+    def _context(rows: list[dict]) -> list[dict]:
+        return _table_context(rows, narratives=narratives, authority=authority)
+
     mandatory = [c for c in cols if _is_mandatory(c, obj_entity)]
     optional = [c for c in cols if not _is_mandatory(c, obj_entity)]
     scored = sorted(optional,
@@ -734,8 +1475,8 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
 
     selected = list(mandatory)
     trim = 0
-    while (_assembled_bytes(_enriched(selected, trim=trim), _table_context(selected))
-           > byte_budget):
+    while (_assembled_bytes(_enriched(selected, trim=trim),
+                            _context(selected)) > byte_budget):
         if trim >= len(_V4_TRIM_ORDER):
             raise ContextTooLarge(
                 f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
@@ -748,30 +1489,39 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     dropped = 0
     for i, c in enumerate(scored):
         trial = selected + [c]
-        if _assembled_bytes(_enriched(trial, trim=trim), _table_context(trial)) > byte_budget:
+        if _assembled_bytes(_enriched(trial, trim=trim),
+                            _context(trial)) > byte_budget:
             dropped = len(scored) - i
             break
         selected = trial
     if dropped:
         logger.info("feature-context relevance dropped %d of %d optional columns (byte budget %d)",
                     dropped, len(optional), byte_budget)
-    return _enriched(selected, trim=trim), _table_context(selected), dropped
+    return (_enriched(selected, trim=trim), _context(selected),
+            dropped)
 
 
 def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
                 entity: str | None = None, scope=None,
-                roles: Iterable[str] = ()) -> tuple[list[dict], list[dict]]:
+                roles: Iterable[str] = (),
+                client: LLMClient | None = None,
+                actor: IdentityEnvelope | None = None) -> tuple[list[dict], list[dict]]:
     """The menu + per-table context for one generation call. Flag-OFF ⟹ the thin pre-Slice-3 menu
     and NO context (byte-identical). Flag-ON ⟹ the enriched, relevance-selected menu + context
     (may raise ContextTooLarge).
 
     `roles` is the CALLER's scope, threaded down to the v4 bundle build (D11). The candidate rows
     were already read-scoped; the bundle re-applies the same scope at its own boundary rather than
-    inheriting a clearance from a row that passed it earlier."""
+    inheriting a clearance from a row that passed it earlier.
+
+    `client`/`actor` are the SAME pair every generation call in this module already carries, handed
+    on so relevance ranking can widen the question under the caller's own identity (Task 6d).
+    Flag-OFF never reaches the ranking at all, so it never expands."""
     if not feature_context_enabled():
         return _menu(cols), []
     columns, table_context, _dropped = select_relevant_context(
-        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
+        conn, cols, objective=objective, entity=entity, scope=scope, roles=roles, client=client,
+        actor=actor)
     return columns, table_context
 
 
@@ -834,6 +1584,47 @@ class ExternalRequirementPreview:
             content=str(d.get("content", "")),
             schema_version=str(d.get("schema_version", "v1")),
             content_hash=str(d.get("content_hash", "")))
+
+
+#: What a column can CONTRIBUTE to a feature — a CLOSED vocabulary (Task 6c). Free text here would
+#: become a second, ungoverned way of saying what `operand_roles` / `RoleBinding.role` already say,
+#: and the six between them cover every way a column enters a calculation. Closed on the WIRE
+#: (`x-wire-enum`) and again in `_ground_notes`; deliberately NOT closed on the response schema,
+#: where an off-vocabulary answer would fail the whole call instead of costing one entry.
+GROUNDING_ROLES: tuple[str, ...] = ("measure", "grain", "time_anchor", "filter", "currency",
+                                    "dimension")
+
+#: The model's evidence clause is DISPLAY TEXT on a review card, so it is bounded like one — and
+#: the bound lives HERE, not in the response schema, because `maxLength` is stripped from the wire
+#: (the model never learns it) yet still validated against the response: one long clause would fail
+#: the whole call. Truncating, not refusing: an explanation that ran long must never cost a feature.
+_MAX_GROUNDING_WHY_LEN = 200
+#: And a ceiling on how many entries ride back, so an unbounded array cannot become an unbounded
+#: response. Applied AFTER every entry is validated (see `_ground_notes`).
+_MAX_GROUNDING_ENTRIES = 32
+
+
+@dataclass(frozen=True, slots=True)
+class GroundingNote:
+    """ONE column the generator says it used, what it contributed, and the evidence it named.
+
+    EXPLANATORY, NEVER AUTHORITY. Nothing in the gauntlet, the USE gate, the tri-state or any
+    downstream disposition reads these values — a feature carrying a confident-sounding note is
+    neither more trusted nor more complete than the identical feature carrying none
+    (`test_grounding_changes_no_disposition` pins it). Its whole job is to let a reviewer see WHY a
+    feature was proposed instead of guessing, and to let the operator tell whether the widened
+    semantic context is being READ rather than merely delivered.
+
+    `column` is a RESOLVED catalog object_ref, never the model's raw string: an entry that could not
+    be resolved against the offered candidate set discarded the whole proposal before this object
+    was built (`_ground_notes`), so nothing here can be a channel for an ungrounded ref.
+    """
+    column: str
+    role: str                       # in GROUNDING_ROLES
+    why: str
+
+    def to_json(self) -> dict:
+        return {"column": self.column, "role": self.role, "why": self.why}
 
 
 @dataclass(frozen=True, slots=True)
@@ -932,6 +1723,19 @@ class FeatureIdea:
     #    None also on every path that threads no candidate identity (LLM / planner / confirm-time
     #    revalidation). Nothing in the V1 payload reads it.
     grounding_trace: GroundingDecisionTraceV1 | None = None
+    # ── Task 6c: the GENERATOR's own account of what it used, per proposed feature ──
+    #    Each note is one offered column, the role it played, and the evidence the model named.
+    #    EXPLANATORY, NEVER AUTHORITY: no check, requirement, status, dedup signature or gate reads
+    #    it, and a feature is not more trusted for carrying a confident one. Empty for every
+    #    non-LLM path (recipes and the planner declare `operand_roles` instead), for every contract
+    #    version below `_GROUNDING_SCHEMA_VERSION` (the wire item has no such key), and for a model
+    #    that simply did not answer — all three are honest absence, never a refusal.
+    #
+    #    NOT the same axis as `grounding_trace`, which sits above it: that is the PLATFORM's
+    #    verifiable record of what the gauntlet read; this is the MODEL's unverifiable claim about
+    #    what it reasoned from. Only the columns are checked — they must exist in the offered
+    #    candidate set — and nothing checks the claim itself, which is why nothing may rest on it.
+    grounding: tuple[GroundingNote, ...] = ()
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -1012,16 +1816,29 @@ def _grain_column_ref(conn, catalog_source: str, table: str) -> str | None:
     return row[0] if row else None
 
 
+def _by_bare_column(known: set[str]) -> dict[str, str | None]:
+    """Bare column name -> the ONE object_ref ending in it, or ``None`` when several do (AMBIGUOUS).
+
+    ONE home for the suffix-resolution rule. `_ground_refs` and `_ground_notes` must agree about
+    what a bare name means — a second copy of an identity-bearing rule is a rule that drifts — and
+    the two need DIFFERENT answers from it (a dropped ref vs a dropped note), which they can only
+    give from the same map. The ``None`` marker is what makes "ambiguous" distinguishable from
+    "unknown"; collapsing them is what made an ambiguous name cost a whole feature.
+    """
+    by_col: dict[str, str | None] = {}
+    for ref in known:
+        col = ref.rsplit(".", 1)[-1]
+        by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    return by_col
+
+
 def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     """Resolve each LLM-proposed ``derives_from`` entry to a real catalog ``object_ref``. Exact match
     first; else a UNIQUE bare-column-name / suffix match, so a model that emits ``actual_tran_amt``
     (or ``public.t.actual_tran_amt`` verbatim) both ground to the same object_ref — the model's
     reference FORMAT must not silently un-ground an otherwise-valid feature. Ambiguous column names
     (same name in >1 table) and unknown refs are dropped. Order-preserving + de-duplicated."""
-    by_col: dict[str, str | None] = {}
-    for ref in known:
-        col = ref.rsplit(".", 1)[-1]
-        by_col[col] = None if col in by_col else ref   # 2nd occurrence -> None marks it AMBIGUOUS
+    by_col = _by_bare_column(known)
     # The model returns derives_from as EITHER a JSON list OR a single string — and measured on Opus, that
     # string is frequently a COMMA/semicolon/newline-separated list of several refs
     # ("public.t.a, public.t.b, public.t.c"). Split it so a multi-column feature grounds on ALL its
@@ -1043,10 +1860,83 @@ def _ground_refs(raw_refs: object, known: set[str]) -> list[str]:
     return out
 
 
+def _ground_notes(raw_grounding: object,
+                  known: set[str]) -> tuple[tuple[GroundingNote, ...], str | None]:
+    """Resolve the model's `grounding` array. Returns (notes, unresolved_column).
+
+    EXACTLY ONE failure costs the whole feature, and the CALLER applies it: a `column` that names
+    NOTHING in the offered candidate set. That is a false claim about the CATALOG — the account the
+    feature gives of itself is fabricated — and left in place the array would be a second channel
+    for ungrounded refs to re-enter beside the ones `_ground_refs` filters out of `derives_from`.
+
+    EVERY other malformation costs THAT ENTRY and nothing else, because none of them is a claim
+    about the catalog that is false:
+
+      * an AMBIGUOUS bare name (the same column name in >1 table) — and the payload invites exactly
+        this: `_table_context` presents grain and as-of columns as BARE NAMES, and the grounding
+        directive asks the model to account for them. A model that copies the name it was SHOWN,
+        for a column that really was offered, must not lose its feature over the spelling. Note the
+        asymmetry that would otherwise exist: for `derives_from` the identical ambiguity drops one
+        ref and the feature survives, so the EXPLANATION would have been strictly harsher than the
+        thing it explains.
+      * a MISSING or non-string `column` — an incomplete entry. `column` is wire-required and
+        response-OPTIONAL by deliberate design (a canonical `required` would fail the whole call);
+        treating the omission the schema tolerates as a fabrication would contradict that in the
+        same breath. `None` in particular must never be stringified into a column literally named
+        "None" and reported to a human as an invention.
+      * an OFF-VOCABULARY ROLE — a limit of OUR taxonomy, not a fabrication.
+
+    Resolution is `_ground_refs`' — exact ref, else a unique bare-name/suffix match, off the SAME
+    `_by_bare_column` map — so the model's reference FORMAT cannot un-ground a feature, and the
+    emitted `column` is the resolved object_ref so a reviewer follows a real catalog ref rather than
+    the model's string. An ABSENT or empty array is honest absence: no notes, no rejection, no
+    disposition changed.
+    """
+    if not isinstance(raw_grounding, list):
+        # Absent (the normal case at v4 and below) or a shape we cannot read. Neither is a refusal:
+        # `grounding` is optional on the response precisely so a model that skips it does not turn
+        # every such response into a whole-call failure.
+        return (), None
+    by_col = _by_bare_column(known)
+    notes: list[GroundingNote] = []
+    for entry in raw_grounding:
+        if not isinstance(entry, dict):
+            continue
+        column = entry.get("column")
+        column = column.strip() if isinstance(column, str) else ""
+        if not column:
+            continue                                  # incomplete — dropped, never a fabrication
+        tail = column.rsplit(".", 1)[-1]
+        if column in known:
+            resolved: str | None = column
+        elif tail in by_col:
+            resolved = by_col[tail]                   # None ⟹ the bare name is AMBIGUOUS
+        else:
+            return (), column                         # names NOTHING — the one fatal case
+        if resolved is None:
+            logger.info("dropping an ambiguous grounding column %r", column[:80])
+            continue
+        role = str(entry.get("role", "")).strip().lower()
+        if role not in GROUNDING_ROLES:
+            logger.info("dropping a grounding entry with an off-vocabulary role %r", role[:40])
+            continue
+        notes.append(GroundingNote(column=resolved, role=role,
+                                   why=str(entry.get("why", ""))[:_MAX_GROUNDING_WHY_LEN]))
+    # Capped LAST, so a fabricated column past the cap is still refused rather than trimmed away.
+    return tuple(notes[:_MAX_GROUNDING_ENTRIES]), None
+
+
 # The AI's suggestion is DISPLAY TEXT on a review card, so it is bounded like one. T2's drafter
-# already caps a drafted unit at 32 chars; this is the independent read-side ceiling (a suggestion
-# from any future writer can never turn a requirement into an unbounded payload).
-_MAX_SUGGESTION_LEN = 64
+# already caps a drafted unit at 64 chars (`enrich._MAX_UNIT_LEN`); this is the independent
+# read-side ceiling (a suggestion from any future writer can never turn a requirement into an
+# unbounded payload).
+#
+# ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 256. Unlike the accept gates above, this one TRUNCATES
+# an already-ACCEPTED value on its way out — so at 64 it was exactly co-located with the drafter's
+# old bound and any future writer with a longer legitimate value would have been silently clipped
+# on the card rather than refused at the door. It stays deliberately ABOVE `_MAX_UNIT_LEN` so the
+# display ceiling can never be the thing that cuts a value the drafter accepted.
+_MAX_SUGGESTION_LEN = 256
 
 
 def _ai_suggestion_with_evidence(conn, logical_ref: str, field_name: str):
@@ -1394,6 +2284,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
               "derives_from", {"resolved_object_refs": list(derives)})
     if not derives:
         return _reject(RejectCode.UNGROUNDED, "ungrounded")
+    # Task 6c — the model's own account of what it used, checked against the SAME offered candidate
+    # set the returned refs are, and here beside them so the two grounding rules read as one. The
+    # notes themselves are NOT pinned into the decision trace and NOT read by anything below: the
+    # trace records what the PLATFORM verified, and an unverifiable model claim in it would be
+    # indistinguishable from a verified dependency.
+    notes, unresolved = _ground_notes(raw.get("grounding"), known)
+    if unresolved is not None:
+        return _reject(RejectCode.UNKNOWN_GROUNDING_COLUMN,
+                       f"grounding names a column that does not exist: {unresolved[:80]}")
     pairs: list[tuple[str, str]] = []
     for d in derives:
         srcs = src_of.get(d, set())
@@ -1693,6 +2592,10 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         # PROVENANCE, from the gate that already ran above: the policy revisions that licensed this
         # candidate's personal-data operands, or () when it binds none.
         personal_data_policy_revision_ids=use.personal_data_policy_revision_ids,
+        # Task 6c: carried, never consulted. `status` and `requirements` above were both decided
+        # before this line and neither reads `notes` — the ONE property that makes an explanation
+        # safe to accept from a model is that nothing rests on it.
+        grounding=notes,
         grounding_trace=trace.build(
             validation_status=status, requirements=tuple(requirements),
             validation_rule_content_hashes=evaluated_rule_content_hashes(
@@ -1827,7 +2730,8 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
+                    "feature_ideas", _generation_instruction(objective, table_context=table_context),
+                        inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     for raw in out.get("features", []):
@@ -1850,6 +2754,136 @@ _DERIVES_FROM_DIRECTIVE = (
     "`object_ref` string(s) — format public.<table>.<column> — of the source columns it is computed "
     "from, copied verbatim from the provided columns list. A feature whose `derives_from` is empty or "
     "omitted cannot be grounded and is discarded, so never leave it blank.")
+
+# Task 6c. Two things are being asked for that the schema alone cannot ask for. The first is
+# COVERAGE — an entry per column used, including the ones that are in the menu because the
+# calculation is wrong without them (the confirmed grain, the as-of column) rather than because they
+# match the objective. The second is HONESTY ABOUT AUTHORITY: the widened context distinguishes a
+# confirmed semantic from one the enrichment merely PROPOSED, and a reader who cannot tell which a
+# feature rests on has been given confidence they did not earn. Neither makes the feature more or
+# less trusted by the platform — this is for the human.
+_GROUNDING_DIRECTIVE = (
+    "\n\nFor EVERY feature you propose, return a `grounding` entry per column you used: the column, "
+    "its role, and one short clause naming the evidence you relied on. Where a value you relied on "
+    "is marked llm/proposed in `semantic_authority`, or a fact carries `proposed_value` rather than "
+    "`value`, say so — a feature resting on an unconfirmed semantic is still worth proposing, and "
+    "the reader needs to know which one it is.")
+
+
+def _grounding_directive() -> str:
+    """The grounding directive at the versions whose schema can carry the answer, else "".
+
+    Version-gated in BOTH directions, and both directions are the same rule — the prompt and the
+    schema must agree about shape:
+
+      * below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding` key, so
+        asking for one would demand output the schema forbids the model to give;
+      * AT it the key is wire-REQUIRED, so the model is compelled to answer — and compelling an
+        answer while withholding the rules for it is the same inversion the other way up. That is
+        why EVERY call stamping this version appends it, including `refine_idea`, whose human
+        instruction otherwise carries no system directive at all.
+    """
+    return (_GROUNDING_DIRECTIVE
+            if _feature_schema_version() >= _GROUNDING_SCHEMA_VERSION else "")
+
+
+# Task 8b. THE TOKENS MUST BE DEFINED WHERE THEY ARE READ. Task 8's review found `grain_status` /
+# `as_of_status` travelling as bare JSON with no prompt text defining them anywhere, so the model
+# read the English word and took `confirmed` at face value — which is exactly the confidence nobody
+# earned, since ingest auto-confirms an unreviewed CSV flag. A token whose meaning lives only in a
+# Python docstring is not labelling.
+#
+# Every member of `TABLE_FACT_STATUSES` is named here; `test_every_status_token_is_defined_for_the_
+# model_in_the_directive` fails if a fourth is ever added without its sentence. Like its two
+# siblings above it is a fixed PII-free constant appended after the redacted objective, so the
+# egress guard still scans it and the llm_call audit records exactly what was asked.
+# EVERY CLAUSE MUST BE TRUE IN EVERY STATE THAT PRODUCES ITS TOKEN, which is a stricter test than
+# "true in the normal case" and is where BOTH earlier drafts of this sentence failed. The full
+# enumeration lives on `_ENDORSEMENT_NOT_WITHDRAWN`; the drafts and why each was false:
+#
+#   draft 1: "the uploaded catalog file asserted it, so NOBODY has reviewed it" — false for the
+#            FAIL-SOFT state, where a grain a human really did endorse degrades to this token. Not a
+#            weaker claim than the truth but a DIFFERENT one: it asserts a fact about a file that
+#            never declared anything and denies a review that happened.
+#   draft 2: "NO HUMAN REVIEW IS RECORDED for it" — fixed that, and was still false for a REJECTED
+#            re-verification, where a human review is emphatically recorded: it is the refusal.
+#   draft 3: `human_confirmed` gained "and that sign-off STILL STANDS" — false in the two states the
+#            same change newly routed into that token. In REVERIFY/STALE the fold has moved the
+#            signed value to `prior_value`, the status is in `_AWAITING_CONFIRMATION`, a re-verify
+#            task is open and `resolve_fact` refuses to serve it: the platform can EVIDENCE that the
+#            sign-off has lapsed, and "still stands" reads as "still in force". The first over-claim
+#            of the three, and the task calls that the dangerous direction. The private definition
+#            ("stands" = not withdrawn) lived in the comment below and never reached the model —
+#            which is the ORIGINAL finding of this whole task, committed again one level down.
+#
+# So: `human_confirmed` claims only that the sign-off has NOT BEEN WITHDRAWN — true in all three of
+# its producing states, and it keeps the lapse/repudiation distinction `_ENDORSEMENT_NOT_WITHDRAWN` is
+# built on. `source_declared` claims that NO SIGN-OFF STANDS — true of never-signed, unreadable and
+# withdrawn alike. Neither says anything about whether the fact can currently EXECUTE; that is the
+# other axis and `resolve_fact` alone answers it.
+_TABLE_CONTEXT_STATUS_DIRECTIVE = (
+    "\n\nEach `table_context` block may carry `grain_status` and `as_of_status`. These name what the "
+    "platform can EVIDENCE about that table's grain (what one row means) or its as-of column (when "
+    "the row was true), and nothing else: `human_confirmed` — a person with authority over the "
+    "table reviewed and signed it, and that sign-off has not been withdrawn; `source_declared` — NO "
+    "HUMAN SIGN-OFF STANDS for it, which usually means the uploaded catalog file asserted it and "
+    "the platform recorded it automatically; `ai_proposed` — a model inferred it from the schema "
+    "and it is unconfirmed. Use all three: an unreviewed grain is better information than none, and "
+    "a feature resting on one is still worth proposing — but only `human_confirmed` means a person "
+    "checked it.")
+# The one clause that mentions `grounding`, split out because a model must NEVER be asked for output
+# its schema forbids: below `_GROUNDING_SCHEMA_VERSION` the wire item is CLOSED with no `grounding`
+# key, and a sentence telling the model to write one there is the same prompt/schema inversion
+# `_grounding_directive` exists to avoid. Gated off `_grounding_directive()`'s OWN emptiness rather
+# than a second copy of the version test, so the two cannot drift apart.
+#
+# IT ASKS ABOUT ALL THREE, NOT ONLY THE WEAK ONES. The first version said "where a feature rests on
+# a grain that is NOT `human_confirmed`, say so", which made `human_confirmed` the silent default —
+# so a reader could not tell a signed grain from one whose status the model simply never mentioned,
+# and the review's second-order finding lands here: a signature that has lapsed would vanish from
+# the label AND from the audit trail in the same breath. Naming the status whichever it is costs one
+# short phrase and makes the absence of a claim mean something again.
+_TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE = (
+    " Where a feature rests on a table's grain or as-of column, name that column's status in its "
+    "`grounding` entry — whichever of the three it is. The reader needs to know what the feature is "
+    "standing on, and `human_confirmed` is worth stating explicitly rather than left as the "
+    "assumption when nothing is said.")
+
+
+def _table_context_directive(table_context: Iterable[Mapping] | None, *,
+                             cites_grounding: bool) -> str:
+    """The status vocabulary, or "" when no block in this payload carries a status.
+
+    Gated on the PAYLOAD, not on a flag, and for the same reason `_grounding_directive` is gated on
+    the schema version: the prompt and the payload must agree about what is there. Flag-off sends no
+    `table_context` at all, and a catalog where every table abstained sends blocks with no status —
+    defining tokens that do not appear is noise the egress guard still has to walk, and it invites
+    the model to look for a key it will not find.
+
+    `cites_grounding` says whether THIS CALL'S contract has a `grounding` array to cite the status
+    in — TRUE for the two `feature_ideas` paths, FALSE for `feature_recipe`, whose response contract
+    is `{grain_table, join_table, derives_from, aggregation, as_of_column}` and which `Recipe` reads
+    key by key. Two gates, not one, and both are the same rule stated at two grains: the clause
+    rides only where the schema HAS the key (`cites_grounding`) and where that key is live at this
+    version (`_grounding_directive`). Asking a recipe call to write a `grounding` entry would spend
+    its output on a field nothing reads — the same prompt/schema inversion as demanding output the
+    wire item forbids, arriving by the other door.
+    """
+    if not any(b.get("grain_status") or b.get("as_of_status") for b in (table_context or ())):
+        return ""
+    return _TABLE_CONTEXT_STATUS_DIRECTIVE + (
+        _TABLE_CONTEXT_STATUS_GROUNDING_CLAUSE
+        if cites_grounding and _grounding_directive() else "")
+
+
+def _generation_instruction(objective: str, *,
+                            table_context: Iterable[Mapping] | None = None) -> str:
+    """The generation instruction: the (already-redacted) objective plus the fixed system
+    directives. All are PII-free constants appended AFTER the objective, so the egress guard still
+    scans the whole string and the llm_call audit records exactly what was asked.
+    """
+    return (objective + _DERIVES_FROM_DIRECTIVE + _grounding_directive()
+            + _table_context_directive(table_context, cites_grounding=True))
 
 
 def _generate(conn, objective: str, client: LLMClient, *,
@@ -1874,7 +2908,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
     registered = _registered_signatures(conn)
     try:
         menu, table_context = _build_menu(
-            conn, cols, objective=objective, entity=entity, scope=scope, roles=roles)
+            conn, cols, objective=objective, entity=entity, scope=scope, roles=roles,
+            client=client, actor=actor)
     except ContextTooLarge as exc:
         logger.warning("feature context too large for %r: %s", objective, exc)
         return [], [{"name": "", "reason": str(exc), "code": RejectCode.CONTEXT_TOO_LARGE}]
@@ -1894,7 +2929,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", objective + _DERIVES_FROM_DIRECTIVE, inputs, actor=actor,
+                        "feature_ideas", _generation_instruction(objective, table_context=table_context),
+                        inputs, actor=actor,
                         prompt_version=_feature_schema_version(),
                         schema_version=_feature_schema_version())
         proposed = out.get("features", [])
@@ -2047,7 +3083,7 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
             "aggregation": idea.get("aggregation"), "issue": instruction}]
     try:
         menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity,
-                                          roles=roles)
+                                          roles=roles, client=client, actor=actor)
     except ContextTooLarge as exc:
         return None, {"name": str(idea.get("name", "")), "reason": str(exc),
                       "code": RejectCode.CONTEXT_TOO_LARGE}
@@ -2056,8 +3092,17 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
         inputs["table_context"] = table_context
     if objective:
         inputs["objective"] = objective
+    # The grounding directive rides here too — NOT the derives-from one, which this path has never
+    # appended. The difference is that the v5 wire item makes `grounding` REQUIRED on this call:
+    # the schema compels an answer, so the rules for it must travel with the request rather than
+    # leaving a human's revision to be refused for a convention it was never told (see
+    # `_grounding_directive`). A fixed PII-free constant appended after the human's instruction, so
+    # the egress guard still scans the whole string and the llm_call records exactly what was asked.
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", instruction, inputs, actor=actor,
+                    "feature_ideas",
+                    instruction + _grounding_directive()
+                    + _table_context_directive(table_context, cites_grounding=True),
+                    inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     proposed = out.get("features", [])
@@ -2092,7 +3137,8 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
     try:
-        menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles)
+        menu, table_context = _build_menu(conn, cols, objective=nl_query, roles=roles,
+                                          client=client, actor=actor)
     except ContextTooLarge as exc:
         logger.warning("feature-recipe context too large for %r: %s", nl_query, exc)
         return Recipe(intent=nl_query, grain_table=None, derives_from=[], aggregation=None,
@@ -2100,8 +3146,20 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     recipe_inputs: dict = {"columns": menu}
     if table_context:
         recipe_inputs["table_context"] = table_context
+    # THE THIRD SURFACE THAT SENDS THESE TOKENS, and the one the first version of Task 8b missed.
+    # This path puts `table_context` in the inputs exactly like the two generation paths, so with
+    # the context flag on a recipe request for a table whose grain is `ai_proposed` hands the model
+    # a token it has never been told the meaning of — precisely the defect Task 8's review raised,
+    # surviving on one surface of three. `Recipe.grain_table` / `as_of_column` then come back to
+    # `POST /features/recipe` looking grounded.
+    #
+    # `cites_grounding=False`: the recipe RESPONSE contract is
+    # {grain_table, join_table, derives_from, aggregation, as_of_column}, which `Recipe` reads key
+    # by key. There is no `grounding` array here at any version, so telling the model to write one
+    # would spend its output on a field nothing reads.
     out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    nl_query, recipe_inputs, actor=actor,
+                    nl_query + _table_context_directive(table_context, cites_grounding=False),
+                    recipe_inputs, actor=actor,
                     prompt_version=_feature_schema_version(),
                     schema_version=_feature_schema_version())
     derives = [d for d in out.get("derives_from", []) if d in known]
