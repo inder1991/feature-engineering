@@ -2445,13 +2445,27 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # separate pipeline step), and its report rides out via `stats`. Zero identifier items ->
         # `not_applicable`, NEVER silent; a concept stage that died before acceptance -> `not_run`;
         # a contained critic fault -> `failed`.
+        #
+        # The critic's own START (final branch review, 2026-08-09). Every other stage passes
+        # `started_at`, so `ingestion_run_stage.started_at` is NULL for this one alone and it has no
+        # DURATION — while reporting a clean `succeeded`. That is the wrong stage to leave
+        # unmeasured: `critique_concept_batch` is a plain per-item loop with no call ceiling, no
+        # deadline and no `not_attempted` (`OVERLAY_ENRICH_MAX_PROVIDER_CALLS` does not reach it),
+        # and Task 9b's 102 added `is_a` parents move `_registry_fingerprint()`, so the FIRST run
+        # after merge re-critiques every stored identifier verdict. On a 144-column catalog that is
+        # ~70-100 sequential calls at up to 300s each. `enrich_concepts` records the instant it
+        # started; absent (an older caller, or a fault before the critic block) it stays NULL, which
+        # is honest rather than a fabricated zero.
+        # The MARKER states below keep `started_at=None` per `StageRecorder.record`'s contract — a
+        # `not_run` never began, and a `not_applicable` critic dispatched nothing to time.
+        critic_started = concept_stats.get("concept_critic_started_at")
         critic_report = concept_stats.get("concept_critic")
         if concepts is None or critic_report is None:
             record_stage(stage_recorder, "enrich_concept_critic", "not_run",
                          reason_code="enrich_concept_failed")
         elif critic_report.get("failed"):
             record_stage(stage_recorder, "enrich_concept_critic", "failed",
-                         reason_code="exception")
+                         reason_code="exception", started_at=critic_started)
         elif not critic_report.get("items"):
             record_stage(stage_recorder, "enrich_concept_critic", "not_applicable",
                          reason_code="no_identifier_assignments")
@@ -2465,7 +2479,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             if concept_rolled_back:
                 critic_detail["rolled_back"] = True
             record_stage(stage_recorder, "enrich_concept_critic", "succeeded",
-                         detail=critic_detail)
+                         detail=critic_detail, started_at=critic_started)
         stage_started = datetime.now(UTC)
         def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         def_evidence_failures = 0

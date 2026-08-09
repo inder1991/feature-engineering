@@ -426,23 +426,31 @@ _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semant
 # `party_role` (feature-context v4) is a closed-vocabulary token from `party_vocab`, the same grade
 # of structural identity as `concept`.
 #
-# THREE of the five D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here:
+# TWO of the five D13.1/D13.2 CLASSIFICATION AXES (Task 6) join them here:
 #
-#   * `sub_domain` carries the SAME `field_policies._MEANING` policy as `domain` and reads as the
-#     same short classification label — but its ONLY producer is
-#     `enrich._write_sub_domain_evidence`, which admits a value through `accept_label`. It is
-#     MODEL-authored (D13.2), never uploader-typed, so the two-origin argument that moved `domain`
-#     to prose does not reach it. The asymmetry between the pair IS the rule: the grade follows who
-#     TYPED the value, not how the key reads.
 #   * `table_role` / `event_or_snapshot` are platform-derived `_TABLE_ADVISORY` tokens — the same
 #     grade `_TABLE_CONTEXT_IDENTITY_KEYS` gives `data_role`/`primary_entity`, and `table_role` is
 #     already `_STRUCTURAL_META_KEYS` on the enrichment seam.
 #
-# `domain` / `bian_path` / `process_path` are DELIBERATELY NOT here — see
+# `domain` / `sub_domain` / `bian_path` / `process_path` are DELIBERATELY NOT here — see
 # `_FEATURE_COLUMN_PROSE_KEYS`.
 #
-# All three are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`: an over-long value excludes the
-# column and is audited, never truncated into a different classification token.
+# THE RULE, RESTATED (2026-08-09, final branch review — it used to read "the grade follows who
+# TYPED the value", and `sub_domain` was graded identity on that reading). Who typed the value is
+# not the question; whether the value is drawn from a CLOSED SET is. A closed-vocabulary token
+# (`concept`, `party_role`, `confidence_band`) cannot carry an arbitrary span, so a type-and-length
+# check is the whole of its safety. Free text cannot be made safe that way whoever authored it —
+# and a model drafting from a payload that carries uploader definitions can echo an uploader's
+# account number as readily as the uploader can type one. See `_FEATURE_COLUMN_PROSE_KEYS` for the
+# failure-direction argument that decides it.
+#
+# These are ACCEPTANCE-gated at `_FEATURE_STRUCTURAL_MAX_LEN`, and the gate is WHOLE-PAYLOAD
+# FAIL-CLOSED, not per column: an over-long value makes `sanitize_feature_context` return None, the
+# caller blocks dispatch and audits EGRESS_BLOCKED, and NO column is enriched on that call. It is
+# never truncated into a different classification token, and never quietly dropped either. `_refuse`
+# logs which element and which key did it, because on a 237-column catalog that is the difference
+# between a diagnosis and an opaque failure. (An earlier version of this comment claimed the value
+# "excludes the column and is audited" — it excluded the whole payload and logged nothing.)
 #
 # `confidence_band` (Task 6b) is the ADJUDICATOR's grade — a member of the closed
 # `semantic_adjudication.CONFIDENCE_BANDS` vocabulary (`high|medium|low`), validated on the way in
@@ -451,7 +459,7 @@ _FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "ai_summary", "semant
 # two-origin argument that moved `domain` to prose does not reach it and the prose grade's redactor
 # would have nothing to scrub. It is EXPLANATION, never authority: nothing branches on it.
 _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept",
-                                           "party_role", "sub_domain",
+                                           "party_role",
                                            "table_role", "event_or_snapshot",
                                            "confidence_band"})
 # PROSE grade for the feature menu: PII-redacted via `redact_free_text` (no sample-clause strip and
@@ -499,7 +507,33 @@ _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "con
 # unredacted `glossary_reader` branch reason (2) names for `domain`, and already prose-graded on the
 # enrichment seam as `term_name` (`_SCALAR_PROSE_META_KEYS`) — so the two seams agree, which is this
 # file's stated principle.
-_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "bian_path", "process_path", "business_term"})
+#
+# `sub_domain` (D13.2) joins them too — DECIDED 2026-08-09 at the final branch review, reversing
+# Task 6, which added it at identity grade in the very commit that moved `bian_path`/`process_path`
+# OUT of identity grade for this exact reason. The argument it rested on ("the grade follows who
+# TYPED the value"; `sub_domain`'s only producer is `enrich._write_sub_domain_evidence`) is true and
+# does not decide the question:
+#
+#   * Reason (a) below is ORIGIN-INDEPENDENT. It is about what happens when a detectable token
+#     reaches the wire, not about who put it there. At identity grade one such token on one column
+#     kills the whole call, for all 237 columns; at prose grade it is scrubbed and the call
+#     proceeds. Availability is the whole of the difference, and Task 6 accepted precisely that
+#     argument for the other two axes.
+#   * `sub_domain` is NOT a closed vocabulary. It is the model's free-text refinement of `domain`,
+#     admitted by `accept_label` — a length-and-shape gate, not a member check — and it is drafted
+#     from a payload carrying uploader definitions, so an uploader's account number can arrive in
+#     it by echo. That is what separates it from `concept` / `party_role` / `confidence_band`,
+#     which are validated against registries and cannot carry an arbitrary span at all.
+#   * It carries the SAME `field_policies._MEANING` policy as `domain`, which is prose-graded by an
+#     explicit human decision (2026-08-07). Grading a parent and its refinement differently is a
+#     trap for the next reader, and the pair reads identically at every other seam.
+#
+# Cost of the move: one `redact_free_text` pass per column. The wire is byte-identical for a clean
+# value (the redactor returns unchanged text), and the bound is the same `_FEATURE_STRUCTURAL_MAX_LEN`
+# — applied AFTER redaction, so a near-budget value carrying PII can now be refused where an
+# un-scrubbed one of the same length was admitted. That is the fail-closed direction.
+_FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "sub_domain", "bian_path", "process_path",
+                                        "business_term"})
 # The LIST form of the same grade (Task 7b): each item PII-redacted at its own indexed path
 # (`related_terms[1]`) and bounded per TERM, mirroring `_LIST_PROSE_META_KEYS` on the enrichment
 # seam. `related_terms` is uploader-authored curated vocabulary, so the token-list grade its SHAPE
@@ -762,6 +796,22 @@ def sanitize_feature_context(
     def _structural_ok(v: object) -> bool:  # identity strings may be None (`concept` is nullable)
         return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
 
+    def _refuse(path: str, rule: str) -> tuple[None, list[dict], list[dict], str | None]:
+        """Refuse the WHOLE payload, and say which element and which key did it.
+
+        Every branch below fails closed to the same `(None, ...)`, and the caller turns that into a
+        blocked call with no dispatch — so ONE over-long `sub_domain` on ONE column costs feature
+        generation for every column in the catalog. That is the intended direction (the alternative
+        is egressing a value nobody scanned), but until now it was also OPAQUE: a 237-column run
+        returned nothing with no record of which key tripped it, and re-running does not narrow it.
+
+        VALUE-FREE by construction, exactly like the `enrich_reject` line: the `path` is a key name
+        and a list index this code minted, `rule` is a member of the closed set below, and the value
+        itself is never read here. Lengths, counts, codes, refs — never content."""
+        logger.warning("feature-context egress REFUSED the whole payload at %s (rule=%s) — the "
+                       "call is blocked and NO column is dispatched", path, rule)
+        return None, pii_spans, sample_audits, version
+
     new_columns = columns
     if has_cols:
         rebuilt: list = []
@@ -778,7 +828,7 @@ def sanitize_feature_context(
                         continue
                     clean = _defn(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "definition_scan")
                     out[k] = clean
                 elif k in _FEATURE_COLUMN_PROSE_KEYS:
                     if v is None:                # absent taxonomy path — no content to scan
@@ -786,39 +836,39 @@ def sanitize_feature_context(
                         continue
                     clean = _prose(v, path)
                     if clean is None:
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "prose_scan")
                     out[k] = clean
                 elif k in _FEATURE_COLUMN_PROSE_LIST_KEYS:
                     cleaned = _prose_list(v, path)
                     if cleaned is None:
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "prose_list_scan")
                     out[k] = cleaned
                 elif k in _FEATURE_COLUMN_IDENTITY_KEYS:
                     if not _structural_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "identity_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_FACT_KEYS:
                     if not _fact_wrapper_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "fact_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_TOKEN_LIST_KEYS:
                     if not _token_list_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "token_list_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_OBJECT_KEYS:
                     if not _token_object_ok(v, _FEATURE_COLUMN_OBJECT_KEYS[k]):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "object_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_MAPPING_KEYS:
                     if not _mapping_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "mapping_shape")
                     out[k] = v
                 elif k in _FEATURE_COLUMN_DICT_LIST_KEYS:
                     if not _dict_list_ok(v, _FEATURE_COLUMN_DICT_LIST_KEYS[k]):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "dict_list_shape")
                     out[k] = v
                 else:
-                    return None, pii_spans, sample_audits, version   # unclassified — fail closed
+                    return _refuse(path, "unclassified_key")     # fail closed
             rebuilt.append(out)
         new_columns = rebuilt
 
@@ -827,7 +877,7 @@ def sanitize_feature_context(
         rebuilt_ctx: list = []
         for idx, block in enumerate(table_context):
             if not isinstance(block, dict):
-                return None, pii_spans, sample_audits, version
+                return _refuse(f"table_context[{idx}]", "block_not_a_dict")
             out = {}
             for k, v in block.items():
                 path = f"table_context[{idx}].{k}"
@@ -838,7 +888,7 @@ def sanitize_feature_context(
                     clean = _defn(v, path)
                     if clean is None:
                         if k not in _ADVISORY_CONTEXT_KEYS:
-                            return None, pii_spans, sample_audits, version
+                            return _refuse(path, "definition_scan")
                         _drop_advisory(path)
                         continue
                     out[k] = clean
@@ -849,7 +899,7 @@ def sanitize_feature_context(
                     clean = _prose(v, path)
                     if clean is None:
                         if k not in _ADVISORY_CONTEXT_KEYS:
-                            return None, pii_spans, sample_audits, version
+                            return _refuse(path, "prose_scan")
                         _drop_advisory(path)
                         continue
                     out[k] = clean
@@ -857,7 +907,7 @@ def sanitize_feature_context(
                     advisory = k in _ADVISORY_CONTEXT_KEYS
                     cleaned = _prose_list(v, path, droppable=advisory)
                     if cleaned is None:
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "prose_list_scan")
                     if advisory and not cleaned:
                         # Scrubbed empty — a fabricated `[]` is not context, so drop the key.
                         _drop_advisory(path)
@@ -865,17 +915,17 @@ def sanitize_feature_context(
                     out[k] = cleaned
                 elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
                     if not _structural_ok(v):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "identity_shape")
                     out[k] = v
                 elif k in _TABLE_CONTEXT_LIST_KEYS:
                     cap = (_TABLE_ADVISORY_MAX_LEN if k == "advisories"
                            else _FEATURE_STRUCTURAL_MAX_LEN)
                     if not (isinstance(v, list) and len(v) <= _FEATURE_COLLECTION_MAX_ITEMS
                             and all(isinstance(x, str) and len(x) <= cap for x in v)):
-                        return None, pii_spans, sample_audits, version
+                        return _refuse(path, "list_shape")
                     out[k] = v
                 else:
-                    return None, pii_spans, sample_audits, version
+                    return _refuse(path, "unclassified_key")
             rebuilt_ctx.append(out)
         new_ctx = rebuilt_ctx
 

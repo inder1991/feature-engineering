@@ -26,7 +26,11 @@ from featuregen.intake.llm import (
     LLMRequest,
     LLMResult,
 )
-from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
+from featuregen.intake.redaction import (
+    INPUT_KEY_CATALOG,
+    INPUT_KEY_INTENT,
+    INPUT_KEY_REPAIR_ERRORS,
+)
 from featuregen.intake.schema_projection import project_for_anthropic
 
 logger = logging.getLogger(__name__)
@@ -101,8 +105,8 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
     ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched.
 
     A REPAIR re-call additionally appends the driver's value-free validation complaint to the user
-    turn (see the ``_repair_errors`` block below); a first attempt carries no such key and renders
-    exactly as before."""
+    turn (see the ``INPUT_KEY_REPAIR_ERRORS`` block below); a first attempt carries no such key and
+    renders exactly as before."""
     intent = request.inputs.get(INPUT_KEY_INTENT, "")
     catalog = dict(request.inputs.get(INPUT_KEY_CATALOG, {}) or {})
     cache_keys = [k for k in request.cacheable_metadata_keys if k in catalog]
@@ -121,7 +125,10 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
     # repair sends byte-identical bytes and the budget buys nothing. The key is `_`-prefixed so it
     # stays OUT of `compute_input_hash` — the repair keeps its parent's identity while differing
     # on the wire, which is exactly the intent. The values are already value-free (`_safe_reason`).
-    errors = request.inputs.get("_repair_errors")
+    # It is the SHARED `INPUT_KEY_REPAIR_ERRORS` constant, never a literal: the writer is in
+    # `llm.drive_structured_call` and a rename on one side alone would silently revert every repair
+    # to a byte-identical re-call.
+    errors = request.inputs.get(INPUT_KEY_REPAIR_ERRORS)
     if errors:
         rendered = "; ".join(str(e) for e in errors)[:_MAX_REPAIR_FEEDBACK_CHARS]
         user_content += (

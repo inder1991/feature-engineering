@@ -24,6 +24,7 @@ from featuregen.config import get_settings
 from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
 from featuregen.contracts.db import DbConn
 from featuregen.idgen import mint_id
+from featuregen.intake.redaction import INPUT_KEY_REPAIR_ERRORS
 
 # ---- shared-contract shapes (overview §9.1) -------------------------------------------------
 
@@ -105,7 +106,7 @@ DEFAULT_LLM_MODEL = "claude-sonnet-5"
 
 def compute_input_hash(inputs: Mapping[str, Any]) -> str:
     """sha256 of the exact redacted (LLM-safe) input — the dedup/identity component (§9.3).
-    Transient driver keys (`_`-prefixed, e.g. `_repair_errors`) are excluded so a repair re-call
+    Transient driver keys (`_`-prefixed, e.g. `INPUT_KEY_REPAIR_ERRORS`) are excluded so a re-call
     keeps the SAME identity as its parent (no double-charge, stable FakeLLM keying)."""
     material = {k: v for k, v in inputs.items() if not str(k).startswith("_")}
     canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -435,7 +436,9 @@ def drive_structured_call(
                 attempts.append({"attempt": repairs_used, "class": "repair", "reason": reason})
                 # re-prompt with the accumulated validation error, via a transient (`_`-prefixed)
                 # key EXCLUDED from the identity hash so the repair keeps its parent's identity.
-                request = replace(request, inputs={**request.inputs, "_repair_errors": list(errors)})
+                request = replace(request,
+                                  inputs={**request.inputs,
+                                          INPUT_KEY_REPAIR_ERRORS: list(errors)})
                 resp = client.call(request)
                 provider_calls += 1
                 continue

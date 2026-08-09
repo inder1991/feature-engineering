@@ -1363,3 +1363,279 @@ definitions turn out to be common or pathological.
 observation of `_V4_TRIM_ORDER` shedding `definition` on a catalog under ~200 columns. **Closure:**
 decide whether the budget should scale with observed definition length, or whether the drafting
 prompt should target a shorter definition, rather than raising a constant against a hypothetical.
+
+---
+
+## A.51–A.57 — "LLM enrichment reaches feature generation" (2026-08-06 → 2026-08-09)
+
+Nineteen tasks against `docs/superpowers/plans/2026-08-06-llm-enrichment-reaches-feature-generation.md`,
+each individually reviewed, then a whole-branch review returning READY WITH FIXES. **The branch's
+working ledger lives under `.superpowers/`, which `.gitignore:8` excludes — so it does not survive
+the merge.** These seven entries are the curated record of what must outlive it. They are not the
+ledger: its per-round narrative, fix-loop bookkeeping and cosmetic minors were left behind
+deliberately.
+
+### A.51 The four binding human decisions, and what has NOT been run (2026-08-09)
+
+Recorded because each closed a question the next author would otherwise re-open from scratch, and
+because two of them are the reason parts of this branch look unfinished.
+
+| # | Decision | The reasoning, so it is not re-litigated |
+|---|---|---|
+| 1 | 🔴 **A live before/after ingest to MEASURE the enrichment call count was REFUSED** (2026-08-06). Task 4b Steps 2 and 8 were rewritten as OFFLINE derivations. | Live LLM spend against a real catalog is a standing approval gate here. The replacement derives the ceiling from the code's own constants (237 items × `max_batch_attempts` 2 + `max_single_fallback` 8 = 482 → ceiling 512) and guards it with a test, and asserts the real `chunk_items` still packs >1 item/chunk at the new caps instead of re-measuring a run. **The true per-stage call count REMAINS UNMEASURED and must never be presented as verified** — A.50 owns that gap. |
+| 2 | 🔴 **The `domain` egress exposure was FIXED, not accepted** (2026-08-07, `c62ab49d`): `domain` moved from identity grade to `_FEATURE_COLUMN_PROSE_KEYS`. | `domain` is uploader text reaching the provider unredacted — a CSV satisfying `is_glossary_csv` but not `is_glossary_mapping` routes to `read_glossary`, which builds `domain=_cell(...)` with NO redaction; it is then persisted as SOURCE evidence, projected to `graph_node.domain`, and emitted by `for_feature_generation`. **The key insight for whoever revisits this:** `redact_free_text`'s `_scan` and `assert_llm_safe`'s `_first_pii` walk the SAME `_PII_PATTERNS`, and NO `IntentRedactor` is registered anywhere in `src/`. So the prose grade buys FAILURE DIRECTION (scrub-and-proceed instead of an `EgressViolation` that kills the whole call), an audit span, and the DI seam — and **no additional detection**. A personal NAME still egresses at either grade. Registering a NER-backed `IntentRedactor` is the change that closes the name-leak class, on both seams. |
+| 3 | 🟡 **Task 2b was ADDED: an author-attested `SchemaValidationError` subclass** carrying a value-free reason that `_safe_reason` prefers. | `analysis/intent.py`'s seven hand-authored validation errors have no `jsonschema` `__cause__`, so `_safe_reason` returned the generic constant for the whole intent flow — including the deliberately actionable "that is a TABLE. `entity_ref` must be a COLUMN" message, written expressly so a second attempt could correct it. The default stays sanitised and every exemption is greppable. The implementer did NOT attest the interpolated text: it authored seven new value-free reasons beside them, dropping the model-supplied `{ref!r}` at every site — that would re-egress where `assert_llm_safe` has already run for the last time, and land verbatim in `llm_call.repair_attempts` / `llm_dispatch.redacted_input`. |
+| 4 | 🔴 **ONE live dry run with the real catalog IS APPROVED — but only after comprehensive observability landed.** The user's words: "have proper logging for everything that will help to find real issues". | This is why Task 9c exists and why it was sequenced immediately before the run. Its deliverable — the exact query answering each question a run raises — is now `docs/runbooks/enrichment-run-reading-guide.md`. |
+
+**🔴 NO LIVE RUN HAS HAPPENED.** Nothing on this branch has been deployed, no catalog has been
+uploaded, and no LLM budget has been spent. Every number in the branch's tests and comments is
+DERIVED from code constants or measured against fixtures — never observed against a provider. The
+single approved live run is the next task after merge. Treat any claim about provider cost, latency
+or call count on this branch as derived until that run happens.
+
+### A.52 🔴 Non-glossary columns have no evidence-ref strategy — and the WARN it causes is permanent (2026-08-07)
+
+*This entry exists because the branch ledger cited "DEFERRED-WORK A.7" for this deferral. A.7 is an
+unrelated 2026-07-27 entry about source-engine assumptions, so the deferral was recorded nowhere
+tracked — while a permanent user-visible warning depends on it.*
+
+On a glossary-LESS upload the drafted synonyms have **ZERO consumers**: `_write_synonym_evidence` is
+gated on the glossary, `_project_semantic_terms` is unreachable, and the same-run summary ride-along
+is `not_applicable` — while `draft_synonyms` runs over EVERY column and pays for every one. The
+stage used to report a clean `succeeded`.
+
+**What Task 4c changed: the LABELLING only.** The stage now reports `partial` /
+`evidence_not_stored` with `{resolved, expected, evidence_skipped}`. No migration (`partial` is
+already in 0996's CHECK list; `reason_code` is unconstrained text — verified against the constraint,
+not against the report).
+
+**The underlying waste is UNFIXED**, and it was the highest-value open item in the plan: giving
+non-glossary columns a ref strategy so their drafted values can be stored at all. The blocker is
+that `field_evidence` keys on the glossary's schema-preserving `logical_ref`, and a technical column
+has none.
+
+**🔴 The user-visible consequence, permanent until this lands:** every glossary-less upload with a
+client configured now shows a standing **"enrichment partial" WARN** (`IngestResultCallout`
+`WARN_STATES`). That is intended honesty — the run really did discard what it drafted — but it is a
+warning a user can neither act on nor clear.
+
+**Scope check for the CIB catalog:** the user's CIB file IS a glossary upload (111 rows, `term_name`
++ `description_business_definition` 111/111 filled), so this does not bite for it. But the mapping
+covers 111 columns while the plan works from a 144-column `BO_CIB_CUSTOMER`, so ~33 columns would
+still lose their synonyms.
+
+**Trigger:** the first technical (non-glossary) upload whose enrichment matters, or the first user
+who asks why every upload warns. **Fix shape:** mint a technical logical_ref that `field_evidence`
+can key on, or gate `draft_synonyms` off where nothing can consume it — the second is cheaper but
+makes the platform quietly less capable rather than visibly incomplete.
+
+### A.53 🔴 The first run after merge re-critiques EVERY identifier column — and `CONCEPT_REGISTRY_VERSION` was deliberately not bumped (2026-08-08)
+
+**The warning.** Task 9b added 102 `is_a` parents to `CONCEPT_REGISTRY` (coverage 52 → 152 of 324;
+zero parents overwritten, no other field changed, namespaces byte-identical, all 324 chains proven
+terminating by a cycle-detecting walk). `concept_critic._registry_fingerprint()` folds `is_a`, so
+the fingerprint MOVES — and it is part of every stored verdict's replay identity.
+
+**The consequence the operator must know before reading the first run's output:** every stored
+identifier verdict re-rolls, non-deterministically, because the verdict comes from a model. And the
+verdicts are not cosmetic — `is_a` rides in the critic's PROMPT, not only its replay hash
+(`CRITIC_RENDERED_KEYS` includes `concept_path`; the critic is scoped to
+`{identifier, monetary, temporal, label}`), and `enrich._apply_concept_critic` applies it:
+
+- `REVISED` → a different concept, therefore a different **namespace**, therefore different **join
+  candidacy**;
+- `REFUTED` → `unclassified`, and the column **LOSES bridge candidacy** entirely.
+
+Nothing shipped is wrong — `concept_critic` names a re-parented `is_a` as a reason to re-critique,
+which is exactly what it is for. But a different feature set on that run is explained HERE, not by
+enrichment coverage. `docs/runbooks/enrichment-run-reading-guide.md` Q1 is the query that separates
+the two, and it must be read before anything else in that run's output.
+
+**The paired decision: `CONCEPT_REGISTRY_VERSION` (`taxonomy/versions.py`, `"concepts@2"`) was NOT
+bumped, and that is deliberate.** It is folded into `planner_input_hash`,
+`PlannerReplayEnvelopeV1`, `shadow_capture`, `live_activation`, and the
+`concept-registry:concepts@2` provenance citation on every attributed label. So registry content
+changed while the tag did not — the critic's content fingerprint says "changed, re-critique" while
+the sealed planner identity says "same registry".
+
+**Why that is right and not an oversight:** nothing outside `concepts.py` and `concept_critic.py`
+reads `is_a`. Planner behaviour is genuinely unaffected, so bumping the version would re-key and
+falsely invalidate every sealed planner artifact for a change none of them can observe.
+`_registry_fingerprint()` moving is the correct and sufficient consequence — it is scoped to exactly
+the consumer that DOES read `is_a`. **Revisit the moment anything outside those two modules starts
+reading `is_a`.** Ancestor-based search expansion is the obvious candidate, and `retrieval.py`
+already *documents* it while not implementing it (it absorbs name/group/entity_link/namespace only).
+At that point the version tag becomes load-bearing and must move.
+
+### A.54 🟡 The concept-critic stage has no call ceiling, no deadline and no `not_attempted` (2026-08-09)
+
+`critique_concept_batch` is a plain per-item loop. Unlike every batched enrichment stage it has **no
+call ceiling** (`OVERLAY_ENRICH_MAX_PROVIDER_CALLS` does not reach it), **no stage deadline**, and
+no `not_attempted` accounting — so nothing stops it and nothing records what it skipped. On a
+144-column catalog that is roughly 70–100 sequential provider calls at up to 300s each. By A.53 it
+is also exactly the stage that runs hardest on the first run after merge.
+
+**What was fixed instead (2026-08-09): the MEASUREMENT.** `enrich_concepts` records the critic's own
+start instant and `ingest` passes it as `started_at`, so `ingestion_run_stage` carries a real
+duration instead of a NULL beside a clean `succeeded`; and Q6 of the reading guide gives the
+`llm_call` count-and-span query for `overlay.enrich.concept_critique` /
+`overlay.enrich.concept_revision`. Note `llm_call.latency_ms` is NULL on every enrichment path (no
+call site sets it), so per-call duration is unavailable — the first-to-last span read against the
+stage wall clock is what there is.
+
+**A ceiling was NOT added.** It is a design change, not a cheap fix: the critic's loop has no
+salvage/trim ladder to degrade into, so a bound must decide what an un-criticised identifier
+assignment MEANS (keep the classifier's answer un-refuted? refuse it?) — and keeping it is the
+fail-OPEN direction, which is why the loop has no bound today. **Trigger: the first live run** — its
+measured duration and call count are the input to that decision. **Fix shape:** share the stage's
+`CallLedger` and `deadline_s` with the critic, and give an un-critiqued item an explicit disposition
+rather than silence.
+
+### A.55 🟡 One over-long or unscannable value refuses the WHOLE feature-generation payload (2026-08-09)
+
+Every branch of `sanitize_feature_context`'s classifier loop fails closed to `(None, ...)` for the
+**whole payload**, which the caller turns into a blocked call with no dispatch. So one over-long
+`sub_domain` on one column costs feature generation for all 237. A comment in `enrich_llm.py`
+claimed the opposite ("excludes the column and is audited") — corrected 2026-08-09.
+
+**Direction accepted, opacity fixed.** Refusing is right (the alternative is egressing a value
+nobody scanned), but it used to be silent: a 237-column run returned nothing, with no record of
+which key tripped it, and re-running does not narrow it. Every refusal now routes through
+`_refuse(path, rule)`, which logs the element, the key and a closed rule code — value-free by
+construction. See Q3b of the reading guide.
+
+**Still open: the granularity.** Dropping the offending KEY (as `_drop_advisory` already does for
+advisory context) would keep the other 236 columns usable, but it changes what the model is told
+about a column without saying so — it needs the same "never silently degrade the payload" argument
+the advisory path had to make. **Trigger:** the first live run that refuses, or any catalog whose
+uploader text routinely trips the bound.
+
+### A.56 The four items the whole-branch review recorded rather than fixed (2026-08-09)
+
+| # | Item | Detail, and what acting on it requires |
+|---|---|---|
+| F4 | 🟡 **`domain` is unscanned on the Pass-B `column_profiles` seam** | `_redact_free_text_meta` routes `column_profiles[*].business_definition` through the definition sanitizer, but a profile's `domain` is not in that per-descriptor scan — so the value A.51 #2 moved to prose grade on the feature seam still egresses unredacted on the Pass-B synthesis seam. **It compounds with the zero-truncation raise:** `_MAX_COLUMN_PROFILES` went 64 → 512, so one call carries up to 8× as many unscanned values. **Fix shape:** add `domain` to the per-descriptor prose scan, and audit the rest of `_column_profile_shape_ok`'s admitted keys against the two prose lists. **Trigger:** before Pass B runs on any catalog whose `domain` is uploader-authored — i.e. before the live run, if Pass B is on. |
+| F7 | 🟡 **`proposed_value` is misattributed on the LLM seam** | `proposed_value` is ALWAYS the LLM's own row, but `semantic_authority[field]` carries the STRONGEST producer for that field — so a model reading the payload can see its own unconfirmed proposal labelled `rulebook/proposed` or `human/confirmed`. Task 9 fixed exactly this shape on the UI (the proposal branch takes its word from the LLM label, and the tooltip names the strongest record AS the strongest record); the LLM seam was left. **Fix shape:** mirror Task 9 — carry the proposal's own producer beside it rather than inferring from the lead. **Trigger:** the first generated feature citing an authority it did not have, or the next feature-context version bump (it changes the payload). |
+| F9 | 🟡 **`_fallback` discards acceptor reasons, so the rejection account is batch-path only** | `enrich_batch._account(res.outcomes)` has ONE call site, in the batch path. `_fallback` calls `_single_fallback`, keeps `value` and drops `status`, so a per-item retry the acceptor refuses appears in neither `rejects` nor `outcomes`. Task 9c's "every rejection is attributable" claim therefore holds for the batch path only. **Fix shape:** account the fallback's status through the same `_account` seam. **Trigger:** any stage showing high `fallback_calls` with unexplained `unresolved` — the reading guide's Q3 flags this as a coverage limit. |
+| F10 | 🟡 **The synonyms ask widened ~5× against a cap the model is never told** | `_SYN_INSTRUCTION` asks for "15 to 20 terms"; `_MAX_SYNONYMS_LEN` is 1000 chars and the paired schema `maxLength` is 1000 — and the instruction never states a length. 20 terms at ~50 chars sits at the cap, and the acceptor's failure is WHOLE-VALUE: the column gets no synonyms at all, not a truncated list. **Fix shape:** state the character budget in the instruction, or accept a prefix of the comma-separated list rather than refusing it. **Trigger:** any run whose `enrich_synonyms` `rejects` shows `over_length`. |
+
+### A.57 Load-bearing deferred minors carried from the 19 tasks (2026-08-09)
+
+The ledger recorded ~40 deferred minors. The cosmetic ones (docstring typos, a testid collision, a
+shadowed import name) were left in the working log deliberately. These are the load-bearing ones —
+each is a claim the code makes that is not quite true, or a guard that does not guard what it says.
+
+**Bounds, budgets and the driver**
+
+- 🔴 **The 2702s worst-case logical call exceeds the 1800s stage deadline, which cannot interrupt an
+  in-flight call.** The deadline is checked only BETWEEN chunks, so a hung chain runs to its own
+  ceiling; worst-case advisory-lock hold ~4502s. The fix is a logical-call deadline inside
+  `drive_structured_call`. **This is the standing concern for the live run.**
+- 🟡 **The concept stage's 400_000-token chunk budget is ~1.4MB of JSON in one provider call**, and
+  `estimate_tokens` is `len(json)//4`, which UNDERSTATES real tokenisation. Nothing bounds a single
+  chunk against the model's context window except that budget.
+- 🟡 `.env.example` and `20-backend.yaml` document the same bounds with DIFFERENT values and
+  formulas, and `test_every_bound_is_DOCUMENTED_in_both_deployment_files` asserts bare substring
+  presence — so the drift it exists to prevent is present and undetected.
+- ⚪ `test_deployment_llm_bounds.py` re-implements `_escalated` by hand rather than driving it, in
+  the one place the codebase claims the number is derived.
+
+**Egress and grading**
+
+- 🟡 **`fibo_path` is one line from the `domain` exposure of A.51 #2** — built unredacted by the same
+  `glossary_reader` branch, and genuinely not emitted on any LLM-facing seam TODAY. The guard is
+  "fail closed, then human judgement", not "correct grade already applied": emitting it without
+  grading it prose re-opens the closed exposure.
+- 🟡 **The Pass-B `shared_metadata` seam has NO per-item redaction** — `assert_llm_safe` RAISES
+  rather than scrubs — and sits outside the replay identity. That is why Pass A and adjudication do
+  NOT see the catalog narrative (Task 7b leverage point (a)); opening that channel needs its own
+  task, and refusing to open it was right.
+- 🟡 **The citable-ref set is computed PRE-redaction**, so an advisory-dropped narrative key stays
+  forgeable (needs the profiles flag on + an authored narrative + a marker failure). The comment
+  claiming it "cannot disagree with what egressed" is false in exactly that case.
+- 🟡 **The unscannable-advisory drop leaves no audit trace** — a log line only, no `sample_audits`
+  entry — contradicting `_drop_advisory`'s "never silent".
+
+**What the model is told, and what it is told about**
+
+- 🟡 **`_grain_block` legitimately returns `{}`** while the grounding clause tells the model to name
+  "whichever of the three" statuses it is — so the model is told to pick one of three and given
+  none, on the free-text field that clause widened to PROTECT the audit trail. One sentence fixes it
+  ("if the block states no status, say so").
+- 🟡 **The grain/as-of vocabulary has no SERVABILITY axis** — a LAPSED human-signed grain still
+  reports `human_confirmed` in both label and grounding entry. Deliberate (the stamp survives by
+  design), but the model cannot tell a live sign-off from an expired one.
+- 🟡 **`confidence_band` and `concept_alternatives` ride with NO producer marker** in
+  `semantic_authority`, so the model cannot tell the shortlist came from an LLM adjudicator.
+- 🟡 **The ~600-byte grounding directive is appended AFTER the `ContextTooLarge` guard** on the
+  recipe path, so it sits outside the measured budget.
+- ⚪ **`_FEATURE_CONTEXT_SCHEMA_VERSION` now moves for an OUTPUT-only change** (Task 6c), so an
+  `llm_call` can stamp 5 for a payload byte-identical to v4.
+
+**Guards that do not guard what they claim**
+
+- 🟡 **Five `test_feature_context_coverage.py` exclusions state a machine-checkable reason the test
+  does not machine-check** (`semantic_type`, `temporal_role`, `leakage_anchor`, `feature_role`,
+  excluded for having no `_DISPLAY_COLUMN` entry). If one later gains one, the exclusion stays and
+  the guard goes silent — the exact leak class that test closes, for five named fields. **The
+  highest-value follow-up on this branch:** one derived assertion closes it.
+- 🟡 **Four more of its exclusions rest on an emitter behind `FEATUREGEN_DATASET_PROFILES`, which
+  defaults OFF** — so in the default config `authority_role` / `temporal_storage_model` /
+  `business_context` reach generation nowhere, while the accounting says they do.
+- 🟡 **Nothing couples `_EXPANSION_INSTRUCTION` to `OBJECTIVE_EXPANSION_VERSION`** — the bump
+  discipline is prose only, while the local precedent (`concept_critic._input_hash` folding the
+  registry fingerprint) does it structurally.
+- 🟡 **`_is_enumeration` needs TWO marker-led lines**, so a single-bullet answer passes as prose;
+  `+`, `>`, markdown headings, multi-line JSON objects and YAML all slip through. Erring loose is
+  deliberate — a false negative caches an ugly but VISIBLE definition; a false positive leaves the
+  column with NO definition and a failure indistinguishable from a provider blip.
+- 🟡 **`table_synth` has `max_items == min_split == 4`**, so its split tier is unreachable; and
+  `budget(short)` never reads `short` (every field is a global env read), so per-stage lowering was
+  never available. The old 4+4 split gave each half a FRESH `max_batch_attempts` at zero fallback
+  cost, so `left_uncached` now arrives earlier on a run with several failing chunks.
+
+**Diagnosis and attribution**
+
+- 🟡 **A timeout and a 400 schema rejection persist a byte-identical failure reason**
+  ("non-retryable provider outcome (non_retryable)"); the only distinguisher is an ephemeral
+  WARNING. A durable sub-reason seam on `_fail` is what it needs — fold into A.49.
+- 🟡 **`llm.py`'s `reason = errors[-1] if errors else ...` can record a STALE reason** when a schema
+  failure is followed by `PROVIDER_INVALID` — now more consequential, since `reason` is the audit
+  record's only remaining description of what went wrong.
+- 🟡 **The SDK-inheritance guard runs in NO automatic job** (`anthropic` lives in the `llm` extra;
+  CI runs `uv sync --extra dev`). A RENAME or REMOVAL of an SDK exception class surfaces as an
+  `AttributeError` escaping `call()` on the failure path. Cheapest hardening: add `anthropic` to
+  whatever extra the live-canary job installs.
+- 🟡 **Per-column match attribution is RECONSTRUCTIBLE but not surfaced** — the objective expansion
+  logs the derived term set and `structured_result` stores it against the subject hash, so "matched
+  on `obligor`, which we derived from your word `counterparty`" is recoverable by intersecting
+  stored terms with `_column_tokens(col)`. Nothing joins them.
+- 🟡 **`taxonomy/recognizer.py` puts a full `str(exc)` into a CALLER-FACING result**, and that
+  validator sits OUTSIDE `drive_structured_call`, so it gets no repair feedback at all. Adjacent to
+  Task 2b, unfixed.
+- ⚪ **Task 2b's repair names the FIELD, not the offending ref.** If the live run shows intent
+  repairs still failing, echoing the ref is the next lever and needs its own decision.
+
+**Pre-existing, found here, not caused here**
+
+- 🔴 **`formula_dispatches_reconciled` appears unconditionally FALSE on the frozen-configuration
+  path.** `freeze_provider_contract` hashes `(role, instruction_sha256, output_schema_sha256)` via
+  JCS; reconciliation recomputes `(call_role, provider, model, prompt_content_hash,
+  schema_content_hash)`. Both were computed for identical inputs and differ. The only e2e test
+  asserting the gate green runs WITHOUT a frozen configuration, and worker tests monkeypatch the
+  gate out. **It is a HARD GATE — it wants its own task.**
+- 🟡 **`ingest._assert_fact` AUTO-CONFIRMS every file-declared grain/as-of** with
+  `authority_basis=source_declared`, so an ordinary upload's declared grain lands on `confirmed`
+  with nobody having reviewed anything. The wire token `confirmed` therefore covers both a human
+  endorsement and an uploader CSV flag, and no prompt anywhere defines the vocabulary — the model
+  reads the English word. `bridge_assessment._human_reviewed` is the surface that can draw the line.
+- 🟡 **The COLUMN's `semantic_terms` renders as a space-joined blob under a single authority chip**
+  in "What the platform resolved", while `ingest` builds that string as glossary term + synonyms +
+  BIAN/FIBO/process paths UNIONED WITH the LLM's terms — one producer named as author of text with
+  two authors. Task 9 fixed the section it introduced; the principle ("index material does not
+  belong here") is enforced only there.
+- 🟡 **The source glossary's own synonyms are persisted NOWHERE but the unsplittable projection**
+  (`enrich.py` excludes them from `field_evidence` by design), so "why is this column findable" is
+  only half-answerable — a user sees the AI's terms, not the ones their own glossary supplied. And
+  `semantic_terms` is absent from `asset_detail._METADATA_FIELDS`, so there is no decision surface
+  and search terms can never wear a confirmed state. **Raised to the human as a PRODUCT concern.**

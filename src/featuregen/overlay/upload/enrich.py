@@ -6,6 +6,7 @@ import logging
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
@@ -2157,7 +2158,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     the distinct ``truncated``) instead of a laundered success. It also receives
     ``concept_critic`` — the acceptance hook's report (``_apply_concept_critic``; ``{"failed":
     True}`` when the contained critic faulted) — which ingest records as the
-    ``enrich_concept_critic`` stage.
+    ``enrich_concept_critic`` stage, plus ``concept_critic_started_at``, that stage's own start
+    instant (the critic runs INSIDE this function, so the concept stage's timer measures the
+    classifier and the critic together and can report neither on its own).
 
     ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
     dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
@@ -2251,6 +2254,14 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # reconstructed afterwards because `_apply_concept_critic` mutates `result` in place — once it
     # returns, the pre-critic namespace picture no longer exists anywhere.
     namespaces_before = namespace_histogram(result)
+    # The critic's OWN clock. It runs inside `enrich_concepts`, so `enrich_concept`'s stage timer
+    # covers the classifier too and cannot say what the critic cost; and unlike every batched stage
+    # the critic is a plain per-item loop with NO ceiling, NO deadline and no `not_attempted` (see
+    # `critique_concept_batch`), so on a wide catalog it is the longest unbounded thing in the run.
+    # Recorded on `stats` BEFORE the try, so a fault still leaves the stage a start time to report.
+    critic_started = datetime.now(UTC)
+    if stats is not None:
+        stats["concept_critic_started_at"] = critic_started
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(

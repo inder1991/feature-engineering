@@ -269,9 +269,13 @@ def test_the_classification_axes_are_egress_classified(db, v4, monkeypatch):
     # Each axis is pinned against the list it ACTUALLY belongs to, so this fails both if someone
     # drops an axis and if someone silently re-grades one (identity <-> prose): removing
     # `bian_path` from the identity list must NOT refuse the column, because it is not there.
+    # `sub_domain` moved identity -> prose at the final branch review (2026-08-09): it is the
+    # model's FREE-TEXT refinement of `domain`, drafted from a payload carrying uploader
+    # definitions, so at identity grade one echoed PII token killed the whole call.
     for attr, axes in (("_FEATURE_COLUMN_IDENTITY_KEYS",
-                        ("sub_domain", "table_role", "event_or_snapshot")),
-                       ("_FEATURE_COLUMN_PROSE_KEYS", ("bian_path", "process_path"))):
+                        ("table_role", "event_or_snapshot")),
+                       ("_FEATURE_COLUMN_PROSE_KEYS",
+                        ("sub_domain", "bian_path", "process_path"))):
         original = getattr(enrich_llm, attr)
         for axis in axes:
             monkeypatch.setattr(enrich_llm, attr, original - {axis})

@@ -105,17 +105,34 @@ def _worst_case_logical_call_seconds(timeout: float, max_tokens: int) -> float:
 @pytest.mark.parametrize(("key", "value"), sorted(_EXPECTED.items()))
 def test_the_manifest_ships_the_governed_value(config_map, key: str, value: str) -> None:
     """A config change with no test is how these revert. `FEATUREGEN_FEATURE_CONTEXT` in particular
-    is the switch that makes `_feature_schema_version()` return 4 and activates the entire v4
-    feature-generation payload — flipping it back is a functional change wearing a one-character
+    is the switch that makes `_feature_schema_version()` return the CURRENT default payload version
+    instead of the thin v1 menu — flipping it back is a functional change wearing a one-character
     diff."""
     assert config_map[key] == value
 
 
-def test_the_v3_rollback_lever_is_ABSENT_so_the_flag_means_v4(config_map) -> None:
-    """The D8 ladder: flag on + no version override = v4. If a `FEATUREGEN_FEATURE_CONTEXT_VERSION`
-    key ever appears in `data` it silently downgrades the contract this task exists to turn on, so
-    the key's ABSENCE is part of the configuration, not an accident of it."""
+def test_the_rollback_lever_is_ABSENT_so_the_flag_means_the_CURRENT_default(config_map) -> None:
+    """The D8 ladder: flag on + no version override = `_FEATURE_CONTEXT_SCHEMA_VERSION`, which is
+    5 since Task 6c (v4 plus the `grounding` output contract) and was 4 when this test was written.
+    If a `FEATUREGEN_FEATURE_CONTEXT_VERSION` key ever appears in `data` it silently downgrades the
+    contract, so the key's ABSENCE is part of the configuration, not an accident of it.
+
+    The default is asserted from the MODULE, never restated: a test that pinned "4" would have gone
+    stale the moment Task 6c moved the default, which is exactly how the manifest's own comment
+    came to describe a rollback lever that no longer existed."""
+    from featuregen.overlay.upload.feature_assist import (
+        _FEATURE_CONTEXT_SCHEMA_VERSION,
+        _SELECTABLE_CONTEXT_VERSIONS,
+    )
+
     assert "FEATUREGEN_FEATURE_CONTEXT_VERSION" not in config_map
+    # The manifest documents the ladder for an incident responder; a version the code cannot render
+    # would send them to a value that warns and falls back instead of rolling anything back.
+    manifest = _KIND_BACKEND.read_text(encoding="utf-8")
+    for version in _SELECTABLE_CONTEXT_VERSIONS:
+        assert f'"{version}"' in manifest, f"the ladder does not document v{version}"
+    assert f"default (v{_FEATURE_CONTEXT_SCHEMA_VERSION})" in manifest, (
+        "the manifest names a different default than feature_assist renders")
 
 
 # ── the arithmetic ───────────────────────────────────────────────────────────────────────────────
@@ -204,6 +221,27 @@ def test_the_call_ceiling_cannot_bind_before_the_wall_clock_does(config_map, mon
     assert b.max_provider_calls > worst_case, (
         f"{b.max_provider_calls} can bind at {worst_case} worst-case calls — enrichment would "
         f"truncate. Raise OVERLAY_ENRICH_MAX_PROVIDER_CALLS or lower the item caps.")
+
+
+def test_the_CODE_DEFAULT_is_the_ceiling_the_manifest_ships(config_map, monkeypatch) -> None:
+    """The mismatch this closes was real, not hypothetical (final branch review, 2026-08-09).
+
+    The manifest shipped 512 while `enrich_config` defaulted to 32, so which number bound a run
+    depended on whether an env var happened to be set — and Task 4b's
+    `_DEFAULT_MAX_ITEMS["definition"]` 8 -> 4 doubled that stage's chunk count, taking a 237-column
+    catalog to ~60 definition chunks against a default of 32. Every deployment that did not set the
+    variable (a dev box, a test harness, a second manifest) silently stopped enriching columns.
+
+    Asserting equality rather than "the default is large enough" is deliberate: the ceiling is
+    DERIVED from the item caps, so the two numbers must move together or the derivation belongs to
+    whichever copy the reader happened to open."""
+    from featuregen.overlay.upload import enrich_config
+
+    monkeypatch.delenv("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", raising=False)
+    assert (str(enrich_config.budget("concept").max_provider_calls)
+            == config_map["OVERLAY_ENRICH_MAX_PROVIDER_CALLS"]), (
+        "the code default and the deployed ceiling have drifted apart — an unset environment now "
+        "enriches a different number of columns than the cluster does")
 
 
 def test_the_ceiling_is_PER_STAGE_not_per_upload() -> None:

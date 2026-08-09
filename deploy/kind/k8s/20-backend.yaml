@@ -102,20 +102,28 @@ data:
   # FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated. Truthy set: 1/true/yes/on.
   # NOT AN APPROVAL RECORD: applying this ConfigMap IS the Release-A gate decision for the flag
   # below, and that decision has not been taken. This file states a value, never a sign-off.
-  # Richer feature-generation context (v4 payload). ON: feature generation receives the full
-  # semantic dossier — concept, definition, domain, ai_summary, semantic_terms, party_role,
+  # Richer feature-generation context (CURRENT DEFAULT: v5). ON: feature generation receives the
+  # full semantic dossier — concept, definition, domain, ai_summary, semantic_terms, party_role,
   # concept ancestry, identifier namespace, cross-catalog links — plus `semantic_authority`,
-  # the {field: "producer/strength"} map that makes an LLM proposal legible AS a proposal.
-  # Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION="3" drops to the shipped v3 payload
-  # WITHOUT falling back to the thin v1 menu.
+  # the {field: "producer/strength"} map that makes an LLM proposal legible AS a proposal, and
+  # (v5) every proposed feature returns `grounding`, its own account of which offered column it
+  # used. Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION below, NOT this switch — turning this
+  # off drops to the thin v1 menu.
   FEATUREGEN_FEATURE_CONTEXT: "1"
-  # THE v3 ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v4, the shared
-  # SemanticContextBundleV1 contract. Add `FEATUREGEN_FEATURE_CONTEXT_VERSION: "3"` here to fall
-  # back to the shipped v3 payload (smaller prompts, no concept ancestry / identifier namespace /
-  # party role / authority axes) WITHOUT dropping to the thin v1 menu, which is what turning
-  # FEATUREGEN_FEATURE_CONTEXT off would do — a functional regression dressed as a safety valve.
+  # THE ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v5
+  # (`feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION`), the shared SemanticContextBundleV1 payload
+  # PLUS the `grounding` output contract. Set `FEATUREGEN_FEATURE_CONTEXT_VERSION` here to fall
+  # back WITHOUT dropping to the thin v1 menu, which is what turning FEATUREGEN_FEATURE_CONTEXT off
+  # would do — a functional regression dressed as a safety valve. The ladder, in order of how much
+  # it gives up:
+  #   "4" — the rich v4 payload with NO returned grounding (the model is no longer asked which
+  #         column it used, so a proposal can no longer be checked against the menu it was offered);
+  #   "3" — the shipped v3 payload: smaller prompts, no concept ancestry / identifier namespace /
+  #         party role / authority axes, and no grounding.
   # Named here, commented, so an incident response edits a value instead of inventing a key: only
-  # "3" and "4" are honoured, and a typo warns and silently keeps v4.
+  # "3", "4" and "5" are honoured, and a typo warns and silently keeps the default (v5).
+  # DO NOT set "4" to "stay on the default" — since Task 6c the default is 5, and 4 silently drops
+  # the grounding output contract.
   # Dataset/catalog semantic profiles: profile API surfaces, upload narrative part, listing
   # display names — off ⟹ every new surface 404s and existing payloads stay byte-identical.
   FEATUREGEN_DATASET_PROFILES: "0"

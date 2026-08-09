@@ -324,11 +324,38 @@ def _int(name: str, default: int) -> int:
     return int(os.environ.get(name, default))
 
 
+#: The per-stage provider-call CEILING, and the ONE bound whose overrun costs COLUMNS rather than
+#: money: an item that alone exceeds the token budget still forms its own chunk, so every other
+#: bound degrades proportionally (more calls) while this one converts "more calls" into "stopped
+#: enriching".
+#:
+#: 512, DERIVED (Task 4b, offline — no live run was authorised): the widest catalog this repo
+#: exercises is 237 items, the ladder issues at most `max_batch_attempts` (2) per item plus
+#: `max_single_fallback` (8) per-item calls, so the degenerate one-item-per-chunk worst case is
+#: 237 x 2 + 8 = 482, and 512 is the next power of two above it.
+#:
+#: WHY THE CODE DEFAULT AND NOT ONLY THE MANIFEST (2026-08-09, final branch review). This was 32
+#: while `deploy/kind/k8s/20-backend.yaml` shipped 512, so the number that bound a run depended on
+#: whether an env var was set. That gap became a defect on this branch: Task 4b lowered
+#: `_DEFAULT_MAX_ITEMS["definition"]` 8 -> 4, doubling that stage's chunk count, so a 237-column
+#: catalog now needs ~60 definition chunks (a 144-column one ~36) where 237/8 ~ 30 used to fit
+#: under 32. Any deployment that did not set the variable — a dev box, a test harness, a second
+#: manifest — silently stopped enriching columns partway through. Raising the code default closes
+#: it at the source, and `test_deployment_llm_bounds.py` now pins default == manifest so the two
+#: cannot drift apart again.
+#:
+#: This is a COUNT bound, not a time bound. Raising it does not lengthen how long a stage may hold
+#: the source advisory lock — `stage_deadline_s()` and the derived wall-clock budget are what stop
+#: a runaway, and both are unchanged.
+DEFAULT_MAX_PROVIDER_CALLS = 512
+
+
 def budget(short: str) -> Budget:
     return Budget(
         max_batch_attempts=_int("OVERLAY_ENRICH_MAX_BATCH_ATTEMPTS", 2),
         max_single_fallback=_int("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", 8),
-        max_provider_calls=_int("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", 32),
+        max_provider_calls=_int("OVERLAY_ENRICH_MAX_PROVIDER_CALLS",
+                                DEFAULT_MAX_PROVIDER_CALLS),
         # DERIVED from the stage deadline, not a second hard-coded 240s. The docstring on
         # `stage_deadline_s` calls these "one coherent ceiling", and they were two independent env
         # vars that merely shared a default — so raising the deadline alone left this binding at
