@@ -361,14 +361,22 @@ def test_domain_is_prose_graded_like_the_taxonomy_paths(db, v4):
 
 def test_an_axis_longer_than_the_structural_bound_refuses_rather_than_truncates(db, v4):
     """Identity grade is an ACCEPTANCE gate, not a formatter: an over-long path is excluded, never
-    silently clipped into a different taxonomy path."""
+    silently clipped into a different taxonomy path.
+
+    [A.55, 2026-08-09] EXCLUDED now means the KEY is dropped rather than the whole payload
+    refused — `bian_path` is a facet (context ABOUT the column), so one over-long path no longer
+    costs feature generation for every other column. What this test pins is unchanged: the
+    over-long value is never clipped and never egresses."""
     from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
 
     _bank_graph(db)
     _with_classification_axes(db)
     payload = _column(db, "public.payments.tran_amt")
-    payload["bian_path"] = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
-    assert sanitize_feature_context({"columns": [payload]})[0] is None
+    over_long = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
+    payload["bian_path"] = over_long
+    out, *_ = sanitize_feature_context({"columns": [payload]})
+    assert "bian_path" not in out["columns"][0]      # excluded…
+    assert over_long not in json.dumps(out)          # …and never clipped into a shorter path
 
 
 def test_an_ai_proposed_axis_is_legible_as_a_proposal(db, v4):
@@ -428,11 +436,49 @@ def test_the_payload_carries_a_proposal_it_used_to_only_announce(db, v4):
     payload = _column(db, "public.payments.fee_amt")
     assert payload["semantic_authority"]["unit"] == "llm/proposed"
     assert payload["semantic_authority"]["currency"] == "llm/proposed"
-    assert payload["unit"] == {"value": None, "authority": "hint", "proposed_value": "currency"}
-    assert payload["currency"] == {"value": None, "authority": "hint", "proposed_value": "AED"}
+    # [F7] the proposal is captioned with ITS OWN producer, never the lead's.
+    assert payload["unit"] == {"value": None, "authority": "hint",
+                               "proposed_value": "currency",
+                               "proposed_authority": "llm/proposed"}
+    assert payload["currency"] == {"value": None, "authority": "hint",
+                                   "proposed_value": "AED",
+                                   "proposed_authority": "llm/proposed"}
     # A fact the operational read model DID answer carries no proposal key at all — the wrapper
     # every existing consumer reads is byte-identical to what it was.
     assert payload["additivity"] == {"value": "additive", "authority": "hint"}
+
+
+def test_the_proposal_names_ITS_OWN_producer_not_the_strongest_one(db, v4):
+    """[F7] `proposed_value` is ALWAYS the LLM's row — `for_feature_generation` looks it up by
+    `EvidenceProducer.LLM` — but `semantic_authority[field]` names the STRONGEST producer with
+    evidence for that field. So a field the LLM proposed AND a stronger producer also wrote sends
+    the model's own guess captioned with somebody else's name.
+
+    Task 9 fixed exactly this shape on the UI seam (the proposal branch takes its word from the LLM
+    label) and left the LLM seam, which is the one the generator reads. A model that believes a
+    guess carries `source/attested` authority weights it as a fact."""
+    _bank_graph(db)
+    ref = f"{_SRC}::public.payments.fee_amt"
+    from featuregen.overlay.upload.graph import add_column_row
+    add_column_row(db, _SRC, CanonicalRow(_SRC, "payments", "fee_amt", "numeric",
+                                          definition="Fee charged on the transaction."))
+    # The LLM proposes a unit; the SOURCE also has an (attested, stronger) row for the same field.
+    for producer, strength, value in (("llm", "proposed", "currency"),
+                                      ("source", "attested", "currency")):
+        record_field_evidence(
+            db, logical_ref=ref, field_name="unit", proposed_value=value,
+            producer=producer, strength=strength, producer_ref=f"{producer}-ref",
+            source_snapshot_id="snap",
+            input_hash=field_input_hash(logical_ref=ref, field_name="unit",
+                                        material=f"{value}:{producer}"))
+
+    payload = _column(db, "public.payments.fee_amt")
+    unit = payload["unit"]
+    assert unit.get("proposed_value") is not None, "no proposal to attribute — test is inert"
+    # The proposal must carry ITS OWN producer, whatever `semantic_authority` says the lead is.
+    assert unit["proposed_authority"] == "llm/proposed", (
+        f"the proposal is captioned with the lead producer: {unit} / "
+        f"semantic_authority={payload['semantic_authority'].get('unit')}")
 
 
 def test_a_fact_that_DID_resolve_never_carries_the_proposal_beside_it(db, v4):

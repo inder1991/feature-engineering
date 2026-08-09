@@ -301,6 +301,62 @@ def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
     assert got == {}   # unresolved, left uncached (retried next ingest)
 
 
+def test_a_fallback_rejection_is_ACCOUNTED_not_silently_dropped(db, monkeypatch):
+    """[F9] Task 9c's claim is "every rejection is attributable". It held on the BATCH path only.
+
+    `_account(res.outcomes)` has one call site, inside `process`. `_fallback` called
+    `_single_fallback`, kept `value` and dropped `status` — and `_single_fallback` had already
+    collapsed the acceptor's own reason code into a bare FALLBACK_FAILED one frame earlier. So an
+    item the batch missed, retried per-item, and REJECTED appeared in neither `rejects` nor
+    `outcomes`: it simply vanished, indistinguishable from one that was never attempted.
+
+    That is precisely the reading the run's `fallback_calls`-with-unexplained-`unresolved` question
+    needs (reading guide Q3), and it is the path a first live run exercises most."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "c", "type": "text"})]
+    client = FakeLLM()
+    # the batch returns nothing -> h1 falls through to the per-item fallback...
+    client.script(task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                  responses=[FakeResponse(output={"results": []})])
+    # ...which answers with a concept the acceptor refuses.
+    client.script(task=_CTASK, prompt_id="overlay_concept_v1",
+                  responses=[FakeResponse(output={"concept": "not_a_real_concept"})])
+    report: dict = {}
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None, report=report)
+
+    assert got == {}                                  # unchanged: still unresolved
+    assert report.get("rejects", {}).get("invalid_value") == 1, (
+        f"the fallback's rejection never reached the account: {report}")
+    # …under its OWN status, so a per-item refusal stays distinguishable from a batch one. (The
+    # batch's `missing` events are counted separately and are not what this test is about.)
+    assert report.get("outcomes", {}).get(eb.FALLBACK_FAILED) == 1, report
+
+
+def test_a_RESOLVED_fallback_is_not_counted_as_a_rejection(db, monkeypatch):
+    """The inverse, and the mistake the [F9] wiring invites: `_account` skips VALID, but a rescued
+    item carries FALLBACK_VALID. Routing fallbacks through the account without teaching it that
+    second success token would count every rescue as a reject — inverting the signal."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "c", "type": "text"})]
+    client = FakeLLM()
+    client.script(task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                  responses=[FakeResponse(output={"results": []})])
+    client.script(task=_CTASK, prompt_id="overlay_concept_v1",
+                  responses=[FakeResponse(output={"concept": "monetary_stock"})])
+    report: dict = {}
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None, report=report)
+
+    assert got == {"h1": "monetary_stock"}            # the fallback RESCUED it
+    assert eb.FALLBACK_VALID not in report.get("outcomes", {}), report
+    assert "valid" not in report.get("rejects", {}), report
+
+
 def test_enrich_concepts_batch_mode_caches_valid_only(db, monkeypatch):
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric"),

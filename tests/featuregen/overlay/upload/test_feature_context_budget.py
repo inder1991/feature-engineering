@@ -22,6 +22,8 @@ from __future__ import annotations
 import pytest
 from tests.featuregen._helpers import mint_test_identity
 
+from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload import feature_assist as fa
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.feature_assist import (
@@ -33,6 +35,8 @@ from featuregen.overlay.upload.feature_assist import (
     select_relevant_context,
 )
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.semantic_context import normalize_ref
+from featuregen.overlay.upload.source_profile import FTR_GLOSSARY_PROFILE, strength_for
 
 ACTOR = mint_test_identity(subject="user:owner", role_claims=("data_owner",))
 
@@ -60,6 +64,106 @@ def wide_catalogs(db, synthetic_ftr_upload):
     db.execute("UPDATE graph_node SET entity = 'customer' WHERE kind = 'column' "
                "AND catalog_source IN ('budget_ftr', 'budget_cib')")
     return db
+
+
+#: A realistic value for each field the readiness wave / branch added but the `wide_catalogs`
+#: fixture leaves EMPTY. Sized like the real thing — an FTR taxonomy path, a screening sub-domain,
+#: a shortlist of concept alternatives — because the point is to measure bytes, not to prove a key
+#: exists.
+_SATURATION = {
+    "sub_domain": "Sanctions Screening and Adverse Media",
+    "bian_path": "BIAN > Party Reference Data Directory > Party Routing Profile",
+    "process_path": "Onboarding > KYC Refresh > Periodic Review",
+    "fibo_path": "FIBO > FND > Relations > Relations > hasLegalName",
+    "related_terms": "obligor exposure, credit exposure, counterparty exposure, net exposure",
+    "table_role": "fact",
+    "event_or_snapshot": "event",
+}
+
+
+@pytest.fixture
+def saturated_catalogs(wide_catalogs):
+    """`wide_catalogs` with EVERY field the branch added actually populated, through the same
+    writers the real pipeline uses.
+
+    WHY THIS FIXTURE EXISTS. `wide_catalogs` leaves 8 of the 11 added fields at exactly 0, so the
+    pinned pair below measured a catalog thinner than any real one — and the gap was not theoretical:
+    F7's `proposed_authority` subkey grew the payload and
+    `test_the_floor_rose_by_exactly_what_the_payload_rose_by` passed COMPLETELY UNCHANGED, because
+    the field it sits beside is empty here. A payload change went straight through the one test whose
+    job is to notice payload changes.
+
+    Writers, not fabrication: the projection columns take the same `UPDATE graph_node` that
+    `resolve_and_project` performs, the source fields take `record_field_evidence` under the FTR
+    glossary profile exactly as `ingest._write_glossary_source_evidence` does, and the LLM proposal
+    takes an `llm/proposed` evidence row on `_MEASURE_ANNOTATION` fields — the one shape that
+    produces `proposed_value` + `proposed_authority` by design.
+    """
+    conn = wide_catalogs
+    conn.execute(
+        "UPDATE graph_node SET sub_domain = %s, bian_path = %s, process_path = %s, fibo_path = %s "
+        "WHERE kind = 'column' AND catalog_source IN ('budget_ftr', 'budget_cib')",
+        (_SATURATION["sub_domain"], _SATURATION["bian_path"],
+         _SATURATION["process_path"], _SATURATION["fibo_path"]))
+    conn.execute(
+        "UPDATE graph_node SET table_role = %s, event_or_snapshot = %s "
+        "WHERE kind = 'table' AND catalog_source IN ('budget_ftr', 'budget_cib')",
+        (_SATURATION["table_role"], _SATURATION["event_or_snapshot"]))
+
+    # The SCHEMA-PRESERVING logical ref, NOT `graph_node.object_ref` (which is public-flattened).
+    # `feature_assist` documents this exact trap: the adjudication lookup keyed on the flattened
+    # form matched no row, so every column came back unadjudicated and "the feature would look
+    # implemented". An evidence write keyed on the wrong form fails the same silent way — the
+    # `related_terms` count in the saturation assertion below is what catches it.
+    refs = [normalize_ref(src, schema or None, table, column) for src, schema, table, column
+            in conn.execute(
+                "SELECT catalog_source, schema_name, table_name, column_name FROM graph_node "
+                "WHERE kind = 'column' AND catalog_source IN ('budget_ftr', 'budget_cib') "
+                "ORDER BY object_ref").fetchall()]
+    for ref in refs:
+        # SOURCE curated vocabulary — the glossary reader's own field and profile.
+        record_field_evidence(
+            conn, logical_ref=ref, field_name="related_terms",
+            proposed_value=_SATURATION["related_terms"],
+            producer="source", strength=strength_for(FTR_GLOSSARY_PROFILE, "related_terms"),
+            producer_ref="budget-saturation", source_snapshot_id="snap",
+            input_hash=field_input_hash(logical_ref=ref, field_name="related_terms",
+                                        material=f"{_SATURATION['related_terms']}:source"))
+        # The LLM's answer on a field its policy EXCLUDES it from winning (`_MEASURE_ANNOTATION`),
+        # which is exactly the state that emits `proposed_value` + `proposed_authority`.
+        for field_name, value in (("unit", "currency"), ("currency", "AED")):
+            record_field_evidence(
+                conn, logical_ref=ref, field_name=field_name, proposed_value=value,
+                producer="llm", strength="proposed", producer_ref="budget-saturation",
+                source_snapshot_id="snap",
+                input_hash=field_input_hash(logical_ref=ref, field_name=field_name,
+                                            material=f"{value}:llm"))
+
+    # Adjudication — `confidence_band` + `concept_alternatives` come from the 1046 current pointer,
+    # so they need the REAL adjudication writer, not a hand-written row. One scripted answer drives
+    # all 237: the shortlist length is what costs bytes, and a realistic shortlist is short.
+    from featuregen.overlay.upload import semantic_adjudication as adj
+    # The concept/shape pair must SURVIVE `shape_conflicts`, which re-runs on read: a `branch_id`
+    # verdict on a "Branch description" column is the deterministic conflict the critic exists to
+    # refute, and adjudications that fail re-validation land on ~5% of columns instead of all of
+    # them — which would understate the bytes exactly the way this fixture exists to stop.
+    answer = {"selected_concept": "customer_id",
+              "alternatives": ["counterparty_id", "bank_bic", "account_id"],
+              "confidence_band": "medium",
+              "reason_codes": ["name_only_signal"],
+              "missing_context": ["definition_missing"]}
+    client = FakeLLM(script={adj.SEMANTIC_ADJUDICATION_TASK: FakeResponse(output=answer)})
+    targets = [
+        adj.AdjudicationTargetV1(
+            candidate=adj.AdjudicationCandidateV1(
+                logical_ref=ref, column_name=ref.rsplit(".", 1)[-1],
+                declared_type="varchar(20)",
+                definition="Customer master identifier for the party.", concept=None),
+            selection_reasons=("unclassified_column",), context=None)
+        for ref in refs
+    ]
+    adj.adjudicate_targets(conn, client, targets, catalog_revision="budget-rev", actor=ACTOR)
+    return conn
 
 
 def _candidates(conn):
@@ -296,7 +400,7 @@ def test_the_floor_rose_by_exactly_what_the_payload_rose_by(wide_catalogs, monke
     record_property("floor_before", floor_before)
     record_property("floor_now", floor_now)
     # The reconstructed baselines, pinned so the prose above is checkable and not remembered.
-    assert (floor_before, untrimmed_before) == (206_010, 250_982), (
+    assert (floor_before, untrimmed_before) == (215_507, 260_479), (
         f"reconstructed baseline moved: floor {floor_before}, payload {untrimmed_before}")
     assert not set(_TASK_7B_COLUMN_KEYS) & set(fa._V4_TRIM_ORDER), (
         "a Task-7b key became trimmable — the equality below no longer has to hold, and the "
@@ -304,7 +408,13 @@ def test_the_floor_rose_by_exactly_what_the_payload_rose_by(wide_catalogs, monke
     assert floor_now - floor_before == untrimmed_now - untrimmed_before, (
         f"floor +{floor_now - floor_before} vs payload "
         f"+{untrimmed_now - untrimmed_before}: impossible while nothing added is sheddable")
-    assert (floor_now, untrimmed_now) == (214_433, 259_405), (
+    # RE-MEASURED 2026-08-09 (readiness wave): `fibo_path` reached the payload for the first
+    # time (migration 1058 gave it a `graph_node` column; it had SOURCE evidence and nowhere
+    # to land), so BOTH sides rose by exactly 9_497 on the 126 FTR glossary columns that
+    # carry one. Baseline 206_010/250_982 -> 215_507/260_479, current 214_433/259_405 ->
+    # 223_930/268_902. The equal-delta invariant above is what proves the rise is a new
+    # un-sheddable field rather than a trim-policy change.
+    assert (floor_now, untrimmed_now) == (223_930, 268_902), (
         f"re-measure and re-pin: floor {floor_now}, payload {untrimmed_now}")
 
 
@@ -445,3 +555,77 @@ def test_measured_cost_of_the_grain_and_as_of_status_block(wide_catalogs, record
     assert ai_both // len(tables) < 200
     # …and it is negligible against the budget — the real ratio, not a comfortable-sounding one.
     assert ai_both < FEATURE_CONTEXT_BYTE_BUDGET // 3_000
+
+
+# ── the SATURATED measurement (readiness wave) ───────────────────────────────────────────────────
+
+
+def test_the_saturation_fixture_ACTUALLY_populates_what_it_claims(saturated_catalogs, monkeypatch):
+    """A saturation fixture that quietly stops saturating is worse than none — it would pin a
+    confident number for a catalog as thin as the one it replaced. So the COVERAGE is asserted
+    before the bytes are.
+
+    Two of these counts are deliberately not 237, and both are product facts rather than fixture
+    defects:
+
+    * `confidence_band` / `concept_alternatives` are capped by `adjudication_bounds()`
+      (`max_provider_calls`, shipped at 12) — adjudication is the EXCEPTION path, so these can
+      never scale with catalog width no matter how unclear the catalog is;
+    * `relationships` (and its `outbound_cardinality`) needs cross-catalog LINK rows, a different
+      subsystem this fixture does not stand up — the one field still measured at zero, recorded
+      rather than faked.
+    """
+    from featuregen.overlay.upload.semantic_adjudication import adjudication_bounds
+
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
+    cols = _candidates(saturated_catalogs)
+    columns = [fa._context_column(saturated_catalogs, c, roles=()) for c in cols]
+
+    def present(key: str) -> int:
+        return sum(1 for c in columns if c.get(key) not in (None, "", [], {}))
+
+    for key in ("sub_domain", "bian_path", "process_path", "fibo_path", "related_terms"):
+        assert present(key) == 237, f"{key} saturates {present(key)}/237"
+    # F7's subkeys — the pair whose emptiness let a real payload change through this file unnoticed.
+    for key in ("unit", "currency"):
+        assert sum(1 for c in columns
+                   if c[key].get("proposed_value") is not None) == 237, f"{key}.proposed_value"
+        assert sum(1 for c in columns
+                   if c[key].get("proposed_authority") is not None) == 237, f"{key}.proposed_authority"
+    assert present("confidence_band") == adjudication_bounds().max_provider_calls
+    assert present("concept_alternatives") == adjudication_bounds().max_provider_calls
+    assert present("relationships") == 0          # the one honest remaining zero
+
+
+def test_the_SATURATED_catalog_is_measured_and_still_clears_the_budget(saturated_catalogs,
+                                                                       monkeypatch):
+    """The number `wide_catalogs` could not produce, and the reason this fixture exists.
+
+    The un-saturated pair (214_433 / 259_405) measures a catalog with 8 of the branch's 11 added
+    fields at exactly 0, so it was a narrower guarantee than its name suggested — proven when F7's
+    `proposed_authority` grew the payload and
+    `test_the_floor_rose_by_exactly_what_the_payload_rose_by` passed COMPLETELY UNCHANGED, because
+    the field it sits beside was empty here.
+
+    The handover's "measured if all populate" figures (payload 313_197, floor 268_225) were never
+    pinned by anything and are BOTH LOW — the real saturated payload is ~29% above the first and the
+    floor ~34% above the second. They came from a gitignored report, the same provenance that made
+    `171_347` and `203_629` wrong. These two numbers replace them and are asserted, so they cannot
+    rot the same way.
+    """
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, "4")
+    cols = _candidates(saturated_catalogs)
+    columns = [fa._context_column(saturated_catalogs, c, roles=()) for c in cols]
+    payload = _assembled_bytes(columns, _table_context(cols))
+    floor = _assembled_bytes([fa._trimmed(c, len(fa._V4_TRIM_ORDER)) for c in columns],
+                             _table_context(cols))
+
+    assert (floor, payload) == (360_891, 405_863), (
+        f"the saturated measurement moved: floor {floor}, payload {payload}. Re-derive the rungs in "
+        "`feature_assist.FEATURE_CONTEXT_BYTE_BUDGET`'s note and update A.58 in the SAME change — "
+        "that comment is the one an operator reads.")
+    # Still comfortably inside the budget: saturation costs ~56% more than the sparse fixture and
+    # is STILL ~3.7x under. The budget remains a runaway backstop, not a working constraint.
+    assert payload < FEATURE_CONTEXT_BYTE_BUDGET * 0.3

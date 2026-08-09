@@ -271,6 +271,10 @@ _POLICIES: dict[str, FieldPolicy] = {
     # shape as every other curated glossary scalar: shown, human-correctable, never load-bearing.
     "bian_path": _GLOSSARY_TERM,
     "process_path": _GLOSSARY_TERM,
+    # The THIRD path from the same sidecar (migration 1058). It was captured as SOURCE evidence
+    # exactly like the two above and then had no policy and no column, so it resolved nowhere —
+    # invisible precisely BECAUSE its siblings worked.
+    "fibo_path": _GLOSSARY_TERM,
     # D13.2 — the LLM-proposed FINER classification axis beside the coarse source `domain`. The
     # SAME `_MEANING` policy `domain` carries, deliberately: recommendation tier (never load-
     # bearing however strong the evidence), lenient display so an `llm/proposed` value is visible

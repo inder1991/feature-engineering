@@ -314,6 +314,28 @@ def test_the_prompt_and_the_gate_AGREE_about_shape() -> None:
         "still refuses — a model must never be asked for output the gate discards")
 
 
+def test_the_prompt_and_the_gate_AGREE_about_LENGTH_not_just_shape() -> None:
+    """[F10] The length counterpart of the shape test above, and the sharper of the two.
+
+    A `maxLength` CANNOT reach the model: `schema_projection.PROVIDER_UNSUPPORTED_KEYWORDS` strips it
+    from the wire because Anthropic's `json_schema` output format rejects it — while
+    `validate_output` still checks it against the response. So every schema length bound in this
+    module is invisible to the model that has to satisfy it, and the only channel left is the
+    INSTRUCTION.
+
+    `_SYN_INSTRUCTION` asks for "15 to 20 terms" and states no length at all. Twenty business
+    aliases at ~50 chars each sit exactly at the 1000-char cap, so the ask was widened ~5x against a
+    bound nobody told the model — and the failure is not graceful: the schema half fails the WHOLE
+    CHUNK (see this module's header), taking every sibling column's good synonyms with it.
+
+    DERIVED from `_MAX_SYNONYMS_LEN`, never restated — a hard-coded "1000" here would go stale the
+    moment the cap moves, which is the exact defect this file exists to catch."""
+    assert str(enrich._MAX_SYNONYMS_LEN) in enrich._SYN_INSTRUCTION, (
+        "the synonyms instruction never states its character budget, and the schema `maxLength` "
+        "that would have enforced it is stripped before the request leaves — so the model is being "
+        "asked to satisfy a bound it is never told")
+
+
 def test_an_accepted_definition_survives_every_consumer_at_the_new_length() -> None:
     """Traced before raising: nothing downstream re-bounds an accepted definition BELOW the gate.
 

@@ -244,6 +244,25 @@ def test_the_CODE_DEFAULT_is_the_ceiling_the_manifest_ships(config_map, monkeypa
         "enriches a different number of columns than the cluster does")
 
 
+def test_the_CODE_DEFAULT_timeout_is_the_one_the_manifest_ships(config_map) -> None:
+    """The SECOND half of the drift class `test_the_CODE_DEFAULT_is_the_ceiling_the_manifest_ships`
+    closed. That test pinned `OVERLAY_ENRICH_MAX_PROVIDER_CALLS` default == manifest; the timeout
+    was left at 60s in code against the manifest's 300, so which clock bound a run still depended on
+    whether an env var happened to be set.
+
+    Why it matters more here than a bare number suggests: the manifest's own comment (20-backend.yaml
+    line 27) records that `FEATUREGEN_LLM_MAX_TOKENS=32000` with adaptive thinking at `effort=high`
+    means "a slow call dies at 60s". 4096+60 and 32000+300 are each COHERENT PAIRS; the failure is a
+    MIXED pair, which is exactly what an environment that applies one half of the manifest gets. A
+    dev box or test harness inheriting the 60s code default while anything raises max_tokens fails
+    its chunks outright instead of retrying — the §6 behaviour change, still live."""
+    from featuregen.intake.llm_claude import ClaudeConfig
+
+    assert str(int(ClaudeConfig().timeout)) == config_map["FEATUREGEN_LLM_TIMEOUT"], (
+        "the code default and the deployed per-call clock have drifted apart — an unset "
+        "environment gives a slow call a different ceiling than the cluster does")
+
+
 def test_the_ceiling_is_PER_STAGE_not_per_upload() -> None:
     """The arithmetic above is only sound if each stage gets its own ledger. `run_batched` builds
     `CallLedger(b.max_provider_calls)` per invocation unless a caller passes a shared one (only Pass

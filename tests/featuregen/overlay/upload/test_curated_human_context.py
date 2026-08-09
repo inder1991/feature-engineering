@@ -657,3 +657,34 @@ def _term_evidence(db, table: str, column: str, value: str) -> None:
         producer_ref="test", source_snapshot_id="snap",
         input_hash=field_input_hash(logical_ref=ref, field_name="business_term",
                                     material=f"{value}:source:attested"))
+
+
+# ── the LAST gap: fibo_path at the feature seam (readiness wave, migration 1058) ──────────────────
+
+
+def test_fibo_path_reaches_the_feature_payload_like_its_two_siblings():
+    """The final `UNCARRIED_GAPS` entry, asserted on a VALUE rather than on the field's name.
+
+    The handover called closing this "one line to close" — the `_FEATURE_COLUMN_PROSE_KEYS` grade.
+    It was six: `fibo_path` had NO `graph_node` column (1051 added `bian_path`/`process_path`/
+    `sub_domain` and not it), no field policy and no projection, so there was nothing for the grade
+    to carry. It was invisible precisely BECAUSE its two siblings from the same sidecar worked —
+    all three are captured identically as SOURCE evidence by the glossary reader, and only these
+    two had somewhere to land."""
+    payload = for_feature_generation(fully_populated_bundle())
+    assert payload["fibo_path"] == sentinel("fibo_path")
+    # …and it travels beside the siblings it was always meant to, not on some private path.
+    assert payload["bian_path"] == sentinel("bian_path")
+    assert payload["process_path"] == sentinel("process_path")
+
+
+def test_fibo_path_is_prose_graded_so_an_unredacted_source_value_is_scanned():
+    """Its origin (`glossary_reader`) is uploader text, so the grade is the point of the whole
+    exercise: without a `_FEATURE_COLUMN_PROSE_KEYS` entry the key is UNCLASSIFIED and fails the
+    column closed; with the wrong (structural) grade it would egress unscanned."""
+    payload = {"columns": [{"object_ref": "x",
+                            "fibo_path": "FIBO > Contracts > owner jane.doe@bank.example"}]}
+    out, pii_spans, _sa, _v = sanitize_feature_context(payload)
+    assert out is not None, "fibo_path is not classified — it fails the whole column closed"
+    assert "jane.doe@bank.example" not in out["columns"][0]["fibo_path"]
+    assert any(s["key"] == "columns[0].fibo_path" for s in pii_spans)

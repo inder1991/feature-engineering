@@ -164,8 +164,14 @@ def chunk_items(items: list[BatchItem], *, max_items: int,
 def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchItem, shared_metadata,
                      accept, actor, ref_aware: bool = False,
                      prompt_version: int = 1, schema_version: int = 1,
-                     dispatch_audit: DispatchAuditContext | None = None) -> tuple[str | None, str]:
-    """One per-item fallback through the existing single seam. Returns (value|None, status).
+                     dispatch_audit: DispatchAuditContext | None = None) -> BatchItemOutcome:
+    """One per-item fallback through the existing single seam. Returns a `BatchItemOutcome`.
+
+    [F9] It returned `(value|None, status)` and collapsed the acceptor's own reason code into a bare
+    `FALLBACK_FAILED`, one frame before `_fallback` dropped the status too — so a per-item retry the
+    acceptor refused was accounted NOWHERE, and Task 9c's "every rejection is attributable" held on
+    the batch path only. Returning the same outcome type the batch path produces lets the ONE
+    `_account` seam see both, with the acceptor's rule and the raw length intact.
 
     A ``ref_aware`` (structured) task has NO single-call fallback in Phase 2: the flat single schema
     carries no ``synthesis`` wrapper and the ref-aware ``accept`` needs ``(raw, ref)``, so the item is
@@ -178,7 +184,7 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
     ``dispatch_audit`` (C5-T5): the run's per-ITEM context (this one item's subject), so a batch that
     degrades to the single seam stays run+subject attributed; ``None`` is byte-identical."""
     if ref_aware:
-        return None, MISSING
+        return BatchItemOutcome(item.ref, MISSING, None, (MISSING,))
     from featuregen.overlay.upload.enrich_llm import audited_enrich_call  # lazy (import cycle)
     single_prompt = task.rsplit(".", 1)[-1]   # concept|definition|domain
     raw = audited_enrich_call(
@@ -192,9 +198,15 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
         # so those fallback calls reuse it too rather than re-billing it each time.
         cacheable_metadata_keys=tuple(shared_metadata))
     if raw is None:
-        return None, FALLBACK_FAILED
-    value, _reason = accept(raw)
-    return (value, FALLBACK_VALID) if value is not None else (None, FALLBACK_FAILED)
+        # The call was ISSUED and produced no usable answer — distinct from a rejection, and from
+        # an item never attempted. `value_len` is None because there is nothing to measure.
+        return BatchItemOutcome(item.ref, FALLBACK_FAILED, None, ("fallback_no_answer",))
+    value, reason = accept(raw)
+    if value is None:
+        # The acceptor's OWN rule (`over_length` / `enumeration` / `invalid_value` / ...), carried
+        # through with the raw length beside it — the same diagnosis the batch path records.
+        return BatchItemOutcome(item.ref, FALLBACK_FAILED, None, (reason,), len(raw))
+    return BatchItemOutcome(item.ref, FALLBACK_VALID, value, (VALID,), len(raw))
 
 
 def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_id: str,
@@ -333,7 +345,10 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         if report is None:
             return
         for o in outcomes:
-            if o.status == VALID:
+            # [F9] FALLBACK_VALID is a SUCCESS — the per-item retry resolved the item. It joins
+            # VALID here or every rescued item would be counted as a rejection, inverting the
+            # signal this account exists to give.
+            if o.status in (VALID, FALLBACK_VALID):
                 continue
             # The keys are created LAZILY, on the first rejection. An empty `outcomes: {}` on a
             # clean run is not information — and it costs the reader the one cheap signal worth
@@ -433,13 +448,13 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             ledger.charge()          # one per-item call, reserved before it is issued (as before)
             counters.incr(f"overlay.enrich.{short}.batch.single_fallback")
             try:
-                value, status = _single_fallback(conn, client, task=task, out_key=out_key,
-                                                  instruction=instruction, item=it,
-                                                  shared_metadata=shared_metadata, accept=accept,
-                                                  actor=actor, ref_aware=ref_aware,
-                                                  prompt_version=prompt_version,
-                                                  schema_version=schema_version,
-                                                  dispatch_audit=_ctx_for([it]))
+                outcome = _single_fallback(conn, client, task=task, out_key=out_key,
+                                           instruction=instruction, item=it,
+                                           shared_metadata=shared_metadata, accept=accept,
+                                           actor=actor, ref_aware=ref_aware,
+                                           prompt_version=prompt_version,
+                                           schema_version=schema_version,
+                                           dispatch_audit=_ctx_for([it]))
             except SchemaUnregisteredError:
                 # The FALLBACK's (schema_id, version) pair is unregistered (a version bumped
                 # without a body) — raised at dispatch, BEFORE any provider call, and
@@ -453,8 +468,13 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
                 schema_unregistered = True
                 continue
-            if value is not None:
-                resolved[it.ref] = value
+            # [F9] BOTH dispositions go through the ONE account seam. `_account` skips VALID by
+            # design, so a resolved fallback still costs nothing; a REFUSED one now carries its
+            # rule and length into `rejects`/`outcomes` and the greppable `enrich_reject` line,
+            # instead of vanishing and leaving `fallback_calls` beside an unexplained `unresolved`.
+            _account([outcome])
+            if outcome.value is not None:
+                resolved[it.ref] = outcome.value
 
     deadline_start = now()
     planned = chunk_items(items, max_items=max_items, max_input_tokens=max_tokens)

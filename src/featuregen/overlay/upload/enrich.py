@@ -41,7 +41,7 @@ from featuregen.overlay.upload.concepts import (
 )
 from featuregen.overlay.upload.concepts import concept as concept_record
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
-from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
+from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
     MAX_DEFINITION_LEN,
@@ -1767,7 +1767,9 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
                           by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
                           rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor,
                           bundles: dict[str, SemanticContextBundleV1] | None = None,
-                          critic_outcomes: dict[str, dict] | None = None) -> dict:
+                          critic_outcomes: dict[str, dict] | None = None,
+                          call_ledger: CallLedger | None = None,
+                          deadline_s: float | None = None) -> dict:
     """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
     concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
     ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
@@ -1864,8 +1866,12 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     # stored critique for free, while any content change re-asks the affected questions.
     catalog_revision = hashlib.sha256(
         json.dumps(sorted(by_hash)).encode("utf-8")).hexdigest()[:16]
+    # [A.54] The bound. `not_attempted`/`stopped_by` land on the report so the stage can say
+    # `truncated` rather than a laundered `succeeded` over a run that criticised a fraction of
+    # its columns. A skipped item ABSTAINS — the classifier's concept stands, un-refuted.
     outcomes = critique_concept_batch(
-        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor)
+        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor,
+        call_ledger=call_ledger, deadline_s=deadline_s, stats=report)
     corrections: list[tuple[str, str]] = []
     for ref, outcome in outcomes.items():
         h = ref_to_hash.get(ref)
@@ -2194,6 +2200,13 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     miss_hashes = [h for h in by_hash if h not in result]
     resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (a MISS only)
 
+    # [A.54] ONE ledger for the WHOLE concept stage. `run_batched` would build its own, which is
+    # correct only while every provider call of the stage is issued by the ladder — and the critic
+    # below issues up to two more PER IDENTIFIER COLUMN from outside it. Sharing the ledger is
+    # exactly what `CallLedger` prescribes, and what stops the critic spending a ceiling it was
+    # never counted against. Built unconditionally so BOTH modes hand the critic the same object.
+    stage_ledger = CallLedger(enrich_config.budget("concept").max_provider_calls)
+    stage_deadline = enrich_config.stage_deadline_s()
     if enrich_config.mode("concept") == "batch":
         misses = [BatchItem(h, payload_by_hash[h]) for h in miss_hashes]
         # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
@@ -2207,8 +2220,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor,
-            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
-            report=batch_report,
+            deadline_s=stage_deadline,                     # MF-4 — bound the source-lock hold
+            call_ledger=stage_ledger, report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_concept",
             dispatch_subjects=({h: _column_subject(by_hash[h]) for h in miss_hashes}
                                if ingestion_run_id is not None else None))
@@ -2255,9 +2268,13 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # returns, the pre-critic namespace picture no longer exists anywhere.
     namespaces_before = namespace_histogram(result)
     # The critic's OWN clock. It runs inside `enrich_concepts`, so `enrich_concept`'s stage timer
-    # covers the classifier too and cannot say what the critic cost; and unlike every batched stage
-    # the critic is a plain per-item loop with NO ceiling, NO deadline and no `not_attempted` (see
-    # `critique_concept_batch`), so on a wide catalog it is the longest unbounded thing in the run.
+    # covers the classifier too and cannot say what the critic cost.
+    #
+    # [A.54, fixed 2026-08-09] It is no longer unbounded. The critic now shares this stage's
+    # `stage_ledger` and `stage_deadline`, and an item either bound skipped ABSTAINS with a
+    # `skipped_reason` — the classifier's concept stands un-refuted — while `not_attempted` /
+    # `stopped_by` land on the critic report. The clock below still matters: the deadline is
+    # checked BEFORE each item and cannot interrupt a call already in flight.
     # Recorded on `stats` BEFORE the try, so a fault still leaves the stage a start time to report.
     critic_started = datetime.now(UTC)
     if stats is not None:
@@ -2267,7 +2284,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             critic_report = _apply_concept_critic(
                 conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
                 rec_by_tc=rec_by_tc, actor=actor, bundles=bundles,
-                critic_outcomes=critic_outcomes)
+                critic_outcomes=critic_outcomes,
+                call_ledger=stage_ledger, deadline_s=stage_deadline)
     except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
         logger.warning("advisory concept critic failed", exc_info=True)
         # The savepoint rolled the critic's writes back, so its per-ref verdicts describe state
@@ -2713,6 +2731,12 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
 # its dedupe key. The `_accept_single_line` gate below refuses that shape, and an instruction must
 # never ask for output the gate discards — so asking for MORE terms must never become asking for a
 # term per line.
+# [F10] The character budget is INTERPOLATED from `_MAX_SYNONYMS_LEN`, never typed as a literal.
+# A schema `maxLength` cannot carry this bound to the model: `schema_projection` strips it from the
+# wire (Anthropic's `json_schema` format rejects it) while `validate_output` still checks it on the
+# response — so the instruction is the ONLY channel the bound has, and an over-run fails the whole
+# chunk rather than one item. Asking for "15 to 20 terms" without a length put ~20 x ~50 chars right
+# at the cap. Pinned by `test_the_prompt_and_the_gate_AGREE_about_LENGTH_not_just_shape`.
 _SYN_INSTRUCTION = (
     "List the business SYNONYMS and common aliases for EACH column — the other names a business "
     "user would search for it by. Give 15 to 20 terms where the evidence supports them; give fewer "
@@ -2720,7 +2744,10 @@ _SYN_INSTRUCTION = (
     "its business definition — the definition is usually the richest source of aliases, so read it. "
     "If the concept is the literal value 'unclassified', ignore it: it is the absence of a "
     "classification, not a hint. Return ONE comma-separated line per item, terms only, no "
-    "explanation. Treat each item independently; return exactly one result per input ref.")
+    f"explanation. HARD LIMIT: the line for each item must be at most {_MAX_SYNONYMS_LEN} "
+    "characters INCLUDING the separators — if the terms you have would exceed it, return fewer "
+    "terms rather than a longer line, keeping the ones a business user is most likely to search "
+    "for. Treat each item independently; return exactly one result per input ref.")
 
 
 def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,

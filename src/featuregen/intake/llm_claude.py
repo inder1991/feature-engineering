@@ -36,6 +36,21 @@ from featuregen.intake.schema_projection import project_for_anthropic
 logger = logging.getLogger(__name__)
 
 
+#: The per-call wall-clock ceiling, in seconds. RAISED 60 -> 300 (2026-08-09) to close the second
+#: half of the drift class that `enrich_config.DEFAULT_MAX_PROVIDER_CALLS` closed: the manifest
+#: shipped 300 while this defaulted to 60, so which clock bound a run depended on whether an env var
+#: happened to be set.
+#:
+#: THE PAIR IS THE UNIT, not this number. `FEATUREGEN_LLM_MAX_TOKENS` and this timeout are coupled —
+#: 4096+60 and 32000+300 are each coherent, and the manifest's own note records that 32000 with
+#: adaptive thinking at effort=high means "a slow call dies at 60s". The dangerous configuration is
+#: a MIXED pair, which is what an environment applying half the manifest gets. Raising this default
+#: makes the unconfigured case fail in the SAFE direction (a slow call gets the time the cluster
+#: gives it) at the cost of a longer worst-case lock hold, which
+#: `test_the_stage_deadline_CANNOT_bound_a_call_already_in_flight` already pins and documents.
+DEFAULT_LLM_TIMEOUT_S = 300.0
+
+
 @dataclass(frozen=True)
 class ClaudeConfig:
     enabled: bool = False
@@ -48,8 +63,9 @@ class ClaudeConfig:
     # PHYSICAL attempt — and because `_SDK_MAX_RETRIES` is 0 it is also the entire wall clock of one
     # `messages.create`, so the ceiling an operator configures is the ceiling that elapses. The
     # driver's bounded repair/retry budget (§9.2) is the only retry layer above it.
-    # Default 60s (env FEATUREGEN_LLM_TIMEOUT); the kind deployment sets 300.
-    timeout: float = 60.0
+    # Default `DEFAULT_LLM_TIMEOUT_S` (env FEATUREGEN_LLM_TIMEOUT), pinned EQUAL to the manifest by
+    # `test_the_CODE_DEFAULT_timeout_is_the_one_the_manifest_ships`.
+    timeout: float = DEFAULT_LLM_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> ClaudeConfig:
@@ -59,7 +75,7 @@ class ClaudeConfig:
             max_tokens=int(os.environ.get("FEATUREGEN_LLM_MAX_TOKENS", "4096")),
             thinking=os.environ.get("FEATUREGEN_LLM_THINKING", "adaptive"),
             effort=os.environ.get("FEATUREGEN_LLM_EFFORT", "high"),
-            timeout=float(os.environ.get("FEATUREGEN_LLM_TIMEOUT", "60")),
+            timeout=float(os.environ.get("FEATUREGEN_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_S))),
         )
 
 

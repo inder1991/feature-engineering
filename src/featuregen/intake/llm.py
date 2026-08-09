@@ -208,7 +208,31 @@ class StructuredCallOutcome:
     provider_calls: int = 1
 
 
+def _accrue(total: dict, resp: LLMResult) -> dict:
+    """Add ONE physical attempt's provider usage to the running total for this logical call.
+
+    Every arm used to report only the LAST response's `cost_metadata`, so a logical call that
+    repaired or retried before succeeding silently dropped the tokens it had ALREADY paid for, and
+    `_failed` reported `{}` — under-counting a run's spend by exactly its failures. Both are the
+    same mistake `provider_calls` avoids by construction: the requests were issued, so the spend was
+    incurred, whatever the outcome.
+
+    Usage is OPTIONAL and may be PARTIAL (`llm_claude._usage_cost`: a provider error yields no usage
+    at all), so a missing key is ZERO rather than an absent total — an attempt that reports nothing
+    must not erase the attempts that did. Only int/float values accumulate; anything else is carried
+    through unsummed rather than crashing the driver on a provider field this code has not seen."""
+    for key, value in resp.cost_metadata.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            total.setdefault(key, value)
+            continue
+        prior = total.get(key)
+        total[key] = value if not isinstance(prior, (int, float)) or isinstance(prior, bool) \
+            else prior + value
+    return total
+
+
 def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int,
+            cost_metadata: dict | None = None,
             security_audit: bool = False) -> StructuredCallOutcome:
     return StructuredCallOutcome(
         output=dict(resp.output),
@@ -216,7 +240,8 @@ def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int
         status=STATUS_FAILED,
         validation_result={"result": STATUS_FAILED, "reason": reason},
         repair_attempts=tuple(attempts),
-        cost_metadata={},
+        # The tokens this logical call actually spent before it failed — NOT `{}`. See `_accrue`.
+        cost_metadata=dict(cost_metadata or {}),
         security_audit_reason=reason if security_audit else None,
         provider_calls=provider_calls,
     )
@@ -403,6 +428,8 @@ def drive_structured_call(
     errors: list[str] = []
     resp = client.call(request)
     provider_calls = 1
+    # Running provider spend for this LOGICAL call, accrued per PHYSICAL attempt (see `_accrue`).
+    spend: dict = _accrue({}, resp)
     while True:
         ps = resp.status
         if ps == PROVIDER_OK:
@@ -425,7 +452,7 @@ def drive_structured_call(
                     status=status,
                     validation_result={"result": status},
                     repair_attempts=tuple(attempts),
-                    cost_metadata=dict(resp.cost_metadata),  # N9 — capture provider usage/cost
+                    cost_metadata=dict(spend),   # N9 — EVERY attempt's usage, not just this one
                     security_audit_reason=None,
                     provider_calls=provider_calls,
                 )
@@ -441,12 +468,13 @@ def drive_structured_call(
                                           INPUT_KEY_REPAIR_ERRORS: list(errors)})
                 resp = client.call(request)
                 provider_calls += 1
+                _accrue(spend, resp)
                 continue
             return _failed(resp, attempts, "repair budget exhausted (malformed structure)",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps == PROVIDER_REFUSAL:
             return _failed(resp, attempts, "provider refusal (policy decline)",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps in _RETRYABLE:
             if retries_used < retry_budget:
                 retries_used += 1
@@ -460,15 +488,16 @@ def drive_structured_call(
                     sleep(transient_backoff_s(retries_used))
                 resp = client.call(request)
                 provider_calls += 1
+                _accrue(spend, resp)
                 continue
             return _failed(resp, attempts, f"{ps} retry budget exhausted",
-                           provider_calls=provider_calls)
+                           provider_calls=provider_calls, cost_metadata=spend)
         if ps == PROVIDER_AUTH_ERROR:
             return _failed(resp, attempts, "provider auth failure", provider_calls=provider_calls,
-                           security_audit=True)
+                           cost_metadata=spend, security_audit=True)
         # PROVIDER_NON_RETRYABLE and any unknown token → fail closed
         return _failed(resp, attempts, f"non-retryable provider outcome ({ps})",
-                       provider_calls=provider_calls)
+                       provider_calls=provider_calls, cost_metadata=spend)
 
 
 # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------

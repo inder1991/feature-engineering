@@ -2449,11 +2449,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # The critic's own START (final branch review, 2026-08-09). Every other stage passes
         # `started_at`, so `ingestion_run_stage.started_at` is NULL for this one alone and it has no
         # DURATION — while reporting a clean `succeeded`. That is the wrong stage to leave
-        # unmeasured: `critique_concept_batch` is a plain per-item loop with no call ceiling, no
-        # deadline and no `not_attempted` (`OVERLAY_ENRICH_MAX_PROVIDER_CALLS` does not reach it),
-        # and Task 9b's 102 added `is_a` parents move `_registry_fingerprint()`, so the FIRST run
-        # after merge re-critiques every stored identifier verdict. On a 144-column catalog that is
-        # ~70-100 sequential calls at up to 300s each. `enrich_concepts` records the instant it
+        # unmeasured: Task 9b's 102 added `is_a` parents move `_registry_fingerprint()`, so the
+        # FIRST run after merge re-critiques every stored identifier verdict. On a 144-column
+        # catalog that is ~70-100 sequential calls at up to 300s each.
+        #
+        # [A.54, fixed 2026-08-09] That loop is now BOUNDED — it shares the concept stage's
+        # `CallLedger` and deadline, and reports `not_attempted`/`stopped_by`. The duration below
+        # is what says whether either bound actually bit. `enrich_concepts` records the instant it
         # started; absent (an older caller, or a fault before the critic block) it stays NULL, which
         # is honest rather than a fabricated zero.
         # The MARKER states below keep `started_at=None` per `StageRecorder.record`'s contract — a

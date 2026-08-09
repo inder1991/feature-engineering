@@ -334,6 +334,11 @@ class SemanticValueV1:
     resolution_status: str
     operational_influence: str | None = None
     proposed_value: object | None = None
+    #: [F7] The `producer/strength` of the row `proposed_value` CAME FROM. `proposed_value` is
+    #: always the LLM's row, but `semantic_authority[field]` names the STRONGEST producer with
+    #: evidence — so without this the payload captions the model's own guess with somebody
+    #: else's name, and a guess wearing `source/attested` gets weighted as a fact.
+    proposed_authority: str | None = None
 
     def __post_init__(self) -> None:
         if self.resolution_status not in RESOLUTION_STATUSES:
@@ -1274,7 +1279,7 @@ _OPERATIONAL_FIELDS = ("additivity", "currency", "data_type", "declared_type", "
 # finer axis beside `domain` — all three are display/recommendation tier (field_policies `_MEANING`
 # / `_GLOSSARY_TERM`), so they ride the same list as `domain` itself.
 _DISPLAY_FIELDS = ("ai_summary", "bian_path", "concept", "definition", "domain", "party_role",
-                   "process_path", "semantic_terms", "sub_domain")
+                   "process_path", "fibo_path", "semantic_terms", "sub_domain")
 
 
 def _render(raw: object) -> str | None:
@@ -1377,7 +1382,7 @@ def bundle_from_store(
         "SELECT object_ref, schema_name, table_name, column_name, data_type, declared_type, "
         "definition, domain, concept, semantic_terms, ai_summary, additivity, unit, currency, "
         "entity, is_grain, is_as_of, party_role, grain_fact_event_id, availability_fact_event_id, "
-        "sub_domain, bian_path, process_path "
+        "sub_domain, bian_path, process_path, fibo_path "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = %s "
         "AND kind = 'column' AND COALESCE(visible_requires, '{}') <@ %s",
         (source, flat_ref, allowed)).fetchone()
@@ -1386,7 +1391,7 @@ def bundle_from_store(
     (_ref, schema_name, table_name, column_name, data_type, declared_type, definition, domain,
      concept_name, semantic_terms, ai_summary, additivity, unit, currency, entity, is_grain,
      is_as_of, party_role, grain_event, availability_event,
-     sub_domain, bian_path, process_path) = anchor
+     sub_domain, bian_path, process_path, fibo_path) = anchor
     logical_ref = normalize_ref(source, schema_name or None, table_name, column_name)
     table_logical_ref = normalize_ref(source, schema_name or None, table_name)
 
@@ -1428,6 +1433,7 @@ def bundle_from_store(
         "domain": domain, "semantic_terms": semantic_terms,
         "party_role": party_role or getattr(normalize_party_role(column_name), "value", None),
         "sub_domain": sub_domain, "bian_path": bian_path, "process_path": process_path,
+        "fibo_path": fibo_path,
     }
     operational = {
         "additivity": additivity, "currency": currency, "data_type": data_type,
@@ -1486,6 +1492,10 @@ def bundle_from_store(
         llm_proposed = evidence_values.get(
             (logical_ref, _EVIDENCE_FIELD.get(field_name, field_name),
              EvidenceProducer.LLM.value))
+        # [F7] The proposal's OWN attribution, read from the same LLM row rather than inferred
+        # from `entries[0]` (the strongest producer, which may be an entirely different one).
+        llm_entry = next((e for e in entries
+                          if e.producer == EvidenceProducer.LLM.value), None)
         resolved_values.append(SemanticValueV1(
             field_name=field_name,
             value=value,
@@ -1493,6 +1503,8 @@ def bundle_from_store(
             resolution_status="current" if value is not None else UNRESOLVED_PENDING_REVIEW,
             operational_influence=influence,
             proposed_value=llm_proposed,
+            proposed_authority=(f"{llm_entry.producer}/{llm_entry.strength}"
+                                if llm_entry is not None else None),
         ))
     resolved_values.sort(key=lambda v: v.field_name)
 
@@ -1890,6 +1902,9 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
         # while sending `{"value": null}`, which is strictly worse than either alternative.
         if got is not None and got.proposed_value is not None and value is None:
             entry["proposed_value"] = _render(got.proposed_value)
+            # [F7] captioned with the proposal's OWN producer, never the lead's.
+            if got.proposed_authority:
+                entry["proposed_authority"] = got.proposed_authority
         out[fact_key] = entry
     out["concept_path"] = list(bundle.concept_path)
     out["identifier_namespace"] = _namespace_dict(bundle)
@@ -1898,6 +1913,7 @@ def for_feature_generation(bundle: SemanticContextBundleV1) -> dict:
     # SOURCE's own taxonomy, which the generator should weigh above anything the model inferred.
     out["sub_domain"] = _value_of(bundle, "sub_domain")
     out["bian_path"] = _value_of(bundle, "bian_path")
+    out["fibo_path"] = _value_of(bundle, "fibo_path")
     out["process_path"] = _value_of(bundle, "process_path")
     # The GLOSSARY's curated vocabulary (Task 7b). `for_concept_enrichment` and `for_summary` have
     # always sent both — the feature seam sent neither, so a generator was shown `CPTY_EXPSR_AMT`

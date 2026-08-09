@@ -1076,11 +1076,35 @@ def _profile_advisories(members: list[dict]) -> dict:
 # all 237 are mandatory (`test_feature_context_budget.py` builds both and records the numbers):
 #
 #   v3 mandatory bytes, 237 columns:  175_520   (~740 bytes/column)
-#   v4 mandatory bytes, 237 columns:  241_491   (~1_019 bytes/column)
-#   v4 with every trimmable field shed: 203_629
+#   v4 mandatory bytes, 237 columns:  268_902   (~1_135 bytes/column)
+#   v4 with every trimmable field shed: 223_930   (~945 bytes/column)
 #
-# The v4 figure was RE-MEASURED on 2026-08-06 (it read 248_601 when v4 landed; the payload drifted
-# down since, inside the test's tolerance, so the recorded number had quietly stopped being true).
+# ...and the SATURATED shape — every field the branch added actually populated, which the fixture
+# above does NOT do (see below):
+#
+#   v4 saturated, 237 columns:          405_863   (~1_712 bytes/column)
+#   v4 saturated, fully shed:           360_891   (~1_523 bytes/column)
+#
+# THESE NUMBERS ARE PINNED, NOT DESCRIBED: `test_the_floor_rose_by_exactly_what_the_payload_rose_by`
+# asserts `(floor, untrimmed) == (223_930, 268_902)` and
+# `test_the_SATURATED_catalog_is_measured_and_still_clears_the_budget` asserts the saturated pair,
+# so this comment cannot drift from the measurement without a red test. Read them there, not here,
+# if the two ever disagree.
+#
+# WHY TWO PAIRS. `wide_catalogs` leaves 8 of the 11 fields this branch added at exactly 0, so the
+# first pair measures a catalog thinner than any real one. That was not theoretical: a new
+# `proposed_authority` subkey grew the payload and the pinned test passed COMPLETELY UNCHANGED,
+# because the field it sits beside was empty in the fixture. `saturated_catalogs` populates each
+# field through its real writer and costs ~51% more. Two fields stay structurally low and that is
+# a product fact, not a gap: adjudication (`confidence_band`/`concept_alternatives`) is capped at
+# `adjudication_bounds().max_provider_calls` = 12 columns per run because it is the EXCEPTION path,
+# and `relationships` needs cross-catalog link rows the fixture does not stand up.
+#
+# The v4 figure has been RE-MEASURED four times (248_601 when v4 landed -> 241_491 on 2026-08-06 ->
+# 250_982 with the Task-6 axes -> 259_405 with Task 7b's curated vocabulary -> 268_902 when
+# `fibo_path` finally reached the payload, migration 1058). Twice the recorded number had quietly
+# stopped being true while staying inside the test's tolerance band — which is exactly how a
+# "measured" number stops being one, and why the pins above exist.
 #
 # The finding that matters: at 60_000 the SHIPPED v3 payload ALREADY raised ContextTooLarge on
 # these catalogs — nearly 3x over. v4 did not create that cliff; it would have deepened it. So the
@@ -1093,7 +1117,7 @@ def _profile_advisories(members: list[dict]) -> dict:
 # WHAT THIS BUDGET DOES NOT BOUND — the COST. This is the assembly's own byte ceiling and nothing
 # downstream caps input size: the provider call carries no input-token limit, so raising the budget
 # from 60_000 to 300_000 removed a refusal, not a spend control. On the measured catalogs above v4
-# sends ~1.4x the v3 prompt bytes for the same 237 columns (241_491 vs 175_520), and a mid-size
+# sends ~1.5x the v3 prompt bytes for the same 237 columns (268_902 vs 175_520), and a mid-size
 # catalog that previously refused now succeeds at ~4x the bytes it used to attempt. Input tokens are
 # the cheaper half of a call and this is metadata, not data — but "cheaper" is not "free", and the
 # number belongs beside the constant that produces it rather than in a review nobody re-reads.
@@ -1105,13 +1129,29 @@ def _profile_advisories(members: list[dict]) -> dict:
 # every prose and item cap did NOT move these numbers. The assembled `definition` is read straight
 # out of `graph_node` (see `_candidate_columns`' query), so it never passes through
 # `enrich_llm.MAX_DEFINITION_LEN` at all — that cap governs the ENRICHMENT egress path, not this
-# assembly. v4 measured 241_491 both before and after the raise.
+# assembly. v4 measured 241_491 both before and after the raise (it has since moved to 268_902 for
+# reasons unrelated to the caps — the Task-6 axes, Task 7b's vocabulary and `fibo_path`; see the
+# ladder above).
 #
 # The raise is still the right change, for a reason that is about CATALOG SIZE rather than per-value
-# length. At ~1_019 bytes/column, 300_000 bytes is roughly 294 columns — so a catalog past ~300
+# length. At ~1_135 bytes/column, 300_000 bytes is roughly 264 columns — so a catalog past ~265
 # mandatory columns starts shedding prose through `_V4_TRIM_ORDER` (definition first) and, past the
 # trimmed floor, refuses outright. That trim IS truncation on the feature-generation path, arriving
-# by a different door than the caps. 1_500_000 moves the first shed to ~1_470 columns.
+# by a different door than the caps.
+#
+# At 1_500_000 the two rungs are, DERIVED from the pinned per-column rates above:
+#   first shed  ~1_322 mandatory columns  (1_500_000 / ~1_135 B per column, untrimmed)
+#   refusal     ~1_588 mandatory columns  (1_500_000 /   ~945 B per column, fully shed)
+# On the SATURATED rate those rungs come in to ~876 and ~985 columns — still unreachable, and the
+# honest pair to quote for a richly-enriched catalog.
+# A 144-column catalog therefore assembles ~163_000 B sparse / ~247_000 B saturated (144 x the
+# rates above, DERIVED — not measured; the pinned fixtures are the 237-column pairs, and no
+# 144-column shape is measured anywhere in this repo). NEITHER RUNG IS REACHABLE ON ANY REALISTIC CATALOG, which is the honest
+# reading of this constant: it is a runaway backstop, not a working constraint. Both rungs assume
+# the mandatory set scales linearly at the measured per-column rate; a catalog with markedly longer
+# prose per column reaches them sooner. (An earlier revision of this paragraph put the first shed at
+# ~1_470 columns and quoted a 203_629 floor — that floor matched no rung of any ladder and was never
+# true. Both numbers understated cost while overstating headroom.)
 #
 # The cost is the same cost as before, five times over: nothing downstream bounds the prompt, so on
 # a catalog large enough to use this headroom the request is correspondingly larger. It buys the

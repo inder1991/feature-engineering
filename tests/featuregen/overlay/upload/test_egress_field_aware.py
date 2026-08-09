@@ -120,6 +120,65 @@ def test_shape_gate_still_rejects_forbidden_keys_and_wrong_types():
     assert _item_shape_ok({"table": "t", "columns": ["a", 1]}) is False
 
 
+# ---- [F4]: the per-descriptor scan covers EVERY free-text key, not just business_definition -----
+#
+# A.56 recorded `domain`; the audit it asked for ("audit the rest of `_column_profile_shape_ok`'s
+# admitted keys against the two prose lists") finds THREE. `table_synth._descriptor` emits
+# `term_type`, `domain` and `process_path` from the uploader's sidecar and its docstring calls them
+# "bounded structural tokens (200 cap)" — but `_SCALAR_PROSE_META_KEYS` already classifies
+# `term_type`/`process_path` as PROSE at the top level, and A.51 #2 established `domain` as uploader
+# text. A 200-char cap is a length bound, not a safety property.
+
+
+@pytest.mark.parametrize("key", ["domain", "term_type", "process_path"])
+def test_every_free_text_profile_key_is_pii_scanned_not_just_the_definition(key: str):
+    """The [F4] leak: only `column_profiles[*].business_definition` was routed through a sanitizer,
+    so an uploader-authored facet beside it egressed VERBATIM. It compounds with the zero-truncation
+    raise — `_MAX_COLUMN_PROFILES` 64 -> 512 means one Pass-B call carries up to 8x as many."""
+    meta = {"table": "txn",
+            "column_profiles": [{"column": "amt", key: "owner jane.doe@bank.example"}]}
+    out, pii_spans, _sa, version = _redact_free_text_meta(meta)
+    assert out is not None
+    assert "jane.doe@bank.example" not in out["column_profiles"][0][key]
+    assert "[REDACTED:EMAIL]" in out["column_profiles"][0][key]
+    assert any(s["key"] == f"column_profiles.{key}" and s["type"] == "EMAIL" for s in pii_spans)
+    assert version is not None      # a scanned payload must name the redactor that scanned it
+
+
+def test_a_profile_facet_is_prose_grade_so_an_ordinary_sample_phrase_survives():
+    """Prose, NOT definition grade — deliberately. The definition grade's marker gate fails CLOSED
+    on phrases like "values such as", and these facets ride EVERY Pass-B item; grading them as
+    definitions would hand one uploader sentence a kill switch over the whole table's synthesis,
+    which is the exact failure mode `_ADVISORY_CONTEXT_KEYS` was created to avoid."""
+    meta = {"table": "txn",
+            "column_profiles": [{"column": "amt", "domain": "Values Such As Payments"}]}
+    out, _pii, sample_audits, _v = _redact_free_text_meta(meta)
+    assert out is not None
+    assert out["column_profiles"][0]["domain"] == "Values Such As Payments"
+    assert all(not a["path"].startswith("column_profiles.domain") for a in sample_audits)
+
+
+def test_every_admitted_profile_key_is_CLASSIFIED_so_a_new_one_cannot_ride_unscanned():
+    """The structural guard, and the reason this bug was invisible. The top-level loop fails closed
+    on an unclassified key (D10); the per-descriptor loop had no such gate, so widening
+    `_COLUMN_PROFILE_KEYS` silently opened an unscanned egress path. Adding a key to that set must
+    now force a classification decision instead of defaulting to 'rides raw'."""
+    unclassified = (enrich_llm._COLUMN_PROFILE_KEYS
+                    - enrich_llm._COLUMN_PROFILE_STRUCTURAL_KEYS
+                    - enrich_llm._COLUMN_PROFILE_DEFINITION_KEYS
+                    - enrich_llm._COLUMN_PROFILE_PROSE_KEYS)
+    assert unclassified == set(), (
+        f"column-profile key(s) {sorted(unclassified)} egress with no declared classification")
+
+
+def test_an_unclassified_descriptor_key_fails_the_item_CLOSED():
+    """The single-call path has no `_item_shape_ok`, so before [F4] an unknown descriptor key rode
+    to the provider unscanned. Mirrors the top-level D10 gate one level down."""
+    meta = {"table": "txn", "column_profiles": [{"column": "amt", "mystery": "free text"}]}
+    out, _pii, _sa, _v = _redact_free_text_meta(meta)
+    assert out is None
+
+
 def _concept_batch_call(db, items, script_results):
     client = FakeLLM(script={"overlay.enrich.concept":
                              FakeResponse(output={"results": script_results})})

@@ -78,19 +78,28 @@ def test_redaction_can_grow_a_domain_past_the_structural_bound():
     6-char email), and the prose branch bounds AFTER redaction — so a near-budget value carrying PII
     can cross `_FEATURE_STRUCTURAL_MAX_LEN` on the way out and be refused where the same-length
     un-scrubbed value was admitted. Fail-closed direction, and deliberate: bounding before redaction
-    would bound a string that is not the one egressing."""
+    would bound a string that is not the one egressing.
+
+    [A.55, 2026-08-09] What this pins is the VALUE never egressing, which is the safety property.
+    It used to assert the whole payload went `None`; a facet that fails its scan is now dropped by
+    key instead (see `test_one_bad_facet_drops_its_KEY_and_the_other_columns_survive`), so the
+    refusal is scoped rather than catastrophic. The fail-closed DIRECTION is unchanged — only the
+    blast radius moved."""
     from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
 
     email = " a@b.co"                                         # 7 chars in, 17 chars out
     at_budget = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email)) + email
     assert len(at_budget) == _FEATURE_STRUCTURAL_MAX_LEN      # admitted at identity grade
-    assert sanitize_feature_context(
-        {"columns": [{"object_ref": "public.t.c", "domain": at_budget}]})[0] is None
+    grown, *_ = sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": at_budget}]})
+    assert "domain" not in grown["columns"][0]                # refused — by dropping the key
+    assert at_budget not in json.dumps(grown)                 # and the value did not egress
     # One char shorter and the SAME value survives redaction inside the bound — the refusal above
     # is the placeholder's growth, not a blanket ban on a near-budget domain.
     under = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email) - 10) + email
-    assert sanitize_feature_context(
-        {"columns": [{"object_ref": "public.t.c", "domain": under}]})[0] is not None
+    kept, *_ = sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": under}]})
+    assert kept["columns"][0]["domain"].startswith("x")       # admitted, redacted in place
 
 
 def test_definition_sample_clause_stripped_and_audited():
@@ -340,3 +349,45 @@ def test_planted_sample_token_never_egresses_and_is_audited(db, monkeypatch):
     hit = next((a for a in sample_strip if a["path"] == "columns[0].definition"), None)
     assert hit is not None and hit["removed_count"] >= 1
     assert hit["state"] == "stripped"
+
+
+# ---- A.55: a bad FACET costs its key, not the catalog ---------------------------------------------
+
+
+def test_one_bad_facet_drops_its_KEY_and_the_other_columns_survive():
+    """[A.55] Every branch of the classifier loop failed closed for the WHOLE payload, so one
+    over-long `domain` on ONE column cost feature generation for all 237 — the model saw nothing at
+    all rather than 236 good columns and one missing facet.
+
+    The line between DROP and REFUSE is the one `_ADVISORY_CONTEXT_KEYS` already argued: a value
+    that is CONTEXT ABOUT the subject may be dropped (losing it degrades the payload; it cannot
+    falsify it), while a value that IS the subject must refuse. A column's `definition` is the
+    meaning the model reasons from — it still refuses. `domain` / `sub_domain` / `bian_path` /
+    `process_path` are facets beside it, and the model is never told a facet exists.
+
+    The safety property is UNCHANGED: the offending value never egresses. Only the blast radius
+    narrows."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    bad = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
+    out, _pii, _sa, _v = sanitize_feature_context({"columns": [
+        {"object_ref": "public.t.bad", "domain": bad, "definition": "A good definition."},
+        {"object_ref": "public.t.good", "domain": "Payments"},
+    ]})
+
+    assert out is not None, "one bad facet still refused the whole payload"
+    assert "domain" not in out["columns"][0]              # the offending KEY is gone…
+    assert out["columns"][0]["definition"] == "A good definition."   # …its column survives…
+    assert out["columns"][1]["domain"] == "Payments"      # …and so does every sibling
+    assert bad not in json.dumps(out)                     # the value NEVER egresses
+
+
+def test_a_bad_DEFINITION_still_refuses_the_whole_payload():
+    """The other side of the line, pinned so the narrowing above cannot creep into the subject. A
+    column whose meaning cannot be scanned must not be sent with the meaning silently missing — the
+    model would answer confidently about a column nobody could describe."""
+    out, _pii, _sa, _v = sanitize_feature_context({"columns": [
+        {"object_ref": "public.t.c", "definition": "sample values: OPN; CLS; PND"},
+        {"object_ref": "public.t.d", "domain": "Payments"},
+    ]})
+    assert out is None

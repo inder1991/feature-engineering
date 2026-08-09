@@ -390,13 +390,37 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     if isinstance(profiles, list):
         new_profiles = []
         for desc in profiles:
-            if isinstance(desc, dict) and isinstance(desc.get("business_definition"), str):
-                nv = _definition(desc["business_definition"],
-                                 "column_profiles.business_definition")
+            if not isinstance(desc, dict):
+                new_profiles.append(desc)
+                continue
+            # [F4] Same D10 fail-closed rule the top-level loop applies, one level down: this scan
+            # used to name `business_definition` and let every sibling key ride unscanned, so the
+            # descriptor namespace had no gate at all. The batch path's `_item_shape_ok` rejects an
+            # unknown descriptor key, but the SINGLE-CALL path has no such gate — exactly the
+            # asymmetry D10 closed above.
+            unknown_desc = sorted(k for k in desc if k not in _COLUMN_PROFILE_KEYS)
+            if unknown_desc:
+                logger.warning("column_profiles descriptor key(s) with no declared egress "
+                               "classification: %s — failing closed", unknown_desc)
+                return None, pii_spans, sample_audits, version
+            updated = dict(desc)
+            for key in sorted(desc):
+                if key in _COLUMN_PROFILE_DEFINITION_KEYS:
+                    scrub = _definition
+                elif key in _COLUMN_PROFILE_PROSE_KEYS:
+                    scrub = _prose
+                else:
+                    continue                                   # structural: no scan by contract
+                if not isinstance(desc[key], str):
+                    continue
+                nv = scrub(desc[key], f"column_profiles.{key}")
                 if nv is None:
+                    # A descriptor field IS the subject the model reasons about, so a blanked value
+                    # blocks the item rather than dropping (the `_ADVISORY_CONTEXT_KEYS` argument
+                    # does not reach here) — the contract `business_definition` already had.
                     return None, pii_spans, sample_audits, version
-                desc = {**desc, "business_definition": nv}
-            new_profiles.append(desc)
+                updated[key] = nv
+            new_profiles.append(updated)
         out["column_profiles"] = new_profiles
     # `dropped` guards the passthrough (review round 2). A value the scrubber REFUSED without ever
     # setting `version` — a non-`str` under a free-text key, so no scrubber body ran — would
@@ -532,8 +556,11 @@ _FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "con
 # value (the redactor returns unchanged text), and the bound is the same `_FEATURE_STRUCTURAL_MAX_LEN`
 # — applied AFTER redaction, so a near-budget value carrying PII can now be refused where an
 # un-scrubbed one of the same length was admitted. That is the fail-closed direction.
+# `fibo_path` joins its two sidecar siblings here (readiness wave). Uploader-authored, unredacted
+# at origin (`glossary_reader`), so it takes the same prose grade `domain` does — a length bound
+# is not a safety property.
 _FEATURE_COLUMN_PROSE_KEYS = frozenset({"domain", "sub_domain", "bian_path", "process_path",
-                                        "business_term"})
+                                        "fibo_path", "business_term"})
 # The LIST form of the same grade (Task 7b): each item PII-redacted at its own indexed path
 # (`related_terms[1]`) and bounded per TERM, mirroring `_LIST_PROSE_META_KEYS` on the enrichment
 # seam. `related_terms` is uploader-authored curated vocabulary, so the token-list grade its SHAPE
@@ -546,7 +573,11 @@ _FEATURE_COLUMN_FACT_KEYS = frozenset({
 # `value` is null, and a bounded token exactly like `value`. It is a SUBKEY of the wrapper rather
 # than a sibling column key so it cannot be read as an operationally-resolved fact by anything that
 # reads `.value`; classifying it here is what stops the whole column failing closed.
-_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value"})
+# [F7] `proposed_authority` is the `producer/strength` of the row `proposed_value` came from —
+# a platform-minted closed-vocabulary pair, exactly like `authority`, never model or uploader
+# text. Classified here or the whole column fails closed on an unknown subkey.
+_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority", "proposed_value",
+                                   "proposed_authority"})
 # ── feature-context v4 (semantic Task 8, D10) ────────────────────────────────────────────────────
 # Every NEW key ships with an explicit classification here plus a golden egress test; unclassified
 # stays BLOCKED, and now loudly. All four groups carry closed-vocabulary tokens or platform-minted
@@ -836,7 +867,18 @@ def sanitize_feature_context(
                         continue
                     clean = _prose(v, path)
                     if clean is None:
-                        return _refuse(path, "prose_scan")
+                        # [A.55] DROP the key, do not refuse the catalog. These are FACETS —
+                        # context ABOUT the column, beside the `definition` that IS its meaning —
+                        # so this is the same argument `_ADVISORY_CONTEXT_KEYS` made for the
+                        # catalog narrative: losing one degrades the payload and cannot falsify
+                        # it, and the model is never told a facet exists. Refusing cost feature
+                        # generation for all 237 columns over one column's `domain`.
+                        #
+                        # The safety property is UNCHANGED — the value that failed its scan never
+                        # egresses. Only the blast radius narrows, and the drop is audited exactly
+                        # like the advisory one, so it is degradation the record can name.
+                        _drop_advisory(path)
+                        continue
                     out[k] = clean
                 elif k in _FEATURE_COLUMN_PROSE_LIST_KEYS:
                     cleaned = _prose_list(v, path)
@@ -2047,6 +2089,36 @@ _COLUMN_PROFILE_KEYS = frozenset({
     "column", "type", "operational_type", "declared_type", "concept", "business_definition",
     "identifier_role", "temporal_role", "semantic_type", "entity",
     "term_type", "domain", "process_path",
+})
+
+# [F4] The descriptor's OWN egress classification — the nested mirror of the three top-level classes,
+# and the gate whose absence made this a leak. `_redact_free_text_meta` scanned exactly ONE nested
+# key (`business_definition`) by name, so every OTHER admitted key rode to the provider unscanned,
+# and widening `_COLUMN_PROFILE_KEYS` opened a new unscanned path with nothing to notice.
+#
+# WHY DESCRIPTOR-LOCAL AND NOT `_FREE_TEXT_META_KEYS`. The two namespaces are genuinely different:
+# `_ITEM_META_ALLOWED` admits `data_domain` at the top level and never a bare `domain`, so folding
+# these names into the top-level set would let a top-level `domain` egress as prose where it fails
+# CLOSED today — a widening bought for no producer that exists. `_FEATURE_COLUMN_PROSE_KEYS` is the
+# precedent: the feature MENU's nested column dicts already carry their own per-key grade, including
+# `domain` and `process_path` under the same names.
+#
+# WHY PROSE AND NOT DEFINITION. `sanitize_definition` fails CLOSED on five literal sample-clause
+# phrases, and these facets ride EVERY Pass-B item — so the definition grade would hand one ordinary
+# uploader sentence ("Values Such As Payments" as a domain label) a kill switch over the whole
+# table's synthesis. That is precisely the blast radius `_ADVISORY_CONTEXT_KEYS` was created to
+# avoid. Prose scans for PII without the marker gate, which is the grade these already carry at the
+# top level (`_SCALAR_PROSE_META_KEYS`) and on the feature seam.
+_COLUMN_PROFILE_DEFINITION_KEYS = frozenset({"business_definition"})
+# Uploader-authored sidecar text. `table_synth._descriptor` truncates each to 200 chars and its
+# docstring called them "bounded structural tokens" — a length bound is not a safety property, and
+# `_SCALAR_PROSE_META_KEYS` already grades `term_type`/`process_path` as prose one namespace up.
+_COLUMN_PROFILE_PROSE_KEYS = frozenset({"term_type", "domain", "process_path"})
+# Platform-derived: physical/declared type tokens, registry concept + entity links, and the closed
+# `identifier_role`/`temporal_role`/`semantic_type` role vocabularies. None can carry uploader text.
+_COLUMN_PROFILE_STRUCTURAL_KEYS = frozenset({
+    "column", "type", "operational_type", "declared_type", "concept", "entity",
+    "identifier_role", "temporal_role", "semantic_type",
 })
 #: ZERO-TRUNCATION RAISE (2026-08-06): 64 -> 512.
 #:

@@ -26,7 +26,8 @@ never mutation of human decisions).
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -55,6 +56,10 @@ from featuregen.overlay.upload.structured_results import (
 if TYPE_CHECKING:
     from featuregen.contracts.envelopes import IdentityEnvelope
     from featuregen.intake.llm import LLMClient
+
+    # Annotation-only: `enrich_batch` owns the stage ledger and this module is imported from the
+    # enrichment path, so a runtime import here would close a cycle for a type name.
+    from featuregen.overlay.upload.enrich_batch import CallLedger
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +102,10 @@ CONCEPT_CRITIC_REASON_CODES = frozenset({
     "revision_rejected",              # the revise answer was off-registry/conflicted/withdrawn
     "llm_critic_unavailable",         # no client, provider failure, or dispatch blocked
     "llm_critic_invalid_result",      # a validated-looking output failed the code-side gate
+    # [A.54] BUDGET stops — facts about this RUN, not about the assignment or the provider.
+    # Distinct from `llm_critic_unavailable` so a short run does not read as an outage.
+    "critic_call_ceiling",            # the stage call ledger was exhausted before this item
+    "critic_deadline",                # the stage wall clock ran out before this item
 })
 
 
@@ -250,10 +259,17 @@ def _closed_reasons(codes: Sequence[str]) -> tuple[str, ...]:
 def _drive(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
            payload: dict[str, object], instruction: str,
            actor: IdentityEnvelope | None,
-           cacheable: tuple[str, ...] = ()) -> tuple[dict | None, str | None]:
+           cacheable: tuple[str, ...] = (),
+           call_ledger: CallLedger | None = None) -> tuple[dict | None, str | None]:
     """One audited structured call through the exact seam the bridge critic uses. A client throw
     (a fake with no script, a provider outage) is contained to ``(None, None)`` — the critic must
-    degrade to abstention/deterministic-only, never abort the enrichment run that hosts it."""
+    degrade to abstention/deterministic-only, never abort the enrichment run that hosts it.
+
+    [A.54] RESERVES its call on the stage ledger first. This is the ONE dispatch point in the
+    module — the revise pass comes through here too — so charging here is what stops the critic
+    spending a ceiling it was never counted against, the defect `CallLedger` was built for."""
+    if call_ledger is not None and not call_ledger.charge():
+        return None, None
     try:
         call = drive_audited_structured_call(
             conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
@@ -269,6 +285,7 @@ def _drive(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str
 
 def _revise(conn, client: LLMClient, item: ConceptCriticItemV1,
             payload: dict[str, object], *, actor: IdentityEnvelope | None,
+            call_ledger: CallLedger | None = None,
             ) -> tuple[str | None, str, str | None]:
     """The ONE revise pass for a flagged item: ``(accepted_concept | None, reason_code,
     llm_call_ref)``. An acceptable revision is IN the registry, is not the literal
@@ -282,7 +299,7 @@ def _revise(conn, client: LLMClient, item: ConceptCriticItemV1,
     CANONICAL forms, so an alias can never resurrect its own refuted successor (or vice versa) as
     a "different" concept."""
     output, llm_call_ref = _drive(
-        conn, client, task=CONCEPT_REVISION_TASK, prompt_id=CONCEPT_REVISION_PROMPT_ID,
+        conn, client, call_ledger=call_ledger, task=CONCEPT_REVISION_TASK, prompt_id=CONCEPT_REVISION_PROMPT_ID,
         schema_id=CONCEPT_REVISION_SCHEMA_ID,
         payload={**payload, "vocabulary": list(classification_vocabulary())},
         instruction=_REVISION_INSTRUCTION, actor=actor, cacheable=("vocabulary",))
@@ -373,7 +390,8 @@ def _stored_llm_call_ref(conn, structured_result_id: str) -> str | None:
 
 def _critique_one(conn, client: LLMClient | None, item: ConceptCriticItemV1,
                   *, catalog_revision: str,
-                  actor: IdentityEnvelope | None) -> ConceptCriticResultV1:
+                  actor: IdentityEnvelope | None,
+                  call_ledger: CallLedger | None = None) -> ConceptCriticResultV1:
     conflicts = shape_conflicts(
         item.column_name, item.declared_type, item.definition, item.proposed_concept)
     payload = _item_payload(item, conflicts)
@@ -410,10 +428,16 @@ def _critique_one(conn, client: LLMClient | None, item: ConceptCriticItemV1,
         # question is never dispatched (the bridge critic's short-circuit, applied here).
         reason_codes.append("deterministic_shape_conflict")
     else:
+        if call_ledger is not None and call_ledger.exhausted():
+            # [A.54] The ceiling ran out between the loop's check and this item's dispatch.
+            # Named distinctly from `llm_critic_unavailable`: a budget stop is a fact about THIS
+            # RUN, not about the provider, and an operator reading a short run must not be sent
+            # hunting an outage that never happened.
+            return _not_attempted(item, "critic_call_ceiling")
         output, llm_call_ref = _drive(
             conn, client, task=CONCEPT_CRITIC_TASK, prompt_id=CONCEPT_CRITIC_PROMPT_ID,
             schema_id=CONCEPT_CRITIC_SCHEMA_ID, payload=payload,
-            instruction=_CRITIQUE_INSTRUCTION, actor=actor)
+            instruction=_CRITIQUE_INSTRUCTION, actor=actor, call_ledger=call_ledger)
         if output is None:
             return ConceptCriticResultV1(
                 item.logical_ref, item.proposed_concept, ConceptDisposition.ABSTAINED,
@@ -448,9 +472,15 @@ def _critique_one(conn, client: LLMClient | None, item: ConceptCriticItemV1,
                 proposal_stands, conflicts, tuple(reason_codes), result_id, llm_call_ref)
         reason_codes.append("llm_refuted")
 
+    # [A.54] A refutation must be a JUDGEMENT, never an accounting outcome. The tail below is
+    # `REVISED if revised else REFUTED`, so an unfunded revise pass would evict the concept — and
+    # with it the column's join candidacy — because the run ran out of calls. Abstain instead:
+    # the deterministic conflict is still recorded in `conflict_codes` for the next run to act on.
+    if call_ledger is not None and call_ledger.exhausted():
+        return _not_attempted(item, "critic_call_ceiling")
     # ONE revise pass for the flagged item (deterministically conflicted, or model-refuted).
     revised, revision_reason, revise_call_ref = _revise(
-        conn, client, item, payload, actor=actor)
+        conn, client, item, payload, actor=actor, call_ledger=call_ledger)
     llm_call_ref = revise_call_ref or llm_call_ref
     if revision_reason != "llm_critic_unavailable":
         reason_codes.append(revision_reason)
@@ -469,6 +499,25 @@ def _critique_one(conn, client: LLMClient | None, item: ConceptCriticItemV1,
         "llm_critic_unavailable" if revision_reason == "llm_critic_unavailable" else None)
 
 
+def _not_attempted(item: ConceptCriticItemV1, reason: str) -> ConceptCriticResultV1:
+    """[A.54] The explicit disposition for an item the bound skipped WITHOUT dispatch.
+
+    FAIL-OPEN, and that is the whole design decision this carries. The critic is refute-oriented —
+    "absence of support is not an eviction" — so an un-critiqued assignment keeps the classifier's
+    answer un-refuted, exactly as ABSTAINED already means everywhere else in this module. The
+    alternative (refuse the assignment) would let a budget ceiling silently strip columns of their
+    concept and therefore of their join candidacy, which is a far worse failure than an
+    un-criticised proposal standing.
+
+    What makes it honest rather than silent is `skipped_reason`: the run can tell "the critic looked
+    and had nothing to say" from "the critic never looked", which is the distinction A.54 says was
+    missing and the one an operator reading a short run needs first."""
+    return ConceptCriticResultV1(
+        item.logical_ref, item.proposed_concept, ConceptDisposition.ABSTAINED,
+        item.proposed_concept if item.proposed_concept in CONCEPT_REGISTRY else None,
+        (), (reason,), None, None, reason)
+
+
 def critique_concept_batch(
     conn,
     client: LLMClient | None,
@@ -476,6 +525,10 @@ def critique_concept_batch(
     *,
     catalog_revision: str,
     actor: IdentityEnvelope | None = None,
+    call_ledger: CallLedger | None = None,
+    deadline_s: float | None = None,
+    now: Callable[[], float] = time.monotonic,
+    stats: dict | None = None,
 ) -> dict[str, ConceptCriticResultV1]:
     """Critique a batch of proposed concept assignments; returns ``{logical_ref: result}``.
 
@@ -483,9 +536,45 @@ def critique_concept_batch(
     provider is scripted for nothing (abstain), the client is absent (deterministic-only), or the
     replay store already holds the validated outcome (no dispatch at all). ``catalog_revision`` is
     part of every item's replay identity — the same column under a changed catalog is a new
-    question, while a byte-identical re-upload replays for free."""
+    question, while a byte-identical re-upload replays for free.
+
+    [A.54] BOUNDED. This was a plain per-item loop with no call ceiling, no deadline and no
+    ``not_attempted`` accounting — ~70-100 sequential provider calls at up to 300s each on a
+    144-column catalog, and by A.53 the stage the first run after merge runs hardest.
+
+    * ``call_ledger`` — the STAGE's ledger, shared rather than a second budget, exactly as
+      :class:`CallLedger` prescribes ("the caller builds one ledger, hands it to ``run_batched`` AND
+      to the nested seam"). Every physical call this critic issues — the critique AND the revise —
+      is charged, so the count cannot drift the way Pass B's did.
+    * ``deadline_s`` — wall clock from the FIRST item. This is the bound that matters for the source
+      advisory lock; like ``run_batched``'s it is checked BEFORE issuing each item and cannot
+      interrupt a call already in flight.
+    * ``stats`` (optional out-param) — receives ``not_attempted`` and ``stopped_by`` so the caller's
+      stage report can say ``truncated`` instead of a laundered ``succeeded``.
+
+    Both bounds resolve a skipped item through :func:`_not_attempted` (fail-open, ABSTAINED, with a
+    ``skipped_reason``). Omitting both is the historical unbounded behaviour, byte-for-byte."""
     results: dict[str, ConceptCriticResultV1] = {}
+    started = now()
+    skipped = 0
+    stopped_by: str | None = None
     for item in items:
+        if call_ledger is not None and call_ledger.exhausted():
+            stop = "critic_call_ceiling"
+        elif deadline_s is not None and now() - started >= deadline_s:
+            stop = "critic_deadline"
+        else:
+            stop = None
+        if stop is not None:
+            skipped += 1
+            stopped_by = stopped_by or stop
+            results[item.logical_ref] = _not_attempted(item, stop)
+            continue
         results[item.logical_ref] = _critique_one(
-            conn, client, item, catalog_revision=catalog_revision, actor=actor)
+            conn, client, item, catalog_revision=catalog_revision, actor=actor,
+            call_ledger=call_ledger)
+    if stats is not None:
+        stats["not_attempted"] = skipped
+        if stopped_by is not None:
+            stats["stopped_by"] = stopped_by
     return results

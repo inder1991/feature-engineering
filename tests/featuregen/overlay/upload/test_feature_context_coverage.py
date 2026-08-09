@@ -147,12 +147,10 @@ UNCARRIED_GAPS: dict[str, str] = {
     #     `feature_assist._column_tokens`, so an objective in the bank's own vocabulary can reach
     #     the bank's own term.
     #   * `related_terms` now rides the same payload as a per-term-redacted prose LIST.
-    "fibo_path": (
-        "DEFERRED by a recorded decision (progress ledger, 2026-08-07): not emitted on any "
-        "feature seam today, and the reason is that it has no egress grade here yet, NOT that it "
-        "is unwanted. `bian_path` and `process_path`, its two siblings from the same sidecar, ARE "
-        "carried. Carrying it means one `_FEATURE_COLUMN_PROSE_KEYS` entry — the grade its "
-        "unredacted origin (`glossary_reader.py`) requires, exactly as for `domain`."),
+    # CLOSED by the readiness wave (2026-08-09): `fibo_path` now has a `graph_node` column
+    # (migration 1058), a field policy, a projection and a `_FEATURE_COLUMN_PROSE_KEYS` grade —
+    # joining `bian_path`/`process_path`, its two siblings from the same sidecar. The handover
+    # called this "one line"; it was six, because the column did not exist.
 }
 
 

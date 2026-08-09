@@ -9,12 +9,19 @@ actually guards them), while the older kwarg-forwarding test remains `pytest.imp
 from dataclasses import replace
 
 from featuregen.intake.llm import LLMRequest
-from featuregen.intake.llm_claude import ClaudeConfig, _effective_timeout
+from featuregen.intake.llm_claude import (
+    DEFAULT_LLM_TIMEOUT_S,
+    ClaudeConfig,
+    _effective_timeout,
+)
 
 
 def test_timeout_default_and_env(monkeypatch):
-    # Default 60s; env FEATUREGEN_LLM_TIMEOUT overrides. SDK-free — constructs the dataclass only.
-    assert ClaudeConfig().timeout == 60.0
+    # The default is `DEFAULT_LLM_TIMEOUT_S`; env FEATUREGEN_LLM_TIMEOUT overrides. SDK-free —
+    # constructs the dataclass only. DERIVED from the constant, never restated: this test pinned a
+    # literal 60.0 and went red when the default was raised to the manifest's 300 (2026-08-09),
+    # which is the drift `test_the_CODE_DEFAULT_timeout_is_the_one_the_manifest_ships` now guards.
+    assert ClaudeConfig().timeout == DEFAULT_LLM_TIMEOUT_S
     monkeypatch.setenv("FEATUREGEN_LLM_TIMEOUT", "12.5")
     assert ClaudeConfig.from_env().timeout == 12.5
 
@@ -41,9 +48,11 @@ def test_effective_timeout_scales_the_configured_clock_with_the_escalated_ceilin
 
 
 def test_effective_timeout_leaves_the_baseline_call_untouched():
-    # The un-escalated path must keep EXACTLY today's timeout — this change raises the clock only
-    # for a retry that was granted more tokens, never the baseline for every call.
-    assert _effective_timeout(_req(), ClaudeConfig()) == ClaudeConfig().timeout == 60.0
+    # The un-escalated path must keep EXACTLY the CONFIGURED timeout — escalation raises the clock
+    # only for a retry that was granted more tokens, never the baseline for every call. The
+    # relationship is the assertion; the number is whatever the config carries.
+    assert (_effective_timeout(_req(), ClaudeConfig())
+            == ClaudeConfig().timeout == DEFAULT_LLM_TIMEOUT_S)
 
 
 def test_messages_create_receives_timeout(monkeypatch):

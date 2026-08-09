@@ -548,6 +548,57 @@ def test_provider_calls_counted_when_retry_budget_exhausted():
     assert out.provider_calls == 3
 
 
+def test_cost_metadata_is_REPORTED_on_a_failed_outcome():
+    """The exact argument `provider_calls` already makes, applied to tokens: the requests were made,
+    so the spend was incurred. `_failed` hard-coded `cost_metadata={}`, so a run's token spend
+    under-counted by EXACTLY its failures — and a first live run is most likely to produce failures,
+    which is the reading this instrumentation exists to support."""
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"wrong": 1}, cost_metadata={"input_tokens": 10,
+                                                                            "output_tokens": 3}),
+                           FakeResponse(output={"wrong": 2}, cost_metadata={"input_tokens": 12,
+                                                                            "output_tokens": 4}),
+                           FakeResponse(output={"wrong": 3}, cost_metadata={"input_tokens": 14,
+                                                                            "output_tokens": 5})])
+    out = drive_structured_call(fake, _req(), _needs_entity, repair_budget=2)
+    assert out.status == STATUS_FAILED
+    assert out.provider_calls == 3
+    assert out.cost_metadata == {"input_tokens": 36, "output_tokens": 12}
+
+
+def test_cost_metadata_ACCUMULATES_across_every_physical_attempt():
+    """The second half, and it under-counts the SUCCESS path too: both arms captured only the LAST
+    response's usage, so a call that repaired twice before validating reported one attempt's tokens
+    and silently dropped the two it had already paid for."""
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"wrong": 1}, cost_metadata={"input_tokens": 10,
+                                                                            "output_tokens": 3}),
+                           FakeResponse(output={"entity": "customer"},
+                                        cost_metadata={"input_tokens": 20, "output_tokens": 7})])
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_REPAIRED
+    assert out.provider_calls == 2
+    assert out.cost_metadata == {"input_tokens": 30, "output_tokens": 10}
+
+
+def test_accumulated_cost_tolerates_attempts_that_report_no_usage():
+    """A provider ERROR yields `_fail(...)` with no usage at all, so the accumulator must treat a
+    missing key as zero rather than propagating None into the sum or dropping the attempts that DID
+    report. Partial usage is explicitly allowed by `_usage_cost`'s contract."""
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="max_tokens",
+                                        cost_metadata={"input_tokens": 9}),
+                           FakeResponse(output={}, provider_status="max_tokens"),
+                           FakeResponse(output={"entity": "customer"},
+                                        cost_metadata={"output_tokens": 4})])
+    out = drive_structured_call(fake, _req(), _needs_entity, retry_budget=2)
+    assert out.status == STATUS_RETRIED
+    assert out.cost_metadata == {"input_tokens": 9, "output_tokens": 4}
+
+
 def test_a_non_retryable_outcome_is_not_re_attempted():
     """The other half of "a timeout is not retried": once the adapter NAMES a timeout
     `non_retryable`, the driver must issue exactly ONE physical call and stop.

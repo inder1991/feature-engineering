@@ -49,8 +49,13 @@ def _descriptor(view: ColumnMetadataView) -> dict:
     sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded by
     `column_view._bounded` to the ONE `enrich_llm.MAX_DEFINITION_LEN` egress window (32_000 since
     2026-08-06 — named rather than restated, so the two cannot drift); the field-aware egress seam
-    (`_redact_free_text_meta`) re-sanitizes it (sample-clause strip + PII) at dispatch. Facets are
-    bounded structural tokens (200 cap)."""
+    (`_redact_free_text_meta`) re-sanitizes it (sample-clause strip + PII) at dispatch.
+
+    [F4] `term_type` / `domain` / `process_path` are UPLOADER-AUTHORED PROSE, not structural tokens
+    — an earlier revision of this docstring called them "bounded structural tokens (200 cap)" and
+    that misreading is what let them egress unscanned. The 200-char slice below is a LENGTH bound;
+    it is not a safety property. They are graded `_COLUMN_PROFILE_PROSE_KEYS` and PII-scanned
+    per descriptor at dispatch, at the indexed path `column_profiles.<key>`."""
     desc: dict = {"column": view.column,
                   "operational_type": (view.operational_type or "")[:200],
                   "declared_type": (view.declared_type or "")[:200]}
