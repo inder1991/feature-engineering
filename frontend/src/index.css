@@ -4230,7 +4230,8 @@ button.stat:hover {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: start;
-  gap: 9px;
+  /* 9px read as "boxes touching boxes" at three columns. */
+  gap: 14px;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -4238,17 +4239,42 @@ button.stat:hover {
 }
 
 .adg-suggestion-grid > .sfc {
-  display: grid;
-  align-content: start;
+  /* FLEX COLUMN, not `grid` + `align-content: start`. The grid form stretched each card to the
+     tallest in its row (`height: 100%`) and then packed the content to the top, so the uses row —
+     which carries a `border-top` — floated in the middle of the card with a void beneath it. A
+     column lets the footer be pushed to the bottom instead (`.sfc-usesrow { margin-top: auto }`),
+     which is what makes ragged content lengths read as one tidy row. */
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 11px;
   min-width: 0;
-  height: 100%;
-  padding: 12px;
+  /* NOT `height: 100%`. Stretching every card to the tallest in its row left the short ones with a
+     large void between their last control and the pinned footer. Natural height gives a ragged
+     bottom edge, which reads as content of different lengths; a void reads as something failing
+     to load. */
+  height: auto;
+  /* 12px was too tight against a 9px grid gap: the fact boxes and the formula block sat almost on
+     the card edge, and adjacent cards nearly touched. See the specificity repair below — this
+     declaration alone does NOT win. */
+  padding: 16px;
   border: 1px solid var(--line);
   border-radius: 9px;
   /* An INSET, not a floating card: tinted a step darker than the card it sits in, and no shadow.
      That is what keeps a panel-inside-a-card from reading as a card-inside-a-card. */
   background: var(--surface-2);
   box-shadow: none;
+}
+
+
+/* SPECIFICITY REPAIR — measured in the browser, not guessed. The card is an `li.row`, so
+   `.adg-card-body > .rows > .row { padding-inline: 0 }` (0,3,0) beat `.adg-suggestion-grid > .sfc`
+   (0,2,0) and zeroed the HORIZONTAL padding: computed style read `16px 0px`, and every child sat
+   1px from the border. That is why the footer text, the fact boxes and the callouts all touched
+   the card edge while looking like they had been given padding.
+   This selector is (0,4,0) and restores the inset for real. */
+.adg-card-body > .rows.adg-suggestion-grid > .sfc {
+  padding: 16px;
 }
 
 .adg-suggestion-grid .sfc-name { flex-basis: 100%; }
@@ -6103,8 +6129,11 @@ button.stat:hover {
   display: grid;
   grid-template-columns: fit-content(150px) 1fr;
   gap: 8px 12px;
-  padding: 8px 10px;
-  border-left: 3px solid var(--warn);
+  /* A full 1px border, never a thick left stripe: a colored side-stripe is decoration standing in
+     for structure, and it also crowded the text against the card edge. The tint already carries
+     the caution. */
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
   border-radius: var(--radius);
   background: var(--warn-soft);
   color: var(--ink-soft);
@@ -6158,12 +6187,12 @@ button.stat:hover {
 .sfc-factgrid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
+  gap: 10px;
 }
 
 .sfc-factgrid .sfc-fact {
   display: block;
-  padding: 8px 10px;
+  padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 7px;
   background: var(--surface);
@@ -6210,11 +6239,16 @@ button.stat:hover {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding-top: 9px;
+  /* Pushed to the bottom of a stretched card, so the rule above it separates the footer from the
+     content rather than hanging in empty space. */
+  margin-top: auto;
+  padding-top: 10px;
   border-top: 1px solid var(--line);
   color: var(--proposal);
   font-family: var(--font-mono);
-  font-size: 9px;
+  /* 9px uppercase mono with letter-spacing was below the point of legibility, and it is real
+     content (the operand and the input count), not decoration. */
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.05em;
   text-transform: uppercase;
