@@ -722,3 +722,26 @@ it('does not make EVERY field value monospace at the stylesheet level', () => {
   // …and the opt-in still exists, so a genuine literal can ask for it.
   expect(css).toMatch(/\.adg-field-value\.mono \{[^}]*--font-mono/)
 })
+
+
+// ── authority colour must not over-claim ─────────────────────────────────────────────────────────
+
+it('does not paint a source PROPOSAL in the same tone as a source ATTESTATION', async () => {
+  // `SourceGlossaryField.provenance` is "source attested" OR "source proposed" — two different
+  // strengths — and the card hardcoded `gj-verified` for both. On a product whose whole value is
+  // knowing who asserted what, painting a proposal with the attested tone is the worst class of
+  // error available: it over-claims authority, and it does so silently.
+  await renderDossier(detail(d => {
+    d.source_glossary = { fields: {
+      business_term: { value: 'Customer Number', provenance: 'source attested' },
+      // `term_type`, not `domain`: only keys in `GLOSSARY_FIELDS` render, and `domain` is not one
+      // of them — a variant the card never draws proves nothing.
+      term_type: { value: 'Business term', provenance: 'source proposed' },
+    } } as never
+  }))
+  const card = screen.getByTestId('source-glossary')
+  const attested = within(card).getByText('source attested')
+  const proposed = within(card).getByText('source proposed')
+  expect(attested).toHaveClass('gj-verified')
+  expect(proposed).not.toHaveClass('gj-verified')
+})

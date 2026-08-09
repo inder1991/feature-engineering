@@ -251,6 +251,16 @@ function PathValue({ value }: { value: string }) {
   )
 }
 
+//: The source file asserts its vocabulary at TWO strengths — "source attested" and "source
+//: proposed" — and the card used to paint both with the attested tone. On a product whose value is
+//: knowing who asserted what, painting a proposal as an attestation over-claims authority, and does
+//: it silently. An unrecognised provenance stays quiet rather than being promoted to either.
+function glossaryTone(provenance: string): string {
+  if (/attested|declared/.test(provenance)) return 'gj-verified'
+  if (/proposed/.test(provenance)) return 'gj-proposed'
+  return 'gj-none'
+}
+
 function SourceGlossaryCard({ detail }: { detail: AssetDetail }) {
   const fields = detail.source_glossary?.fields ?? {}
   const declaredType = detail.identity.declared_type
@@ -274,7 +284,9 @@ function SourceGlossaryCard({ detail }: { detail: AssetDetail }) {
                   ? processPathText(fields[key].value)
                   : fields[key].value}
             </span>
-            <span className="badge gj-verified">{fields[key].provenance}</span>
+            <span className={`badge ${glossaryTone(fields[key].provenance)}`}>
+              {fields[key].provenance}
+            </span>
           </li>
         ))}
         {declaredType && (
