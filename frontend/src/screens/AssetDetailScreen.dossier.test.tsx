@@ -745,3 +745,43 @@ it('does not paint a source PROPOSAL in the same tone as a source ATTESTATION', 
   expect(attested).toHaveClass('gj-verified')
   expect(proposed).not.toHaveClass('gj-verified')
 })
+
+
+// ── the badge's colour agrees with its own words ─────────────────────────────────────────────────
+
+const attestedField = (over: Record<string, unknown> = {}) => ({
+  value: 'x', authority: 'hint', c1_status: 'confirmed',
+  provenance: null, evidence_provenance: 'source attested', selected_evidence_ids: [], ...over,
+})
+
+it('colours an attestation green even when its operational authority is only a hint', async () => {
+  // THE REPORTED CONFUSION. The badge used to take its tone from the OPERATIONAL axis
+  // (`governed`/`hint`/`missing`) while taking its WORDS from provenance, so "source attested"
+  // rendered teal in one card and green in another and read as arbitrary. Colour now follows the
+  // words. `authority: 'hint'` here is the case that used to force teal.
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.entity = attestedField() as never
+  }))
+  const row = screen.getByTestId('axis-entity')
+  expect(within(row).getByText('source attested')).toHaveClass('gj-verified')
+})
+
+it('colours a proposal teal, never green', async () => {
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.entity =
+      attestedField({ evidence_provenance: 'llm proposed', authority: 'governed' }) as never
+  }))
+  const row = screen.getByTestId('axis-entity')
+  const badge = within(row).getByText('llm proposed')
+  expect(badge).toHaveClass('gj-proposed')
+  expect(badge).not.toHaveClass('gj-verified')
+})
+
+it('leaves an unattested value quiet', async () => {
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.entity =
+      attestedField({ evidence_provenance: null, provenance: null, authority: 'governed' }) as never
+  }))
+  const row = screen.getByTestId('axis-entity')
+  expect(within(row).getByText('unattested')).toHaveClass('gj-none')
+})

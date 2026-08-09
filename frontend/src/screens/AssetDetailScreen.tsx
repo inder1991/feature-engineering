@@ -28,7 +28,7 @@ import { useColumnSuggestions } from './columnSuggestions'
 import { AuthorityBadge } from './AuthorityBadge'
 import {
   attestedByLabel,
-  authorityTone,
+  provenanceTone,
   fieldValueText,
   humanizeField,
   typeDisplay,
@@ -280,7 +280,7 @@ export function AssetDetailScreen({ source, objectRef }: { source: string; objec
             </span>
             {headlineConcept
               && (headlineConcept.value != null || headlineConcept.proposed_value != null) && (
-              <span className={`badge ${authorityTone(headlineConcept.authority)}`}>
+              <span className={`badge ${provenanceTone(attestedByLabel(headlineConcept))}`}>
                 {fieldValueText(headlineConcept)} · {attestedByLabel(headlineConcept)}
               </span>
             )}
