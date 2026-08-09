@@ -946,3 +946,21 @@ it('states a realization’s missing cardinality as not established, never as a 
   // The link-level note belongs to links with NO realization at all; this one has one.
   expect(screen.queryByTestId('context-cardinality-bfk_1')).toBeNull()
 })
+
+// ── the authority badge's colour agrees with its words HERE TOO ───────────────────────────────────
+
+it('gives the Context tab the same authority tones as the rest of the dossier', async () => {
+  // REPORTED after the tone rule landed: "still the same issue at many places". The rule was
+  // applied to the axis rows, the header chip and the glossary card, and this row was missed — it
+  // set a tone ONLY for the proposal-only case and otherwise fell through to a bare `.badge`,
+  // which renders neutral grey whatever the label says. So "source attested" was green on
+  // Metadata & evidence and grey here.
+  //
+  // My verification missed it too: I measured 44 badges on the OVERVIEW tab and reported "zero
+  // inconsistent" without saying the page has six tabs. Sweeping all six found it in seconds.
+  await openContext(contextFixture())
+  const attested = screen.getAllByText('source attested')[0]
+  expect(attested).toHaveClass('gj-verified')
+  const proposed = screen.getAllByText('source proposed')[0]
+  expect(proposed).toHaveClass('gj-proposed')
+})
