@@ -1051,18 +1051,26 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
                 # Stale the LLM's own prior ACTIVE concept rows with a DIFFERENT input (a reclassify),
                 # keeping any row that matches this run's input (unchanged -> reuse).
+                # Keyed on the input AND the VOCABULARY: the classifier's answer depends on both,
+                # so a vocabulary that gained the concept a column needed must be able to dislodge
+                # a label chosen when that concept did not exist. Keying on the column alone made a
+                # re-upload a no-op for every unchanged column — measured 2026-08-09, 209 of cib's
+                # 319 concept rows were still on superseded vocabularies four days after an ingest.
+                vocabulary = _vocab_fingerprint()
                 stale_source_evidence(
                     conn, logical_ref=rec.logical_ref, field_name="concept",
-                    producer=EvidenceProducer.LLM, keep_input_hash=input_hash)
+                    producer=EvidenceProducer.LLM, keep_input_hash=input_hash,
+                    keep_configuration_hash=vocabulary)
                 reused = any(
                     e.producer == EvidenceProducer.LLM.value and e.input_hash == input_hash
+                    and e.producer_configuration_hash == vocabulary
                     for e in read_active_field_evidence(conn, rec.logical_ref, "concept"))
                 if not reused:
                     record_field_evidence(
                         conn, logical_ref=rec.logical_ref, field_name="concept",
                         proposed_value=concept, producer=EvidenceProducer.LLM,
                         strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
-                        producer_item_ref=item_ref, producer_configuration_hash=_vocab_fingerprint(),
+                        producer_item_ref=item_ref, producer_configuration_hash=vocabulary,
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
             # Counted only AFTER the savepoint committed: an increment inside the `with` would
             # survive a rollback and report a row that does not exist.

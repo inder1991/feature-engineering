@@ -1501,10 +1501,39 @@ def canonical_entity(entity: str | None) -> str | None:
 
 
 def classification_vocabulary() -> tuple[dict, ...]:
-    """The vocabulary the enrichment classifier chooses from — each concept's ``name``, ``group`` and a
-    short ``hint`` (first clause of its description), EXCLUDING the legacy aliases. Passed to the LLM
-    (B1b) so it classifies into the full structured vocabulary rather than a hardcoded subset; an
-    unrecognised answer still falls back to ``unclassified`` at the caller."""
-    return tuple(
-        {"name": c.name, "group": c.group, "hint": c.description.split(".")[0].strip()[:120]}
-        for c in _ALL if c.name not in _LEGACY_ALIASES)
+    """The vocabulary the enrichment classifier chooses from — each concept's ``name``, ``group`` and
+    its ``hint`` (the WHOLE description), EXCLUDING the legacy aliases. Passed to the LLM (B1b) so it
+    classifies into the full structured vocabulary rather than a hardcoded subset; an unrecognised
+    answer still falls back to ``unclassified`` at the caller.
+
+    ``hint`` used to be ``description.split(".")[0][:120]`` — the FIRST SENTENCE. That silently
+    discarded the half of every description this file writes ON PURPOSE for the classifier (see the
+    "Descriptions state the NEGATIVE deliberately" note above the identifier block): ``bank_bic``
+    sent "SWIFT BIC of a BANK (8/11 alphanumeric)" and cut "never the counterparty person/company —
+    a counterparty's CIF is counterparty_id", and ``clearing_member_code`` cut "not a BIC and not a
+    counterparty". Those are precisely the sentences that separate the concepts seven live FTR
+    columns were misclassified across. Sending the whole description costs ~16k characters across
+    318 entries on a payload that rides ``shared_metadata`` ONCE per batch, not per item.
+
+    Still bounded: a registry description is authored text, and an unbounded registry field must not
+    become an unbounded prompt. 320 clears the current longest (306) with headroom.
+
+    THE ABSTAIN ENTRY is offered last and is not a registry concept — it is the answer that means
+    "none of these fits". Without it a closed answer set can only report a vocabulary GAP as a
+    confident wrong label: on 2026-07-21 the classifier had to name a concept for a column defined
+    as "Correspondent Intermediary Bank BIC" ten days before ``bank_bic`` existed, and the nearest
+    neighbour it returned went on to propose eight bridges from a bank's SWIFT code to a customer
+    number. ``_accept_concept`` has always treated ``unclassified`` as VALID; it was simply
+    unreachable without violating the response contract. Offering it makes the honest answer a legal
+    move, so a gap surfaces as a gap."""
+    return (
+        *(
+            {"name": c.name, "group": c.group, "hint": c.description.strip()[:320]}
+            for c in _ALL if c.name not in _LEGACY_ALIASES
+        ),
+        {"name": UNCLASSIFIED, "group": "none",
+         "hint": "NONE of the concepts above fits. Prefer a genuine match wherever one exists — "
+                 "this is not a way to avoid deciding. Choose it only when no concept applies, in "
+                 "preference to a near-neighbour: a wrong concept silently sets join eligibility, "
+                 "visibility and aggregation safety."},
+    )

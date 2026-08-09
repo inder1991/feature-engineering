@@ -211,6 +211,7 @@ def representation_role(
 #: critic, stage details, decision-trail reasons) may rely on this set being exhaustive.
 SHAPE_CONFLICT_CODES = frozenset({
     "identifier_namespace_mismatch",
+    "identifier_entity_mismatch",
     "name_or_description_not_identifier",
     "measure_not_identifier",
     # ── joint Task 4 (d): the same deterministic-first discipline for the other HIGH-IMPACT
@@ -265,6 +266,59 @@ def _claimed_namespaces(tokens: set[str]) -> set[str]:
     return claimed
 
 
+#: An institution word IMMEDIATELY FOLLOWED BY an identifier word — "bank code", "institution
+#: code", "bank identifier", "bank bic". Adjacency is the whole rule; see `_claims_institution`.
+_INSTITUTION_WORDS = frozenset({"bank", "institution"})
+_IDENTIFIER_WORDS = frozenset({"code", "bic", "identifier"})
+
+#: The entities a PARTY identifier links. A bank is not one of them, which is the whole contradiction.
+_PARTY_ENTITIES = frozenset({"customer", "counterparty"})
+
+
+def _word_sequence(*values: object) -> list[list[str]]:
+    """Each value's words IN ORDER. `_tokens` returns a set, which cannot express adjacency."""
+    out: list[list[str]] = []
+    for value in values:
+        if value is None:
+            continue
+        text = _CAMEL_BOUNDARY.sub(" ", str(value))
+        words = [w for w in _WORD_RE.split(text.lower()) if w]
+        if words:
+            out.append(words)
+    return out
+
+
+def _claims_institution(column_name: str, definition: str | None) -> bool:
+    """Whether the column's own wording says the identifier identifies an INSTITUTION.
+
+    Deliberately an ENTITY claim, not a namespace one. The namespace comment above is right that a
+    "bank code" is shape-anonymous — national scheme, correspondent scheme or in-house, one cannot
+    tell — so no namespace may be inferred from it. What IS unambiguous is WHO it identifies: a
+    column defined "Correspondent Receiver Bank Code" or "Third Reimbursement Institution Code"
+    identifies a BANK, and therefore cannot be a customer's or counterparty's identifier whatever
+    scheme it belongs to. That is a decidable contradiction on the weaker axis, and it is the axis
+    the live defect actually crossed.
+
+    ADJACENCY, not co-occurrence. The first draft of this rule asked whether an institution word and
+    an identifier word both appeared anywhere in the text, and it refuted a CORRECT assignment:
+
+        counter_party_cif_id — "The bank's own customer information file identifier for the
+                                counterparty."   -> concept customer_id, which is right
+
+    There "the bank's own" is POSSESSIVE — the bank ISSUES the identifier; the thing identified is
+    the customer. Only adjacency separates that from "Bank Code", where the institution word
+    modifies the identifier noun directly. The Pass-A golden payload caught it, which is what that
+    fixture is for.
+
+    Refutes only a PARTY-linked concept, so a correctly bank-linked one (`bank_bic`,
+    `clearing_member_code`) is untouched. Absent wording ABSTAINS, like every rule here."""
+    for words in _word_sequence(column_name, definition):
+        for first, second in zip(words, words[1:]):
+            if first in _INSTITUTION_WORDS and second in _IDENTIFIER_WORDS:
+                return True
+    return False
+
+
 #: The concept GROUPS the deterministic ruleset (and therefore the critic) covers. High-impact by
 #: the plan's own naming: an identifier decides join candidacy, a monetary/temporal misclassification
 #: decides aggregation and point-in-time semantics, and a label/leakage misclassification decides
@@ -299,6 +353,8 @@ def _identifier_conflicts(column_name, declared_type, definition, registered,
     claimed = _claimed_namespaces(tokens)
     if claimed and registered.namespace not in claimed:
         conflicts.add("identifier_namespace_mismatch")
+    if _claims_institution(column_name, definition) and registered.entity_link in _PARTY_ENTITIES:
+        conflicts.add("identifier_entity_mismatch")
     if _bare_role(column_name, definition, declared_type) in _TEXT_ROLES:
         conflicts.add("name_or_description_not_identifier")
     if _tokens(column_name) & _MEASURE_NAME_TOKENS or _fractional_declared_type(declared_type):

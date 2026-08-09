@@ -130,3 +130,67 @@ def test_stale_source_evidence_keeps_unchanged_input(db):
         producer=EvidenceProducer.SOURCE, keep_input_hash=h1)
     assert staled == 0
     assert len(read_active_field_evidence(db, logical_ref, "definition")) == 1
+
+
+def test_a_changed_producer_configuration_stales_even_when_the_input_is_identical(db):
+    """FIX 1 — the staleness rule must consider the PRODUCER'S CONFIGURATION, not just the input.
+
+    MEASURED ON THE LIVE CATALOG (2026-08-09). A classifier's answer depends on two things: the
+    column, and the closed VOCABULARY it must choose from. Only the first was keyed. So a vocabulary
+    that gained the very concept a column needed (`bank_bic`, added 2026-07-31) could not dislodge a
+    label chosen when that concept did not exist — the column had not changed, so the row was
+    'reused' and a re-upload was a no-op. The evidence table had been RECORDING the vocabulary
+    fingerprint in `producer_configuration_hash` all along and nothing ever read it.
+
+    The scale that made it worth fixing: 209 of cib's 319 concept rows sat on superseded
+    vocabularies four days AFTER a re-ingest, and 124 of 124 of ftr's did.
+
+    Passing no `keep_configuration_hash` keeps the historical behaviour EXACTLY — the other callers
+    (type attestation, table synth, the source re-upload path) key on input alone and must not start
+    staling rows because a column they never configured reports NULL here.
+    """
+    logical_ref = normalize_ref("upload", "public", "accounts", "concept")
+    material = {"table": "accounts", "column": "cust_num", "type": "text"}
+    h = field_input_hash(logical_ref=logical_ref, field_name="concept", material=material)
+
+    record_field_evidence(
+        db, logical_ref=logical_ref, field_name="concept", proposed_value="counterparty_id",
+        producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
+        producer_ref="run-july", producer_configuration_hash="vocab_JULY",
+        source_snapshot_id="snap1", input_hash=h)
+
+    # SAME input hash, SAME producer — only the vocabulary moved on.
+    staled = stale_source_evidence(
+        db, logical_ref=logical_ref, field_name="concept", producer=EvidenceProducer.LLM,
+        keep_input_hash=h, keep_configuration_hash="vocab_TODAY")
+    assert staled == 1, "a label produced under a superseded vocabulary must not survive as active"
+    assert read_active_field_evidence(db, logical_ref, "concept") == []
+
+
+def test_an_unchanged_configuration_still_reuses_the_row(db):
+    """The other half: re-deriving on every ingest would be as wrong as never re-deriving."""
+    logical_ref = normalize_ref("upload", "public", "accounts", "concept")
+    h = field_input_hash(logical_ref=logical_ref, field_name="concept", material="same")
+    record_field_evidence(
+        db, logical_ref=logical_ref, field_name="concept", proposed_value="customer_id",
+        producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
+        producer_ref="run-1", producer_configuration_hash="vocab_TODAY",
+        source_snapshot_id="snap1", input_hash=h)
+    assert stale_source_evidence(
+        db, logical_ref=logical_ref, field_name="concept", producer=EvidenceProducer.LLM,
+        keep_input_hash=h, keep_configuration_hash="vocab_TODAY") == 0
+    assert len(read_active_field_evidence(db, logical_ref, "concept")) == 1
+
+
+def test_omitting_the_configuration_keeps_the_historical_input_only_rule(db):
+    """Callers that never configured a vocabulary must be untouched by this change."""
+    logical_ref = normalize_ref("upload", "public", "accounts", "definition")
+    h = field_input_hash(logical_ref=logical_ref, field_name="definition", material="text")
+    record_field_evidence(
+        db, logical_ref=logical_ref, field_name="definition", proposed_value="text",
+        producer=EvidenceProducer.SOURCE, strength=AssertionStrength.SUPPORTED,
+        producer_ref="glossary", source_snapshot_id="snap1", input_hash=h)
+    assert stale_source_evidence(
+        db, logical_ref=logical_ref, field_name="definition", producer=EvidenceProducer.SOURCE,
+        keep_input_hash=h) == 0
+    assert len(read_active_field_evidence(db, logical_ref, "definition")) == 1

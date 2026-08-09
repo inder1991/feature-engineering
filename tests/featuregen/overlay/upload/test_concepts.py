@@ -146,7 +146,12 @@ def test_classification_vocabulary_offers_rich_concepts_excludes_legacy():
     names = {v["name"] for v in vocab}
     assert "monetary_stock" in names and "outcome_label" in names        # rich §3 concepts are targets
     assert "monetary_amount" not in names and "rate_or_ratio" not in names  # legacy aliases are not
-    assert "unclassified" not in names
+    # `unclassified` IS offered now, deliberately — it is the abstain answer, not a concept. This
+    # line used to assert its absence; see
+    # `test_the_vocabulary_offers_an_explicit_abstain_choice` for the live failure that reversed it
+    # (a closed set with no "none of these" can only report a vocabulary gap as a confident wrong
+    # label). It is still excluded from the REGISTRY, which is what this test is really about.
+    assert "unclassified" not in CONCEPTS
     ms = next(v for v in vocab if v["name"] == "monetary_stock")
     assert ms["group"] == "monetary" and ms["hint"]                       # name + group + short hint
 
@@ -384,3 +389,61 @@ def test_current_registry_validates():
     # import-time regression: the SHIPPED registry must survive the stricter cycle check
     from featuregen.overlay.upload.concepts import _validate_registry
     _validate_registry()
+
+
+def test_the_classifier_vocabulary_carries_the_whole_disambiguating_description():
+    """FIX 3 — the NEGATIVE half of a description is the routing signal, and it was being cut off.
+
+    `concepts.py` states the intent directly: "Descriptions state the NEGATIVE deliberately — they
+    are the LLM's routing signal." The renderer sent `description.split(".")[0][:120]`, i.e. the
+    FIRST SENTENCE only, so every disambiguation written after the first full stop was authored for
+    a reader that never saw it:
+
+        bank_bic              SENT "SWIFT BIC of a BANK (8/11 alphanumeric)"
+                              CUT  "...never the counterparty person/company — a counterparty's
+                                    CIF is counterparty_id; the bank's code is this."
+        clearing_member_code  CUT  "...not a BIC and not a counterparty."
+
+    Those two sentences are exactly the ones that separate the concepts seven live FTR columns were
+    misclassified across. Whether the model then follows the steering is its business; sending it
+    is ours.
+
+    Asserted on the CONTENT, not the length: a cap that happens to admit the clause today would
+    pass a length check and still cut a longer one tomorrow.
+    """
+    from featuregen.overlay.upload.concepts import classification_vocabulary
+
+    hints = {c["name"]: c["hint"] for c in classification_vocabulary()}
+    assert "never the counterparty" in hints["bank_bic"]
+    assert "not a BIC and not a counterparty" in hints["clearing_member_code"]
+    # Still bounded — an unbounded registry field must not become an unbounded prompt.
+    assert all(len(h) <= 320 for h in hints.values())
+
+
+def test_the_vocabulary_offers_an_explicit_abstain_choice():
+    """FIX 2 — a closed answer set with no "none of these" can only report a gap as a wrong answer.
+
+    THE LIVE FAILURE (2026-08-09). On 2026-07-21 the classifier was asked to label
+    `corres_bank_intermediary_bic`, whose own glossary definition opens "Correspondent Intermediary
+    Bank BIC". `bank_bic` did not enter the registry until 2026-07-31, the response schema REQUIRES
+    a `concept` string per ref, and `unclassified` was not offered — so no available answer was
+    correct and no answer meant "not in your list". It returned the nearest neighbour,
+    `counterparty_id`, which later aliased to `customer_id` and produced eight bridge proposals from
+    a bank's SWIFT code to a customer number.
+
+    That is compliance with the contract, not a hallucination. Without an abstain channel a
+    vocabulary gap is INDISTINGUISHABLE on the wire from a confident correct answer, so it can only
+    ever surface as silent downstream noise.
+
+    The accept path already treats `unclassified` as valid (`_accept_concept`) — it was reachable
+    only by VIOLATING the contract and returning something off-vocabulary. This makes the honest
+    answer a legitimate move rather than a protocol error.
+    """
+    from featuregen.overlay.upload.concepts import UNCLASSIFIED, classification_vocabulary
+
+    entries = {c["name"]: c for c in classification_vocabulary()}
+    assert UNCLASSIFIED in entries, "a closed vocabulary must let the model say 'none of these'"
+    hint = entries[UNCLASSIFIED]["hint"].lower()
+    assert "none" in hint or "no concept" in hint, (
+        "the abstain entry must SAY it is the none-of-these answer; an unexplained token in a "
+        "318-entry list is not an offer")
