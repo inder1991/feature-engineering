@@ -96,7 +96,17 @@ type Outcome =
   | { kind: 'unsupported' }
   | { kind: 'error'; detail: string }
 
-export function SuggestedFeaturesScreen({ source, table }: { source: string; table: string }) {
+export function SuggestedFeaturesScreen({
+  source,
+  table,
+  fromColumn,
+}: {
+  source: string
+  table: string
+  // Optional: the column the reader clicked through from. Highlights, never filters — hiding
+  // suggestions the reader did not ask to hide would be a worse answer than an unmarked list.
+  fromColumn?: string
+}) {
   // Read scope decides which columns ground and which suggestions exist at all, so a result read
   // under one identity is not an answer for another. Keyed on principal + claims, NOT on the URL.
   const identity = useIdentityKey()
@@ -235,6 +245,26 @@ export function SuggestedFeaturesScreen({ source, table }: { source: string; tab
         <span className="mono">{collection.anchor_table_ref}</span> ·{' '}
         <span className="mono">{collection.anchor_catalog_source}</span>
       </p>
+
+      {/* The page is table-scoped, so arriving from four different columns produced four
+          identical pages with nothing naming the one you clicked -- indistinguishable from a
+          broken link. This states the context that the table-scoped handoff drops. It
+          HIGHLIGHTS and never filters: hiding suggestions the reader did not ask to hide
+          would be a worse answer than an unmarked list. */}
+      {fromColumn && (
+        <p className="sfs-from" role="status">
+          You opened this from <code>{fromColumn}</code>.{' '}
+          {(() => {
+            const ref = `${table}.${fromColumn}`.toLowerCase()
+            const n = data.hits.filter(h => h.suggestion.operands
+              .some(o => o.graph_object_ref.toLowerCase().endsWith(ref)
+                || o.graph_object_ref.toLowerCase().endsWith(`.${fromColumn.toLowerCase()}`))).length
+            return n === 0
+              ? 'None of the suggestions below bind it — they are the rest of what this table can build.'
+              : `${n} of ${data.hits.length} below bind it; the rest are what else this table can build.`
+          })()}
+        </p>
+      )}
 
       <div className="stats" role="group" aria-label="Suggestion summary">
         <Stat n={summary.suggested} label="suggested" />

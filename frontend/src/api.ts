@@ -1067,6 +1067,8 @@ export interface LineageNode {
   // table's as-of column — the availability basis (posted_at | ingested_at) from its as-of fact.
   concept?: string
   domain?: string
+  // Declared type from graph_node, so a card can state what a column IS as well as what it means.
+  data_type?: string
   as_of_basis?: string
   // feature stamps (omitted when absent): the honest verification stamp (e.g. DESIGN-CHECKED) and
   // the causal WHY it was born (its hypothesis); rationale is absent for directly-registered features.
