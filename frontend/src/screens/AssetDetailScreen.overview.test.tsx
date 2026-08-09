@@ -211,14 +211,17 @@ it('keeps the technical refs reachable but out of the page-top position', async 
 
 // ── capabilities lifted onto Overview ────────────────────────────────────────────────────────────
 
-it('answers "can I use this column" on Overview and hands off to full readiness', async () => {
+it('answers "can I use this column" on Overview and hands off to the Readiness tab', async () => {
   await renderOverview(detail())
   const roles = fixture().readiness?.usability?.roles ?? []
   expect(roles.length).toBeGreaterThan(0)
   for (const role of roles) {
     expect(screen.getByTestId(`cap-${role.role}`)).toHaveTextContent(role.headline)
   }
-  await userEvent.click(screen.getByRole('button', { name: /full readiness/i }))
+  // Label changed "Full readiness" -> "View readiness" (2026-08-09 UX review): the old wording read
+  // as a VERDICT and contradicted the strip above it, which says "2 of 5 potential uses" for the
+  // same column. What this test cares about is the HANDOFF, which is unchanged.
+  await userEvent.click(screen.getByRole('button', { name: 'View readiness' }))
   // The jump lands on the Readiness tab rather than duplicating its evidence ids on Overview.
   expect(screen.getByRole('button', { name: 'Readiness' })).toHaveAttribute('aria-pressed', 'true')
 })

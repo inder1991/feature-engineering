@@ -6258,8 +6258,19 @@ button.stat:hover {
   color: var(--ok);
 }
 
-.sfc-status .badge.gj-partial,
+/* The two DESIGN states must not look alike. `SuggestionCard`'s STATUS_TONE deliberately assigns
+   `gj-none` to DESIGN_CHECKED and `gj-partial` to design-NOT-checked, with the stated intent that
+   "neither state gets the success fill" but that they remain distinguishable. This rule used to
+   list both selectors together and paint them the SAME amber, so a checked design and an unchecked
+   one were identical at a glance — defeating the one signal a reader triaging a grid of cards
+   needs. Checked is quiet; not-checked keeps the amber. Neither is green. */
 .sfc-status .badge.gj-none {
+  border-color: var(--line);
+  background: var(--paper);
+  color: var(--ink-soft);
+}
+
+.sfc-status .badge.gj-partial {
   border-color: var(--warn);
   background: var(--warn-soft);
   color: var(--warn);
