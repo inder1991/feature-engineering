@@ -5,6 +5,7 @@
 #   ./deploy/kind/deploy.sh            # build + deploy everything (backend, frontend, postgres)
 #   ./deploy/kind/deploy.sh backend    # rebuild + redeploy ONLY the backend (fast iteration)
 #   ./deploy/kind/deploy.sh frontend   # rebuild + redeploy ONLY the frontend
+#   ./deploy/kind/deploy.sh worker     # restart ONLY the durable-runtime worker
 #
 # The LLM key (never committed) is sourced, in order, from:
 #   1. $ANTHROPIC_API_KEY in your environment, or
@@ -22,7 +23,7 @@ CLUSTER="${KIND_CLUSTER:-featuregen}"
 NS="${KIND_NAMESPACE:-featuregen}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
-TARGET="${1:-all}"   # all | backend | frontend
+TARGET="${1:-all}"   # all | backend | frontend | worker
 
 log() { printf '\n==> %s\n' "$*"; }
 want() { [ "$TARGET" = "all" ] || [ "$TARGET" = "$1" ]; }
@@ -70,6 +71,10 @@ restart_wait() {  # $1 = deploy name
 }
 want backend  && restart_wait backend
 want frontend && restart_wait frontend
+# The worker runs the BACKEND image, so a backend rebuild leaves it stale exactly as it would the
+# backend itself — but SILENTLY, since it serves no traffic to notice with. It is therefore
+# restarted on a `backend` target as well as its own: that is when its code actually moved.
+{ want backend || want worker; } && restart_wait worker
 
 # ── 6. verify the running image actually serves the code (not just "pod is up") ─────────────────────
 log "verify"
