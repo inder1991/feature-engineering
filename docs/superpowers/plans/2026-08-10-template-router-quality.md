@@ -801,6 +801,71 @@ say the product does):
   knows the critic's false-positive rate on real hypotheses. The flag-only period IS the evaluation;
   define the acceptable rate before deciding on any refusal mode.
 
+## External architecture review — adjudicated against verified platform facts (2026-08-10)
+
+Six proposals received; each checked before adoption. Two rest on false premises and are rejected
+with evidence; the rest are adopted, two of them redesigned.
+
+| # | proposal | verdict |
+|---|---|---|
+| 2 | structured target extraction at intake | **ADOPT — spec FIRST** |
+| 4 | gauntlet-refusal feedback to the router | **ADOPT, redesigned deterministic** |
+| 1 | two-phase / batched gauntlet for 4b | **ADOPT as 4b's mitigation design, behind the existing measurement gate** |
+| 6 | composite keys on `Need` | **PARK — no measured demand; compound keys already live where joins execute** |
+| 3 | HLL cardinality sketches at ingest | **REJECT as specified — no data exists at ingest** |
+| 5 | blanket entity inheritance from table grain | **REJECT as specified — semantically wrong, and its premise is false** |
+
+**#2 (adopt first).** Verified: `target_ref: str | None = None` (`contract.py:170`) — the target is
+OPTIONAL at intake, so the `target_ref` veto and the near-label critic are both gated on an input
+the user may simply not provide, and the reviewer's abstain-cascade concern is real: vague prose →
+extraction failure → ABSTAIN → advisory chip only. Spec: an intake pre-pass extracting a strict
+contract (`target_column`, `target_window_days`, `target_type`, domain) through the governed seam,
+cached, with abstention REPORTED as a coverage metric. One product boundary the reviewer's version
+crosses: hard fail-closed on low-confidence extraction would refuse the whole generation flow for a
+merely informal hypothesis. Instead: extraction failure + a grounded NEAR-LABEL candidate in the
+result = that candidate is withheld pending an explicit target declaration — fail-closed exactly
+where the risk is, exploratory generation unblocked elsewhere. Abstention-rate monitoring (the
+reviewer's Task-3-dead-weight concern) becomes a first-class metric of this pre-pass.
+
+**#4 (adopt, redesigned).** The finding is real — nothing feeds gauntlet refusals back, so a refused
+tie-break winner is re-proposed on every cache miss. But the LLM-prompt-injection fix adds
+nondeterminism management for little gain. Deterministic version: when the adjudicated winner's
+candidate is gauntlet-refused, RE-BIND to the next tied candidate and re-run — a retry loop in
+grounding, no model in the loop — and record the refusal code beside the verdict in
+`structured_result` so Step-0 instrumentation surfaces chronic refusals. Fold into Task 2's spec.
+
+**#1 (adopt as design, keep the gate).** The decided 4b emission policy is already ONE card per
+recipe (hypothesis-chosen parameters), so the 6× blast only exists if top-K widening is later
+chosen. The two-phase gauntlet (in-memory static checks first, I/O checks on survivors) and batched
+freshness/profile reads are the right mitigation WHEN that gate opens — spec then, not now.
+
+**#3 (reject as specified).** HyperLogLog needs data; **ingest has none.** Verified this session:
+`CanonicalRow` carries schema and glossary metadata only — no rows, no samples; its `cardinality` is
+a DECLARED string; the profiler was retired in the upload-catalog pivot. There is nothing at ingest
+to sketch. The real path to bridge cardinality already exists in the data model: the crosswalk
+OBSERVATION store (migration 1057, `crosswalk_observation_revision`, with `source_to_target_max_matches`
+/ `target_to_source_max_matches` / `row_coverage` fields) is designed for exactly these measurements
+— produced by the data agent against the physical cluster, not by ingest. Until observations run:
+declared + human-confirmed cardinality, and the gauntlet refuses additive aggregations across an
+unmeasured bridge (already Task 0's rule). The reviewer's fan-out gating idea is right; the venue is
+wrong.
+
+**#5 (reject as specified).** Two defects. The premise — "Tier-1 recipes are blocked by 15% entity
+coverage" — is false: R1/R2 ground by CONCEPT match (`cif_id` carries `customer_id`; `_candidate_score`
+scores `col.concept == need.concept` at −4 with no graph `entity` read); the governed-entity branch
+is an alternate path for `is_grain` columns, not a gate. And the mechanism — inherit the table
+grain's entity across all columns — is semantically wrong in exactly the catalogs at hand:
+`ftr.counter_party_cif_id` sits in a customer-grain table and describes the COUNTERPARTY; blanket
+inheritance would relabel it `customer`, manufacturing the same class of error the BIC
+misclassification just taught. The safe version already runs: `axis_projection` fills `entity` from
+identifier concepts' `entity_link`, fill-only-NULL, skip-loud on governed facts. The genuine lever
+is registry `entity_link` coverage plus the existing suggest→confirm loop — Task 5 as written.
+
+**#6 (park).** Real capability, no measured demand: the blocked-concept histogram shows missing
+CONCEPTS, not compound-key failures, and compound keys already exist where joins execute (crosswalk
+definitions carry 1–16 member pairs, migration 1050 CHECK). Spec when a recipe or crosswalk
+observation actually needs the router to see a tuple.
+
 ## What NOT to do
 
 Do not let an LLM author templates. The 157 are SME-written and safe-by-construction, each carrying
