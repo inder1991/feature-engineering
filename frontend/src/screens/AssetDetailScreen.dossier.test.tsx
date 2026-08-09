@@ -626,3 +626,57 @@ it('gives the search-terms card the full grid width', async () => {
   }))
   expect(await screen.findByTestId('search-terms')).toHaveClass('adg-card--full')
 })
+
+
+// ── review fixes: the three verified defects from the 2026-08-09 UX review ────────────────────────
+
+it('the readiness action reads as an ACTION, not as a verdict', async () => {
+  // It is a <button> that swaps to the Readiness tab, but it was labelled "Full readiness" in
+  // `.btn--ghost` — transparent border AND background at rest, so it rendered as plain grey text.
+  // Two failures at once: no resting affordance, and a label that reads as a STATUS claim which
+  // contradicted the strip above it ("2 of 5 potential uses") for this very column.
+  await renderDossier(detail())
+  // Scoped to the CARD: the tab strip also has a "Readiness" button, and an ambiguous query here
+  // would fail for a reason that has nothing to do with what this test is about.
+  const card = screen.getByTestId('capabilities')
+  const action = within(card).getByRole('button', { name: 'View readiness' })
+  expect(action).toHaveClass('btn--link')       // the page's own underlined-action style
+  expect(within(card).queryByText('Full readiness')).toBeNull()
+})
+
+it('counts of one are not labelled in the plural', async () => {
+  // "1 Direct relationships". The suggestion card already pluralises its operand count, so the
+  // codebase knows the rule; the stat strip did not apply it.
+  await renderDossier(detail(d => {
+    d.relationships!.approved_joins = []
+    d.relationships!.cross_catalog = [{
+      relationship_ref: 'r1', kind: 'crosswalk', status: 'confirmed',
+      object_ref: 'public.other.col', catalog_source: 'ftr',
+    } as unknown as never]
+  }))
+  const strip = screen.getByLabelText('Asset decision summary')
+  expect(within(strip).getByText('Direct relationship')).toBeInTheDocument()
+  expect(within(strip).queryByText('Direct relationships')).toBeNull()
+})
+
+
+it('the two DESIGN states are not painted the same colour', async () => {
+  // `SuggestionCard.STATUS_TONE` maps DESIGN_CHECKED -> `gj-none` and design-NOT-checked ->
+  // `gj-partial` on purpose. A single CSS rule listed BOTH selectors together and painted them the
+  // same amber, so the two opposite verdicts were indistinguishable on a grid of cards — the one
+  // signal a reader triaging them needs.
+  //
+  // Structural because jsdom computes no styles: the class assignment was always correct, so no
+  // DOM assertion could ever have caught this. The stylesheet is the artifact under test.
+  const css = readFileSync('src/index.css', 'utf8')
+  expect(css).not.toMatch(/\.sfc-status \.badge\.gj-partial,\s*\n\.sfc-status \.badge\.gj-none/)
+  const none = css.match(/\.sfc-status \.badge\.gj-none \{[^}]*\}/)?.[0] ?? ''
+  const partial = css.match(/\.sfc-status \.badge\.gj-partial \{[^}]*\}/)?.[0] ?? ''
+  expect(none).toBeTruthy()
+  expect(partial).toBeTruthy()
+  expect(none).not.toEqual(partial)
+  expect(partial).toContain('--warn')       // not-checked keeps the amber
+  expect(none).not.toContain('--warn')      // checked goes quiet
+  expect(none).not.toContain('--ok')        // …but never the success fill, on either
+  expect(partial).not.toContain('--ok')
+})

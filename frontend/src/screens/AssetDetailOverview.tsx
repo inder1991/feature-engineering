@@ -70,16 +70,21 @@ function Stat({
   label,
   qualifier,
   tone,
+  one,
 }: {
   value: string
   label: string
   qualifier: string
   tone?: 'ok' | 'warn'
+  //: The SINGULAR label, used when the count is exactly 1. Opt-in rather than derived: "Potential
+  //: uses" reads "2 of 5" and is never singular, and stripping a trailing "s" would mangle any
+  //: label that does not pluralise that way. A stat with no singular form simply omits this.
+  one?: string
 }) {
   return (
     <div className="stat adg-stat">
       <b className={tone ? `tone-${tone}` : undefined}>{value}</b>
-      <span className="adg-stat-label">{label}</span>
+      <span className="adg-stat-label">{one && value === '1' ? one : label}</span>
       <small>{qualifier}</small>
     </div>
   )
@@ -151,6 +156,7 @@ export function SummaryStrip({
         <Stat
           value={String(direct)}
           label="Direct relationships"
+          one="Direct relationship"
           qualifier={direct === 0
             ? 'The parent table still provides context'
             : 'Verified joins and cross-catalog links'}
@@ -502,12 +508,16 @@ function CapabilitiesCard({
 }) {
   return (
     <DossierCard
+      testId="capabilities"
       title="What can the system use it for?"
       subtitle="Role verdicts, each with the evidence still required."
       aside={
+        // `btn--link`, not `btn--ghost`: ghost is transparent border AND background at rest, so this
+        // rendered as plain grey text with no affordance until hover. `btn--link` is the page's own
+        // underlined-action style, already used by "View all recommendations".
         <button
           type="button"
-          className="btn btn--ghost"
+          className="btn btn--link"
           onClick={() => {
             onOpenReadiness()
             // After the tab swap the Overview panel is gone; put the caret on the tab that now owns
@@ -519,7 +529,9 @@ function CapabilitiesCard({
             })
           }}
         >
-          Full readiness
+          {/* An ACTION, not a verdict. "Full readiness" read as a status claim and contradicted the
+              strip above it, which says "2 of 5 potential uses" for this same column. */}
+          View readiness
         </button>
       }
     >
