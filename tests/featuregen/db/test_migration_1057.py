@@ -175,10 +175,25 @@ def test_the_id_prefix_is_check_pinned(db) -> None:
 # ── the reservation ─────────────────────────────────────────────────────────────────────────────
 
 def test_this_stream_allocated_exactly_one_number() -> None:
-    """D7: uniqueness is the FULL FILENAME, and Task 11 owns 1057 — nothing else."""
+    """D7: uniqueness is the FULL FILENAME, and Task 11 owns 1057 — nothing else.
+
+    Phrased as a fact about THIS STREAM rather than about the pool. It used to assert
+    ``[n for n in names if n.startswith("1058_")] == []``, which READS as "Task 11 did not also
+    grab the next number" but ASSERTS "nobody may ever take 1058" — so the first unrelated stream
+    to claim it legitimately turned this stream's own discipline into somebody else's red test.
+    That is a landmine, not a guard: the number a later author must take is exactly the one this
+    line forbade, and the failure gives them no hint that the fix is here.
+
+    1058 is now taken by the readiness wave (``1058_graph_node_fibo_path.sql``), reserved in the
+    D7 table in the same commit as the migration — which is the coordination step the 1032/1033
+    double-allocation (A.22) exists to enforce, and the one this assertion was reaching for.
+    """
     names = sorted(p.name for p in _MIGRATION_DIR.glob("*.sql"))
     assert [n for n in names if n.startswith("1057_")] == ["1057_crosswalk_observation.sql"]
-    assert [n for n in names if n.startswith("1058_")] == []
+    # The real invariant: this STREAM contributed exactly one migration, whatever number any
+    # later stream takes. Keyed on the stream's own name, so it stays true as the pool advances.
+    assert [n for n in names
+            if "crosswalk_observation" in n] == ["1057_crosswalk_observation.sql"]
 
 
 def test_1057_orders_after_everything_it_references() -> None:
