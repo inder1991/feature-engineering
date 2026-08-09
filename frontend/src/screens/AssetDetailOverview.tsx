@@ -366,8 +366,13 @@ function SearchTermsCard({ detail }: { detail: AssetDetail }) {
         <>
           <ul className="rows adg-fieldsum">
             <li className="row">
+              {/* NEUTRAL chips. These are the drafted words themselves — data — and they carried
+                  `gj-proposed`, the same fill as the "AI proposed" badge directly beneath them, so
+                  eight content chips read as eight authority verdicts. A tone means authority
+                  strength, and it can only mean that if nothing else wears it. The card states the
+                  authority ONCE, in its badge and its rationale; the terms do not repeat it. */}
               {terms.map(term => (
-                <span key={term.toLowerCase()} className="badge gj-proposed">
+                <span key={term.toLowerCase()} className="badge">
                   {term}
                 </span>
               ))}
@@ -468,10 +473,13 @@ function SemanticsCard({
   return (
     <DossierCard
       full
+      testId="operational-semantics"
       title="Operational semantics"
       subtitle="Every supported axis is shown; “not known” is different from hidden."
       aside={axesApply && (
-        <span className="badge gj-proposed adg-count">
+        // NEUTRAL: this is a tally of the card's own rows, not a claim about who vouched for
+        // anything. It wore the proposal fill, so a count read as an AI proposal.
+        <span className="badge adg-count">
           {known} populated · {unknown} unknown
         </span>
       )}
