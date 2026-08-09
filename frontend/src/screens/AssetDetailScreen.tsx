@@ -1,7 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { AssetProfilePanel } from './AssetProfilePanel'
-import { CatalogNarrativePanel } from './CatalogNarrativePanel'
-import { DatasetPolicyPanel } from './DatasetPolicyPanel'
 import {
   ApiError,
   type AssetApprovedJoin,
