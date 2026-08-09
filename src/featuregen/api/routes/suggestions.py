@@ -55,13 +55,16 @@ import time
 from typing import Annotated, Any
 
 import psycopg
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from psycopg import sql
 from pydantic import BaseModel, ConfigDict
 
 from featuregen.api.deps import get_feature_gen_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CatalogProjectionUnavailable,
+)
 from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
 from featuregen.overlay.upload.suggestion_contract import page_to_json, unknown_table_page_v2
 from featuregen.overlay.upload.suggestions import (
@@ -452,16 +455,25 @@ def table_suggestions(
     conn.execute(sql.SQL("SET LOCAL statement_timeout = {}")
                  .format(sql.Literal(SUGGESTIONS_STATEMENT_TIMEOUT_MS)))
     started = time.monotonic()
-    if contract_version == 2:
-        page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
-                                        roles=identity.role_claims, max_hops=max_hops)
-        collection = page.collection
-        logger.info("suggestions v2 for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
-                    catalog_source, table, time.monotonic() - started, collection.table_known,
-                    len(page.hits), max_hops, dict(collection.omitted_counts))
-        return page_to_json(page)
-    out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
-                                     roles=identity.role_claims, max_hops=max_hops)
+    # Suggestions are computed ON DEMAND, and the gauntlet reads GOVERNED values (grain, join
+    # authority) via `_governed_read`, which fails closed on a lagged projection rather than reason
+    # from a value it knows is stale. That refusal is correct; what it must NOT do is leave as an
+    # opaque 500. Mapped to the same retryable 503 `contract.py` already uses — the mapping
+    # `_governed_read`'s docstring promises — so the caller learns this is temporary and retryable.
+    try:
+        if contract_version == 2:
+            page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
+                                            roles=identity.role_claims, max_hops=max_hops)
+            collection = page.collection
+            logger.info(
+                "suggestions v2 for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
+                catalog_source, table, time.monotonic() - started, collection.table_known,
+                len(page.hits), max_hops, dict(collection.omitted_counts))
+            return page_to_json(page)
+        out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
+                                         roles=identity.role_claims, max_hops=max_hops)
+    except CatalogProjectionUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
     logger.info("suggestions for %s.%s took %.3fs (known=%s, suggested=%s, hops=%s, "
                 "neighbours=%s/%s)", catalog_source, table, time.monotonic() - started,
                 out["table_known"], out["summary"]["suggested"], max_hops,

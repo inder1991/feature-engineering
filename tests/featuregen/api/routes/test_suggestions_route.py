@@ -34,6 +34,10 @@ from featuregen.overlay.catalog import _clear_catalog_adapter
 from featuregen.overlay.commands import register_overlay_commands
 from featuregen.overlay.config import _clear_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CATALOG_PROJECTION_UNAVAILABLE,
+    CatalogProjectionUnavailable,
+)
 from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
 
 PATH = f"/catalog/{SOURCE}/tables/{TABLE}/suggestions"
@@ -399,3 +403,35 @@ def test_the_two_contracts_describe_the_same_read(client, ftr_catalog):  # noqa:
         s["name"] for g in v1["groups"] for s in g["suggestions"]}
     assert [r["code"] for r in v2["collection"]["rejections"]] == [
         r["code"] for r in v1["rejections"]]
+
+
+@pytest.mark.parametrize("contract_version", [1, 2])
+def test_a_lagged_projection_is_a_retryable_503_not_an_opaque_500(client, monkeypatch,
+                                                                  contract_version):
+    """FROM THE LIVE CLUSTER (2026-08-09): the page showed "Could not load suggestions: Internal
+    Server Error" while the backend logged CATALOG_PROJECTION_UNAVAILABLE.
+
+    The refusal itself is CORRECT and stays: suggestions are computed on demand, and the gauntlet
+    reads GOVERNED values (grain, join authority) through `_governed_read`, which fails closed
+    rather than reason from a projection it knows is behind. What was wrong is only how it left the
+    building — an unhandled exception became a 500, which reads as a crash and tells the caller
+    nothing about the one thing that matters: this is TEMPORARY, and retrying is the right move.
+
+    `contract.py` already maps this exception to a retryable 503 (the mapping `_governed_read`'s own
+    docstring promises: "which the feature-gen route maps to a retryable 503"). This route reaches
+    the identical `_governed_read` and had no such mapping, so BOTH payload contracts are pinned
+    here — v1 and v2 run different engine entrypoints and would have to regress separately.
+    """
+    def _lagged(*a, **k):
+        raise CatalogProjectionUnavailable(
+            CATALOG_PROJECTION_UNAVAILABLE,
+            "load-bearing projection 'overlay' is LAGGED: checkpoint 53 < event head 54")
+
+    target = ("suggest_features_page_v2" if contract_version == 2
+              else "suggest_features_for_table")
+    monkeypatch.setattr(f"featuregen.api.routes.suggestions.{target}", _lagged)
+
+    r = client.get(PATH, params={"contract_version": contract_version}, headers=_h())
+    assert r.status_code == 503
+    # The caller must be able to tell WHY, and that waiting is the fix.
+    assert "LAGGED" in r.json()["detail"]
