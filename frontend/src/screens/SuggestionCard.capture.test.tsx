@@ -52,6 +52,40 @@ describe('SuggestionCard over a captured server body', () => {
     }
   })
 
+  it('emits the same number of grid rows whichever optional section the payload omits', () => {
+    // THE SUBGRID INVARIANT. The cards share the grid's row tracks so section N of each card lines
+    // up with section N of its neighbours. That holds only while every card contributes the SAME
+    // number of children in the SAME order — a card whose optional section renders nothing
+    // collapses a row and shifts everything below it out of line with the columns either side.
+    // That is exactly how the misalignment arose: `sfc-caveats` rendered only when there were
+    // caveats, so a card with none had 10 children against its neighbour's 11.
+    //
+    // DRIVEN BY CONSTRUCTED VARIANTS, not by the capture. A first version of this test looped the
+    // captured hits and passed even with the bug reintroduced: every captured hit carries warnings,
+    // a null `business_value` and both prose fields, so no optional section is ever ABSENT in that
+    // body and the loop compared ten identical shapes. Each variant below removes exactly one.
+    const base = CAPTURE.hits[0]
+    const variants: [string, FeatureSuggestionHit][] = [
+      ['baseline', base],
+      ['no caveats', { ...base, suggestion: { ...base.suggestion, warnings: [] } }],
+      ['no interpretation',
+        { ...base, suggestion: { ...base.suggestion, business_interpretation: null } }],
+      ['no point-in-time',
+        { ...base, suggestion: { ...base.suggestion, point_in_time_declaration: null } }],
+      ['has business value',
+        { ...base, suggestion: { ...base.suggestion, business_value: { value: 'x' } } }],
+    ] as [string, FeatureSuggestionHit][]
+
+    const counts = variants.map(([label, hit]) => {
+      const { container, unmount } = render(<ul><SuggestionCard hit={hit} /></ul>)
+      const n = (container.querySelector('li.sfc') as HTMLElement).children.length
+      unmount()
+      return [label, n] as const
+    })
+    const summary = counts.map(([l, n]) => `${l}=${n}`).join(' ')
+    expect(new Set(counts.map(([, n]) => n)).size, summary).toBe(1)
+  })
+
   it('renders every captured card, compact and expanded, without unmounting', async () => {
     for (const hit of CAPTURE.hits) {
       const { container, unmount } = render(<ul><SuggestionCard hit={hit} /></ul>)
