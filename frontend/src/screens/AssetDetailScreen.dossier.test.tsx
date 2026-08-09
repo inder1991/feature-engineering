@@ -1,4 +1,5 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -27,10 +28,12 @@ vi.mock('../api', async importOriginal => {
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
     getTableSuggestionsV2: vi.fn(),
+    getAssetProfile: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
 const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
+const getAssetProfile = vi.mocked(api.getAssetProfile)
 
 const BASE_SESSION = getSession()
 
@@ -578,4 +581,30 @@ describe('section order', () => {
     for (const idx of order) expect(idx).toBeGreaterThan(-1)
     for (let i = 1; i < order.length; i++) expect(order[i]).toBeGreaterThan(order[i - 1])
   })
+})
+
+
+// ── the three flag-gated panels are MOUNTED by the page ───────────────────────────────────────────
+
+it('mounts the asset-profile panel on the dossier', async () => {
+  // Proof of WIRING rather than of rendering: the panel self-gates to table assets and renders
+  // NOTHING on a 404, so a DOM assertion cannot tell "not mounted" from "flag off". Its read
+  // effect firing can — if the page does not mount it, `getAssetProfile` is never called.
+  //
+  // The rejection is the flag-off path, so this asserts the wiring without asserting any markup
+  // the panel's own test already owns.
+  getAssetProfile.mockRejectedValue(new api.ApiError(404, 'not found'))
+  await renderDossier(detail(d => { d.identity.kind = 'table' }))
+  await waitFor(() => expect(getAssetProfile).toHaveBeenCalled())
+})
+
+it('keeps all three flag-gated panels wired into the overview', async () => {
+  // Structural, deliberately: these panels self-gate on a 404 (flag-off renders nothing), so a
+  // DOM assertion cannot distinguish "not wired" from "flag off" for the two without a mockable
+  // read. What must never silently become true is that the page stopped referencing them at all —
+  // which is exactly what happened.
+  const overview = readFileSync('src/screens/AssetDetailOverview.tsx', 'utf8')
+  for (const panel of ['AssetProfilePanel', 'DatasetPolicyPanel', 'CatalogNarrativePanel']) {
+    expect(overview).toContain(`<${panel}`)
+  }
 })

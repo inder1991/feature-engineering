@@ -12,6 +12,9 @@ import { SuggestionCard } from './SuggestionCard'
 import { AuthorityBadge } from './AuthorityBadge'
 import { type SuggestionsOutcome, useColumnSuggestions } from './columnSuggestions'
 import { fieldValueText, typeDisplay } from './assetDetailFields'
+import { AssetProfilePanel } from './AssetProfilePanel'
+import { CatalogNarrativePanel } from './CatalogNarrativePanel'
+import { DatasetPolicyPanel } from './DatasetPolicyPanel'
 
 // The Overview tab of the asset dossier, in three tiers.
 //
@@ -827,6 +830,24 @@ export function OverviewTab({
           />
         )}
       </div>
+
+      {/* RESTORED 2026-08-09. These three shipped on `main` inside the Overview region this
+          restructure replaced, so extracting the Overview dropped them from the page entirely —
+          they survived only as unused imports, which `tsc -b` (not `tsc --noEmit`) caught at
+          build time. Their guards are unchanged: each is flag-gated server-side and renders
+          NOTHING on a 404, so flag-off looks exactly like before. */}
+
+      {/* Release-A table profile: renders ONLY for table assets and ONLY while the server offers
+          the surface. */}
+      <AssetProfilePanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
+
+      {/* Release-B dataset policies: how this dataset's rows are chosen, and which dataset serves a
+          need. It sits under the profile because the profile is what a policy must agree with. */}
+      <DatasetPolicyPanel source={source} objectRef={identity.object_ref} kind={identity.kind} />
+
+      {/* The CATALOG narrative this asset lives in — "what is this catalog for" is the first thing
+          anyone reading an unfamiliar column needs. */}
+      <CatalogNarrativePanel source={source} />
 
       <TechnicalIdentity detail={detail} />
     </>
