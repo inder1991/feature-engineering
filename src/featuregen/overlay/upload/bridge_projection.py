@@ -2,14 +2,29 @@
 
 The bridge's source of truth is the overlay_fact event stream; entity_bridge_edge is a derived projection
 (the active cross-catalog set the 3B.3 planner reads, replacing the permissive find_cross_catalog_path
-adjacency). State is read by folding the stream directly (no adapter/no drain needed — the fold is the
-authoritative status). Demotion DELETEs the derived edge; it is always rebuildable from the stream."""
+adjacency). State is read by folding the stream directly — the fold is the authoritative status for THIS
+edge, so deciding it needs no drain. Demotion DELETEs the derived edge; it is always rebuildable from
+the stream.
+
+WHAT THE FOLD PREMISE MISSED (live cluster, 2026-08-09). "No drain needed" is true of this edge and
+false of the confirm that produces it. `confirm_fact` branches by fact type, and three of the four
+branches drain the shared 'overlay' checkpoint to head on the caller's connection
+(`project_verified_join`, `project_verified_semantic_binding`, the table-fact surface). This branch
+did not, so a bridge confirm appended OVERLAY_FACT_CONFIRMED and left the checkpoint one event
+behind — permanently, since nothing else advances it between ingests. Every load-bearing catalog
+read gates on that checkpoint with a bare `checkpoint < head` and no tolerance, so one bridge confirm
+fail-closed the whole governed read path (`/suggestions` 500ed until an unrelated upload drained it).
+
+`_drain_overlay` below is therefore about the SIDE EFFECT of the confirm, not about this projection's
+own correctness — which is why it never gates the edge write and never changes the return value."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
 from featuregen.overlay.identity import EntityBridgeRef, canonical_bridge_value, fact_key
+from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_assessment import (
@@ -17,6 +32,10 @@ from featuregen.overlay.upload.bridge_assessment import (
     available_identifier_links,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.projections.runner import run_projection, try_lock_checkpoint_nowait
+from featuregen.runtime.observability import counters
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,9 +60,49 @@ def _obj_ref_str(d: dict) -> str:
     return f"{d['schema']}.{d['table']}.{d['column']}"
 
 
+def _drain_overlay(conn) -> None:
+    """Catch the shared 'overlay' checkpoint up to head on the CALLER'S connection — the step this
+    module used to skip (see the module docstring).
+
+    Mirrors `join_governance.project_verified_join`'s drain, with two deliberate differences that
+    follow from this projection being fold-based rather than read-model-based:
+
+    * It runs for its SIDE EFFECT only. The bridge edge is decided by folding the stream, so a
+      deferred drain cannot make the edge wrong — the caller therefore projects either way and this
+      never gates the write or the return value. The join surface must defer instead, because ITS
+      projection reads the read model and would otherwise serve a stale status.
+    * There is no residual-lag check. A poison-HALT short of head leaves the same fail-closed lag
+      the callers already handle; re-reporting it here would imply this function owns a decision it
+      does not.
+
+    Fail-soft and savepoint-guarded: a projection fault must never roll back an accepted confirm.
+    A lock held by an in-flight ingest is a DEFERRAL, not an error — draining would block the
+    confirm behind a multi-minute ingest transaction (audit finding [9]) — and the worker's tick
+    picks it up, which is the difference between "deferred by a second" and "deferred until
+    somebody happens to upload a CSV"."""
+    try:
+        with conn.transaction():   # savepoint: a projection fault must not roll back the confirm
+            if not try_lock_checkpoint_nowait(conn, "overlay"):
+                counters.incr("overlay.bridge_projection.drain_skipped_lock")
+                logger.warning("bridge projection: overlay checkpoint lock held by an in-flight "
+                               "ingest — deferring the drain; the worker tick will catch it up")
+                return
+            while run_projection(conn, OverlayProjection()) >= 500:
+                pass               # one pass caps at 500 events — loop until caught up
+    except Exception:  # noqa: BLE001 — fail-soft: the confirm stands; the worker re-drains
+        counters.incr("overlay.bridge_projection.drain_error")
+        logger.warning("bridge projection: overlay drain failed — the fact stays VERIFIED and the "
+                       "worker tick will catch the checkpoint up", exc_info=True)
+
+
 def project_verified_bridge(conn, ref: EntityBridgeRef, *, now) -> str:
     """Project the bridge iff its folded state is VERIFIED. Returns 'projected' or 'pending'. A non-VERIFIED
-    bridge is demoted (any stale edge removed). Idempotent (DELETE-then-INSERT by fact_key)."""
+    bridge is demoted (any stale edge removed). Idempotent (DELETE-then-INSERT by fact_key).
+
+    Also drains the shared 'overlay' checkpoint (`_drain_overlay`), because the confirm that calls
+    this appended an event that nothing else here would have projected. That drain is fail-soft and
+    never changes what this function returns."""
+    _drain_overlay(conn)
     key = fact_key(ref, "entity_bridge")
     state = fold_overlay_state(load_fact(conn, key))
     if state.status != "VERIFIED" or not state.value:
