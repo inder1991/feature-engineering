@@ -718,8 +718,15 @@ function ContextValueRow({
       <span className="adg-field-value mono">
         {shown == null || shown === '' ? '—' : String(shown)}
       </span>
+      {/* The SAME tone rule as every other authority chip on the page. This row used to set a tone
+          only for the proposal-only case and otherwise fall through to a bare `.badge`, which
+          renders neutral grey whatever the label says — so "source attested" was green on
+          Metadata & evidence and grey here. Fourth call site, fourth rule; `provenanceTone` is the
+          one rule now. */}
       <span
-        className={`badge${proposalOnly ? ' gj-proposed' : ''}`}
+        className={`badge ${proposalOnly
+          ? 'gj-proposed'
+          : provenanceTone(authorityWords(value.authority_label))}`}
         title={
           proposalOnly
             // The lead triple describes the STRONGEST record, which is not the one whose value is
