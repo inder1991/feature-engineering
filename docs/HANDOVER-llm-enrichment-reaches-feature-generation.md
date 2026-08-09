@@ -85,51 +85,81 @@ a computed set-diff base↔head.
 
 ## 4. What must be fixed, in priority order
 
+> **Readiness wave, 2026-08-09 — most of this section is now DONE.** Working toward "ingestion ready
+> for testing" reordered the ledger: several items below deferred their fix until the first live run
+> could measure them, but an unbounded loop and an unreadable spend account are exactly what make the
+> run unsafe to start. Fixed: **F4, F7, F9, F10, A.54, A.55**, the failure-path token accounting, and
+> the `FEATUREGEN_LLM_TIMEOUT` code default. Corrected rather than fixed: **`fibo_path` is NOT "one
+> line"** — it needed a migration, and it is now CLOSED too (1058). The budget-fixture blindness is
+> CLOSED (§4.2). **The only thing still open is the ~4502s worst-case lock hold above**, which needs
+> the ability to interrupt a call already in flight. The durable account is **A.58**.
+
 ### 4.1 Before the live run
 
-**The concept critic is uncapped and, until the fix wave, was unmeasured.** `critique_concept_batch`
-(`concept_critic.py:472-491`) is a plain per-item loop with **no call ceiling and no deadline** —
-`OVERLAY_ENRICH_MAX_PROVIDER_CALLS` does not bound it. On a 144-column catalog that is ~70–100
-sequential calls at up to 300s each, on exactly the run 9b forces. The fix wave added `started_at` so
-it now has a duration, and a runbook query for its cost. **The ceiling itself is still missing** —
-filed as A.54 with the fail-open reasoning.
+**~~The concept critic is uncapped~~ BOUNDED 2026-08-09 (A.54).** `critique_concept_batch` now takes
+the concept stage's own `CallLedger` and `deadline_s`; `_drive` — the single dispatch point, so the
+critique AND the revise both count — charges the ledger, and an item either bound skipped resolves
+to ABSTAINED with a `skipped_reason`, with `not_attempted`/`stopped_by` on the stage report.
+Fail-OPEN by decision: the classifier's concept stands un-refuted rather than being evicted for a
+budget reason. See A.54 for the full reasoning and the `REVISED if revised else REFUTED` trap.
 
-**A single logical call can run ~2702s against an 1800s stage deadline that cannot interrupt it
-mid-flight.** Worst-case advisory-lock hold ~4502s. Bounded, tested and documented; not fixed. This is
-the standing risk for the run.
+**A single logical call can still run ~2702s against an 1800s stage deadline that cannot interrupt it
+mid-flight.** Worst-case advisory-lock hold ~4502s. Bounded, tested and documented; NOT fixed — the
+deadline is checked before issuing each item, never mid-call. **This remains the standing risk for
+the run.**
 
-**F4 has a live-run deadline if Pass B is on.** `domain` is redacted on the feature seam (the human's
-2026-08-07 decision) but **not** on the Pass-B `column_profiles` seam, where `_redact_free_text_meta`
-re-sanitises only `business_definition`. Compounding: Task 4b raised `_MAX_COLUMN_PROFILES` 64 → 512,
-which is Pass B's narrow/wide router — so an unredacted uploader field went from ≤64 summarised values
-to ≤512 verbatim values per call. Recorded in A.56.
+**~~F4 has a live-run deadline if Pass B is on.~~ FIXED 2026-08-09.** Pass B *is* on
+(`OVERLAY_TABLE_SYNTH: "1"`), so the deadline had fired. The audit A.56 asked for found **three**
+unscanned uploader-authored keys, not one: `term_type`, `domain` and `process_path`, all emitted by
+`table_synth._descriptor`, whose docstring called them "bounded structural tokens (200 cap)" — the
+misreading that let them ride. `_redact_free_text_meta` now routes every free-text descriptor key
+through its declared grade (prose, not definition — see A.56 for why that choice is load-bearing)
+and fails closed on an unclassified one, mirroring the top-level D10 gate. Six tests; suite 4911.
 
 ### 4.2 Before trusting the budget pins
 
-**The budget fixture is blind to 8 of the 11 fields the branch added.** `confidence_band`,
-`concept_alternatives`, `proposed_value`, `outbound_cardinality`, `sub_domain`, `table_role` and
-`event_or_snapshot` all measure **exactly 0**; `related_terms` appears on 1 of 237 columns. So the
-pinned `+17_914` rise is essentially two fields.
+**~~The budget fixture is blind to 8 of the 11 fields the branch added.~~ CLOSED 2026-08-09.** A
+`saturated_catalogs` fixture now populates every added field through its REAL writer, and both pairs
+are pinned:
 
-Nothing breaks — measured headroom is large — but these can populate in production and move the floor
-with **no test noticing**. Measured if all populate: payload **313_197**, floor **268_225**.
+| | payload | floor |
+|---|---|---|
+| sparse (`wide_catalogs`) | **268_902** | **223_930** |
+| **saturated** | **405_863** | **360_891** |
 
-**Measured at `f1eb1e1b`:** mandatory **259_405** B (17.3% of the 1_500_000 budget), un-sheddable floor
-**214_433** B. The user's 144-column shape ≈ **171_347 B, 8.8× under budget**. Refusal needs ~1_657
-mandatory columns. **A refusal is not reachable on any realistic catalog.**
+The blindness was not theoretical — F7's `proposed_authority` grew the payload and the pinned test
+passed **completely unchanged**, because the field it sits beside was empty in the fixture.
 
-**Stale prose in the dangerous direction:** `feature_assist.py:1078-1114` records `241_491`,
-`~1_019 B/col`, `203_629` and `~1_470 columns` — all understating cost or overstating headroom, and
-`203_629` matches no rung of any ladder and was never true.
+**Two corrections to what this section said.** The "measured if all populate" figures (313_197 /
+268_225) were BOTH LOW — the real saturated pair is 29% and 34% higher — and, like `171_347`, they
+were never pinned by anything. And two fields stay structurally low by DESIGN, not omission:
+adjudication is capped at 12 columns per run (`adjudication_bounds()`), and
+`relationships`/`outbound_cardinality` needs cross-catalog link rows the fixture does not stand up
+(asserted as 0 rather than left unstated).
+
+Saturated is **27.1% of budget, 3.7× under**; the rungs sit at ~876 and ~985 columns. **A refusal is
+not reachable on any realistic catalog.**
+
+**~~Stale prose in the dangerous direction~~ CORRECTED 2026-08-09.** `feature_assist.py` now carries
+the pinned `259_405` / `~1_095 B/col` / `214_433`, with the two rungs re-derived (first shed ~1_370
+mandatory columns, refusal ~1_658) and a pointer to
+`test_the_floor_rose_by_exactly_what_the_payload_rose_by`, which asserts the pair — so the comment
+cannot drift from the measurement again without a red test.
+
+**One correction to §4.2 itself:** `171_347 B` for the 144-column shape appears **only in this
+handover**. No test pins it, and the budget fixture is the 237-column pair — there is no 144-column
+measurement in the repo. It was NOT copied into the source comment; a derived `~158_000 B`
+(144 × ~1_095) is recorded instead, explicitly labelled derived-not-measured. Restating an
+unreproducible number as fact is exactly how `203_629` got there.
 
 ### 4.3 Recorded, no deadline
 
-- **F7** — `proposed_value` misattribution on the LLM seam. `proposed_value` is always the LLM's row,
+- **~~F7~~ FIXED 2026-08-09** — `proposed_value` misattribution on the LLM seam. `proposed_value` is always the LLM's row,
   but `semantic_authority` names the *strongest* producer, so the payload can show the model's guess
   under another producer's name. Task 9 fixed exactly this on the UI seam and left the LLM seam.
-- **F9** — `_fallback` discards acceptor reasons, so 9c's per-item rejection accounting is closed on
+- **~~F9~~ FIXED 2026-08-09** — `_fallback` discarded acceptor reasons, so 9c's per-item rejection accounting is closed on
   the batch path only.
-- **F10** — the synonyms ask was widened ~5× against a 1000-char cap the model is never told; the
+- **~~F10~~ FIXED 2026-08-09** — the synonyms ask was widened ~5× against a 1000-char cap the model was never told; the
   `maxLength` is stripped from the wire and validated only on the response, so an over-run fails the
   whole chunk.
 - **The column's `semantic_terms` still renders as a space-joined blob** under a single authority chip
@@ -150,7 +180,14 @@ and the asset-detail UI"*:
    column; the writer is gated, the projection unreachable, the ride-along `not_applicable`. Task 4c
    fixed the *label* (the stage now reports `partial`, not a false `succeeded`) — not the waste. The
    clearest miss. **Does not affect the CIB catalog**, which is a glossary upload.
-2. `fibo_path` — the sole remaining `UNCARRIED_GAPS` entry; one line to close.
+2. ~~`fibo_path`~~ **CLOSED 2026-08-09 (migration 1058).** The handover called this "one line to
+   close" — it was six, because the column did not exist. `fibo_path` was in NO migration, not in
+   `field_policies` and not in `field_resolution`; 1051 gave its two sidecar siblings their
+   projection columns and skipped it, so its SOURCE evidence had nowhere to land. It was invisible
+   precisely because those siblings worked. Closed with a migration, a policy, a projection, the
+   `semantic_context` anchor + bundle emission and the prose egress grade — and the D7 reservation
+   table appended in the same change (pool note now 1059+), which is the step A.22's 1032/1033
+   double-allocation exists to enforce. **`UNCARRIED_GAPS` is now empty.**
 3. `authority_role` / `temporal_storage_model` / `business_context` reach generation only under
    `FEATUREGEN_DATASET_PROFILES`, shipped `"0"` — so in the default config, nowhere.
 4. The catalog narrative reaches Pass B and the feature seam, but not Pass A or adjudication.
