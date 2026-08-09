@@ -552,10 +552,15 @@ def test_the_pass_b_prompt_says_what_the_narrative_is_and_that_it_is_citable():
     assert "WHOLE CATALOG" in table_synth._TYPE_FIELDS_NOTE
     assert "catalog_business_context" in table_synth._PROFILE_NOTE
     # The version MUST move with the text — a changed question replayed under the old identity is
-    # the trap this contract's own comments document.
-    assert table_synth._SYNTH_PROMPT_VERSION == 5
-    assert table_synth._SYNTH_PROMPT_ID.endswith("v5")
-    assert table_synth._SUMMARY_PROMPT_ID.endswith("v5")
+    # the trap this contract's own comments document. A LITERAL on purpose: reading the constant
+    # would make this tautological, and the point is that a human re-versions deliberately.
+    # 5 -> 6 (2026-08-09): `_PROFILE_NOTE` now shows a correct `evidence_refs` entry and forbids a
+    # placeholder, after the first live run lost its `business_context` and `table_description`
+    # to `no_evidence_ref`.
+    assert table_synth._SYNTH_PROMPT_VERSION == 6
+    # The id and the version are ONE contract generation; they must never disagree.
+    assert table_synth._SYNTH_PROMPT_ID.endswith(f"v{table_synth._SYNTH_PROMPT_VERSION}")
+    assert table_synth._SUMMARY_PROMPT_ID.endswith(f"v{table_synth._SYNTH_PROMPT_VERSION}")
 
 
 def test_the_long_narrative_fields_have_their_own_egress_length_cap():

@@ -120,3 +120,44 @@ def test_ingest_wires_pass_b_behind_flag(db, monkeypatch):
     ev = read_active_field_evidence(db, normalize_ref("src", None, "txn"), "table_role")
     # Slice 2: the accept vocab-normalizes the advisory role — "fact" + event -> "event_fact".
     assert any(e.proposed_value == "event_fact" for e in ev)
+
+
+# ── the live run's finding: rich prose produced, then dropped for citing nothing ─────────────────
+
+
+def test_the_instruction_SHOWS_a_correct_citation_and_forbids_a_placeholder() -> None:
+    """FROM THE FIRST LIVE RUN (2026-08-09). Pass B returned genuinely good prose —
+
+        business_context : "Maintains a corporate-customer master used to build point-in-time
+                            customer-level features and to enrich event/transaction data..."
+        table_description: "One row represents the master profile of a corporate/institutional
+                            customer (cust_num) as of a given business reporting date..."
+
+    and BOTH were discarded, along with `temporal_storage_model`, as
+    `dropped_invalid / no_evidence_ref`. The model had emitted:
+
+        "evidence_refs": [{"refs": [], "field": "placeholder"}]
+
+    a syntactically valid entry carrying no citation. Three findings, in order:
+
+    * the GATE is right and must not be relaxed. `_NARRATIVE_CITATION_REFS`' own note explains that
+      accepting uncited prose is a forgery surface — a model citing `catalog_description` on a
+      deployment that carries no narrative would land prose resting on something that does not
+      exist.
+    * the SCHEMA is not at fault: `evidence_refs` is absent from `required` (only `grain_columns`
+      is there), so nothing forced the model to emit a placeholder rather than omit the array.
+    * the INSTRUCTION told the model to cite but never SHOWED it a correct entry and never
+      forbade a placeholder. That is the same shape as [F10], where a bound the model was never
+      shown produced output the gate then refused.
+
+    So this pins the instruction, not the gate. The cost of the gap is total: the whole point of
+    Pass-B prose is the sentence a reader gets, and the page currently shows "Nobody has described
+    this catalog yet" while the model's description sits in `llm_call.raw_output`.
+    """
+    from featuregen.overlay.upload.table_synth import _INSTRUCTION
+
+    # It must SHOW the shape, not merely name it — a schema fragment in prose is what the model
+    # failed to infer.
+    assert '{"field": "business_context", "refs":' in _INSTRUCTION
+    # …and rule out the exact token the live model reached for.
+    assert 'placeholder' in _INSTRUCTION.lower()

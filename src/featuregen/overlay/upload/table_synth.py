@@ -797,8 +797,13 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 #: would have left the capability unreachable; telling the model without widening `_cited_refs`
 #: would have taught it to cite something the code silently discards. The SCHEMA is untouched — the
 #: response shape did not move, only the question.
-_SYNTH_PROMPT_ID = "overlay_table_synth_v5"
-_SYNTH_PROMPT_VERSION = 5
+#: v6 (2026-08-09, from the first live run): `_PROFILE_NOTE` now SHOWS a correct `evidence_refs`
+#: entry and forbids a placeholder. The QUESTION moved, the response shape did not — the same kind
+#: of change v5 was, and it MUST re-version for the same reason: `context_revision` below folds in
+#: `prompt_version`, so leaving this at 5 would replay the stored synthesis produced by the OLD
+#: question and the prompt fix would never be asked. The schema is untouched.
+_SYNTH_PROMPT_ID = "overlay_table_synth_v6"
+_SYNTH_PROMPT_VERSION = 6
 _SYNTH_SCHEMA_VERSION = 3
 #: The phase-1 (wide-table) summary prompt id. Its VERSIONS are `_SYNTH_PROMPT_VERSION` /
 #: `_SYNTH_SCHEMA_VERSION` — one Pass B run stamps ONE contract generation across both phases.
@@ -1110,6 +1115,17 @@ _PROFILE_NOTE = (
     "narrative keys when the item carries them ('catalog_description', 'catalog_business_context', "
     "'catalog_display_name', 'catalog_business_domains') — a suggestion citing nothing is "
     "discarded. "
+    # SHOW the shape, do not merely name it. The first live run (2026-08-09) returned genuinely
+    # good `business_context` and `table_description` prose and lost BOTH, because it emitted
+    # `evidence_refs: [{"field": "placeholder", "refs": []}]` — a syntactically valid entry
+    # carrying no citation. The gate then dropped all three prose fields as `no_evidence_ref`.
+    # Naming a shape is not showing one, and the model had no example to copy.
+    "One entry per suggested field, each naming the refs THAT field rests on, for example: "
+    "\"evidence_refs\": [{\"field\": \"business_context\", \"refs\": [\"cust_num\", "
+    "\"business_dt\"]}, {\"field\": \"table_description\", \"refs\": [\"table_definition\"]}]. "
+    "NEVER emit a placeholder entry, an empty `refs` list, or a `field` value that is not one of "
+    "the suggestions you are making — an entry that cites nothing discards the suggestion it "
+    "belongs to, so OMIT the suggestion instead. "
     "When a table_definition is already provided it is CURATED and stays current: offer a "
     "table_description only as an ALTERNATIVE for human review, never as a correction, and NEVER "
     "paraphrase the curated text back. Omit any field the evidence does not settle — an omission is "
