@@ -608,3 +608,21 @@ it('keeps all three flag-gated panels wired into the overview', async () => {
     expect(overview).toContain(`<${panel}`)
   }
 })
+
+
+it('gives the search-terms card the full grid width', async () => {
+  // It carries 15-20 chips (Task 4c widened the synonyms ask) plus a four-line rationale. In a
+  // half-width cell the chip row overflowed the card and the paragraph was clipped mid-sentence —
+  // visible on the deployed page, invisible to jsdom, which does not lay anything out. Asserting
+  // the CLASS is what a test can honestly check: `.adg-card--full` is `grid-column: 1 / -1`.
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [{
+        evidence_id: 'ev-syn', producer: 'llm', strength: 'proposed',
+        proposed_value: 'customer id, customer number, cust number, client id, customer identifier',
+        confidence_band: null,
+      }],
+    }
+  }))
+  expect(await screen.findByTestId('search-terms')).toHaveClass('adg-card--full')
+})

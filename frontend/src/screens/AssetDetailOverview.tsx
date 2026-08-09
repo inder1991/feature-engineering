@@ -345,6 +345,11 @@ function SearchTermsCard({ detail }: { detail: AssetDetail }) {
     ([lifecycle, rows]) => lifecycle !== 'active' && (rows ?? []).length > 0)
   return (
     <DossierCard
+      // FULL WIDTH, like `meaning` and `source-glossary` above it. This card carries 15-20 chips
+      // (Task 4c widened the synonyms ask) plus a four-line rationale; in a half-width grid cell the
+      // chip row overflowed the card and the paragraph was clipped mid-sentence. The content is
+      // inherently wide, so the cell has to be.
+      full
       testId="search-terms"
       title="Search terms"
       subtitle="Words the model drafted so this column can be found — proposals, not meaning."
@@ -364,7 +369,7 @@ function SearchTermsCard({ detail }: { detail: AssetDetail }) {
             <span className="badge gj-proposed">AI proposed</span> The model drafted these so this
             column can be found by the words a business reader would use. Nobody has confirmed them,
             and they carry no authority over what the column means. The source glossary's own term
-            and related terms are in the card beside this one.
+            and related terms are above.
           </p>
         </>
       ) : (
