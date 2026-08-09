@@ -538,9 +538,14 @@ export function SuggestionCard({
       {/* Four boxed parameters a reader actually compares between candidates, two per row —
           not six label/value rows stacked down the card. Sources and data roles drop to the
           quiet line below, and everything absent stays in the detail disclosure. */}
-      {s.business_interpretation !== null && (
-        <p className="sfc-lead sfc-clamp">{s.business_interpretation.value}</p>
-      )}
+      {/* EVERY optional section still emits a grid row when it has nothing to show. The cards are
+          a subgrid (see `.adg-suggestion-grid > .sfc`), so corresponding sections only line up
+          across columns while every card contributes the SAME number of rows in the SAME order.
+          A conditional that renders nothing collapses one card's rows and knocks every section
+          below it out of alignment with its neighbours. */}
+      {s.business_interpretation !== null
+        ? <p className="sfc-lead sfc-clamp">{s.business_interpretation.value}</p>
+        : <div className="sfc-slot" aria-hidden="true" />}
 
       <dl className="sfc-facts sfc-factgrid">
         <Fact label="Entity & grain">{entityWords(s)}</Fact>
@@ -566,26 +571,32 @@ export function SuggestionCard({
 
       <p className="mono sfc-recipe">{s.recipe}</p>
 
-      {s.point_in_time_declaration !== null && (
-        <div className="sfc-safety-note">
-          <span className="sfc-clamp">{s.point_in_time_declaration.value}</span>
-        </div>
-      )}
+      {s.point_in_time_declaration !== null
+        ? (
+          <div className="sfc-safety-note">
+            <span className="sfc-clamp">{s.point_in_time_declaration.value}</span>
+          </div>
+        )
+        // A NEUTRAL placeholder, never an empty `.sfc-safety-note`: that class carries the amber
+        // border and tint, so an empty one would render a blank caution box.
+        : <div className="sfc-slot" aria-hidden="true" />}
       {/* A caveat COUNT, not a defect list. This panel exists to hand a data scientist a
           candidate worth pursuing; two amber blocks per card reading MISSING_CURRENCY made it
           read as a validation report. The caveats still change whether the feature is
           trustworthy, so they are never dropped — they move into Full detail and the card
           carries one quiet chip saying how many there are. */}
-      {limitations.length > 0 && (
-        <p className="sfc-caveats">
-          {limitations.length} {limitations.length === 1 ? 'caveat' : 'caveats'} to check before
-          {' '}using this — see full detail.
-        </p>
-      )}
+      {limitations.length > 0
+        ? (
+          <p className="sfc-caveats">
+            {limitations.length} {limitations.length === 1 ? 'caveat' : 'caveats'} to check before
+            {' '}using this — see full detail.
+          </p>
+        )
+        : <div className="sfc-slot" aria-hidden="true" />}
 
-      {s.business_value === null && (
-        <p className="sfc-novalue">Business value has not been documented for this recipe.</p>
-      )}
+      {s.business_value === null
+        ? <p className="sfc-novalue">Business value has not been documented for this recipe.</p>
+        : <div className="sfc-slot" aria-hidden="true" />}
 
       <div className="sfc-foot">
         <button

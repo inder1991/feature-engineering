@@ -4275,7 +4275,31 @@ button.stat:hover {
    This selector is (0,4,0) and restores the inset for real. */
 .adg-card-body > .rows.adg-suggestion-grid > .sfc {
   padding: 16px;
+  /* SUBGRID — the cards share the grid's row tracks, so section N of every card sits on the same
+     line as section N of its neighbours. Each card previously laid itself out independently, so a
+     one-line description in the middle column pulled its fact boxes, formula, callout and footer
+     up relative to the three-line descriptions either side, and nothing lined up at any level.
+     `display: grid` is required: subgrid is ignored on a flex container.
+     The row count is the card's fixed slot sequence — head, taxonomy, lead, facts, status, recipe,
+     safety note, caveats, no-value, foot, uses. Every optional section renders a placeholder so
+     the count never varies; `test_every_suggestion_card_emits_the_same_row_count` pins that, since
+     a card with fewer children silently mis-maps every row after the missing one. */
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 11;
+  row-gap: 11px;
 }
+
+/* An EXPANDED card mounts its detail drawer as a 12th child and spans all three columns, so it can
+   no longer map onto an 11-row band. It drops out of the subgrid and lays itself out. */
+.adg-card-body > .rows.adg-suggestion-grid > .sfc:has(.sfc-detail) {
+  display: flex;
+  flex-direction: column;
+  grid-row: auto;
+}
+
+/* Occupies its row and paints nothing. */
+.sfc-slot { min-height: 0; }
 
 .adg-suggestion-grid .sfc-name { flex-basis: 100%; }
 
