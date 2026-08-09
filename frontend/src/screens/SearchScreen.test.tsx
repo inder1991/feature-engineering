@@ -17,7 +17,7 @@ const lineageGraph = vi.mocked(api.lineageGraph)
 const HIT: api.SearchHit = {
   object_ref: 'public.accounts.balance', table: 'accounts', column: 'balance', kind: 'column',
   data_type: 'numeric', definition: 'end-of-day ledger balance', is_grain: false, is_as_of: false,
-  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null,
+  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null, sensitivity_display: null,
   additivity: 'semi_additive', unit: 'dollars', currency: 'USD', entity: 'Account', score: 1.2,
 }
 
@@ -25,7 +25,10 @@ const HIT: api.SearchHit = {
 const FACETS: Record<string, api.FacetBucket[]> = {
   source: [{ value: 'deposits', count: 3 }, { value: 'cards', count: 1 }],
   domain: [{ value: 'retail', count: 3 }],
+  // The raw source-declared tag ("Declared tag" in the sidebar) and the projected display axis
+  // ("Sensitivity") are separate facets with separate vocabularies — see SEARCH_FACET_KEYS.
   sensitivity: [{ value: '(none)', count: 3 }, { value: 'pii', count: 1 }],
+  sensitivity_display: [{ value: 'restricted', count: 2 }],
   additivity: [{ value: 'semi_additive', count: 3 }, { value: 'additive', count: 1 }],
   entity: [{ value: 'Account', count: 3 }],
   kind: [{ value: 'column', count: 4 }],
@@ -159,7 +162,8 @@ describe('search screen — facet sidebar', () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await screen.findByText('public.accounts.balance')
-    for (const group of ['Source', 'Domain', 'Sensitivity', 'Additivity', 'Entity', 'Kind', 'Flags']) {
+    for (const group of ['Source', 'Domain', 'Sensitivity', 'Declared tag', 'Additivity',
+                         'Entity', 'Kind', 'Flags']) {
       expect(screen.getByText(group)).toBeInTheDocument()
     }
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).not.toBeChecked()
@@ -221,7 +225,7 @@ describe('search screen — facet sidebar', () => {
     )
     render(<SearchScreen />)
     await screen.findByText('public.accounts.balance')
-    expect(screen.getByText('Sensitivity')).toBeInTheDocument()
+    expect(screen.getByText('Declared tag')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '(none) 4' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: 'pii 1' })).not.toBeInTheDocument()
   })

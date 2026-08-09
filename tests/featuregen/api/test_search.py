@@ -50,8 +50,8 @@ def test_empty_query_browses_all_read_scoped_fresh_rows(client):
     assert body["total"] == len(body["hits"]) == 11
     # facets come back for the browse (no term needed).
     assert _bucket(body["facets"], "source", "deposits") == 11
-    assert set(body["facets"]) == {"source", "domain", "sensitivity", "additivity",
-                                   "entity", "kind", "grain", "as_of"}
+    assert set(body["facets"]) == {"source", "domain", "sensitivity", "sensitivity_display",
+                                   "additivity", "entity", "kind", "grain", "as_of"}
 
 
 def test_text_query_ranks_with_grain_boost(client):
@@ -196,3 +196,44 @@ def test_search_requires_auth(client):
 def test_search_limit_validated(client):
     assert client.get("/search", params={"q": "x", "limit": 0}, headers=AUTH).status_code == 422
     assert client.get("/search", params={"q": "x", "limit": 500}, headers=AUTH).status_code == 422
+
+
+def test_the_display_sensitivity_axis_is_its_own_facet_beside_the_enforcement_tag(client):
+    """The projected DISPLAY axis is searchable WITHOUT disturbing the enforcement facet.
+
+    The two columns speak different vocabularies on purpose: `graph_node.sensitivity` is the raw
+    read-scope TAG ('pii') and an input to the generated `visible_requires`; `sensitivity_display`
+    (migration 1042) is the projected restriction LABEL ('restricted'/'confidential'). Repointing
+    the existing facet at the display column would have DELETED the role-gated `pii` bucket that
+    `test_read_scope_gates_sensitivity_facet_and_filter` pins — a vocabulary swap, not a fix. So
+    this is ADDITIVE: a second facet, its own name, both live at once.
+
+    The gap it closes, measured on the deployed cib catalog: 28 of 111 columns carried a
+    `sensitivity_display` that search could not show or filter, because no source declares the raw
+    tag and the search screen only ever read that one.
+    """
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.get("/search", headers=PII_AUTH).json()
+
+    # The enforcement facet is UNCHANGED — same column, same vocabulary, same role gate.
+    assert _bucket(body["facets"], "sensitivity", "pii") == 1
+
+    # The display axis is now visible in its own right, in the restriction vocabulary.
+    assert _bucket(body["facets"], "sensitivity_display", "restricted") == 1
+
+    # ...and it filters, and the hit carries the value so a badge can render it.
+    seen = client.get("/search", params={"sensitivity_display": "restricted"},
+                      headers=PII_AUTH).json()
+    assert [h["object_ref"] for h in seen["hits"]] == ["public.customers.email"]
+    assert seen["hits"][0]["sensitivity_display"] == "restricted"
+
+
+def test_the_display_facet_is_read_scoped_like_every_other_facet(client):
+    """A projected display label must never become a side channel around read scope: the column it
+    describes is hidden from a caller without the role, so its BUCKET must vanish too."""
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = client.get("/search", headers=AUTH).json()          # no pii_reader
+    assert _bucket(body["facets"], "sensitivity_display", "restricted") is None
+    gated = client.get("/search", params={"sensitivity_display": "restricted"},
+                       headers=AUTH).json()
+    assert gated["hits"] == [] and gated["total"] == 0

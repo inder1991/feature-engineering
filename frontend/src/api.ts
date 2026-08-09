@@ -209,6 +209,10 @@ export interface SearchHit {
   concept: string | null
   domain: string | null
   sensitivity: string | null
+  // The projected DISPLAY label (migration 1042) — what the asset page renders. Distinct from
+  // `sensitivity` above, which is the raw read-scope tag a source file declares; on a catalog that
+  // declares none, this is the only sensitivity a column has.
+  sensitivity_display: string | null
   additivity: string | null
   unit: string | null
   currency: string | null
@@ -231,7 +235,7 @@ export const SEARCH_PAGE_SIZE = 20
 // The repeated-value facet groups, in the order they ride the /search query string. AND across
 // groups, OR within one. grain/as_of are boolean flags carried separately (=true restricts).
 export const SEARCH_FACET_KEYS = [
-  'source', 'domain', 'sensitivity', 'additivity', 'entity', 'kind',
+  'source', 'domain', 'sensitivity', 'sensitivity_display', 'additivity', 'entity', 'kind',
 ] as const
 export type SearchFacetKey = (typeof SEARCH_FACET_KEYS)[number]
 

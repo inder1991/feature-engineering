@@ -24,7 +24,7 @@ function hit(n: number): api.SearchHit {
   return {
     object_ref: `public.t.c${n}`, table: 't', column: `c${n}`, kind: 'column',
     data_type: 'text', definition: '', is_grain: false, is_as_of: false,
-    catalog_source: 'wide', concept: null, domain: null, sensitivity: null,
+    catalog_source: 'wide', concept: null, domain: null, sensitivity: null, sensitivity_display: null,
     additivity: null, unit: null, currency: null, entity: null, score: 1,
   }
 }

@@ -18,7 +18,7 @@ beforeEach(() => {
 const ANCHOR: api.SearchHit = {
   object_ref: 'public.accounts.balance', table: 'accounts', column: 'balance', kind: 'column',
   data_type: 'numeric', definition: 'end-of-day ledger balance', is_grain: false, is_as_of: false,
-  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null,
+  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null, sensitivity_display: null,
   additivity: 'semi_additive', unit: 'dollars', currency: 'USD', entity: 'Account', score: 1.2,
 }
 

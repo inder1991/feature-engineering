@@ -110,8 +110,10 @@ def _facets(db, roles=()):
 
 
 def test_the_profile_facets_do_not_exist_while_the_flag_is_off(catalog):
-    assert set(column_facets()) == {"source", "domain", "sensitivity", "additivity", "entity",
-                                    "kind"}
+    # `sensitivity_display` is a BASE facet (the migration-1042 display axis), not a profile one —
+    # it is present with the flag off, which is what keeps this assertion about the PROFILE set.
+    assert set(column_facets()) == {"source", "domain", "sensitivity", "sensitivity_display",
+                                    "additivity", "entity", "kind"}
     assert "data_role" not in _facets(catalog)
 
 

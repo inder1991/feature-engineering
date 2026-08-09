@@ -285,3 +285,56 @@ def test_facet_counts_respect_the_derived_table_scope(db):
     priv = search(db, "", now=now, roles=("restricted_reader",))
     kind_counts_priv = {b.value: b.count for b in priv.facets["kind"]}
     assert kind_counts_priv.get("table", 0) == 2
+
+
+def test_the_display_axis_is_a_facet_of_its_own_beside_the_enforcement_tag(db):
+    """FROM THE FIRST LIVE RUN (2026-08-09): search showed one `(none) 221` sensitivity bucket
+    while 28 columns carried a real label on their asset pages.
+
+    Two sensitivity columns exist and they are NOT interchangeable:
+
+    * ``graph_node.sensitivity`` — the READ-SCOPE ENFORCEMENT TAG (0993 CHECK) and an input to the
+      generated ``visible_requires``. Only a source file or a human sets it; `axis_projection`
+      deliberately never writes it. On an upload that declares no sensitivity it is NULL on every
+      row — exactly the shipped CIB catalog, hence the single `(none)` bucket.
+    * ``graph_node.sensitivity_display`` (migration 1042) — the DISPLAY axis, filled from
+      ``visible_requires`` else the concept registry's class. It is what the asset page renders.
+
+    THE FIX IS ADDITIVE, and this test exists because the obvious alternative is wrong: repointing
+    the EXISTING `sensitivity` facet at the display column swaps its VOCABULARY ('pii' becomes
+    'restricted'), which silently retires the role-gated `pii` bucket that
+    `test_read_scope_gates_sensitivity_facet_and_filter` pins. So both facets live at once, each
+    bucketing its own column.
+
+    Asserted through a real `search()` call rather than against the facet-map constant: a test that
+    only reads the dict passes whether or not the query layer ever honours it.
+    """
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("hr", "people", "emp_ref", "text", sensitivity="restricted"),
+        CanonicalRow("hr", "people", "desk_no", "text"),
+    ]
+    assert ingest_upload(db, "hr", rows, actor=_actor(), now=now).status == "ingested"
+    # The case that was invisible: the projection labelled it, the SOURCE never tagged it.
+    db.execute("UPDATE graph_node SET sensitivity_display = 'confidential' "
+               "WHERE catalog_source = 'hr' AND column_name = 'desk_no'")
+
+    facets = search(db, "", now=now, roles=("data_owner", "restricted_reader",
+                                            "confidential_reader")).facets
+    buckets = {name: {b.value: b.count for b in rows_} for name, rows_ in facets.items()}
+
+    # The enforcement facet still buckets the TAG — the source-declared value, untouched.
+    assert buckets["sensitivity"].get("restricted") == 1
+
+    # The display facet buckets the PROJECTED label, including the row no source ever tagged.
+    assert buckets["sensitivity_display"].get("confidential") == 1
+
+    # ...and it filters, which is the half a facet-map assertion cannot see.
+    filtered = search(db, "", now=now, filters={"sensitivity_display": ["confidential"]},
+                      roles=("data_owner", "restricted_reader", "confidential_reader")).hits
+    assert [h.object_ref for h in filtered] == ["public.people.desk_no"]
+    assert filtered[0].sensitivity_display == "confidential"
+    assert filtered[0].sensitivity is None      # the tag stays empty; they are different columns
+
+

@@ -16,7 +16,12 @@ import { LineageView } from './LineageView'
 const FACET_GROUPS: { key: SearchFacetKey; label: string }[] = [
   { key: 'source', label: 'Source' },
   { key: 'domain', label: 'Domain' },
-  { key: 'sensitivity', label: 'Sensitivity' },
+  // Two sensitivity facets, deliberately named apart. `sensitivity_display` is the projected
+  // restriction label the asset page shows and the one a user means by "sensitivity";
+  // `sensitivity` is the raw tag a source file declared, which is empty on catalogs that declare
+  // none. Labelling both "Sensitivity" would put two different vocabularies under one word.
+  { key: 'sensitivity_display', label: 'Sensitivity' },
+  { key: 'sensitivity', label: 'Declared tag' },
   { key: 'additivity', label: 'Additivity' },
   { key: 'entity', label: 'Entity' },
   { key: 'kind', label: 'Kind' },
@@ -510,6 +515,12 @@ function HitRow({
           {hit.is_grain && <span className="badge grain">grain</span>}
           {hit.is_as_of && <span className="badge asof">as-of</span>}
           {hit.sensitivity && <span className="badge sensitivity">{hit.sensitivity}</span>}
+          {/* The projected display label, its OWN badge — never merged with the tag above: the two
+              speak different vocabularies ('pii' vs 'restricted'), and on a catalog that declares
+              no tag this is the only sensitivity a column has. */}
+          {hit.sensitivity_display && (
+            <span className="badge sensitivity">{hit.sensitivity_display}</span>
+          )}
         </div>
         {hit.definition && <p style={{ color: 'var(--ink-soft)' }}>{hit.definition}</p>}
         <p className="hint">{meta}</p>

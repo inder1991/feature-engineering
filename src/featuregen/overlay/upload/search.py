@@ -21,6 +21,14 @@ _COLUMN_FACETS: dict[str, str] = {
     "source": "catalog_source",
     "domain": "domain",
     "sensitivity": "sensitivity",
+    # The projected DISPLAY axis (migration 1042), a SEPARATE facet from the enforcement tag above
+    # — never a repoint of it. The two speak different vocabularies ('pii' vs
+    # 'restricted'/'confidential'), and `sensitivity` is an input to the generated
+    # `visible_requires`, so swapping the column under the existing name would silently retire the
+    # role-gated `pii` bucket. Read scope applies here exactly as it does to every other facet: the
+    # base predicates gate the facet counts too, so a label can never name a row the caller cannot
+    # already see.
+    "sensitivity_display": "sensitivity_display",
     "additivity": "additivity",
     "entity": "entity",
     "kind": "kind",
@@ -88,7 +96,7 @@ def _select_hit(match: str) -> str:
     return f"""
     n.object_ref, n.table_name, n.column_name, n.kind, n.data_type, n.definition,
     n.is_grain, n.is_as_of, n.catalog_source, n.concept, n.domain, n.sensitivity,
-    n.additivity, n.unit, n.currency, n.entity,
+    n.sensitivity_display, n.additivity, n.unit, n.currency, n.entity,
     ts_rank_cd(n.search_doc, {_TSQUERY[match]})
       + (CASE WHEN n.is_grain THEN 0.5 ELSE 0 END)
       + (CASE WHEN n.is_as_of THEN 0.3 ELSE 0 END) AS score
@@ -110,7 +118,8 @@ class SearchHit:
     catalog_source: str
     concept: str | None
     domain: str | None
-    sensitivity: str | None
+    sensitivity: str | None              # the raw read-scope TAG (what the file declared)
+    sensitivity_display: str | None      # the projected display LABEL (1042) — never enforcement
     additivity: str | None
     unit: str | None
     currency: str | None
@@ -146,6 +155,7 @@ def _hit(r: dict[str, Any]) -> SearchHit:
         kind=r["kind"], data_type=r["data_type"], definition=r["definition"],
         is_grain=r["is_grain"], is_as_of=r["is_as_of"], catalog_source=r["catalog_source"],
         concept=r["concept"], domain=r["domain"], sensitivity=r["sensitivity"],
+        sensitivity_display=r["sensitivity_display"],
         additivity=r["additivity"], unit=r["unit"], currency=r["currency"], entity=r["entity"],
         score=float(r["score"]))
 

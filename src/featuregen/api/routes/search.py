@@ -25,6 +25,9 @@ def search_catalog(
     source: _Facet,
     domain: _Facet,
     sensitivity: _Facet,
+    # The projected display axis — a facet in its own right, beside (never instead of) the
+    # enforcement tag above. Read scope gates its counts like every other facet.
+    sensitivity_display: _Facet,
     additivity: _Facet,
     entity: _Facet,
     kind: _Facet,
@@ -56,6 +59,7 @@ def search_catalog(
         name: values
         for name, values in (
             ("source", source), ("domain", domain), ("sensitivity", sensitivity),
+            ("sensitivity_display", sensitivity_display),
             ("additivity", additivity), ("entity", entity), ("kind", kind),
             ("data_role", data_role), ("authority_role", authority_role),
             ("temporal_storage_model", temporal_storage_model), ("bian_path", bian_path),
