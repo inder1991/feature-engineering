@@ -785,3 +785,39 @@ it('leaves an unattested value quiet', async () => {
   const row = screen.getByTestId('axis-entity')
   expect(within(row).getByText('unattested')).toHaveClass('gj-none')
 })
+
+
+it('does not dress the search terms as authority claims', async () => {
+  // The terms are DATA — the words the model drafted — not statements about who vouched for them.
+  // They carried `gj-proposed`, the same class and the same fill as the "AI proposed" badge sitting
+  // beneath them, so eight content chips were indistinguishable from an authority verdict. That
+  // undoes the rule the badge tones were just unified under: a tone means authority strength, and
+  // it can only mean that if nothing else wears it.
+  //
+  // The card states the authority ONCE, in its own badge and its rationale. The chips do not each
+  // need to re-assert it.
+  await renderDossier(detail(d => {
+    d.evidence!.proposals_by_field.semantic_terms = {
+      active: [{
+        evidence_id: 'ev-syn', producer: 'llm', strength: 'proposed',
+        proposed_value: 'customer id, client id', confidence_band: null,
+      }],
+    }
+  }))
+  const card = screen.getByTestId('search-terms')
+  const term = within(card).getByText('customer id')
+  const authority = within(card).getByText('AI proposed')
+  expect(authority).toHaveClass('gj-proposed')
+  expect(term).not.toHaveClass('gj-proposed')
+})
+
+
+it('does not dress a COUNT as an authority claim', async () => {
+  // Same class of defect as the search terms, found by sweeping every authority-tone use rather
+  // than fixing the one that was reported. "2 populated · 7 unknown" is a tally of the card's own
+  // rows. It wore `gj-proposed`, so a summary count was indistinguishable from an AI proposal
+  // sitting a few pixels below it.
+  await renderDossier(detail())
+  const count = within(screen.getByTestId('operational-semantics')).getByText(/populated ·/)
+  expect(count).not.toHaveClass('gj-proposed')
+})

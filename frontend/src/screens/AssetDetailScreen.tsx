@@ -1431,6 +1431,11 @@ function SemanticCandidateRow({ candidate }: { candidate: SemanticCandidate }) {
         <span className="mono gj-kind">
           {shortRef(candidate.subject_graph_ref)} → {shortRef(candidate.target_graph_ref)}
         </span>
+        {/* KEEPS the proposal tone, unlike the search terms and the axis count. Its LABEL is a
+            kind, but this chip is the row's AUTHORITY marker: the section is "Proposed candidates"
+            and sits opposite a "Verified" section whose rows carry `gj-verified`. Neutralising it
+            during the authority-tone sweep removed the only thing distinguishing the two, which
+            `renders verified joins/edges distinctly from proposed candidates` caught. */}
         <span className="badge gj-proposed">{candidate.binding_kind}</span>
         <span className="gj-score">{candidate.disposition}</span>
       </div>
