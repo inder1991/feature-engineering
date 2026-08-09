@@ -276,18 +276,27 @@ it('renders the SAME card vocabulary the table screen uses, drawer included', as
   })]))
   await renderDossier(detail())
   const section = await screen.findByTestId('column-suggestions')
-  // the card's own semantic and warning vocabulary, not a stripped copy
-  expect(within(section).getByText('suggested · recipe')).toBeInTheDocument()
-  expect(within(section).getByText('Trend & Trajectory')).toBeInTheDocument()
-  expect(within(section).getByText('Liquidity')).toBeInTheDocument()
-  expect(within(section).getByText('Execution safety')).toBeInTheDocument()
-  expect(within(section).getByText(/could duplicate or drop rows/i)).toBeInTheDocument()
-  expect(within(section).getByText(/predictive usefulness and production execution are not proven/i))
-    .toBeInTheDocument()
+  // the card's own semantic and warning vocabulary, not a stripped copy. Category and family
+  // live in Full recommendation detail now, so they are asserted after it is opened below.
+  expect(within(section).getByText('account_balance_avg_30d')).toBeInTheDocument()
+  // The caveat moved off every card and onto the panel header, once. The guarantee is unchanged
+  // -- a reader meets it before the badges -- and the badges now name both states of the axis
+  // themselves, which is what made the per-card paragraph redundant.
+  expect(within(section).getByText(
+    /a design check tests the inputs, not whether the feature predicts anything/i,
+  )).toBeInTheDocument()
   // the card heading sits BELOW the dossier section heading, not beside it
   expect(within(section).getByRole('heading', { level: 4, name: 'account_balance_avg_30d' }))
     .toBeInTheDocument()
   await userEvent.click(within(section).getByRole('button', { name: /show full detail/i }))
+  // Generation source moved into the detail's Classification section when the card head was
+  // reduced to the name. Same guarantee: a reader can always learn this is a recipe suggestion.
+  expect(within(section).getByText('suggested · recipe')).toBeInTheDocument()
+  expect(within(section).getAllByText('Trend & Trajectory').length).toBeGreaterThan(0)
+  expect(within(section).getAllByText('Execution safety').length).toBeGreaterThan(0)
+  expect(within(section).getAllByText(/could duplicate or drop rows/i).length)
+    .toBeGreaterThan(0)
+  expect(within(section).getByText('Liquidity')).toBeInTheDocument()
   const drawer = within(section).getByRole('group', {
     name: /full detail for account_balance_avg_30d/i,
   })
@@ -430,6 +439,36 @@ it('a sub-domain nobody proposed reads "nothing known yet", never a blank row', 
     .toBeInTheDocument()
 })
 
+it('renders the sub-domain axis when the server DOES send it', async () => {
+  // The positive half of the axis, which nothing covered: `main`'s test asserts the row is ABSENT
+  // for an older backend, and the dossier fixture never sends the field — so the axis could have
+  // been dropped by the Overview restructure and every test would still have passed. It nearly was.
+  //
+  // Absence is keyed on the KEY, not the value: a backend that sends `sub_domain: null` has an
+  // opinion (nobody has classified it yet) and must get a row saying so.
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.sub_domain = {
+      value: 'Sanctions Screening', authority: 'hint', c1_status: 'proposed',
+      provenance: 'llm_proposed', evidence_provenance: null, selected_evidence_ids: [],
+    }
+  }))
+  const row = screen.getByTestId('axis-sub_domain')
+  expect(row).toBeInTheDocument()
+  expect(within(row).getByText('Sanctions Screening')).toBeInTheDocument()
+})
+
+it('renders the sub-domain row when the server sends the key with a NULL value', async () => {
+  // "The backend has never heard of this axis" and "the backend knows the axis and nobody has
+  // classified this column" are different facts, and only the first may hide the row.
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.sub_domain = {
+      value: null, authority: 'missing', c1_status: 'unset',
+      provenance: null, evidence_provenance: null, selected_evidence_ids: [],
+    }
+  }))
+  expect(screen.getByTestId('axis-sub_domain')).toBeInTheDocument()
+})
+
 it('omits the sub-domain row entirely when the server does not send the field', async () => {
   // A deployment whose backend predates the axis must look exactly like today's, not like a
   // column whose sub-domain is missing.
@@ -524,13 +563,17 @@ describe('section order', () => {
     }))
     await screen.findByTestId('column-suggestions')
     const text = document.body.textContent ?? ''
+    // The dossier reads in three tiers: the verdict strip, then the reasoning cards, then the
+    // receipts. Technical identity is LAST — it used to be first, which put the object/logical/
+    // graph refs in the most valuable position on the page and the business meaning below them.
     const order = [
-      'Identity',
-      'Meaning',
+      'Potential uses',
+      'Business meaning',
       'From the source glossary',
-      'Semantics',
-      'Governance',
+      'Operational semantics',
+      'Trust and coverage',
       'Suggested features using this column',
+      'Technical identity',
     ].map(h => text.indexOf(h))
     for (const idx of order) expect(idx).toBeGreaterThan(-1)
     for (let i = 1; i < order.length; i++) expect(order[i]).toBeGreaterThan(order[i - 1])

@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FeatureGen — Business Date Column Dossier</title>
+  <style>
+    :root {
+      --ground: #eaf2f3;
+      --surface: #fbfdfd;
+      --surface-2: #f3f8f8;
+      --ink: #142d32;
+      --ink-soft: #52696e;
+      --ink-faint: #73868b;
+      --line: #d0dde0;
+      --line-strong: #b5c7ca;
+      --rail: #04373f;
+      --rail-deep: #032e35;
+      --cyan: #007e90;
+      --cyan-dark: #006574;
+      --cyan-soft: #dceff2;
+      --green: #08775f;
+      --green-soft: #ddf3e9;
+      --amber: #96600e;
+      --amber-soft: #fff2d8;
+      --purple: #65509a;
+      --purple-soft: #eee9f8;
+      --danger: #9c4646;
+      --danger-soft: #f8e9e7;
+      --shadow: 0 1px 2px rgba(8,43,49,.04), 0 12px 30px rgba(8,43,49,.07);
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { min-width: 1120px; }
+    body { min-height: 100vh; margin: 0; background: var(--ground); color: var(--ink); font: 13px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
+    button, a { font: inherit; }
+    button { color: inherit; cursor: pointer; }
+    a { color: inherit; }
+    code, .mono { font-family: var(--mono); }
+    .hidden { display: none !important; }
+
+    .rail { position: fixed; inset: 0 auto 0 0; z-index: 10; display: flex; width: 220px; flex-direction: column; border-right: 1px solid rgba(255,255,255,.08); background: var(--rail); color: #aac4c8; }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 20px 17px 17px; color: #86d8df; }
+    .brand-mark { display: grid; width: 21px; height: 21px; place-items: center; border: 1px solid #75d1d9; border-radius: 5px; font: 700 11px var(--mono); }
+    .brand strong { display: block; font-size: 14px; line-height: 1.05; }
+    .brand small { display: block; margin-top: 3px; font-size: 9px; letter-spacing: .11em; text-transform: uppercase; }
+    .nav { display: grid; gap: 2px; padding: 7px 8px; }
+    .nav-item { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 11px; border-radius: 8px; color: #aac4c8; text-decoration: none; }
+    .nav-item.active { background: #0a5661; color: #93e0e6; font-weight: 650; }
+    .nav-icon { width: 16px; color: #82adb3; font-family: var(--mono); text-align: center; }
+    .session { margin-top: auto; padding: 14px 15px; border-top: 1px solid rgba(255,255,255,.08); background: var(--rail-deep); }
+    .session-label { margin-bottom: 7px; color: #779ba0; font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    .user { padding: 7px 9px; border: 1px solid #18515a; border-radius: 7px; color: #c8dcdf; }
+    .role { display: inline-block; margin: 7px 4px 0 0; padding: 4px 8px; border: 1px solid #1b5962; border-radius: 99px; font: 10px var(--mono); }
+    .role.active { border-color: #76d5dc; background: #0a4a54; color: #d8f7f9; }
+
+    main { margin-left: 220px; padding: 20px 28px 48px; }
+    .page { width: min(1240px, calc(100vw - 276px)); margin: 0 auto; }
+    .topline { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+    .crumb { color: var(--cyan-dark); font: 700 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .button { display: inline-flex; min-height: 34px; align-items: center; justify-content: center; gap: 7px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-weight: 650; text-decoration: none; }
+    .button:hover { border-color: var(--cyan); }
+    .button.primary { border-color: var(--cyan); background: var(--cyan); color: white; }
+    .button.quiet { border-color: transparent; background: transparent; color: var(--cyan-dark); }
+    .button.small { min-height: 29px; padding-inline: 9px; font-size: 11px; }
+
+    .hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px; padding: 19px 20px; border: 1px solid var(--line); border-radius: 12px 12px 0 0; background: var(--surface); }
+    .hero-kicker { margin: 0 0 5px; color: var(--cyan-dark); font: 700 9px var(--mono); letter-spacing: .09em; text-transform: uppercase; }
+    .hero h1 { margin: 0; font-size: 24px; letter-spacing: -.025em; }
+    .fqn { margin: 3px 0 0; color: var(--ink-soft); font: 11px var(--mono); }
+    .definition { max-width: 790px; margin: 10px 0 0; color: var(--ink-soft); font-size: 13.5px; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .badge { display: inline-flex; min-height: 22px; align-items: center; padding: 2px 7px; border-radius: 99px; font: 700 8.5px var(--mono); letter-spacing: .055em; text-transform: uppercase; white-space: nowrap; }
+    .badge.info { background: var(--cyan-soft); color: var(--cyan-dark); }
+    .badge.good { background: var(--green-soft); color: var(--green); }
+    .badge.warn { background: var(--amber-soft); color: var(--amber); }
+    .badge.proposed { background: var(--purple-soft); color: var(--purple); }
+    .badge.muted { border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-faint); }
+    .hero-actions { display: flex; align-items: start; gap: 8px; padding-top: 16px; }
+
+    .summary { display: grid; grid-template-columns: repeat(4, 1fr); overflow: hidden; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 12px 12px; background: var(--surface); }
+    .summary-item { padding: 11px 15px; }
+    .summary-item + .summary-item { border-left: 1px solid var(--line); }
+    .summary-item strong { display: block; font: 650 16px var(--mono); }
+    .summary-item span { display: block; margin-top: 1px; font-size: 11px; font-weight: 650; }
+    .summary-item small { display: block; margin-top: 2px; color: var(--ink-faint); font-size: 9.5px; }
+
+    .tabs { display: flex; margin-top: 15px; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); }
+    .tab { min-height: 39px; padding: 0 14px; border: 0; border-right: 1px solid var(--line); background: transparent; color: var(--ink-soft); font-weight: 650; }
+    .tab[aria-selected="true"] { background: var(--cyan); color: white; }
+    .tabpanel { padding-top: 13px; }
+
+    .overview-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(350px, .85fr); gap: 12px; }
+    .card { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); box-shadow: 0 1px 1px rgba(8,43,49,.02); }
+    .card.full { grid-column: 1 / -1; }
+    .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 46px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+    .card-head h2, .card-head h3 { margin: 0; font-size: 13px; }
+    .card-head p { margin: 2px 0 0; color: var(--ink-faint); font-size: 10px; }
+    .card-body { padding: 14px; }
+    .micro { margin: 0; color: var(--ink-faint); font: 700 9px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+
+    .meaning { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
+    .meaning-col { min-height: 145px; padding: 14px; }
+    .meaning-col + .meaning-col { border-left: 1px solid var(--line); background: #faf8fd; }
+    .meaning-col p:not(.micro) { margin: 8px 0 11px; font-size: 13px; line-height: 1.52; }
+
+    .glossary { display: grid; }
+    .glossary-row { display: grid; grid-template-columns: 145px minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 49px; padding: 9px 14px; }
+    .glossary-row + .glossary-row { border-top: 1px solid var(--line); }
+    .glossary-row dt, .glossary-row dd { margin: 0; }
+    .glossary-row dt { font-weight: 650; }
+    .glossary-row dd { color: var(--ink-soft); }
+    .bian { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+    .bian span { padding: 3px 7px; border-radius: 6px; background: var(--surface-2); color: var(--ink); font-size: 10px; }
+    .bian i { color: var(--ink-faint); font-style: normal; }
+
+    .semantic-set { display: grid; grid-template-columns: 1fr 1fr; }
+    .semantic-row { display: grid; grid-template-columns: 135px minmax(0, 1fr) auto; gap: 9px; align-items: center; min-height: 45px; padding: 8px 13px; border-top: 1px solid var(--line); }
+    .semantic-row:nth-child(odd) { border-right: 1px solid var(--line); }
+    .semantic-label { font-weight: 650; }
+    .semantic-value { min-width: 0; color: var(--ink-soft); font: 10.5px var(--mono); }
+    .semantic-value small { display: block; margin-top: 2px; color: var(--ink-faint); font: 9px var(--sans); }
+    .unknown { color: var(--ink-faint); font-family: var(--sans); font-style: italic; }
+
+    .coverage-list { display: grid; }
+    .coverage-row { display: grid; grid-template-columns: 125px minmax(0, 1fr) auto; gap: 9px; align-items: center; min-height: 49px; padding: 9px 13px; }
+    .coverage-row + .coverage-row { border-top: 1px solid var(--line); }
+    .coverage-row strong { font-size: 11px; }
+    .coverage-row p { margin: 1px 0 0; color: var(--ink-faint); font-size: 9.5px; }
+
+    .capabilities { display: grid; }
+    .cap-row { display: grid; grid-template-columns: 95px minmax(0, 1fr) auto; gap: 10px; align-items: center; min-height: 61px; padding: 9px 13px; }
+    .cap-row + .cap-row { border-top: 1px solid var(--line); }
+    .cap-role { font: 650 10.5px var(--mono); }
+    .cap-copy strong { display: block; font-size: 11px; }
+    .cap-copy span { display: block; margin-top: 2px; color: var(--ink-faint); font-size: 9.5px; }
+
+    .features { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 9px; padding: 12px; align-items: start; }
+    .feature { display: flex; grid-column: span 2; min-height: 348px; flex-direction: column; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); }
+    .feature h3 { margin: 0; font: 650 11px var(--mono); overflow-wrap: anywhere; }
+    .feature p { margin: 7px 0; color: var(--ink-soft); font-size: 10.5px; }
+    .feature-class { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0 2px; }
+    .feature-class span { padding: 3px 6px; border-radius: 5px; background: var(--purple-soft); color: var(--purple); font: 700 8px var(--mono); text-transform: uppercase; }
+    .feature-trust { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0; }
+    .feature-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; margin: 5px 0 8px; }
+    .feature-fact { min-width: 0; padding: 6px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .feature-fact small { display: block; color: var(--ink-faint); font: 700 7.5px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .feature-fact strong { display: block; margin-top: 2px; font-size: 9.5px; overflow-wrap: anywhere; }
+    .formula { margin-top: 2px; padding: 7px; border-radius: 6px; background: var(--surface); color: var(--ink-soft); font: 9px/1.4 var(--mono); overflow-wrap: anywhere; }
+    .safety-note { padding: 7px; border-left: 3px solid #d39a35; border-radius: 4px; background: var(--amber-soft); color: var(--amber) !important; font-size: 9.5px !important; }
+    .missing-note { color: var(--ink-faint) !important; font-style: italic; }
+    .feature-foot { display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-top: 8px; color: var(--purple); font: 700 8px var(--mono); letter-spacing: .05em; text-transform: uppercase; }
+    .feature-foot a { color: var(--purple); text-decoration: none; }
+    .feature-detail { margin-top: 9px; border-top: 1px solid var(--line); }
+    .feature-detail summary { padding: 8px 0 0; color: var(--cyan-dark); cursor: pointer; font-size: 10px; font-weight: 700; }
+    .detail-grid { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 5px 8px; margin: 8px 0 0; font-size: 9.5px; }
+    .detail-grid dt, .detail-grid dd { margin: 0; }
+    .detail-grid dt { color: var(--ink-faint); }
+    .detail-grid dd { color: var(--ink-soft); overflow-wrap: anywhere; }
+    .limitations { margin-top: 8px; padding: 7px; border-radius: 6px; background: var(--amber-soft); color: var(--amber); font-size: 9.5px; }
+    .detail-section { margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--line); }
+    .detail-section h4 { margin: 0 0 5px; color: var(--ink); font-size: 9.5px; }
+    .detail-section p { margin: 4px 0; font-size: 9.5px; }
+    .operand-list { display: grid; gap: 5px; margin: 6px 0 0; padding: 0; list-style: none; }
+    .operand-list li { padding: 6px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink-soft); font-size: 9px; }
+    .operand-list strong { color: var(--ink); font-family: var(--mono); }
+    .provenance-detail { margin-top: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .provenance-detail summary { padding: 7px; color: var(--ink-soft); font-size: 9px; }
+    .provenance-detail .detail-grid { padding: 0 7px 8px; grid-template-columns: 105px minmax(0, 1fr); font-size: 8px; }
+    .feature:has(> .feature-detail[open]) { grid-column: 1 / -1; min-height: 0; }
+    .features:has(.feature-detail[open]) .feature:not(:has(> .feature-detail[open])) { grid-column: span 3; }
+    .feature:has(> .feature-detail[open]) > .feature-detail > .detail-grid { grid-template-columns: 180px minmax(0, 1fr); }
+    .feature:has(> .feature-detail[open]) .operand-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+    details.tech { margin-top: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    details.tech summary { padding: 11px 13px; cursor: pointer; font-weight: 650; }
+    .tech-grid { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 7px 13px; padding: 0 13px 13px; color: var(--ink-soft); font-size: 10.5px; }
+    .tech-grid dt, .tech-grid dd { margin: 0; }
+    .tech-grid dt { color: var(--ink-faint); }
+    .tech-grid dd { font-family: var(--mono); overflow-wrap: anywhere; }
+
+    .rel-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 12px; }
+    .rel-canvas { position: relative; height: 430px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background-color: var(--surface); background-image: radial-gradient(#d7e3e5 .8px, transparent .8px); background-size: 22px 22px; }
+    .rel-node { position: absolute; left: 50%; width: 245px; transform: translateX(-50%); border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow); }
+    .rel-node.table { top: 77px; }
+    .rel-node.column { top: 236px; border-color: var(--cyan); }
+    .rel-node h3 { margin: 0; padding: 10px; border-bottom: 1px solid var(--line); font: 650 11px var(--mono); }
+    .rel-node p { margin: 0; padding: 8px 10px; color: var(--ink-faint); font-size: 10px; }
+    .rel-line { position: absolute; top: 159px; left: 50%; width: 1px; height: 77px; border-left: 2px dotted var(--line-strong); }
+    .empty-panel { padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .empty-panel h2 { margin: 0; font-size: 13px; }
+    .empty-panel p { margin: 5px 0 13px; color: var(--ink-soft); font-size: 11px; }
+    .empty-list { display: grid; gap: 7px; }
+    .empty-item { padding: 9px; border-radius: 7px; background: var(--surface-2); }
+    .empty-item strong { display: block; font-size: 10.5px; }
+    .empty-item span { display: block; margin-top: 2px; color: var(--ink-faint); font-size: 9.5px; }
+
+    .evidence-table, .readiness-table, .history-list { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .evidence-row { display: grid; grid-template-columns: 140px minmax(0, 1fr) 150px auto; gap: 11px; align-items: center; min-height: 56px; padding: 9px 13px; }
+    .evidence-row:not(:first-child) { border-top: 1px solid var(--line); }
+    .field-name { font: 650 10.5px var(--mono); }
+    .field-value { min-width: 0; overflow: hidden; color: var(--ink-soft); font: 10.5px var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+    .evidence-detail { margin: -1px 13px 10px 153px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
+    .evidence-detail summary { padding: 7px 9px; color: var(--cyan-dark); cursor: pointer; font-size: 9.5px; font-weight: 700; }
+    .evidence-detail .detail-grid { padding: 0 9px 9px; grid-template-columns: 130px minmax(0, 1fr); }
+    .unset-box { margin-top: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); color: var(--ink-soft); }
+    .unset-box strong { color: var(--ink); }
+    .contract-card { margin-top: 10px; overflow: hidden; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    .contract-head { padding: 11px 13px; border-bottom: 1px solid var(--line); }
+    .contract-head h3 { margin: 0; font-size: 11px; }
+    .contract-head p { margin: 3px 0 0; color: var(--ink-faint); font-size: 9.5px; }
+    .contract-row { display: grid; grid-template-columns: 155px minmax(0, 1fr) 120px; gap: 10px; align-items: center; padding: 9px 13px; }
+    .contract-row + .contract-row { border-top: 1px solid var(--line); }
+    .contract-row strong { font: 650 10px var(--mono); }
+    .contract-row p { margin: 0; color: var(--ink-soft); font-size: 9.5px; }
+
+    .readiness-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 180px; gap: 12px; align-items: center; min-height: 67px; padding: 10px 13px; }
+    .readiness-row + .readiness-row { border-top: 1px solid var(--line); }
+    .readiness-row h3 { margin: 0; font: 650 11px var(--mono); }
+    .readiness-row p { margin: 2px 0 0; color: var(--ink-soft); font-size: 10.5px; }
+    .readiness-action { text-align: right; }
+    .req-detail { margin-top: 6px; }
+    .req-detail summary { color: var(--cyan-dark); cursor: pointer; font-size: 9.5px; font-weight: 700; }
+    .req-detail code { display: block; margin-top: 5px; padding: 6px 7px; border-radius: 5px; background: var(--surface-2); color: var(--ink-faint); font-size: 8.5px; overflow-wrap: anywhere; }
+    .rollup { margin-top: 11px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+    .rollup h3 { margin: 0 0 4px; font-size: 11px; }
+    .rollup p { margin: 0; color: var(--ink-soft); }
+
+    .history-item { display: grid; grid-template-columns: 120px minmax(0, 1fr) auto; gap: 12px; align-items: start; padding: 13px; }
+    .history-item + .history-item { border-top: 1px solid var(--line); }
+    .history-date { color: var(--ink-faint); font: 9.5px var(--mono); }
+    .history-copy strong { display: block; font-size: 11px; }
+    .history-copy p { margin: 3px 0 0; color: var(--ink-soft); font-size: 10.5px; }
+    .run-detail { margin-top: 6px; }
+    .run-detail summary { color: var(--cyan-dark); cursor: pointer; font-size: 9.5px; font-weight: 700; }
+    .stage-list { display: flex; flex-wrap: wrap; gap: 5px; margin: 7px 0 0; padding: 0; list-style: none; }
+    .stage-list li { padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface-2); color: var(--ink-faint); font: 8px var(--mono); }
+    .stage-list li.warn { border-color: #e7c78d; background: var(--amber-soft); color: var(--amber); }
+    .audit-note { margin-top: 11px; padding: 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface-2); color: var(--ink-soft); }
+
+    .notes { position: fixed; inset: 12px 12px 12px auto; z-index: 20; width: 370px; overflow: auto; padding: 17px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: 0 18px 50px rgba(5,42,48,.22); }
+    .notes-head { display: flex; align-items: start; justify-content: space-between; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .notes h2 { margin: 0; font-size: 15px; }
+    .notes-head p { margin: 3px 0 0; color: var(--ink-faint); font-size: 10.5px; }
+    .close { width: 29px; height: 29px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+    .note { display: grid; grid-template-columns: 23px 1fr; gap: 9px; padding: 12px 0; }
+    .note + .note { border-top: 1px solid var(--line); }
+    .note-number { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; background: var(--cyan-soft); color: var(--cyan-dark); font: 700 10px var(--mono); }
+    .note strong { display: block; font-size: 11px; }
+    .note p { margin: 3px 0 0; color: var(--ink-soft); font-size: 10.5px; }
+
+    @media (max-width: 1240px) {
+      .overview-grid { grid-template-columns: 1fr; }
+      .card.full { grid-column: auto; }
+      .features { grid-template-columns: 1fr; }
+      .feature, .features:has(.feature-detail[open]) .feature:not(:has(> .feature-detail[open])) { grid-column: 1; }
+    }
+  </style>
+</head>
+<body>
+  <aside class="rail" aria-label="Primary navigation">
+    <div class="brand"><span class="brand-mark">+</span><span><strong>FeatureGen</strong><small>Feature catalog</small></span></div>
+    <nav class="nav">
+      <a class="nav-item" href="#"><span class="nav-icon">◉</span>Overview</a>
+      <a class="nav-item" href="#"><span class="nav-icon">＋</span>Generate features</a>
+      <a class="nav-item" href="#"><span class="nav-icon">?</span>Ask a question</a>
+      <a class="nav-item" href="#"><span class="nav-icon">⌘</span>Registry</a>
+      <a class="nav-item active" href="#"><span class="nav-icon">⌕</span>Search</a>
+      <a class="nav-item" href="#"><span class="nav-icon">↥</span>Ingest</a>
+      <a class="nav-item" href="#"><span class="nav-icon">♧</span>Integrations</a>
+      <a class="nav-item" href="#"><span class="nav-icon">≡</span>Review queue</a>
+      <a class="nav-item" href="#"><span class="nav-icon">◇</span>Semantics</a>
+      <a class="nav-item" href="#"><span class="nav-icon">♢</span>Governance</a>
+      <a class="nav-item" href="#"><span class="nav-icon">▥</span>Dashboard</a>
+    </nav>
+    <div class="session"><div class="session-label">Dev session (stub auth)</div><div class="user">dev</div><span class="role">catalog_viewer</span><span class="role active">data_owner</span><span class="role">feature_engineer</span></div>
+  </aside>
+
+  <main>
+    <div class="page">
+      <div class="topline"><div class="crumb">Catalog · Search · bo_cib_customer · business_dt</div><button class="button small" id="notesToggle" type="button">Design decisions</button></div>
+
+      <header class="hero">
+        <div>
+          <p class="hero-kicker">Column intelligence dossier</p>
+          <h1>Business Date</h1>
+          <p class="fqn">public.bo_cib_customer.business_dt</p>
+          <p class="definition">Business reporting date that identifies the effective date for the customer record within the CIB data snapshot.</p>
+          <div class="chips"><span class="badge info">CIB · Customer</span><span class="badge muted">timestamp(0) · source declared</span><span class="badge proposed">as_of_date · AI proposed</span><span class="badge warn">As-of · data check required</span><span class="badge warn">Grain · data check required</span></div>
+        </div>
+        <div class="hero-actions"><button class="button" type="button" data-tab-target="relationships">View graph</button><a class="button primary" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer">Recommended features</a></div>
+      </header>
+
+      <section class="summary" aria-label="Column decision summary">
+        <div class="summary-item"><strong>2 of 5</strong><span>Potential uses</span><small>Event time and grain need checks</small></div>
+        <div class="summary-item"><strong>3</strong><span>Recommended features</span><small>Use this column · 6 available for the table</small></div>
+        <div class="summary-item"><strong>8</strong><span>Field decisions</span><small>Evidence remains traceable</small></div>
+        <div class="summary-item"><strong>0</strong><span>Direct relationships</span><small>Parent table still provides context</small></div>
+      </section>
+
+      <nav class="tabs" role="tablist" aria-label="Asset sections">
+        <button class="tab" role="tab" aria-selected="true" data-tab="overview">Overview</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="relationships">Relationships</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="metadata">Metadata &amp; evidence</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="readiness">Readiness</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="history">History</button>
+      </nav>
+
+      <section class="tabpanel" data-panel="overview">
+        <div class="overview-grid">
+          <article class="card full">
+            <div class="card-head"><div><h2>Business meaning</h2><p>The source definition and AI interpretation remain visibly distinct.</p></div></div>
+            <div class="meaning">
+              <div class="meaning-col"><p class="micro">Source definition</p><p>Business reporting date that identifies the effective date for the customer record within the CIB data snapshot.</p><span class="badge good">Source attested</span></div>
+              <div class="meaning-col"><p class="micro">AI interpretation</p><p>Business Date is a timestamp field that captures the effective business reporting date identifying when the customer record was valid within the CIB data snapshot.</p><span class="badge proposed">AI proposed · unconfirmed</span></div>
+            </div>
+          </article>
+
+          <article class="card full">
+            <div class="card-head"><div><h2>Source glossary and classification</h2><p>Business vocabulary supplied by the catalog source—not inferred UI labels.</p></div></div>
+            <dl class="glossary">
+              <div class="glossary-row"><dt>Business term</dt><dd>Business Date</dd><span class="badge good">Source attested</span></div>
+              <div class="glossary-row"><dt>BIAN classification</dt><dd class="bian"><span>Sales and Service</span><i>→</i><span>Customer Management</span><i>→</i><span>Reference Data</span><i>→</i><span>Party</span></dd><span class="badge good">Source attested</span></div>
+              <div class="glossary-row"><dt>Declared type</dt><dd class="mono">timestamp(0)</dd><span class="badge info">Source declared</span></div>
+            </dl>
+          </article>
+
+          <article class="card full">
+            <div class="card-head"><div><h2>Operational semantics</h2><p>Every supported semantic axis is shown; “not known” is different from hidden.</p></div><span class="badge proposed">2 populated · 6 unknown</span></div>
+            <div class="semantic-set">
+              <div class="semantic-row"><span class="semantic-label">Business concept</span><span class="semantic-value">as_of_date</span><span class="badge proposed">AI proposed</span></div>
+              <div class="semantic-row"><span class="semantic-label">Data domain</span><span class="semantic-value">Customer<small>Direct column assertion</small></span><span class="badge info">Source proposed</span></div>
+              <div class="semantic-row"><span class="semantic-label">Aggregation behavior</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+              <div class="semantic-row"><span class="semantic-label">Unit</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+              <div class="semantic-row"><span class="semantic-label">Currency</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+              <div class="semantic-row"><span class="semantic-label">Entity</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+              <div class="semantic-row"><span class="semantic-label">Sensitivity</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+              <div class="semantic-row"><span class="semantic-label">Party role</span><span class="semantic-value unknown">Nothing known yet</span><span class="badge muted">Not set</span></div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head"><div><h2>What can the system use it for?</h2><p>Role verdicts with the next evidence required.</p></div><button class="button quiet small" type="button" data-tab-target="readiness">Full readiness</button></div>
+            <div class="capabilities">
+              <div class="cap-row"><span class="cap-role">Event time</span><div class="cap-copy"><strong>Candidate</strong><span>Check population and bounded lag.</span></div><span class="badge warn">Data check</span></div>
+              <div class="cap-row"><span class="cap-role">Grain key</span><div class="cap-copy"><strong>Candidate</strong><span>Check row-level uniqueness.</span></div><span class="badge warn">Data check</span></div>
+              <div class="cap-row"><span class="cap-role">Measure</span><div class="cap-copy"><strong>Not suitable</strong><span>A timestamp is not numeric.</span></div><span class="badge muted">No</span></div>
+              <div class="cap-row"><span class="cap-role">Entity key</span><div class="cap-copy"><strong>Not set</strong><span>No entity assignment held.</span></div><span class="badge muted">Unknown</span></div>
+              <div class="cap-row"><span class="cap-role">Join key</span><div class="cap-copy"><strong>Not considered</strong><span>No current join candidate uses it.</span></div><span class="badge muted">None</span></div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head"><div><h2>Trust and coverage</h2><p>Important product information is never omitted silently.</p></div></div>
+            <div class="coverage-list">
+              <div class="coverage-row"><strong>Catalog ingestion</strong><div><b>31 Jul 2026</b><p>Upload completed; two projections finished with lag.</p></div><span class="badge info">Last observed</span></div>
+              <div class="coverage-row"><strong>Data profiling</strong><div><b>Not profiled</b><p>No observed null rate, distinctness, value range or samples are available for this column.</p></div><span class="badge muted">Not profiled</span></div>
+              <div class="coverage-row"><strong>Owner / steward</strong><div><b>Not assigned</b><p>No accountable owner is held on this asset response.</p></div><span class="badge muted">Not set</span></div>
+              <div class="coverage-row"><strong>Operational SLA</strong><div><b>Not defined</b><p>No refresh or quality SLA is held for this column.</p></div><span class="badge muted">Not set</span></div>
+              <div class="coverage-row"><strong>Audit summaries</strong><div><b>Restricted</b><p>The current role lacks audit:read.</p></div><span class="badge muted">Role gated</span></div>
+            </div>
+          </article>
+
+          <article class="card full">
+            <div class="card-head"><div><h2>Recommended features using this column</h2><p>Discovery candidates are distinct from already-registered feature lineage.</p></div><a class="button small" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer">View all recommendations</a></div>
+            <div class="features">
+              <article class="feature">
+                <h3>tenure_days</h3>
+                <div class="feature-class"><span>Duration &amp; Streak</span><span>Context stage</span></div>
+                <p>Age of the customer relationship: as-of date minus signup or origination date.</p>
+                <div class="feature-facts"><div class="feature-fact"><small>Entity &amp; grain</small><strong>Customer · per cust_num</strong></div><div class="feature-fact"><small>Time binding</small><strong>business_dt · as-of role</strong></div><div class="feature-fact"><small>Window</small><strong>No rolling window</strong></div><div class="feature-fact"><small>Aggregation</small><strong>Not summable · n/a</strong></div></div>
+                <div class="feature-trust"><span class="badge good">Design checked</span><span class="badge warn">Binding ambiguous</span></div>
+                <div class="formula">tenure(cust_cnsnt_mod_dt, business_dt) BY cust_num</div>
+                <p class="safety-note">Point-in-time order is declared, but no data plane enforces it. The governed <span class="mono">time_ref</span> is unresolved.</p>
+                <p class="missing-note">Business value has not been documented for this recipe.</p>
+                <details class="feature-detail"><summary>Full recommendation detail</summary>
+                  <dl class="detail-grid"><dt>Recipe family</dt><dd>Tenure · taxonomy attested</dd><dt>Discovery</dt><dd>Partial mapping · no controlled business domain, canonical use case or keywords supplied</dd><dt>Catalog wording</dt><dd>Customer · catalog resolved from active source-proposed evidence</dd><dt>Entity</dt><dd>customer · template-authored and backed by the customer concept registry</dd><dt>Grain</dt><dd><span class="mono">cib · public.bo_cib_customer.cust_num</span></dd><dt>Operation</dt><dd><span class="mono">tenure</span> · no window · no governed time reference</dd><dt>Recipe stage</dt><dd>context</dd><dt>Output additivity</dt><dd>n/a</dd><dt>Dataset</dt><dd><span class="mono">cib · bo_cib_customer</span> · dataset profile unavailable</dd><dt>Relationships</dt><dd>None traversed; all inputs are on one table</dd><dt>Requirements</dt><dd>No requirements or warnings raised</dd><dt>Currentness</dt><dd>On-demand response · no stored projection · nothing truncated or withheld</dd></dl>
+                  <section class="detail-section"><h4>Point-in-time and authoring constraints</h4><p>Origination must be less than or equal to the as-of value. This is a design-time declaration; runtime point-in-time enforcement is not available.</p><p>Entity substitutes <span class="mono">customer_id</span>; signup is grounded on effective date with origination date accepted as an alternate.</p></section>
+                  <section class="detail-section"><h4>Every input column</h4><ul class="operand-list"><li><strong>cust_cnsnt_mod_dt</strong> · origination role · time</li><li><strong>business_dt</strong> · as-of role · time</li><li><strong>cust_num</strong> · entity role · grain · evidence pinned</li></ul></section>
+                  <div class="limitations">Design rules passed. Predictive usefulness and production execution are not proven; the ambiguous binding still needs human review.</div>
+                  <details class="provenance-detail"><summary>Technical provenance and revisions</summary><dl class="detail-grid"><dt>Contract</dt><dd>feature-suggestion-v2 · recipe generated</dd><dt>Suggestion</dt><dd>2efbff659342437416af6b7b0f2c9bf9468f48c57783e0e9812d38be499ce8b0</dd><dt>Revision</dt><dd>eed484b76c9ecf2d40e1837f51f96b8aca45386cff9496103e2238e6c879dbc2</dd><dt>Template</dt><dd>tenure_days</dd><dt>Recipe revision</dt><dd>a26efe6c713e119c34139671ba3f5dff6c2a26aa132daeba764585c913fad115</dd><dt>Discovery revision</dt><dd>a4c9ec9635ebac3658724211e1d955f6c6226b135ed46ba3af9e6e7b456e40a8</dd><dt>Grounding trace</dt><dd>5286da0a5fe75ef2a3063b11e83ab7377ca730192329fc4fa88589ad9ae8c156</dd><dt>Dependency</dt><dd>evt_01KYMVRAYV9EGAJQDD9EFRF39E</dd></dl></details>
+                </details>
+                <div class="feature-foot"><span>Uses business_dt</span><a href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer">Open recommendation →</a></div>
+              </article>
+              <article class="feature">
+                <h3>share_of_wallet_growth_365d</h3>
+                <div class="feature-class"><span>Ratio &amp; Share</span><span>Maturity stage</span></div>
+                <p>Growth in held-product or revenue share of the customer’s eligible wallet over 365 days.</p>
+                <div class="feature-facts"><div class="feature-fact"><small>Entity &amp; grain</small><strong>Customer · per cust_num</strong></div><div class="feature-fact"><small>As-of time</small><strong>business_dt</strong></div><div class="feature-fact"><small>Window</small><strong>Trailing 365 days</strong></div><div class="feature-fact"><small>Aggregation</small><strong>Non-additive</strong></div></div>
+                <div class="feature-trust"><span class="badge good">Design checked</span><span class="badge info">Binding acceptable</span></div>
+                <div class="formula">share_of_wallet_365d(cust_smart_cust_pkg_cd) BY cust_num OVER 365d [business_dt]</div>
+                <p class="safety-note">Pre-purchase behavior only; never use the purchased outcome. Point-in-time intent is not runtime-enforced.</p>
+                <p class="missing-note">Business value has not been documented for this recipe.</p>
+                <details class="feature-detail"><summary>Full recommendation detail</summary>
+                  <dl class="detail-grid"><dt>Recipe family</dt><dd>Share of Wallet · taxonomy attested</dd><dt>Discovery</dt><dd>Partial mapping · no controlled business domain, canonical use case or keywords supplied</dd><dt>Catalog wording</dt><dd>Customer · catalog resolved from active source-proposed evidence</dd><dt>Entity</dt><dd>customer · template-authored and backed by the customer concept registry</dd><dt>Grain</dt><dd><span class="mono">cib · public.bo_cib_customer.cust_num</span></dd><dt>Operation</dt><dd><span class="mono">share_of_wallet_365d</span> · 365d · <span class="mono">business_dt</span></dd><dt>Recipe stage</dt><dd>4-maturity</dd><dt>Output additivity</dt><dd>non_additive · compute per customer; never sum</dd><dt>Dataset</dt><dd><span class="mono">cib · bo_cib_customer</span> · dataset profile unavailable</dd><dt>Relationships</dt><dd>None traversed; all inputs are on one table</dd><dt>Requirements</dt><dd>No requirements or warnings raised</dd><dt>Currentness</dt><dd>On-demand response · no stored projection · nothing truncated or withheld</dd></dl>
+                  <section class="detail-section"><h4>Point-in-time and eligibility constraints</h4><p>Observe relationship state within <span class="mono">(as_of − 365d, as_of]</span>; inputs must be knowable at or before as-of and must never look forward. Runtime enforcement is unavailable.</p><p>Use pre-purchase behavior only. The conversion or purchased outcome is a leakage anchor and is refused by construction.</p></section>
+                  <section class="detail-section"><h4>Every input column</h4><ul class="operand-list"><li><strong>cust_smart_cust_pkg_cd</strong> · product role · measure</li><li><strong>business_dt</strong> · as-of role · time · evidence pinned</li><li><strong>cust_num</strong> · entity role · grain · evidence pinned</li></ul></section>
+                  <div class="limitations">Design rules passed and binding is acceptable. Predictive usefulness and runtime execution still have not been validated.</div>
+                  <details class="provenance-detail"><summary>Technical provenance and revisions</summary><dl class="detail-grid"><dt>Contract</dt><dd>feature-suggestion-v2 · recipe generated</dd><dt>Suggestion</dt><dd>5ac6838a050c97f47994f24a69ba5f152ef34aacace19c37ffa2999ad8de762d</dd><dt>Revision</dt><dd>8ee5317f2d81e49a23821574e165d126377c01ca8609528236681e8813d16259</dd><dt>Template</dt><dd>share_of_wallet_growth</dd><dt>Recipe revision</dt><dd>2a2a1220a2d07f909493efa9959cf507867034ff7a1ea334d3b9b0330a0c82ba</dd><dt>Discovery revision</dt><dd>89871cd1a5bd08e2dabb3bfd5d4f4de66c9b6626b6d5dadc7a8e205389aed637</dd><dt>Grounding trace</dt><dd>3163eb701967bb92e34d0eabf6d2684011e121f457ad3163a493516d5fb693fa</dd><dt>Dependencies</dt><dd>evt_01KYMVRAYV9EGAJQDD9EFRF39E · evt_01KYMVRFX2JNEQW4JRGZX4XSJM</dd></dl></details>
+                </details>
+                <div class="feature-foot"><span>Uses business_dt</span><a href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer">Open recommendation →</a></div>
+              </article>
+              <article class="feature">
+                <h3>tenure_upsell_readiness_365d</h3>
+                <div class="feature-class"><span>Composite Score</span><span>Deepening stage</span></div>
+                <p>Seasoning-gated cross-sell signal combining tenure and held product to estimate upsell readiness.</p>
+                <div class="feature-facts"><div class="feature-fact"><small>Entity &amp; grain</small><strong>Customer · per cust_num</strong></div><div class="feature-fact"><small>As-of time</small><strong>business_dt</strong></div><div class="feature-fact"><small>Window</small><strong>Trailing 365 days</strong></div><div class="feature-fact"><small>Aggregation</small><strong>Not summable · n/a</strong></div></div>
+                <div class="feature-trust"><span class="badge good">Design checked</span><span class="badge warn">Binding ambiguous</span></div>
+                <div class="formula">upsell_readiness_365d(cust_smart_cust_pkg_cd, cust_cnsnt_mod_dt) BY cust_num OVER 365d [business_dt]</div>
+                <p class="safety-note">Pre-purchase behavior only; never use the purchased outcome. Point-in-time intent is not runtime-enforced.</p>
+                <p class="missing-note">Business value has not been documented for this recipe.</p>
+                <details class="feature-detail"><summary>Full recommendation detail</summary>
+                  <dl class="detail-grid"><dt>Recipe family</dt><dd>Upsell Readiness · taxonomy attested</dd><dt>Discovery</dt><dd>Partial mapping · no controlled business domain, canonical use case or keywords supplied</dd><dt>Catalog wording</dt><dd>Customer · catalog resolved from active source-proposed evidence</dd><dt>Entity</dt><dd>customer · template-authored and backed by the customer concept registry</dd><dt>Grain</dt><dd><span class="mono">cib · public.bo_cib_customer.cust_num</span></dd><dt>Operation</dt><dd><span class="mono">upsell_readiness_365d</span> · 365d · <span class="mono">business_dt</span></dd><dt>Recipe stage</dt><dd>3-deepening</dd><dt>Output additivity</dt><dd>n/a · readiness flag or tenure-gap score is not summable</dd><dt>Dataset</dt><dd><span class="mono">cib · bo_cib_customer</span> · dataset profile unavailable</dd><dt>Relationships</dt><dd>None traversed; all inputs are on one table</dd><dt>Requirements</dt><dd>No requirements or warnings raised</dd><dt>Currentness</dt><dd>On-demand response · no stored projection · nothing truncated or withheld</dd></dl>
+                  <section class="detail-section"><h4>Point-in-time and eligibility constraints</h4><p>Observe relationship state within <span class="mono">(as_of − 365d, as_of]</span>; inputs must be knowable at or before as-of and must never look forward. Runtime enforcement is unavailable.</p><p>Use pre-purchase behavior only. The conversion or purchased outcome is a leakage anchor and is refused by construction.</p></section>
+                  <section class="detail-section"><h4>Every input column</h4><ul class="operand-list"><li><strong>cust_smart_cust_pkg_cd</strong> · product role · measure</li><li><strong>cust_cnsnt_mod_dt</strong> · origination role · time</li><li><strong>business_dt</strong> · as-of role · time · evidence pinned</li><li><strong>cust_num</strong> · entity role · grain · evidence pinned</li></ul></section>
+                  <div class="limitations">Design rules passed, but the ambiguous binding still needs human review. Predictive usefulness and runtime execution are not proven.</div>
+                  <details class="provenance-detail"><summary>Technical provenance and revisions</summary><dl class="detail-grid"><dt>Contract</dt><dd>feature-suggestion-v2 · recipe generated</dd><dt>Suggestion</dt><dd>2305cf94291269896198451b0db8505d10f70bf8e5187ccf191b634ac27d429f</dd><dt>Revision</dt><dd>6205726d394a9f4d5e56cd2ada646c384b34dea35a230480b10499d063c05b80</dd><dt>Template</dt><dd>tenure_upsell_readiness</dd><dt>Recipe revision</dt><dd>5cdc0169123ce4077873f76322827eaec1554d921dd5a25001cfc726dfc13776</dd><dt>Discovery revision</dt><dd>1c6434ec796eff8ea032ca0bbf3a44ec92bbeb8e7e1823cf9c8680d66ea8bbad</dd><dt>Grounding trace</dt><dd>220080ea126ddb1aa82f2bb77319aefc0f8ef81e15b495be9a5f5a04086a6410</dd><dt>Dependencies</dt><dd>evt_01KYMVRAYV9EGAJQDD9EFRF39E · evt_01KYMVRFX2JNEQW4JRGZX4XSJM</dd></dl></details>
+                </details>
+                <div class="feature-foot"><span>Uses business_dt</span><a href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer">Open recommendation →</a></div>
+              </article>
+            </div>
+          </article>
+        </div>
+
+        <details class="tech"><summary>Technical identity, response state and catalog references</summary><dl class="tech-grid"><dt>Source</dt><dd>cib</dd><dt>Kind</dt><dd>column</dd><dt>Schema</dt><dd>BO_DPL_CIB</dd><dt>Table</dt><dd>bo_cib_customer</dd><dt>Column</dt><dd>business_dt</dd><dt>Object reference</dt><dd>public.bo_cib_customer.business_dt</dd><dt>Logical reference</dt><dd>cib::bo_dpl_cib.bo_cib_customer.business_dt</dd><dt>Graph reference</dt><dd>public.bo_cib_customer.business_dt</dd><dt>Operational type</dt><dd>not attested yet</dd><dt>Snapshot</dt><dd>one repeatable-read response; consistency token retained for safe field decisions</dd><dt>Availability</dt><dd>all requested sections available; audit content role-gated</dd><dt>Correction actions</dt><dd>none returned for this asset/session</dd></dl></details>
+      </section>
+
+      <section class="tabpanel hidden" data-panel="relationships">
+        <div class="rel-layout">
+          <div class="rel-canvas"><div class="rel-node table"><h3>TABLE · bo_cib_customer</h3><p>cib · BO_DPL_CIB · 85 columns</p></div><span class="rel-line"></span><div class="rel-node column"><h3>COLUMN · business_dt</h3><p>Contained by bo_cib_customer</p></div></div>
+          <aside class="empty-panel"><h2>Relationship summary</h2><p>This column currently has structural context, but no direct business relationship edges.</p><div class="empty-list"><div class="empty-item"><strong>Containment</strong><span>Belongs to bo_cib_customer · 84 other columns</span></div><div class="empty-item"><strong>Cross-catalog links</strong><span>No link to another catalog</span></div><div class="empty-item"><strong>Approved joins</strong><span>No verified join touches this column</span></div><div class="empty-item"><strong>Semantic links</strong><span>No verified edge or proposal</span></div></div><a class="button primary" style="width:100%;margin-top:12px" href="http://localhost:8080/#/search?q=business_dt">Open graph in Search</a></aside>
+        </div>
+        <details class="tech"><summary>Relationship API coverage</summary><dl class="tech-grid"><dt>Structural context</dt><dd>parent table + sibling count</dd><dt>Approved joins</dt><dd>none returned for business_dt</dd><dt>Cross-catalog</dt><dd>none returned; reason and review status render here when present</dd><dt>Semantic links</dt><dd>no verified links, candidates or divergence returned</dd><dt>Cardinality</dt><dd>shown per relationship when the API supplies it; never guessed</dd></dl></details>
+      </section>
+
+      <section class="tabpanel hidden" data-panel="metadata">
+        <div class="card-head" style="border:1px solid var(--line);border-radius:10px 10px 0 0;background:var(--surface)"><div><h2>Metadata fields and evidence</h2><p>Values, their author, and review state—opaque IDs stay behind details.</p></div><span class="badge info">8 field decisions</span></div>
+        <div class="evidence-table" style="border-radius:0 0 10px 10px;border-top:0">
+          <div class="evidence-row"><span class="field-name">concept</span><span class="field-value">as_of_date</span><span class="badge proposed">AI proposed</span><span class="badge muted">Resolved hint</span></div>
+          <details class="evidence-detail"><summary>Evidence and latest decision</summary><dl class="detail-grid"><dt>Active evidence</dt><dd>LLM proposed · <span class="mono">fev_01KYVNB1S625RKRRN87D4THX1Z</span></dd><dt>Earlier evidence</dt><dd>One stale LLM proposal with the same value · <span class="mono">fev_01KYMRXZ10HBXENQNWDK12WVBT</span></dd><dt>Latest decision</dt><dd>Resolved · influence not operational · not load-bearing</dd><dt>Decision event</dt><dd><span class="mono">fde_01KYVNSFBMVBCWGZNVC886WJE3</span> · 31 Jul 2026 08:10 UTC</dd></dl></details>
+          <div class="evidence-row"><span class="field-name">definition</span><span class="field-value">Business reporting date that identifies the effective date for the customer record…</span><span class="badge good">Source attested</span><span class="badge muted">Resolved hint</span></div>
+          <details class="evidence-detail"><summary>Evidence and latest decision</summary><dl class="detail-grid"><dt>Active evidence</dt><dd>Source attested · <span class="mono">fev_01KYMS3EJK5GTQZDV2H6JF6HAZ</span></dd><dt>Earlier evidence</dt><dd>None stale, rejected or superseded</dd><dt>Latest decision</dt><dd>Resolved · influence not operational · not load-bearing</dd><dt>Decision event</dt><dd><span class="mono">fde_01KYVNSFBMC9QXNX2T9NQTWFQ3</span> · 31 Jul 2026 08:10 UTC</dd></dl></details>
+          <div class="evidence-row"><span class="field-name">ai_summary</span><span class="field-value">Business Date is a timestamp field that captures the effective business reporting date…</span><span class="badge proposed">AI proposed</span><span class="badge muted">Resolved hint</span></div>
+          <details class="evidence-detail"><summary>Evidence and latest decision</summary><dl class="detail-grid"><dt>Active evidence</dt><dd>LLM proposed · <span class="mono">fev_01KYVNK3Y0QZZWBJF5VMVX9ZZJ</span></dd><dt>Earlier evidence</dt><dd>None stale, rejected or superseded</dd><dt>Latest decision</dt><dd>Resolved · influence not operational · not load-bearing</dd><dt>Decision event</dt><dd><span class="mono">fde_01KYVNSFBJ15R2TRV2YBR2C7D2</span> · 31 Jul 2026 08:10 UTC</dd></dl></details>
+          <div class="evidence-row"><span class="field-name">domain</span><span class="field-value">Customer · direct column assertion</span><span class="badge info">Source proposed</span><span class="badge muted">Resolved hint</span></div>
+          <details class="evidence-detail"><summary>Evidence and latest decision</summary><dl class="detail-grid"><dt>Active evidence</dt><dd>Source proposed · <span class="mono">fev_01KYMS3EJKW4HREPHAT3G51ESB</span></dd><dt>Origin</dt><dd>Direct assertion on this column; not inherited and not LLM-generated</dd><dt>Latest decision</dt><dd>Resolved · influence not operational · not load-bearing</dd><dt>Decision event</dt><dd><span class="mono">fde_01KYVNSFBN2WMYG3H9NV5X2J6W</span> · 31 Jul 2026 08:10 UTC</dd></dl></details>
+          <div class="evidence-row"><span class="field-name">type</span><span class="field-value">timestamp(0)</span><span class="badge info">Source declared</span><span class="badge muted">No decision</span></div>
+          <details class="evidence-detail"><summary>Evidence and latest decision</summary><dl class="detail-grid"><dt>Basis</dt><dd>Declared physical type</dd><dt>Proposal evidence</dt><dd>None; the type is not an enrichment proposal</dd><dt>Decision</dt><dd>No field-decision event</dd><dt>Operational type</dt><dd>Not attested yet; this is tracked separately in readiness</dd></dl></details>
+        </div>
+        <div class="unset-box"><strong>6 effective metadata fields are not set:</strong> additivity, unit, currency, entity, sensitivity display and party role. They remain visible on Overview as explicit unknowns. <strong>Sub-domain is not omitted data:</strong> it does not exist in the current asset-detail API contract.</div>
+
+        <section class="contract-card" aria-label="Supporting enrichment and API coverage">
+          <div class="contract-head"><h3>Supporting enrichment and safety signals</h3><p>Returned evidence that should not be misrepresented as effective, governed metadata.</p></div>
+          <div class="contract-row"><strong>semantic_terms</strong><p>business date, as of date, as-of date, reporting date, snapshot date, position date, effective date, data date, processing date</p><span class="badge proposed">LLM · search only</span></div>
+          <div class="contract-row"><strong>temporal_role</strong><p><span class="mono">as_of</span> is taxonomy-proposed; the latest decision says authority insufficient, so the UI uses it as a readiness signal—not confirmed metadata.</p><span class="badge warn">Not authoritative</span></div>
+          <div class="contract-row"><strong>sensitivity_floor</strong><p><span class="mono">public</span> is taxonomy-proposed; authority is insufficient, so sensitivity display remains “not set.”</p><span class="badge warn">Not authoritative</span></div>
+          <div class="contract-row"><strong>leakage_anchor</strong><p><span class="mono">false</span> is taxonomy-proposed; authority is insufficient and the signal is not load-bearing.</p><span class="badge warn">Not authoritative</span></div>
+          <div class="contract-row"><strong>Glossary evidence</strong><p>Business term and full BIAN path are source-attested and surfaced on Overview. Related terms, FIBO path, process path and physical FQN render when supplied.</p><span class="badge good">Consumed</span></div>
+          <div class="contract-row"><strong>Contract boundary</strong><p>The asset API exposes concept, definition, AI summary, domain, additivity, unit, currency, entity, type, sensitivity display and party role. It exposes no sub-domain field.</p><span class="badge info">Explicit</span></div>
+        </section>
+      </section>
+
+      <section class="tabpanel hidden" data-panel="readiness">
+        <div class="readiness-table">
+          <div class="readiness-row"><div><h3>Measure</h3></div><div><strong>Not suitable</strong><p>Declared type timestamp is not numeric.</p><details class="req-detail"><summary>Requirement evidence</summary><code>outstanding: operational_type</code></details></div><div class="readiness-action"><span class="badge muted">Not suitable</span></div></div>
+          <div class="readiness-row"><div><h3>Entity key</h3></div><div><strong>Not set</strong><p>Nothing—person or AI—has proposed an entity assignment.</p><details class="req-detail"><summary>Requirement evidence</summary><code>outstanding: entity_assignment</code></details></div><div class="readiness-action"><span class="badge muted">Assign</span></div></div>
+          <div class="readiness-row"><div><h3>Event time</h3></div><div><strong>Needs a data check</strong><p>The taxonomy proposes an as-of role, but its authority is insufficient. Validate population and bounded lag.</p><details class="req-detail"><summary>Required data checks</summary><code>external:TEMPORAL_IS_POPULATED<br>external:TEMPORAL_LAG_BOUNDED</code></details></div><div class="readiness-action"><span class="badge warn">Run data check</span></div></div>
+          <div class="readiness-row"><div><h3>Grain key</h3></div><div><strong>Needs a data check</strong><p>Validate that the candidate key is unique per row.</p><details class="req-detail"><summary>Required data check</summary><code>external:GRAIN_IS_UNIQUE</code></details></div><div class="readiness-action"><span class="badge warn">Run data check</span></div></div>
+          <div class="readiness-row"><div><h3>Join key</h3></div><div><strong>Not considered</strong><p>No current join candidate or governed join uses this column.</p><details class="req-detail"><summary>Requirement evidence</summary><code>outstanding: join_candidate</code></details></div><div class="readiness-action"><span class="badge muted">No action</span></div></div>
+        </div>
+        <div class="rollup"><h3>Parent table · bo_cib_customer</h3><p>105 columns are AI-proposed and not yet reviewed; 7 need a decision. The table carries 902 individual readiness items.</p></div>
+      </section>
+
+      <section class="tabpanel hidden" data-panel="history">
+        <div class="history-list">
+          <div class="history-item"><span class="history-date">31 Jul 2026<br>08:10 UTC</span><div class="history-copy"><strong>Catalog upload completed</strong><p>24 of 27 stages succeeded. Concept enrichment was partial; join and semantic-binding projections completed with lag.</p><details class="run-detail"><summary>27 stages · run ingrun_01KYVKKDY2J7WG4QES8HV2BCD8</summary><ul class="stage-list"><li>parse</li><li>validation</li><li>brake</li><li>fact_assertion</li><li>drift</li><li>glossary_classification</li><li class="warn">enrich_concept · partial · truncated</li><li>enrich_definition</li><li>enrich_summary</li><li>enrich_domain</li><li>enrich_synonyms</li><li>enrich_unit</li><li>graph_persistence</li><li>governed_joins</li><li>pass_c</li><li>pass_b</li><li>glossary_evidence</li><li>semantic_binding_candidates</li><li>semantic_binding_proposals</li><li>projection_drain</li><li>table_fact_projection</li><li>entity_bridges</li><li class="warn">join_projection · lagged</li><li class="warn">semantic_binding_projection · lagged</li><li>join_drift</li><li>quarantine</li><li>manifest_finalization</li></ul></details></div><span class="badge warn">Completed with lag</span></div>
+          <div class="history-item"><span class="history-date">28 Jul 2026<br>17:10 UTC</span><div class="history-copy"><strong>Catalog upload completed</strong><p>All 26 recorded ingestion stages completed successfully.</p><details class="run-detail"><summary>26 stages · run ingrun_01KYMV9MGZ14Y4WM4SPACPGBGV</summary><ul class="stage-list"><li>parse</li><li>validation</li><li>brake</li><li>fact_assertion</li><li>drift</li><li>glossary_classification</li><li>enrich_concept</li><li>enrich_definition</li><li>enrich_domain</li><li>enrich_synonyms</li><li>enrich_unit</li><li>graph_persistence</li><li>governed_joins</li><li>pass_c</li><li>pass_b</li><li>glossary_evidence</li><li>entity_bridges</li><li>semantic_binding_candidates</li><li>semantic_binding_proposals</li><li>projection_drain</li><li>table_fact_projection</li><li>join_projection</li><li>semantic_binding_projection</li><li>join_drift</li><li>quarantine</li><li>manifest_finalization</li></ul></details></div><span class="badge good">Succeeded</span></div>
+          <div class="history-item"><span class="history-date">28 Jul 2026<br>16:27 UTC</span><div class="history-copy"><strong>Catalog upload completed</strong><p>All 25 recorded ingestion stages completed successfully.</p><details class="run-detail"><summary>25 stages · run ingrun_01KYMRTMFMF31XYC2ZB909XCKY</summary><ul class="stage-list"><li>parse</li><li>validation</li><li>brake</li><li>fact_assertion</li><li>drift</li><li>glossary_classification</li><li>enrich_concept</li><li>enrich_definition</li><li>enrich_domain</li><li>enrich_synonyms</li><li>enrich_unit</li><li>graph_persistence</li><li>governed_joins</li><li>pass_c</li><li>pass_b</li><li>glossary_evidence</li><li>semantic_binding_candidates</li><li>semantic_binding_proposals</li><li>projection_drain</li><li>table_fact_projection</li><li>join_projection</li><li>semantic_binding_projection</li><li>join_drift</li><li>quarantine</li><li>manifest_finalization</li></ul></details></div><span class="badge good">Succeeded</span></div>
+          <div class="history-item"><span class="history-date">28 Jul 2026<br>16:25 UTC</span><div class="history-copy"><strong>Catalog upload completed</strong><p>All 25 recorded ingestion stages completed successfully.</p><details class="run-detail"><summary>25 stages · run ingrun_01KYMRPYF2KAVYKP6Z1K8XAJRR</summary><ul class="stage-list"><li>parse</li><li>validation</li><li>brake</li><li>fact_assertion</li><li>drift</li><li>glossary_classification</li><li>enrich_concept</li><li>enrich_definition</li><li>enrich_domain</li><li>enrich_synonyms</li><li>enrich_unit</li><li>graph_persistence</li><li>governed_joins</li><li>pass_c</li><li>pass_b</li><li>glossary_evidence</li><li>semantic_binding_candidates</li><li>semantic_binding_proposals</li><li>projection_drain</li><li>table_fact_projection</li><li>join_projection</li><li>semantic_binding_projection</li><li>join_drift</li><li>quarantine</li><li>manifest_finalization</li></ul></details></div><span class="badge good">Succeeded</span></div>
+        </div>
+        <div class="audit-note"><strong>LLM audit summaries are unavailable for this session.</strong> The current role does not include <span class="mono">audit:read</span>. When authorized, this section renders the task, stage, provider, model, prompt reference and outcome returned by the API; it does not infer a count from missing data.</div>
+      </section>
+    </div>
+  </main>
+
+  <aside class="notes hidden" id="notesDrawer" aria-label="Updated asset-detail design decisions">
+    <div class="notes-head"><div><h2>Updated asset dossier</h2><p>Corrected against latest main and the live business_dt response.</p></div><button class="close" id="notesClose" type="button" aria-label="Close design decisions">×</button></div>
+    <div class="note"><span class="note-number">1</span><div><strong>The business term leads</strong><p>“Business Date” is the page title; the physical column reference remains immediately below it.</p></div></div>
+    <div class="note"><span class="note-number">2</span><div><strong>Source glossary is first-class</strong><p>Business term, complete BIAN hierarchy and declared type appear on Overview with provenance.</p></div></div>
+    <div class="note"><span class="note-number">3</span><div><strong>Every semantic axis is visible</strong><p>Concept and domain are shown alongside six explicit unknowns. Missing information cannot disappear through omission.</p></div></div>
+    <div class="note"><span class="note-number">4</span><div><strong>Meaning, authority and confirmation are separate</strong><p>Source-attested definition, AI interpretation and proposed concepts use distinct labels.</p></div></div>
+    <div class="note"><span class="note-number">5</span><div><strong>Capabilities show evidence still required</strong><p>Event-time and grain roles are candidates needing checks, not unconditional green badges.</p></div></div>
+    <div class="note"><span class="note-number">6</span><div><strong>Important API gaps are exposed</strong><p>Profiling, ownership and operational SLA are valuable product information. Until APIs supply them, the page says they are unavailable instead of pretending they do not matter.</p></div></div>
+    <div class="note"><span class="note-number">7</span><div><strong>The latest-main information architecture remains</strong><p>Overview, Relationships, Metadata &amp; evidence, Readiness and History stay separate, while Overview answers the essential business questions without tab-hunting.</p></div></div>
+    <div class="note"><span class="note-number">8</span><div><strong>Enrichment is provenance-driven</strong><p>Concept and AI summary are LLM proposals for this column. Domain is a direct source proposal. Search vocabulary and taxonomy safety signals are visible in supporting detail without being promoted to governed metadata. Sub-domain is absent because the API has no such field.</p></div></div>
+    <div class="note"><span class="note-number">9</span><div><strong>Recommendation trust is inspectable</strong><p>Validation, binding, classification gaps, grain, time, inputs, datasets, relationships, requirements, currentness and revision provenance live behind progressive detail rather than being discarded.</p></div></div>
+  </aside>
+
+  <script>
+    const tabs = [...document.querySelectorAll('[data-tab]')]
+    const panels = [...document.querySelectorAll('[data-panel]')]
+    function openTab(name, focus = false) {
+      tabs.forEach(tab => {
+        const active = tab.dataset.tab === name
+        tab.setAttribute('aria-selected', String(active))
+        if (active && focus) tab.focus()
+      })
+      panels.forEach(panel => panel.classList.toggle('hidden', panel.dataset.panel !== name))
+      history.replaceState(null, '', '#section=' + name)
+    }
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => openTab(tab.dataset.tab))
+      tab.addEventListener('keydown', event => {
+        if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return
+        const index = tabs.indexOf(tab)
+        const direction = event.key === 'ArrowRight' ? 1 : -1
+        openTab(tabs[(index + direction + tabs.length) % tabs.length].dataset.tab, true)
+      })
+    })
+    document.querySelectorAll('[data-tab-target]').forEach(button => button.addEventListener('click', () => openTab(button.dataset.tabTarget, true)))
+
+    const recommendationDetails = [...document.querySelectorAll('.feature-detail')]
+    recommendationDetails.forEach(detail => detail.addEventListener('toggle', () => {
+      if (!detail.open) return
+      recommendationDetails.forEach(other => { if (other !== detail) other.open = false })
+    }))
+
+    const notes = document.getElementById('notesDrawer')
+    const toggleNotes = show => notes.classList.toggle('hidden', !show)
+    document.getElementById('notesToggle').addEventListener('click', () => toggleNotes(notes.classList.contains('hidden')))
+    document.getElementById('notesClose').addEventListener('click', () => toggleNotes(false))
+
+    const initial = new URLSearchParams(location.hash.replace('#', '')).get('section')
+    if (initial && panels.some(panel => panel.dataset.panel === initial)) openTab(initial)
+  </script>
+</body>
+</html>

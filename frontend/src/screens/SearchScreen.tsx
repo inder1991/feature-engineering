@@ -195,7 +195,13 @@ export function SearchScreen() {
   // The read-only suggested-features sheet's ONE entry point (P4). Same shape as Details, keyed on
   // the hit's own TABLE: suggestions are per table, so a column hit opens the table it lives on.
   function openSuggested(hit: SearchHit) {
-    navigate('suggested', { source: hit.catalog_source, table: hit.table })
+    // Carry the COLUMN so the table-scoped page can say which one you arrived from; without
+    // it, every column on a table lands on an identical page.
+    navigate('suggested', {
+      source: hit.catalog_source,
+      table: hit.table,
+      ...(hit.column ? { column: hit.column } : {}),
+    })
   }
 
   // Active-filter chips, in facet-group order, then flags.
@@ -269,8 +275,12 @@ export function SearchScreen() {
         )}
       </form>
 
+      {/* The row reserved 26px + 14px whether or not it had anything in it. Removing the
+          "No filters" text left the empty container behind, which is most of the dead band
+          between the search bar and the workspace. Render the row only when it has chips. */}
+      {hasFilters && (
       <div className="active-filters">
-        <span className="active-filters-label">{hasFilters ? 'Filters' : 'No filters'}</span>
+        <span className="active-filters-label">Filters</span>
         {chips.map(chip => (
           <span
             key={chip.id}
@@ -288,8 +298,10 @@ export function SearchScreen() {
           </button>
         )}
       </div>
+      )}
 
-      <div className="facet-cols">
+      <div className={effectiveView === 'graph' ? 'facet-cols facet-cols--graph' : 'facet-cols'}>
+        {effectiveView === 'list' && (
         <aside className="facet-panel" aria-label="Filters">
           {FACET_GROUPS.map(group => {
             const buckets = result?.facets[group.key] ?? []
@@ -343,6 +355,7 @@ export function SearchScreen() {
             </fieldset>
           )}
         </aside>
+        )}
 
         <div className="search-results">
           {error && (
@@ -366,7 +379,10 @@ export function SearchScreen() {
             </div>
           )}
 
-          {!error && hasHits && (
+          {/* The result slice is list-mode information. In graph mode it is chrome above a
+              workspace that has its own anchor bar, and it was a third of the 300px of dead space
+              before the canvas began. */}
+          {!error && hasHits && effectiveView === 'list' && (
             <p className="micro-label tabular-nums result-count" role="status">
               <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
               {result.total === 1 ? 'result' : 'results'}
@@ -381,7 +397,10 @@ export function SearchScreen() {
             </p>
           )}
 
-          {!error && hasHits && (offset > 0 || offset + result.hits.length < result.total) && (
+          {/* A1: paging the RESULT LIST while a graph is on screen is chrome for a view that is
+              not showing. It cost ~90px directly above the workspace. */}
+          {!error && hasHits && effectiveView === 'list'
+            && (offset > 0 || offset + result.hits.length < result.total) && (
             <nav className="pager" aria-label="Result pages">
               <button
                 type="button"
@@ -426,14 +445,12 @@ export function SearchScreen() {
             // a table-anchored graph from a column-anchored one (the unfiltered browse lists the
             // table itself first, and its Graph action was mistaken for a column's).
             <>
-              <p className="hint" role="status">
-                Graph of: <code>{graphAnchor.object_ref}</code> (
-                {graphAnchor.column ? 'column' : 'table'}). Click Graph on any result row to
-                re-anchor.
-              </p>
+              {/* The anchor used to be named in this sentence; the graph's own context bar names
+                  it properly now, with its kind, wording and actions. */}
               <LineageView
                 key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
                 anchor={graphAnchor}
+                onBackToResults={() => setView('list')}
               />
             </>
           )}

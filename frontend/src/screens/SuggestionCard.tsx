@@ -147,15 +147,21 @@ const BASIS_WORDS: Record<string, string> = {
   llm_proposed: 'AI-proposed',
 }
 
+// BOTH states name the same axis, so the badge is self-explaining: a reader who sees "design
+// checked" on one card and "design not checked" on another understands the badge answers one
+// narrow question about DESIGN, and is not declaring the feature ready. That replaces a
+// per-card paragraph nobody read past the second card.
 const STATUS_WORDS: Record<string, string> = {
   DESIGN_CHECKED: 'design checked',
-  NEEDS_EXTERNAL_VALIDATION: 'needs external validation',
+  NEEDS_EXTERNAL_VALIDATION: 'design not checked',
 }
 
-// design checked reads as settled-for-design; needs external validation as partial (warn) — never
-// as rejected. A card waiting on a declared fact is honest output, not a failure.
+// Neither state gets the success fill. Solid green reads as "good to go", which is precisely
+// the over-trust the removed paragraph existed to prevent — a design check is not an end-to-end
+// verification. Quiet chips; the WORDS carry the verdict. Not-checked stays partial, never
+// rejected: a card waiting on a declared fact is honest output, not a failure.
 const STATUS_TONE: Record<string, string> = {
-  DESIGN_CHECKED: 'gj-verified',
+  DESIGN_CHECKED: 'gj-none',
   NEEDS_EXTERNAL_VALIDATION: 'gj-partial',
 }
 
@@ -430,35 +436,7 @@ function LimitationRow({ item }: { item: Limitation }) {
 
 // How many controlled values fit before the card starts counting instead of listing. Small on
 // purpose: the card is a scan target, and the drawer lists every value with its provenance.
-const CHIP_PREVIEW = 3
 
-function ChipRow({
-  label,
-  labels,
-  absent,
-  tone,
-}: {
-  label: string
-  labels: AttributedLabel[]
-  absent: string
-  tone?: string
-}) {
-  const shown = labels.slice(0, CHIP_PREVIEW)
-  const more = labels.length - shown.length
-  return (
-    <div className="sfc-chiprow">
-      <span className="sfc-chiprow-label">{label}</span>
-      {labels.length === 0 ? (
-        <Absent>{absent}</Absent>
-      ) : (
-        <>
-          {shown.map(l => <LabelChip key={l.id} label={l} tone={tone} />)}
-          {more > 0 && <span className="sfc-more">+{more} more</span>}
-        </>
-      )}
-    </div>
-  )
-}
 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -477,7 +455,7 @@ function entityWords(s: FeatureSuggestionV2): ReactNode {
       {s.entity === null
         ? <Absent>entity not named</Absent>
         : <span title={bounded(`id: ${s.entity.id}`)}>{s.entity.display_name}</span>}
-      {' per '}
+      {' · per '}
       {grain
         ? <span className="mono">{grain}</span>
         : <Absent>no governed grain column</Absent>}
@@ -485,13 +463,43 @@ function entityWords(s: FeatureSuggestionV2): ReactNode {
   )
 }
 
-function sourceRoleSummary(datasets: SuggestionSourceDataset[]): string | null {
-  const roles = datasets.map(d => d.data_role?.display_name).filter((r): r is string => !!r)
-  return roles.length > 0 ? roles.join(' + ') : null
+
+// A recipe may bind an `asof` operand without resolving the governed `time_ref`. Those are different
+// truths: the former explains the computation, while the latter is the time authority downstream
+// execution can rely on. Keep both visible instead of promoting a recipe slot into governance.
+function timeBindingWords(s: FeatureSuggestionV2): ReactNode {
+  if (s.time_ref) return <span className="mono">{columnOf(s.time_ref[1])}</span>
+  const recipeAsOf = s.operands.find(o => o.recipe_role === 'asof')
+  if (recipeAsOf) {
+    return (
+      <>
+        <span className="mono">{columnOf(recipeAsOf.graph_object_ref)}</span>{' '}
+        <Absent>recipe as-of role; governed time anchor unresolved</Absent>
+      </>
+    )
+  }
+  return <Absent>no time anchor</Absent>
 }
+
 
 // Exported for the asset-detail column dossier, which renders the SAME card for the suggestions
 // that use the opened column — one semantic and warning vocabulary for a suggestion everywhere.
+// The payload speaks in storage enums. "365d" and "non_additive" are not what a banker reads;
+// unknown values fall through verbatim rather than being swallowed.
+function windowWords(w: string): string {
+  const m = /^(\d+)d$/.exec(w)
+  return m ? `Trailing ${m[1]} days` : w
+}
+
+const ADDITIVITY_WORDS: Record<string, string> = {
+  additive: 'Additive', non_additive: 'Non-additive',
+  semi_additive: 'Semi-additive', 'n/a': 'Not summable · n/a',
+}
+
+function additivityWords(v: string): string {
+  return ADDITIVITY_WORDS[v] ?? v
+}
+
 export function SuggestionCard({
   hit,
   omitted,
@@ -504,113 +512,82 @@ export function SuggestionCard({
   const s = hit.suggestion
   const [open, setOpen] = useState(false)
   const detailId = useId()
+  // The column this card is anchored on, for the footer. First operand carrying an as-of role,
+  // else the first operand — the artifact's "USES BUSINESS_DT".
+  const usesColumn = (s.operands.find(o => o.recipe_role === 'asof') ?? s.operands[0])
+    ?.graph_object_ref.split('.').pop()
   const limitations = limitationsOf(s)
-  const roles = sourceRoleSummary(s.source_datasets)
   const Heading = headingLevel === 4 ? 'h4' : 'h3'
-  const tables = s.source_datasets.length
 
   return (
     <li className="row q-item sfc">
       <div className="sfc-head">
-        <Heading className="sfc-name mono">{s.display_name}</Heading>
+        <Heading className="sfc-name">{s.display_name}</Heading>
+      </div>
+
+      {/* Family and journey stage lead as pills: they say what KIND of feature this is before
+          any of its parameters. This REVERSES an earlier decision that kept the fine-grained
+          family off the compact card (SuggestedFeaturesScreen.test.tsx) — the reviewed concept
+          puts it here, and the family is what a reader scans candidates by. The detail still
+          carries it with its attribution. */}
+      <div className="sfc-taxonomy">
+        {s.recipe_family && <span className="sfc-tax">{s.recipe_family.display_name}</span>}
+        {s.recipe_stage && <span className="sfc-tax">{s.recipe_stage.value} stage</span>}
+      </div>
+
+      {/* Four boxed parameters a reader actually compares between candidates, two per row —
+          not six label/value rows stacked down the card. Sources and data roles drop to the
+          quiet line below, and everything absent stays in the detail disclosure. */}
+      {s.business_interpretation !== null && (
+        <p className="sfc-lead sfc-clamp">{s.business_interpretation.value}</p>
+      )}
+
+      <dl className="sfc-facts sfc-factgrid">
+        <Fact label="Entity & grain">{entityWords(s)}</Fact>
+        <Fact label="Time binding">{timeBindingWords(s)}</Fact>
+        <Fact label="Window">
+          {s.window ? windowWords(s.window) : <Absent>No rolling window</Absent>}
+        </Fact>
+        <Fact label="Aggregation">
+          {s.output_additivity === null
+            ? <Absent>not authored</Absent>
+            : additivityWords(s.output_additivity.value)}
+        </Fact>
+      </dl>
+
+      {/* Status AFTER the parameters: the reader sees what the feature IS before how far it
+          has been checked. */}
+      <div className="sfc-status">
         <span className={`badge ${STATUS_TONE[s.validation_status] ?? 'gj-none'}`}>
           {STATUS_WORDS[s.validation_status] ?? s.validation_status}
         </span>
-        <span
-          className="badge sfc-origin"
-          title="Generated by a governed recipe. It is a suggestion, not a registered feature."
-        >
-          suggested · {s.generation_source}
-        </span>
-        {limitations.length > 0 ? (
-          <span
-            className={`badge sfc-limcount${
-              limitations.some(l => l.kind === 'safety') ? ' sfc-limcount--safety' : ''}`}
-          >
-            {limitations.length} {limitations.length === 1 ? 'limitation' : 'limitations'}
-          </span>
-        ) : (
-          <span className="sfc-nolim">no limitations recorded</span>
-        )}
+        {s.binding_quality && <span className="gj-score">binding {s.binding_quality}</span>}
       </div>
-
-      {/* The one place the words could mislead. "Design checked" describes the INPUTS, and the
-          reader is told so where the badge is, because this card also renders on the column
-          dossier where the page-level note does not exist. */}
-      {s.validation_status === 'DESIGN_CHECKED' && (
-        <p className="sfc-limit-note">
-          Design checked means the inputs pass the catalog&apos;s design rules. Predictive
-          usefulness and production execution are not proven.
-        </p>
-      )}
-
-      <div className="sfc-tax">
-        <div className="sfc-chiprow">
-          <span className="sfc-chiprow-label">Category</span>
-          {s.feature_category === null ? (
-            <Absent>no category mapped yet</Absent>
-          ) : (
-            <LabelChip
-              label={s.feature_category}
-              tone="sfc-cat"
-              derived={s.feature_category_derived_from_family_mapping}
-            />
-          )}
-          <span className="sfc-more">
-            {DISPOSITION_WORDS[s.discovery_disposition] ?? s.discovery_disposition}
-          </span>
-        </div>
-        <ChipRow
-          label="Business domains" labels={s.business_domains}
-          absent="not supplied: no controlled domain vocabulary is registered here"
-        />
-        <ChipRow label="Use cases" labels={s.use_cases} absent="not supplied" />
-      </div>
-
-      <dl className="sfc-meaning">
-        <Fact label="What it measures">
-          {s.business_interpretation === null
-            ? <Absent>the recipe carries no interpretation</Absent>
-            : <span className="sfc-clamp">{s.business_interpretation.value}</span>}
-        </Fact>
-        <Fact label="Why it is useful">
-          {s.business_value === null
-            ? <Absent>no business value has been written for this recipe yet</Absent>
-            : <span className="sfc-clamp">{s.business_value.value}</span>}
-        </Fact>
-      </dl>
-
-      <dl className="sfc-facts">
-        <Fact label="Entity and grain">{entityWords(s)}</Fact>
-        <Fact label="Operation, window, time">
-          <span className="mono">{s.operation_kind}</span>
-          {' over '}
-          {s.window ? <span className="mono">{s.window}</span> : <Absent>no window</Absent>}
-          {' at '}
-          {s.time_ref
-            ? <span className="mono">{columnOf(s.time_ref[1])}</span>
-            : <Absent>no time anchor</Absent>}
-        </Fact>
-        <Fact label="Sources">
-          {tables} {tables === 1 ? 'table' : 'tables'}, {s.operands.length}{' '}
-          {s.operands.length === 1 ? 'column' : 'columns'}
-          {' · '}
-          {roles ?? <Absent>data roles not supplied: dataset profiles are unavailable</Absent>}
-        </Fact>
-      </dl>
 
       <p className="mono sfc-recipe">{s.recipe}</p>
 
+      {s.point_in_time_declaration !== null && (
+        <div className="sfc-safety-note">
+          <span className="sfc-clamp">{s.point_in_time_declaration.value}</span>
+        </div>
+      )}
+      {/* A caveat COUNT, not a defect list. This panel exists to hand a data scientist a
+          candidate worth pursuing; two amber blocks per card reading MISSING_CURRENCY made it
+          read as a validation report. The caveats still change whether the feature is
+          trustworthy, so they are never dropped — they move into Full detail and the card
+          carries one quiet chip saying how many there are. */}
       {limitations.length > 0 && (
-        <ul className="sfc-lims" aria-label="Requirements and limitations">
-          {limitations.map(item => <LimitationRow key={item.key} item={item} />)}
-        </ul>
+        <p className="sfc-caveats">
+          {limitations.length} {limitations.length === 1 ? 'caveat' : 'caveats'} to check before
+          {' '}using this — see full detail.
+        </p>
+      )}
+
+      {s.business_value === null && (
+        <p className="sfc-novalue">Business value has not been documented for this recipe.</p>
       )}
 
       <div className="sfc-foot">
-        {s.binding_quality && (
-          <span className="gj-score">binding {s.binding_quality}</span>
-        )}
         <button
           type="button"
           className="sfc-toggle"
@@ -624,8 +601,23 @@ export function SuggestionCard({
           aria-label={`${open ? 'Hide' : 'Show'} full detail for ${bounded(s.display_name, 80)}`}
           onClick={() => setOpen(v => !v)}
         >
-          {open ? 'Hide full detail' : 'Full detail'}
+          {open ? '▾ Full recommendation detail' : '▸ Full recommendation detail'}
         </button>
+      </div>
+
+      {/* The artifact ends every card deliberately: which column it uses on the left, the way
+          onward on the right. Ours trailed off after the toggle. */}
+      <div className="sfc-usesrow">
+        <span className="sfc-uses">
+          {usesColumn ? `Uses ${usesColumn}` : `${s.operands.length} input columns`}
+        </span>
+        {/* NOT a second control. The artifact's "OPEN RECOMMENDATION →" links to a separate
+            page; ours has the detail inline, so an action here would both duplicate the
+            disclosure and break this card's read-only guarantee (exactly one control, pinned
+            by two tests). The count is the ending instead. */}
+        <span className="sfc-open">
+          {s.operands.length} {s.operands.length === 1 ? 'input' : 'inputs'}
+        </span>
       </div>
 
       {open && (
@@ -847,6 +839,14 @@ function SuggestionDetail({
       <section className="sfc-sec">
         <Micro level={headingLevel}>Classification</Micro>
         <dl className="kv">
+          {/* How this candidate came to exist. It was a chip in the card head; moving the head to
+              the name alone would have dropped it from the UI entirely, which is a loss rather
+              than a relocation — a reader must always be able to learn that this is a suggestion
+              from a governed recipe, not a registered feature and not an LLM invention. */}
+          <div>
+            <dt>Generated by</dt>
+            <dd>suggested · {s.generation_source}</dd>
+          </div>
           <div>
             <dt>Feature category</dt>
             <dd>
@@ -1073,7 +1073,7 @@ function SuggestionDetail({
           <p className="hint">Nothing was raised against this suggestion.</p>
         ) : (
           <>
-            <ul className="sfc-lims">
+            <ul className="sfc-lims" aria-label="Requirements and limitations">
               {limitationsOf(s).map(item => <LimitationRow key={item.key} item={item} />)}
             </ul>
             <ul className="sfc-reqs">
