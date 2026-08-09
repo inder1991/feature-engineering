@@ -390,6 +390,13 @@ function SearchTermsCard({ detail }: { detail: AssetDetail }) {
   )
 }
 
+//: The axes whose VALUE is a literal a reader would copy or match on, and the only ones set in
+//: monospace. `concept` and `entity` are registry names (snake_case, exact); `unit` and `currency`
+//: are codes. Everything else on this list is a human-readable label — a domain, a sub-domain, a
+//: sensitivity, a party role — and setting a label like code says it is something to paste
+//: somewhere, which it is not.
+const MONO_AXES = new Set(['concept', 'entity', 'unit', 'currency'])
+
 function axisIsKnown(field: EffectiveMetadataField | undefined): boolean {
   return !!field && (field.value != null || field.proposed_value != null)
 }
@@ -408,7 +415,9 @@ function AxisRow({
       <span className="adg-field-label">{label}</span>
       {axisIsKnown(field) && field ? (
         <>
-          <span className="adg-field-value mono">{fieldValueText(field)}</span>
+          <span className={`adg-field-value${MONO_AXES.has(name) ? ' mono' : ''}`}>
+            {fieldValueText(field)}
+          </span>
           <AuthorityBadge field={field} />
         </>
       ) : (
@@ -538,7 +547,11 @@ function CapabilitiesCard({
       <ul className="rows adg-caps">
         {roles.map(role => (
           <li className="row adg-cap" key={role.role} data-testid={`cap-${role.role}`}>
-            <span className="adg-cap-role mono">{role.label}</span>
+            {/* Sans, not mono: "Measure" and "Grain key" are labels this interface chose, not
+                values the catalog holds. The inconsistency was visible on the page, where this
+                rendered monospace while `.adg-cov-label` beside it — same size, same weight, same
+                job — rendered sans. */}
+            <span className="adg-cap-role">{role.label}</span>
             <span className="adg-cap-copy">
               <small>{role.detail}</small>
             </span>

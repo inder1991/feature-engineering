@@ -680,3 +680,45 @@ it('the two DESIGN states are not painted the same colour', async () => {
   expect(none).not.toContain('--ok')        // …but never the success fill, on either
   expect(partial).not.toContain('--ok')
 })
+
+
+// ── typography: monospace means "a literal machine value", and nothing else ───────────────────────
+
+const axisField = (value: string) => ({
+  value, authority: 'hint', c1_status: 'proposed',
+  provenance: 'llm_proposed', evidence_provenance: null, selected_evidence_ids: [],
+})
+
+it('reserves monospace for the registry identifier and not for a business label', async () => {
+  // `customer_id` is a snake_case registry name a reader matches on: exact, copyable, machine
+  // facing. `Customer` is a domain label nobody pastes anywhere. Rendering both as code made the
+  // distinction invisible, which is the whole reason monospace exists on this page.
+  await renderDossier(detail(d => {
+    d.effective_metadata!.fields.concept = axisField('customer_id') as never
+    d.effective_metadata!.fields.domain = axisField('Customer') as never
+  }))
+  expect(within(screen.getByTestId('axis-concept')).getByText('customer_id')).toHaveClass('mono')
+  expect(within(screen.getByTestId('axis-domain')).getByText('Customer')).not.toHaveClass('mono')
+})
+
+it('sets the capability role labels as prose', async () => {
+  // "Measure", "Grain key" and friends are UI labels this interface chose, not values the catalog
+  // holds. The symptom was visible on the page: "Measure" rendered monospace while "Catalog
+  // ingestion", the same size and weight in the card beside it, rendered sans.
+  await renderDossier(detail())
+  const role = within(screen.getByTestId('capabilities')).getByText('Measure')
+  expect(role).not.toHaveClass('mono')
+})
+
+it('does not make EVERY field value monospace at the stylesheet level', () => {
+  // The root cause, and it is not reachable from the DOM: `.adg-field-value` set
+  // `font-family: var(--font-mono)` for every value, so an absence message ("nothing known yet")
+  // and an identifier (`customer_id`) were typographically identical no matter what classes the
+  // JSX applied. jsdom computes no stylesheet, so the stylesheet is the artifact under test.
+  const css = readFileSync('src/index.css', 'utf8')
+  const base = css.match(/\.adg-field-value \{[^}]*\}/)?.[0] ?? ''
+  expect(base).toBeTruthy()
+  expect(base).not.toContain('--font-mono')
+  // …and the opt-in still exists, so a genuine literal can ask for it.
+  expect(css).toMatch(/\.adg-field-value\.mono \{[^}]*--font-mono/)
+})

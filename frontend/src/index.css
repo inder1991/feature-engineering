@@ -4031,17 +4031,25 @@ button.stat:hover {
   border-bottom: 1px solid var(--line);
 }
 
+/* 16px, not 13. At 13 the card title was the same size as the field label, the field value AND
+   the body copy under it, so the heading-to-body ratio was 1.0 and hierarchy rested entirely on
+   700-vs-600 weight, which is not perceptible. 16/13 is 1.23, just over the 1.25 a scale needs to
+   read as deliberate; the weight drops to 600 because size is now carrying the contrast. */
 .adg-card-head h3 {
   margin: 0;
-  font-size: 13px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
+/* 12px, not 10. This line explains what the card means and it was the smallest text on the page,
+   at 77% of the body copy it introduces. */
 .adg-card-head p {
-  margin: 2px 0 0;
+  margin: 3px 0 0;
   max-width: 68ch;
-  color: var(--ink-faint);
-  font-size: 10px;
-  line-height: 1.4;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .adg-card-head .adg-count,
@@ -4096,10 +4104,12 @@ button.stat:hover {
   align-items: center;
 }
 
+/* One small-label step at 12/600. These were 11px/650, and 650 is not a shipped IBM Plex weight
+   so it snapped to a neighbour anyway — 600 and 650 were doing one job between them. */
 .adg-cap-role,
 .adg-cov-label {
-  font-size: 11px;
-  font-weight: 650;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .adg-cap-copy,
@@ -4335,9 +4345,17 @@ button.stat:hover {
 }
 
 .adg-kv dd.mono,
+/* MONOSPACE IS A SIGNAL, NOT A STYLE. This rule made EVERY field value monospace, so an absence
+   message ("nothing known yet"), a business label ("Customer") and a registry identifier
+   (`customer_id`) were typographically identical — and a reader could not tell a placeholder from
+   real data. Mono now means one thing: the string is exact and copyable, so it is opt-in per
+   value (`.mono`) rather than the default for the class. */
 .adg-field-value {
-  font-family: var(--font-mono);
   font-size: 13px;
+}
+
+.adg-field-value.mono {
+  font-family: var(--font-mono);
 }
 
 /* a compact read-only field row (overview summary / containment / audit): label, value, chips */
