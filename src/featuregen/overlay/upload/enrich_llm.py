@@ -1503,6 +1503,22 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # code-side as an exact permutation of the tied set; the schema cannot express that) plus a
     # bounded rationale. NO maxItems: the Anthropic structured-output API rejects it (HTTP 400) and
     # the permutation check is the real bound.
+    # Intake build (#2 spec): the mandatory-read ticket. `target_ref` must be ∈ the sent
+    # candidates or "" (validated code-side); `target_window_days` 0 ⟹ not stated (mapped to None
+    # code-side — the schema cannot express nullable cleanly across providers).
+    ("intake_ticket", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "target_ref": {"type": "string", "maxLength": 512},
+            "target_window_days": {"type": "integer", "minimum": 0},
+            "target_type": {"type": "string",
+                            "enum": ["binary_classification", "regression", "multiclass",
+                                     "abstain"]},
+            "business_domain": {"type": "array", "items": {"type": "string", "maxLength": 64}},
+            "confidence": {"type": "string", "enum": ["high", "medium", "abstain"]},
+        },
+        "required": ["target_ref", "target_window_days", "target_type", "business_domain",
+                     "confidence"]},
     ("overlay_tie_break", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {
