@@ -72,6 +72,10 @@ class AggregateFunctionV2(StrEnum):
     SLOPE = "slope"                  # OLS trend of operand over event time; units per day
     STREAK_PERIODS = "streak_periods"  # longest consecutive run of window-unit periods with a qualifying row
     ANY_MATCH = "any_match"          # boolean: any in-window row satisfies the filter
+    # increment 6 — concentration: operand is the GROUPING dimension, second_operand the
+    # optional weighting measure (absent = row-count shares)
+    HHI = "hhi"                      # sum of squared group shares; 1/n .. 1
+    TOP_SHARE = "top_share"          # the largest single group's share of the total; 0 .. 1
 
 
 class FinalOperationV2(StrEnum):
@@ -194,16 +198,16 @@ def _check_expression_v2(expr: AggregateExpressionV2, path: str,
         _require_column_ref(expr.operand, f"{path}.operand")
         _require_contained_column(expr.operand, f"{path}.operand",
                                   expr.source_relation.table_ref)
-    if rule.second_operand == "required":
-        if expr.second_operand is None:
+    if rule.second_operand == "required" and expr.second_operand is None:
+        raise SchemaError(
+            f"{path}.second_operand: {expr.aggregation.value} requires its second column")
+    if expr.second_operand is not None:
+        if rule.second_operand == "forbidden":
             raise SchemaError(
-                f"{path}.second_operand: {expr.aggregation.value} requires its second column")
+                f"{path}.second_operand: {expr.aggregation.value} takes no second column")
         _require_column_ref(expr.second_operand, f"{path}.second_operand")
         _require_contained_column(expr.second_operand, f"{path}.second_operand",
                                   expr.source_relation.table_ref)
-    elif expr.second_operand is not None:
-        raise SchemaError(
-            f"{path}.second_operand: {expr.aggregation.value} takes no second column")
     if expr.filter is not None:
         count = _check_filter_node(expr.filter, f"{path}.filter", 1,
                                    expr.source_relation.table_ref, params)

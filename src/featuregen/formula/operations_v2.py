@@ -36,7 +36,7 @@ class OperationRuleV1:
     additivity: AdditivityClass
     result_kind: str                  # RESULT_KINDS
     order_sensitive: bool             # needs the event clock to mean anything
-    second_operand: str = "forbidden"   # "forbidden" | "required" (row-level binary ops)
+    second_operand: str = "forbidden"   # "forbidden" | "required" | "optional"
 
 
 _R = OperationRuleV1
@@ -84,6 +84,13 @@ OPERATION_RULES: dict[AggregateFunctionV2, OperationRuleV1] = {rule.aggregation:
        "count", True),
     _R(AggregateFunctionV2.ANY_MATCH, False, "forbidden", AdditivityClass.NON_ADDITIVE,
        "flag", False),
+    # increment 6 — concentration. The operand is the GROUPING dimension (counterparty,
+    # merchant, MCC); second_operand is the optional weighting measure — absent means row-count
+    # shares, which is a DIFFERENT feature with a different identity, honestly so.
+    _R(AggregateFunctionV2.HHI, True, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "dimensionless", False, second_operand="optional"),
+    _R(AggregateFunctionV2.TOP_SHARE, True, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "dimensionless", False, second_operand="optional"),
 )}
 
 

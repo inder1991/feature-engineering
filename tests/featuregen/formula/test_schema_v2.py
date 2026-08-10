@@ -198,3 +198,25 @@ def test_the_trend_and_condition_group():
     smuggled["body"]["expr"]["operand"] = "authored::public.txns.txn_amt"
     with pytest.raises(SchemaError, match="carries no operand"):
         parse_proposal_v2(smuggled)
+
+
+def test_the_concentration_group_and_the_optional_second_operand():
+    """Increment 6: hhi / top_share — the operand is the GROUPING dimension, the second operand
+    the optional weighting measure. Count-based and amount-weighted variants are two identities,
+    honestly; and `optional` never weakens `forbidden` elsewhere (sum still refuses one)."""
+    from featuregen.formula.canonical_v2 import proposal_content_hash_v2
+
+    weighted = parse_proposal_v2(_ok_fixture("25_hhi_counterparty_amount_weighted.json"))
+    count_based = parse_proposal_v2(_ok_fixture("26_top_share_merchant_count_based.json"))
+    assert weighted.body.expr.second_operand is not None
+    assert count_based.body.expr.second_operand is None
+    # dropping the weighting measure is a DIFFERENT feature — a different hash
+    unweighted = _ok_fixture("25_hhi_counterparty_amount_weighted.json")
+    unweighted["body"]["expr"].pop("second_operand")
+    assert (proposal_content_hash_v2(parse_proposal_v2(unweighted))
+            != proposal_content_hash_v2(weighted))
+    # `optional` is scoped to the concentration ops — sum still refuses a second column
+    smuggled = _ok_fixture("04_sum_txn_amt_90d_v2.json")
+    smuggled["body"]["expr"]["second_operand"] = "authored::public.txns.txn_dt"
+    with pytest.raises(SchemaError, match="takes no second column"):
+        parse_proposal_v2(smuggled)
