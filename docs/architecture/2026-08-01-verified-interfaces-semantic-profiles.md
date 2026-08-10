@@ -207,7 +207,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 
 | 1059 | Intake build increment 2 (router-quality plan 2026-08-10) — `contract_intent` target-reading extension (`1059_contract_intent_target_reading.sql`), CONSUMED. The storage decision executed: the model's ticket draft lives in `structured_result` (increment 1, no DDL); the HUMAN confirmation extends `contract_intent` with `target_window_days`/`target_type`/`business_domain` + provenance (`target_provenance` ∈ human_confirmed / user_typed / exploring, `target_confirmed_by/_at`). All additive-NULL; legacy client-supplied target_ref writes are untouched (provenance NULL). |
 
-New needs append 1060+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
+| 1060 | Banking-recipe plan BR-23 schema half, pulled into R1 per its re-baseline amendment (2026-08-10) — append-only `recipe_review_event` (`1060_recipe_review_event.sql`), CONSUMED. Revision-specific SME review evidence keyed on the canonical-recipe-v2 hash, 1034-idiom append-only guards, `supersedes_event_id` audit chain; "current" is a read projection, never a column. The validity fold and decision APIs remain BR-23 proper. |
+
+New needs append 1061+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
 
 ## D8. Flag matrix
 

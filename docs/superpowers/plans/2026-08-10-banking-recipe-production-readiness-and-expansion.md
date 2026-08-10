@@ -1851,7 +1851,7 @@ No pack is added merely to turn a zero-coverage leaf green. Each proposed recipe
 
 **Purpose:** Make recipe ownership and review visible, repeatable and revision-specific.
 
-**Sequencing amendment (re-baseline):** the review-event SCHEMA — RecipeReviewV1, the append-only `recipe_review_event` store, and its migration (drawn from the pool at 1060+, D7 row appended in the same commit) — lands in R1 alongside BR-2, so the family migrations (BR-11–BR-16) have somewhere durable to record the SME decisions they produce as they produce them, instead of re-reviewing migrated families here. This task keeps the validity fold, the decision APIs, the invalidation wiring and the batch reports.
+**Sequencing amendment (re-baseline): SCHEMA HALF DONE 2026-08-10** — RecipeReviewV1 (shipped with BR-2), the append-only `recipe_review_event` store (`recipe_review.py`: record/read/current-projection; supersedes chain validated same-recipe-only) and migration 1060 (D7 row appended in the same commit; 1034-idiom append-only guards — UPDATE/DELETE/TRUNCATE are database errors). Approval is revision-specific by LOOKUP MISS: `current_review` keys on the canonical-recipe-v2 hash, so an edited definition finds no approval with no flag to forget. Landed in R1 alongside BR-2, so the family migrations (BR-11–BR-16) have somewhere durable to record the SME decisions they produce as they produce them, instead of re-reviewing migrated families here. This task keeps the validity fold, the decision APIs, the invalidation wiring and the batch reports.
 
 **Files:**
 
