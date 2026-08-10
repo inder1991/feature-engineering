@@ -271,6 +271,44 @@ looked up again. Invalidation policy: none, by construction. This is the
    `tied_candidate_set_hash` already recorded there, so a sealed plan replays to the identical
    binding from the identical stored verdict.
 
+### The design rule, and the owner discussion that settled it (2026-08-10)
+
+The owner probed this design from every side — recompute after every upload? a refresh button on
+the UI? save the filled recipes the warming pass already computes? Each variant resolves under ONE
+rule, recorded here because it settles every future version of the same question:
+
+**Cache a result only when CHECKING the cached copy is much cheaper than REMAKING it.**
+
+* The tie-break judgements: remaking = an LLM call; checking = a fingerprint comparison. Millions of
+  times cheaper → **store them.**
+* The grounding (which recipes have their columns): remaking = an in-memory glance; checking a
+  saved copy = the same glance, because trusting it requires verifying no column changed since. The
+  check costs what the work costs → **storing buys zero**, and the only way a saved copy ever
+  "pays" is by skipping the check — which is how it becomes Saturday's bug (a stored summary,
+  silently wrong after a write path that forgot to refresh it). The warming pass therefore fills
+  recipes transiently to FIND the ties, then discards the filling on purpose.
+* Refresh-after-every-upload is insufficient by timeline, not by principle: these catalogs go days
+  to weeks between uploads (`ftr`: Jul 31 → Aug 9) while six write paths edit grounding inputs from
+  the UI in between. A copy refreshed only by uploads lies for the whole gap.
+* A correctness-bearing refresh button converts the computer's free glance into a HUMAN job split
+  across two people who cannot see each other (the curator who corrected a label, the data
+  scientist who asks the next hypothesis). "Press refresh just in case before every use" IS the
+  per-request check, performed by the forgetful party.
+
+**Adopted from the discussion — the button aimed at the right layer:** a curator-facing
+**"Re-adjudicate recipes now"** action on the UI. After a batch of field corrections it re-runs the
+warming pass immediately instead of waiting for lazy re-adjudication by the worker. Strictly an
+optimisation: press it and the next request gets fresh judgements instantly; forget it and nothing
+is ever wrong — one deterministic-fallback binding, then the worker catches up. A button the system
+stays correct WITHOUT is the only kind this platform ships.
+
+**The stopwatch guard:** the whole design leans on one measured fact — the glance is ~free at 237
+columns. Step-0 instrumentation therefore records grounding time per request. If a future catalog
+makes the glance genuinely expensive, that arrives as a NUMBER and the design is revisited with
+evidence — the same metric-triggered posture as the intake search-loop upgrade. No
+conviction-driven rebuilds in either direction; every unmeasured conviction this week measured
+wrong.
+
 ## Task 3 — the near-label leakage control was specified and never built
 
 23 templates carry `near_label=True`. `dormancy_days` says:
