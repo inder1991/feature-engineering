@@ -190,6 +190,9 @@ _STRUCTURAL_META_KEYS = frozenset({
     # contract_intent (migration 1059), human-confirmed at intake; never text. The candidate card
     # rides the `candidates` class above; the hypothesis rides `objective` (already redacted).
     "label_window_days",
+    # Task 4b param choice: the registry's own authored parameter tuples per template — repo text,
+    # closed vocabulary by construction; the hypothesis rides `objective` (already redacted).
+    "parameter_menu",
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
@@ -1523,6 +1526,24 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         },
         "required": ["target_ref", "target_window_days", "target_type", "business_domain",
                      "confidence"]},
+    # Task 4b — hypothesis-chosen recipe parameters. A flat triple list (template_id, param,
+    # value-as-string): nested per-template objects would need open additionalProperties, which
+    # this seam forbids. Every triple is re-validated code-side against the AUTHORED tuples — an
+    # off-menu answer is dropped, and an omitted param means the safe default. NO maxItems (the
+    # Anthropic structured-output API rejects it); the menu size is the real bound.
+    ("param_choice", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "choices": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "template_id": {"type": "string", "maxLength": 128},
+                    "param": {"type": "string", "maxLength": 64},
+                    "value": {"type": "string", "maxLength": 64},
+                },
+                "required": ["template_id", "param", "value"]}},
+        },
+        "required": ["choices"]},
     # Task 3 — the near-label critic's closed verdict vocabulary. Deliberately NO token that reads
     # as "cleared" (no_finding ≠ clearance); the enum is re-validated code-side and an off-enum
     # answer degrades to abstain.

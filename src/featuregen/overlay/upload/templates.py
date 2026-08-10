@@ -33,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import product
@@ -694,7 +694,8 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
                         roles: Iterable[str] = (),
                         use_case: str | None = None,
                         table: str | None = None,
-                        also_tables: Iterable[str] = ()) -> list[GroundingOutcome]:
+                        also_tables: Iterable[str] = (),
+                        params_by_id: Mapping[str, dict] | None = None) -> list[GroundingOutcome]:
     """Ground ``templates`` against ``catalog_source``, one outcome per template.
 
     ``table`` narrows the candidate columns to that one table. It is a pure NARROWING applied AFTER
@@ -715,6 +716,12 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
     the columns ``_load_columns`` already cleared — so it cannot widen a read scope. It is IGNORED
     when ``table is None``: there is no anchor to widen FROM, and the catalog-wide pass is already
     every table.
+
+    ``params_by_id`` (Task 4b) carries hypothesis-chosen parameter OVERRIDES per template id —
+    validated upstream against the authored tuples and re-guarded by :func:`_bind_params` here
+    regardless (an off-menu value raises, never silently grounds). Absent id = the historical
+    first-allowed-value default; ``None`` (the default) is byte-identical to today for every
+    template.
     """
     # The read-scoped column list is IDENTICAL for every template in this pass, so load it ONCE and
     # hand it down — grounding the whole registry re-read the entire catalog per template (157 full
@@ -733,6 +740,7 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
             template,
             catalog_source=catalog_source,
             roles=roles,
+            params=(params_by_id or {}).get(template.id),
             columns=cols,
         ))
     return outcomes

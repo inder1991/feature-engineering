@@ -2450,3 +2450,13 @@ describe('near-label verdict chip', () => {
     expect(screen.queryByText(/Near-label check/)).toBeNull()
   })
 })
+
+// ------------------------------------------- Task 4b: untaken parameterisations on the card ----
+describe('parameter alternatives line', () => {
+  it('renders the untaken parameterisations when the server sends them', async () => {
+    await renderAndGenerate([{ ...IDEA, param_alternatives: 'window: 30/[90]/180' }, OTHER_IDEA])
+    expect(await screen.findByText('Also available — window: 30/[90]/180')).toBeInTheDocument()
+    // absent field (flag off / nothing to choose) renders nothing
+    expect(screen.getAllByText(/Also available/)).toHaveLength(1)
+  })
+})

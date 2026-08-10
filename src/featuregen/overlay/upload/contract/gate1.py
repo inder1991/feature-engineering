@@ -30,6 +30,7 @@ from featuregen.overlay.upload.contract.near_label_critic import (
     annotate_near_label,
     near_label_critic_enabled,
 )
+from featuregen.overlay.upload.contract.param_choice import choose_params
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.enrich_batch import CallLedger
 from featuregen.overlay.upload.feature_assist import (
@@ -197,6 +198,25 @@ _MAX_RATIONALE = 200
 _NEAR_LABEL_MAX_CALLS = 24
 
 
+def _param_choice_enabled() -> bool:
+    """Task 4b — hypothesis-chosen recipe parameters. Default OFF: no dispatch, no override,
+    byte-identical grounding. Unlike the free ordering shadow (Task 4), a shadow here would COST a
+    model call per fresh hypothesis, so flag-off means fully off."""
+    return os.environ.get("FEATUREGEN_PARAM_CHOICE", "0") == "1"
+
+
+def _param_alternatives_line(template: Template, bound: dict) -> str:
+    """The card's "also available" line (Task 4b emission policy): each multi-value param with its
+    chosen value marked. "" for a recipe with nothing to choose — the field stays absent."""
+    parts = []
+    for key, allowed in sorted(template.params.items()):
+        if len(allowed) <= 1:
+            continue
+        rendered = "/".join(f"[{v}]" if v == bound.get(key) else str(v) for v in allowed)
+        parts.append(f"{key}: {rendered}")
+    return "; ".join(parts)
+
+
 def _operand_roles(gf: GroundedFeature) -> tuple[tuple[str, str], ...]:
     """The (object_ref, role) pairs the TEMPLATE declared for this candidate's bound operands.
 
@@ -271,6 +291,7 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
                          fresh_within: timedelta = timedelta(hours=24),
                          table: str | None = None,
                          also_tables: Sequence[str] = (),
+                         params_by_id: dict | None = None,
                          ) -> TemplateCandidatesResult:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
@@ -307,6 +328,10 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         narrowing["table"] = table
         if also_tables:
             narrowing["also_tables"] = tuple(also_tables)
+    # Task 4b: hypothesis-chosen parameter overrides, passed ONLY when present for the same
+    # seam-stability reason — the flag-off / abstain call stays argument-for-argument identical.
+    if params_by_id:
+        narrowing["params_by_id"] = params_by_id
     outcomes = _ground_template_outcomes(
         conn, templates, catalog_source=catalog_source, roles=roles, **narrowing)
     grounded = [
@@ -364,9 +389,15 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
             # requirements are untouched.
             # `replace` preserves `grounding_trace` by construction, so the server stamp cannot
             # drop the trace the validator just minted.
+            # Task 4b: the "also available" line rides ONLY under the flag — it feeds _idea_json's
+            # only-when-present emission, so populating it unconditionally would silently change
+            # flag-off snapshot bytes and option identities.
+            alternatives_line = (_param_alternatives_line(by_id[gf.template_id], gf.params)
+                                 if _param_choice_enabled() else "")
             ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
                                  planner_applicability="not_applicable_single_catalog",
-                                 operand_roles=idea.operand_roles))
+                                 operand_roles=idea.operand_roles,
+                                 param_alternatives=alternatives_line))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
             contexts[context.recipe_candidate_key] = context
@@ -772,9 +803,20 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
+        to_ground = _templates_to_ground(intent, applicability)
+        # Task 4b: hypothesis-chosen parameters — a closed selection from the authored tuples,
+        # dispatched ONCE per build for the cache misses only, applied at grounding (BEFORE the
+        # gauntlet and the near-label critic — the walkthrough ordering fix). Flag off / abstain /
+        # no client = empty overrides = the historical first-allowed-value defaults, byte-identical.
+        param_overrides: dict[str, dict] = {}
+        if _param_choice_enabled() and client is not None:
+            param_overrides = choose_params(
+                conn, client, templates=to_ground,
+                redacted_hypothesis=intent.redacted_hypothesis,
+                call_ledger=CallLedger(max_provider_calls=1))
         candidates = _template_candidates(
             conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
-            templates=_templates_to_ground(intent, applicability))
+            templates=to_ground, params_by_id=param_overrides or None)
         grounded_template_ids = candidates.grounded_ids
         rejected_template_ids = candidates.rejected_ids
         binding_quality_by_template = candidates.binding_by_id
@@ -969,6 +1011,10 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f.near_label_verdict is not None:
         d["near_label_verdict"] = f.near_label_verdict
         d["near_label_rationale"] = f.near_label_rationale
+    # Task 4b: only-when-present (populated only under FEATUREGEN_PARAM_CHOICE, so flag-off
+    # snapshots keep their historical bytes).
+    if f.param_alternatives:
+        d["param_alternatives"] = f.param_alternatives
     return d
 
 
@@ -1209,7 +1255,8 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         physical_plan_id=d.get("physical_plan_id"),
         planner_declaration_id=d.get("planner_declaration_id"),
         near_label_verdict=d.get("near_label_verdict"),
-        near_label_rationale=d.get("near_label_rationale", ""))
+        near_label_rationale=d.get("near_label_rationale", ""),
+        param_alternatives=d.get("param_alternatives", ""))
 
 
 def _chosen_feature_from_snapshot(

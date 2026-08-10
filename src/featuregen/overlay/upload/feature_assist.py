@@ -1723,6 +1723,11 @@ class FeatureIdea:
     #    a candidate; they annotate the card and the considered set.
     near_label_verdict: str | None = None
     near_label_rationale: str = ""
+    # ── Task 4b: the recipe's UNTAKEN parameterisations, named on the card per the emission
+    #    policy ("also available: 30/180-day windows") — one bounded human-readable line, "" when
+    #    the recipe has no multi-value params. PRESENTATION ONLY: identity rides the bound params
+    #    (name + semantic_parameter_binding_hash), never this string.
+    param_alternatives: str = ""
     # ── Task 2A: the DECISION TRACE this candidate's validation produced (freeze 0F-7 P1) ──
     #    Defaulted last and never serialized: it is TRANSIENT CARRY from the gauntlet to the
     #    projection built in the same call. A persisted-and-reloaded idea has None here, which is

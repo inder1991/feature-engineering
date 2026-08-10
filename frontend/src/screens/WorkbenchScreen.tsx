@@ -2483,6 +2483,13 @@ export function WorkbenchScreen() {
                         Near-label check: {c.idea.near_label_rationale}
                       </p>
                     )}
+                    {/* Task 4b emission policy: the untaken parameterisations, named on the
+                        card — chosen value in brackets. Server populates only under its flag. */}
+                    {c.kind === 'generated' && c.idea.param_alternatives && (
+                      <p style={{ color: 'var(--ink-soft)' }}>
+                        Also available — {c.idea.param_alternatives}
+                      </p>
+                    )}
                     <dl className="kv">
                       <div>
                         <dt>derives from</dt>

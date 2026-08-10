@@ -322,6 +322,9 @@ export interface FeatureIdea {
   // critic cannot clear anything. Only `too_close` renders a warning; nothing is ever removed.
   near_label_verdict?: 'no_finding' | 'too_close' | 'abstain' | null
   near_label_rationale?: string
+  // Task 4b (flag-gated server-side): the recipe's untaken parameterisations, chosen value
+  // marked — "window: 30/[90]/180". Presentation only; absent when there is nothing to choose.
+  param_alternatives?: string
 }
 
 // One gauntlet rejection, shown to the human, never hidden. `code` carries the backend's
