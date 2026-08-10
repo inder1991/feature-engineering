@@ -263,3 +263,30 @@ def test_the_br18_exemplar_is_fully_expressible_and_authorities_are_identity():
     vacuous = json.loads((_GOLD_V2 / "32_vacuous_authority_block_invalid.json").read_text())
     with pytest.raises(SchemaError, match="omit the block instead"):
         parse_proposal_v2(vacuous["proposal"])
+
+
+def test_effective_dated_lookup_and_the_signed_sum_close_the_operation_groups():
+    """Increment 9: effective_at_cutoff (valid_from is the window clock, valid_to the second
+    operand — without it, state never ends and the lookup refuses) and the multi-expression
+    MINIMUM: a signed sum of ≥2 uniquely-named ±1 terms — DSO + DIO − DPO — with weights
+    deliberately not a thing."""
+    eff = parse_proposal_v2(_ok_fixture("33_effective_rate_at_cutoff.json"))
+    assert eff.body.expr.second_operand == "authored::public.rates.valid_to"
+    cycle = parse_proposal_v2(_ok_fixture("34_working_capital_cycle_signed_sum.json"))
+    assert [t.sign for t in cycle.body.terms] == [1, 1, -1]
+    assert [t.name for t in cycle.body.terms] == ["dso", "dio", "dpo"]
+
+    single = json.loads((_GOLD_V2 / "35_single_term_signed_sum_invalid.json").read_text())
+    with pytest.raises(SchemaError):
+        parse_proposal_v2(single["proposal"])
+    bare = json.loads((_GOLD_V2 / "36_effective_without_valid_to_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="requires its second column"):
+        parse_proposal_v2(bare["proposal"])
+    weighted = _ok_fixture("34_working_capital_cycle_signed_sum.json")
+    weighted["body"]["terms"][0]["sign"] = 2
+    with pytest.raises(SchemaError):
+        parse_proposal_v2(weighted)
+    dup = _ok_fixture("34_working_capital_cycle_signed_sum.json")
+    dup["body"]["terms"][1]["name"] = "dso"
+    with pytest.raises(SchemaError, match="unique"):
+        parse_proposal_v2(dup)

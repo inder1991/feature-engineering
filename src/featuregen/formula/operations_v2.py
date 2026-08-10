@@ -91,6 +91,10 @@ OPERATION_RULES: dict[AggregateFunctionV2, OperationRuleV1] = {rule.aggregation:
        "dimensionless", False, second_operand="optional"),
     _R(AggregateFunctionV2.TOP_SHARE, True, "forbidden", AdditivityClass.NON_ADDITIVE,
        "dimensionless", False, second_operand="optional"),
+    # increment 9 — effective-dated state: the row whose [valid_from, valid_to) contains the
+    # cutoff, latest valid_from winning. State semantics, exactly like last_known.
+    _R(AggregateFunctionV2.EFFECTIVE_AT_CUTOFF, True, "forbidden",
+       AdditivityClass.SEMI_ADDITIVE, "operand_valued", True, second_operand="required"),
 )}
 
 

@@ -75,12 +75,16 @@ class AggregateFunctionV2(StrEnum):
     # optional weighting measure (absent = row-count shares)
     HHI = "hhi"                      # sum of squared group shares; 1/n .. 1
     TOP_SHARE = "top_share"          # the largest single group's share of the total; 0 .. 1
+    # increment 9 — effective-dated state: operand = the value column, second_operand = the
+    # valid_to column, window.event_time_ref = the valid_from column (its lookback bound)
+    EFFECTIVE_AT_CUTOFF = "effective_at_cutoff"   # the row valid at the cutoff; latest valid_from wins
 
 
 class FinalOperationV2(StrEnum):
     IDENTITY = "identity"
     RATIO = "ratio"
     DIFFERENCE = "difference"
+    SIGNED_SUM = "signed_sum"     # increment 9 — the ONLY multi-expression combiner (see below)
 
 
 # The offset cap: a year of monthly look-backs. An offset this large is a modelling smell worth a
@@ -193,7 +197,28 @@ class DiffBodyV2:
     final_operation: FinalOperationV2 = field(default=FinalOperationV2.DIFFERENCE, init=False)
 
 
-FormulaBodyV2 = UnaryBodyV2 | RatioBodyV2 | DiffBodyV2
+@dataclass(frozen=True, slots=True)
+class SignedTermV2:
+    """One named term of a signed sum: +1 or −1 times its expression's value."""
+
+    name: str
+    sign: int                       # +1 | -1
+    expr: AggregateExpressionV2
+
+
+@dataclass(frozen=True, slots=True)
+class CompositeBodyV2:
+    """Increment 9's multi-expression body — deliberately the MINIMUM: a SIGNED SUM of named
+    terms (DSO + DIO − DPO; inflow − outflow − fees). The plan's own risk table warns against
+    Formula-v2 becoming an unbounded DSL; a closed ±1 combiner covers the cycle/net/spread
+    shapes the banking library actually names, and anything richer stays honestly
+    unsupported until a reviewed increment adds it."""
+
+    terms: tuple[SignedTermV2, ...]
+    final_operation: FinalOperationV2 = field(default=FinalOperationV2.SIGNED_SUM, init=False)
+
+
+FormulaBodyV2 = UnaryBodyV2 | RatioBodyV2 | DiffBodyV2 | CompositeBodyV2
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,6 +299,8 @@ def body_expressions_v2(body: FormulaBodyV2) -> tuple[AggregateExpressionV2, ...
         return (body.numerator, body.denominator)
     if isinstance(body, DiffBodyV2):
         return (body.minuend, body.subtrahend)
+    if isinstance(body, CompositeBodyV2):
+        return tuple(term.expr for term in body.terms)
     raise SchemaError(f"unknown v2 body shape: {type(body).__name__}")
 
 
@@ -289,6 +316,15 @@ def validate_semantics_v2(p: TypedFormulaProposalV2) -> None:
         raise SchemaError("canonicalization_version: not the v2 canonicalization")
     for key in p.grain.keys:
         _require_column_ref(key, "grain.keys")
+    if isinstance(p.body, CompositeBodyV2):
+        if len(p.body.terms) < 2:
+            raise SchemaError("a signed sum needs at least two terms — one term is identity")
+        names = [term.name for term in p.body.terms]
+        if len(names) != len(set(names)) or not all(n.strip() for n in names):
+            raise SchemaError("signed-sum terms need unique, non-blank names")
+        if not all(term.sign in (1, -1) for term in p.body.terms):
+            raise SchemaError("a signed-sum term's sign is +1 or -1 — weights are not a thing "
+                              "this combiner does")
     params = {decl.name: decl for decl in p.parameters}
     for index, expr in enumerate(body_expressions_v2(p.body)):
         _check_expression_v2(expr, f"body.expr[{index}]", params)

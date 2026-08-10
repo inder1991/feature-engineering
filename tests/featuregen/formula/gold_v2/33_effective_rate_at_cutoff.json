@@ -1,0 +1,50 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"expr\":{\"aggregation\":\"effective_at_cutoff\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.rates.rate_value\",\"second_operand\":\"authored::public.rates.valid_to\",\"source_relation\":{\"table_ref\":\"authored::public.rates\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.rates.valid_from\",\"length\":365,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"obligor\",\"keys\":[\"authored::public.rates.product_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "effective_rate_at_cutoff",
+  "expected": "ok",
+  "expected_proposal_hash": "2720bc7b47e311c22f4ec770cfb7ec507f8209a7ff4654f7376d4e58ebe1ef7e",
+  "note": "effective-dated state: the row whose [valid_from, valid_to) contains the cutoff, latest valid_from winning \u2014 the product-rate / segment / classification shape; valid_from is the window's event clock (its lookback bound), valid_to the second operand; SEMI-additive state, like last_known",
+  "operation": "effective_at_cutoff",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "effective_at_cutoff",
+        "filter": null,
+        "operand": "authored::public.rates.rate_value",
+        "second_operand": "authored::public.rates.valid_to",
+        "source_relation": {
+          "table_ref": "authored::public.rates"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.rates.valid_from",
+          "length": 365,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "obligor",
+      "keys": [
+        "authored::public.rates.product_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

@@ -106,7 +106,14 @@ def _build_authority_refs(data: dict[str, Any] | None):
 
 
 def _build_body_v2(data: dict[str, Any]) -> FormulaBodyV2:
+    from featuregen.formula.schema_v2 import CompositeBodyV2, SignedTermV2
+
     final_operation = FinalOperationV2(data["final_operation"])
+    if final_operation is FinalOperationV2.SIGNED_SUM:
+        return CompositeBodyV2(terms=tuple(
+            SignedTermV2(name=term["name"], sign=term["sign"],
+                         expr=_build_expression_v2(term["expr"]))
+            for term in data["terms"]))
     if final_operation is FinalOperationV2.IDENTITY:
         return UnaryBodyV2(expr=_build_expression_v2(data["expr"]))
     if final_operation is FinalOperationV2.RATIO:

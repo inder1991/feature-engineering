@@ -1,0 +1,55 @@
+{
+  "canonical_json": null,
+  "case_id": "single_term_signed_sum",
+  "expected": "schema_error",
+  "expected_proposal_hash": null,
+  "note": "a signed sum of one term is identity wearing a composite's name \u2014 refused",
+  "operation": "signed_sum",
+  "proposal": {
+    "body": {
+      "final_operation": "signed_sum",
+      "terms": [
+        {
+          "expr": {
+            "aggregation": "sum",
+            "filter": null,
+            "operand": "authored::public.wc.amt",
+            "source_relation": {
+              "table_ref": "authored::public.wc"
+            },
+            "window": {
+              "basis": "trailing",
+              "empty_window": "null",
+              "end_inclusive": "exclusive",
+              "event_time_ref": "authored::public.wc.event_dt",
+              "length": 365,
+              "null_input": "ignore",
+              "start_inclusive": "inclusive",
+              "timezone": "Asia/Dubai",
+              "unit": "day"
+            }
+          },
+          "name": "only",
+          "sign": 1
+        }
+      ]
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "obligor",
+      "keys": [
+        "authored::public.wc.obligor_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

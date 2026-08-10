@@ -168,7 +168,7 @@
       "type": "object",
       "properties": {
         "aggregation": {
-          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore", "date_diff_avg", "slope", "streak_periods", "any_match", "hhi", "top_share"]
+          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore", "date_diff_avg", "slope", "streak_periods", "any_match", "hhi", "top_share", "effective_at_cutoff"]
         },
         "aggregation_argument": {
           "anyOf": [{"type": "number"}, {"type": "null"}]
@@ -205,8 +205,31 @@
       "oneOf": [
         {"$ref": "#/$defs/unaryBody"},
         {"$ref": "#/$defs/ratioBody"},
-        {"$ref": "#/$defs/diffBody"}
+        {"$ref": "#/$defs/diffBody"},
+        {"$ref": "#/$defs/compositeBody"}
       ]
+    },
+    "compositeBody": {
+      "type": "object",
+      "properties": {
+        "final_operation": {"const": "signed_sum"},
+        "terms": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "sign": {"enum": [1, -1]},
+              "expr": {"$ref": "#/$defs/aggregateExpression"}
+            },
+            "required": ["name", "sign", "expr"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["final_operation", "terms"],
+      "additionalProperties": false
     },
     "unaryBody": {
       "type": "object",

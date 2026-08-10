@@ -1,0 +1,49 @@
+{
+  "canonical_json": null,
+  "case_id": "effective_without_valid_to",
+  "expected": "schema_error",
+  "expected_proposal_hash": null,
+  "note": "an effective-dated lookup without its valid_to column cannot know when state ends",
+  "operation": "effective_at_cutoff",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "effective_at_cutoff",
+        "filter": null,
+        "operand": "authored::public.rates.rate_value",
+        "source_relation": {
+          "table_ref": "authored::public.rates"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.rates.valid_from",
+          "length": 365,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "obligor",
+      "keys": [
+        "authored::public.rates.product_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}
