@@ -64,6 +64,7 @@ def _build_expression_v2(data: dict[str, Any]) -> AggregateExpressionV2:
         source_relation=SourceRelation(table_ref=data["source_relation"]["table_ref"]),
         filter=_build_filter(filter_data) if filter_data is not None else None,
         window=_build_window(data["window"]),
+        aggregation_argument=data.get("aggregation_argument"),
     )
 
 

@@ -45,8 +45,13 @@ def test_an_engine_advertises_and_the_verdict_distinguishes_engine_from_grammar(
                                           "count_distinct", "min", "max", "avg"}))
     avg = _proposal("01_avg_txn_amt_90d.json")
     total = _proposal("04_sum_txn_amt_90d_v2.json")
+    p95 = _proposal("09_percentile_p95_txn_amt_90d.json")
     assert classify_formula_capability_v2(avg, engine=v1_only_engine) == "unsupported_engine"
     assert classify_formula_capability_v2(avg, engine=full_engine) == "ok"
     assert classify_formula_capability_v2(total, engine=v1_only_engine) == "ok"
-    # authoring-time (no engine) never claims materializability — avg is grammar-ok regardless
+    # the distributional group is likewise per-engine — a full-vocabulary engine advertises it
+    assert classify_formula_capability_v2(p95, engine=full_engine) == "unsupported_engine", \
+        "this engine never advertised percentile — advertisement is explicit, never assumed"
+    # authoring-time (no engine) never claims materializability — grammar-ok regardless
     assert classify_formula_capability_v2(avg) == "ok"
+    assert classify_formula_capability_v2(p95) == "ok"

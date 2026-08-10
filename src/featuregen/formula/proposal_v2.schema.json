@@ -166,7 +166,10 @@
       "type": "object",
       "properties": {
         "aggregation": {
-          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg"]
+          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median"]
+        },
+        "aggregation_argument": {
+          "anyOf": [{"type": "number"}, {"type": "null"}]
         },
         "operand": {
           "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]

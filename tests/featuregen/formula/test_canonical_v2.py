@@ -22,7 +22,7 @@ def _ok_docs() -> list[dict]:
 
 def test_every_ok_fixture_pins_canonical_bytes_and_their_hash():
     docs = _ok_docs()
-    assert len(docs) == 4
+    assert len(docs) == 8
     for doc in docs:
         proposal = parse_proposal_v2(doc["proposal"])
         assert canonical_json_v2(proposal) == doc["canonical_json"], doc["case_id"]
@@ -35,7 +35,7 @@ def test_every_ok_fixture_pins_canonical_bytes_and_their_hash():
 def test_each_operation_is_its_own_identity():
     hashes = {doc["case_id"]: doc["expected_proposal_hash"] for doc in _ok_docs()}
     assert len(set(hashes.values())) == len(hashes), \
-        "avg / max / min / sum over the same operands are four identities"
+        "every operation (and every argument) over the same operands is its own identity"
 
 
 def test_the_projection_is_field_exhaustive():

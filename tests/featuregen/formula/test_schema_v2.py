@@ -93,3 +93,25 @@ def test_the_dispatch_reads_the_declared_version_and_nothing_else():
         parse_versioned(unversioned)
     with pytest.raises(SchemaError, match="never inferred"):
         parse_versioned({**v1_doc, "formula_schema_version": 3})
+
+
+def test_the_distributional_group_parses_and_the_argument_is_disciplined():
+    """Increment 2: recency / stddev / percentile / median. The aggregate argument is REQUIRED
+    for percentile (p strictly inside (0,100)), FORBIDDEN everywhere else — a parameterized
+    aggregate is declared, never smuggled into a label."""
+    for name in ("07_recency_last_txn_90d.json", "08_stddev_txn_amt_90d.json",
+                 "09_percentile_p95_txn_amt_90d.json", "10_median_txn_amt_90d.json"):
+        parse_proposal_v2(_ok_fixture(name))
+    p95 = parse_proposal_v2(_ok_fixture("09_percentile_p95_txn_amt_90d.json"))
+    assert p95.body.expr.aggregation_argument == 95
+
+    bare = json.loads((_GOLD_V2 / "11_percentile_without_argument_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="strictly between 0 and 100"):
+        parse_proposal_v2(bare["proposal"])
+    smuggled = json.loads((_GOLD_V2 / "12_argument_on_sum_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="takes no argument"):
+        parse_proposal_v2(smuggled["proposal"])
+    edge = _ok_fixture("09_percentile_p95_txn_amt_90d.json")
+    edge["body"]["expr"]["aggregation_argument"] = 100
+    with pytest.raises(SchemaError, match="strictly between"):
+        parse_proposal_v2(edge)

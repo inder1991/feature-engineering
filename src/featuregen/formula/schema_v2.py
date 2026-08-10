@@ -53,6 +53,11 @@ class AggregateFunctionV2(StrEnum):
     MIN = "min"
     MAX = "max"
     AVG = "avg"
+    # increment 2 — the distributional group
+    RECENCY = "recency"          # duration since the latest in-window event, at the cutoff
+    STDDEV = "stddev"
+    PERCENTILE = "percentile"    # requires aggregation_argument p ∈ (0, 100)
+    MEDIAN = "median"            # percentile 50 as its own authored name — no argument
 
 
 class FinalOperationV2(StrEnum):
@@ -68,6 +73,10 @@ class AggregateExpressionV2:
     source_relation: SourceRelation
     filter: FilterNode | None
     window: WindowPolicy
+    # increment 2: the aggregate's own argument — REQUIRED for percentile (p ∈ (0,100),
+    # exclusive), FORBIDDEN for every other operation. A parameterized aggregate carries its
+    # parameter in identity, never in a generic label.
+    aggregation_argument: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +123,15 @@ def _check_expression_v2(expr: AggregateExpressionV2, path: str,
     if not isinstance(expr.aggregation, AggregateFunctionV2):
         raise SchemaError(f"{path}.aggregation: not a v2 aggregate: {expr.aggregation!r}")
     _require_table_ref(expr.source_relation.table_ref, f"{path}.source_relation.table_ref")
+    if expr.aggregation is AggregateFunctionV2.PERCENTILE:
+        if not isinstance(expr.aggregation_argument, (int, float)) or isinstance(
+                expr.aggregation_argument, bool) or not 0 < expr.aggregation_argument < 100:
+            raise SchemaError(
+                f"{path}.aggregation_argument: percentile requires p strictly between 0 and "
+                f"100, got {expr.aggregation_argument!r}")
+    elif expr.aggregation_argument is not None:
+        raise SchemaError(
+            f"{path}.aggregation_argument: {expr.aggregation.value} takes no argument")
     if expr.aggregation is AggregateFunctionV2.COUNT_ROWS:
         if expr.operand is not None:
             raise SchemaError(f"{path}.operand: count_rows carries no operand")
@@ -170,4 +188,8 @@ AGGREGATE_ADDITIVITY_V2: dict[AggregateFunctionV2, AdditivityClass] = {
     AggregateFunctionV2.MIN: AdditivityClass.NON_ADDITIVE,
     AggregateFunctionV2.MAX: AdditivityClass.NON_ADDITIVE,
     AggregateFunctionV2.AVG: AdditivityClass.NON_ADDITIVE,
+    AggregateFunctionV2.RECENCY: AdditivityClass.NON_ADDITIVE,
+    AggregateFunctionV2.STDDEV: AdditivityClass.NON_ADDITIVE,
+    AggregateFunctionV2.PERCENTILE: AdditivityClass.NON_ADDITIVE,
+    AggregateFunctionV2.MEDIAN: AdditivityClass.NON_ADDITIVE,
 }

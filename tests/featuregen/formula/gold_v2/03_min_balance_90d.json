@@ -1,9 +1,9 @@
 {
-  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"min\",\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"min\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
   "case_id": "min_balance_90d",
   "expected": "ok",
-  "expected_proposal_hash": "2dd00a9b31d31b3ccfa91b4633388c19c904f0b35ad923fc89bf72890294600c",
-  "note": "increment-1 NEW group: minimum daily balance shape",
+  "expected_proposal_hash": "6ed741c255e8b771fd883a0d029f9b61e3dfca6b006fdfef0607ed6c5fb0be5f",
+  "note": "increment-1 NEW group: minimum daily balance shape [re-keyed in increment 2: aggregation_argument joined the canonical form]",
   "operation": "min",
   "proposal": {
     "body": {
