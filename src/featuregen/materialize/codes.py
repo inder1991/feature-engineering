@@ -46,6 +46,10 @@ class CompilationRefusalCode(StrEnum):
     TERMINAL_PAYLOAD_TAMPERED = "TERMINAL_PAYLOAD_TAMPERED"
     NOT_RESOLVED = "NOT_RESOLVED"
     FORMULA_HASH_MISMATCH = "FORMULA_HASH_MISMATCH"
+    # BR-6: the compiler consumes exactly Formula-v1 today. A formula claiming any other schema
+    # version is refused at admission — never silently compiled under v1 semantics. Lifting this
+    # is an ENGINE capability decision (capability_v2.EngineCapabilityV1), not a default.
+    FORMULA_SCHEMA_UNSUPPORTED = "FORMULA_SCHEMA_UNSUPPORTED"
     AXES_MISMATCH = "AXES_MISMATCH"
     INTENT_HASH_MISMATCH = "INTENT_HASH_MISMATCH"
 

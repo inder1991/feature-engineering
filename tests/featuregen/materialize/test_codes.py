@@ -17,7 +17,7 @@ from featuregen.materialize.codes import (
 def test_compilation_codes_are_exactly_the_spec_set():
     assert {c.value for c in CompilationRefusalCode} == {
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
-        "FORMULA_HASH_MISMATCH", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
+        "FORMULA_HASH_MISMATCH", "FORMULA_SCHEMA_UNSUPPORTED", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
         "AMBIGUOUS_TABLE_NAME",
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",

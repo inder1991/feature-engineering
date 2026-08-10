@@ -199,6 +199,7 @@ def _admit_one(conn: DbConn, item: ResolvedFeatureInput) -> AdmittedFeature:
     _verify_payload_hash(event, run_id)                                  # 2
     _require_resolved(event, run_id)                                     # 3
     formula, content_hash = _verify_formula_hash(event, result, run_id)  # 4
+    _verify_schema_version(formula, run_id)                              # 4b (BR-6)
     _verify_axes(event, result, run_id)                                  # 5
     _verify_intent_hash(conn, item.intent, run_id)                       # 6
 
@@ -209,6 +210,18 @@ def _admit_one(conn: DbConn, item: ResolvedFeatureInput) -> AdmittedFeature:
         intent=item.intent,
         authoring_run_id=run_id,
     )
+
+
+def _verify_schema_version(formula: TypedFormulaV1, run_id: str) -> None:
+    """BR-6 (4b): this compiler consumes exactly Formula-v1. A v2 (or any-other-version) formula
+    reaching admission is refused loudly — compiling it under v1 semantics would silently
+    misread operations v1 never defined. The v2 path arrives with an engine that ADVERTISES it."""
+    if formula.formula_schema_version != 1:
+        raise MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"authoring run {run_id}: formula schema version "
+            f"{formula.formula_schema_version} is not compilable by this engine (v1 only)",
+        )
 
 
 # ── 1. a terminal event exists ───────────────────────────────────────────────────────────────────
