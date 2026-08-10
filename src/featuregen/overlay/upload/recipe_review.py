@@ -125,10 +125,12 @@ def record_review_event(conn, *, recipe_id: str, recipe_revision_hash: str, deci
 
 
 def review_events(conn, recipe_id: str) -> list[RecipeReviewEventV1]:
-    """Every recorded event for a recipe, oldest first — the immutable history, all revisions."""
+    """Every recorded event for a recipe, oldest first — ordered by the append sequence
+    (1061): same-transaction events share now(), so a timestamp is a coincidence, not an
+    order."""
     rows = conn.execute(
         f"SELECT {_COLUMNS} FROM recipe_review_event WHERE recipe_id = %s "
-        "ORDER BY recorded_at, event_id", (recipe_id,)).fetchall()
+        "ORDER BY recorded_seq", (recipe_id,)).fetchall()
     return [_event(r) for r in rows]
 
 
@@ -139,6 +141,6 @@ def current_review(conn, *, recipe_id: str,
     row = conn.execute(
         f"SELECT {_COLUMNS} FROM recipe_review_event "
         "WHERE recipe_id = %s AND recipe_revision_hash = %s "
-        "ORDER BY recorded_at DESC, event_id DESC LIMIT 1",
+        "ORDER BY recorded_seq DESC LIMIT 1",
         (recipe_id, recipe_revision_hash)).fetchone()
     return _event(row) if row else None
