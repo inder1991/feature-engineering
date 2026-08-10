@@ -827,6 +827,66 @@ result = that candidate is withheld pending an explicit target declaration — f
 where the risk is, exploratory generation unblocked elsewhere. Abstention-rate monitoring (the
 reviewer's Task-3-dead-weight concern) becomes a first-class metric of this pre-pass.
 
+**Target resolution is SELECTION, not generation (owner question, 2026-08-10: "are we passing the
+catalog with the prompt?").** Three stages, deterministic-first:
+
+1. **Exact match, no LLM.** Normalise the hypothesis tokens and match against catalog column names
+   (case/underscore-insensitive). A user who typed `cust_status_flg` never involves a model at all —
+   most intents name their target literally.
+2. **Closed choice from a passed shortlist.** Only when nothing matches exactly ("the churn flag"),
+   the LLM picks from a READ-SCOPED candidate shortlist included in the prompt — names + concepts +
+   one-line summaries, derived by searching the catalog with the hypothesis's own terms — or
+   abstains. Selection from a provided list, never free generation of a name: the concept
+   classifier's closed-vocabulary pattern, applied to columns. At today's 237 columns the whole
+   name list fits trivially; at the 150K-column ambition the search-derived shortlist IS the
+   scaling mechanism.
+3. **Membership validation regardless** — defence in depth: even an answer copied from the provided
+   list is re-checked against the catalog before it feeds the veto, because a model can miscopy.
+
+Same shape as everywhere: deterministic first, LLM for the residual, code validates the landing.
+
+**What the fuzzy path sends per candidate column (owner-confirmed 2026-08-10):** exactly three
+fields — column ref, concept, and the one-line `ai_summary`. The summary, not the full definition:
+definitions run to paragraphs (up to 32k chars) and 237 of them drown the signal; the summary is the
+one-liner enrichment wrote for discovery, exists 237/237, and is the same field search ranks on. All
+three fields are already egress-graded — nothing new crosses the boundary. The reply must be a ref
+from the sent list or abstain; membership-validated regardless.
+
+**Search is staged; the upgrade trigger is a metric, not a conviction (recommendation adopted
+2026-08-10).** Stage 1 exact match (no model). Stage 2 NOW: one code-driven search builds the
+candidate list — at 237 columns the list is the whole catalog. Stage 3 LATER: the model drives the
+same two functions (`search_columns`, `inspect_column`) as bounded, audited tools — built as
+internal functions today so promotion is a caller change, not a rework. Raw SQL access is
+permanently off the table: read scope and egress grading live inside the curated functions, and the
+database also holds decisions, audit and redacted inputs. Stage 3 builds only when one of three
+named triggers fires: (a) the correction/abstention rate says the shortlist misses, (b) a catalog
+too large for the shortlist to be the catalog, (c) cross-catalog target resolution. Every
+unmeasured "this will be transformative" this week measured small — this decision is wired to a
+counter instead.
+
+**HUMAN CONFIRMATION OF THE TARGET, ON THE UI (owner requirement, 2026-08-10).** The extracted
+target is the single most safety-critical value in the flow — it drives the leakage veto — and it
+must not take effect as an unreviewed model pick. Before generation runs:
+
+> "I understood your target as: `cust_status_flg` — *Current lifecycle status of the customer
+> relationship.* (matched on: 'churn' ≈ relationship status)"
+> **[ Yes, that's my target ]  [ Change it ]  [ No target — just exploring ]**
+
+* **Change it** surfaces the model's ranked runners-up (one-click correction) plus a search box —
+  correcting is never a restart.
+* **Just exploring** is a legitimate answer, not a failure (the links-usable-before-confirmation
+  steer): generation runs, near-label candidates are withheld with "declare a target to see this."
+* **On confirm the target becomes a recorded HUMAN decision** — provenance flips from
+  `llm/proposed` to `human/confirmed`, persisted with the intent, on the audit trail. The veto then
+  runs on a value a human signed.
+* **Exact-match path shows, doesn't gate** (default; uniform-click alternative offered and not
+  taken): a user who literally typed the column name sees "Target: `cust_status_flg` ✓ (you named
+  it)" with an edit affordance and no mandatory click. The confirmation GATE applies to the fuzzy
+  path, where a model interpreted.
+* **The confirm/correct clicks are the extractor's ground truth**: correction rate is the primary
+  quality metric of this pre-pass and the stage-3 trigger (a) above — the approval UI is also the
+  evaluation harness.
+
 **#4 (adopt, redesigned).** The finding is real — nothing feeds gauntlet refusals back, so a refused
 tie-break winner is re-proposed on every cache miss. But the LLM-prompt-injection fix adds
 nondeterminism management for little gain. Deterministic version: when the adjudicated winner's
