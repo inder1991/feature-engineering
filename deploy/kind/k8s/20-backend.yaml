@@ -110,6 +110,11 @@ data:
   # used. Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION below, NOT this switch — turning this
   # off drops to the thin v1 menu.
   FEATUREGEN_FEATURE_CONTEXT: "1"
+  # Task 2 (router plan): tied grounding bindings follow the warmed LLM verdict instead of
+  # alphabetical order. Flipped 2026-08-10 after the shadow phase: 20-verdict disagreement report
+  # reviewed (9 disagreements, all SME-endorsed — aggregating recipes re-bind to fixed-AED amounts,
+  # rail ties to clearing_type). Flag-off restores the historical byte-identical order.
+  FEATUREGEN_TIE_BREAK_BINDING: "1"
   # THE ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v5
   # (`feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION`), the shared SemanticContextBundleV1 payload
   # PLUS the `grounding` output contract. Set `FEATUREGEN_FEATURE_CONTEXT_VERSION` here to fall
