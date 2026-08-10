@@ -104,6 +104,9 @@ from featuregen.overlay.upload.catalogs import list_visible_catalogs
 from featuregen.overlay.upload.contract.invalidation import bridge_fact_marker
 from featuregen.overlay.upload.governed_grain import load_governed_grains
 from featuregen.overlay.upload.join_governance import list_open_approved_join_proposals
+from featuregen.overlay.upload.semantic_binding_governance import (
+    list_semantic_binding_proposals,
+)
 from featuregen.overlay.upload.table_fact_governance import (
     list_open_table_fact_proposals_governance,
 )
@@ -141,7 +144,11 @@ APPROVED_JOIN = "approved_join"
 
 #: The kinds, in the order the queue presents them. Bridges first: they are the cross-catalog
 #: decisions no per-source screen could show, which is why this surface exists.
-KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time")
+# `entity_assignment` / `currency_binding` joined 2026-08-10: six service-proposed currency
+# bindings sat behind a four-eyes confirm while the ONE screen humans review from never listed
+# the kind — a dual-control over an invisible queue. The routes existed; the merge did not.
+KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time",
+              "entity_assignment", "currency_binding")
 
 #: Wordings that must NEVER appear anywhere in this payload — not in a value, a key, or a comment.
 #: Every one of them asserts that human review gates use, which is false: review is accountability,
@@ -753,6 +760,38 @@ def _table_fact_item(view: Mapping[str, Any], source: str) -> QueueItem:
                 "evidence_parse_status": view.get("evidence_parse_status")})
 
 
+def _semantic_binding_item(view: Mapping[str, Any], source: str,
+                           actor: IdentityEnvelope | None) -> QueueItem:
+    """A pending semantic binding as ONE queue item. `view` is
+    `list_semantic_binding_proposals`' shape (display statuses — `_STATE_LABEL`'s own vocabulary).
+
+    FOUR-EYES IS PROJECTED, NOT JUST ENFORCED: the item contract promises `available_actions` is
+    the server-sanctioned set for THIS caller, and `confirm_fact` 409s the uploading principal on a
+    binding born of their own upload (`source_uploader`, program-audit F2). Advertising confirm to
+    that caller invites a guaranteed 409 — the exact confusion the 2026-08-10 currency review hit —
+    so the uploader's own queue drops `confirm` and keeps `reject`."""
+    subject = view.get("subject") or {}
+    state, code = _state(str(view.get("status") or ""))
+    actions = tuple(view.get("available_actions") or ())
+    uploader = view.get("source_uploader")
+    if actor is not None and uploader and actor.subject == uploader:
+        actions = tuple(a for a in actions if a != "confirm")
+    return QueueItem(
+        kind=str(view.get("binding_kind") or ""),
+        fact_key=str(view["fact_key"]),
+        catalogs=(source,),
+        subject=f"{source}.{subject.get('table') or ''}.{subject.get('column') or ''}",
+        state=state, state_code=code,
+        # A binding is metadata about ONE column — nothing crosses, so the automatic axis is silent.
+        production_eligibility=None, production_eligibility_code="not_applicable",
+        available_actions=actions,
+        detail={"target": view.get("target"), "value": view.get("value"),
+                "entity_id": view.get("entity_id"), "prior_value": view.get("prior_value"),
+                "target_event_id": view.get("target_event_id"),
+                "disposition": view.get("disposition"),
+                "reason_codes": view.get("reason_codes")})
+
+
 # ── The merge ────────────────────────────────────────────────────────────────────────────────────
 
 def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
@@ -887,6 +926,27 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
             facts = []
         for view in facts:
             item = _table_fact_item(view, source)
+            key = (item.kind, item.fact_key)
+            if not item.fact_key or key in seen or item.kind not in by_kind:
+                continue
+            seen.add(key)
+            by_kind[item.kind].append(item)
+
+        try:
+            bindings = list_semantic_binding_proposals(
+                conn, source, limit=_FETCH_LIMIT, roles=role_claims)
+            capped = capped or len(bindings) >= _FETCH_LIMIT
+        except Exception:  # noqa: BLE001 — one catalog's listing, not the whole queue
+            counters.incr("overlay.governance_queue.semantic_bindings_unreadable")
+            logger.warning("governance queue: the semantic-binding listing for %s is unreadable",
+                           source, exc_info=True)
+            unreadable.append(Unreadable(
+                "semantic_binding", source, "the semantic-binding listing could not be read"))
+            bindings = []
+        for view in bindings:
+            if view.get("status") == "VERIFIED":
+                continue   # the queue lists PENDING decisions; a VERIFIED binding is not one
+            item = _semantic_binding_item(view, source, actor)
             key = (item.kind, item.fact_key)
             if not item.fact_key or key in seen or item.kind not in by_kind:
                 continue

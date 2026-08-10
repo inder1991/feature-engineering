@@ -19,6 +19,8 @@ vi.mock('../api', async importOriginal => {
     rejectJoin: vi.fn(),
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
+    confirmSemanticBinding: vi.fn(),
+    rejectSemanticBinding: vi.fn(),
     reviewBridgeRealization: vi.fn(),
     getDataUsePolicies: vi.fn(),
   }
@@ -30,6 +32,8 @@ const bulkRejectEntityBridges = vi.mocked(api.bulkRejectEntityBridges)
 const reviewBridgeRealization = vi.mocked(api.reviewBridgeRealization)
 const confirmJoin = vi.mocked(api.confirmJoin)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
+const confirmSemanticBinding = vi.mocked(api.confirmSemanticBinding)
+const rejectSemanticBinding = vi.mocked(api.rejectSemanticBinding)
 const getDataUsePolicies = vi.mocked(api.getDataUsePolicies)
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
@@ -1239,4 +1243,94 @@ it('carries the data-use policy panel the feature refusal points at', async () =
   const panel = await screen.findByTestId('data-use-policies')
   expect(within(panel).getByRole('heading', { name: 'Data-use policies' })).toBeInTheDocument()
   expect(within(panel).getByTestId('dup-pep_flag')).toBeInTheDocument()
+})
+
+// ── semantic bindings in the queue (the 2026-08-10 currency-review gap) ─────────────────────────
+// Six service-proposed currency bindings sat behind a four-eyes confirm while this screen — the one
+// place humans review — never listed the kind. These tests pin the kind end to end: section,
+// headline in the reviewer's language, its OWN confirm command and reject vocabulary.
+
+function currencyBinding(over: Partial<api.GovernanceQueueItem> = {}): api.GovernanceQueueItem {
+  return {
+    kind: 'currency_binding',
+    fact_key: 'fact:currency:tran_amt',
+    catalogs: ['ftr'],
+    subject: 'ftr.comp_financial_tran_repos_dly.tran_amt',
+    state: 'Unreviewed — available for use',
+    state_code: 'unreviewed_available',
+    production_eligibility: null,
+    production_eligibility_code: 'not_applicable',
+    available_actions: ['confirm', 'reject'],
+    detail: {
+      target: { schema: 'public', table: 'comp_financial_tran_repos_dly', column: 'tran_crncy' },
+      value: { currency_column: { column: 'tran_crncy' } },
+      entity_id: null, prior_value: null, target_event_id: 'ev-ccy-1',
+      disposition: 'strong', reason_codes: [],
+    },
+    already_depended_on_by: [],
+    ...over,
+  }
+}
+
+describe('semantic bindings in the queue', () => {
+  it('renders a per-row currency binding in the reviewer\'s language', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    expect(row.getByText(/tran_amt is in the currency named by tran_crncy/i)).toBeInTheDocument()
+    expect(screen.getByTestId('kind-currency_binding')).toBeInTheDocument()
+  })
+
+  it('confirm goes to the SEMANTIC-BINDING command with the binding agreement', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    confirmSemanticBinding.mockResolvedValue(
+      { governance_status: 'VERIFIED', operational_projection: 'projected' })
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    await userEvent.click(row.getByRole('button', { name: /^confirm/i }))
+    const label = row.getByRole('checkbox').closest('label')!
+    expect(label).toHaveTextContent(/currency varies per row and is named by tran_crncy/i)
+    await userEvent.click(row.getByRole('checkbox'))
+    await userEvent.click(row.getByRole('button', { name: /record my confirmation/i }))
+    await waitFor(() => expect(confirmSemanticBinding)
+      .toHaveBeenCalledWith('fact:currency:tran_amt', {}))
+    expect(confirmTableFact).not.toHaveBeenCalled()
+    expect(confirmJoin).not.toHaveBeenCalled()
+  })
+
+  it('reject offers the semantic-binding vocabulary, and dispatches to its own command', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    rejectSemanticBinding.mockResolvedValue({ governance_status: 'REJECTED', category: 'wrong_currency_column' })
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    await userEvent.click(row.getByRole('button', { name: /^reject/i }))
+    // categories render as pressed-state chips (CategoryChips), not radios
+    await userEvent.click(row.getByRole('button', { name: /^wrong currency column$/i }))
+    await userEvent.click(row.getByRole('button', { name: /record my rejection/i }))
+    await waitFor(() => expect(rejectSemanticBinding).toHaveBeenCalledWith(
+      'fact:currency:tran_amt', { category: 'wrong_currency_column' }))
+  })
+
+  it('an uploader whose confirm the server would 409 gets a DISABLED confirm, not a live one', async () => {
+    // The queue projects four-eyes into available_actions (backend: the uploading principal's
+    // confirm is dropped). The screen's existing pattern for an unsanctioned action is a
+    // disabled button — never a live button that invites a guaranteed 409.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding({ available_actions: ['reject'] })],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    expect(row.getByRole('button', { name: /^confirm/i })).toBeDisabled()
+    expect(row.getByRole('button', { name: /^reject/i })).toBeEnabled()
+  })
 })

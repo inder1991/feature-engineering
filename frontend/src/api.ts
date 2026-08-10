@@ -700,6 +700,31 @@ export function confirmTableFact(
   })
 }
 
+// ── semantic bindings (currency / entity) — the E4a four-eyes confirm surface ─────────────────
+// The reject vocabulary is the server's closed set (RejectSemanticBindingRequest).
+export const SEMANTIC_BINDING_REJECT_CATEGORIES = [
+  'wrong_entity', 'wrong_currency_column', 'not_a_binding', 'needs_data_check',
+] as const
+export type SemanticBindingRejectCategory = (typeof SEMANTIC_BINDING_REJECT_CATEGORIES)[number]
+
+export function confirmSemanticBinding(
+  factKey: string,
+  body: { note?: string },
+): Promise<{ governance_status: string; operational_projection: string }> {
+  return post(`/governance/semantic-bindings/${encodeURIComponent(factKey)}/confirm`, {
+    note: body.note ?? null,
+  })
+}
+
+export function rejectSemanticBinding(
+  factKey: string,
+  body: { category: SemanticBindingRejectCategory; note?: string },
+): Promise<{ governance_status: string; category: string }> {
+  return post(`/governance/semantic-bindings/${encodeURIComponent(factKey)}/reject`, {
+    category: body.category, note: body.note ?? null,
+  })
+}
+
 export function rejectTableFact(
   factKey: string,
   body: { category: TableFactRejectCategory; note?: string },

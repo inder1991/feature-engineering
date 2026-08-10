@@ -14,10 +14,14 @@ import {
   bulkRejectEntityBridges,
   confirmEntityBridge,
   confirmJoin,
+  confirmSemanticBinding,
+  SEMANTIC_BINDING_REJECT_CATEGORIES,
+  type SemanticBindingRejectCategory,
   confirmTableFact,
   getGovernanceQueue,
   rejectEntityBridge,
   rejectJoin,
+  rejectSemanticBinding,
   rejectTableFact,
   reviewBridgeRealization,
 } from '../api'
@@ -79,12 +83,16 @@ const KIND_LABEL: Record<string, string> = {
   approved_join: 'Discovered joins',
   grain: 'Table grain',
   availability_time: 'As-of date',
+  currency_binding: 'Currency bindings',
+  entity_assignment: 'Entity assignments',
 }
 const KIND_LABEL_ONE: Record<string, string> = {
   entity_bridge: 'Cross-catalog identifier link',
   approved_join: 'Discovered join',
   grain: 'Table grain',
   availability_time: 'As-of date',
+  currency_binding: 'Currency binding',
+  entity_assignment: 'Entity assignment',
 }
 // What each kind IS, for the section lead-in — including the fact that a discovered join lives
 // inside ONE catalog: `list_open_approved_join_proposals` filters on `from_ref.catalog_source` only
@@ -96,6 +104,9 @@ const KIND_ABOUT: Record<string, string> = {
     + 'listed under the catalog it starts in.',
   grain: 'What one row of a table is — the key every feature on it aggregates to.',
   availability_time: 'Which column carries the as-of date point-in-time features read.',
+  currency_binding: 'What currency an amount column is in — a fixed code, or the column on the '
+    + 'same table that names it per row. Features that sum money are refused until this is decided.',
+  entity_assignment: 'Which business entity an identifier column denotes.',
 }
 
 function kindLabel(kind: string): string {
@@ -173,6 +184,9 @@ const AVAILABILITY_TONE: Record<string, string> = {
 function rejectCategories(kind: string): readonly string[] {
   if (kind === 'entity_bridge') return ENTITY_BRIDGE_REJECT_CATEGORIES
   if (kind === 'approved_join') return REJECT_CATEGORIES
+  if (kind === 'currency_binding' || kind === 'entity_assignment') {
+    return SEMANTIC_BINDING_REJECT_CATEGORIES
+  }
   return TABLE_FACT_REJECT_CATEGORIES
 }
 
@@ -180,6 +194,7 @@ function rejectCategories(kind: string): readonly string[] {
 // instead of "nothing is waiting". Both table-fact kinds come from the one `table_fact` listing.
 function unreadableListings(kind: string): string[] {
   if (kind === 'grain' || kind === 'availability_time') return ['table_fact']
+  if (kind === 'currency_binding' || kind === 'entity_assignment') return ['semantic_binding']
   return [kind]
 }
 
@@ -227,6 +242,19 @@ function headline(item: GovernanceQueueItem): string {
     if (table && column) return `${table} is as of ${column}`
     if (table) return `The as-of date of ${table}`
   }
+  if (item.kind === 'currency_binding') {
+    const column = item.subject.split('.').pop() ?? item.subject
+    const fixed = asStr(asRec(d.value).currency_code)
+    const target = asStr(asRec(d.target).column)
+    if (fixed) return `${column} is always in ${fixed}`
+    if (target) return `${column} is in the currency named by ${target}`
+    return `The currency of ${column}`
+  }
+  if (item.kind === 'entity_assignment') {
+    const column = item.subject.split('.').pop() ?? item.subject
+    const entity = asStr(d.entity_id)
+    return entity ? `${column} identifies a ${entity}` : `What ${column} identifies`
+  }
   return item.subject
 }
 
@@ -260,6 +288,19 @@ function agreement(item: GovernanceQueueItem): string {
   if (item.kind === 'availability_time') {
     const column = asStr(asRec(d.proposed_value).column) || 'the proposed column'
     return `I agree that ${column} is the as-of date of ${asStr(d.table) || 'this table'}.`
+  }
+  if (item.kind === 'currency_binding') {
+    const fixed = asStr(asRec(item.detail.value).currency_code)
+    const target = asStr(asRec(item.detail.target).column)
+    if (fixed) return `I agree this amount is always denominated in ${fixed}.`
+    if (target) {
+      return `I agree this amount's currency varies per row and is named by ${target}.`
+    }
+    return 'I agree with this currency binding as it is described here.'
+  }
+  if (item.kind === 'entity_assignment') {
+    const entity = asStr(item.detail.entity_id) || 'the proposed entity'
+    return `I agree this column identifies a ${entity}.`
   }
   return 'I agree with this relationship as it is described here.'
 }
@@ -884,6 +925,14 @@ async function confirmItem(item: GovernanceQueueItem, note: string): Promise<Out
       projectionKind: 'review',
     }
   }
+  if (item.kind === 'currency_binding' || item.kind === 'entity_assignment') {
+    const result = await confirmSemanticBinding(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
+  }
   const result = item.kind === 'approved_join'
     ? await confirmJoin(item.fact_key, body)
     : await confirmTableFact(item.fact_key, body)
@@ -908,6 +957,11 @@ async function rejectItem(
   }
   if (item.kind === 'approved_join') {
     await rejectJoin(item.fact_key, { category: category as RejectCategory, ...rest })
+    return
+  }
+  if (item.kind === 'currency_binding' || item.kind === 'entity_assignment') {
+    await rejectSemanticBinding(item.fact_key,
+      { category: category as SemanticBindingRejectCategory, ...rest })
     return
   }
   await rejectTableFact(item.fact_key, { category: category as TableFactRejectCategory, ...rest })
