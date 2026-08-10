@@ -883,6 +883,29 @@ catalog with the prompt?").** Three stages, deterministic-first:
 
 Same shape as everywhere: deterministic first, LLM for the residual, code validates the landing.
 
+**REVISED (owner decision, 2026-08-10): the intake READING is MANDATORY — one call per new
+hypothesis.** The staged framing above governs the target COLUMN only, and the owner caught its
+hole: an exact-name match short-circuited the model entirely, silently dropping the ticket's other
+three fields — label window, target type, business domain — which only prose can yield. A user who
+types the exact column name AND writes "churn means no activity in 90 days" would have had the
+near-label critic run blind precisely because they were maximally cooperative. So: every new
+hypothesis gets ONE intake call (cached by hypothesis text) that always fills the full ticket.
+Three rules carry over unchanged:
+
+* **An exactly-typed column name PINS the column** — the model can never override it. The mandatory
+  read upgrades the old shortcut into a cross-check: if the typed name and the prose disagree ("you
+  named `cust_susp_flg`; your description reads as churn"), the confirm screen surfaces the
+  contradiction instead of silently trusting either side.
+* **Human confirmation still gates** (the owner's UI requirement above) — the mandatory call drafts,
+  the human decides.
+* **Failure degrades, never blocks**: on model failure or timeout, an exact-named target proceeds
+  code-resolved with the window absent (near-label candidates withheld per the abstain rule); a
+  fuzzy target falls back to search results + human pick. Mandatory to attempt, never load-bearing.
+
+Net cost is NEGATIVE: the `business_domain` field folds Task 4's hypothesis→use_cases mapping —
+previously its own mandatory call — into this one. One read of the question, one cached ticket,
+four consumers (veto, near-label critic, ordering, parameter choice).
+
 **What the fuzzy path sends per candidate column (owner-confirmed 2026-08-10):** exactly three
 fields — column ref, concept, and the one-line `ai_summary`. The summary, not the full definition:
 definitions run to paragraphs (up to 32k chars) and 237 of them drown the signal; the summary is the
