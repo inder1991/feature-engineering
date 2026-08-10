@@ -18,12 +18,15 @@ Discipline, in one line each:
   hypothesis text" hashed one input of four).
 * Failure degrades, never blocks — no client / fault / ceiling yields a ticket with the pinned
   target (if any) and honest abstains everywhere else.
-* The human confirmation gate (B2) consumes this ticket; it is built in the next increment. Nothing
-  here is a decision — the ticket is a DRAFT reading, `llm/proposed` in spirit, until a human signs
-  the target.
+* The human confirmation gate (B2) consumes this ticket: the ticket is a DRAFT reading,
+  `llm/proposed` in spirit, until a person signs the target — and the signed reading lands on
+  `contract_intent` via :func:`record_target_reading` (migration 1059), where the existing
+  server-side leakage path already reads. Model drafts live in `structured_result`; human decisions
+  live with the intent they govern.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from collections.abc import Iterable, Sequence
@@ -186,6 +189,62 @@ def _ticket_from_output(output: dict, *, pin: str | None,
                           target_type=target_type, business_domain=domains,
                           confidence=confidence, pinned=pin is not None,
                           contradiction=contradiction)
+
+
+_PROVENANCES = ("human_confirmed", "user_typed", "exploring")
+
+
+def record_target_reading(conn, *, intent_id: str, provenance: str, target_ref: str | None = None,
+                          target_window_days: int | None = None, target_type: str | None = None,
+                          business_domain: Sequence[str] = (),
+                          confirmed_by: str | None = None) -> bool:
+    """Persist the SIGNED reading onto the intent it governs (migration 1059 — the storage
+    decision's human half; the model's draft stays in ``structured_result``). Provenance is closed:
+    ``human_confirmed`` (fuzzy path, a person clicked), ``user_typed`` (the person literally named
+    the column — human-origin by construction, recorded without a click), ``exploring`` (an explicit
+    no-target declaration; ``target_ref`` is forced NULL so the veto downstream honestly has nothing
+    to guard and near-label withholding can say why). Returns False when the intent does not exist —
+    the caller owns the 404."""
+    if provenance not in _PROVENANCES:
+        raise ValueError(f"unknown target provenance: {provenance!r}")
+    if provenance == "exploring":
+        target_ref = None
+    row = conn.execute(
+        "UPDATE contract_intent SET target_ref = %s, target_window_days = %s, target_type = %s, "
+        "business_domain = %s::jsonb, target_provenance = %s, target_confirmed_by = %s, "
+        "target_confirmed_at = now() WHERE intent_id = %s RETURNING intent_id",
+        (target_ref, target_window_days, target_type,
+         json.dumps(sorted(business_domain)), provenance, confirmed_by, intent_id)).fetchone()
+    return row is not None
+
+
+def target_reading(conn, intent_id: str) -> dict | None:
+    """The recorded reading, for consumers beyond the leakage gate (which keeps its own
+    ``intent_target_ref``): the near-label critic reads the window, the menu ordering reads the
+    domain. None when the intent is unknown; NULL fields mean "not declared", never a default."""
+    row = conn.execute(
+        "SELECT target_ref, target_window_days, target_type, business_domain, target_provenance, "
+        "target_confirmed_by FROM contract_intent WHERE intent_id = %s", (intent_id,)).fetchone()
+    if row is None:
+        return None
+    return {"target_ref": row[0], "target_window_days": row[1], "target_type": row[2],
+            "business_domain": tuple(row[3] or ()), "target_provenance": row[4],
+            "target_confirmed_by": row[5]}
+
+
+def is_readable_column(conn, ref: str, *, roles: Iterable[str],
+                       catalog_source: str | None = None) -> bool:
+    """Membership check for a human-supplied target: a READ-SCOPED column node with this ref exists.
+    The confirm route validates against the catalog, not against the ticket — the human may correct
+    to any real column, and a column the confirmer cannot see cannot be their target."""
+    from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
+    return conn.execute(
+        "SELECT 1 FROM graph_node WHERE kind = 'column' AND object_ref = %(ref)s "
+        "AND (%(src)s::text IS NULL OR catalog_source = %(src)s) "
+        "AND visible_requires <@ %(allowed)s LIMIT 1",
+        {"ref": ref, "src": catalog_source,
+         "allowed": allowed_sensitivities(roles)}).fetchone() is not None
 
 
 def extract_intake_ticket(conn, client, *, hypothesis: str, catalog_source: str | None = None,

@@ -70,6 +70,13 @@ from featuregen.overlay.upload.contract.intake import (
     redact_free_text,
     submit_intent,
 )
+from featuregen.overlay.upload.contract.intake_ticket import (
+    _use_case_vocabulary,
+    extract_intake_ticket,
+    is_readable_column,
+    record_target_reading,
+    target_reading,
+)
 from featuregen.overlay.upload.contract.live_activation import (
     CROSS_CATALOG_GROUNDING_NOT_ENABLED,
     LiveActivationNotReady,
@@ -238,6 +245,29 @@ class RecognitionIn(BaseModel):
     objective: str = ""           # optional prediction goal; redacted before it can reach the LLM
     feedback: str | None = Field(default=None, max_length=2000)
     supersedes_scope_id: str | None = None
+
+
+class IntakeIn(BaseModel):
+    """The mandatory read (intake build, router-quality plan 2026-08-10): one hypothesis in, one
+    ticket out — a DRAFT reading for the confirm screen, never a decision."""
+    hypothesis: str = Field(min_length=1)
+    catalog_source: str | None = None
+
+
+class IntakeTargetIn(BaseModel):
+    """The human's answer to the confirm screen. ``confirmed`` = "Yes, that's my target" (agreed
+    with the draft), ``corrected`` = "Change it" (the click IS the extractor's ground truth — the
+    two are one provenance and two telemetry counters), ``exploring`` = an explicit no-target
+    declaration. The server validates the signed ref against the READ-SCOPED catalog — never
+    against the ticket — so a correction to any real, visible column is one click."""
+    intent_id: str
+    decision: str = Field(pattern="^(confirmed|corrected|exploring)$")
+    target_ref: str | None = None
+    target_window_days: int | None = Field(default=None, ge=1)
+    target_type: str | None = Field(default=None,
+                                    pattern="^(binary_classification|regression|multiclass)$")
+    business_domain: list[str] = []
+    catalog_source: str | None = None
 
 
 # ---- routes -------------------------------------------------------------------------------------
@@ -908,6 +938,107 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
             "modelling_contexts": list(result.modelling_contexts),
             "target_entity": result.target_entity,
             "warnings": list(result.warnings)}
+
+
+def _intent_row(conn, intent_id: str):
+    return conn.execute(
+        "SELECT actor, target_provenance FROM contract_intent WHERE intent_id = %s",
+        (intent_id,)).fetchone()
+
+
+@router.post("/contract/intake", dependencies=[Depends(require_feature_generate)])
+def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLLM) -> dict:
+    """The mandatory read: persist the intent (per-actor idempotent, the recognitions discipline),
+    extract the ticket (ONE cached governed call — replay is free), and return the DRAFT reading
+    for the confirm screen. A literally-typed name is recorded server-side as ``user_typed``
+    immediately (shows-doesn't-gate: human-origin by construction, no click required) — but NEVER
+    over a reading a human already signed. Degrades, never blocks: with no LLM configured the
+    pinned target still lands and everything else honestly abstains."""
+    try:
+        intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
+    except IntentValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    prior = conn.execute(
+        "SELECT intent_id FROM contract_intent WHERE hypothesis = %s AND intake_mode = %s "
+        "AND actor = %s::jsonb ORDER BY created_at ASC LIMIT 1",
+        (intent.hypothesis, intent.intake_mode, _actor_json(intent.actor))).fetchone()
+    if prior is not None:
+        intent = replace(intent, intent_id=prior[0])
+    persist_intent(conn, intent)
+
+    ticket, reason = extract_intake_ticket(
+        conn, client, hypothesis=body.hypothesis, catalog_source=body.catalog_source,
+        roles=identity.role_claims, actor=identity)
+    counters.incr(f"overlay.intake.{reason}")
+
+    row = _intent_row(conn, intent.intent_id)
+    if ticket.pinned and ticket.target_column and (row is None or row[1] is None):
+        # The pin is the USER's own typed name — record it without a click, but never clobber a
+        # signed reading (re-running intake on a confirmed intent is a read, not a write).
+        record_target_reading(conn, intent_id=intent.intent_id, provenance="user_typed",
+                              target_ref=ticket.target_column, confirmed_by=identity.subject)
+        counters.incr("overlay.intake.pinned")
+
+    def _column_detail(ref: str | None) -> dict | None:
+        if not ref:
+            return None
+        detail = conn.execute(
+            "SELECT catalog_source, concept, ai_summary FROM graph_node "
+            "WHERE kind = 'column' AND object_ref = %s "
+            "AND (%s::text IS NULL OR catalog_source = %s) LIMIT 1",
+            (ref, body.catalog_source, body.catalog_source)).fetchone()
+        if detail is None:
+            return None
+        return {"ref": ref, "catalog_source": detail[0], "concept": detail[1] or "",
+                "ai_summary": detail[2] or ""}
+
+    return {"intent_id": intent.intent_id, "reason": reason,
+            "ticket": {"target_column": ticket.target_column,
+                       "target_window_days": ticket.target_window_days,
+                       "target_type": ticket.target_type,
+                       "business_domain": list(ticket.business_domain),
+                       "confidence": ticket.confidence, "pinned": ticket.pinned,
+                       "contradiction": ticket.contradiction},
+            "target_detail": _column_detail(ticket.target_column)}
+
+
+@router.post("/contract/intake/target", dependencies=[Depends(require_feature_generate)])
+def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dict:
+    """Record the HUMAN's answer — the point where provenance flips to a person. Author-only: the
+    reading governs the author's own leakage gate, so another principal cannot sign it. The signed
+    ref is validated against the read-scoped catalog (never the ticket — the human may correct to
+    any column they can see); the domain tokens are validated against the closed use-case
+    vocabulary STRICTLY (a human decision is recorded verbatim or refused, never silently edited).
+    The existing server-side leakage path (``intent_target_ref``) reads the same row, so the veto
+    downstream runs on the signed value with no further wiring."""
+    row = _intent_row(conn, body.intent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such intent")
+    if row[0] != identity.subject:
+        raise HTTPException(status_code=403,
+                            detail="only the intent's author can sign its target reading")
+    if body.decision in ("confirmed", "corrected"):
+        if not body.target_ref:
+            raise HTTPException(status_code=422,
+                                detail=f"decision '{body.decision}' requires target_ref")
+        if not is_readable_column(conn, body.target_ref, roles=identity.role_claims,
+                                  catalog_source=body.catalog_source):
+            raise HTTPException(status_code=422,
+                                detail="target_ref is not a readable column in this catalog")
+    vocabulary = set(_use_case_vocabulary())
+    off_vocab = [d for d in body.business_domain if d not in vocabulary]
+    if off_vocab:
+        raise HTTPException(
+            status_code=422,
+            detail=f"business_domain outside the use-case vocabulary: {sorted(off_vocab)}")
+    provenance = "exploring" if body.decision == "exploring" else "human_confirmed"
+    record_target_reading(
+        conn, intent_id=body.intent_id, provenance=provenance, target_ref=body.target_ref,
+        target_window_days=body.target_window_days, target_type=body.target_type,
+        business_domain=tuple(body.business_domain), confirmed_by=identity.subject)
+    counters.incr(f"overlay.intake.target_{body.decision}")
+    return {"intent_id": body.intent_id, **(target_reading(conn, body.intent_id) or {}),
+            "business_domain": sorted(body.business_domain)}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])

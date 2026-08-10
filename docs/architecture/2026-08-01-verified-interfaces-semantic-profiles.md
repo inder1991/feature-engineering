@@ -205,7 +205,9 @@ and the runner is lexical + name-ledgered, `db/migrations.py:260-317`).
 
 | 1058 | Readiness wave (2026-08-09) — `graph_node.fibo_path` display projection (`1058_graph_node_fibo_path.sql`), CONSUMED. The third FTR sidecar taxonomy path, joining `bian_path`/`process_path` from 1051; it was captured as SOURCE evidence exactly like both siblings and then had no policy and no flat column, so it resolved nowhere — invisible precisely BECAUSE its siblings worked. Closes the last `UNCARRIED_GAPS` entry. Same rebuildable, never-authoritative contract as 1051/1052. |
 
-New needs append 1059+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
+| 1059 | Intake build increment 2 (router-quality plan 2026-08-10) — `contract_intent` target-reading extension (`1059_contract_intent_target_reading.sql`), CONSUMED. The storage decision executed: the model's ticket draft lives in `structured_result` (increment 1, no DDL); the HUMAN confirmation extends `contract_intent` with `target_window_days`/`target_type`/`business_domain` + provenance (`target_provenance` ∈ human_confirmed / user_typed / exploring, `target_confirmed_by/_at`). All additive-NULL; legacy client-supplied target_ref writes are untouched (provenance NULL). |
+
+New needs append 1060+ to this table FIRST (edit this doc in the same commit as the migration; note Phase G's future G-2/G-3 iterations also draw from this pool — coordinate here).
 
 ## D8. Flag matrix
 
