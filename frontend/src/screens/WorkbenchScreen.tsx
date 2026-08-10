@@ -54,9 +54,11 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
+  type IntakeReading, type IntakeResp,
   type JoinStep, type RankedRecipe, type Recipe, type RecipeDisposition, type RecognitionCandidate,
   type RecognitionResp, type RefineRejection, type Rejection, type SetRecommendation,
-  contractConfirm, contractConsideredSet, contractDraft, contractRecognitions, featureFreshness,
+  contractConfirm, contractConsideredSet, contractDraft, contractIntake, contractIntakeTarget,
+  contractRecognitions, featureFreshness,
   featureRecipe, refineCandidate, registerFeature,
 } from '../api'
 import { getSession } from '../session'
@@ -620,6 +622,16 @@ export function WorkbenchScreen() {
   const [source, setSource] = useState('')
   const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
+  // The mandatory read (intake build): the DRAFT ticket for the target confirm block, fetched
+  // alongside recognition. Null = not fetched or unavailable — the manual target field is the
+  // degrade path, so intake failing NEVER blocks the flow. `intakeReading` is the recorded HUMAN
+  // answer (confirmed/corrected/exploring) once one lands.
+  const [intake, setIntake] = useState<IntakeResp | null>(null)
+  const [intakeReading, setIntakeReading] = useState<IntakeReading | null>(null)
+  const [intakeCorrecting, setIntakeCorrecting] = useState(false)
+  const [intakeCorrection, setIntakeCorrection] = useState('')
+  const [intakeBusy, setIntakeBusy] = useState(false)
+  const [intakeError, setIntakeError] = useState('')
   const [generated, setGenerated] = useState<GeneratedCandidate[] | null>(null)
   // Ordered lenses of the last round's non-empty sets. Two or more render the compare cards;
   // one (or zero) renders the flat single list exactly as before the sets model.
@@ -1004,6 +1016,23 @@ export function WorkbenchScreen() {
     setSignalWarnings(null)
     clearSets()
     clearFeedback()
+    // The mandatory read runs ALONGSIDE recognition (one cached call — a repeat hypothesis is
+    // free). Degrade-never-block, on the UI too: an intake failure (older backend, no LLM) leaves
+    // `intake` null and the manual target field carries the flow exactly as before.
+    setIntake(null)
+    setIntakeReading(null)
+    setIntakeCorrecting(false)
+    setIntakeError('')
+    const intakeSeq = seq
+    contractIntake(hypothesis.trim(), { catalogSource: source.trim() || undefined })
+      .then(resp => {
+        if (intakeSeq !== generateSeq.current) return
+        setIntake(resp)
+        // A pinned name is already recorded server-side (user_typed, no click needed): thread it
+        // into the manual field so the considered-set request carries what the server signed.
+        if (resp.ticket.pinned && resp.ticket.target_column) setTarget(resp.ticket.target_column)
+      })
+      .catch(() => { /* degrade to the manual target field */ })
     try {
       const rec = await contractRecognitions(hypothesis.trim(), objective)
       if (seq !== generateSeq.current) return
@@ -1025,6 +1054,37 @@ export function WorkbenchScreen() {
       fail(err)
     } finally {
       if (seq === generateSeq.current) setGenerating(false)
+    }
+  }
+
+  // Record the human's answer to the target confirm block — the provenance flip to a person.
+  // 'confirmed' signs the draft as shown; 'corrected' signs the ref the human typed instead (the
+  // click is the extractor's ground-truth telemetry); 'exploring' records an explicit no-target
+  // declaration. The signed value is threaded into the manual target field so the considered-set
+  // request and the server's record agree.
+  async function answerIntake(decision: 'confirmed' | 'corrected' | 'exploring', ref?: string) {
+    if (!intake || intakeBusy) return
+    setIntakeBusy(true)
+    setIntakeError('')
+    try {
+      const t = intake.ticket
+      const reading = await contractIntakeTarget(intake.intent_id, decision, {
+        targetRef: decision === 'exploring' ? undefined : ref,
+        targetWindowDays: t.target_window_days ?? undefined,
+        targetType: t.target_type !== 'abstain' ? t.target_type : undefined,
+        businessDomain: t.business_domain,
+        catalogSource: source.trim() || undefined,
+      })
+      setIntakeReading(reading)
+      setIntakeCorrecting(false)
+      setIntakeCorrection('')
+      setTarget(reading.target_ref ?? '')
+    } catch (err) {
+      setIntakeError(err instanceof ApiError
+        ? err.detail
+        : 'Could not record the target decision. Try again.')
+    } finally {
+      setIntakeBusy(false)
     }
   }
 
@@ -1857,6 +1917,114 @@ export function WorkbenchScreen() {
                 Include all sub-use-cases?
               </label>
             </>
+          )}
+          {/* The target confirm block (intake build): the model's DRAFT reading of the prediction
+              target, awaiting the human's signature. The extracted target drives the leakage veto,
+              so it must not take effect as an unreviewed model pick — but a name the user
+              literally TYPED is theirs already (shows-doesn't-gate: recorded without a click, one
+              edit away). Absent intake (older backend, no LLM) renders nothing: the manual target
+              field above carries the flow exactly as before. */}
+          {intake !== null && (
+            <div className="scope-target" data-role="intake-target" style={{ marginTop: 16 }}>
+              <h3 style={{ margin: '0 0 8px' }}>Prediction target</h3>
+              {intakeReading !== null ? (
+                intakeReading.target_provenance === 'exploring' ? (
+                  <p role="status" style={{ margin: 0 }}>
+                    <span className="badge">Exploring</span>{' '}
+                    No target declared. Generation runs, but leakage checks are off — declare a
+                    target any time in the target field above.
+                  </p>
+                ) : (
+                  <p role="status" style={{ margin: 0 }}>
+                    <span className="badge recommended">Signed</span>{' '}
+                    Target: <code>{intakeReading.target_ref}</code> — recorded as your decision.
+                    Candidates are screened against it server-side.
+                  </p>
+                )
+              ) : intake.ticket.pinned && intake.ticket.target_column ? (
+                <p role="status" style={{ margin: 0 }}>
+                  Target: <code>{intake.ticket.target_column}</code> ✓ (you named it) — edit the
+                  target field above to change it.
+                </p>
+              ) : intake.ticket.target_column !== null ? (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <p style={{ margin: 0 }}>
+                    I understood your target as: <code>{intake.ticket.target_column}</code>
+                    {intake.target_detail?.ai_summary
+                      ? <> — <em>{intake.target_detail.ai_summary}</em></>
+                      : null}
+                    {intake.ticket.target_window_days !== null && (
+                      <> (label window: {intake.ticket.target_window_days} days)</>
+                    )}
+                  </p>
+                  {intake.ticket.contradiction !== null && (
+                    <p className="hint" role="alert" style={{ margin: 0 }}>
+                      Heads up: {intake.ticket.contradiction}.
+                    </p>
+                  )}
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() =>
+                        answerIntake('confirmed', intake.ticket.target_column ?? undefined)}
+                    >
+                      Yes, that's my target
+                    </button>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() => setIntakeCorrecting(v => !v)}
+                    >
+                      Change it
+                    </button>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() => answerIntake('exploring')}
+                    >
+                      No target — just exploring
+                    </button>
+                  </div>
+                  {intakeCorrecting && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                      <label htmlFor="wb-intake-correction" style={{ alignSelf: 'center' }}>
+                        Correct target
+                      </label>
+                      <input
+                        id="wb-intake-correction"
+                        value={intakeCorrection}
+                        onChange={e => setIntakeCorrection(e.target.value)}
+                        placeholder="e.g. public.labels.churned"
+                        style={{ flex: '1 1 260px' }}
+                      />
+                      <button
+                        type="button" className="btn"
+                        disabled={intakeBusy || !intakeCorrection.trim()}
+                        onClick={() => answerIntake('corrected', intakeCorrection.trim())}
+                      >
+                        Sign this target
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ display: 'grid', gap: 8 }}>
+                  <p style={{ margin: 0 }}>
+                    No target detected in your objective. Type one into the target field above, or
+                    explore without one.
+                  </p>
+                  <div>
+                    <button
+                      type="button" className="btn" disabled={intakeBusy}
+                      onClick={() => answerIntake('exploring')}
+                    >
+                      No target — just exploring
+                    </button>
+                  </div>
+                </div>
+              )}
+              {intakeError && (
+                <p className="hint" role="alert" style={{ margin: '8px 0 0' }}>{intakeError}</p>
+              )}
+            </div>
           )}
           {/* Phase-2B SOFT dimensions (modelling context + prediction grain). Rendered whenever a
               recognition has landed — dimensions can be proposed WITHOUT a use-case — so it lives

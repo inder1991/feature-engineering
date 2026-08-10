@@ -1407,6 +1407,78 @@ export function contractRecognitions(
   })
 }
 
+// The mandatory read's DRAFT ticket (intake build, router-quality plan 2026-08-10). Never a
+// decision: `pinned` means code matched a name the user literally typed (recorded server-side
+// without a click); a fuzzy `target_column` is a model reading awaiting the confirm screen;
+// `contradiction` is the warning when the prose disagreed with a typed name.
+export interface IntakeTicket {
+  target_column: string | null
+  target_window_days: number | null
+  target_type: 'binary_classification' | 'regression' | 'multiclass' | 'abstain'
+  business_domain: string[]
+  confidence: 'high' | 'medium' | 'abstain'
+  pinned: boolean
+  contradiction: string | null
+}
+
+export interface IntakeResp {
+  intent_id: string
+  // extracted = fresh model call; replayed = cached (free); unavailable/call_ceiling = degraded —
+  // the pinned target (pure code) still lands, everything else honestly abstains.
+  reason: 'extracted' | 'replayed' | 'unavailable' | 'call_ceiling'
+  ticket: IntakeTicket
+  // The confirm screen's one-liner: "I understood your target as `ref` — <ai_summary>".
+  target_detail: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  } | null
+}
+
+// One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist
+// + vocabulary + prompt version), so re-asking the same question is free.
+export function contractIntake(
+  hypothesis: string,
+  opts: { catalogSource?: string } = {},
+): Promise<IntakeResp> {
+  return post('/contract/intake', {
+    hypothesis,
+    catalog_source: opts.catalogSource ?? null,
+  })
+}
+
+// The recorded reading after the human's answer — provenance is the audit fact: 'human_confirmed'
+// (a person clicked), 'user_typed' (they literally named it), 'exploring' (explicit no-target).
+export interface IntakeReading {
+  intent_id: string
+  target_ref: string | null
+  target_window_days: number | null
+  target_type: string | null
+  business_domain: string[]
+  target_provenance: string | null
+  target_confirmed_by: string | null
+}
+
+// Record the human's answer to the confirm screen. Author-only (403 otherwise); the signed ref is
+// validated against the read-scoped catalog server-side — a column you cannot see cannot be your
+// target; off-vocabulary domain tokens are refused, never silently dropped.
+export function contractIntakeTarget(
+  intentId: string,
+  decision: 'confirmed' | 'corrected' | 'exploring',
+  opts: {
+    targetRef?: string; targetWindowDays?: number; targetType?: string
+    businessDomain?: string[]; catalogSource?: string
+  } = {},
+): Promise<IntakeReading> {
+  return post('/contract/intake/target', {
+    intent_id: intentId,
+    decision,
+    target_ref: opts.targetRef ?? null,
+    target_window_days: opts.targetWindowDays ?? null,
+    target_type: opts.targetType ?? null,
+    business_domain: opts.businessDomain ?? [],
+    catalog_source: opts.catalogSource ?? null,
+  })
+}
+
 // Gate #1 intake: mandatory hypothesis + objective; the server persists the intent and returns the
 // gauntlet-validated considered set (anchor + generated alternatives + an advisory recommendation).
 // Phase 1B: when `confirmedScope` is supplied (the human confirmed/broadened the recognised scope),

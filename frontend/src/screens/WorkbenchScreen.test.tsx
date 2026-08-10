@@ -11,6 +11,8 @@ vi.mock('../api', async importOriginal => {
     recommendFeatures: vi.fn(),
     contractConsideredSet: vi.fn(),
     contractRecognitions: vi.fn(),
+    contractIntake: vi.fn(),
+    contractIntakeTarget: vi.fn(),
     contractDraft: vi.fn(),
     contractConfirm: vi.fn(),
     refineCandidate: vi.fn(),
@@ -23,6 +25,8 @@ vi.mock('../api', async importOriginal => {
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractRecognitions = vi.mocked(api.contractRecognitions)
+const contractIntake = vi.mocked(api.contractIntake)
+const contractIntakeTarget = vi.mocked(api.contractIntakeTarget)
 const contractDraft = vi.mocked(api.contractDraft)
 const contractConfirm = vi.mocked(api.contractConfirm)
 const refineCandidate = vi.mocked(api.refineCandidate)
@@ -34,6 +38,12 @@ beforeEach(() => {
   recommendFeatures.mockReset()
   contractConsideredSet.mockReset()
   contractRecognitions.mockReset()
+  contractIntake.mockReset()
+  contractIntakeTarget.mockReset()
+  // The mandatory read is degrade-never-block: tests that don't script it exercise exactly the
+  // degraded path (older backend / no LLM), where the manual target field carries the flow.
+  contractIntake.mockRejectedValue(new Error('intake unavailable in this test'))
+  contractIntakeTarget.mockRejectedValue(new Error('intake unavailable in this test'))
   contractDraft.mockReset()
   contractConfirm.mockReset()
   refineCandidate.mockReset()
@@ -2272,5 +2282,147 @@ describe('Phase 2A ranking', () => {
     const row = within(panel).getByText('balance_trend_30d').closest('li') as HTMLElement
     expect(within(row).getByText('Built at a different grain — derivable by roll-up'))
       .toBeInTheDocument()
+  })
+})
+
+// ------------------------------------------------- Intake build: the target confirm block ----
+describe('Intake target confirmation', () => {
+  const RECOGNITION: api.RecognitionResp = {
+    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+    candidates: [{
+      use_case_id: 'churn', display_name: 'Customer churn',
+      relationship: 'primary', confidence: 'high', evidence_spans: [],
+    }],
+    modelling_contexts: [], target_entity: null, warnings: [],
+  }
+
+  const TICKET: api.IntakeTicket = {
+    target_column: 'public.labels.churned', target_window_days: 90,
+    target_type: 'binary_classification', business_domain: ['retail_churn'],
+    confidence: 'high', pinned: false, contradiction: null,
+  }
+
+  const INTAKE: api.IntakeResp = {
+    intent_id: 'int_1', reason: 'extracted', ticket: TICKET,
+    target_detail: {
+      ref: 'public.labels.churned', catalog_source: 'deposits',
+      concept: 'label', ai_summary: 'Whether the customer churned in the window.',
+    },
+  }
+
+  const READING: api.IntakeReading = {
+    intent_id: 'int_1', target_ref: 'public.labels.churned', target_window_days: 90,
+    target_type: 'binary_classification', business_domain: ['retail_churn'],
+    target_provenance: 'human_confirmed', target_confirmed_by: 'user:tester',
+  }
+
+  function scoped(): api.ConsideredSetResp {
+    return {
+      intent_id: 'int_1', anchor: null, alternatives: [{ lens: 'temporal', features: [IDEA] }],
+      recommendation: null, rejections: [],
+      generation_run_id: 'run_1', scope_id: 'scope_1', in_scope_count: 1, dispositions: [],
+    }
+  }
+
+  async function generateConfirmOn() {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scoped())
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  it('renders the draft reading and Yes signs it and threads it into generation', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue(READING)
+    await generateConfirmOn()
+    // the mandatory read ran alongside recognition, on the SAME hypothesis
+    expect(contractIntake).toHaveBeenCalledWith(HYPOTHESIS, { catalogSource: undefined })
+    // the draft reading renders with the summary one-liner and the window
+    expect(await screen.findByText(/I understood your target as/)).toBeInTheDocument()
+    expect(screen.getByText('Whether the customer churned in the window.')).toBeInTheDocument()
+    expect(screen.getByText(/label window: 90 days/)).toBeInTheDocument()
+    // a DRAFT is not a decision: nothing was recorded yet
+    expect(contractIntakeTarget).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole('button', { name: /yes, that's my target/i }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'confirmed', {
+      targetRef: 'public.labels.churned', targetWindowDays: 90,
+      targetType: 'binary_classification', businessDomain: ['retail_churn'],
+      catalogSource: undefined,
+    })
+    expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+    // the signed target threads into the considered-set request
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({ targetRef: 'public.labels.churned' }))
+  })
+
+  it('surfaces a name-vs-prose contradiction as a warning', async () => {
+    contractIntake.mockResolvedValue({
+      ...INTAKE,
+      ticket: {
+        ...TICKET,
+        contradiction: 'you named cust_status_flg; the description reads as cust_susp_flg',
+      },
+    })
+    await generateConfirmOn()
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /you named cust_status_flg; the description reads as cust_susp_flg/)
+  })
+
+  it('Change it opens the correction input and signs the typed ref as corrected', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue({
+      ...READING, target_ref: 'public.labels.closed',
+    })
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    await userEvent.click(screen.getByRole('button', { name: /change it/i }))
+    await userEvent.type(screen.getByLabelText('Correct target'), 'public.labels.closed')
+    await userEvent.click(screen.getByRole('button', { name: /sign this target/i }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'corrected',
+      expect.objectContaining({ targetRef: 'public.labels.closed' }))
+    expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+  })
+
+  it('exploring is a recorded declaration, not a failure', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue({
+      ...READING, target_ref: null, target_provenance: 'exploring',
+    })
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    await userEvent.click(screen.getByRole('button', { name: /no target — just exploring/i }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'exploring',
+      expect.objectContaining({ targetRef: undefined }))
+    expect(await screen.findByText(/leakage checks are off/i)).toBeInTheDocument()
+  })
+
+  it('a pinned name renders as the user’s own, already recorded, no click required', async () => {
+    contractIntake.mockResolvedValue({
+      ...INTAKE,
+      ticket: { ...TICKET, pinned: true },
+    })
+    await generateConfirmOn()
+    expect(await screen.findByText(/you named it/)).toBeInTheDocument()
+    // no confirm gate on the pin path — recorded server-side without a click
+    expect(screen.queryByRole('button', { name: /yes, that's my target/i })).toBeNull()
+    expect(contractIntakeTarget).not.toHaveBeenCalled()
+    // the pin threads into the manual target field for the considered-set request
+    expect(screen.getByLabelText('Target column')).toHaveValue('public.labels.churned')
+  })
+
+  it('an intake failure renders no block and never blocks the flow', async () => {
+    // beforeEach default: contractIntake rejects — the degraded path
+    await generateConfirmOn()
+    expect(await screen.findByText('Customer churn')).toBeInTheDocument()
+    expect(screen.queryByText(/I understood your target as/)).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Prediction target' })).toBeNull()
+    // generation is unimpeded
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalled()
   })
 })
