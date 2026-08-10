@@ -61,6 +61,8 @@ shares one picture. **[code]** = deterministic · **[AI]** = model · **[human]*
   label definition in disguise?"* — `dormancy_days` (days since activity) vs a 90-day-inactivity
   churn label is the canonical catch; `txn_frequency_trend` (related, not identical) is the
   canonical pass. Verdicts `no_finding | too_close | abstain`; `too_close` can only ADD a warning.
+  **Origin-blind**: runs on every surviving candidate, template-grounded or LLM-proposed — the same
+  invented dish gets the same taste, whoever cooked it.
 * **B7. Order the menu** [code — no fresh AI] — B1's `business_domain` already translated the
   user's words to the experts' tags; B7 is set-intersection against each card's `use_cases` and a
   sort. Ordering never removes.
@@ -399,6 +401,15 @@ LLM output must never clear a design check (`_governed_read` and the gauntlet ow
   prompt already applies.
 * **Flag-only first.** Verdicts appear on cards and in the considered set before any refusal mode
   exists. Turning `too_close` into a hard refusal is a later, explicit product decision.
+* **ORIGIN-BLIND (owner decision, 2026-08-10).** The critic runs on EVERY surviving candidate —
+  template-grounded and LLM-proposed alike. The gap this closes: the check as first spec'd was
+  triggered by the `near_label` flag, which only template cards carry — so the LLM path could invent
+  "days since the customer's last transaction" for a 90-day-inactivity churn label and sail past the
+  exact check that flags the identical template feature. Same feature, same leakage, flagged on one
+  and not the other purely by origin. Rule: safety checks are origin-blind, exactly as the gauntlet
+  already is. The template flag survives as a cheap "always taste this one" marker; for LLM-origin
+  candidates the critic reads the candidate's own description and formula. Cost stays bounded by the
+  surviving-candidate count, cached per (candidate content, label-definition hash).
 
 ## Task 4 — rank by the taxonomy that already exists; do not filter
 
@@ -660,6 +671,12 @@ Scope it honestly:
 
 * **Phase 1 (now, size S): telemetry only.** Selection rate by template / use-case / parameterisation,
   queryable. This also becomes the plan's true north-star metric the moment it exists.
+  **Record ORIGIN on every selection (owner decision, 2026-08-10)** — template-grounded vs
+  LLM-proposed (the ideas already carry `origin`; this is a group-by, not new capture). The platform
+  runs TWO proposer engines into one gauntlet, and nobody can currently answer which one humans
+  actually keep, per question type. This tag turns the two-engine question from a permanent debate
+  into a measured answer — and it is the evidence base for every future "invest in templates vs
+  invest in the LLM path" decision.
 * **Phase 2 (explicitly deferred): ranking prior.** Feeding selection history into Task 4's order is
   a decision to take when there is volume — tens of contracts, not three. Premature personalisation
   on three data points would just add noise with a feedback loop attached.
