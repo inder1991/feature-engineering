@@ -278,6 +278,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
         # the display-axis projection runs LAST among the graph writers (richness Task 3), so
         # its fill-only-NULL guards see every governed re-projection already applied.
         "axis_projection",
+        # Task 2b: every genuine grounding tie adjudicated once, at the tail, graph final.
+        "tie_break_warming",
         # Step 6c: the ONE summary draft per ingest happens at the tail, from the enriched
         # dossier the axis projection just completed.
         "enrich_summary",

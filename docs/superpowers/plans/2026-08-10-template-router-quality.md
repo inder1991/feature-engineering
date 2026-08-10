@@ -876,8 +876,8 @@ ACCEPTANCE CRITERIA — a step is DONE when:
 | step | done when |
 |---|---|
 | 0 | **DONE 2026-08-10** — reject codes were already live (premise corrected); the funnel endpoint ships the never-grounded side + stopwatch; `cib` measured 10→9 |
-| 1 | every GENUINE tie remaining after the F1/F2 corrections adjudicated at ingest-warm time; request path is cache-hit only; a re-run of the same catalog reuses every verdict |
-| 2 | shadow disagreement report reviewed by an SME; flag on; the disagreement-fixture test proves meaning beats spelling; replay test green |
+| 1 | **BUILT 2026-08-10** (increments 1–3): verdict seam on `structured_result` (order-independent content keys, ranking verdicts, refuse-whole reads); adjudicator through the governed seam — the egress gate blocked its own author's first dispatch until every payload key was classified; warming stage at the ingest tail (`tie_break_warming`, pinned in the stage list). Proven: a re-run replays every verdict with zero model calls |
+| 2 | **SHADOW BUILT 2026-08-10**: grounding consults warmed verdicts and counts agree / disagree / unadjudicated (`overlay.tie_break.shadow_*`); binding behind `FEATUREGEN_TIE_BREAK_BINDING` (default OFF, byte-identical); the disagreement fixture proves meaning beats spelling. REMAINING: SME reviews the live disagreement counters, then the flag |
 | intake | full ticket extracted on real hypotheses; typed names pin (collision → fuzzy); confirm screen live; ticket + confirmation stored per the storage decision; cache key covers all four inputs |
 | 3 | every grounded near-label candidate carries `no_finding` / `too_close` / `abstain`; zero refusals in flag-only mode |
 | 4 | two different hypotheses produce visibly different orders; an unmappable hypothesis provably falls back to today's order |

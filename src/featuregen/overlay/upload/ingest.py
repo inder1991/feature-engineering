@@ -3532,6 +3532,31 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         record_stage(stage_recorder, "axis_projection", "failed", reason_code="exception",
                      started_at=stage_started)
 
+    # ── Tie-break warming (router-plan Task 2b): adjudicate every genuine grounding tie ONCE, now,
+    # while the catalog is the thing that just changed and the LLM machinery is already paid for.
+    # AFTER axis_projection so the graph (and the enrichment text the deliberation reads) is final.
+    # Advisory like its neighbours: own savepoint, fail-soft, counted account on the stage detail.
+    # Requests never dispatch — they read verdicts; a skipped tie keeps the deterministic order.
+    stage_started = datetime.now(UTC)
+    if client is None:
+        record_stage(stage_recorder, "tie_break_warming", "skipped_no_client")
+    else:
+        try:
+            from featuregen.overlay.upload.tie_break import warm_tie_break_verdicts
+
+            with conn.transaction():
+                warm_stats = warm_tie_break_verdicts(
+                    conn, catalog_source=catalog_source, client=client, actor=actor)
+            record_stage(stage_recorder, "tie_break_warming", "succeeded",
+                         detail=warm_stats, started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: a warming fault never fails an upload
+            counters.incr("overlay.tie_break_warming.error")
+            logger.warning("advisory tie-break warming failed for %r — grounding falls back to "
+                           "the deterministic order at request time", catalog_source,
+                           exc_info=True)
+            record_stage(stage_recorder, "tie_break_warming", "failed", reason_code="exception",
+                         started_at=stage_started)
+
     # ── Step 6c: the ONE summary draft per ingest, at the TAIL, from the FULL enriched dossier —
     # concept, party_role (projected just above), grain/as-of role, table role, the Step-6b
     # sidecar fields and the AI's synonyms — assembled per column and passed as the drafting

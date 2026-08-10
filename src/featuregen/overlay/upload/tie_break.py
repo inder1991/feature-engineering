@@ -228,3 +228,66 @@ def adjudicate_tie_break(conn, client, *, template_id: str, need_role: str, need
         producer_ref=call.llm_call_ref or "tie_break:unrecorded")
     return verdict, "adjudicated"
 
+
+
+def warm_tie_break_verdicts(conn, *, catalog_source: str, client, actor=None,
+                            roles: Iterable[str] = (), templates=None,
+                            max_provider_calls: int = 64) -> dict[str, int]:
+    """The ingest-tail warming pass: adjudicate every genuine tie ONCE, while the catalog is the
+    thing that just changed and the LLM machinery is already paid for. Requests then read verdicts;
+    they never dispatch (the owner's precompute goal, applied to the deliberation — the only part
+    the caching rule lets us store).
+
+    Deliberately AFTER `axis_projection` (the graph is final) and deliberately advisory: any fault
+    degrades to counted skips, and a skipped tie simply keeps today's deterministic order at
+    request time until the worker or the next warming catches it. Returns the counted account for
+    `record_stage` — `ambiguous` plus one counter per adjudication reason."""
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+    from featuregen.overlay.upload.templates import ALL_TEMPLATES, ground_all_outcomes
+
+    registry = list(ALL_TEMPLATES if templates is None else templates)
+    by_id = {t.id: t for t in registry}
+    outcomes = ground_all_outcomes(conn, registry, catalog_source=catalog_source, roles=roles)
+
+    ties: list[tuple[str, str, str, str, tuple[str, ...]]] = []
+    wanted: set[str] = set()
+    for outcome in outcomes:
+        feature = outcome.feature
+        if feature is None:
+            continue
+        template = by_id.get(outcome.template_id)
+        if template is None:
+            continue
+        needs_by_role = {n.role: n for n in template.needs}
+        for resolution in feature.binding_resolutions:
+            refs = resolution.tied_candidate_refs
+            if len(refs) < 2:
+                continue
+            need = needs_by_role.get(resolution.role)
+            if need is None:
+                continue
+            ties.append((template.id, resolution.role, need.concept, template.intent,
+                         tuple(refs)))
+            wanted.update(refs)
+
+    stats: dict[str, int] = {"ambiguous": len(ties)}
+    if not ties:
+        return stats
+    text_rows = {row[0]: row for row in conn.execute(
+        "SELECT object_ref, definition, ai_summary, semantic_terms FROM graph_node "
+        "WHERE catalog_source = %s AND kind = 'column' AND object_ref = ANY(%s)",
+        (catalog_source, sorted(wanted))).fetchall()}
+    ledger = CallLedger(max_provider_calls)
+    for template_id, role, concept_name, intent, refs in ties:
+        tied = tuple(
+            TieBreakCandidate(
+                ref=ref,
+                definition=(text_rows.get(ref) or (None, "", "", ""))[1] or "",
+                ai_summary=(text_rows.get(ref) or (None, "", "", ""))[2] or "",
+                semantic_terms=(text_rows.get(ref) or (None, "", "", ""))[3] or "")
+            for ref in refs)
+        _verdict, reason = adjudicate_tie_break(
+            conn, client, template_id=template_id, need_role=role, need_concept=concept_name,
+            intent=intent, tied=tied, actor=actor, call_ledger=ledger)
+        stats[reason] = stats.get(reason, 0) + 1
+    return stats

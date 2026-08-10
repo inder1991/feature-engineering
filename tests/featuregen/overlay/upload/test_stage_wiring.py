@@ -72,7 +72,9 @@ def test_successful_upload_records_all_stages_in_order(db):
         "table_fact_projection", "entity_bridges", "join_projection",
         "semantic_binding_projection", "join_drift",
         "stamp_reconcile",
-        "axis_projection", "enrich_summary",
+        "axis_projection",
+        # Task 2b: every genuine grounding tie adjudicated once, graph final.
+        "tie_break_warming", "enrich_summary",
         "quarantine"]
     assert _states(rec) == {
         "validation": "succeeded", "brake": "succeeded", "fact_assertion": "succeeded",
@@ -99,6 +101,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "join_drift": "disabled",
         "stamp_reconcile": "succeeded",
         "axis_projection": "succeeded",
+        "tie_break_warming": "skipped_no_client",   # Task 2b: no client in this fixture — honest skip
         "quarantine": "succeeded"}
     assert _report(rec, "fact_assertion").detail == {"asserted": 2}   # grain + availability_time
     assert _report(rec, "drift").detail == {"changed_objects": 0}
@@ -137,7 +140,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 30
+    assert len(rec.reports) == 31
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
