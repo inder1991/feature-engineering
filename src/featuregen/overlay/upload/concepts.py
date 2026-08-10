@@ -1438,6 +1438,14 @@ def _validate_alias_seam() -> None:
 _validate_alias_seam()
 
 
+def is_classifier_producible(name: str) -> bool:
+    """True when a NEW classification can produce this name today: a registry member that is NOT a
+    retired legacy alias. The recipe registry validates every ``Need`` against THIS (router plan
+    Task 1) rather than bare registry membership — a need for a retired alias passed the old check
+    and then silently never ground again, because no column could ever be classified to it."""
+    return name in CONCEPT_REGISTRY and name not in _LEGACY_ALIASES
+
+
 def canonical_concept_name(name: str) -> str:
     """The canonical registry name for a NEW selection attempt (semantic Task 2).
 

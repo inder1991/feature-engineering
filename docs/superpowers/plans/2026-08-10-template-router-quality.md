@@ -864,6 +864,21 @@ AGREED ORDER (owner-endorsed 2026-08-10; Step 0 and acceptance criteria added in
    engineering-bound). **Task 7 phase 1** (acceptance telemetry, with origin) alongside — it is a
    query, and it creates the north-star metric everything else is judged by.
 
+**Task 1 BUILT 2026-08-10, with one verified deviation from the spec's "canonicalize at import".**
+Canonicalizing `Need.concept` at construction — the spec's first suggestion — was implemented,
+run against the frozen registry-wide grounding baseline, and REJECTED by what it measured:
+`counterparty_id -> customer_id` makes `fan_in_fan_out`'s counterparty leg and entity leg the same
+concept, ties both against both columns, and merges the two party legs onto one column (a
+distinct-counterparties-per-customer feature counting each customer as their own counterparty).
+The shipped design: the AUTHORED spelling is preserved and matching is two-tier — exact authored
+match (−4, today's behaviour byte-for-byte) outranks cross-alias canonical match (−3, new) — so
+the party legs never merge, a stored-alias column keeps its binding, a fresh catalog (which can
+only store successors) still grounds through the weaker tier, and validation requires the
+CANONICAL form to be classifier-producible (the plan's named test passes; a successorless retired
+alias fails import loudly). Zero delta on the grounding-regression baseline. `Need.alternates`
+(ordered, first-match-wins, consulted only on a total primary miss) shipped alongside; no authored
+template uses it yet — the F1/R1/R6 authoring edits await SME sign-off.
+
 Task 1 (the alias hygiene) rides with whichever change first touches `templates.py`. It recovers
 ZERO templates today (measured); it prevents silent template death tomorrow.
 
@@ -883,7 +898,7 @@ ACCEPTANCE CRITERIA — a step is DONE when:
 | 4 | **BUILT 2026-08-10** (flag `FEATUREGEN_USE_CASE_ORDERING`, default OFF; shadow log-and-compare ALWAYS on — pure set math, counters `overlay.use_case_order.{changed,unchanged,unmappable}`): the template lens orders by stable descending \|use_cases ∪ {family} ∩ signed business_domain\|; equal overlap keeps registry order, so unmappable (nothing signed / zero overlap) falls back to today's order byte-for-byte — proven in test. ORDERS-never-removes encoded; LLM-origin ideas (no template) never gain rank. One `signed_reading_for` lookup feeds Task 3's window AND Task 4's domains. REMAINING: read the shadow counters on real hypotheses, then flip |
 | 5 (=4b) | **BUILT 2026-08-10** (flag `FEATUREGEN_PARAM_CHOICE`, default OFF — fully off, no shadow: unlike Task 4's free math a shadow here would COST a call per hypothesis): closed selection from the authored tuples via one governed call per build covering the cache misses only; per-template replay through `structured_result` with ABSTAINS STORED (never re-asks); off-menu answers dropped, `_bind_params` re-guards; two hypotheses → two cache keys → two parameterisations with distinct identities (the NAME carries the window — proven in test); the untaken alternatives named on the card (`param_alternatives`, populated only under the flag so flag-off snapshot bytes are unchanged); emission stays ONE card per recipe — top-K widening remains GATED on the gauntlet-cost measurement |
 | 4c | first five SME cards ground and survive the gauntlet on the live catalogs |
-| 7 | selection rate by template / use-case is a query anyone can run |
+| 7 | **PHASE 1 BUILT 2026-08-10**: `GET /contracts/selection-telemetry` — selection rate per candidate identity (the NAME carries the parameterisation) + the two-engine `by_origin` totals (recipe / llm_freeform / user_defined, the owner's origin decision), computed from the already-durable Gate-1 choice rows (a join, no new capture); counts are per-round (one identity may occupy several menu slots); zero rounds = the honest zero report. Phase 2 (feeding history into ordering) stays deferred until tens of contracts |
 
 FOUR INVARIANTS TO ENCODE, not merely observe:
 

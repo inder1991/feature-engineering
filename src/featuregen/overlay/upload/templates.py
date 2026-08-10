@@ -30,6 +30,7 @@ the honest limit is that grounding asserts intent, not enforcement.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -40,7 +41,11 @@ from itertools import product
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.column_authority import logical_ref_of
-from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept
+from featuregen.overlay.upload.concepts import (
+    canonical_concept_name,
+    concept,
+    is_classifier_producible,
+)
 from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.runtime.observability import counters
@@ -79,15 +84,32 @@ class ResolvedSourceEntityRole:
 @dataclass(frozen=True, slots=True)
 class Need:
     """One binding slot of a template — a required (or optional) concept the grounding engine must find a
-    column for. ``concept`` is a NAME that must exist in ``CONCEPT_REGISTRY`` (validated at import)."""
+    column for. ``concept`` must resolve, THROUGH the one alias seam, to a name the classifier can
+    PRODUCE today (router plan Task 1; validated at import) — bare registry membership let a need
+    target a retired alias with no successor and silently never ground again.
+
+    The AUTHORED spelling is preserved deliberately (verified against the registry-wide grounding
+    baseline before choosing): canonicalizing ``counterparty_id`` -> ``customer_id`` at
+    construction would make `fan_in_fan_out`'s counterparty leg and entity leg the SAME concept
+    and merge their bindings onto one column. Instead, matching is two-tier
+    (:func:`_candidate_score`): an exact authored match outranks a cross-alias canonical match, so
+    the counterparty leg still prefers a stored-alias column where one exists, while a FRESH
+    catalog (whose enrichment can only write successors) still grounds through the canonical tier.
+
+    ``alternates`` (SME triage F1): ordered fallback concepts, FIRST MATCH WINS — tried only when
+    the primary finds no column at all. ``tenure_days``' author wanted
+    ``(origination_date, effective_date)`` and could only write it as a comment; the one-concept
+    Need is why that template binds KYC dates while true origination columns sit unused. The
+    primary stays the need's identity everywhere (keys, metadata derivation, dispositions)."""
     role: str            # binding slot, e.g. "stock_col", "asof", "entity", "flow_col", "event_ts"
-    concept: str         # required concept NAME (must exist in CONCEPT_REGISTRY)
+    concept: str         # required concept NAME (authored; must canonicalize to a producible name)
     optional: bool = False
     # ── 3B.1 cross-catalog binding metadata (optional; need_metadata derives the unset ones) ──
     allowed_source_grains: tuple[str, ...] = ()   # acceptable source grains; () = unconstrained
     join_role: JoinRole | None = None             # explicit override; None -> derived (NEVER tuple position)
     temporal_role: TemporalRole | None = None     # explicit override; None -> derived from concept.pit_role
     distinct_binding_group: str | None = None     # members must bind different physical columns
+    alternates: tuple[str, ...] = ()              # ordered fallback concepts; first match wins
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,11 +320,22 @@ def _candidate_score(conn, col: _Col, need: Need, *, prefer_table: str | None) -
     want_as_of = bool(expected and expected.pit_role == "as_of")
     want_entity = bool(expected and expected.entity_link)
     score = 0
+    # Task 1 two-tier concept match. Tier 1 (-4): the column's STORED concept equals the need's
+    # AUTHORED spelling — today's behaviour, byte-identical for every unaliased pairing. Tier 2
+    # (-3): the two spellings meet through the one alias seam (`counterparty_id` stored yesterday
+    # satisfies an authored `customer_id`, and vice versa) — WEAKER on purpose: where a template
+    # authored the alias to mean a distinct PARTY LEG (fan_in_fan_out), the exact column still
+    # outranks the cross-alias one, so the two legs never merge onto one column; and where only
+    # one spelling exists in the catalog, the recipe still grounds instead of silently dying.
+    concept_match = 0
     if col.concept == need.concept:
-        score -= 4
+        concept_match = -4
+    elif col.concept and canonical_concept_name(col.concept) == canonical_concept_name(need.concept):
+        concept_match = -3
+    score += concept_match
     if want_as_of and col.is_as_of:
         score -= 2
-    if want_entity and col.concept != need.concept and col.is_grain:
+    if want_entity and concept_match == 0 and col.is_grain:
         entity = effective_entity(conn, col.catalog_source, col.object_ref)
         if entity.authority == GOVERNED_ENTITY and entity.entity == expected.entity_link:
             score -= 2
@@ -313,18 +346,28 @@ def _candidate_score(conn, col: _Col, need: Need, *, prefer_table: str | None) -
 
 def _ranked_matches(conn, cols: Sequence[_Col], need: Need, *,
                     prefer_table: str | None = None) -> tuple[list[tuple[int, _Col]], bool]:
-    ranked = [
-        (score, col)
-        for col in cols
-        if (score := _candidate_score(
-            conn, col, need, prefer_table=prefer_table)) is not None
-    ]
-    ranked.sort(key=lambda item: (
-        item[0], item[1].table, item[1].column, item[1].object_ref))
-    return (
-        ranked[:MAX_GROUNDING_CANDIDATES_PER_NEED],
-        len(ranked) > MAX_GROUNDING_CANDIDATES_PER_NEED,
-    )
+    # Task 1 alternates: FIRST MATCH WINS — the primary concept is tried exactly as always, and an
+    # alternate is consulted only when the concept before it yielded NOTHING (an alternate never
+    # competes with or widens a primary that matched). A need with no alternates (all 157 authored
+    # templates today) takes the identical single pass.
+    for concept_name in (need.concept, *need.alternates):
+        probe = (need if concept_name == need.concept
+                 else dataclasses.replace(need, concept=concept_name, alternates=()))
+        ranked = [
+            (score, col)
+            for col in cols
+            if (score := _candidate_score(
+                conn, col, probe, prefer_table=prefer_table)) is not None
+        ]
+        if not ranked:
+            continue
+        ranked.sort(key=lambda item: (
+            item[0], item[1].table, item[1].column, item[1].object_ref))
+        return (
+            ranked[:MAX_GROUNDING_CANDIDATES_PER_NEED],
+            len(ranked) > MAX_GROUNDING_CANDIDATES_PER_NEED,
+        )
+    return [], False
 
 
 def _match(conn, cols: Sequence[_Col], need: Need, *,
@@ -4781,9 +4824,16 @@ def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[
             raise ValueError(f"template {t.id!r} has duplicate need roles")
         distinct_groups: dict[str, list[str]] = {}
         for need in t.needs:
-            if need.concept not in CONCEPT_REGISTRY:
-                raise ValueError(
-                    f"template {t.id!r} need {need.role!r} references unknown concept {need.concept!r}")
+            # Task 1: producible-by-the-classifier-TODAY (through the alias seam), not bare
+            # registry membership — the registry keeps retired aliases (byte-stable fact keys), so
+            # the old check let a need target one and silently never ground again. An authored
+            # alias WITH a successor passes (matching handles both spellings); a successorless
+            # retired alias or an unknown name fails loudly here.
+            for concept_name in (need.concept, *need.alternates):
+                if not is_classifier_producible(canonical_concept_name(concept_name)):
+                    raise ValueError(
+                        f"template {t.id!r} need {need.role!r} references concept "
+                        f"{concept_name!r}, which no fresh classification can produce")
             if need.distinct_binding_group is not None:
                 if not need.distinct_binding_group.strip():
                     raise ValueError(
