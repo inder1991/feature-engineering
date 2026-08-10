@@ -186,6 +186,10 @@ _STRUCTURAL_META_KEYS = frozenset({
     # ...and its three sibling tokens: a registry template id, an authored need role, a registry
     # concept name — closed-vocabulary platform values, never uploader text.
     "template_id", "need_role", "need_concept",
+    # Task 3 near-label critic: the signed label window in days — a bounded integer off
+    # contract_intent (migration 1059), human-confirmed at intake; never text. The candidate card
+    # rides the `candidates` class above; the hypothesis rides `objective` (already redacted).
+    "label_window_days",
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
@@ -1519,6 +1523,16 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         },
         "required": ["target_ref", "target_window_days", "target_type", "business_domain",
                      "confidence"]},
+    # Task 3 — the near-label critic's closed verdict vocabulary. Deliberately NO token that reads
+    # as "cleared" (no_finding ≠ clearance); the enum is re-validated code-side and an off-enum
+    # answer degrades to abstain.
+    ("near_label_verdict", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "verdict": {"type": "string", "enum": ["no_finding", "too_close", "abstain"]},
+            "rationale": {"type": "string", "maxLength": 600},
+        },
+        "required": ["verdict", "rationale"]},
     ("overlay_tie_break", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {

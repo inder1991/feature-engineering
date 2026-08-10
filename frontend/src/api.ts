@@ -317,6 +317,11 @@ export interface FeatureIdea {
   rationale: string
   // The critic's dissent note when it flagged but did not block the idea; "" when clean.
   critic_note: string
+  // Task 3 near-label critic (flag-only, origin-blind): {no_finding | too_close | abstain},
+  // absent when the critic did not run. Deliberately no value that reads as "cleared" — the
+  // critic cannot clear anything. Only `too_close` renders a warning; nothing is ever removed.
+  near_label_verdict?: 'no_finding' | 'too_close' | 'abstain' | null
+  near_label_rationale?: string
 }
 
 // One gauntlet rejection, shown to the human, never hidden. `code` carries the backend's

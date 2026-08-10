@@ -25,7 +25,13 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_to_json,
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
+from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
+from featuregen.overlay.upload.contract.near_label_critic import (
+    annotate_near_label,
+    near_label_critic_enabled,
+)
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
+from featuregen.overlay.upload.enrich_batch import CallLedger
 from featuregen.overlay.upload.feature_assist import (
     ExternalRequirementPreview,
     FeatureIdea,
@@ -86,6 +92,7 @@ from featuregen.overlay.upload.templates import (
 from featuregen.overlay.upload.templates import (
     ground_all_outcomes as _ground_all_default,
 )
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +191,10 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 # whole ALL_TEMPLATES registry (every family), and grounding is the router — a family surfaces ONLY where
 # its distinctive concepts exist in the catalog (a churn-shaped catalog yields exactly the churn lens).
 _MAX_RATIONALE = 200
+# Task 3: the near-label critic's per-build spend ceiling. Verdicts are content-addressed, so a
+# steady-state build replays for free; the ceiling only bites on a cold, unusually wide set — where
+# the overflow candidates abstain honestly rather than dispatch unboundedly.
+_NEAR_LABEL_MAX_CALLS = 24
 
 
 def _operand_roles(gf: GroundedFeature) -> tuple[tuple[str, str], ...]:
@@ -383,6 +394,42 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
 # Normal release mode always narrows to the supplied applicability. The old applicability flag is read
 # only in the explicit legacy_unscoped emergency mode. The narrowing never widens and never relaxes
 # grounding safety.
+def _use_case_ordering_enabled() -> bool:
+    """Task 4 — ORDER the template lens by the signed reading's business_domain. Log-and-compare
+    always runs (pure set math, counters only); the flag gates whether the order is APPLIED.
+    Default OFF: byte-identical."""
+    return os.environ.get("FEATUREGEN_USE_CASE_ORDERING", "0") == "1"
+
+
+def order_ideas_by_use_case(ideas: list[FeatureIdea],
+                            domains: tuple[str, ...]) -> list[FeatureIdea]:
+    """Task 4's whole ranking step — deterministic set intersection, NO model. Stable descending
+    sort on |template.use_cases ∪ {family} ∩ signed business_domain|: equal-overlap ideas keep
+    today's registry order EXACTLY, so an unmappable hypothesis (no signed domains, or nothing
+    overlaps) provably falls back to today's order. ORDERS, never removes — THE RULE: the
+    hypothesis may remove a recipe only for being unsafe, never for being irrelevant. Shadow
+    counters always fire; the reordered list is returned only under the flag."""
+    domain_set = frozenset(domains)
+    by_id = {t.id: t for t in ALL_TEMPLATES}
+
+    def _overlap(idea: FeatureIdea) -> int:
+        template = by_id.get(idea.recipe_id) if idea.recipe_id else None
+        if template is None:
+            return 0
+        return len((set(template.use_cases) | {template.family}) & domain_set)
+
+    if not domain_set:
+        counters.incr("overlay.use_case_order.unmappable")
+        return ideas
+    ordered = sorted(ideas, key=lambda i: -_overlap(i))   # stable: ties keep registry order
+    if all(_overlap(i) == 0 for i in ideas):
+        counters.incr("overlay.use_case_order.unmappable")
+        return ideas
+    changed = [i.name for i in ordered] != [i.name for i in ideas]
+    counters.incr(f"overlay.use_case_order.{'changed' if changed else 'unchanged'}")
+    return ordered if _use_case_ordering_enabled() else ideas
+
+
 def _intent_scoped_applicability_enabled() -> bool:
     """Release mode always enforces scoped applicability.
 
@@ -694,6 +741,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     recorded on the contract_considered row (see :func:`_persist_considered_snapshot`). On a READ
     COMMITTED connection no snapshot is taken (additive — the lineage columns stay NULL)."""
     persist_intent(conn, intent, target_ref)
+    # The intake build's SIGNED reading, fetched once for its two consumers here: the use-case
+    # ordering reads business_domain (Task 4), the near-label critic reads the window (Task 3).
+    # None on the legacy path / unsigned round — both consumers degrade (today's order; abstain).
+    signed_reading = signed_reading_for(
+        conn, hypothesis=intent.hypothesis, intake_mode=intent.intake_mode,
+        actor_json=_actor_json(intent.actor))
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
     # so a required-but-ignored field (bug_003) now actually shapes generation.
@@ -729,7 +782,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         recipe_grounding_context_by_candidate_key = candidates.contexts
         recipe_candidate_keys_by_recipe_id = candidates.keys_by_recipe
         if candidates.ideas:
-            alternatives.append(FeatureSet(lens="templates", features=candidates.ideas))
+            # Task 4: the template lens is ORDERED by the signed reading's business_domain —
+            # deterministic set intersection, shadow-counted always, applied only under
+            # FEATUREGEN_USE_CASE_ORDERING. Removes nothing by construction.
+            alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
+                candidates.ideas,
+                signed_reading["business_domain"] if signed_reading else ())))
         rejections.extend(candidates.rejections)
     elif is_live:
         # 3C.2a — the LIVE governed cross-catalog lens (entity-scoped: no single catalog to ground on).
@@ -769,6 +827,24 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             rejections.append({"name": anchor.name, "reason": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
                                "code": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED})
             anchor = None
+    # Task 3 — the near-label critic, FLAG-ONLY and ORIGIN-BLIND: every surviving candidate (anchor
+    # included, template and LLM alike) gets a {no_finding | too_close | abstain} annotation;
+    # nothing is removed (relevance is ORDER, safety is REMOVAL — and this pass is advisory until
+    # the explicit refusal decision). Flag off = byte-identical. The label window is the intake
+    # build's SIGNED reading — no signed window means every verdict abstains at zero model cost.
+    if near_label_critic_enabled():
+        window = signed_reading["target_window_days"] if signed_reading else None
+        ledger = CallLedger(max_provider_calls=_NEAR_LABEL_MAX_CALLS)
+        alternatives = [
+            replace(fs, features=annotate_near_label(
+                conn, client, ideas=fs.features,
+                redacted_hypothesis=intent.redacted_hypothesis,
+                label_window_days=window, call_ledger=ledger))
+            for fs in alternatives]
+        if anchor is not None:
+            anchor = annotate_near_label(
+                conn, client, ideas=[anchor], redacted_hypothesis=intent.redacted_hypothesis,
+                label_window_days=window, call_ledger=ledger)[0]
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
@@ -886,6 +962,13 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
         d["physical_plan_id"] = f.physical_plan_id
     if f.planner_declaration_id is not None:
         d["planner_declaration_id"] = f.planner_declaration_id
+    # Task 3: only-when-present, same byte-identity strategy as every additive key above. The
+    # verdict is ADVISORY card metadata; it round-trips so the Gate-1 reload shows what the
+    # reviewer saw, and it participates in option identity exactly because it is part of the
+    # reviewed artifact.
+    if f.near_label_verdict is not None:
+        d["near_label_verdict"] = f.near_label_verdict
+        d["near_label_rationale"] = f.near_label_rationale
     return d
 
 
@@ -1124,7 +1207,9 @@ def _idea_from_json(d: dict) -> FeatureIdea:
             str(r) for r in d.get("personal_data_policy_revision_ids", ())),
         planner_applicability=d.get("planner_applicability", "not_applicable_nonrecipe"),
         physical_plan_id=d.get("physical_plan_id"),
-        planner_declaration_id=d.get("planner_declaration_id"))
+        planner_declaration_id=d.get("planner_declaration_id"),
+        near_label_verdict=d.get("near_label_verdict"),
+        near_label_rationale=d.get("near_label_rationale", ""))
 
 
 def _chosen_feature_from_snapshot(

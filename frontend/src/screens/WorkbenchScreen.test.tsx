@@ -2426,3 +2426,27 @@ describe('Intake target confirmation', () => {
     expect(contractConsideredSet).toHaveBeenCalled()
   })
 })
+
+// ---------------------------------------------- Task 3: the near-label chip (flag-only) ----
+describe('near-label verdict chip', () => {
+  it('too_close renders the warning chip and its rationale — and nothing is removed', async () => {
+    await renderAndGenerate([
+      { ...IDEA, near_label_verdict: 'too_close', near_label_rationale: '≈ the 90-day label' },
+      OTHER_IDEA,
+    ])
+    expect(await screen.findByText('⚠ near label')).toBeInTheDocument()
+    expect(screen.getByText(/Near-label check: ≈ the 90-day label/)).toBeInTheDocument()
+    // flag-only: the flagged candidate is still on the list, selectable like any other
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
+  })
+
+  it('no_finding is NOT a clearance — no chip renders for it or for abstain', async () => {
+    await renderAndGenerate([
+      { ...IDEA, near_label_verdict: 'no_finding', near_label_rationale: 'ordinary predictor' },
+      { ...OTHER_IDEA, near_label_verdict: 'abstain', near_label_rationale: 'cannot tell' },
+    ])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText('⚠ near label')).toBeNull()
+    expect(screen.queryByText(/Near-label check/)).toBeNull()
+  })
+})

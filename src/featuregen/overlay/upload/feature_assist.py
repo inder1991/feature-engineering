@@ -1715,6 +1715,14 @@ class FeatureIdea:
     #
     #    Sorted + deduped so the frozen dataclass stays deterministic and hashable.
     personal_data_policy_revision_ids: tuple[str, ...] = ()
+    # ── Task 3 (router-quality plan): the near-label critic's ADVISORY verdict on this candidate.
+    #    Closed vocabulary {no_finding | too_close | abstain} — deliberately no token that reads as
+    #    "cleared", because this critic must be INCAPABLE of clearing anything (LLM output never
+    #    clears a design check). None = the critic did not run (flag off / pre-Task-3 snapshot) —
+    #    honest absence, rendered as today's warning chip. FLAG-ONLY: nothing reads these to remove
+    #    a candidate; they annotate the card and the considered set.
+    near_label_verdict: str | None = None
+    near_label_rationale: str = ""
     # ── Task 2A: the DECISION TRACE this candidate's validation produced (freeze 0F-7 P1) ──
     #    Defaulted last and never serialized: it is TRANSIENT CARRY from the gauntlet to the
     #    projection built in the same call. A persisted-and-reloaded idea has None here, which is

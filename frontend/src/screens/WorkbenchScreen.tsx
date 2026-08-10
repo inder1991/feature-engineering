@@ -2466,10 +2466,22 @@ export function WorkbenchScreen() {
                       {c.kind === 'generated' && refine.appliedRound !== null && (
                         <span className="badge revised">Revised · R{refine.appliedRound}</span>
                       )}
+                      {/* Task 3 near-label critic: FLAG-ONLY. Only too_close renders — a warning
+                          the human weighs, never a removal. no_finding is not a clearance (no
+                          chip); abstain is honest absence. */}
+                      {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close' && (
+                        <span className="badge stale">⚠ near label</span>
+                      )}
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
                     {c.kind === 'generated' && c.idea.rationale && (
                       <p style={{ color: 'var(--ink-soft)' }}>Why: {c.idea.rationale}</p>
+                    )}
+                    {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close'
+                      && c.idea.near_label_rationale && (
+                      <p style={{ color: 'var(--ink-soft)' }} role="note">
+                        Near-label check: {c.idea.near_label_rationale}
+                      </p>
                     )}
                     <dl className="kv">
                       <div>

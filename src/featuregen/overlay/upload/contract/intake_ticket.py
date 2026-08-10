@@ -232,6 +232,34 @@ def target_reading(conn, intent_id: str) -> dict | None:
             "target_confirmed_by": row[5]}
 
 
+def signed_reading_for(conn, *, hypothesis: str, intake_mode: str,
+                       actor_json: str) -> dict | None:
+    """The SIGNED reading for this (hypothesis, mode, actor) — the consumers' join point: the
+    near-label critic reads ``target_window_days``, the use-case ordering reads
+    ``business_domain``. Looked up by the same per-actor identity the intake and recognitions
+    routes dedup on (NOT by intent_id: the legacy considered-set path mints a fresh intent per
+    call, while the signed reading lives on the earliest deduped row). Only a reading a HUMAN
+    stood behind counts (provenance recorded); None = not declared — every consumer must degrade
+    (abstain / today's order) on it, never guess."""
+    row = conn.execute(
+        "SELECT target_ref, target_window_days, target_type, business_domain, target_provenance "
+        "FROM contract_intent "
+        "WHERE hypothesis = %s AND intake_mode = %s AND actor = %s::jsonb "
+        "AND target_provenance IS NOT NULL ORDER BY created_at ASC LIMIT 1",
+        (hypothesis, intake_mode, actor_json)).fetchone()
+    if row is None:
+        return None
+    return {"target_ref": row[0], "target_window_days": row[1], "target_type": row[2],
+            "business_domain": tuple(row[3] or ()), "target_provenance": row[4]}
+
+
+def signed_label_window(conn, *, hypothesis: str, intake_mode: str, actor_json: str) -> int | None:
+    """The near-label critic's one data input — a thin view over :func:`signed_reading_for`."""
+    reading = signed_reading_for(conn, hypothesis=hypothesis, intake_mode=intake_mode,
+                                 actor_json=actor_json)
+    return reading["target_window_days"] if reading else None
+
+
 def is_readable_column(conn, ref: str, *, roles: Iterable[str],
                        catalog_source: str | None = None) -> bool:
     """Membership check for a human-supplied target: a READ-SCOPED column node with this ref exists.
