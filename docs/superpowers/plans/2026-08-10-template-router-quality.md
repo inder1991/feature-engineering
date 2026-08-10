@@ -27,6 +27,62 @@ hypothesis/contract flow (`build_considered_set`) is where a question arrives an
 "same 23 features for every hypothesis" complaint is actually answered: Tasks 4 and 4b act THERE.
 Tasks 2/2b (binding correctness) and 4c (new recipes) improve both surfaces.
 
+## The process after this plan — plain-language walkthrough (owner-validated 2026-08-10)
+
+The canonical end-to-end description, kept in the plan so every reader — SME, product, engineering —
+shares one picture. **[code]** = deterministic · **[AI]** = model · **[human]** = a person.
+
+**At upload, once (the prep shift):**
+
+* **A1. Label everything** [AI, code-validated] — concept + one-line summary per column; critic
+  reviews high-impact labels; `unclassified` is a legal answer.
+* **A2. Make the judgement calls, pin them up** [AI, once] — ground all recipes transiently, find
+  the genuine ties, decide each ONCE with a written reason, store under content fingerprints
+  (`structured_result`), discard the trial grounding (the caching rule: keep only the thinking).
+* **A3. Registry health** — the SME cards, the `Need` fixes, the `tran_time`-class reclassifications.
+
+**Per hypothesis:**
+
+* **B1. Read the question — ALWAYS** [AI, one cached call] — the mandatory intake read fills the
+  full ticket: target column, label window, target type, business domain. A literally-typed column
+  name is PINNED (the model cannot override it; a name-vs-prose disagreement becomes a confirm-screen
+  warning).
+* **B2. Human approves the target** [human] — Yes / Change (ranked runners-up) / Just exploring
+  (near-label candidates withheld). On confirm: a recorded human decision.
+* **B3. Fresh glance** [code, ms] — ground the registry against the live catalog. Never stored; a
+  curator's correction is visible to the next request automatically.
+* **B4. Read the pinned judgements** [code] — tied bindings resolve by verdict lookup, rationale
+  attached; a fingerprint miss falls back to deterministic order for one request while the worker
+  re-adjudicates (curator "Re-adjudicate now" button skips even that wait).
+* **B5. Gauntlet** [code] — unchanged checks; a refused winner re-binds to the runner-up; every
+  rejection carries a reason code.
+* **B6. Leakage** [code + AI flag-only] — the veto removes anything built on the confirmed target
+  (string match). The near-label critic answers ONE fenced question: *"is this feature the user's
+  label definition in disguise?"* — `dormancy_days` (days since activity) vs a 90-day-inactivity
+  churn label is the canonical catch; `txn_frequency_trend` (related, not identical) is the
+  canonical pass. Verdicts `no_finding | too_close | abstain`; `too_close` can only ADD a warning.
+* **B7. Order the menu** [code — no fresh AI] — B1's `business_domain` already translated the
+  user's words to the experts' tags; B7 is set-intersection against each card's `use_cases` and a
+  sort. Ordering never removes.
+* **B8. Tune the settings** [AI, closed choice, cached] — pick WHICH of the SME-authored parameter
+  values fits this question (churn → the 90-day window; structuring → the 30-day). Off-list values
+  are rejected by `_bind_params`; the model cannot invent a setting.
+* **B9. Record the choice** [code] — Gate-1 selections land per recipe/domain: the feedback signal
+  and, with B2's corrections, the metric set that gates every future upgrade.
+
+**The fenced-question summary — the AI's entire request-time role:**
+
+| step | the AI's one question | it can never |
+|---|---|---|
+| B1 | "what is this question's target, window, type, domain?" | override a typed name; skip the human gate |
+| B6 | "is this feature the answer in disguise?" | approve — warnings only |
+| B7 | (answered in B1) "which expert tags match these words?" | remove — order only |
+| B8 | "which of the allowed settings fits?" | invent a setting — list only |
+
+The model translates and judges MEANING — the one thing code cannot do — inside boxes whose walls
+are all code. Everything repeatable is code; everything the model produces is validated, human-gated
+where it matters, and recorded.
+
 ## The funnel, measured
 
 ```
