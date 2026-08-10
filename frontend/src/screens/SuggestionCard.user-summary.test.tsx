@@ -89,3 +89,83 @@ describe('SuggestionCard end-user summary', () => {
       .toBeGreaterThan(0)
   })
 })
+
+// ── contract v3 (BR-8): the execution-readiness axis ────────────────────────────────────────────
+describe('SuggestionCard execution readiness (contract v3)', () => {
+  const block = (over: Partial<NonNullable<import('../api').SuggestionExecutionBlock>> = {}) => ({
+    recipe_contract_version: 'legacy-template',
+    computation_kind: 'conceptual_pattern',
+    execution_readiness: 'UNASSESSED',
+    readiness_blockers: [],
+    binding_ambiguity: false,
+    ...over,
+  })
+
+  it('renders NOTHING readiness-shaped on a v2 page, where the block is absent', () => {
+    render(<ul><SuggestionCard hit={hit({ display_name: 'v2_card' })} /></ul>)
+    const card = screen.getByRole('heading', { name: 'v2_card' }).closest('.sfc') as HTMLElement
+    expect(within(card).queryByText(/execution not assessed/)).toBeNull()
+    expect(within(card).queryByText(/Execution readiness/)).toBeNull()
+  })
+
+  it('renders UNASSESSED as an idea — never a failure, never the success fill', async () => {
+    render(
+      <ul>
+        <SuggestionCard hit={hit({ display_name: 'idea_card', execution: block() })} />
+      </ul>,
+    )
+    const card = screen.getByRole('heading', { name: 'idea_card' }).closest('.sfc') as HTMLElement
+    const chip = within(card).getByText('idea — execution not assessed')
+    // The quiet tone: no green "good to go" for a state that only means "nobody decided yet",
+    // and no amber either — an idea is not a defect.
+    expect(chip.className).toContain('gj-none')
+    expect(chip.className).not.toContain('gj-verified')
+    await userEvent.click(within(card).getByRole('button', { name: /full detail/i }))
+    expect(within(card).getByText(/that is a to-do, not/)).toBeInTheDocument()
+  })
+
+  it('explains each blocker in banking words and keeps the machine code beside it', async () => {
+    render(
+      <ul>
+        <SuggestionCard
+          hit={hit({
+            display_name: 'authorable_card',
+            execution: block({
+              computation_kind: 'deterministic_formula',
+              execution_readiness: 'FORMULA_AUTHORABLE',
+              readiness_blockers: [
+                { code: 'gold_evaluation_unproven', group: 'formula_capability' },
+              ],
+            }),
+          })}
+        />
+      </ul>,
+    )
+    const card = screen.getByRole('heading', { name: 'authorable_card' })
+      .closest('.sfc') as HTMLElement
+    expect(within(card).getByText('formula authorable')).toBeInTheDocument()
+    await userEvent.click(within(card).getByRole('button', { name: /full detail/i }))
+    expect(within(card)
+      .getByText(/worked examples that prove this formula have not been run/))
+      .toBeInTheDocument()
+    // The audit half of the rule: the machine code never disappears behind the words.
+    expect(within(card).getByText('gold_evaluation_unproven')).toBeInTheDocument()
+    expect(within(card).getByText(/formula capability/)).toBeInTheDocument()
+  })
+
+  it('renders an unknown future state as words rather than crashing', () => {
+    render(
+      <ul>
+        <SuggestionCard
+          hit={hit({
+            display_name: 'future_card',
+            execution: block({ execution_readiness: 'SHADOW_PROVEN' }),
+          })}
+        />
+      </ul>,
+    )
+    const card = screen.getByRole('heading', { name: 'future_card' })
+      .closest('.sfc') as HTMLElement
+    expect(within(card).getByText('shadow proven')).toBeInTheDocument()
+  })
+})

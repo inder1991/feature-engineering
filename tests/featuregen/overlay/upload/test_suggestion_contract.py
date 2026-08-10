@@ -58,8 +58,11 @@ from featuregen.overlay.upload.suggestion_contract import (
     WARNING_CODES,
     SuggestionV1ReconstructionError,
     SuggestionWarningV1,
+    blocker_group_v3,
+    execution_block_v3,
     is_family_derived_category,
     page_to_json,
+    page_to_json_v3,
     to_table_suggestions_v1,
 )
 from featuregen.overlay.upload.suggestion_taxonomy import (
@@ -1633,3 +1636,59 @@ def test_the_wire_keeps_every_evidence_axis_on_an_attributed_value(overlay_conn,
                            "source_refs"}
     assert family["evidence"] and set(family["evidence"][0]) == {
         "producer", "strength", "lifecycle", "producer_ref", "evidence_id"}
+
+
+# ── contract v3 (BR-8): the execution block ─────────────────────────────────────────────────────
+def test_a_plain_legacy_template_is_an_unassessed_idea_never_a_failure():
+    """UNASSESSED means "nobody decided yet" — an idea, carried with ZERO blockers, because the
+    absence of a review is not a defect of the suggestion. Its computation kind is the adapter's
+    honest word: a conceptual pattern."""
+    block = execution_block_v3("txn_count_90d", "exact")
+    assert block == {"recipe_contract_version": "legacy-template",
+                     "computation_kind": "conceptual_pattern",
+                     "execution_readiness": "UNASSESSED",
+                     "readiness_blockers": [],
+                     "binding_ambiguity": False}
+
+
+def test_a_reviewed_expectation_anchor_enters_the_fold_and_rests_authorable():
+    """The two expectation-holding anchors are not ideas — a reviewed formula expectation exists,
+    the grammar accepts it, and the ONLY thing between them and validated is the gold gate, named
+    as such and grouped as formula capability."""
+    for recipe_id in ("merchant_mcc_diversity", "obligor_facility_count"):
+        block = execution_block_v3(recipe_id, "exact")
+        assert block["execution_readiness"] == "FORMULA_AUTHORABLE"
+        assert block["computation_kind"] == "deterministic_formula"
+        assert block["readiness_blockers"] == [
+            {"code": "gold_evaluation_unproven", "group": "formula_capability"}]
+
+
+def test_an_ambiguous_binding_blocks_an_expectation_anchor_with_the_fact_named():
+    """The engine's own binding verdict is a BR-7 fold input: an ambiguous resolution cannot be
+    authored over, and the blocker says so in the data-meaning group while `binding_ambiguity`
+    carries the flag the card renders."""
+    block = execution_block_v3("merchant_mcc_diversity", "ambiguous")
+    assert block["execution_readiness"] == "FORMULA_BLOCKED"
+    assert block["binding_ambiguity"] is True
+    assert block["readiness_blockers"] == [
+        {"code": "ambiguous_operand_binding", "group": "data_meaning"}]
+
+
+def test_an_unmapped_blocker_code_lands_in_governance_not_a_crash():
+    """The grouping is display taxonomy, not authority: a code the map does not know means a human
+    needs to look, which is what the governance group says."""
+    assert blocker_group_v3("some_future_code") == "governance"
+    assert blocker_group_v3("engine_capability_unproven") == "execution"
+
+
+def test_v3_decorates_a_copy_of_the_v2_page_and_tallies_what_it_added(overlay_conn, ftr_catalog):
+    """page_to_json_v3 = page_to_json + additive truth. Deleting the additions restores the v2
+    payload EXACTLY, and the tally counts precisely the blocks it attached."""
+    page = _page(overlay_conn)
+    v2, v3 = page_to_json(page), page_to_json_v3(page)
+    assert v3["contract_version"] == 3
+    assert sum(v3["readiness_counts"].values()) == len(v3["hits"]) == len(v2["hits"]) >= 1
+    for hit in v3["hits"]:
+        hit["suggestion"].pop("execution")
+    del v3["contract_version"], v3["readiness_counts"]
+    assert v3 == v2

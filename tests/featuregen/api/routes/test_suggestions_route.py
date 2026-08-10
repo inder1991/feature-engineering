@@ -255,6 +255,50 @@ def test_the_v1_body_matches_its_declared_response_model_exactly(client, ftr_cat
     assert suggestions_route.TableSuggestionsV1Response.model_validate(body)
 
 
+def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  # noqa: F811
+    """BR-8. Contract v3 must be asked for deliberately, and what it adds is exactly three things:
+    the page's own declared version, one `execution` block per hit, and the readiness tally. The
+    rest of the page is the v2 payload UNCHANGED — proven by deleting the additions and comparing
+    equal — so v3 can never drift into a re-rendering that happens to agree today."""
+    v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
+    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
+    assert v3["contract_version"] == 3
+    assert set(v3) - set(v2) == {"contract_version", "readiness_counts"}
+
+    tally: dict[str, int] = {}
+    for hit in v3["hits"]:
+        block = hit["suggestion"].pop("execution")
+        state = block["execution_readiness"]
+        tally[state] = tally.get(state, 0) + 1
+        # Every card declares what it IS: today's whole legacy registry projects conceptual-only
+        # ideas (UNASSESSED — "nobody decided yet", carried with ZERO blockers because an idea is
+        # not a failure) except the reviewed expectation anchors, which enter BR-7's fold.
+        assert block["recipe_contract_version"] == "legacy-template"
+        if block["execution_readiness"] == "UNASSESSED":
+            assert block["computation_kind"] == "conceptual_pattern"
+            assert block["readiness_blockers"] == []
+        else:
+            assert block["computation_kind"] == "deterministic_formula"
+            assert all(b["code"] and b["group"] for b in block["readiness_blockers"])
+    assert v3["readiness_counts"] == tally and sum(tally.values()) == len(v3["hits"])
+
+    del v3["contract_version"], v3["readiness_counts"]
+    assert v3 == v2
+
+
+def test_v2_carries_no_execution_key_ever(client, ftr_catalog):  # noqa: F811
+    """The frozen side of BR-8: v1 and v2 clients see not one new byte. The v1 default already has
+    its own byte-stability test above; this pins the v2 page."""
+    v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
+    assert "contract_version" not in v2 and "readiness_counts" not in v2
+    assert all("execution" not in hit["suggestion"] for hit in v2["hits"])
+
+
+def test_the_v3_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811
+    body = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
+    assert suggestions_route.FeatureSuggestionPageV3Response.model_validate(body)
+
+
 def test_an_unknown_table_stays_a_200_payload_state_in_v2(client, ftr_catalog):  # noqa: F811
     """The honesty rule survives the new contract: "this catalog does not hold that table" is data,
     never an error, and the requested string is echoed verbatim."""
@@ -267,7 +311,7 @@ def test_an_unknown_table_stays_a_200_payload_state_in_v2(client, ftr_catalog): 
     assert r.json()["hits"] == [] and collection["neighbourhood"]["max_hops"] == 1
 
 
-@pytest.mark.parametrize("version", [0, 3, 99, -1])
+@pytest.mark.parametrize("version", [0, 4, 99, -1])
 def test_an_unsupported_integer_version_is_a_typed_422(client, version):
     """The typed error contract (0F-12). The bound is deliberately NOT on the query parameter: a
     FastAPI `le=2` would reject the request before the handler ran, so this machine-readable code

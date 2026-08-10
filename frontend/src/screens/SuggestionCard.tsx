@@ -172,6 +172,65 @@ const DISPOSITION_WORDS: Record<string, string> = {
   unclassified: 'unclassified',
 }
 
+// BR-8 contract v3: execution readiness in words — a SEPARATE axis from the design-check badge
+// beside it. "Idea" language for UNASSESSED/CONCEPTUAL_ONLY, because a pattern nobody assessed
+// for execution is honest output, not a failure; blocked states name the fact; and NOTHING here
+// gets the success fill — even ready-to-materialize stays a quiet chip whose words carry it.
+const READINESS_WORDS: Record<string, string> = {
+  UNASSESSED: 'idea — execution not assessed',
+  CONCEPTUAL_ONLY: 'conceptual pattern',
+  FORMULA_BLOCKED: 'formula blocked',
+  FORMULA_AUTHORABLE: 'formula authorable',
+  FORMULA_VALIDATED: 'formula validated',
+  MATERIALIZATION_BLOCKED: 'materialization blocked',
+  MATERIALIZATION_READY: 'ready to materialize',
+  RETIRED: 'retired',
+}
+
+const READINESS_TONE: Record<string, string> = {
+  FORMULA_BLOCKED: 'gj-partial',
+  MATERIALIZATION_BLOCKED: 'gj-partial',
+}
+
+// A newer backend's enum member renders as its de-underscored words, never a crash and never a
+// blank chip (the v3 compatibility rule, pinned by test).
+function readinessWords(state: string): string {
+  return READINESS_WORDS[state] ?? state.toLowerCase().replace(/_/g, ' ')
+}
+
+const COMPUTATION_KIND_WORDS: Record<string, string> = {
+  conceptual_pattern: 'a conceptual pattern — a useful idea, not an exact computation',
+  deterministic_formula: 'an exact deterministic formula',
+  governed_model_output: 'a governed model output',
+}
+
+// Each blocker in banking language; the machine code stays beside it for the auditor. An unknown
+// code renders its de-underscored words — same rule as the states.
+const BLOCKER_WORDS: Record<string, string> = {
+  gold_evaluation_unproven:
+    'the worked examples that prove this formula have not been run yet',
+  ambiguous_operand_binding:
+    'more than one column could supply an input and nobody has picked one',
+  no_reviewed_formula_expectation:
+    'no reviewed formula definition exists for this recipe',
+  formula_outside_grammar_capability:
+    'the formula needs an operation the platform grammar does not support yet',
+  engine_capability_unproven:
+    'the selected execution engine has not proven it can run this',
+  model_feature_spec_owns_readiness:
+    'this is a model output — the model-feature contract governs its readiness',
+}
+
+const BLOCKER_GROUP_WORDS: Record<string, string> = {
+  data_meaning: 'data meaning',
+  time: 'time',
+  currency: 'currency',
+  relationship: 'relationships',
+  formula_capability: 'formula capability',
+  governance: 'governance',
+  execution: 'execution',
+}
+
 const OPERAND_ROLE_WORDS: Record<string, string> = {
   measure: 'measured quantity',
   grain: 'grain key',
@@ -566,6 +625,14 @@ export function SuggestionCard({
         <span className={`badge ${STATUS_TONE[s.validation_status] ?? 'gj-none'}`}>
           {STATUS_WORDS[s.validation_status] ?? s.validation_status}
         </span>
+        {/* v3 ONLY: the execution axis, beside — never merged with — the design-check axis. On a
+            v2 page the block is absent and NOTHING readiness-shaped renders: a card must not
+            synthesize a state the contract did not carry. */}
+        {s.execution && (
+          <span className={`badge ${READINESS_TONE[s.execution.execution_readiness] ?? 'gj-none'}`}>
+            {readinessWords(s.execution.execution_readiness)}
+          </span>
+        )}
         {s.binding_quality && <span className="gj-score">binding {s.binding_quality}</span>}
       </div>
 
@@ -891,6 +958,39 @@ function SuggestionDetail({
             evidence={s.feature_category.evidence} sourceRefs={s.feature_category.source_refs}
             derived={s.feature_category_derived_from_family_mapping}
           />
+        )}
+        {/* v3 ONLY. The audit drawer's side of the readiness chip: what this suggestion IS, and
+            every blocker in banking words with its machine code beside it. */}
+        {s.execution && (
+          <>
+            <Micro level={headingLevel}>Execution readiness</Micro>
+            <p>
+              This suggestion is {COMPUTATION_KIND_WORDS[s.execution.computation_kind]
+                ?? s.execution.computation_kind.replace(/_/g, ' ')}.
+              {' '}Readiness: {readinessWords(s.execution.execution_readiness)}{' '}
+              <span className="mono">{s.execution.execution_readiness}</span>.
+            </p>
+            {s.execution.readiness_blockers.length === 0
+              ? (
+                s.execution.execution_readiness === 'UNASSESSED' && (
+                  <p className="hint">
+                    Nobody has assessed this idea for exact execution yet — that is a to-do, not
+                    a defect of the suggestion.
+                  </p>
+                )
+              )
+              : (
+                <ul className="sfc-omit">
+                  {s.execution.readiness_blockers.map(b => (
+                    <li key={b.code}>
+                      {BLOCKER_WORDS[b.code] ?? b.code.replace(/_/g, ' ')}
+                      {' '}({BLOCKER_GROUP_WORDS[b.group] ?? b.group.replace(/_/g, ' ')}
+                      {' '}· <span className="mono">{b.code}</span>)
+                    </li>
+                  ))}
+                </ul>
+              )}
+          </>
         )}
         <Micro level={headingLevel}>Business domains</Micro>
         {s.business_domains.length === 0 ? (

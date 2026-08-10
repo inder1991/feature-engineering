@@ -2971,6 +2971,29 @@ export interface FeatureSuggestionV2 {
   semantic_context_hashes: string[]   // empty in Release A: the semantic plan has not landed
   dataset_profile_hashes: string[]    // empty in Release A: the profile plan has not landed
   grounding_trace_content_hash: string
+
+  // BR-8 contract v3 ONLY: the execution-truthfulness block. Absent on a v2 page — a card must
+  // render nothing readiness-shaped from its absence, never synthesize a state.
+  execution?: SuggestionExecutionBlock
+}
+
+// One named fact about why a suggestion is not further up the execution ladder. `group` is the
+// display taxonomy (data_meaning / time / currency / relationship / formula_capability /
+// governance / execution); `code` is the machine vocabulary the audit drawer keeps.
+export interface SuggestionReadinessBlocker {
+  code: string
+  group: string
+}
+
+// What this card IS, execution-wise — a SEPARATE axis from design checking. UNASSESSED is the
+// legacy registry's honest word for "nobody decided yet": an idea, never a failure and never
+// readiness. States are OPEN strings: a newer backend's member renders as words, never crashes.
+export interface SuggestionExecutionBlock {
+  recipe_contract_version: string
+  computation_kind: string
+  execution_readiness: string
+  readiness_blockers: SuggestionReadinessBlocker[]
+  binding_ambiguity: boolean
 }
 
 // The exact ids a reader compares for CURRENTNESS — and which are excluded from every semantic
@@ -3092,6 +3115,24 @@ export function getTableSuggestionsV2(
   return request(
     `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
       + '/suggestions?contract_version=2',
+  )
+}
+
+// The BR-8 v3 page: the v2 page plus its declared version, an `execution` block on every hit and
+// the page-level readiness tally. v2 stays this frontend's DEFAULT until the BR-24 rollout gates
+// pass; callers opt into v3 deliberately, exactly as v2 was introduced.
+export interface FeatureSuggestionPageV3 extends FeatureSuggestionPageV2 {
+  contract_version: 3
+  readiness_counts: Record<string, number>
+}
+
+export function getTableSuggestionsV3(
+  source: string,
+  table: string,
+): Promise<FeatureSuggestionPageV3> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
+      + '/suggestions?contract_version=3',
   )
 }
 

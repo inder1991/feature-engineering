@@ -66,7 +66,11 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
 )
 from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
-from featuregen.overlay.upload.suggestion_contract import page_to_json, unknown_table_page_v2
+from featuregen.overlay.upload.suggestion_contract import (
+    page_to_json,
+    page_to_json_v3,
+    unknown_table_page_v2,
+)
 from featuregen.overlay.upload.suggestions import (
     suggest_features_for_table,
     suggest_features_page_v2,
@@ -89,8 +93,9 @@ _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 
 #: The contract versions this deployment serves. v1 stays the DEFAULT for the whole of Release A:
-#: the frontend must ask for v2 deliberately.
-SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (1, 2)
+#: the frontend must ask for v2 deliberately — and v3 (the BR-8 execution-truthfulness page) is
+#: explicit during its whole rollout too, until the BR-24 gates pass.
+SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (1, 2, 3)
 
 #: Closed machine-readable error codes emitted by HANDLER-level checks, where the body shape is
 #: actually controllable. Framework validation errors are deliberately not in this vocabulary.
@@ -395,6 +400,37 @@ class FacetBucketResponse(_Model):
     count: int
 
 
+class ReadinessBlockerV3Response(_Model):
+    """One named fact about why a suggestion is not further up the execution ladder. ``group`` is
+    BR-8's display taxonomy (data_meaning / time / currency / relationship / formula_capability /
+    governance / execution); ``code`` is the machine vocabulary the audit drawer keeps."""
+
+    code: str
+    group: str
+
+
+class ExecutionBlockV3Response(_Model):
+    """Contract v3's additive truthfulness block: what this card IS, execution-wise. UNASSESSED
+    is the legacy adapter's honest word for "nobody decided yet" — an idea, never a failure and
+    never readiness. Design checking (``validation_status``) stays a SEPARATE axis."""
+
+    recipe_contract_version: str
+    computation_kind: str
+    execution_readiness: str
+    readiness_blockers: list[ReadinessBlockerV3Response]
+    binding_ambiguity: bool
+
+
+class FeatureSuggestionV3Response(FeatureSuggestionV2Response):
+    """The v2 suggestion plus its execution block — strictly additive by construction."""
+
+    execution: ExecutionBlockV3Response
+
+
+class FeatureSuggestionHitV3Response(FeatureSuggestionHitResponse):
+    suggestion: FeatureSuggestionV3Response  # type: ignore[assignment]
+
+
 class FeatureSuggestionPageV2Response(_Model):
     """Release A serves ``read_mode='on_demand'`` with no projection state and no facets; Release B
     adds the projected mode, the search facets and the cursor."""
@@ -408,13 +444,24 @@ class FeatureSuggestionPageV2Response(_Model):
     next_cursor: str | None
 
 
+class FeatureSuggestionPageV3Response(FeatureSuggestionPageV2Response):
+    """The v3 page: the v2 page plus its own declared version, execution blocks on every hit and
+    the page-level readiness tally — additive, never a reshuffle."""
+
+    contract_version: int
+    hits: list[FeatureSuggestionHitV3Response]  # type: ignore[assignment]
+    readiness_counts: dict[str, int]
+
+
 #: Documentation-only: the handler returns plain dicts, so declaring these here publishes both
 #: contracts and the typed error in OpenAPI WITHOUT letting FastAPI re-serialize a v1 body through
 #: a model (which would put the legacy payload's byte stability at the mercy of a schema edit).
 _RESPONSES: dict[int | str, dict[str, Any]] = {
-    200: {"model": TableSuggestionsV1Response | FeatureSuggestionPageV2Response,
-          "description": "The v1 table payload (default) or the v2 discovery page "
-                         "(`?contract_version=2`)."},
+    200: {"model": (TableSuggestionsV1Response | FeatureSuggestionPageV2Response
+                    | FeatureSuggestionPageV3Response),
+          "description": "The v1 table payload (default), the v2 discovery page "
+                         "(`?contract_version=2`) or the v3 execution-truthfulness page "
+                         "(`?contract_version=3`)."},
     422: {"model": SuggestionsErrorResponse,
           "description": "An integer `contract_version` outside the supported set. A non-integer "
                          "value keeps FastAPI's own validation error, whose `detail` is a list."},
@@ -461,15 +508,16 @@ def table_suggestions(
     # opaque 500. Mapped to the same retryable 503 `contract.py` already uses — the mapping
     # `_governed_read`'s docstring promises — so the caller learns this is temporary and retryable.
     try:
-        if contract_version == 2:
+        if contract_version in (2, 3):
             page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
                                             roles=identity.role_claims, max_hops=max_hops)
             collection = page.collection
             logger.info(
-                "suggestions v2 for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
-                catalog_source, table, time.monotonic() - started, collection.table_known,
-                len(page.hits), max_hops, dict(collection.omitted_counts))
-            return page_to_json(page)
+                "suggestions v%s for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
+                contract_version, catalog_source, table, time.monotonic() - started,
+                collection.table_known, len(page.hits), max_hops,
+                dict(collection.omitted_counts))
+            return page_to_json(page) if contract_version == 2 else page_to_json_v3(page)
         out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
                                          roles=identity.role_claims, max_hops=max_hops)
     except CatalogProjectionUnavailable as e:
@@ -481,6 +529,7 @@ def table_suggestions(
     return out
 
 
-__all__ = ["FeatureSuggestionPageV2Response", "SuggestionsErrorResponse",
+__all__ = ["FeatureSuggestionPageV2Response", "FeatureSuggestionPageV3Response",
+           "SuggestionsErrorResponse",
            "TableSuggestionsV1Response", "router", "suggest_features_for_table",
            "suggest_features_page_v2", "table_suggestions", "unknown_table_page_v2"]

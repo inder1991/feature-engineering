@@ -68,6 +68,8 @@ from featuregen.overlay.upload.grounding_trace import (
 from featuregen.overlay.upload.join_path import JoinNeighbourhood, table_of_ref
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
+from featuregen.overlay.upload.recipe_formula_expectations import RECIPE_FORMULA_EXPECTATIONS
+from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
 from featuregen.overlay.upload.suggestion_identity import (
     UnresolvableRelationshipPath,
     build_read_scope,
@@ -1592,3 +1594,81 @@ def page_to_json(page: FeatureSuggestionPageV2) -> dict:
                           for b in buckets] for name, buckets in page.facets.items()},
         "next_cursor": page.next_cursor,
     }
+
+
+# ── contract v3 (BR-8): the execution block ─────────────────────────────────────────────────────
+#: A suggestion's declared recipe carriage. Every template-generated suggestion today rides the
+#: legacy Template registry; "recipe-contract-v2" enters this wire the day the BR-17 cutover lets
+#: V2 definitions generate suggestions — the vocabulary exists NOW so that day is additive.
+RECIPE_CONTRACT_LEGACY = "legacy-template"
+RECIPE_CONTRACT_V2 = "recipe-contract-v2"
+
+#: The one binding blocker THIS surface can honestly assert: the engine's own `binding_quality`
+#: verdict said the resolution was ambiguous. BR-5's per-operand vocabulary (AMBIGUOUS_ENTITY,
+#: AMBIGUOUS_MEASURE, ...) speaks only where `bind_v2_operands` actually ran — smuggling those
+#: codes here would claim a verdict nobody produced.
+BLOCKER_AMBIGUOUS_OPERAND_BINDING = "ambiguous_operand_binding"
+
+#: BR-8's seven UX blocker groups. The grouping is DISPLAY taxonomy, not authority — the machine
+#: code always rides beside it. An unmapped code lands in "governance": a human needs to look,
+#: which is the honest reading of a blocker the map does not know.
+_BLOCKER_GROUPS_V3: dict[str, str] = {
+    BLOCKER_AMBIGUOUS_OPERAND_BINDING: "data_meaning",
+    "no_reviewed_formula_expectation": "governance",
+    "formula_outside_grammar_capability": "formula_capability",
+    "gold_evaluation_unproven": "formula_capability",
+    "engine_capability_unproven": "execution",
+    "model_feature_spec_owns_readiness": "governance",
+}
+
+
+def blocker_group_v3(code: str) -> str:
+    return _BLOCKER_GROUPS_V3.get(code, "governance")
+
+
+def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
+    """The additive per-suggestion truthfulness block: what this card IS, execution-wise.
+
+    A plain legacy template projects exactly what the adapter says it is — a conceptual pattern
+    whose execution was never assessed (UNASSESSED lives on that projection and nowhere else; v3's
+    job is to RENDER it as the idea it is, never as failure and never as readiness). A template
+    holding a REVIEWED formula expectation enters BR-7's fold with that fact — and with the
+    engine's own binding verdict — so the two authorable anchors surface as FORMULA_AUTHORABLE
+    (gold still unproven, honestly named) or FORMULA_BLOCKED when their binding was ambiguous."""
+    binding_ambiguity = binding_quality == "ambiguous"
+    if template_id in RECIPE_FORMULA_EXPECTATIONS:
+        readiness = fold_readiness(ReadinessInputsV1(
+            computation_kind="deterministic_formula",
+            reviewed_expectation=True,
+            grammar_verdict="ok",
+            binding_blockers=((BLOCKER_AMBIGUOUS_OPERAND_BINDING,) if binding_ambiguity else ()),
+        ))
+        state, blockers = readiness.state, readiness.blockers
+        computation_kind = "deterministic_formula"
+    else:
+        state, blockers = "UNASSESSED", ()
+        computation_kind = "conceptual_pattern"
+    return {
+        "recipe_contract_version": RECIPE_CONTRACT_LEGACY,
+        "computation_kind": computation_kind,
+        "execution_readiness": state,
+        "readiness_blockers": [{"code": code, "group": blocker_group_v3(code)}
+                               for code in blockers],
+        "binding_ambiguity": binding_ambiguity,
+    }
+
+
+def page_to_json_v3(page: FeatureSuggestionPageV2) -> dict:
+    """Contract v3 = the v2 page plus ADDITIVE truth: `contract_version`, one `execution` block
+    per hit, and the page-level `readiness_counts`. The v2 serialization above is byte-frozen —
+    v3 decorates a COPY of its output and never reaches back into it."""
+    doc = page_to_json(page)
+    doc["contract_version"] = 3
+    counts: dict[str, int] = {}
+    for hit_doc, hit in zip(doc["hits"], page.hits, strict=True):
+        block = execution_block_v3(hit.suggestion.template_id, hit.suggestion.binding_quality)
+        hit_doc["suggestion"]["execution"] = block
+        state = block["execution_readiness"]
+        counts[state] = counts.get(state, 0) + 1
+    doc["readiness_counts"] = counts
+    return doc
