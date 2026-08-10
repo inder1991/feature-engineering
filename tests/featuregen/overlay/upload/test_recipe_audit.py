@@ -42,6 +42,7 @@ def test_the_baseline_reproduces_the_reviewed_numbers():
     assert report.counters == baseline["counters"]
     assert report.informational == baseline["informational"]
     # the review's headline numbers, pinned by value so a silent definition change is loud
+    assert report.counters["pit_unmatched_placeholder_recipes"] == 0   # BR-4 fixed both
     assert report.counters["multi_measure_recipes"] == 126
     assert report.counters["identity_collision_recipes"] == 145
     assert report.informational["parameter_combinations"] == 1122
@@ -50,13 +51,14 @@ def test_the_baseline_reproduces_the_reviewed_numbers():
     assert report.informational["formula_v1_authorable_recipes"] == 2
 
 
-def test_the_two_known_pit_defects_are_pinned_and_are_the_only_two():
+def test_the_pit_placeholder_class_is_fixed_and_held_at_zero():
+    """BR-1 pinned the two known defects (merchant_mcc_diversity's {window_min},
+    maturity_ladder_runoff's {window} — each a SHARED pit constant borrowed by a recipe with
+    different parameters); BR-4 gave each its own declaration. The counter is now the zero-guard:
+    the next borrowed-constant drift fails here, mechanically."""
     report = audit_registry()
-    assert report.examples["pit_unmatched_placeholder_recipes"] == (
-        "merchant_mcc_diversity", "maturity_ladder_runoff") or sorted(
-        report.examples["pit_unmatched_placeholder_recipes"]) == [
-        "maturity_ladder_runoff", "merchant_mcc_diversity"]
-    assert report.counters["pit_unmatched_placeholder_recipes"] == 2
+    assert report.counters["pit_unmatched_placeholder_recipes"] == 0
+    assert report.examples["pit_unmatched_placeholder_recipes"] == ()
 
 
 def test_the_named_defect_examples_are_pinned():

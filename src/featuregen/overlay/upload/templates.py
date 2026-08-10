@@ -1612,7 +1612,11 @@ FRAUD_TEMPLATES: tuple[Template, ...] = (
         additivity="non_additive",
         explain="H",
         use_cases=("fraud", "merchant_analytics"),
-        pit=_FRAUD_PIT_REALTIME,
+        pit=("trailing {window}-day observation window (as_of − {window}d, as_of]: distinct MCC breadth "
+            "accumulated from BOOKED transactions knowable strictly ≤ as_of. NOT a real-time "
+            "pre-authorization signal: this recipe reads batch booked data, and real-time wording is "
+            "earned only by binding a governed pre-decision feed (BR-4: the borrowed fraud constant "
+            "referenced a minutes parameter, window_min, that this recipe never declared)."),
         degrade="missing merchant, MCC or event-time authority -> SKIP.",
         stage="merchant-monitoring",
         eligibility=_FRAUD_BEHAVIOUR,
@@ -2470,7 +2474,11 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
         params={"horizon_days": (30, 90, 365), "measure": ("runoff_share", "runoff_amount")},
         aggregation="maturity_runoff", additivity="non_additive", explain="H",
         use_cases=("deposit_stability", "alm", "liquidity_risk"),
-        pit=_DEPOSIT_PIT_STATE,
+        pit=("FORWARD contractual-maturity ladder: deposits whose contractual maturity falls in "
+            "(as_of, as_of + {horizon_days}d], bucketed from contract terms knowable strictly "
+            "≤ as_of — a FUTURE horizon read from effective contracts, never a trailing "
+            "observation window (BR-4: the borrowed deposit-state constant described a trailing "
+            "lookback over a window parameter this recipe has no parameter for)."),
         degrade="no maturity_date (a non-maturity deposit) -> SKIP; use nmd_stickiness for NMDs.",
         stage="runoff-prone",
         eligibility=_ALM_SINGLE_CCY,
@@ -4676,7 +4684,10 @@ CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
         additivity="non_additive",
         explain="H",
         use_cases=("trade_finance", "limit_management"),
-        pit=_CORP_PIT_STATE,
+        pit=("trailing {window}-day facility-ACTIVITY window (as_of − {window}d, as_of]: facilities "
+            "counted for the obligor from records active in the window, knowable strictly ≤ as_of "
+            "(BR-4: its own activity declaration — the borrowed corporate-state constant describes "
+            "latest exposure/limit/covenant/utilisation state, which is a different recipe shape)."),
         degrade="missing obligor, facility or event-time authority -> SKIP.",
         stage="obligor-monitoring",
         eligibility="Identifiers only; facility activity must be knowable by the as-of cutoff.",

@@ -371,12 +371,7 @@ The program is complete only when all of the following are true:
 - [ ] Add a mismatch test proving an undeclared temporal parameter cannot compile.
 - [ ] Keep the legacy PIT string on v1/v2 payloads for compatibility; v3 exposes the rendered typed declaration and structured temporal fields.
 
-**Acceptance:**
-
-- PIT status cannot be complete when the temporal anchor is missing, ambiguous or ungoverned.
-- No V2 PIT string contains an unresolved placeholder.
-- Real-time fraud and batch trailing-window recipes cannot share one temporal declaration.
-- Future contractual maturity is not represented as a past trailing window.
+**Acceptance: DONE 2026-08-10.** `recipe_temporal_v2.compile_temporal`: PIT text is a pure rendering of TemporalSpecV2 + the resolved selection — an unresolved placeholder is impossible (the renderer asserts none survive), and a hole is a NAMED blocker from a closed vocabulary (window_unbound / event_role_unbound / snapshot_policy_missing / pre_decision_authority_unproven / pre_decision_not_minute_grained / knowledge_time_missing), never worse prose: a blocked contract renders NOTHING. The four time shapes render distinctly (a forward ladder says "(cutoff, cutoff + 90d] — never a trailing observation window"); real-time wording is EARNED (governed pre-decision feed authority + minute grain, the merchant_mcc_diversity rule); a correctable source must declare knowledge time + late-arrival behavior. `pit_completeness_v2` consumes ONLY the compiler verdict — COMPLETE is structurally unreachable while any blocker exists; the keyword-marker path survives untouched for the legacy registry and dies with it at BR-17. The three registry fixes landed and revealed the defects' true anatomy: each was a SHARED pit constant borrowed by a recipe with different parameters (merchant_mcc_diversity borrowed the minute-grained fraud constant; maturity_ladder_runoff and obligor_facility_count borrowed state-lookback constants); each now carries its own declaration and the audit's placeholder counter is ZERO (baseline regenerated same-commit; BR-1's pin test became the zero-guard). DEVIATIONS: `planner/declarations.py` untouched (its pit_anchor derives from need metadata, which V2 operand temporal roles feed only at BR-17's cutover); `suggestion_contract.py` untouched (v1/v2 payloads keep the legacy string by NOT changing anything; the compiled declaration is exposed by contract v3 in BR-8).
 
 **Verification:**
 
