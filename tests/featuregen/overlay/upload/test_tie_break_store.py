@@ -115,3 +115,75 @@ def test_one_input_cannot_yield_two_different_verdicts(db):
                                 ranking=("public.t.actual_counter_party_amt",
                                          "public.t.tran_amt_aed"),
                                 rationale="different answer", producer_ref="llm_call:test-4")
+
+
+# ── increment 2: the adjudicator through the governed seam ──────────────────────────────────────
+
+from featuregen.intake.llm import FakeLLM, FakeResponse  # noqa: E402
+from featuregen.overlay.upload.tie_break import (  # noqa: E402
+    TIE_BREAK_TASK,
+    adjudicate_tie_break,
+)
+
+
+def _adjudicate(db, client, **over):
+    kwargs = dict(template_id="inflow_outflow_ratio", need_role="flow_col",
+                  need_concept="monetary_flow",
+                  intent="Sum of transaction amounts per customer.", tied=_tied())
+    kwargs.update(over)
+    return adjudicate_tie_break(db, client, **kwargs)
+
+
+def _ranking_client(ranking) -> FakeLLM:
+    return FakeLLM(script={TIE_BREAK_TASK: FakeResponse(
+        output={"ranking": list(ranking), "rationale": "aggregation wants the fixed denomination"})})
+
+
+class _MustNotBeCalled:
+    def call(self, *a, **k):  # pragma: no cover — being here IS the failure
+        raise AssertionError("a replayed verdict must never re-dispatch the model")
+
+
+def test_a_valid_ranking_is_stored_and_the_second_ask_replays(db):
+    verdict, reason = _adjudicate(db, _ranking_client(
+        ["public.t.tran_amt_aed", "public.t.actual_counter_party_amt"]))
+    assert reason == "adjudicated"
+    assert verdict is not None
+    assert verdict.ranking[0] == "public.t.tran_amt_aed"
+    again, reason2 = _adjudicate(db, _MustNotBeCalled())
+    assert reason2 == "replayed"
+    assert again is not None and again.ranking == verdict.ranking
+
+
+def test_an_off_set_ranking_is_refused_whole_and_nothing_is_stored(db):
+    """The closed-output rule, applied to rankings: a ref outside the tied set (or a missing one)
+    falls to the deterministic order and must NOT poison the store — the next ask with a real
+    client re-asks."""
+    verdict, reason = _adjudicate(db, _ranking_client(
+        ["public.t.tran_amt_aed", "public.t.SOMETHING_INVENTED"]))
+    assert (verdict, reason) == (None, "invalid_result")
+    # nothing stored: a subsequent honest client is ASKED, not fed the invalid replay
+    verdict2, reason2 = _adjudicate(db, _ranking_client(
+        ["public.t.actual_counter_party_amt", "public.t.tran_amt_aed"]))
+    assert reason2 == "adjudicated" and verdict2 is not None
+
+
+def test_no_client_degrades_to_the_deterministic_order(db):
+    assert _adjudicate(db, None) == (None, "unavailable")
+
+
+def test_an_exhausted_ledger_stops_before_the_dispatch(db):
+    from featuregen.overlay.upload.enrich_batch import CallLedger
+
+    ledger = CallLedger(0)
+    verdict, reason = _adjudicate(db, _MustNotBeCalled(), call_ledger=ledger)
+    assert (verdict, reason) == (None, "call_ceiling")
+
+
+def test_a_provider_fault_is_contained_never_raised(db):
+    class _Explodes:
+        def call(self, *a, **k):
+            raise RuntimeError("provider down")
+
+    verdict, reason = _adjudicate(db, _Explodes())
+    assert (verdict, reason) == (None, "unavailable")

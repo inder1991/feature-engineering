@@ -177,6 +177,15 @@ _STRUCTURAL_META_KEYS = frozenset({
     # {scheme, issuer_scope, basis} projection, `entity` is a registry entity link.
     "declared_type", "operational_type", "primary_entity", "concept_path",
     "identifier_namespace", "entity",
+    # Task 2b tie-break adjudication: `candidates` is a nested list whose free-text fields
+    # (definition / ai_summary / semantic_terms) are graded BY THE CALLER (`tie_break.py` sanitizes
+    # definitions and redacts prose before building the payload — the column_profiles precedent:
+    # the owning adapter scans, this gate admits the scanned shape). Refs and the remaining keys
+    # are platform-derived tokens.
+    "candidates",
+    # ...and its three sibling tokens: a registry template id, an authored need role, a registry
+    # concept name — closed-vocabulary platform values, never uploader text.
+    "template_id", "need_role", "need_concept",
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
@@ -200,7 +209,7 @@ _STRUCTURAL_META_KEYS = frozenset({
     "feature", "aggregation", "derives_from",
     # feature assist structural half (feature_assist.py) — `columns`/`table_context` are
     # additionally routed through sanitize_feature_context after this scan
-    "target", "candidates", "sets", "table_context",
+    "target", "sets", "table_context",
     # formula authoring/critic (formula/author.py, formula/critic.py)
     "authoring_intent", "tool_trail", "recipe_authoring_context", "proposal", "operand_columns",
     # Suggestion-discovery Task 1 (classified at the main merge): REPO-AUTHORED recipe labels and
@@ -1490,6 +1499,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # whether an ALREADY-PROPOSED concept assignment is supported by the supplied metadata evidence
     # — a closed verdict, never a replacement concept (the revise pass below owns that), so an
     # off-vocabulary answer cannot ride this channel.
+    # Task 2b: the tie-break adjudicator's closed output — a RANKING of the tied refs (validated
+    # code-side as an exact permutation of the tied set; the schema cannot express that) plus a
+    # bounded rationale. NO maxItems: the Anthropic structured-output API rejects it (HTTP 400) and
+    # the permutation check is the real bound.
+    ("overlay_tie_break", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "ranking": {"type": "array", "items": {"type": "string", "maxLength": 512}},
+            "rationale": {"type": "string", "maxLength": 1000},
+        },
+        "required": ["ranking", "rationale"]},
     ("concept_critique", 1): {
         "type": "object",
         "additionalProperties": False,
