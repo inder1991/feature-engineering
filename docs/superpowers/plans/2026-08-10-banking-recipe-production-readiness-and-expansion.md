@@ -21,12 +21,16 @@ The router-quality plan (2026-08-10-template-router-quality.md) completed its en
 
 **Technology:** Python 3.12, FastAPI, psycopg3, PostgreSQL, TypedFormula, React, TypeScript, Vitest and pytest.
 
+## Task naming
+
+Tasks in this document are numbered BR-1 through BR-24 (BR = banking recipes). The prefix exists because the concurrently-executing router-quality plan (2026-08-10-template-router-quality.md) has its own Task 1–7 numbering and the two plans touch adjacent surfaces — an unprefixed "Task 7" is ambiguous in any cross-plan discussion, review, or commit message. Internal shorthand like "Tasks 11–17" always means BR-11–BR-17.
+
 ## Why this is a program, not a recipe-editing task
 
 The current library has several systemic constraints:
 
 - 126 recipes offer multiple output measures but carry one aggregation and one additivity.
-- 153 of 157 recipes are unassessed for formula authoring; only two are Formula-v1 authorable.
+- 153 of 157 recipes are unassessed for formula authoring; only two are Formula-v1 authorable (VERIFIED at re-baseline 58041a59: `RECIPE_FORMULA_EXPECTATIONS` contains exactly `merchant_mcc_diversity` and `obligor_facility_count`).
 - 145 recipes have user-facing identity collisions across their parameter space.
 - Normal grounding binds the first parameter value rather than surfacing a bounded, explicit variant choice.
 - Two recipes have demonstrably incorrect PIT placeholders.
@@ -95,7 +99,7 @@ The program is complete only when all of the following are true:
 | Release increment | Scope | Exit gate |
 |---|---|---|
 | R0 | Audit, lint and debt ratchet | New recipe debt cannot increase |
-| R1 | Recipe Contract v2, identity, temporal and binding correctness | Contract and grounding invariants pass |
+| R1 | Recipe Contract v2, identity, temporal and binding correctness — INCLUDING the BR-23 review-event SCHEMA (types + append-only store + its D7-reserved migration, not the decision APIs) | Contract and grounding invariants pass; family-migration PRs can carry review records from day one |
 | R2 | Formula-v2 and execution-readiness classification | Formula capability is versioned and fail-closed |
 | R3 | Suggestion contract v3 and UI truthfulness | No conceptual suggestion looks executable |
 | R4 | Migrate and correct the existing 157 recipes | Legacy debt is zero |
@@ -105,7 +109,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 1: Add the registry audit, debt baseline and CI ratchet
+## Task BR-1: Add the registry audit, debt baseline and CI ratchet
 
 **Purpose:** Make every identified defect machine-countable before changing behavior. The first delivery prevents new debt and proves later tasks reduce it.
 
@@ -162,7 +166,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 2: Introduce Recipe Contract v2 with one atomic output
+## Task BR-2: Introduce Recipe Contract v2 with one atomic output
 
 **Purpose:** Establish a schema capable of expressing banking computation honestly without editing all 157 constructors in one risky change.
 
@@ -250,6 +254,7 @@ The program is complete only when all of the following are true:
 - Add canonical-recipe-v2 hashing for V2 definitions.
 - A V2 replacement names legacy recipe IDs and names explicitly; there is no heuristic aliasing.
 - Make all collection fields deeply immutable. Do not place a mutable dictionary inside a frozen dataclass.
+- ROUTING RULE for in-flight SME content (re-baseline): the router plan's twelve 4c triage cards (2026-08-10-recipe-triage-4c.md, drafted and awaiting SME second-review) are authored DIRECTLY as RecipeDefinitionV2 once this task lands — never as new legacy Templates, which BR-17 makes a CI failure. If SME sign-off arrives before this task ships, the cards wait; content is cheaper to hold than to migrate twice.
 
 **Steps:**
 
@@ -281,7 +286,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 3: Correct candidate identity, naming and bounded parameter selection
+## Task BR-3: Correct candidate identity, naming and bounded parameter selection
 
 **Purpose:** Ensure two different semantic or operational choices never look like the same feature, without generating an unbounded Cartesian product.
 
@@ -340,7 +345,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 4: Replace prose PIT declarations with a typed temporal contract
+## Task BR-4: Replace prose PIT declarations with a typed temporal contract
 
 **Purpose:** Remove placeholder drift and distinguish banking event time, business effective time, processing time and knowledge time.
 
@@ -396,7 +401,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 5: Fail closed on ambiguous or semantically incompatible operands
+## Task BR-5: Fail closed on ambiguous or semantically incompatible operands
 
 **Purpose:** Stop deterministic tie-breaking from turning uncertainty into a plausible-looking feature.
 
@@ -463,7 +468,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 6: Add Formula-v2 without changing Formula-v1 identity
+## Task BR-6: Add Formula-v2 without changing Formula-v1 identity
 
 **Purpose:** Support the computations required by the banking catalogue while preserving every Formula-v1 hash, replay envelope and materialized artifact.
 
@@ -536,7 +541,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 7: Make execution readiness explicit and complete the formula evidence path
+## Task BR-7: Make execution readiness explicit and complete the formula evidence path
 
 **Purpose:** Replace unassessed with a closed, audited readiness vocabulary and prevent conceptual recipes from appearing executable.
 
@@ -608,7 +613,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 7A: Introduce a separate governed model-feature contract
+## Task BR-7A: Introduce a separate governed model-feature contract
 
 **Purpose:** Prevent propensities, forecasts, anomaly scores and accounting/risk model outputs from being forced into deterministic Formula-v2 or presented as if a short recipe description were an executable model.
 
@@ -679,7 +684,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 8: Publish suggestion contract v3 and update the table and column experiences
+## Task BR-8: Publish suggestion contract v3 and update the table and column experiences
 
 **Purpose:** Let users distinguish a good idea from a computable, governed and materializable feature.
 
@@ -771,7 +776,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 9: Correct taxonomy applicability and coverage accounting
+## Task BR-9: Correct taxonomy applicability and coverage accounting
 
 **Purpose:** Stop supporting tags and legacy inference from looking like owned banking use-case coverage.
 
@@ -821,7 +826,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 10: Add the canonical banking event, state and policy vocabulary
+## Task BR-10: Add the canonical banking event, state and policy vocabulary
 
 **Purpose:** Give recipes the semantic building blocks that eleven current definitions explicitly lack and many others currently approximate.
 
@@ -909,7 +914,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 11: Migrate and correct Retail/RBWM churn and cross-sell recipes
+## Task BR-11: Migrate and correct Retail/RBWM churn and cross-sell recipes
 
 **Purpose:** Convert the current retail and cross-sell families into atomic outputs with account/customer lifecycle correctness.
 
@@ -980,7 +985,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 12: Migrate and correct Credit Risk and Collections recipes
+## Task BR-12: Migrate and correct Credit Risk and Collections recipes
 
 **Purpose:** Make facility/account obligations, payment allocation, delinquency and post-default stages explicit.
 
@@ -1046,7 +1051,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 13: Migrate and correct Fraud, AML and Payments recipes
+## Task BR-13: Migrate and correct Fraud, AML and Payments recipes
 
 **Purpose:** Model the payment lifecycle and financial-crime decision point precisely.
 
@@ -1121,7 +1126,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 14: Migrate and correct Deposits/ALM and Markets recipes
+## Task BR-14: Migrate and correct Deposits/ALM and Markets recipes
 
 **Purpose:** Separate liability cash-flow behavior, asset liquidity, rate sensitivity and model-produced market-risk measures.
 
@@ -1183,7 +1188,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 15: Migrate and correct Custody, Asset Management, Insurance, Islamic and ESG recipes
+## Task BR-15: Migrate and correct Custody, Asset Management, Insurance, Islamic and ESG recipes
 
 **Purpose:** Correct specialist product, accounting, valuation and methodology semantics.
 
@@ -1258,7 +1263,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 16: Migrate and correct Corporate/CIB recipes
+## Task BR-16: Migrate and correct Corporate/CIB recipes
 
 **Purpose:** Model trade finance, working capital, legal-group exposure and transaction-banking structures at the correct lifecycle and grain.
 
@@ -1310,7 +1315,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 17: Cut the active registry over to V2 and retire legacy debt
+## Task BR-17: Cut the active registry over to V2 and retire legacy debt
 
 **Purpose:** Complete migration without deleting historical identity or breaking old contracts.
 
@@ -1330,7 +1335,7 @@ The program is complete only when all of the following are true:
 - [ ] Prevent one legacy multi-measure ID from resolving ambiguously; require the output alias.
 - [ ] Switch contract-v3 grounding to the V2 registry.
 - [ ] Keep v1/v2 suggestion generation on the legacy projection during the compatibility window.
-- [ ] Make new recipe authoring through Template fail CI.
+- [ ] Make new recipe authoring through Template fail CI (this is also the enforcement of BR-2's routing rule for the 4c triage cards).
 - [ ] Turn recipe audit strict mode on.
 - [ ] Require zero UNASSESSED V2 recipes.
 - [ ] Require zero legacy applicability inference in release coverage.
@@ -1354,7 +1359,7 @@ The program is complete only when all of the following are true:
 
 ---
 
-## Task 18: Add the transaction and account foundation packs
+## Task BR-18: Add the transaction and account foundation packs
 
 **Purpose:** Build reusable atomic primitives before authoring more domain composites.
 
@@ -1474,7 +1479,7 @@ The first exemplar must demonstrate the complete contract:
 
 ---
 
-## Task 19: Add the Customer, RBWM and Wealth expansion packs
+## Task BR-19: Add the Customer, RBWM and Wealth expansion packs
 
 **Purpose:** Build customer and relationship features from validated account/product primitives rather than re-deriving weak composites from generic columns.
 
@@ -1559,7 +1564,7 @@ The first exemplar must demonstrate the complete contract:
 
 ---
 
-## Task 20: Add the CIB and Transaction Banking expansion packs
+## Task BR-20: Add the CIB and Transaction Banking expansion packs
 
 **Purpose:** Extend beyond the corrected current corporate recipes into the client, account, liquidity, trade and profitability capabilities expected from a CIB data product.
 
@@ -1647,7 +1652,7 @@ The first exemplar must demonstrate the complete contract:
 
 ---
 
-## Task 21: Add the remaining banking ecosystem packs by governed priority
+## Task BR-21: Add the remaining banking ecosystem packs by governed priority
 
 **Purpose:** Complete high-value gaps without lowering the production admission standard.
 
@@ -1747,7 +1752,7 @@ No pack is added merely to turn a zero-coverage leaf green. Each proposed recipe
 
 ---
 
-## Task 22: Build the banking semantic gold corpus and adversarial test suite
+## Task BR-22: Build the banking semantic gold corpus and adversarial test suite
 
 **Purpose:** Test the meaning of the recipes, not only registry shape and route serialization.
 
@@ -1852,18 +1857,20 @@ No pack is added merely to turn a zero-coverage leaf green. Each proposed recipe
 
 ---
 
-## Task 23: Add source-controlled SME review and governed activation
+## Task BR-23: Add source-controlled SME review and governed activation
 
 **Purpose:** Make recipe ownership and review visible, repeatable and revision-specific.
+
+**Sequencing amendment (re-baseline):** the review-event SCHEMA — RecipeReviewV1, the append-only `recipe_review_event` store, and its migration (drawn from the pool at 1060+, D7 row appended in the same commit) — lands in R1 alongside BR-2, so the family migrations (BR-11–BR-16) have somewhere durable to record the SME decisions they produce as they produce them, instead of re-reviewing migrated families here. This task keeps the validity fold, the decision APIs, the invalidation wiring and the batch reports.
 
 **Files:**
 
 - Extend RecipeReviewV1 in recipe_contract_v2.py
-- Create: src/featuregen/overlay/upload/recipe_review.py
+- Create: src/featuregen/overlay/upload/recipe_review.py (schema half in R1; validity/API half here)
 - Create: src/featuregen/api/routes/recipe_review.py
 - Create: tests/featuregen/overlay/upload/test_recipe_review.py
 - Create: tests/featuregen/api/routes/test_recipe_review_route.py
-- Add the next unallocated migration at implementation time for append-only recipe_review_event
+- The recipe_review_event migration ships in R1 per the sequencing amendment above (pool 1060+, D7 same-commit rule)
 - Optionally add a governance screen only after the backend event model lands
 
 **Review roles:**
@@ -1924,7 +1931,7 @@ No pack is added merely to turn a zero-coverage leaf green. Each proposed recipe
 
 ---
 
-## Task 24: Shadow, measure, canary and roll out safely
+## Task BR-24: Shadow, measure, canary and roll out safely
 
 **Purpose:** Move from a source-controlled library to production behavior without a big-bang contract or identity change.
 
@@ -2069,7 +2076,8 @@ Every PR must state:
 | Taxonomy coverage | V2 primary objective | active registry cutover |
 | Family correction | V2, temporal and binding | legacy debt zero |
 | New foundation packs | V2 and minimum Formula-v2 | RBWM/CIB composites |
-| SME governance | revision hashing stable | production activation |
+| SME governance schema (events + migration) | revision hashing stable (R1, with BR-2) | family migration BR-11 |
+| SME governance decisions (validity fold + APIs) | review schema populated | production activation |
 | Rollout | family gates and review | default-client switch |
 
 ## Principal risks and controls
