@@ -1984,6 +1984,19 @@ export function WorkbenchScreen() {
                     </button>
                   </div>
                   {intakeCorrecting && (
+                    <div style={{ display: 'grid', gap: 8 }}>
+                      {/* The model's ranked runners-up: correcting is one click, never a restart.
+                          The free-text field below stays for a target the model never surfaced. */}
+                      {(intake.runner_up_details ?? []).map(alt => (
+                        <button
+                          key={alt.ref} type="button" className="btn" disabled={intakeBusy}
+                          style={{ justifySelf: 'start', textAlign: 'left' }}
+                          onClick={() => answerIntake('corrected', alt.ref)}
+                        >
+                          <code>{alt.ref}</code>
+                          {alt.ai_summary ? <> — {alt.ai_summary}</> : null}
+                        </button>
+                      ))}
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
                       <label htmlFor="wb-intake-correction" style={{ alignSelf: 'center' }}>
                         Correct target
@@ -2002,6 +2015,7 @@ export function WorkbenchScreen() {
                       >
                         Sign this target
                       </button>
+                    </div>
                     </div>
                   )}
                 </div>
@@ -2488,6 +2502,18 @@ export function WorkbenchScreen() {
                     {c.kind === 'generated' && c.idea.param_alternatives && (
                       <p style={{ color: 'var(--ink-soft)' }}>
                         Also available — {c.idea.param_alternatives}
+                      </p>
+                    )}
+                    {/* Exploring mode's honest asymmetry, stated on the card (intake spec
+                        default): with no declared target the leakage screens cannot run for an
+                        LLM-origin candidate. Presentation only — never a removal. */}
+                    {c.kind === 'generated'
+                      && intakeReading?.target_provenance === 'exploring'
+                      && screenedTarget === null
+                      && (c.idea.generation_source ?? 'llm_freeform') === 'llm_freeform' && (
+                      <p className="hint" role="note">
+                        No target declared — leakage unchecked. Declare a target to screen this
+                        candidate.
                       </p>
                     )}
                     <dl className="kv">

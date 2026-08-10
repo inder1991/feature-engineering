@@ -1427,6 +1427,9 @@ export interface IntakeTicket {
   confidence: 'high' | 'medium' | 'abstain'
   pinned: boolean
   contradiction: string | null
+  // The Change-it menu (prompt v2): ranked next-best readings, subset of the catalog shortlist,
+  // never the chosen target. [] on older-backend replays and honest nothing-else-comes-close.
+  runners_up: string[]
 }
 
 export interface IntakeResp {
@@ -1439,6 +1442,8 @@ export interface IntakeResp {
   target_detail: {
     ref: string; catalog_source: string; concept: string; ai_summary: string
   } | null
+  // The runners-up with the same one-liner material — the Change-it panel's one-click buttons.
+  runner_up_details: { ref: string; catalog_source: string; concept: string; ai_summary: string }[]
 }
 
 // One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist

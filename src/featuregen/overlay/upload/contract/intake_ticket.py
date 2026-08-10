@@ -45,7 +45,7 @@ INTAKE_TICKET_RESULT_VERSION = 1
 
 INTAKE_TICKET_TASK = "overlay.contract.intake_ticket"
 INTAKE_TICKET_PROMPT_ID = "intake_ticket"
-INTAKE_TICKET_PROMPT_VERSION = 1
+INTAKE_TICKET_PROMPT_VERSION = 2   # v2: + runner_up_refs (the Change-it menu)
 INTAKE_TICKET_SCHEMA_ID = "intake_ticket"
 INTAKE_TICKET_RUN_ID = "intake-ticket"
 
@@ -59,7 +59,10 @@ _INSTRUCTION = (
     "when not stated. `target_type`: what kind of prediction this is, or \"abstain\". "
     "`business_domain`: every vocabulary entry that matches the question's business area — copy "
     "tokens exactly from the vocabulary list; empty if none fit. `confidence`: \"high\" only when "
-    "the text names its target unambiguously; \"abstain\" when you are guessing."
+    "the text names its target unambiguously; \"abstain\" when you are guessing. "
+    "`runner_up_refs`: up to three OTHER candidate refs that could also plausibly be the target, "
+    "best first — copied EXACTLY from the candidates list, never the chosen target itself; [] "
+    "when nothing else comes close."
 )
 
 _WORD_RE = re.compile(r"[a-z0-9_]+")
@@ -80,6 +83,10 @@ class IntakeTicketV1:
     confidence: str                        # "high" | "medium" | "abstain"
     pinned: bool
     contradiction: str | None
+    # The Change-it menu (prompt v2): the model's ranked next-best readings, ⊆ the shortlist and
+    # never the chosen target — one-click corrections on the confirm screen. () on v1 replays,
+    # degraded tickets, and honest nothing-else-comes-close answers alike.
+    runners_up: tuple[str, ...] = ()
 
 
 def _use_case_vocabulary() -> tuple[str, ...]:
@@ -153,7 +160,7 @@ def _input_hash(*, hypothesis: str, shortlist: Sequence[dict],
 def _degraded(pin: str | None) -> IntakeTicketV1:
     return IntakeTicketV1(target_column=pin, target_window_days=None, target_type="abstain",
                           business_domain=(), confidence="abstain", pinned=pin is not None,
-                          contradiction=None)
+                          contradiction=None, runners_up=())
 
 
 def _ticket_from_output(output: dict, *, pin: str | None,
@@ -185,10 +192,17 @@ def _ticket_from_output(output: dict, *, pin: str | None,
         confidence = "abstain"
     elif confidence not in ("high", "medium", "abstain"):
         confidence = "abstain"
+    # Runners-up: SELECTION discipline again — ⊆ the shortlist, never the target, order kept,
+    # capped on read (the schema cannot carry maxItems). Absent on v1 replays -> ().
+    raw_runners = output.get("runner_up_refs")
+    runners = tuple(dict.fromkeys(
+        r for r in raw_runners
+        if isinstance(r, str) and r in shortlist_refs and r != target
+    ))[:3] if isinstance(raw_runners, list) else ()
     return IntakeTicketV1(target_column=target, target_window_days=window,
                           target_type=target_type, business_domain=domains,
                           confidence=confidence, pinned=pin is not None,
-                          contradiction=contradiction)
+                          contradiction=contradiction, runners_up=runners)
 
 
 _PROVENANCES = ("human_confirmed", "user_typed", "exploring")
@@ -232,31 +246,32 @@ def target_reading(conn, intent_id: str) -> dict | None:
             "target_confirmed_by": row[5]}
 
 
-def signed_reading_for(conn, *, hypothesis: str, intake_mode: str,
-                       actor_json: str) -> dict | None:
-    """The SIGNED reading for this (hypothesis, mode, actor) — the consumers' join point: the
-    near-label critic reads ``target_window_days``, the use-case ordering reads
-    ``business_domain``. Looked up by the same per-actor identity the intake and recognitions
-    routes dedup on (NOT by intent_id: the legacy considered-set path mints a fresh intent per
-    call, while the signed reading lives on the earliest deduped row). Only a reading a HUMAN
-    stood behind counts (provenance recorded); None = not declared — every consumer must degrade
-    (abstain / today's order) on it, never guess."""
+def signed_reading_for(conn, *, hypothesis: str, actor_json: str) -> dict | None:
+    """The SIGNED reading for this (hypothesis, actor) — the consumers' join point: the near-label
+    critic reads ``target_window_days``, the use-case ordering reads ``business_domain``. Looked up
+    by the QUESTION and its AUTHOR, deliberately mode-blind: the intake route always mints
+    hypothesis-mode intents, while a definition-carrying considered-set request runs in
+    ``definition`` mode — same hypothesis, same person, same signed reading (a mode-filtered
+    lookup silently lost the signature on exactly that path; review fix 2026-08-10). NOT by
+    intent_id: the legacy considered-set path mints a fresh intent per call, while the signed
+    reading lives on the earliest deduped row. Only a reading a HUMAN stood behind counts
+    (provenance recorded); None = not declared — every consumer must degrade (abstain / today's
+    order) on it, never guess."""
     row = conn.execute(
         "SELECT target_ref, target_window_days, target_type, business_domain, target_provenance "
         "FROM contract_intent "
-        "WHERE hypothesis = %s AND intake_mode = %s AND actor = %s::jsonb "
+        "WHERE hypothesis = %s AND actor = %s::jsonb "
         "AND target_provenance IS NOT NULL ORDER BY created_at ASC LIMIT 1",
-        (hypothesis, intake_mode, actor_json)).fetchone()
+        (hypothesis, actor_json)).fetchone()
     if row is None:
         return None
     return {"target_ref": row[0], "target_window_days": row[1], "target_type": row[2],
             "business_domain": tuple(row[3] or ()), "target_provenance": row[4]}
 
 
-def signed_label_window(conn, *, hypothesis: str, intake_mode: str, actor_json: str) -> int | None:
+def signed_label_window(conn, *, hypothesis: str, actor_json: str) -> int | None:
     """The near-label critic's one data input — a thin view over :func:`signed_reading_for`."""
-    reading = signed_reading_for(conn, hypothesis=hypothesis, intake_mode=intake_mode,
-                                 actor_json=actor_json)
+    reading = signed_reading_for(conn, hypothesis=hypothesis, actor_json=actor_json)
     return reading["target_window_days"] if reading else None
 
 

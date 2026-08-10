@@ -1523,9 +1523,13 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "abstain"]},
             "business_domain": {"type": "array", "items": {"type": "string", "maxLength": 64}},
             "confidence": {"type": "string", "enum": ["high", "medium", "abstain"]},
+            # prompt v2: the Change-it menu — ranked next-best refs, ⊆ the sent candidates, never
+            # the chosen target (all re-validated code-side; NO maxItems — the API rejects it,
+            # the read caps at 3). v1 stored outputs simply lack the key; reads tolerate absence.
+            "runner_up_refs": {"type": "array", "items": {"type": "string", "maxLength": 512}},
         },
         "required": ["target_ref", "target_window_days", "target_type", "business_domain",
-                     "confidence"]},
+                     "confidence", "runner_up_refs"]},
     # Task 4b — hypothesis-chosen recipe parameters. A flat triple list (template_id, param,
     # value-as-string): nested per-template objects would need open additionalProperties, which
     # this seam forbids. Every triple is re-validated code-side against the AUTHORED tuples — an

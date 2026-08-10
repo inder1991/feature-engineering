@@ -2300,6 +2300,7 @@ describe('Intake target confirmation', () => {
     target_column: 'public.labels.churned', target_window_days: 90,
     target_type: 'binary_classification', business_domain: ['retail_churn'],
     confidence: 'high', pinned: false, contradiction: null,
+    runners_up: ['public.labels.closed'],
   }
 
   const INTAKE: api.IntakeResp = {
@@ -2308,6 +2309,10 @@ describe('Intake target confirmation', () => {
       ref: 'public.labels.churned', catalog_source: 'deposits',
       concept: 'label', ai_summary: 'Whether the customer churned in the window.',
     },
+    runner_up_details: [{
+      ref: 'public.labels.closed', catalog_source: 'deposits',
+      concept: 'label', ai_summary: 'Whether the account was closed.',
+    }],
   }
 
   const READING: api.IntakeReading = {
@@ -2386,6 +2391,38 @@ describe('Intake target confirmation', () => {
     expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'corrected',
       expect.objectContaining({ targetRef: 'public.labels.closed' }))
     expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+  })
+
+  it('a runner-up is a one-click correction, never a restart', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue({
+      ...READING, target_ref: 'public.labels.closed',
+    })
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    await userEvent.click(screen.getByRole('button', { name: /change it/i }))
+    // the ranked runner-up renders with its one-liner and signs in ONE click
+    await userEvent.click(screen.getByRole('button',
+      { name: /public\.labels\.closed — Whether the account was closed\./ }))
+    expect(contractIntakeTarget).toHaveBeenCalledWith('int_1', 'corrected',
+      expect.objectContaining({ targetRef: 'public.labels.closed' }))
+    expect(await screen.findByText(/recorded as your decision/)).toBeInTheDocument()
+  })
+
+  it('exploring mode states the honest asymmetry on LLM-origin cards', async () => {
+    contractIntake.mockResolvedValue(INTAKE)
+    contractIntakeTarget.mockResolvedValue({
+      ...READING, target_ref: null, target_provenance: 'exploring',
+    })
+    await generateConfirmOn()
+    await screen.findByText(/I understood your target as/)
+    await userEvent.click(screen.getByRole('button', { name: /no target — just exploring/i }))
+    await screen.findByText(/leakage checks are off/i)
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    // the generated LLM-origin card carries the banner — presentation only, never a removal
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText(/No target declared — leakage unchecked/)).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
   })
 
   it('exploring is a recorded declaration, not a failure', async () => {

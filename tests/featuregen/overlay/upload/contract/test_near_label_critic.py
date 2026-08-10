@@ -190,3 +190,21 @@ def test_flag_on_without_a_signed_reading_abstains_everywhere(db, monkeypatch):
                               target_ref="public.accounts.churned", now=NOW)
     ideas = [f for s in cs.alternatives for f in s.features]
     assert ideas and all(f.near_label_verdict == "abstain" for f in ideas)
+
+
+def test_a_definition_mode_round_still_finds_the_signed_reading(db, monkeypatch):
+    """Review fix: the intake route always mints hypothesis-mode intents, while a
+    definition-carrying considered-set request runs in `definition` mode — same hypothesis, same
+    person, same signature. A mode-filtered lookup silently lost it on exactly that path."""
+    monkeypatch.setenv("FEATUREGEN_NEAR_LABEL_CRITIC", "1")
+    _churn_catalog(db)
+    _signed_intent(db)   # signs under hypothesis mode, exactly as /contract/intake does
+    definition_round = submit_intent(hypothesis=_HYPOTHESIS,
+                                     definition="days since last activity per customer",
+                                     actor="ds1")
+    cs = build_considered_set(db, definition_round, _gen_client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    ideas = [f for s in cs.alternatives for f in s.features]
+    assert ideas
+    assert any(f.near_label_verdict == "too_close" for f in ideas), \
+        "the signed 90-day window reached the critic despite the round's definition mode"

@@ -942,7 +942,7 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
 
 def _intent_row(conn, intent_id: str):
     return conn.execute(
-        "SELECT actor, target_provenance FROM contract_intent WHERE intent_id = %s",
+        "SELECT actor, target_provenance, target_ref FROM contract_intent WHERE intent_id = %s",
         (intent_id,)).fetchone()
 
 
@@ -972,9 +972,14 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
     counters.incr(f"overlay.intake.{reason}")
 
     row = _intent_row(conn, intent.intent_id)
-    if ticket.pinned and ticket.target_column and (row is None or row[1] is None):
-        # The pin is the USER's own typed name — record it without a click, but never clobber a
-        # signed reading (re-running intake on a confirmed intent is a read, not a write).
+    # The pin is the USER's own typed name — record it without a click. A NEW pin may overwrite a
+    # PRIOR pin (both are code-derived from the user's own current text; refusing left the stored
+    # target on a column the catalog no longer resolves to while the screen showed the new one —
+    # review fix 2026-08-10). A HUMAN-signed reading (human_confirmed / exploring) is never
+    # clobbered: re-running intake on a decided intent stays a read.
+    if (ticket.pinned and ticket.target_column
+            and (row is None or row[1] in (None, "user_typed"))
+            and (row is None or row[2] != ticket.target_column or row[1] is None)):
         record_target_reading(conn, intent_id=intent.intent_id, provenance="user_typed",
                               target_ref=ticket.target_column, confirmed_by=identity.subject)
         counters.incr("overlay.intake.pinned")
@@ -998,8 +1003,12 @@ def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLL
                        "target_type": ticket.target_type,
                        "business_domain": list(ticket.business_domain),
                        "confidence": ticket.confidence, "pinned": ticket.pinned,
-                       "contradiction": ticket.contradiction},
-            "target_detail": _column_detail(ticket.target_column)}
+                       "contradiction": ticket.contradiction,
+                       "runners_up": list(ticket.runners_up)},
+            "target_detail": _column_detail(ticket.target_column),
+            # the Change-it menu, ranked, with the same one-liner material as the main line
+            "runner_up_details": [d for r in ticket.runners_up
+                                  if (d := _column_detail(r)) is not None]}
 
 
 @router.post("/contract/intake/target", dependencies=[Depends(require_feature_generate)])

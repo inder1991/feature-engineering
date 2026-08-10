@@ -27,7 +27,8 @@ def _fake(target: str = _BALANCE) -> FakeLLM:
         INTAKE_TICKET_TASK: FakeResponse(output={
             "target_ref": target, "target_window_days": 90,
             "target_type": "binary_classification", "business_domain": [],
-            "confidence": "high"})})
+            "confidence": "high",
+            "runner_up_refs": ["public.transactions.amount"]})})
 
 
 def _reading(conn, intent_id: str) -> tuple:
@@ -169,3 +170,46 @@ def test_no_llm_degrades_and_never_blocks(make_client):
     assert res.status_code == 200
     assert res.json()["reason"] == "unavailable"
     assert res.json()["ticket"]["target_column"] == _BALANCE, "the pin is pure code"
+
+
+def test_the_change_it_menu_rides_the_response_with_its_material(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/contract/intake", json={
+        "hypothesis": "Customers leave when their deposits shrink over time.",
+        "catalog_source": "deposits"}, headers=AUTH)
+    body = res.json()
+    assert body["ticket"]["runners_up"] == ["public.transactions.amount"]
+    assert body["runner_up_details"][0]["ref"] == "public.transactions.amount"
+
+
+def test_a_new_pin_overwrites_a_prior_pin_but_never_a_human_decision(make_client, conn):
+    """Review fix: pins are code-derived from the user's own current text, so a NEW pin may
+    replace a PRIOR pin (a rename between sessions must not leave the record on the old column
+    while the screen shows the new one). A human-signed reading stays untouchable."""
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    first = client.post("/contract/intake", json={
+        "hypothesis": "Predict balance from customer activity.",
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    assert _reading(conn, first["intent_id"])[0] == _BALANCE
+    # a DIFFERENT hypothesis pinning a different column is a different intent — so simulate the
+    # rename by rewriting the stored pin, then re-running the SAME intake: the fresh pin wins.
+    conn.execute("UPDATE contract_intent SET target_ref = %s WHERE intent_id = %s",
+                 ("public.accounts.stale_ref", first["intent_id"]))
+    again = client.post("/contract/intake", json={
+        "hypothesis": "Predict balance from customer activity.",
+        "catalog_source": "deposits"}, headers=AUTH).json()
+    assert again["intent_id"] == first["intent_id"]
+    ref, _, _, provenance, _ = _reading(conn, first["intent_id"])
+    assert (ref, provenance) == (_BALANCE, "user_typed"), "the new pin replaced the stale one"
+    # but once the human signs, intake becomes a pure read (covered end-to-end here too)
+    client.post("/contract/intake/target", json={
+        "intent_id": first["intent_id"], "decision": "corrected",
+        "target_ref": "public.transactions.amount",
+        "catalog_source": "deposits"}, headers=AUTH)
+    client.post("/contract/intake", json={
+        "hypothesis": "Predict balance from customer activity.",
+        "catalog_source": "deposits"}, headers=AUTH)
+    ref, _, _, provenance, _ = _reading(conn, first["intent_id"])
+    assert (ref, provenance) == ("public.transactions.amount", "human_confirmed")

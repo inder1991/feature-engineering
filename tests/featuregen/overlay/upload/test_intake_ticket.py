@@ -39,11 +39,11 @@ def _catalog(db):
 
 
 def _ticket_client(target: str = _STATUS, window: int = 90,
-                   domains=("retail_churn",)) -> FakeLLM:
+                   domains=("retail_churn",), runners=()) -> FakeLLM:
     return FakeLLM(script={INTAKE_TICKET_TASK: FakeResponse(output={
         "target_ref": target, "target_window_days": window,
         "target_type": "binary_classification", "business_domain": list(domains),
-        "confidence": "high"})})
+        "confidence": "high", "runner_up_refs": list(runners)})})
 
 
 class _MustNotBeCalled:
@@ -130,3 +130,15 @@ def test_a_window_of_zero_means_not_stated(db):
         db, _ticket_client(window=0), catalog_source=SOURCE, roles=("data_owner",),
         hypothesis="Predict cust_status_flg.")
     assert ticket.target_window_days is None, "0 is the schema's 'not stated', mapped to honest None"
+
+
+def test_runners_up_are_selection_validated_ranked_and_never_the_target(db):
+    """Prompt v2's Change-it menu obeys the same discipline as the target: ⊆ the shortlist, the
+    chosen target excluded, an invented ref dropped, order preserved."""
+    _catalog(db)
+    ticket, _ = extract_intake_ticket(
+        db, _ticket_client(runners=(_SUSP, "public.customers.INVENTED", _STATUS)),
+        catalog_source=SOURCE, roles=("data_owner",),
+        hypothesis="Customers leave when activity drops off.")
+    assert ticket.target_column == _STATUS
+    assert ticket.runners_up == (_SUSP,),         "invented dropped, the target itself excluded, the real runner-up kept in rank order"

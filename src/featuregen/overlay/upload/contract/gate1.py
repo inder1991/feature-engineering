@@ -776,8 +776,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # ordering reads business_domain (Task 4), the near-label critic reads the window (Task 3).
     # None on the legacy path / unsigned round — both consumers degrade (today's order; abstain).
     signed_reading = signed_reading_for(
-        conn, hypothesis=intent.hypothesis, intake_mode=intent.intake_mode,
-        actor_json=_actor_json(intent.actor))
+        conn, hypothesis=intent.hypothesis, actor_json=_actor_json(intent.actor))
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
     # so a required-but-ignored field (bug_003) now actually shapes generation.
