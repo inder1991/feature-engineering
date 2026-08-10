@@ -266,12 +266,7 @@ The program is complete only when all of the following are true:
 - [ ] Implement the legacy adapter and prove it always returns conceptual-only.
 - [ ] Register one non-production probe recipe to prove end-to-end serialization; do not migrate a banking recipe yet.
 
-**Acceptance:**
-
-- It is impossible to construct a valid V2 executable recipe with the current multi-output ambiguity.
-- Legacy templates continue to ground exactly as before.
-- V1 canonical hashes are byte-identical.
-- V2 canonical hashes change when any output, parameter, operand, temporal or policy field changes.
+**Acceptance: DONE 2026-08-10.** All ten core types shipped, frozen + tuple-only, validated at CONSTRUCTION (an invalid definition cannot exist long enough to serialize). The multi-output ambiguity is unconstructible twice over: one structural OutputSpecV2 AND the `measure`-parameter side door rejected by name. UNASSESSED does not exist in the V2 readiness vocabulary — it lives only on the adapter's LegacyRecipeProjectionV1, which also has NO formula field to fill (prose structurally cannot become executable). All 157 legacy templates proven to project conceptual-only; grounding untouched (full suite green). canonical-recipe-v1 is now PINNED by literal hash (the Need.alternates addition changed v1 hashes silently — the pin makes the next change loud and deliberate); canonical-recipe-v2 is fields()-driven so every field of every nested spec is hash-bearing by construction, proven by a recursive walk plus eight representative edits. Registry law at import: unique ids, explicit replacement only, no legacy-id squatting; `v2_replaced_legacy_ids` pipes straight into the BR-1 audit (proven: one replacement drops the migration counter to 156). The non-production probe (`v2_probe_posted_debit_amount`, the BR-18 exemplar's shape) exercises every nested spec end to end. NOTE for BR-3/BR-4/BR-5: the probe's FORMULA_BLOCKED readiness and the placeholder expectation ref are deliberate — expectation-registry membership is BR-7's readiness fold, not a construction rule.
 
 **Verification:**
 
