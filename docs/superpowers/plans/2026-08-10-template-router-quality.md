@@ -814,11 +814,28 @@ and the counter-measurement is one query.
 
 AGREED ORDER (owner-endorsed 2026-08-10; Step 0 and acceptance criteria added in review):
 
-0. **Funnel instrumentation** (pulled forward out of Task 6). Registry → grounded → gauntlet
-   survivors, per-recipe reject codes, on both surfaces. The plan's own Open Questions said this
-   must land before anything judged on survivor counts; the order now agrees. Also the cheapest
-   item here, and it retires the embarrassment that 14 of `ftr`'s 23 grounded recipes vanish with
-   no recorded reason.
+0. **Funnel instrumentation** (pulled forward out of Task 6). **BUILT 2026-08-10 — and its premise
+   was CORRECTED in the building.** Verify-first found the gauntlet reject codes were ALREADY on
+   the wire: `collection.rejections` carries `{template_id, code, explanation}` per refused recipe
+   — the plan's "the drop is invisible" came from reading `omitted_counts: {}` (page-level
+   withholding, a different counter) and never checking the field beside it. What was genuinely
+   missing, now shipped: `GET /catalog/{source}/recipe-funnel` — every template's REAL grounding
+   verdict, EVERY unmet required need with role+concept (`GroundingOutcome` early-returns at the
+   first and names only the role), the blocked-concept histogram in wire order, and the Task-2b
+   grounding stopwatch. Engine `recipe_funnel()` in `templates.py` (load-once, read-scoped,
+   verdicts from `ground_template_outcome` — never a parallel re-derivation); 6 engine + 4 route
+   tests; suite 10162.
+
+   **Live measurements this unlocked (2026-08-10):**
+   ```
+   ftr: 23 grounded → 9 shown   14 rejections: 11× CURRENCY_POLICY_REQUIRED, 3× NON_NUMERIC
+   cib: 10 grounded → 9 shown    1 rejection:   1× PERSONAL_DATA_POLICY_REQUIRED
+   ```
+   `cib`'s survival — an open question since the first draft — is measured: 10→9. And the `ftr`
+   histogram converts Task 5's stranded-proposals bullet into the plan's SINGLE CHEAPEST WIN: **11
+   of 14 rejections are "no declared currency", and 6 LLM currency proposals sit unconfirmed in
+   the E4a review queue.** One reviewer-hour plausibly turns up to 11 rejections into shown
+   features — more yield than any engineering task in this plan.
 1. **Task 2b — the content-addressed verdict store + ingest warming.** No new tables; reuses the
    critic's replay seam. What makes Task 2 affordable and replay-stable.
 2. **Task 2 — tie-break on meaning (shadow → flag).** 19 of 53 live bindings are alphabetical coin
@@ -854,7 +871,7 @@ ACCEPTANCE CRITERIA — a step is DONE when:
 
 | step | done when |
 |---|---|
-| 0 | reject codes visible per recipe on both surfaces; `cib`'s 23→? survival finally measured |
+| 0 | **DONE 2026-08-10** — reject codes were already live (premise corrected); the funnel endpoint ships the never-grounded side + stopwatch; `cib` measured 10→9 |
 | 1 | every GENUINE tie remaining after the F1/F2 corrections adjudicated at ingest-warm time; request path is cache-hit only; a re-run of the same catalog reuses every verdict |
 | 2 | shadow disagreement report reviewed by an SME; flag on; the disagreement-fixture test proves meaning beats spelling; replay test green |
 | intake | full ticket extracted on real hypotheses; typed names pin (collision → fuzzy); confirm screen live; ticket + confirmation stored per the storage decision; cache key covers all four inputs |

@@ -698,6 +698,79 @@ def ground_all(conn, templates: Iterable[Template], *, catalog_source: str,
     ]
 
 
+# ── Step 0: the catalog-wide recipe funnel (read-only diagnostic) ────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class RecipeFunnelEntryV1:
+    """One template's fate against one catalog: the REAL grounding verdict, its reason codes, and —
+    the part no other surface carries — EVERY unmet required need with role AND concept.
+    ``GroundingOutcome`` early-returns at the first unmet need and names only the role; the funnel
+    exists because "which concepts block how many recipes" is the number that sized every task in
+    the router plan and had no product surface (it was computed by hand, in kubectl, four times)."""
+
+    template_id: str
+    status: str                          # GroundingStatus value
+    reason_codes: tuple[str, ...]
+    unmet: tuple[tuple[str, str], ...]   # (need role, need concept), required needs only
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeFunnelV1:
+    entries: tuple[RecipeFunnelEntryV1, ...]
+    registry_total: int
+    grounded: int
+    #: concept -> templates it blocks, sorted most-blocking first. tuple-of-pairs, not a dict, so
+    #: the wire order IS the histogram order.
+    blocked_concepts: tuple[tuple[str, int], ...]
+    #: The Task-2b stopwatch: grounding cost per pass, as a NUMBER. The verdict-store design leans
+    #: on "the glance is ~free"; this is where that stays measured instead of remembered.
+    elapsed_ms: float
+
+
+def recipe_funnel(conn, *, catalog_source: str, roles: Iterable[str] = (),
+                  templates: Sequence[Template] | None = None) -> RecipeFunnelV1:
+    """Every template's fate against ``catalog_source``, read-scoped exactly like grounding itself.
+
+    The verdict per template is the REAL one — :func:`ground_template_outcome`, never a parallel
+    re-derivation that could drift from the distinct-binding or assignment-cap semantics. The unmet
+    sweep then re-walks the REQUIRED needs of every non-grounded template so the entry names them
+    ALL (the outcome stops at the first). Both run over ONE `_load_columns` list — the load-once
+    lesson — and read scope is inherited from it: a column the caller cannot see is not a candidate
+    here either, so the funnel can never become a side channel around visibility."""
+    import time as _time
+
+    if templates is None:
+        templates = ALL_TEMPLATES   # defined at module tail; resolved at call time on purpose
+    started = _time.perf_counter()
+    cols = _load_columns(conn, catalog_source, roles)
+    entries: list[RecipeFunnelEntryV1] = []
+    blocked: dict[str, int] = {}
+    grounded = 0
+    for template in templates:
+        outcome = ground_template_outcome(
+            conn, template, catalog_source=catalog_source, roles=roles, columns=cols)
+        unmet: tuple[tuple[str, str], ...] = ()
+        if outcome.status is GroundingStatus.GROUNDED:
+            grounded += 1
+        else:
+            unmet = tuple(
+                (need.role, need.concept)
+                for need in template.needs
+                if not need.optional and _match(conn, cols, need) is None)
+            for _role, concept_name in unmet:
+                blocked[concept_name] = blocked.get(concept_name, 0) + 1
+        entries.append(RecipeFunnelEntryV1(
+            template_id=template.id, status=outcome.status.value,
+            reason_codes=outcome.reason_codes, unmet=unmet))
+    return RecipeFunnelV1(
+        entries=tuple(entries),
+        registry_total=len(templates),
+        grounded=grounded,
+        blocked_concepts=tuple(sorted(blocked.items(), key=lambda kv: (-kv[1], kv[0]))),
+        elapsed_ms=(_time.perf_counter() - started) * 1000.0,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The 12 retail_churn templates — authored from Part F (§F.1–§F.12) of the SME library.
 #
