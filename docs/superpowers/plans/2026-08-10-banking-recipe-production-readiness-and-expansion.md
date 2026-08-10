@@ -1,0 +1,2106 @@
+# Banking Recipe Production Readiness and Expansion — Detailed Implementation Plan
+
+> Planning artifact only. This document does not authorize recipe, API, database, frontend, or production changes by itself.
+
+**Goal:** Turn the current 157-recipe banking idea catalogue into a versioned, atomic, executable and honestly presented recipe product, then expand it with reusable transaction, account, customer, RBWM, CIB and specialist banking packs.
+
+**Baseline reviewed:** origin/main at 58041a59 on 2026-08-10 (re-baselined the same day from afd75a62 — see "Baseline delta" below; the router-quality wave landed seven commits on top of the original baseline, five of which touch files this plan modifies). Re-verified against 58041a59: registry 157 recipes; 14 authored primary objectives; 1,122 total parameter combinations (the original 1,089 was measured at afd75a62 with the same registry — treat all remaining counts in this document as afd75a62-era estimates and let Task 1's audit regenerate every number as the authoritative baseline). Full suite at re-baseline: 10231 passed.
+
+## Baseline delta — what landed between afd75a62 and 58041a59, and what it changes here
+
+The router-quality plan (2026-08-10-template-router-quality.md) completed its engineering in this window. Consequences for this plan, task by task:
+
+- **Tie-break adjudication is LIVE** (`FEATUREGEN_TIE_BREAK_BINDING=1` in the kind deployment): tied bindings are resolved by warmed, content-addressed model verdicts; unadjudicated ties fall back to the deterministic order with the tie honestly recorded (`BindingResolution.AMBIGUOUS` + `tied_candidate_refs`). Task 5 and invariant 5 are amended below to build on this rather than revert it — fail-closed-on-all-ties as originally written would unground ~19 of 53 live bindings and collapse the measured ftr funnel (9→17 suggestions).
+- **Hypothesis-chosen parameters shipped** (Task 4b of the router plan, flag `FEATUREGEN_PARAM_CHOICE`, default off): `choose_params` through the governed seam, a `params_by_id` grounding seam on `ground_all_outcomes`, window-bearing feature names, `param_alternatives` on the card, and `semantic_parameter_binding_hash` already participating in candidate identity. Task 3 is recast below as extending this, not introducing it.
+- **Alias hygiene + two-tier matching shipped** (router Task 1): a `Need` targeting a successorless retired alias now FAILS import validation; matching is two-tier (exact authored −4 over cross-alias canonical −3), and `Need.alternates` exists. Task 10 is amended below — it may not re-canonicalize a retired alias.
+- **The intake build shipped end to end** (migration 1059; `/contract/intake` + confirm gate + Workbench screen): a signed target reading (`contract_intent.target_*`) now exists and feeds the near-label critic and use-case ordering. Orthogonal to this plan's surfaces, but `gate1.py` and `templates.py` diffs in Tasks 3/5/17 must be authored against the current tree.
+- **Near-label critic, use-case ordering, selection telemetry shipped** (flags `FEATUREGEN_NEAR_LABEL_CRITIC`, `FEATUREGEN_USE_CASE_ORDERING`; `GET /contracts/selection-telemetry`). The `FeatureIdea` dataclass gained `near_label_verdict`/`near_label_rationale`/`param_alternatives` — contract-v3 field naming must not collide.
+- **Migration pool**: 1059 is consumed; the pool is at 1060+. Any migration this plan draws (Task 23's `recipe_review_event`) must append to the D7 reservation table in `docs/architecture/2026-08-01-verified-interfaces-semantic-profiles.md` IN THE SAME COMMIT — the repository's standing discipline, stricter than "allocate at implementation time".
+
+**Architecture:** Introduce Recipe Contract v2 alongside the current Template contract. V2 makes one recipe equal one output, replaces prose-only computation claims with typed formula and operational-policy references, derives PIT text from a typed temporal contract, fails closed on ambiguous operands, and exposes an explicit execution-readiness state through a new suggestion contract version. Existing v1/v2 suggestion clients and persisted feature records remain readable while the 157 legacy templates are migrated family by family. Formula-v1 remains immutable; a versioned Formula-v2 adds the operations the banking library actually requires.
+
+**Technology:** Python 3.12, FastAPI, psycopg3, PostgreSQL, TypedFormula, React, TypeScript, Vitest and pytest.
+
+## Why this is a program, not a recipe-editing task
+
+The current library has several systemic constraints:
+
+- 126 recipes offer multiple output measures but carry one aggregation and one additivity.
+- 153 of 157 recipes are unassessed for formula authoring; only two are Formula-v1 authorable.
+- 145 recipes have user-facing identity collisions across their parameter space.
+- Normal grounding binds the first parameter value rather than surfacing a bounded, explicit variant choice.
+- Two recipes have demonstrably incorrect PIT placeholders.
+- Ambiguous operand bindings may still become suggestions.
+- Thirty-three recipes depend on declared downstream derivations; eleven explicitly admit that the required business concept does not exist.
+- Only fourteen recipes have an authored primary objective, covering eight taxonomy leaves.
+
+Adding more prose recipes before repairing these contracts would increase the number of ambiguous and non-executable suggestions. The implementation order below deliberately fixes the platform first, migrates the current content second, and expands the banking library third.
+
+## Non-negotiable invariants
+
+1. **One active recipe produces one atomic output.** A ratio and an amount are separate recipe revisions, even when they share operands.
+2. **No readiness by implication.** Conceptual grounding, design validation, formula authorability, materialization readiness and predictive validation are separate states.
+3. **Formula-v1 stays immutable.** Formula-v2 is additive and versioned; old hashes and replay envelopes continue to verify.
+4. **Suggestion contracts v1 and v2 stay readable.** New readiness and parameter fields ship through contract v3, never as silent optional reinterpretations of v2.
+5. **Ambiguity fails closed — with the live adjudication seam recognized.** No deterministic alphabetical tie-break may be represented as a valid operand choice. An ADJUDICATED tie — a warmed, content-addressed model verdict recorded per (template, need, tied-candidate content) through the governed seam, auditable and replayable — IS a valid choice on the discovery surface; this is live behavior today (`FEATUREGEN_TIE_BREAK_BINDING`) and this plan builds on it, never reverts it. An UNADJUDICATED tie fails closed in the V2 executable path: it may not become a formula-authorable or materialization-ready binding.
+6. **PIT is compiled, not judged from prose.** Human-readable PIT text is a rendering of the typed temporal policy.
+7. **Banking event lifecycle is explicit.** Authorization, booking, value, clearing, settlement, return, reversal and knowledge times are not interchangeable.
+8. **Direction, sign, status and currency are governed inputs.** A monetary amount alone is not enough to compute an inflow, payment, exposure, revenue or runoff feature.
+9. **Coverage is not inflated.** Primary coverage, supporting relevance and intentional emptiness remain separate metrics.
+10. **No predictive-performance claim.** Formula correctness and banking validity do not establish model lift, fairness or suitability.
+11. **No destructive migration.** Existing registered features, recipe revisions, suggestion v1/v2 payloads and audit hashes remain readable.
+12. **Every production recipe has gold evidence.** Synthetic row-level cases cover ordinary, boundary, null, reversal, multi-currency and late-arriving-data behavior.
+
+## Definition of done
+
+The program is complete only when all of the following are true:
+
+- Every active production recipe uses Recipe Contract v2.
+- Every active production recipe has exactly one OutputSpec.
+- Every output has a type, additivity, unit or unit policy, currency policy, null policy and denominator policy where applicable.
+- Every parameter is classified as semantic, operational or governed-policy selection.
+- Every bound parameter is represented in canonical identity and human display.
+- No PIT placeholder is hand-authored.
+- No ambiguous required binding is emitted as a suggestion.
+- Every active recipe has an explicit primary objective and zero or more explicit supporting objectives.
+- Every active recipe is classified as executable, blocked by named authority, conceptual-only, or retired; unassessed is forbidden.
+- Every executable recipe has a reviewed formula expectation and gold cases.
+- The suggestion UI distinguishes conceptual, governance-blocked, formula-validated and materialization-ready states.
+- The coverage report has zero active recipes relying on legacy applicability inference.
+- The legacy debt ratchet reaches zero.
+- New transaction, account, customer/RBWM and CIB foundation packs meet the same gates before release.
+
+## Review-finding traceability
+
+| Review finding | Primary remediation |
+|---|---|
+| Multi-measure recipes with one output contract | Tasks 2, 11–17 |
+| Parameter and display identity collisions | Task 3 |
+| First-parameter-only grounding | Task 3 |
+| 153 formula-unassessed recipes | Tasks 7, 11–17 |
+| Two PIT placeholder defects | Task 4 |
+| Prose-based PIT completeness | Task 4 |
+| Ambiguous bindings still surface | Task 5 |
+| Generic stock/flow operands bind the wrong banking quantity | Tasks 5, 10–17 |
+| Missing status, direction, reversal and currency semantics | Tasks 5, 10, 18 |
+| Downstream derivations presented like available computations | Tasks 7, 11–17 |
+| Supporting tags inflate coverage | Task 9 |
+| UI cannot communicate real execution readiness | Task 8 |
+| Retail, credit, fraud, AML, collections, ALM, payments and specialist defects | Tasks 11–17 |
+| Missing transaction/account/customer/RBWM/CIB packs | Tasks 18–21 |
+| Existing tests miss banking semantics | Tasks 1, 22 |
+
+## Delivery sequence
+
+| Release increment | Scope | Exit gate |
+|---|---|---|
+| R0 | Audit, lint and debt ratchet | New recipe debt cannot increase |
+| R1 | Recipe Contract v2, identity, temporal and binding correctness | Contract and grounding invariants pass |
+| R2 | Formula-v2 and execution-readiness classification | Formula capability is versioned and fail-closed |
+| R3 | Suggestion contract v3 and UI truthfulness | No conceptual suggestion looks executable |
+| R4 | Migrate and correct the existing 157 recipes | Legacy debt is zero |
+| R5 | Transaction and account foundation | First reusable atomic banking pack is executable |
+| R6 | Customer/RBWM and CIB expansion | Priority business packs meet production gates |
+| R7 | Specialist expansion and rollout | Shadow evidence, SME sign-off and operational SLOs pass |
+
+---
+
+## Task 1: Add the registry audit, debt baseline and CI ratchet
+
+**Purpose:** Make every identified defect machine-countable before changing behavior. The first delivery prevents new debt and proves later tasks reduce it.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipe_audit.py
+- Create: src/featuregen/overlay/upload/recipe_audit_cli.py
+- Create: tests/featuregen/overlay/upload/test_recipe_audit.py
+- Create: docs/architecture/banking-recipe-debt-baseline.json
+- Modify: pyproject.toml
+
+**Audit checks:**
+
+- recipe count and family count;
+- output-measure count per recipe;
+- parameter-combination count and distinct rendered identity count;
+- PIT parameter references versus declared parameter names;
+- explicit primary and supporting objectives;
+- formula-authoring class;
+- authored versus inferred source grain, join role and temporal role;
+- unresolved or ambiguous source-entity role;
+- declared downstream derivations;
+- missing concepts explicitly admitted in notes or degrade text;
+- monetary-flow recipes without direction/sign authority;
+- monetary recipes without unit/currency policy;
+- ambiguous binding disposition;
+- formula expectation and gold-corpus coverage;
+- legacy Template versus RecipeDefinitionV2 population.
+
+**Steps:**
+
+- [ ] Add a pure audit report over ALL_TEMPLATES and the future V2 registry.
+- [ ] Record the reviewed baseline counts in banking-recipe-debt-baseline.json.
+- [ ] Add a ratchet test that fails if any count worsens, while permitting intentional decreases.
+- [ ] Add strict mode that requires every debt count to equal zero; strict mode remains off until Task 17.
+- [ ] Add JSON and human-readable CLI output.
+- [ ] Make the report identify exact recipe IDs, parameter names and conflicting output properties rather than only counts.
+- [ ] Pin the two known PIT defects as failing examples.
+- [ ] Pin at least one multi-measure/additivity conflict, one display collision and one ambiguous binding.
+
+**Acceptance:**
+
+- The baseline report reproduces the reviewed numbers.
+- Adding a new multi-measure legacy recipe fails CI.
+- Adding an unmatched PIT placeholder fails CI.
+- Existing behavior and public API payloads remain unchanged.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_recipe_audit.py -v
+- uv run python -m featuregen.overlay.upload.recipe_audit_cli --format json
+
+**Commit:** test(recipes): add the production-readiness debt audit and CI ratchet
+
+---
+
+## Task 2: Introduce Recipe Contract v2 with one atomic output
+
+**Purpose:** Establish a schema capable of expressing banking computation honestly without editing all 157 constructors in one risky change.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipe_contract_v2.py
+- Create: src/featuregen/overlay/upload/recipe_registry_v2.py
+- Create: src/featuregen/overlay/upload/recipe_legacy_adapter.py
+- Create: tests/featuregen/overlay/upload/test_recipe_contract_v2.py
+- Create: tests/featuregen/overlay/upload/test_recipe_grounding_context.py
+- Modify: src/featuregen/overlay/upload/recipe_grounding_context.py
+
+**Core types:**
+
+- RecipeDefinitionV2
+- OperandSpecV2
+- OutputSpecV2
+- ParameterSpecV2
+- TemporalSpecV2
+- EligibilitySpecV2
+- LeakageSpecV2
+- FormulaReferenceV2
+- RecipeReviewV1
+- RecipeReadiness
+
+**Required RecipeDefinitionV2 fields:**
+
+- stable recipe_id and revision schema version;
+- family and one primary objective;
+- explicit supporting objectives;
+- business definition and intended decision context;
+- computation kind: deterministic_formula, governed_model_output or conceptual_pattern;
+- one OutputSpecV2;
+- typed operand tuple;
+- explicit source grain and output grain;
+- typed temporal specification;
+- immutable parameter tuple;
+- eligibility and exclusion policies;
+- leakage classification by permitted use-case stage;
+- formula reference or explicit conceptual-only reason;
+- SME review metadata;
+- replacement and legacy aliases.
+
+**Required OutputSpecV2 fields:**
+
+- output_id and display label;
+- logical data type;
+- additivity;
+- unit kind and unit policy;
+- currency policy;
+- null-input policy;
+- empty-population policy;
+- zero-denominator policy where applicable;
+- valid range or constraint where meaningful;
+- formula result scale/rounding;
+- aggregation-over-entity and aggregation-over-time rules.
+
+**Required OperandSpecV2 fields:**
+
+- role and expected concept;
+- required/optional;
+- operand class;
+- allowed source grains;
+- join role;
+- temporal role;
+- distinct-binding group;
+- unit and currency expectations;
+- sign/direction expectation;
+- status/lifecycle policy reference;
+- relationship/cardinality requirement;
+- authority level required for suggestion and for execution.
+
+**Parameter classes:**
+
+- semantic: changes the meaning and therefore the output identity;
+- operational: changes execution behavior while preserving the output definition, such as a selected window;
+- governed_policy: references a reviewed threshold, status set, exchange-rate or eligibility policy and may not be a free literal.
+
+**Compatibility design:**
+
+- Keep Template and ALL_TEMPLATES unchanged during R1.
+- Project a legacy Template through recipe_legacy_adapter as conceptual-only unless an explicit reviewed V2 definition exists.
+- Never infer an executable formula from legacy prose.
+- Preserve canonical-recipe-v1 hashing for old contexts.
+- Add canonical-recipe-v2 hashing for V2 definitions.
+- A V2 replacement names legacy recipe IDs and names explicitly; there is no heuristic aliasing.
+- Make all collection fields deeply immutable. Do not place a mutable dictionary inside a frozen dataclass.
+
+**Steps:**
+
+- [ ] Write constructor and validation tests before adding the registry.
+- [ ] Reject more than one output.
+- [ ] Reject a missing primary objective.
+- [ ] Reject output additivity incompatible with its declared formula result.
+- [ ] Reject a monetary output without a currency policy.
+- [ ] Reject a ratio without zero-denominator behavior.
+- [ ] Reject a parameter that has no class or no identity projection.
+- [ ] Reject an executable recipe without an exact formula reference.
+- [ ] Reject an empty allowed-source-grain set for executable operands.
+- [ ] Implement canonical V2 serialization and hashing with exhaustiveness tests.
+- [ ] Implement the legacy adapter and prove it always returns conceptual-only.
+- [ ] Register one non-production probe recipe to prove end-to-end serialization; do not migrate a banking recipe yet.
+
+**Acceptance:**
+
+- It is impossible to construct a valid V2 executable recipe with the current multi-output ambiguity.
+- Legacy templates continue to ground exactly as before.
+- V1 canonical hashes are byte-identical.
+- V2 canonical hashes change when any output, parameter, operand, temporal or policy field changes.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_recipe_contract_v2.py tests/featuregen/overlay/upload/test_recipe_grounding_context.py -v
+
+**Commit:** feat(recipes): introduce the atomic Recipe Contract v2
+
+---
+
+## Task 3: Correct candidate identity, naming and bounded parameter selection
+
+**Purpose:** Ensure two different semantic or operational choices never look like the same feature, without generating an unbounded Cartesian product.
+
+**Shipped baseline this task EXTENDS (re-baseline note):** router-plan Task 4b (38119e26) already delivers the push half — hypothesis-chosen parameters through the governed seam (`param_choice.py`: closed selection from the authored tuples, per-template content-addressed replay with abstains stored), an additive `params_by_id` seam on `ground_all_outcomes` re-guarded by `_bind_params`, window-bearing feature NAMES, the untaken alternatives named on the card (`param_alternatives`), and `semantic_parameter_binding_hash` already inside candidate identity — behind `FEATUREGEN_PARAM_CHOICE` (default off). This task adds the PULL half (user-driven bounded variant selection) and the classification model; both halves MUST flow through the same `params_by_id` grounding seam and the same parameterisation-bearing identity. Do not introduce a second identity or a second override channel.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/suggestion_identity.py
+- Modify: src/featuregen/overlay/upload/recipe_grounding_context.py
+- Modify: src/featuregen/overlay/upload/templates.py
+- Create: src/featuregen/overlay/upload/recipe_variants.py
+- Test: tests/featuregen/overlay/upload/test_suggestion_identity.py
+- Create: tests/featuregen/overlay/upload/test_recipe_variants.py
+
+**Identity rules:**
+
+- Canonical candidate identity contains recipe revision, output_id, every bound parameter, ordered role binding, grain, time anchor and relationship-path assignment.
+- Human display contains output meaning plus every meaning-bearing parameter.
+- Windows use canonical suffixes such as 30d or 60min.
+- Thresholds reference a governed policy label, not an unexplained number.
+- A semantic parameter cannot be hidden in a generic aggregation label.
+- Legacy suggestion v1/v2 identities remain untouched; corrected identities are emitted only in contract v3.
+
+**Variant behavior:**
+
+- Do not ground every parameter combination during a table page load.
+- Ground one reviewed default variant and return the bounded allowed parameter schema.
+- Permit an explicit read-only variant request with exact validated parameter bindings.
+- Bound allowed values and reject unknown parameters.
+- Do not accept arbitrary thresholds or formulas from the browser.
+- A selected variant receives its own deterministic suggestion identity and formula expectation binding.
+
+**Steps:**
+
+- [ ] Add collision tests for window_min, horizon_days, measure, threshold, baseline and match-policy parameters.
+- [ ] Add a display-name golden test for each parameter class.
+- [ ] Introduce ParameterSelectionV2 and validate selections against ParameterSpecV2.
+- [ ] Add a bounded variant resolver that never enumerates the full Cartesian product.
+- [ ] Carry the selection into RecipeGroundingContextV2.
+- [ ] Retain the current first-default behavior only through the legacy adapter.
+- [ ] Add an audit check proving all V2 variants have distinct canonical identities.
+- [ ] Define replacement aliases for any migrated recipe whose display name changes.
+
+**Acceptance:**
+
+- The legacy parameter combinations (1,122 re-measured at 58041a59) no longer collapse after their recipes are migrated.
+- A 90-day ratio and 90-day net amount are different recipes, not variants.
+- A 30-day and 90-day instance of one atomic output are distinct selected variants.
+- Page-load work remains bounded by recipe count rather than all parameter combinations.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_suggestion_identity.py tests/featuregen/overlay/upload/test_recipe_variants.py -v
+
+**Commit:** fix(recipes): make every bound recipe parameter identity-bearing and selectable
+
+---
+
+## Task 4: Replace prose PIT declarations with a typed temporal contract
+
+**Purpose:** Remove placeholder drift and distinguish banking event time, business effective time, processing time and knowledge time.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipe_temporal_v2.py
+- Modify: src/featuregen/overlay/upload/planner/declarations.py
+- Modify: src/featuregen/overlay/upload/taxonomy/ranking_signals.py
+- Modify: src/featuregen/overlay/upload/suggestion_contract.py
+- Test: tests/featuregen/overlay/upload/test_recipe_temporal_v2.py
+- Test: tests/featuregen/overlay/upload/taxonomy/test_ranking_signals.py
+- Test: tests/featuregen/overlay/upload/planner/test_declarations.py
+
+**Temporal model:**
+
+- anchor kind: event, as_of, effective interval, contractual future date or pre-decision;
+- event timestamp role;
+- business-effective timestamp role;
+- ingestion/knowledge timestamp role where late arrival matters;
+- window basis, unit and boundaries;
+- timezone and business calendar;
+- observation cutoff inclusivity;
+- future-horizon policy for contractual maturity inputs;
+- snapshot selection policy such as latest-known-at-cutoff;
+- late-arrival and backfill behavior;
+- required external temporal-policy authority.
+
+**Steps:**
+
+- [ ] Implement TemporalSpecV2 validation and compiler output.
+- [ ] Render human PIT text from the compiled object; remove author-edited placeholders from V2.
+- [ ] Make PIT completeness consume compiler status and governed bindings, never keyword markers.
+- [ ] Add distinct support for fraud pre-authorization state, booking/value/settlement event windows, as-of snapshots and contractual future horizons.
+- [ ] Require knowledge-time semantics for any source that can be corrected or arrive late.
+- [ ] Fix merchant_mcc_diversity by using a day-based trailing observation window and non-real-time wording unless a genuine pre-decision feed is bound.
+- [ ] Fix maturity_ladder_runoff by binding horizon_days to a future contractual-maturity interval.
+- [ ] Give obligor_facility_count its own trailing facility-activity temporal declaration rather than reusing prose about latest exposure, limit, covenant and utilization state.
+- [ ] Add a mismatch test proving an undeclared temporal parameter cannot compile.
+- [ ] Keep the legacy PIT string on v1/v2 payloads for compatibility; v3 exposes the rendered typed declaration and structured temporal fields.
+
+**Acceptance:**
+
+- PIT status cannot be complete when the temporal anchor is missing, ambiguous or ungoverned.
+- No V2 PIT string contains an unresolved placeholder.
+- Real-time fraud and batch trailing-window recipes cannot share one temporal declaration.
+- Future contractual maturity is not represented as a past trailing window.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_recipe_temporal_v2.py tests/featuregen/overlay/upload/taxonomy/test_ranking_signals.py tests/featuregen/overlay/upload/planner/test_declarations.py -v
+
+**Commit:** fix(recipes): compile point-in-time semantics from typed banking time roles
+
+---
+
+## Task 5: Fail closed on ambiguous or semantically incompatible operands
+
+**Purpose:** Stop deterministic tie-breaking from turning uncertainty into a plausible-looking feature.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/templates.py
+- Modify: src/featuregen/overlay/upload/need_metadata.py
+- Modify: src/featuregen/overlay/upload/contract/gate1.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_authority.py
+- Create: src/featuregen/overlay/upload/recipe_operand_policy.py
+- Test: tests/featuregen/overlay/upload/test_templates.py
+- Test: tests/featuregen/overlay/upload/test_need_metadata.py
+- Create: tests/featuregen/overlay/upload/test_recipe_operand_policy.py
+
+**Required behavior (amended at re-baseline to compose with the live tie-break architecture):**
+
+- In the V2 EXECUTABLE path: a tied required operand with NO adjudicated verdict produces AMBIGUOUS_BINDING and no selected column. A tie resolved by a warmed verdict (the Task-2 seam in `tie_break.py` — content-addressed on the tied candidates' own enrichment text) is a valid, auditable binding and carries its verdict reference.
+- The legacy discovery surface keeps today's live behavior byte-for-byte: verdict-bound where adjudicated, deterministic order where not, the tie always recorded (`tied_candidate_refs`). Reverting it would unground ~19 of 53 live bindings.
+- Do NOT build a second tie mechanism: V2 consumes the SAME verdict store, and "adjudicated" means exactly `find_tie_break_verdict` returning a ranking valid for the tied set.
+- An optional tied operand remains unresolved; it is never silently selected.
+- A V2 executable recipe must author allowed source grains, join role and temporal role.
+- Entity compatibility must match governed entity semantics.
+- Generic monetary_stock and monetary_flow concepts require an additional economic-role constraint.
+- Opposing legs such as income/expense or debit/credit require distinct physical bindings or governed sign authority.
+- Cross-table operands require a governed path and acceptable directional cardinality.
+- Unit and currency compatibility are evaluated per operand and output.
+
+**Operational authority checks:**
+
+- direction/sign convention;
+- transaction lifecycle status set;
+- reversal and correction treatment;
+- fixed versus per-row currency;
+- currency-conversion policy and rate timestamp;
+- snapshot uniqueness and effective dating;
+- active-record definition;
+- facility/account/product lifecycle;
+- relationship cardinality and allocation policy.
+
+**Steps:**
+
+- [ ] Change required tie handling in the V2 EXECUTABLE path to return an unbuildable outcome when no adjudicated verdict exists; consume the existing warmed-verdict store for the adjudicated case. Leave the legacy discovery path's live behavior unchanged (its own flag governs it).
+- [ ] Add reason codes for ambiguous entity, measure, time, status, currency and relationship bindings.
+- [ ] Add an explicit economic_role field or policy reference to OperandSpecV2.
+- [ ] Extend authority envelopes to cover status, sign, currency, temporal and lifecycle decisions.
+- [ ] Ensure formula and suggestion paths consume the same binding verdict.
+- [ ] Prove an ambiguous generic balance cannot become DESIGN_CHECKED.
+- [ ] Prove a deposit balance cannot satisfy a drawn-credit-exposure role merely because both are monetary_stock.
+- [ ] Prove beneficiary bank cannot satisfy beneficiary/payee identity.
+- [ ] Prove settlement status cannot satisfy authorization outcome.
+- [ ] Add explicit user/governance resolution information to the rejection payload.
+
+**Acceptance:**
+
+- No ambiguous required operand appears in a suggestion.
+- No formula authority envelope can verify a role using a concept-compatible but economic-role-incompatible column.
+- Optional omissions are visible and formula-specific; no recipe claims an output whose required denominator is absent.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_templates.py tests/featuregen/overlay/upload/test_need_metadata.py tests/featuregen/overlay/upload/test_recipe_operand_policy.py tests/featuregen/overlay/upload/test_recipe_formula_authority.py -v
+
+**Commit:** fix(recipes): reject ambiguous and banking-incompatible operand bindings
+
+---
+
+## Task 6: Add Formula-v2 without changing Formula-v1 identity
+
+**Purpose:** Support the computations required by the banking catalogue while preserving every Formula-v1 hash, replay envelope and materialized artifact.
+
+**Files:**
+
+- Create: src/featuregen/formula/schema_v2.py
+- Create: src/featuregen/formula/proposal_v2.schema.json
+- Create: src/featuregen/formula/canonical_v2.py
+- Create: src/featuregen/formula/parse_v2.py
+- Create: src/featuregen/formula/capability_v2.py
+- Create: src/featuregen/formula/operations_v2.py
+- Create: src/featuregen/formula/output_authority_v2.py
+- Modify: src/featuregen/formula/__init__.py
+- Create: tests/featuregen/formula/test_schema_v2.py
+- Create: tests/featuregen/formula/test_canonical_v2.py
+- Create: tests/featuregen/formula/test_capability_v2.py
+- Create: tests/featuregen/formula/gold_v2/
+
+**Minimum Formula-v2 capability:**
+
+- existing sum, row count, non-null count, distinct count, ratio and difference;
+- minimum, maximum and average;
+- first-known and last-known value at cutoff;
+- lag, delta and date difference;
+- recency;
+- standard deviation and z-score;
+- percentile and median;
+- OLS slope;
+- consecutive-run/streak;
+- conditional expressions and flags;
+- HHI/top-share concentration;
+- future contractual-date inclusion;
+- effective-dated lookup;
+- explicit status, direction and reversal filters;
+- currency conversion through a governed rate policy;
+- account-to-customer and facility-to-obligor rollups through an allocation policy;
+- multi-expression formulas over one governed relationship plan.
+
+**Capability boundaries:**
+
+- A computation outside Formula-v2 is conceptual-only or blocked; it is never approximated by prose.
+- Cross-source formulas remain unsupported until a separate governed multisource capability is accepted.
+- Model predictions, CLV projections, anomaly models and propensities are not ordinary deterministic formulas. They require a ModelFeatureSpec and model-governance workflow.
+- Formula-v2 authoring is offline and versioned; execution engines must advertise supported operations.
+
+**Steps:**
+
+- [ ] Freeze all existing Formula-v1 gold hashes before adding imports.
+- [ ] Add V2 structural schema and canonicalization with separate version pins.
+- [ ] Add operations in small increments, each with positive, invalid and unsupported gold cases.
+- [ ] Add version dispatch that parses v1 and v2 explicitly; never infer a version from body shape.
+- [ ] Add output additivity and unit compatibility validation.
+- [ ] Add execution-capability negotiation so an authorable formula is not assumed materializable on every engine.
+- [ ] Extend replay and audit envelopes with the explicit formula schema version.
+- [ ] Add compiler tests for SQL or target execution artifacts where the repository already supports materialization.
+- [ ] Prove every existing Formula-v1 fixture remains byte-identical.
+
+**Acceptance:**
+
+- Formula-v1 canonical and replay tests are unchanged.
+- Formula-v2 can exactly express the first transaction/account foundation tranche.
+- Unsupported complex model features are classified, not approximated.
+- Every operation has deterministic canonicalization and gold cases.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/formula -v
+
+**Commit series:** feat(formula-v2): add versioned banking operations in reviewable increments
+
+---
+
+## Task 7: Make execution readiness explicit and complete the formula evidence path
+
+**Purpose:** Replace unassessed with a closed, audited readiness vocabulary and prevent conceptual recipes from appearing executable.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/recipe_formula_contracts.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_expectations.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_gate.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_gold.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_eval.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_shadow.py
+- Create: src/featuregen/overlay/upload/recipe_readiness.py
+- Test: tests/featuregen/overlay/upload/test_recipe_readiness.py
+- Test: existing recipe_formula tests
+
+**Closed readiness vocabulary:**
+
+- CONCEPTUAL_ONLY: useful SME pattern, exact deterministic computation not available;
+- FORMULA_BLOCKED: exact formula exists but named temporal, sign, unit, currency, join or type authority is unresolved;
+- FORMULA_AUTHORABLE: exact expectation is in the reviewed registry and the engine can author it;
+- FORMULA_VALIDATED: gold and provider evaluation gates pass;
+- MATERIALIZATION_BLOCKED: formula is valid but the selected execution engine lacks capability or a required governed policy;
+- MATERIALIZATION_READY: formula, authority, execution capability and artifact compilation pass;
+- RETIRED: retained only for legacy resolution;
+- UNASSESSED: permitted only in the legacy adapter and forbidden in the V2 production registry.
+
+**Steps:**
+
+- [ ] Add a pure readiness fold whose inputs are recipe definition, formula expectation, authority envelope, formula evaluation and execution-capability verdict.
+- [ ] Make every state include machine-readable blocker codes.
+- [ ] Require a reviewed formula expectation for FORMULA_AUTHORABLE.
+- [ ] Require exact gold cases for FORMULA_VALIDATED.
+- [ ] Require execution-capability proof for MATERIALIZATION_READY.
+- [ ] Keep predictive validation outside this vocabulary.
+- [ ] Expand recipe formula expectations from unary-only to Formula-v2 body shapes.
+- [ ] Add positive, refusal, boundary and authority-drift gold cases per recipe.
+- [ ] Add corpus partitioning by recipe pack so evaluation can be staged without weakening global integrity.
+- [ ] Make the shadow gate report readiness by recipe and operation, not only aggregate success.
+- [ ] Prevent legacy UNASSESSED recipes from being counted as formula-ready or design-checked in contract v3.
+- [ ] Classify all thirty-three downstream-derivation recipes explicitly during Tasks 11–17.
+
+**Minimum gold cases per executable recipe:**
+
+- ordinary populated window;
+- empty window;
+- null measure;
+- boundary timestamp at start and end;
+- duplicate entity/event rows;
+- reversal or correction when applicable;
+- mixed status when applicable;
+- mixed currency when applicable;
+- late-arriving record when applicable;
+- zero denominator for ratio;
+- ambiguous binding refusal;
+- missing authority refusal.
+
+**Acceptance:**
+
+- V2 registry validation fails on UNASSESSED.
+- Conceptual recipes remain discoverable but cannot be registered or materialized as formulas.
+- MATERIALIZATION_READY cannot be reached from prose, template notes or an LLM assertion.
+- Readiness changes are auditable and content-hashed.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_recipe_readiness.py tests/featuregen/overlay/upload/test_recipe_formula_expectations.py tests/featuregen/overlay/upload/test_recipe_formula_gate.py tests/featuregen/overlay/upload/test_recipe_formula_gold.py -v
+
+**Commit:** feat(recipes): add closed execution-readiness states and formula evidence gates
+
+---
+
+## Task 7A: Introduce a separate governed model-feature contract
+
+**Purpose:** Prevent propensities, forecasts, anomaly scores and accounting/risk model outputs from being forced into deterministic Formula-v2 or presented as if a short recipe description were an executable model.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/model_feature_contract.py
+- Create: src/featuregen/overlay/upload/model_feature_registry.py
+- Create: src/featuregen/overlay/upload/model_feature_readiness.py
+- Create: tests/featuregen/overlay/upload/test_model_feature_contract.py
+- Modify: recipe_contract_v2.py and suggestion contract v3
+
+**ModelFeatureSpec requirements:**
+
+- stable model-feature ID and output contract;
+- model family, registered model/version reference and owner;
+- prediction grain and prediction timestamp;
+- training-data cutoff and inference knowledge-time policy;
+- target/label definition and outcome window;
+- input feature-set revision;
+- population, exclusions and permitted purpose;
+- score type, calibration and valid range;
+- model-risk validation status and expiry;
+- fairness, privacy and suitability controls where applicable;
+- monitoring, drift and fallback policy;
+- lineage to the model artifact and inference run.
+
+**Applies to current or planned outputs such as:**
+
+- next-best-product propensity;
+- churn/default/fraud/claims probability;
+- CLV projection;
+- behavioral runoff forecast;
+- anomaly scores and typology scores;
+- ECL, SICR and IFRS9 stage outputs;
+- VaR, expected shortfall and model-produced Greeks;
+- mortality/morbidity loadings;
+- physical/transition risk scores;
+- uplift and campaign-treatment effect.
+
+**Rules:**
+
+- A ModelFeatureSpec is not a FormulaReferenceV2.
+- Deterministic preprocessing inputs may be Formula-v2 recipes, but the prediction remains a governed model output.
+- A model output cannot be materialization-ready without a registered model version and valid model-governance decision.
+- Model performance, calibration and fairness are not inferred from recipe metadata.
+- Near-label and target-derived model inputs remain subject to use-case-specific leakage controls.
+
+**Steps:**
+
+- [ ] Add schema, canonical revision hash and validation.
+- [ ] Add closed readiness states: MODEL_SPEC_BLOCKED, MODEL_REGISTERED, MODEL_VALIDATED, INFERENCE_READY and MODEL_RETIRED.
+- [ ] Add lineage from model feature to deterministic input recipe revisions.
+- [ ] Add contract-v3 presentation distinct from deterministic formulas.
+- [ ] Reclassify current propensity, projection, anomaly and model-risk recipes during Tasks 11–17.
+- [ ] Add refusal tests for an absent model version, expired validation, wrong prediction grain and post-cutoff training/inference data.
+
+**Acceptance:**
+
+- No model-produced output is described as Formula-validated.
+- A valid deterministic input pack does not imply the model itself is approved.
+- Contract v3 clearly identifies formula, model and conceptual outputs.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_model_feature_contract.py -v
+
+**Commit:** feat(model-features): separate governed model outputs from deterministic recipes
+
+---
+
+## Task 8: Publish suggestion contract v3 and update the table and column experiences
+
+**Purpose:** Let users distinguish a good idea from a computable, governed and materializable feature.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/suggestion_contract.py
+- Modify: src/featuregen/overlay/upload/suggestions.py
+- Modify: src/featuregen/api/routes/suggestions.py
+- Modify: frontend/src/api.ts
+- Modify: frontend/src/screens/SuggestedFeaturesScreen.tsx
+- Modify: frontend/src/screens/SuggestionCard.tsx
+- Modify: frontend/src/screens/AssetDetailScreen.tsx
+- Modify: frontend/src/index.css
+- Test: tests/featuregen/overlay/upload/test_suggestion_contract.py
+- Test: tests/featuregen/api/routes/test_suggestions_route.py
+- Test: frontend/src/screens/SuggestedFeaturesScreen.test.tsx
+- Test: frontend/src/screens/SuggestionCard.user-summary.test.tsx
+- Test: frontend/src/screens/AssetDetailScreen.dossier.test.tsx
+
+**Compatibility:**
+
+- contract_version=1 and contract_version=2 remain unchanged.
+- contract_version=3 is explicit during rollout.
+- Unknown v3 enum members render as words rather than crashing the frontend.
+- No new write action is added to the read-only suggestions route.
+
+**V3 suggestion fields:**
+
+- recipe_contract_version;
+- output_id, output label and output type;
+- output additivity, unit and currency policy;
+- execution_readiness;
+- computation_kind and model-feature summary when applicable;
+- readiness_blockers;
+- formula schema version and formula summary when available;
+- exact bound parameters;
+- allowed parameter schema;
+- typed temporal summary;
+- selected grain and source event grain;
+- status, sign, reversal and currency policy references;
+- SME review status and review reference;
+- primary objective and supporting objectives;
+- leakage class and permitted modelling stages;
+- replacement/legacy recipe references;
+- binding ambiguity status;
+- materialization capability status.
+
+**UX requirements:**
+
+- Use distinct language for conceptual only, governance blocked, formula validated and materialization ready.
+- Keep design checked separate from execution readiness.
+- Never use green success styling for conceptual or merely design-checked states.
+- Show the exact output in the card title; do not title a card with a multi-output family phrase.
+- Show the selected window and policy choices near the formula.
+- Let the user inspect allowed variants without generating all variants.
+- Explain each blocker in banking language and retain the machine code in the audit drawer.
+- Group blockers into data meaning, time, currency, relationship, formula capability, governance and execution.
+- Show primary objective separately from supporting relevance.
+- Provide filters for executable, blocked and conceptual suggestions.
+- Preserve the existing table-context and from-column explanation.
+- On asset detail, show whether the opened column is a required operand, optional operand, grain, time or policy input.
+
+**Steps:**
+
+- [ ] Freeze v1/v2 OpenAPI and real-body fixtures.
+- [ ] Add Pydantic v3 response models with extra fields forbidden.
+- [ ] Add page summary counts by execution readiness.
+- [ ] Add TypeScript v3 types and runtime-tolerant render vocabulary.
+- [ ] Add a compact card summary and expanded technical/governance detail.
+- [ ] Add the read-only parameter selector and v3 variant GET.
+- [ ] Add explicit empty states for no conceptual match, ambiguous data, missing governance and unsupported formula.
+- [ ] Add accessibility tests for heading hierarchy, status words, keyboard disclosure and non-color status communication.
+- [ ] Add snapshot/fixture tests for one example in every readiness state.
+- [ ] Keep v2 as the default until Task 24 rollout gates pass.
+
+**Acceptance:**
+
+- A user cannot mistake conceptual-only for executable.
+- A formula-validated but currency-blocked recipe explains both facts.
+- The card title uniquely identifies the output and selected variant.
+- v1/v2 clients and tests are byte-compatible.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_suggestion_contract.py tests/featuregen/api/routes/test_suggestions_route.py -v
+- cd frontend && npm test -- SuggestedFeaturesScreen SuggestionCard AssetDetailScreen
+
+**Commit:** feat(suggestions): publish execution-ready recipe contract v3
+
+---
+
+## Task 9: Correct taxonomy applicability and coverage accounting
+
+**Purpose:** Stop supporting tags and legacy inference from looking like owned banking use-case coverage.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/taxonomy/coverage.py
+- Modify: src/featuregen/overlay/upload/taxonomy/coverage_cli.py
+- Modify: src/featuregen/overlay/upload/taxonomy/recipe_applicability.py
+- Modify: src/featuregen/overlay/upload/taxonomy/use_cases.py where approved
+- Test: tests/featuregen/overlay/upload/taxonomy/test_coverage_cli.py
+- Test: tests/featuregen/overlay/upload/taxonomy/test_recipe_applicability.py
+- Create: docs/architecture/banking-recipe-coverage-targets.json
+
+**Coverage tiers:**
+
+- AUTHORED_PRIMARY: a reviewed recipe owns the objective;
+- AUTHORED_SUPPORTING: relevant input to the objective, not coverage;
+- LEGACY_INFERRED: migration-only and never accepted by a release gate;
+- INTENTIONALLY_EMPTY: reviewed future scope;
+- ZERO: no primary or supporting recipe.
+
+**Steps:**
+
+- [ ] Require every V2 recipe to declare one selectable primary objective.
+- [ ] Require supporting objectives to be explicit and different from primary.
+- [ ] Remove effective coverage as a release-quality shortcut.
+- [ ] Report recipe count and executable recipe count separately by leaf.
+- [ ] Report conceptual-only versus formula-validated coverage.
+- [ ] Report legacy-inferred recipes as debt.
+- [ ] Add target coverage by release increment rather than demanding shallow coverage of every leaf.
+- [ ] Review the thirteen intentionally-empty leaves; keep the status only with an owner and rationale.
+- [ ] Create explicit backlog rows for the twenty-eight leaves currently lacking a primary recipe.
+- [ ] Add coverage differential tests proving a supporting recipe cannot change primary coverage.
+
+**Acceptance:**
+
+- Primary coverage cannot increase when only a supporting tag is added.
+- An objective is not called executable-covered unless at least one Formula-validated or Materialization-ready primary recipe exists.
+- Legacy applicability inference reaches zero by Task 17.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/taxonomy -v
+- uv run python -m featuregen.overlay.upload.taxonomy.coverage_cli --format json
+
+**Commit:** fix(taxonomy): separate owned, supporting and executable recipe coverage
+
+---
+
+## Task 10: Add the canonical banking event, state and policy vocabulary
+
+**Purpose:** Give recipes the semantic building blocks that eleven current definitions explicitly lack and many others currently approximate.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/concepts.py
+- Modify: src/featuregen/overlay/upload/binding_roles.py
+- Modify: src/featuregen/overlay/upload/operational_facts.py
+- Modify: src/featuregen/overlay/upload/field_policies.py
+- Modify: src/featuregen/data_agent/eligibility.py
+- Modify: src/featuregen/data_agent/eligibility_store.py
+- Create: src/featuregen/overlay/upload/banking_policies.py
+- Create: tests/featuregen/overlay/upload/test_banking_concepts.py
+- Create: tests/featuregen/overlay/upload/test_banking_policies.py
+
+**Canonical transaction/event concepts:**
+
+- transaction_id and original_transaction_id;
+- account_id, card_id, merchant_id and beneficiary_id (counterparty identity is NOT a new identifier concept: `counterparty_id` is a RETIRED alias — D12.1 and the three-axis decision made counterparty a PARTY ROLE of the customer/party identifier. Counterparty-ness is expressed through `party_role` and Task 5's `economic_role`/network-role fields on the operand, never by reviving the alias);
+- transaction amount and original amount;
+- debit/credit direction and physical sign convention;
+- transaction type, instrument, channel, rail, scheme and MCC;
+- authorization outcome and authorization timestamp;
+- booking status and booking timestamp;
+- value date;
+- clearing status and clearing timestamp;
+- settlement status and settlement timestamp;
+- return, rejection, refund, chargeback and reversal event/status/reason;
+- currency, account currency and conversion-rate reference;
+- counterparty country, merchant country and corridor direction;
+- ingestion/knowledge timestamp.
+
+**Canonical state/lifecycle concepts:**
+
+- account open, close, active and dormant state;
+- product holding valid_from and valid_to;
+- approved limit, available limit, drawn principal and accrued interest;
+- contractual due amount, minimum due and payment allocation;
+- facility, covenant, collateral, guarantee and valuation lifecycle;
+- promise amount, promise due date, promise outcome and kept/broken state;
+- contact attempt, contact outcome and right-party-contact indicator;
+- mandate state, scheduled instruction and execution outcome;
+- claim identity, claim event, reserve, paid amount and claim status;
+- invoice issue, due, approval, payment and credit-note event;
+- LC/guarantee issue, amendment, utilization, expiry and rollover event.
+
+**Governed policy types:**
+
+- eligible transaction status policy;
+- direction/sign policy;
+- reversal and correction policy;
+- active account/product/facility policy;
+- currency conversion policy;
+- business calendar and timezone policy;
+- allocation policy for joint accounts and relationship rollups;
+- threshold policy with jurisdiction, effective period and currency;
+- risk-rating/corridor policy with effective dating;
+- model output policy carrying model version, horizon and confidence;
+- privacy, suitability, consent and purpose policy.
+
+**Steps:**
+
+- [ ] Add concepts only after checking no current governed concept already has the meaning.
+- [ ] HARD RULE (re-baseline): no added concept may carry a name in `_LEGACY_ALIASES` (concepts.py) — as of 58041a59 a Need targeting a successorless retired alias fails import validation, and stored legacy values are handled by two-tier matching, so reviving an alias would both break validation and duplicate a governed decision.
+- [ ] Define aliases without collapsing distinct lifecycle stages.
+- [ ] Add entity links, PIT roles, units, additivity and sensitivity metadata.
+- [ ] Add operational facts and evidence requirements for sign, status, reversal, currency and active-state policies.
+- [ ] Reuse the existing eligibility-policy and authority stores rather than embedding source-specific status literals in recipes.
+- [ ] Add enrichment prompt and projection coverage for new concepts.
+- [ ] Add source-profile guidance so card authorization, core-ledger posting and payment settlement datasets are not classified as interchangeable transaction tables.
+- [ ] Add tests that intentionally refuse authorization-from-settlement, payee-from-beneficiary-bank and contact-from-cost mappings.
+- [ ] Add backwards-compatible aliases for valid old concept names; do not alias semantically different concepts.
+
+**Acceptance:**
+
+- Current recipes no longer need to state that chargeback, right-party contact, promise outcome, invoice lifecycle or installment schedule concepts do not exist.
+- A source must declare or resolve its lifecycle/status policy before filtered formulas are materialization-ready.
+- The concept registry can distinguish customer, account, facility, merchant, beneficiary, counterparty and legal group grains.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_concepts.py tests/featuregen/overlay/upload/test_banking_concepts.py tests/featuregen/overlay/upload/test_banking_policies.py -v
+
+**Commit series:** feat(banking-semantics): add governed event, lifecycle and policy concepts
+
+---
+
+## Task 11: Migrate and correct Retail/RBWM churn and cross-sell recipes
+
+**Purpose:** Convert the current retail and cross-sell families into atomic outputs with account/customer lifecycle correctness.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/retail.py
+- Create: src/featuregen/overlay/upload/recipes/cross_sell.py
+- Create: tests/featuregen/overlay/upload/recipes/test_retail.py
+- Create: tests/featuregen/overlay/upload/recipes/test_cross_sell.py
+- Modify: src/featuregen/overlay/upload/recipe_registry_v2.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_expectations.py
+- Modify: src/featuregen/overlay/upload/recipe_formula_gold.py
+
+**Required retail corrections:**
+
+- Split balance_trend into normalized_balance_slope and balance_slope.
+- Add explicit latest-known snapshot selection and base-currency policy.
+- Define eligible activity for dormancy; exclude failed, reversed, technical, closure and system-only events.
+- Add an explicit as-of or pre-decision cutoff to dormancy.
+- Split transaction-frequency halves ratio from transaction-count slope.
+- Require eligible posted transaction status and event type for transaction-frequency recipes.
+- Split inflow_outflow_ratio from net_transaction_flow.
+- Require direction/sign authority; signed-amount inference is allowed only through a governed sign policy.
+- Split salary_signal outputs into salary_credit_count, salary_credit_amount, salary_regularity and salary_confidence.
+- Require credit direction, eligible posted state, stable payer identity and cadence; do not infer salary from category alone.
+- Define product breadth from effective-dated active holdings, not only product_type and effective_date.
+- Separate direct-debit mandate cancellation from failed/returned collection events.
+- Replace fuzzy external-own-transfer matching with verified own-account relationship. Retain fuzzy matching only as conceptual-only with a privacy and false-match warning.
+- Split RFM into recency, frequency and monetary atomic features; any combined score becomes a ModelFeatureSpec or reviewed deterministic scoring policy.
+- Define account-to-customer allocation for joint accounts and multi-account relationships.
+
+**Required cross-sell corrections:**
+
+- Split every measure-bearing recipe into one output.
+- Require an effective-dated eligible product universe for whitespace.
+- Require product eligibility, suitability, affordability, consent, exclusions and availability before next-best-action materialization.
+- Reclassify next_best_product_propensity as a model feature, not a deterministic formula recipe.
+- Require campaign contact/impression, treatment, control and response events for campaign response.
+- Separate descriptive response rate from predictive uplift.
+- Reclassify CLV projection as a model/forecast feature; keep historical net revenue or margin as deterministic atomic recipes.
+- Require an external or modelled total-wallet denominator for share of wallet. Internal product penetration must be named as internal penetration, not share of wallet.
+- Require effective-dated, verified household membership and allocation for household rollups.
+- Remove tenure-only upsell scoring unless a reviewed suitability policy is attached.
+
+**Gold scenarios:**
+
+- joint account with two customers;
+- account closes mid-window;
+- reversed salary-like credit;
+- pension and internal-transfer lookalikes;
+- direct-debit mandate cancelled without a returned payment;
+- campaign response without prior treatment;
+- product becomes ineligible during the window;
+- customer has internal holdings but no external wallet estimate.
+
+**Acceptance:**
+
+- No retail recipe counts an unspecified event as customer activity.
+- Net flow and inflow/outflow ratio have different output contracts.
+- No cross-sell output claims eligibility or wallet share without its denominator/policy.
+- Model outputs are visibly separated from deterministic features.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_retail.py tests/featuregen/overlay/upload/recipes/test_cross_sell.py -v
+
+**Commit series:** feat(recipes-retail): migrate atomic RBWM churn and cross-sell recipes
+
+---
+
+## Task 12: Migrate and correct Credit Risk and Collections recipes
+
+**Purpose:** Make facility/account obligations, payment allocation, delinquency and post-default stages explicit.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/credit.py
+- Create: src/featuregen/overlay/upload/recipes/collections.py
+- Create: tests/featuregen/overlay/upload/recipes/test_credit.py
+- Create: tests/featuregen/overlay/upload/recipes/test_collections.py
+- Modify: recipe registry, expectations and gold corpus
+
+**Required credit corrections:**
+
+- Replace generic monetary_stock roles with drawn principal, approved limit, available limit, EAD, collateral value or accrued balance as appropriate.
+- Require facility_id as source grain for facility features; customer rollups are separate governed recipes.
+- Require same-as-of and same-currency policy for utilization numerator and denominator.
+- Split utilization level from utilization trend.
+- Require contractual minimum due for minimum-payment behavior; percent-of-limit approximation remains conceptual-only.
+- Require schedule due date, amount due and payment allocation for missed/partial payment counts.
+- Add effective-dated collateral valuation, haircut, lien/seniority and collateral-allocation policy for LTV.
+- Separate raw LTV, indexed LTV and LTV trend.
+- Require covenant actual value, threshold, direction, unit, test date, waiver and cure state.
+- Mark DPD, delinquency bucket, IFRS9 stage, SICR, forbearance and ECL inputs with permitted-use stages. They may be valid for monitoring/collections and leakage for origination/default prediction.
+- Treat ECL and IFRS9 stage as model/accounting outputs with model/version provenance.
+- Require bureau pull timestamp and knowledge timestamp; do not use a later bureau state at an earlier cutoff.
+
+**Required collections corrections:**
+
+- Move account/facility-level behavior to contract grain; add separate customer rollups.
+- Require promise amount, promise due date, promise status and kept/broken outcome.
+- Require payment-plan schedule and allocation for adherence.
+- Replace cost_to_collect as a contact proxy with contact-attempt and right-party-contact events.
+- Define cure, re-age and roll-forward transitions using state at window start and end.
+- Add hardship request, assessment, arrangement and outcome lifecycle.
+- Use exposure-at-default or defaulted-balance snapshot as the recovery denominator.
+- Keep recovery and write-off recipes post-default only.
+- Prevent write-off amount, recovery outcome and cure outcome from entering pre-default models.
+- Split counts, rates, amounts, severities and durations into atomic outputs.
+
+**Gold scenarios:**
+
+- multiple facilities for one customer;
+- payment posted but allocated to fees rather than principal;
+- waiver active on a covenant test;
+- collateral valuation after prediction cutoff;
+- cure followed by re-default;
+- broken promise partially paid;
+- write-off after the modelling as-of;
+- recovery in a different currency.
+
+**Acceptance:**
+
+- A deposit balance cannot ground a drawn-exposure recipe.
+- A generic payment flow cannot establish a missed payment without a schedule.
+- Pre-default applicability refuses post-default outcomes.
+- Collections outputs are correct at facility grain before rollup.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_credit.py tests/featuregen/overlay/upload/recipes/test_collections.py -v
+
+**Commit series:** feat(recipes-credit): migrate facility-correct risk and collections recipes
+
+---
+
+## Task 13: Migrate and correct Fraud, AML and Payments recipes
+
+**Purpose:** Model the payment lifecycle and financial-crime decision point precisely.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/fraud.py
+- Create: src/featuregen/overlay/upload/recipes/aml.py
+- Create: src/featuregen/overlay/upload/recipes/payments.py
+- Create: tests/featuregen/overlay/upload/recipes/test_fraud.py
+- Create: tests/featuregen/overlay/upload/recipes/test_aml.py
+- Create: tests/featuregen/overlay/upload/recipes/test_payments.py
+- Modify: recipe registry, expectations and gold corpus
+
+**Required fraud corrections:**
+
+- Define whether each recipe runs before authorization, after authorization or after booking.
+- Require authorization outcome for card-testing and decline patterns.
+- Add merchant, MCC, CNP/card-present, token/card continuity and small-amount policy.
+- Replace beneficiary_bank with verified beneficiary/payee identity for first-time payee.
+- Add customer/account/card source entity to merchant anomaly where the feature is customer-relative.
+- Require effective threshold/control policy for just-under-limit behavior.
+- Add device/account/card continuity rules for tokenization, reissue and shared legitimate devices.
+- Split count, distinct-count, ratio, z-score and flag outputs.
+- Correct merchant_mcc_diversity temporal wording and retain the Formula-v1/V2 count-distinct expectation.
+
+**Required AML corrections:**
+
+- Add jurisdiction, reporting threshold, effective period, currency and instrument for structuring.
+- Require cash transaction/channel/instrument rather than ISO purpose code as a cash proxy.
+- Make round-amount base currency-aware; remove unrelated mandatory purpose code.
+- Add effective-dated corridor/country risk and transaction direction.
+- Give nested correspondent flow an explicit respondent/correspondent entity grain.
+- Add counterparty and account network roles to fan-in/fan-out and passthrough.
+- Separate screening exposure, screening alert and confirmed match.
+- Keep prior alert, case, SAR and investigator outcomes near-label and time-lagged.
+- Add KYC/CDD status, refresh due date, beneficial ownership and correspondent due-diligence state.
+- Add cryptocurrency on/off-ramp counterparty classification authority.
+
+**Required payments corrections:**
+
+- Replace settlement_status with authorization_outcome for authorization approval/decline.
+- Add chargeback/dispute event, reason, lifecycle and original-transaction link.
+- Add return/reject event and reason for return-payment outputs.
+- Keep mandate state separate from collection execution outcome.
+- Model initiation, authorization, booking, clearing, value and settlement timestamps separately.
+- Use merchant/acquirer grain for merchant economics and card-scheme operations.
+- Require fee basis, interchange, assessment, network cost and MDR amount/rate relationships.
+- Split count, amount, rate and average outputs.
+
+**Gold scenarios:**
+
+- approved authorization later reversed;
+- declined authorization with no settlement row;
+- multiple beneficiaries at one beneficiary bank;
+- chargeback linked to original transaction after the observation cutoff;
+- return caused by mandate cancellation versus insufficient funds;
+- threshold changes by jurisdiction and date;
+- nested correspondent payment with respondent and ultimate originator.
+
+**Acceptance:**
+
+- Authorization and settlement are never interchangeable operands.
+- Payee novelty is calculated on beneficiary identity, not bank identity.
+- AML thresholds are effective-dated, jurisdictional and currency-aware.
+- Alert/case outcomes cannot leak into behavior features.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_fraud.py tests/featuregen/overlay/upload/recipes/test_aml.py tests/featuregen/overlay/upload/recipes/test_payments.py -v
+
+**Commit series:** feat(recipes-fincrime): migrate payment-lifecycle-correct fraud, AML and payments recipes
+
+---
+
+## Task 14: Migrate and correct Deposits/ALM and Markets recipes
+
+**Purpose:** Separate liability cash-flow behavior, asset liquidity, rate sensitivity and model-produced market-risk measures.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/deposits_alm.py
+- Create: src/featuregen/overlay/upload/recipes/markets.py
+- Create: tests/featuregen/overlay/upload/recipes/test_deposits_alm.py
+- Create: tests/featuregen/overlay/upload/recipes/test_markets.py
+- Modify: recipe registry, expectations and gold corpus
+
+**Required Deposits/ALM corrections:**
+
+- Retire hqla_eligibility_contribution as a deposit-backed HQLA feature.
+- Replace it with liability_cash_outflow_contribution and separate asset_hqla_buffer recipes.
+- Require LCR runoff factor, stable/less-stable classification, insured/uninsured status, operational-deposit status and counterparty class.
+- Require NSFR ASF factor, residual maturity, funding type and counterparty classification.
+- Add actual paid deposit/customer rate to deposit beta; benchmark rate alone is insufficient.
+- Define rate reset dates and lags for beta.
+- Move repricing-gap output to account/book/bucket grain rather than customer grain.
+- Require effective maturity, balance and scenario/runoff policy for maturity ladders.
+- Require closure/break event, origination and contractual maturity for early withdrawal.
+- Complete contractual_deposit_maturity_profile temporal policy and classify its future-horizon input correctly.
+- Complete lagged_net_interest_flow sign authority.
+- Split amount, share, ratio, beta, count and duration outputs.
+
+**Required Markets corrections:**
+
+- Require valuation timestamp, model version, horizon, confidence level, currency and scenario for VaR.
+- Require instrument, position, valuation and model provenance for Greeks.
+- Add netting set, legal enforceability, CSA, collateral and gross/net exposure for notional netting.
+- Require counterparty/legal-entity grain and effective credit support.
+- Distinguish limit amount, limit type, usage and breach event.
+- Add desk/book hierarchy and allocation for concentration.
+- Treat VaR, expected shortfall and model Greeks as governed model outputs, not raw deterministic aggregates.
+
+**Gold scenarios:**
+
+- deposit classification changes mid-period;
+- benchmark rate changes before customer rate;
+- term deposit broken before maturity;
+- same deposit included in two maturity snapshots;
+- unenforceable netting agreement;
+- VaR rows with different confidence/horizon/model versions;
+- collateral posted after cutoff.
+
+**Acceptance:**
+
+- No deposit recipe claims the liability itself is HQLA.
+- Deposit beta cannot compute without customer/deposit rate.
+- LCR/NSFR contributions use regulatory classification factors.
+- Market model outputs preserve complete model/valuation provenance.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_deposits_alm.py tests/featuregen/overlay/upload/recipes/test_markets.py -v
+
+**Commit series:** feat(recipes-treasury): migrate ALM and market-risk recipes with regulatory semantics
+
+---
+
+## Task 15: Migrate and correct Custody, Asset Management, Insurance, Islamic and ESG recipes
+
+**Purpose:** Correct specialist product, accounting, valuation and methodology semantics.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/custody.py
+- Create: src/featuregen/overlay/upload/recipes/asset_management.py
+- Create: src/featuregen/overlay/upload/recipes/insurance.py
+- Create: src/featuregen/overlay/upload/recipes/islamic.py
+- Create: src/featuregen/overlay/upload/recipes/esg.py
+- Create corresponding tests under tests/featuregen/overlay/upload/recipes/
+- Modify: recipe registry, expectations and gold corpus
+
+**Custody corrections:**
+
+- Separate trade date, contractual settlement date and actual settlement date.
+- Add settlement status, fail reason, market calendar and SSI authority.
+- Define knowability only after contractual settlement date for a fail.
+- Add corporate-action event, entitlement, election, response deadline and payment.
+- Add security, account, market and counterparty grains.
+- Split fail count, fail value, fail rate and fail age.
+
+**Asset-management corrections:**
+
+- Add fund, portfolio and share-class grain.
+- Add valuation date/calendar, NAV version, subscriptions, redemptions and corporate actions.
+- Separate market performance from investor flows and AUM movement.
+- Add benchmark identity/methodology, fee basis and FX policy.
+- Add liquidity buckets, redemption terms, gates and swing-pricing policy.
+- Separate historical net flow from redemption-risk model output.
+
+**Insurance corrections:**
+
+- Add policy state, coverage period, exposure unit, claim identity and claim lifecycle.
+- Separate written, earned and collected premium.
+- Separate claim count, paid amount, incurred amount, reserve, severity and loss ratio.
+- Correct additivity for frequency, severity and loss ratio.
+- Add lapse, death, maturity and claim competing-risk/censoring treatment.
+- Add reinsurance treaty, attachment, limit and recoverable lifecycle.
+- Treat mortality/morbidity loading and claims-fraud scores as model outputs.
+
+**Islamic corrections:**
+
+- Add contract type, Sharia product structure and board/governance reference.
+- Add profit pool, sharing ratio, benchmark/reference rate and actual profit rate.
+- Add principal/profit split and installment due/payment schedule for Murabaha.
+- Add prohibited-income classification and purification governance.
+- Separate Takaful contribution, claim and participant-fund state.
+- Avoid using interest terminology where profit-rate semantics apply.
+
+**ESG corrections:**
+
+- Add reporting entity, organizational boundary, reporting year, methodology and assurance status.
+- Add scope, category and value-chain boundary to prevent double counting.
+- Add PCAF attribution factor, financed amount, EVIC/revenue basis and data-quality score.
+- Add scenario, horizon, hazard, asset location and vulnerability for physical risk.
+- Add transition pathway, sector and target basis for transition alignment.
+- Separate absolute emissions from intensity.
+
+**Acceptance:**
+
+- Every specialist output identifies the relevant accounting/valuation/methodology basis.
+- Claims count, severity and loss ratio are separate outputs.
+- Islamic recipes carry contract-specific semantics.
+- ESG outputs cannot combine incompatible boundaries, years or methodologies.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_custody.py tests/featuregen/overlay/upload/recipes/test_asset_management.py tests/featuregen/overlay/upload/recipes/test_insurance.py tests/featuregen/overlay/upload/recipes/test_islamic.py tests/featuregen/overlay/upload/recipes/test_esg.py -v
+
+**Commit series:** feat(recipes-specialist): migrate custody, AM, insurance, Islamic and ESG recipes
+
+---
+
+## Task 16: Migrate and correct Corporate/CIB recipes
+
+**Purpose:** Model trade finance, working capital, legal-group exposure and transaction-banking structures at the correct lifecycle and grain.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/corporate_cib.py
+- Create: tests/featuregen/overlay/upload/recipes/test_corporate_cib.py
+- Modify: recipe registry, expectations and gold corpus
+
+**Required corrections:**
+
+- Add instrument identity and type for LC, guarantee, standby LC and contingent facilities.
+- Add issue, amendment, utilization, expiry, claim and rollover events.
+- Add invoice identity, issue date, due date, paid date, receivable amount, credit note/dilution and debtor identity.
+- Add SCF buyer, supplier, program, invoice approval, payment date, terms and program limit.
+- Require effective-dated legal hierarchy, control relationship and group membership.
+- Add intra-group elimination and allocation policy.
+- Add guarantee amount, enforceability, expiry, guarantor quality and wrong-way/correlation policy.
+- Require AR, AP, inventory, revenue and COGS periods for working-capital cycle.
+- Add participant accounts, pool type, sweep events and intraday timestamps for cash pooling.
+- Split pool utilization, pool benefit and intraday peak.
+- Add drawn exposure, contingent exposure, product line and stress threshold policy to cross-product stress.
+- Separate stressed-line count, exposure trend and trade-flow decline.
+- Keep obligor_facility_count atomic and formula-authorable.
+- Require relationship/client profitability components before RAROC or wallet outputs.
+
+**Gold scenarios:**
+
+- LC amended and extended without true rollover;
+- invoice partially paid and later credited;
+- supplier changes SCF program;
+- subsidiary leaves a group mid-window;
+- guarantee expired before cutoff;
+- notional pool with intraday deficit but positive end-of-day balance;
+- product line has a limit but no drawn exposure.
+
+**Acceptance:**
+
+- No LC/guarantee output is computed from generic contingent exposure alone.
+- DSO/dilution/debtor concentration require invoice lifecycle data.
+- Group exposure respects effective legal hierarchy and elimination policy.
+- Intraday peak cannot compile from daily snapshots.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_corporate_cib.py -v
+
+**Commit series:** feat(recipes-cib): migrate lifecycle-correct corporate and transaction-banking recipes
+
+---
+
+## Task 17: Cut the active registry over to V2 and retire legacy debt
+
+**Purpose:** Complete migration without deleting historical identity or breaking old contracts.
+
+**Files:**
+
+- Modify: src/featuregen/overlay/upload/recipe_registry_v2.py
+- Modify: src/featuregen/overlay/upload/templates.py
+- Modify: src/featuregen/overlay/upload/recipe_legacy_adapter.py
+- Modify: src/featuregen/overlay/upload/contract/gate1.py
+- Modify: audit and coverage baselines
+- Test: all template, recipe, formula, suggestion and contract suites
+
+**Steps:**
+
+- [ ] Confirm every legacy recipe has a V2 replacement, explicit conceptual-only disposition or retirement record.
+- [ ] Add source-controlled aliases from legacy recipe IDs to one or more atomic V2 recipes.
+- [ ] Prevent one legacy multi-measure ID from resolving ambiguously; require the output alias.
+- [ ] Switch contract-v3 grounding to the V2 registry.
+- [ ] Keep v1/v2 suggestion generation on the legacy projection during the compatibility window.
+- [ ] Make new recipe authoring through Template fail CI.
+- [ ] Turn recipe audit strict mode on.
+- [ ] Require zero UNASSESSED V2 recipes.
+- [ ] Require zero legacy applicability inference in release coverage.
+- [ ] Require zero PIT placeholder mismatches and zero display identity collisions.
+- [ ] Mark the old registry read-only and document its removal criteria; do not delete it in this task.
+- [ ] Update stale module documentation that still says templates are not wired or that the registry contains 153 recipes.
+
+**Acceptance:**
+
+- Contract v3 uses only RecipeDefinitionV2.
+- All reviewed debt counters equal zero for the active registry.
+- Existing v1/v2 API snapshots remain unchanged.
+- Historical canonical-recipe-v1 contexts still verify.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload tests/featuregen/api/routes/test_suggestions_route.py tests/featuregen/formula -v
+- cd frontend && npm test
+
+**Commit:** refactor(recipes): cut the active suggestion registry over to atomic Recipe Contract v2
+
+---
+
+## Task 18: Add the transaction and account foundation packs
+
+**Purpose:** Build reusable atomic primitives before authoring more domain composites.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/transaction_foundation.py
+- Create: src/featuregen/overlay/upload/recipes/account_foundation.py
+- Create: tests/featuregen/overlay/upload/recipes/test_transaction_foundation.py
+- Create: tests/featuregen/overlay/upload/recipes/test_account_foundation.py
+- Add reviewed Formula-v2 expectations and gold cases
+- Extend concept/policy coverage only where Task 10 did not already do so
+
+**Transaction foundation tranche A — existing Formula-v1/V2-basic capability:**
+
+- posted_debit_transaction_count;
+- posted_credit_transaction_count;
+- posted_debit_amount;
+- posted_credit_amount;
+- net_posted_transaction_flow;
+- posted_transaction_average_amount;
+- distinct_transaction_counterparty_count;
+- distinct_merchant_count;
+- active_transaction_day_count;
+- failed_transaction_count and failed_transaction_rate;
+- reversal_count, reversal_amount and reversal_rate;
+- refund_count and refund_amount;
+- return_count and return_amount;
+- cross_border_transaction_count and cross_border_amount;
+- cash_withdrawal_count and cash_withdrawal_amount;
+- fee_amount;
+- transaction_recency_days.
+
+**Transaction foundation tranche B — Formula-v2 analytical capability:**
+
+- transaction_amount_median and percentile;
+- inter_transaction_gap_average and percentile;
+- transaction_velocity;
+- burstiness;
+- transaction_count_trend and amount trend;
+- transaction_amount_volatility;
+- day-of-week and month seasonality;
+- counterparty concentration HHI and top-counterparty share;
+- fan_in_counterparty_count and fan_out_counterparty_count;
+- new_counterparty_flag;
+- recurring_payment_regularity;
+- salary_credit_regularity;
+- subscription, bill, rent and loan-payment regularity;
+- round_amount_share;
+- FX transaction share and conversion spread where rate authority exists.
+
+**Account foundation:**
+
+- end_of_day_balance;
+- average_daily_balance;
+- minimum_daily_balance;
+- maximum_daily_balance;
+- balance_slope;
+- normalized_balance_slope;
+- balance_volatility;
+- maximum_balance_drawdown;
+- debit_turnover and credit_turnover;
+- net_account_flow;
+- available_balance;
+- limit_headroom;
+- overdraft_day_count;
+- maximum_overdraft_depth;
+- excess_limit_episode_count and duration;
+- interest_paid/charged amount;
+- fee_burden_amount and fee_burden_ratio;
+- account_activity_recency;
+- dormant_day_count and reactivation_flag;
+- account_tenure_days;
+- active_mandate_count;
+- primary_salary_account_flag under a governed policy;
+- account_closure and switch precursor features that remain pre-outcome.
+
+**Canonical exemplar: posted_debit_amount**
+
+The first exemplar must demonstrate the complete contract:
+
+- output grain account;
+- source event grain transaction;
+- required transaction_id, account_id, amount, direction, eligible status, booking time and currency;
+- original transaction/reversal link where the source supports corrections;
+- governed direction/sign, eligible-status, reversal and currency policies;
+- trailing-window parameter;
+- sum of eligible debit economic amount;
+- additive over account and time within one currency;
+- base-currency conversion only through a governed rate at the correct timestamp;
+- empty window returns zero;
+- null amount is rejected or ignored according to the reviewed source policy;
+- all boundary cases represented in gold data.
+
+**Steps:**
+
+- [ ] Author tranche A one output at a time.
+- [ ] Reuse formula fragments only as code helpers; every recipe retains a distinct reviewed expectation and output contract.
+- [ ] Add tranche B only after each required Formula-v2 operation is accepted.
+- [ ] Add account-to-customer rollups as separate recipes with allocation policy, never by changing the account recipe grain.
+- [ ] Add source eligibility examples for core ledger, card authorization, payment hub and ATM feeds.
+- [ ] Require a policy choice when sources use signed values versus unsigned amount plus direction.
+- [ ] Add performance tests for wide transaction tables and large parameter schemas.
+
+**Acceptance:**
+
+- At least one complete transaction pack can be grounded, formula-authored, gold-validated and compiled end to end.
+- Reversals and failed transactions cannot silently inflate posted activity.
+- Mixed currencies cannot be summed without a governed conversion.
+- Account and customer grains are not conflated.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_transaction_foundation.py tests/featuregen/overlay/upload/recipes/test_account_foundation.py -v
+- Run the recipe formula shadow/evaluation gate for the new packs.
+
+**Commit series:** feat(recipes-foundation): add executable transaction and account primitives
+
+---
+
+## Task 19: Add the Customer, RBWM and Wealth expansion packs
+
+**Purpose:** Build customer and relationship features from validated account/product primitives rather than re-deriving weak composites from generic columns.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/customer.py
+- Create: src/featuregen/overlay/upload/recipes/rbwm.py
+- Create: src/featuregen/overlay/upload/recipes/wealth.py
+- Create corresponding tests and gold cases
+- Modify taxonomy coverage targets
+
+**Customer foundation:**
+
+- customer_relationship_tenure;
+- active_account_count by account/product class;
+- active_product_family_count;
+- relationship_balance and relationship_revenue using governed allocation;
+- channel_active_day_count and channel diversity;
+- customer_activity_recency;
+- service-interaction count by outcome;
+- complaint count, unresolved complaint count and resolution duration;
+- verified household-member count;
+- address/contactability quality only where privacy policy permits;
+- customer-level rollups of account foundation features.
+
+**RBWM product packs:**
+
+- CASA operating-balance and salary-anchoring features;
+- card utilization, revolve, payment and merchant behavior;
+- mortgage payment, offset-account, prepayment and refinance behavior;
+- personal-loan repayment and early-settlement behavior;
+- overdraft usage, excess and cure behavior;
+- deposit attrition and primacy-loss signals;
+- acquisition, activation and first-90-day engagement;
+- direct-debit, standing-order and recurring-bill continuity;
+- digital adoption and assisted-service migration;
+- service failure and recovery;
+- financial-health and vulnerability indicators behind explicit policy and purpose controls.
+
+**Next-best-action rules:**
+
+- deterministic eligibility and exclusion are policy features;
+- product propensity and uplift are ModelFeatureSpec outputs;
+- a recommendation requires suitability, affordability, consent, channel availability and contact policy;
+- campaign response requires a treatment record and cannot be used as a pre-treatment predictor without lagging;
+- primary versus supporting use cases are explicit.
+
+**Wealth pack:**
+
+- net contribution and withdrawal flow;
+- asset outflow and cash-drag behavior;
+- portfolio concentration and diversification;
+- risk-profile versus portfolio-risk mismatch;
+- suitability-review due/overdue state;
+- advisor interaction recency;
+- mandate breach proximity;
+- fee burden;
+- realized/unrealized performance with valuation and FX policy;
+- client and household rollups with effective membership.
+
+**Steps:**
+
+- [ ] Author account-level primitives first and customer rollups second.
+- [ ] Require joint-account and household allocation policies.
+- [ ] Separate deterministic historical behavior from prediction and recommendation.
+- [ ] Add privacy/suitability gates to vulnerability and wealth recipes.
+- [ ] Add explicit primary recipes for deposit attrition, primacy loss, customer segmentation, campaign and wealth asset outflow where approved.
+- [ ] Add model-governance references for propensity, CLV, uplift and churn scores.
+
+**Acceptance:**
+
+- A customer feature can explain exactly which accounts and allocation rules contributed.
+- No next-best-action suggestion bypasses eligibility or suitability.
+- Wealth performance carries valuation, benchmark, fee and currency basis.
+- Previously supporting-only RBWM/wealth objectives gain reviewed primary recipes where data permits.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_customer.py tests/featuregen/overlay/upload/recipes/test_rbwm.py tests/featuregen/overlay/upload/recipes/test_wealth.py -v
+
+**Commit series:** feat(recipes-rbwm): add governed customer, retail and wealth packs
+
+---
+
+## Task 20: Add the CIB and Transaction Banking expansion packs
+
+**Purpose:** Extend beyond the corrected current corporate recipes into the client, account, liquidity, trade and profitability capabilities expected from a CIB data product.
+
+**Files:**
+
+- Create: src/featuregen/overlay/upload/recipes/cib_client.py
+- Create: src/featuregen/overlay/upload/recipes/transaction_banking.py
+- Create: src/featuregen/overlay/upload/recipes/trade_finance.py
+- Create: src/featuregen/overlay/upload/recipes/cib_risk.py
+- Create corresponding tests and gold cases
+- Modify taxonomy coverage targets
+
+**CIB client and profitability:**
+
+- operating_balance_average and volatility;
+- product revenue by line;
+- net relationship revenue;
+- direct and allocated service cost;
+- economic profit and RAROC only with capital/cost policy;
+- revenue wallet and wallet share only with governed external/estimated denominator;
+- relationship depth and product penetration;
+- limit utilization and excess behavior;
+- client/account/facility profitability rollups;
+- onboarding/KYC completion and periodic-review state.
+
+**Transaction banking and liquidity:**
+
+- payment count/value by rail, corridor, currency and purpose;
+- inbound/outbound concentration;
+- operating-account primacy;
+- cash-position volatility;
+- intraday low/peak and liquidity usage;
+- notional/physical pool sweep behavior;
+- virtual-account utilization;
+- receivables/payables flow;
+- cash-concentration and payment-factory adoption;
+- cross-border and FX conversion behavior.
+
+**Trade finance and working capital:**
+
+- LC issuance, utilization, amendment and expiry;
+- guarantee issuance, utilization and claim;
+- documentary discrepancy and processing duration;
+- invoice approval, DSO, delinquency, dilution and debtor concentration;
+- SCF program utilization and approved-to-paid duration;
+- trade-flow trend;
+- AR/AP/inventory cycle components;
+- working-capital gap;
+- contingent-to-funded conversion.
+
+**CIB risk and treasury sales:**
+
+- group and single-obligor exposure;
+- collateral and guarantee coverage;
+- covenant headroom;
+- maturity wall;
+- refinancing concentration;
+- counterparty and wrong-way risk indicators;
+- FX exposure and hedge ratio;
+- hedge effectiveness under a documented methodology;
+- facility cross-product stress;
+- treasury-product adoption and revenue, without turning sales outcomes into predictors.
+
+**Steps:**
+
+- [ ] Define legal party, obligor, client group, account, facility, instrument and pool grains explicitly.
+- [ ] Require legal hierarchy and allocation policies for every group rollup.
+- [ ] Require intraday timestamps for intraday outputs.
+- [ ] Separate contractual lifecycle events from accounting balances.
+- [ ] Add primary coverage for receivables finance, cash management, obligor monitoring and credit mitigation.
+- [ ] Keep RAROC, wallet and hedge effectiveness blocked until their denominators/methodologies are governed.
+
+**Acceptance:**
+
+- CIB features distinguish party, group, account, facility, instrument and pool grains.
+- Trade-finance outputs follow instrument lifecycle rather than generic exposure.
+- Profitability metrics state capital, cost and allocation methodologies.
+- Intraday liquidity cannot compile from end-of-day data.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/recipes/test_cib_client.py tests/featuregen/overlay/upload/recipes/test_transaction_banking.py tests/featuregen/overlay/upload/recipes/test_trade_finance.py tests/featuregen/overlay/upload/recipes/test_cib_risk.py -v
+
+**Commit series:** feat(recipes-cib): add client, transaction-banking, trade and risk packs
+
+---
+
+## Task 21: Add the remaining banking ecosystem packs by governed priority
+
+**Purpose:** Complete high-value gaps without lowering the production admission standard.
+
+**Files:** Create one module and test module per accepted pack under recipes and tests/recipes. Update coverage targets only after SME approval.
+
+**Priority A — lending and credit lifecycle:**
+
+- application and origination;
+- affordability and disposable-income components;
+- bureau and application bitemporality;
+- vintage/month-on-book;
+- utilization and payment behavior by product;
+- prepayment/refinance;
+- SME and obligor monitoring;
+- collateral/guarantee mitigation;
+- cure, hardship, workout and recovery.
+
+**Priority B — Treasury/ALM:**
+
+- deposit behavioral runoff;
+- NII and EVE sensitivity;
+- repricing gap and basis risk;
+- wholesale funding and maturity concentration;
+- intraday liquidity;
+- encumbrance;
+- FTP contribution;
+- cash-management balances;
+- LCR and NSFR component contribution.
+
+**Priority C — financial crime:**
+
+- card fraud;
+- account takeover;
+- APP scam;
+- synthetic identity;
+- merchant fraud;
+- mule-account network;
+- structuring;
+- sanctions/screening;
+- KYC/CDD;
+- correspondent banking;
+- TBML only after trade-document and goods/shipment semantics exist.
+
+**Priority D — operations and servicing:**
+
+- straight-through-processing rate;
+- manual-touch count;
+- exception/rework count;
+- processing duration and SLA breach;
+- queue age and workload;
+- cost per case/transaction;
+- complaints and service recovery;
+- data-quality and reconciliation break metrics.
+
+**Priority E — pricing and profitability:**
+
+- fee realization and waiver;
+- deposit-rate pricing;
+- credit risk-based pricing;
+- relationship pricing;
+- product/customer margin;
+- cost-to-income;
+- economic profit;
+- pricing exceptions.
+
+**Priority F — specialist banking:**
+
+- wealth client attrition and asset outflow;
+- fund liquidity and performance;
+- custody settlement and corporate actions;
+- insurance underwriting, lapse and claims;
+- Islamic product/accounting lifecycle;
+- ESG climate transition, physical risk and financed emissions;
+- regulatory reporting and data-quality control features.
+
+**Admission rule:**
+
+No pack is added merely to turn a zero-coverage leaf green. Each proposed recipe must identify:
+
+- an end-user decision;
+- a correct atomic output;
+- the exact source and output grain;
+- a formula or model-governance path;
+- data prerequisites;
+- point-in-time and knowledge-time semantics;
+- regulatory/privacy/suitability constraints;
+- a named SME owner;
+- gold cases.
+
+**Acceptance:**
+
+- Pack priority is based on user value and data readiness, not taxonomy vanity.
+- New recipes enter directly as V2; the legacy adapter is unavailable to them.
+- Each added primary objective has at least one non-vacuous gold case and a named owner.
+
+**Commit series:** feat(recipes-domain): add approved banking packs through Recipe Contract v2
+
+---
+
+## Task 22: Build the banking semantic gold corpus and adversarial test suite
+
+**Purpose:** Test the meaning of the recipes, not only registry shape and route serialization.
+
+**Files:**
+
+- Create: tests/featuregen/recipes/gold/
+- Create: tests/featuregen/recipes/fixtures/
+- Create: tests/featuregen/recipes/test_gold_execution.py
+- Create: tests/featuregen/recipes/test_property_invariants.py
+- Create: tests/featuregen/recipes/test_leakage_boundaries.py
+- Create: tests/featuregen/recipes/test_currency_and_sign.py
+- Create: tests/featuregen/recipes/test_temporal_knowledge.py
+- Create: tests/featuregen/recipes/test_grain_and_rollup.py
+- Create: tests/featuregen/recipes/test_registry_mutation.py
+- Extend API and frontend contract tests
+
+**Synthetic datasets:**
+
+- transaction ledger with posted, pending, failed, reversed, refunded and returned rows;
+- card authorization feed separate from settlement feed;
+- multi-currency account with changing rates;
+- balance snapshots with duplicates and late corrections;
+- joint accounts and effective household membership;
+- facility, schedule, payment allocation, delinquency and collateral;
+- mandate, payment instruction, return and cancellation;
+- fraud device/card reissue and beneficiary history;
+- AML corridor, threshold and risk-rating changes;
+- deposit classification and contractual maturity;
+- trade, netting set, CSA, collateral and valuation;
+- invoice, SCF, LC and guarantee lifecycle;
+- fund/share-class/NAV/flow lifecycle;
+- policy, premium, claim and reinsurance lifecycle;
+- Islamic contract and installment schedule;
+- ESG reporting boundary and methodology versions.
+
+**Test layers:**
+
+1. **Schema:** invalid recipe definitions cannot construct.
+2. **Lint:** debt counters, output count, parameter identity and objective ownership.
+3. **Grounding:** exact, missing, optional, ambiguous and incompatible operand behavior.
+4. **Authority:** sign, status, currency, temporal, grain and relationship facts.
+5. **Formula:** canonicalization, authoring, critic, capability and replay.
+6. **Row semantics:** expected output from synthetic rows.
+7. **PIT:** future and late-known rows never enter earlier cutoffs.
+8. **Leakage:** outcome and near-label fields are refused in disallowed modelling stages.
+9. **Rollup:** allocation and cardinality prevent double counting.
+10. **API:** v1/v2 compatibility and strict v3 contract.
+11. **UI:** readiness language, blockers, variants and accessibility.
+12. **Performance:** bounded recipe grounding and variant selection.
+
+**Property invariants:**
+
+- adding an ineligible failed transaction cannot change a posted-transaction feature;
+- adding an exact reversal neutralizes the original event under the reviewed reversal policy;
+- moving an event after the cutoff cannot change the earlier result;
+- changing an unrelated currency cannot change a single-currency result;
+- duplicating a dimension row cannot multiply a fact result when relationship cardinality is governed;
+- splitting one customer into two accounts preserves allocated customer totals under the allocation policy;
+- a ratio remains unchanged when numerator and denominator are scaled equally;
+- an additive flow aggregates over disjoint time partitions;
+- a semi-additive stock does not sum across snapshots;
+- a non-additive ratio is never automatically summed.
+
+**Adversarial mutations:**
+
+- swap authorization and settlement status;
+- bind beneficiary bank as beneficiary;
+- bind deposit balance as drawn exposure;
+- remove sign authority;
+- change recipe measure without changing additivity;
+- add an unmatched PIT parameter;
+- change the formula without changing output review;
+- create tied concept matches;
+- change legal-group membership after cutoff;
+- introduce a later model version;
+- omit a response/control denominator;
+- add a second currency without conversion.
+
+**Steps:**
+
+- [ ] Establish a small, reviewable JSON/CSV fixture format containing no real customer data.
+- [ ] Build expected values independently from production formula code.
+- [ ] Require at least one negative/refusal case per recipe.
+- [ ] Add differential tests between authored formula and compiled artifact.
+- [ ] Add mutation tests for systemic defects listed above.
+- [ ] Add performance budgets for the table suggestion route and formula authoring.
+- [ ] Publish gold-corpus version and content hash in evaluation artifacts.
+
+**Acceptance:**
+
+- The old semantic defects fail at least one test each.
+- A formula implementation cannot pass by reusing the same computation to generate expected values.
+- Every active executable recipe has linked gold cases.
+- No fixture contains production PII or customer data.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/recipes tests/featuregen/formula tests/featuregen/overlay/upload -v
+- cd frontend && npm test
+
+**Commit series:** test(recipes): add adversarial banking semantic and execution gold corpus
+
+---
+
+## Task 23: Add source-controlled SME review and governed activation
+
+**Purpose:** Make recipe ownership and review visible, repeatable and revision-specific.
+
+**Files:**
+
+- Extend RecipeReviewV1 in recipe_contract_v2.py
+- Create: src/featuregen/overlay/upload/recipe_review.py
+- Create: src/featuregen/api/routes/recipe_review.py
+- Create: tests/featuregen/overlay/upload/test_recipe_review.py
+- Create: tests/featuregen/api/routes/test_recipe_review_route.py
+- Add the next unallocated migration at implementation time for append-only recipe_review_event
+- Optionally add a governance screen only after the backend event model lands
+
+**Review roles:**
+
+- banking domain SME;
+- data/semantic owner;
+- formula/engineering reviewer;
+- model-risk reviewer when near-label or model-produced;
+- privacy/compliance reviewer when sensitive, suitability, consent or protected-purpose controls apply;
+- treasury/regulatory/accounting specialist where the output depends on regulatory classification.
+
+**Review event contents:**
+
+- recipe_id and canonical recipe revision hash;
+- output_id;
+- decision: approved, changes_required, rejected, retired;
+- reviewer identity and role;
+- reviewed primary/supporting objectives;
+- formula expectation hash;
+- gold-corpus references;
+- policy dependencies;
+- permitted use cases and prohibited modelling stages;
+- rationale and evidence references;
+- timestamp and superseded review event.
+
+**Rules:**
+
+- Approval is revision-specific; changing formula, output, operands, temporal policy, additivity, currency or leakage constraints invalidates it.
+- Wording-only changes may be classified separately but still re-revision the discovery presentation.
+- A recipe cannot become production-active without current SME and engineering approval.
+- Near-label and model-output recipes require the additional risk review.
+- Reviewer roles are policy-controlled; recipe authors cannot self-approve every required role.
+- Review does not assert predictive performance.
+
+**Steps:**
+
+- [ ] Implement pure review-validity calculation over recipe revision and required roles.
+- [ ] Add append-only review events and current projection.
+- [ ] Add read and decision APIs behind governance permissions and optimistic concurrency.
+- [ ] Add audit links to formula expectation, gold cases and policy dependencies.
+- [ ] Add review status to suggestion contract v3.
+- [ ] Add invalidation when a recipe revision or dependency changes.
+- [ ] Add batch review reports by family and readiness.
+- [ ] Populate review owners for all migrated recipes before Task 24 activation.
+
+**Acceptance:**
+
+- No production-active recipe lacks current revision-specific approval.
+- A changed formula automatically makes the previous approval stale.
+- Review history remains immutable and attributable.
+- Conceptual recipes can be SME-approved as ideas without becoming executable.
+
+**Verification:**
+
+- uv run pytest tests/featuregen/overlay/upload/test_recipe_review.py tests/featuregen/api/routes/test_recipe_review_route.py -v
+
+**Commit series:** feat(recipe-governance): add revision-specific SME review and activation
+
+---
+
+## Task 24: Shadow, measure, canary and roll out safely
+
+**Purpose:** Move from a source-controlled library to production behavior without a big-bang contract or identity change.
+
+**Feature controls:**
+
+- FEATUREGEN_RECIPE_CONTRACT_V2;
+- FEATUREGEN_FORMULA_V2;
+- FEATUREGEN_SUGGESTION_CONTRACT_V3;
+- FEATUREGEN_RECIPE_V2_MATERIALIZATION;
+- per-family activation allowlist;
+- per-catalog canary allowlist.
+
+**Shadow comparisons:**
+
+- legacy grounded recipe versus V2 replacement;
+- legacy display identity versus V3 identity;
+- legacy binding versus V2 fail-closed binding;
+- legacy PIT prose versus compiled temporal contract;
+- legacy design status versus execution readiness;
+- formula-authored output versus synthetic/controlled expected output;
+- primary/supporting coverage before and after correction.
+
+**Operational metrics:**
+
+- registry count by readiness;
+- grounded, unbuildable, ambiguous and policy-blocked counts;
+- formula authoring success/refusal/technical failure;
+- materialization compilation success;
+- recipe suggestion latency by table width and join neighborhood;
+- binding blocker frequency by concept/policy;
+- parameter-variant request frequency;
+- v1/v2/v3 client usage;
+- stale SME review count;
+- gold and shadow-gate status by recipe family;
+- active primary coverage and executable primary coverage.
+
+**Rollout stages:**
+
+1. Audit only; no behavior changes.
+2. V2 registry shadow population.
+3. Contract v3 available by explicit query.
+4. Internal SME/engineering users view v3.
+5. Selected catalogs receive V2 suggestions, still read-only.
+6. Formula-v2 authoring enabled for the transaction/account foundation.
+7. Materialization enabled for approved recipes on one execution engine.
+8. Expand by family after shadow and SLO gates.
+9. Make v3 the frontend default.
+10. Deprecate v1/v2 only after measured client retirement and a separate decision.
+
+**Canary gates:**
+
+- zero ambiguous required bindings emitted;
+- zero PIT compilation errors;
+- zero formula/gold mismatch;
+- no visibility/read-scope regression;
+- suggestion latency within the agreed route budget;
+- no increase in unexplained empty states;
+- all canary-active recipes currently SME-approved;
+- rollback tested.
+
+**Rollback:**
+
+- Disable V2 family/canary activation without deleting V2 revisions.
+- Keep v1/v2 route behavior available.
+- Keep Formula-v1 authoring and stored artifacts untouched.
+- Stop new materialization while preserving audit records.
+- Never rewrite historical feature or suggestion identities.
+
+**Steps:**
+
+- [ ] Add flags and family/catalog allowlists with frozen configuration tests.
+- [ ] Add dual-run comparison records without exposing V2 results to ordinary clients.
+- [ ] Add dashboards and structured blocker metrics.
+- [ ] Run a representative catalog set: retail ledger, cards, payments, lending, CIB, markets and one specialist source.
+- [ ] Conduct SME acceptance using real metadata but no production row data where row access is unavailable.
+- [ ] Execute formula evaluation with real provider evidence where required.
+- [ ] Exercise rollback in a non-production environment.
+- [ ] Promote families individually; do not promote the entire registry from an aggregate pass rate.
+- [ ] Update runbooks and support diagnostics.
+
+**Acceptance:**
+
+- V2/v3 can be disabled without data loss or historical corruption.
+- Every promoted family passes its own semantic, formula, authority and operational gates.
+- Production metrics describe readiness truthfully and never use suggestion count as success.
+- Legacy contract retirement, if desired, is a later explicitly approved project.
+
+**Verification:**
+
+- Full backend and frontend suites.
+- Migration re-apply suite.
+- Formula evaluation and shadow gates.
+- Canary smoke tests on representative catalog metadata.
+- Rollback rehearsal.
+
+**Commit series:** feat(recipes-rollout): shadow and canary Recipe Contract v2 by family
+
+---
+
+## Recommended PR and commit boundaries
+
+Do not implement this plan as one branch or one giant migration. The minimum safe boundaries are:
+
+1. Audit and ratchet only.
+2. Contract V2 types and canonicalization only.
+3. Identity and bounded parameter selection.
+4. Temporal compiler.
+5. Binding fail-closed behavior.
+6. Formula-v2 operation increments, one capability group per PR.
+7. Readiness fold and formula evidence.
+8. Suggestion v3 backend contract.
+9. Suggestion v3 frontend.
+10. Coverage correction.
+11. Banking concepts and operational policies in reviewed groups.
+12. One recipe family migration per PR where practical.
+13. Foundation pack tranches.
+14. Gold/adversarial corpus increments.
+15. Governance/activation.
+16. Shadow/canary rollout.
+
+Every PR must state:
+
+- which invariant it enforces;
+- which old contract remains unchanged;
+- which debt count decreases;
+- which new reason/readiness codes are introduced;
+- exact test commands and results;
+- rollback or compatibility behavior.
+
+## Dependency and parallel-work map
+
+| Workstream | Can start after | Must finish before |
+|---|---|---|
+| Audit/ratchet | immediately | all content expansion |
+| Recipe Contract v2 | audit interfaces frozen | family migration |
+| Identity/variants | V2 parameter model | suggestion v3 |
+| Temporal compiler | V2 temporal model | executable family migration |
+| Binding authority | V2 operand model | executable family migration |
+| Formula-v2 | V2 output/parameter semantics | formula validation of complex recipes |
+| Suggestion v3 backend | V2/readiness shapes | frontend v3 |
+| Frontend v3 | backend fixture frozen | v3 default rollout |
+| Taxonomy coverage | V2 primary objective | active registry cutover |
+| Family correction | V2, temporal and binding | legacy debt zero |
+| New foundation packs | V2 and minimum Formula-v2 | RBWM/CIB composites |
+| SME governance | revision hashing stable | production activation |
+| Rollout | family gates and review | default-client switch |
+
+## Principal risks and controls
+
+| Risk | Control |
+|---|---|
+| Recipe identity churn breaks historical references | V1 hashes remain immutable; explicit aliases; v3 identity only |
+| Formula-v2 becomes an unbounded DSL project | Minimum operation set, versioned capability, unsupported remains valid state |
+| Parameter expansion harms route performance | Default-only grounding plus bounded explicit variant resolution |
+| More strict binding causes fewer suggestions | Honest blocker states and governance actions; never weaken correctness to recover count |
+| SME migration becomes a bottleneck | Family ownership, atomic PRs, source-controlled review checklist and debt dashboard |
+| Coverage falls after removing supporting inflation | Report the truth; prioritize valuable primary recipes rather than restoring vanity coverage |
+| Source systems lack sign/status/currency policies | FORMULA_BLOCKED state and policy onboarding; no silent inference |
+| Model features get forced into deterministic formulas | Separate ModelFeatureSpec and model-governance path |
+| New UI overstates formula validation | Closed readiness vocabulary and explicit non-predictive disclaimer |
+| Migration collides with concurrent DB plans | Allocate the next free migration number at implementation time; do not reserve one in this document |
+
+## Final program acceptance checklist
+
+- [ ] Recipe audit strict mode is green.
+- [ ] Active V2 registry contains no multi-output, unassessed or legacy-inferred recipe.
+- [ ] All V2 identity combinations are collision-free.
+- [ ] All temporal declarations compile and render without placeholders.
+- [ ] Ambiguous required operands are blocked.
+- [ ] Direction, status, reversal, currency and relationship policies are governed where needed.
+- [ ] Every executable recipe has a reviewed formula expectation and gold corpus.
+- [ ] Suggestion v3 communicates execution readiness and blockers.
+- [ ] Primary and supporting coverage are reported separately.
+- [ ] All fifteen current families have been corrected or explicitly retired.
+- [ ] Transaction and account foundation packs are materialization-ready on at least one engine.
+- [ ] Customer/RBWM and CIB packs have reviewed primary coverage.
+- [ ] Every active production recipe has current revision-specific SME approval.
+- [ ] Shadow, canary, performance, read-scope and rollback gates pass.
+- [ ] No existing registered feature, Formula-v1 artifact or suggestion v1/v2 client is broken.
