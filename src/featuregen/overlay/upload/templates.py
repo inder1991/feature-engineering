@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -42,6 +43,7 @@ from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept
 from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.runtime.observability import counters
 
 # Concept-level sensitivities that a feature input may NEVER carry (a hard eligibility block, Part D.4).
 # Distinct from the column-STORED sensitivity (pii/restricted) that read_scope filters on: these are
@@ -247,6 +249,12 @@ class _Col:
     additivity: str | None
     sensitivity: str | None
     currency: str | None
+    # Task 2: the enrichment text the tie-break deliberation reads. Trailing + defaulted so every
+    # positional constructor keeps working; loaded by `_load_columns`, consulted ONLY among tied
+    # candidates (the plan's implementation note), never by the scorer.
+    definition: str | None = None
+    ai_summary: str | None = None
+    semantic_terms: str | None = None
 
 
 def _load_columns(conn, catalog_source: str, roles: Iterable[str]) -> list[_Col]:
@@ -256,7 +264,8 @@ def _load_columns(conn, catalog_source: str, roles: Iterable[str]) -> list[_Col]
     filter — a restricted column the caller can't see simply isn't a grounding candidate."""
     rows = conn.execute(
         "SELECT catalog_source, object_ref, table_name, column_name, data_type, is_grain, is_as_of, "
-        "       concept, entity, additivity, sensitivity, currency "
+        "       concept, entity, additivity, sensitivity, currency, "
+        "       definition, ai_summary, semantic_terms "
         "FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s "
         "  AND visible_requires <@ %s "
@@ -378,6 +387,39 @@ def _is_as_of_concept(concept_name: str | None) -> bool:
         return False
     c = concept(concept_name)
     return bool(c and c.pit_role == "as_of")
+
+
+def _tie_break_binding_enabled() -> bool:
+    """Phase B of the tie-break rollout (router plan, Task 2). Default OFF: flag-off grounding is
+    byte-identical to the historical alphabetical order — the platform's own rollout pattern. The
+    SHADOW half (verdict lookup + agree/disagree counters) runs regardless: it is the evidence the
+    flag decision is made on."""
+    return os.environ.get("FEATUREGEN_TIE_BREAK_BINDING", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _consult_tie_break(conn, template: Template, need: Need,
+                       tied_cols: Sequence[_Col]) -> tuple[str, ...] | None:
+    """The warmed verdict for THIS tie, or None. READ-ONLY and dispatch-free by design: the model
+    was consulted at ingest (warming) or not at all — a request never pays for, or waits on, a
+    deliberation. The key is recomputed from the columns' own enrichment text, so a correction
+    since warming changes the key and honestly misses (deterministic fallback) until the worker or
+    the next warming re-adjudicates."""
+    from featuregen.overlay.upload.tie_break import (
+        TieBreakCandidate,
+        find_tie_break_verdict,
+        tie_break_input_hash,
+    )
+
+    tied = tuple(
+        TieBreakCandidate(ref=c.object_ref, definition=c.definition or "",
+                          ai_summary=c.ai_summary or "", semantic_terms=c.semantic_terms or "")
+        for c in tied_cols)
+    key = tie_break_input_hash(template_id=template.id, need_role=need.role,
+                               need_concept=need.concept, intent=template.intent, tied=tied)
+    verdict = find_tie_break_verdict(conn, input_hash=key,
+                                     tied_refs=(c.object_ref for c in tied_cols))
+    return verdict.ranking if verdict is not None else None
 
 
 def ground_template_outcome(conn, template: Template, *, catalog_source: str,
@@ -527,14 +569,27 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
                 None,
                 ("required_need_missing", need.role),
             )
-        bindings[need.role] = col
         if need.role not in resolutions:
             top_score = ranked[0][0]
-            tied = tuple(
-                candidate.object_ref
-                for score, candidate in ranked
-                if score == top_score
-            )
+            tied_cols = tuple(
+                candidate for score, candidate in ranked if score == top_score)
+            tied = tuple(candidate.object_ref for candidate in tied_cols)
+            if len(tied) > 1:
+                # Task 2: consult the warmed deliberation. SHADOW always (the counters are the
+                # SME's disagreement feed); BINDING only behind the flag — flag-off stays
+                # byte-identical to the alphabetical order, and a missing verdict keeps it under
+                # either flag state. Requests never dispatch a model.
+                ranking = _consult_tie_break(conn, template, need, tied_cols)
+                if ranking is None:
+                    counters.incr("overlay.tie_break.shadow_unadjudicated")
+                elif ranking[0] == col.object_ref:
+                    counters.incr("overlay.tie_break.shadow_agree")
+                else:
+                    counters.incr("overlay.tie_break.shadow_disagree")
+                if ranking is not None and _tie_break_binding_enabled():
+                    by_ref = {c.object_ref: c for c in tied_cols}
+                    col = by_ref[ranking[0]]
+            bindings[need.role] = col
             resolutions[need.role] = GroundedNeedResolution(
                 role=need.role,
                 resolution=(
@@ -545,6 +600,8 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
                 selected_object_ref=col.object_ref,
                 tied_candidate_refs=tied if len(tied) > 1 else (),
             )
+        else:
+            bindings[need.role] = col
 
     # Provenance: the (catalog_source, object_ref) of each bound column, deduped, in needs order.
     derives: list[tuple[str, str]] = []
