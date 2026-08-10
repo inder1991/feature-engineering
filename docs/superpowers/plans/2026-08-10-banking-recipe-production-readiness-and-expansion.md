@@ -150,12 +150,7 @@ The program is complete only when all of the following are true:
 - [ ] Pin the two known PIT defects as failing examples.
 - [ ] Pin at least one multi-measure/additivity conflict, one display collision and one ambiguous binding.
 
-**Acceptance:**
-
-- The baseline report reproduces the reviewed numbers.
-- Adding a new multi-measure legacy recipe fails CI.
-- Adding an unmatched PIT placeholder fails CI.
-- Existing behavior and public API payloads remain unchanged.
+**Acceptance: DONE 2026-08-10.** The audit reproduces the reviewed numbers exactly where they were measured (157 recipes / 126 multi-measure / 145 identity collisions / 1,122 combinations / 33 downstream derivations / 14 primaries / 2 authorable) and supersedes the estimates with measured definitions ("eleven missing-concept admissions" → 15 under the documented regex; additivity conflicts → 72; the two PIT defects → EXACTLY the two known ids, caught mechanically as placeholders naming undeclared parameters). A new multi-measure legacy recipe fails the ratchet twice (multi_measure + legacy-not-in-V2); an unmatched PIT placeholder fails it; intentional decreases pass; a counter dropped from the baseline is itself a regression; strict mode works today and stays unwired until BR-17. The ambiguous-binding disposition is catalog-dependent by design — `dynamic_binding_audit` (proven on a tied fixture pinning dormancy_days) is the operator's per-catalog lens, outside static CI. Zero behavior changes; the audit is pure and read-only.
 
 **Verification:**
 

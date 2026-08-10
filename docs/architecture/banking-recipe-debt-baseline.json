@@ -1,0 +1,35 @@
+{
+  "counters": {
+    "ambiguous_source_entity_recipes": 0,
+    "downstream_derivation_recipes": 33,
+    "formula_unassessed_recipes": 155,
+    "identity_collision_recipes": 145,
+    "legacy_recipes_not_in_v2": 157,
+    "missing_concept_admission_recipes": 15,
+    "monetary_flow_without_direction_recipes": 32,
+    "monetary_without_currency_policy_recipes": 63,
+    "multi_measure_additivity_conflict_recipes": 72,
+    "multi_measure_recipes": 126,
+    "needs_inferred_join_role": 605,
+    "needs_inferred_temporal_role": 605,
+    "needs_unconstrained_source_grains": 605,
+    "pit_unmatched_placeholder_recipes": 2,
+    "recipes_without_primary_objective": 143
+  },
+  "informational": {
+    "distinct_rendered_identities": 442,
+    "family_count": 121,
+    "formula_v1_authorable_recipes": 2,
+    "gold_corpus_cases": 28,
+    "gold_covered_recipes": 2,
+    "needs_total": 605,
+    "parameter_combinations": 1122,
+    "primary_objective_recipes": 14,
+    "recipe_count": 157,
+    "v2_recipe_count": 0
+  },
+  "measured_at_commit": "398cc0ab",
+  "measured_on": "2026-08-10",
+  "note": "BR-1 authoritative baseline, regenerated per the re-baseline amendment. Review-era estimates it supersedes: 'eleven missing-concept admissions' measured 15 under the documented pattern; 'two PIT placeholder defects' confirmed at exactly 2; the additivity-conflict heuristic measures 72. The ratchet holds `counters` only.",
+  "version": "banking-recipe-debt-baseline-v1"
+}

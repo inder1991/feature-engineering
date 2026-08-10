@@ -43,6 +43,8 @@ dependencies = [
 
 [project.scripts]
 featuregen = "featuregen.__main__:main"
+# BR-1: the banking-recipe debt audit (read-only; --baseline ratchets, --strict is BR-17's gate)
+featuregen-recipe-audit = "featuregen.overlay.upload.recipe_audit_cli:main"
 
 [project.optional-dependencies]
 llm = [
