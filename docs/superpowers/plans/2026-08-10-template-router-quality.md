@@ -54,32 +54,41 @@ shares one picture. **[code]** = deterministic · **[AI]** = model · **[human]*
 * **B4. Read the pinned judgements** [code] — tied bindings resolve by verdict lookup, rationale
   attached; a fingerprint miss falls back to deterministic order for one request while the worker
   re-adjudicates (curator "Re-adjudicate now" button skips even that wait).
-* **B5. Gauntlet** [code] — unchanged checks; a refused winner re-binds to the runner-up; every
-  rejection carries a reason code.
-* **B6. Leakage** [code + AI flag-only] — the veto removes anything built on the confirmed target
-  (string match). The near-label critic answers ONE fenced question: *"is this feature the user's
-  label definition in disguise?"* — `dormancy_days` (days since activity) vs a 90-day-inactivity
-  churn label is the canonical catch; `txn_frequency_trend` (related, not identical) is the
-  canonical pass. Verdicts `no_finding | too_close | abstain`; `too_close` can only ADD a warning.
-  **Origin-blind**: runs on every surviving candidate, template-grounded or LLM-proposed — the same
-  invented dish gets the same taste, whoever cooked it.
-* **B7. Order the menu** [code — no fresh AI] — B1's `business_domain` already translated the
-  user's words to the experts' tags; B7 is set-intersection against each card's `use_cases` and a
-  sort. Ordering never removes.
-* **B8. Tune the settings** [AI, closed choice, cached] — pick WHICH of the SME-authored parameter
+* **B5. Tune the settings** [AI, closed choice, cached] — pick WHICH of the SME-authored parameter
   values fits this question (churn → the 90-day window; structuring → the 30-day). Off-list values
   are rejected by `_bind_params`; the model cannot invent a setting.
-* **B9. Record the choice** [code] — Gate-1 selections land per recipe/domain: the feedback signal
-  and, with B2's corrections, the metric set that gates every future upgrade.
+  **ORDER MATTERS (second review, verified):** `_bind_params` binds at grounding
+  (`templates.py:405`) and the gauntlet validates the BOUND candidate — and the near-label verdict
+  depends on the chosen window (180-day dormancy vs a 90-day label is a different answer than
+  90-vs-90). Parameter choice therefore precedes the gauntlet and the critic. An earlier draft of
+  this walkthrough placed it last; that ordering was a bug.
+* **B6. Gauntlet** [code] — unchanged checks, on the PARAMETERISED candidate; a refused winner
+  re-binds down the verdict's RANKING (see Task 2 — the tie-break returns an ordered list, not a
+  single pick, precisely so this fallback stays semantic instead of alphabetical); every rejection
+  carries a reason code.
+* **B7. Leakage** [code + AI flag-only] — the veto removes anything built on the confirmed target
+  (string match). The near-label critic answers ONE fenced question, against the candidate AS
+  PARAMETERISED: *"is this feature the user's label definition in disguise?"* — `dormancy_days`
+  (days since activity) vs a 90-day-inactivity churn label is the canonical catch;
+  `txn_frequency_trend` (related, not identical) is the canonical pass. Verdicts
+  `no_finding | too_close | abstain`; `too_close` can only ADD a warning. **Origin-blind**: runs on
+  every surviving candidate, template-grounded or LLM-proposed — the same invented dish gets the
+  same taste, whoever cooked it.
+* **B8. Order the menu** [code — no fresh AI] — B1's `business_domain` already translated the
+  user's words to the experts' tags; set-intersection against each card's `use_cases`, then sort.
+  Ordering never removes.
+* **B9. Record the choice** [code] — Gate-1 selections land per recipe/domain **with origin**
+  (template vs LLM — the field exists, `feature_assist.py:1665`): the feedback signal and, with
+  B2's corrections, the metric set that gates every future upgrade.
 
 **The fenced-question summary — the AI's entire request-time role:**
 
 | step | the AI's one question | it can never |
 |---|---|---|
 | B1 | "what is this question's target, window, type, domain?" | override a typed name; skip the human gate |
-| B6 | "is this feature the answer in disguise?" | approve — warnings only |
-| B7 | (answered in B1) "which expert tags match these words?" | remove — order only |
-| B8 | "which of the allowed settings fits?" | invent a setting — list only |
+| B5 | "which of the allowed settings fits?" | invent a setting — list only |
+| B7 | "is this feature the answer in disguise?" | approve — warnings only |
+| B8 | (answered in B1) "which expert tags match these words?" | remove — order only |
 
 The model translates and judges MEANING — the one thing code cannot do — inside boxes whose walls
 are all code. Everything repeatable is code; everything the model produces is validated, human-gated
@@ -244,9 +253,14 @@ the change is additive rather than a silent re-binding of every existing pass.
   metadata, and its own `CallLedger` budget entry so a pathological catalog cannot burn spend.
   Column definitions already egress under the enrichment's definition-grade classification; the
   template `intent` is authored text. Nothing crosses the egress boundary unclassified.
-* **Closed output.** The model returns the REF of the winning candidate — validated ∈ the tied set,
-  exactly as concept answers are validated ∈ the vocabulary — plus a bounded rationale string. An
-  off-set answer falls to the deterministic order, never to a write.
+* **Closed output — a RANKING, not a single winner (corrected in second review).** The model
+  returns the tied candidates as an ORDERED LIST — every element validated ∈ the tied set, exactly
+  as concept answers are validated ∈ the vocabulary — plus a bounded rationale for the top choice.
+  Why a ranking: the adjudicated #4 improvement re-binds to "the next candidate" when the gauntlet
+  refuses the winner, and with a single-winner verdict "next" degrades to alphabetical among the
+  residual ties — re-importing the exact disease this task cures, on the fallback path. With a
+  ranking, the re-bind walks the model's own order. A malformed or off-set list falls to the
+  deterministic order, never to a write.
 * **Shadow first.** Phase A records verdicts WITHOUT changing bindings and reports disagreement with
   the alphabetical choice. The live tie population is 19 bindings, so the full shadow review is an
   afternoon of SME time, not a quarter. Phase B flips behaviour behind a flag with flag-off
@@ -461,9 +475,13 @@ showing a feature that leaks the label is worse than showing nothing.
   part of the mapping's cache identity, drift both fragments the taxonomy and churns the cache. One
   test asserting the closed set (updated deliberately when a new use-case is genuinely added) makes
   the vocabulary a contract instead of an accident.
-* **Same seam discipline as Task 2:** registered prompt + schema (`overlay_use_case_map` v1),
-  redacted hypothesis (`redact_free_text`), content-addressed caching — one call per NEW hypothesis,
-  cached thereafter, so steady-state ranking adds zero LLM latency.
+* **SUPERSEDED CALL SHAPE (second review): there is no separate `overlay_use_case_map` call.** The
+  mandatory intake read (#2 spec) now produces `business_domain` on the ticket — the mapping rides
+  that one call, under the intake schema and cache key. What SURVIVES of this bullet: the seam
+  discipline (registered prompt + schema, redacted hypothesis) now applies to the intake call, and
+  the closed use-case ∪ family vocabulary is part of the intake prompt AND its cache key. Task 4's
+  own remaining work is deterministic: the set-intersection ordering and the vocabulary-pinning
+  test below.
 * **Rollout: log-and-compare.** Emit the proposed order beside the served order for a period; the
   cost of being wrong is ordering, so the bar is lower than Task 2's — but the comparison is nearly
   free and catches a bad mapping before users see it.
@@ -810,15 +828,20 @@ AGREED ORDER (owner-endorsed 2026-08-10; Step 0 and acceptance criteria added in
    reclassifying `tran_time` (F2) removes ~6 ties at the source, so the genuine adjudication
    population is markedly smaller than 19. Shadow verdicts are ordinary `structured_result` +
    `llm_call` rows; the disagreement report is a query over them, not a new store.
-3. **Task 3 — near-label critic (flag-only).** Closes a control specified and never built, on 23
-   templates.
-4. **Task 4 — use-case ranking (log-and-compare → on).** Relevance, no new infrastructure. NOT
-   vectors.
-5. **Task 4b — hypothesis-chosen parameters.** The direct answer to "the same 23 features for every
-   hypothesis": 147 authored parameterisations, 23 emitted, always the first-in-list.
-6. **Task 4c — SME recipes against the 71 unused concepts** (parallel; SME-bound, not
-   engineering-bound). **Task 7 phase 1** (acceptance telemetry) alongside — it is a query, and it
-   creates the north-star metric everything else is judged by.
+3. **The intake build (#2 spec)** — added in second review: it was spec'd first and then absent
+   from the build order, though Task 3 consumes its window field and Task 4 its domain field. Lands
+   after Step 0, in parallel with 2b/2 (which do not depend on it), and BEFORE Tasks 3/4 (which
+   do). Includes the storage decision the spec now records.
+4. **Task 3 — near-label critic (flag-only, origin-blind).** Closes a control specified and never
+   built, on 23 templates — and on every LLM-proposed candidate.
+5. **Task 4 — use-case ordering (log-and-compare → on).** Deterministic set-intersection over the
+   intake ticket's domain; the mapping call itself now rides intake. NOT vectors.
+6. **Task 4b — hypothesis-chosen parameters.** The direct answer to "the same 23 features for every
+   hypothesis": 147 authored parameterisations, 23 emitted, always the first-in-list. Parameter
+   choice binds BEFORE the gauntlet and the critic (the walkthrough ordering fix).
+7. **Task 4c — SME recipes against the 71 unused concepts** (parallel; SME-bound, not
+   engineering-bound). **Task 7 phase 1** (acceptance telemetry, with origin) alongside — it is a
+   query, and it creates the north-star metric everything else is judged by.
 
 Task 1 (the alias hygiene) rides with whichever change first touches `templates.py`. It recovers
 ZERO templates today (measured); it prevents silent template death tomorrow.
@@ -834,6 +857,7 @@ ACCEPTANCE CRITERIA — a step is DONE when:
 | 0 | reject codes visible per recipe on both surfaces; `cib`'s 23→? survival finally measured |
 | 1 | every GENUINE tie remaining after the F1/F2 corrections adjudicated at ingest-warm time; request path is cache-hit only; a re-run of the same catalog reuses every verdict |
 | 2 | shadow disagreement report reviewed by an SME; flag on; the disagreement-fixture test proves meaning beats spelling; replay test green |
+| intake | full ticket extracted on real hypotheses; typed names pin (collision → fuzzy); confirm screen live; ticket + confirmation stored per the storage decision; cache key covers all four inputs |
 | 3 | every grounded near-label candidate carries `no_finding` / `too_close` / `abstain`; zero refusals in flag-only mode |
 | 4 | two different hypotheses produce visibly different orders; an unmappable hypothesis provably falls back to today's order |
 | 5 | the same recipe under two hypotheses emits two parameterisations with distinct identities; gauntlet cost measured BEFORE any top-K widening |
@@ -979,6 +1003,34 @@ Net cost is NEGATIVE: the `business_domain` field folds Task 4's hypothesis→us
 previously its own mandatory call — into this one. One read of the question, one cached ticket,
 four consumers (veto, near-label critic, ordering, parameter choice).
 
+**Second-review corrections to this spec (2026-08-10):**
+
+* **The cache key was under-specified — by this plan's own rule.** "Cached by hypothesis text"
+  hashes one of the ticket's four inputs. The ticket also depends on the candidate-column shortlist
+  content (the shelf photo), the use-case/family vocabulary (now that the mapping rides this call),
+  and the prompt/schema version. All four go in the key — otherwise a registry use-case rename or a
+  column re-enrichment serves a stale ticket, which is the `producer_configuration_hash` bug in a
+  fourth costume.
+* **Storage needs a design; the spec asserted one that does not exist.** Verified:
+  `contract_intent` carries `hypothesis`, `redacted_*`, `actor`, `target_ref` — and NOTHING for
+  window, type, domain, or who confirmed. "Provenance flips to human/confirmed, persisted with the
+  intent" currently has nowhere to persist. Decision needed at implementation start: extend
+  `contract_intent` (a migration, drawn from the pool under D7 discipline) vs. a confirmation
+  decision event + the ticket in `structured_result`. Default recommendation: the ticket
+  (model output) lives in `structured_result` like every other model output; the HUMAN confirmation
+  extends `contract_intent` — human decisions live with the intent they govern, model drafts live
+  with model drafts.
+* **Exact-match pinning must be catalog-scoped.** `source_system` exists in BOTH live catalogs. An
+  unqualified typed name that matches exactly one column across readable catalogs pins; a collision
+  routes to the fuzzy path and the confirm screen shows both candidates with their catalogs. A pin
+  that guesses between catalogs is not a pin.
+* **"Just exploring" has an undefined edge for LLM-origin candidates.** Template candidates are
+  withheld by their `near_label` flag; LLM-origin candidates have no flag, and with no declared
+  target the origin-blind critic has nothing to compare against. DEFAULT (product may revisit):
+  LLM-origin candidates in exploring mode are shown with an explicit "no target declared — leakage
+  unchecked" banner rather than silently trusted or blanket-withheld. Honest asymmetry, stated on
+  the card.
+
 **What the fuzzy path sends per candidate column (owner-confirmed 2026-08-10):** exactly three
 fields — column ref, concept, and the one-line `ai_summary`. The summary, not the full definition:
 definitions run to paragraphs (up to 32k chars) and 237 of them drown the signal; the summary is the
@@ -1059,6 +1111,35 @@ is registry `entity_link` coverage plus the existing suggest→confirm loop — 
 CONCEPTS, not compound-key failures, and compound keys already exist where joins execute (crosswalk
 definitions carry 1–16 member pairs, migration 1050 CHECK). Spec when a recipe or crosswalk
 observation actually needs the router to see a tuple.
+
+## Second review log (2026-08-10) — the plan reviewed against itself and the code, again
+
+Findings, all corrected inline above; recorded here so the corrections are findable:
+
+* **A (bug, verified):** the walkthrough ordered parameter choice AFTER the gauntlet and critic.
+  `_bind_params` binds at grounding (`templates.py:405`); the gauntlet validates the bound
+  candidate; the near-label verdict depends on the chosen window. Order fixed: params → gauntlet →
+  leakage → ordering.
+* **B (self-inconsistency):** the intake cache was keyed "by hypothesis text" — one of its four
+  inputs — in a plan whose own caching rule demands all of them. Key completed.
+* **C (stale spec):** Task 4 still specified the separate `overlay_use_case_map` call that the
+  mandatory-intake merge retired. Superseded explicitly.
+* **D (asserted mechanism did not exist, verified):** `contract_intent` has no columns for window /
+  type / domain / confirmer — "persisted with the intent" had nowhere to persist. Storage decision
+  now recorded (default: model ticket in `structured_result`, human confirmation extends
+  `contract_intent`).
+* **F (design gap):** a single-winner tie-break verdict makes the gauntlet-refusal re-bind
+  alphabetical among residual ties — the cured disease returning on the fallback path. The verdict
+  is now an ordered ranking of the tied set.
+* **G (sequencing omission):** the intake build was spec'd first and absent from the build order its
+  dependents (Tasks 3, 4) sit in. Added as step 3 with acceptance criteria.
+* **J (edge):** exact-name pinning was silent on cross-catalog collisions (`source_system` exists in
+  both live catalogs). Collision → fuzzy path + both shown at confirm.
+* **Exploring-mode edge:** LLM-origin candidates have no `near_label` flag and no target to compare
+  against — default recorded: shown with an explicit "leakage unchecked" banner.
+* **Verified true (no change):** ideas carry `origin` (`feature_assist.py:1665`) — Task 7's
+  group-by claim holds; `structured_result` (1039) is the correct cross-run store — Task 2b's
+  no-new-table claim holds.
 
 ## What NOT to do
 
