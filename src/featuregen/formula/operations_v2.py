@@ -25,7 +25,7 @@ from featuregen.formula.schema_v2 import AggregateFunctionV2
 
 # What kind of value an operation emits — the output-authority (BR-6's later increment) and the
 # recipe contract's RESULT_CLASS_ADDITIVITY consume this, not ad-hoc suffix guessing.
-RESULT_KINDS = ("operand_valued", "count", "duration", "dimensionless")
+RESULT_KINDS = ("operand_valued", "count", "duration", "dimensionless", "rate", "flag")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +73,17 @@ OPERATION_RULES: dict[AggregateFunctionV2, OperationRuleV1] = {rule.aggregation:
     # increment 4 — row-level date arithmetic, aggregated
     _R(AggregateFunctionV2.DATE_DIFF_AVG, True, "forbidden", AdditivityClass.NON_ADDITIVE,
        "duration", False, second_operand="required"),
+    # increment 5 — trend and condition. slope is the balance_trend shape (units per day, an OLS
+    # fit over event time — order-sensitive by definition). streak_periods counts the longest
+    # consecutive run of window-unit periods containing a qualifying row (salary regularity's
+    # shape); the FILTER is the condition, so it needs no operand — like count_rows. any_match is
+    # the honest flag: did any in-window row satisfy the condition.
+    _R(AggregateFunctionV2.SLOPE, True, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "rate", True),
+    _R(AggregateFunctionV2.STREAK_PERIODS, False, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "count", True),
+    _R(AggregateFunctionV2.ANY_MATCH, False, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "flag", False),
 )}
 
 

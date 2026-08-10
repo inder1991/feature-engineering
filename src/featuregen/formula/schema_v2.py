@@ -68,6 +68,10 @@ class AggregateFunctionV2(StrEnum):
     ZSCORE = "zscore"            # (last_known − mean) / stddev over one window; dimensionless
     # increment 4 — row-level date arithmetic, aggregated
     DATE_DIFF_AVG = "date_diff_avg"   # mean (operand − second_operand) in days across the window
+    # increment 5 — trend and condition
+    SLOPE = "slope"                  # OLS trend of operand over event time; units per day
+    STREAK_PERIODS = "streak_periods"  # longest consecutive run of window-unit periods with a qualifying row
+    ANY_MATCH = "any_match"          # boolean: any in-window row satisfies the filter
 
 
 class FinalOperationV2(StrEnum):

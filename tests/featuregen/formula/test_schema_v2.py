@@ -171,3 +171,30 @@ def test_date_diff_avg_demands_its_second_column_and_nothing_else_may_carry_one(
     bare["body"]["expr"].pop("second_operand")
     with pytest.raises(SchemaError, match="requires its second column"):
         parse_proposal_v2(bare)
+
+
+def test_the_trend_and_condition_group():
+    """Increment 5: slope (a trend needs a quantity — operand required, order-sensitive, RATE
+    result), streak_periods and any_match (the FILTER is the condition, so no operand — like
+    count_rows; a flag is a boolean, never a smuggled count)."""
+    from featuregen.formula.operations_v2 import operation_rule
+    from featuregen.formula.schema_v2 import AggregateFunctionV2
+
+    slope = parse_proposal_v2(_ok_fixture("21_slope_amount_90d.json"))
+    assert slope.body.expr.aggregation is AggregateFunctionV2.SLOPE
+    streak = parse_proposal_v2(_ok_fixture("22_streak_salary_periods.json"))
+    assert streak.body.expr.operand is None and streak.body.expr.filter is not None
+    parse_proposal_v2(_ok_fixture("23_any_match_dispute_flag.json"))
+
+    assert operation_rule(AggregateFunctionV2.SLOPE).result_kind == "rate"
+    assert operation_rule(AggregateFunctionV2.SLOPE).order_sensitive
+    assert operation_rule(AggregateFunctionV2.ANY_MATCH).result_kind == "flag"
+    assert not operation_rule(AggregateFunctionV2.STREAK_PERIODS).operand_required
+
+    bare = json.loads((_GOLD_V2 / "24_slope_without_operand_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="requires an operand"):
+        parse_proposal_v2(bare["proposal"])
+    smuggled = _ok_fixture("23_any_match_dispute_flag.json")
+    smuggled["body"]["expr"]["operand"] = "authored::public.txns.txn_amt"
+    with pytest.raises(SchemaError, match="carries no operand"):
+        parse_proposal_v2(smuggled)

@@ -22,7 +22,7 @@ def _ok_docs() -> list[dict]:
 
 def test_every_ok_fixture_pins_canonical_bytes_and_their_hash():
     docs = _ok_docs()
-    assert len(docs) == 14
+    assert len(docs) == 17
     for doc in docs:
         proposal = parse_proposal_v2(doc["proposal"])
         assert canonical_json_v2(proposal) == doc["canonical_json"], doc["case_id"]

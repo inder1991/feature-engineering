@@ -167,7 +167,7 @@
       "type": "object",
       "properties": {
         "aggregation": {
-          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore", "date_diff_avg"]
+          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore", "date_diff_avg", "slope", "streak_periods", "any_match"]
         },
         "aggregation_argument": {
           "anyOf": [{"type": "number"}, {"type": "null"}]
