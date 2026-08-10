@@ -14,7 +14,8 @@
     "needs_inferred_temporal_role": 605,
     "needs_unconstrained_source_grains": 605,
     "pit_unmatched_placeholder_recipes": 2,
-    "recipes_without_primary_objective": 143
+    "recipes_without_primary_objective": 143,
+    "v2_variant_identity_collision_recipes": 0
   },
   "informational": {
     "distinct_rendered_identities": 442,
@@ -28,8 +29,8 @@
     "recipe_count": 157,
     "v2_recipe_count": 0
   },
-  "measured_at_commit": "398cc0ab",
+  "measured_at_commit": "2a92230c",
   "measured_on": "2026-08-10",
-  "note": "BR-1 authoritative baseline, regenerated per the re-baseline amendment. Review-era estimates it supersedes: 'eleven missing-concept admissions' measured 15 under the documented pattern; 'two PIT placeholder defects' confirmed at exactly 2; the additivity-conflict heuristic measures 72. The ratchet holds `counters` only.",
+  "note": "BR-1 authoritative baseline, regenerated per the re-baseline amendment. Review-era estimates it supersedes: 'eleven missing-concept admissions' measured 15 under the documented pattern; 'two PIT placeholder defects' confirmed at exactly 2; the additivity-conflict heuristic measures 72. The ratchet holds `counters` only. BR-3 adds v2_variant_identity_collision_recipes (baseline 0) in the same commit as the check \u2014 the missing-counter regression rule demands it.",
   "version": "banking-recipe-debt-baseline-v1"
 }

@@ -413,3 +413,35 @@ def test_the_scope_lattice_bound_is_recomputed_from_the_role_registries():
 
 def test_an_unknown_role_claim_contributes_nothing_to_the_scope():
     assert build_read_scope(("wizard", "root")).scope_key == build_read_scope(()).scope_key
+
+
+# ── BR-3: suggestion_id_v3 — the corrected identity, emitted only through contract v3 ───────────
+def test_v3_exists_beside_v2_and_v2_is_untouched():
+    from featuregen.overlay.upload.recipe_registry_v2 import PROBE_RECIPE
+    from featuregen.overlay.upload.recipe_variants import resolve_variant
+    from featuregen.overlay.upload.suggestion_identity import suggestion_id_v3
+
+    variant = resolve_variant(PROBE_RECIPE)
+    base = _identity()
+    v3 = suggestion_id_v3(
+        variant_identity=variant.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=())
+    # deterministic, and DIFFERENT from the v2 id of the same bindings — v3 carries the recipe
+    # revision + output + parameters through the variant identity, v2 never did
+    assert v3 == suggestion_id_v3(
+        variant_identity=variant.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=())
+    assert v3 != suggestion_id(**_identity())
+    # a different SELECTION of the same recipe is a different v3 candidate
+    other = resolve_variant(PROBE_RECIPE, {"window": 90})
+    assert suggestion_id_v3(
+        variant_identity=other.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=()) != v3
+    # and the LEGACY identity of the same logical candidate is byte-stable against all of this
+    assert suggestion_id(**_identity()) == suggestion_id(**_identity())

@@ -70,6 +70,9 @@ RATCHETED_COUNTERS: tuple[str, ...] = (
     "needs_inferred_temporal_role",
     "needs_unconstrained_source_grains",
     "legacy_recipes_not_in_v2",
+    # BR-3: every V2 recipe's full variant space must mint DISTINCT canonical identities — the
+    # 145-recipe collision class, held at zero for the V2 era from the first migrated recipe.
+    "v2_variant_identity_collision_recipes",
 )
 
 
@@ -98,10 +101,13 @@ def _additivity_classes(values: Iterable) -> set[str]:
 
 
 def audit_registry(templates: Sequence | None = None,
-                   v2_recipe_ids: Iterable[str] = ()) -> RecipeAuditReportV1:
+                   v2_recipe_ids: Iterable[str] = (),
+                   v2_definitions: Sequence | None = None) -> RecipeAuditReportV1:
     """The pure audit. ``templates`` defaults to the live registry at call time; ``v2_recipe_ids``
-    is the future RecipeDefinitionV2 population (empty until BR-2) — a legacy recipe with a V2
-    replacement stops counting toward ``legacy_recipes_not_in_v2``."""
+    is the RecipeDefinitionV2 population's replaced-legacy ids — a legacy recipe with a V2
+    replacement stops counting toward ``legacy_recipes_not_in_v2``. ``v2_definitions`` defaults to
+    the production V2 registry and feeds the BR-3 variant-identity collision check (audit-side
+    enumeration; request paths never enumerate)."""
     from featuregen.overlay.upload.recipe_formula_expectations import (
         RECIPE_FORMULA_EXPECTATIONS,
     )
@@ -181,6 +187,17 @@ def audit_registry(templates: Sequence | None = None,
     for need_counter in ("needs_inferred_join_role", "needs_inferred_temporal_role",
                         "needs_unconstrained_source_grains"):
         ex.pop(need_counter, None)
+
+    if v2_definitions is None:
+        from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+        v2_definitions = V2_RECIPES
+    from featuregen.overlay.upload.recipe_variants import enumerate_variant_identities
+    for definition in v2_definitions:
+        identities = enumerate_variant_identities(definition)
+        if len(set(identities)) != len(identities):
+            ex["v2_variant_identity_collision_recipes"].append(definition.recipe_id)
+    counters["v2_variant_identity_collision_recipes"] = len(
+        ex["v2_variant_identity_collision_recipes"])
 
     gold_recipes = {case.recipe_id for case in FORMULA_GOLD_CASES}
     informational = {

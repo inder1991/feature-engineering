@@ -71,7 +71,9 @@ __all__ = [
     "build_universe_independent_trace_hash",
     "dependency_content_hashes",
     "join_path_assignment",
+    "SUGGESTION_CONTRACT_VERSION_V3",
     "suggestion_id",
+    "suggestion_id_v3",
     "suggestion_revision_id",
 ]
 
@@ -79,6 +81,9 @@ _OWNER = "featuregen.overlay.upload.suggestion_identity"
 
 #: The frozen contract version of the two v2 suggestion identities (0F-10).
 SUGGESTION_CONTRACT_VERSION = "2"
+#: BR-3 (banking-recipe plan): the CORRECTED identity's version — emitted only through suggestion
+#: contract v3 (BR-8). v1/v2 identities are untouched by its existence.
+SUGGESTION_CONTRACT_VERSION_V3 = "3"
 SUGGESTION_ID_CONTRACT = "feature-suggestion-id"
 SUGGESTION_REVISION_CONTRACT = "feature-suggestion-revision"
 #: The grounding decision, projected onto the part of it that does not depend on WHICH COLUMNS were
@@ -317,6 +322,38 @@ def suggestion_id(*, template_id: str | None,
     return contract_hash_v1(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION, payload)
 
 
+def suggestion_id_v3(*, variant_identity: str,
+                     operands: Sequence[tuple[str, str, str]],
+                     entity_id: str | None,
+                     grain_refs: Sequence[tuple[str, str]],
+                     time_ref: tuple[str, str] | None,
+                     relationship_path_assignment: Sequence[tuple[str, Sequence[_LogicalLeg]]]
+                     ) -> str:
+    """BR-3's corrected logical-candidate identity, version 3 — emitted ONLY through suggestion
+    contract v3 (BR-8 wires it; nothing on the v1/v2 paths calls this).
+
+    What v3 corrects: the recipe side of the identity is the ``recipe_variants.variant_identity``
+    — recipe REVISION (canonical-recipe-v2 hash), ``output_id`` and EVERY bound parameter — so a
+    definition edit, a different output of a split family, or a different parameter binding is a
+    different candidate BY CONSTRUCTION (the 145-recipe collision class cannot re-enter). The
+    binding side (operands / grain / time / relationship-path assignment) keeps ``suggestion_id``'s
+    exact semantics, physical-vs-logical caveats included."""
+    payload = {
+        "variant_identity": variant_identity,
+        "operands": sorted([source, logical_ref, role]
+                           for source, logical_ref, role in operands),
+        "entity": {
+            "entity_id": entity_id,
+            "grain_refs": [[source, ref] for source, ref in grain_refs],
+            "time_ref": _ref_json(time_ref),
+        },
+        "relationship_path_assignment": sorted(
+            ([key, [list(leg) for leg in legs]] for key, legs in relationship_path_assignment),
+            key=lambda entry: entry[0]),
+    }
+    return contract_hash_v1(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION_V3, payload)
+
+
 def suggestion_revision_id(*, suggestion_id: str,
                            recipe_revision_id: str | None,
                            discovery_metadata_revision_id: str | None,
@@ -366,5 +403,7 @@ def suggestion_revision_id(*, suggestion_id: str,
 
 register_contract_version(TRACE_PROJECTION_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
 register_contract_version(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
+# BR-3: the corrected v3 identity — registered by the same owner; emitted only via contract v3.
+register_contract_version(SUGGESTION_ID_CONTRACT, SUGGESTION_CONTRACT_VERSION_V3, owner=_OWNER)
 register_contract_version(SUGGESTION_REVISION_CONTRACT, SUGGESTION_CONTRACT_VERSION, owner=_OWNER)
 register_contract_version(READ_SCOPE_CONTRACT, READ_SCOPE_CONTRACT_VERSION, owner=_OWNER)

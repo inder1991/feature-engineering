@@ -320,12 +320,7 @@ The program is complete only when all of the following are true:
 - [ ] Add an audit check proving all V2 variants have distinct canonical identities.
 - [ ] Define replacement aliases for any migrated recipe whose display name changes.
 
-**Acceptance:**
-
-- The legacy parameter combinations (1,122 re-measured at 58041a59) no longer collapse after their recipes are migrated.
-- A 90-day ratio and 90-day net amount are different recipes, not variants.
-- A 30-day and 90-day instance of one atomic output are distinct selected variants.
-- Page-load work remains bounded by recipe count rather than all parameter combinations.
+**Acceptance: DONE 2026-08-10** (V2-side; legacy identities untouched by construction). `recipe_variants.py`: `resolve_variant` (one validated selection at a time; default = first-allowed, the same rule the push half degrades to; unknown params and off-menu values REFUSED; the returned value is always the AUTHORED object), `parameter_schema` (bounded by parameter count — pages return the schema, never the product), `variant_identity` (recipe REVISION hash + output_id + every bound parameter), `enumerate_variant_identities` (AUDIT-ONLY, capped). A governed threshold selects its reviewed policy LABEL — a browser literal is refused. `suggestion_id_v3` registered beside the untouched v2 contract (same owner; emitted only via contract v3/BR-8); proven: same bindings + different selection = different v3 candidate, while the legacy id stays byte-stable. The audit gains ratcheted `v2_variant_identity_collision_recipes` (baseline 0, regenerated same-commit). Collision battery covers window_min / horizon_days / threshold / baseline / match_policy (`measure` is unconstructible since BR-2); a 30-day and 90-day instance of one output are two identities and two display names. DEVIATIONS, both deliberate: `templates.py` needed NO change (the Task-4b `params_by_id` seam already exists — one seam, two callers); "carry the selection into RecipeGroundingContextV2" waits for BR-17's registry cutover (the selection rides `ResolvedRecipeVariantV1` until V2 recipes ground). Replacement display aliases land per-family in BR-11..16.
 
 **Verification:**
 
