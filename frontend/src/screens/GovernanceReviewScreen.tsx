@@ -933,14 +933,28 @@ async function confirmItem(item: GovernanceQueueItem, note: string): Promise<Out
       projectionKind: 'operational',
     }
   }
-  const result = item.kind === 'approved_join'
-    ? await confirmJoin(item.fact_key, body)
-    : await confirmTableFact(item.fact_key, body)
-  return {
-    governance_status: result.governance_status,
-    projection: result.operational_projection,
-    projectionKind: 'operational',
+  if (item.kind === 'approved_join') {
+    const result = await confirmJoin(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
   }
+  if (item.kind === 'grain' || item.kind === 'availability_time') {
+    const result = await confirmTableFact(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
+  }
+  // VERSION SKEW, named (2026-08-10): an old bundle once met a new queue kind here and fell
+  // through to the TABLE-FACT command — the backend 404ed the wrong-route confirm ("No such
+  // table-fact proposal"), which read as a broken screen. A kind this build does not know gets a
+  // reload instruction, never somebody else's command.
+  throw new Error(
+    `This review screen is older than this decision kind (${item.kind}). Reload the page.`)
 }
 
 async function rejectItem(
@@ -964,7 +978,13 @@ async function rejectItem(
       { category: category as SemanticBindingRejectCategory, ...rest })
     return
   }
-  await rejectTableFact(item.fact_key, { category: category as TableFactRejectCategory, ...rest })
+  if (item.kind === 'grain' || item.kind === 'availability_time') {
+    await rejectTableFact(item.fact_key,
+      { category: category as TableFactRejectCategory, ...rest })
+    return
+  }
+  throw new Error(
+    `This review screen is older than this decision kind (${item.kind}). Reload the page.`)
 }
 
 function projectionNote(projection: string, kind: Outcome['projectionKind']): string {

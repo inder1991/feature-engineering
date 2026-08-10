@@ -275,6 +275,8 @@ beforeEach(() => {
     approvals: [],
   })
   confirmTableFact.mockReset()
+  confirmSemanticBinding.mockReset()
+  rejectSemanticBinding.mockReset()
   confirmTableFact.mockResolvedValue({
     governance_status: 'VERIFIED', operational_projection: 'projected',
   })
@@ -1332,5 +1334,24 @@ describe('semantic bindings in the queue', () => {
     const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
     expect(row.getByRole('button', { name: /^confirm/i })).toBeDisabled()
     expect(row.getByRole('button', { name: /^reject/i })).toBeEnabled()
+  })
+
+  it('an unknown kind gets a reload instruction, never somebody else\'s command', async () => {
+    // VERSION SKEW (live, 2026-08-10): a pre-deploy bundle met the new currency_binding kind and
+    // dispatched its confirm to the TABLE-FACT route, which 404ed. The dispatch is now closed over
+    // the kinds this build knows; anything else errors with "reload".
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding({ kind: 'kind_from_the_future', fact_key: 'fact:future:1' })],
+      items_visible_to_you_by_kind: { kind_from_the_future: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:future:1'))
+    await userEvent.click(row.getByRole('button', { name: /^confirm/i }))
+    await userEvent.click(row.getByRole('checkbox'))
+    await userEvent.click(row.getByRole('button', { name: /record my confirmation/i }))
+    expect(await row.findByRole('alert')).toHaveTextContent(/older than this decision kind/i)
+    expect(confirmTableFact).not.toHaveBeenCalled()
+    expect(confirmJoin).not.toHaveBeenCalled()
+    expect(confirmSemanticBinding).not.toHaveBeenCalled()
   })
 })
