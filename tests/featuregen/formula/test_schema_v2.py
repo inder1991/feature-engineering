@@ -238,3 +238,28 @@ def test_the_future_horizon_carries_contractual_sums_and_refuses_observed_histor
     trend_over_future["body"]["expr"]["aggregation"] = "slope"
     with pytest.raises(SchemaError, match="future horizon has none"):
         parse_proposal_v2(trend_over_future)
+
+
+def test_the_br18_exemplar_is_fully_expressible_and_authorities_are_identity():
+    """Increment 8: the plan's canonical exemplar (posted_debit_amount) parses end to end with
+    every governed policy it names — status, direction, reversal, currency — plus the
+    account→customer rollup carrying its allocation policy. The authorities are IDENTITY: the
+    same computation with and without a reversal policy is two formulas; a vacuous block (every
+    ref blank) is a lie and refuses."""
+    from featuregen.formula.canonical_v2 import proposal_content_hash_v2
+
+    exemplar = parse_proposal_v2(_ok_fixture("30_posted_debit_amount_exemplar.json"))
+    refs = exemplar.body.expr.authority_refs
+    assert refs is not None and refs.reversal_policy_ref == "policy:reversal-neutralizes-original"
+    rollup = parse_proposal_v2(_ok_fixture("31_customer_rollup_with_allocation.json"))
+    assert rollup.allocation_policy_ref == "policy:joint-account-equal-split"
+
+    stripped = _ok_fixture("30_posted_debit_amount_exemplar.json")
+    stripped["body"]["expr"].pop("authority_refs")
+    assert (proposal_content_hash_v2(parse_proposal_v2(stripped))
+            != proposal_content_hash_v2(exemplar)), \
+        "a formula that declares no policies is a DIFFERENT formula — honestly so"
+
+    vacuous = json.loads((_GOLD_V2 / "32_vacuous_authority_block_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="omit the block instead"):
+        parse_proposal_v2(vacuous["proposal"])

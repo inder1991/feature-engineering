@@ -5,6 +5,7 @@
   "type": "object",
   "properties": {
     "formula_schema_version": {"const": 2},
+    "allocation_policy_ref": {"type": "string"},
     "operation_grammar_version": {"const": 1},
     "canonicalization_version": {"const": 1},
     "grain": {"$ref": "#/$defs/grain"},
@@ -174,6 +175,19 @@
         },
         "second_operand": {
           "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]
+        },
+        "authority_refs": {
+          "anyOf": [
+            {"type": "object",
+             "properties": {
+               "status_policy_ref": {"type": "string"},
+               "direction_policy_ref": {"type": "string"},
+               "reversal_policy_ref": {"type": "string"},
+               "currency_conversion_ref": {"type": "string"}
+             },
+             "additionalProperties": false},
+            {"type": "null"}
+          ]
         },
         "operand": {
           "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]

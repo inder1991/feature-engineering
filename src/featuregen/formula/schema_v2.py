@@ -128,6 +128,31 @@ class WindowPolicyV2:
 
 
 @dataclass(frozen=True, slots=True)
+class AuthorityRefsV2:
+    """The governed policy REFERENCES one expression computes under (increment 8): which
+    eligible-status set filters rows, which sign/direction convention reads amounts, how
+    reversals neutralize originals, and which rate policy converts currency. These are
+    DECLARATIONS — carried in identity, so a formula with a reversal policy is a DIFFERENT
+    formula from one without. Resolving each ref against its governed store (and refusing a
+    monetary sum whose source needs conversion but declares none) is output authority's and
+    BR-7's job — the schema's job is that the declaration exists, non-vacuously."""
+
+    status_policy_ref: str = ""
+    direction_policy_ref: str = ""
+    reversal_policy_ref: str = ""
+    currency_conversion_ref: str = ""
+
+    def __post_init__(self) -> None:
+        values = (self.status_policy_ref, self.direction_policy_ref,
+                  self.reversal_policy_ref, self.currency_conversion_ref)
+        if not any(v.strip() for v in values):
+            raise SchemaError(
+                "authority_refs with every ref blank is a lie — omit the block instead")
+        if any(v != v.strip() for v in values):
+            raise SchemaError("authority refs must not carry surrounding whitespace")
+
+
+@dataclass(frozen=True, slots=True)
 class AggregateExpressionV2:
     aggregation: AggregateFunctionV2
     operand: LogicalRef | None            # None IFF aggregation == COUNT_ROWS
@@ -141,6 +166,10 @@ class AggregateExpressionV2:
     # increment 4: the second column of a row-level binary operation (date_diff_avg's
     # subtrahend) — REQUIRED where the rule table says so, FORBIDDEN elsewhere, same-table.
     second_operand: LogicalRef | None = None
+    # increment 8: the governed policies this expression computes under. None = the recipe's
+    # temporal/eligibility contract carries everything (many features need no row policies);
+    # a present block is identity-bearing and never vacuous.
+    authority_refs: AuthorityRefsV2 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +209,10 @@ class TypedFormulaProposalV2:
     parameters: tuple[ParameterDecl, ...]
     decimal: DecimalPolicy
     expected_output: object | None
+    # increment 8: the allocation policy governing the SOURCE-grain → OUTPUT-grain rollup
+    # (joint accounts, facility→obligor). "" = grains coincide or the rollup is a plain
+    # per-entity aggregation needing no allocation. Identity-bearing.
+    allocation_policy_ref: str = ""
 
 
 def _check_expression_v2(expr: AggregateExpressionV2, path: str,

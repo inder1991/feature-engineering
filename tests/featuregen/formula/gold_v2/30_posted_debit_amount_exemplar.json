@@ -1,0 +1,65 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"expr\":{\"aggregation\":\"sum\",\"aggregation_argument\":null,\"authority_refs\":{\"currency_conversion_ref\":\"policy:governed-rate-at-booking\",\"direction_policy_ref\":\"policy:dc-sign-convention\",\"reversal_policy_ref\":\"policy:reversal-neutralizes-original\",\"status_policy_ref\":\"policy:eligible-posted-status\"},\"filter\":{\"kind\":\"predicate\",\"left\":\"authored::public.txns.direction\",\"op\":\"equal\",\"right_literal\":{\"type\":\"string\",\"value\":\"debit\"},\"right_param\":null,\"right_set\":null},\"operand\":\"authored::public.txns.txn_amt\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"zero\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.booking_ts\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.txns.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "posted_debit_amount_exemplar",
+  "expected": "ok",
+  "expected_proposal_hash": "093de7a0e954122f2e0e5706eea9af65ec18b42ddb7b29f4dbd9860911930bbc",
+  "note": "THE BR-18 canonical exemplar, end to end: sum of eligible debit economic amount under governed status, direction, reversal and currency policies over a trailing window with empty-window-zero \u2014 every policy the plan's \u00a7BR-18 contract names, declared and identity-bearing",
+  "operation": "sum",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "sum",
+        "authority_refs": {
+          "currency_conversion_ref": "policy:governed-rate-at-booking",
+          "direction_policy_ref": "policy:dc-sign-convention",
+          "reversal_policy_ref": "policy:reversal-neutralizes-original",
+          "status_policy_ref": "policy:eligible-posted-status"
+        },
+        "filter": {
+          "kind": "predicate",
+          "left": "authored::public.txns.direction",
+          "op": "equal",
+          "right_literal": {
+            "type": "string",
+            "value": "debit"
+          },
+          "right_param": null,
+          "right_set": null
+        },
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {
+          "table_ref": "authored::public.txns"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "zero",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.txns.booking_ts",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "account",
+      "keys": [
+        "authored::public.txns.acct_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

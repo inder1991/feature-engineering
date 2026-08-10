@@ -88,6 +88,20 @@ def _build_expression_v2(data: dict[str, Any]) -> AggregateExpressionV2:
         window=_build_window_v2(data["window"]),
         aggregation_argument=data.get("aggregation_argument"),
         second_operand=data.get("second_operand"),
+        authority_refs=_build_authority_refs(data.get("authority_refs")),
+    )
+
+
+def _build_authority_refs(data: dict[str, Any] | None):
+    if data is None:
+        return None
+    from featuregen.formula.schema_v2 import AuthorityRefsV2
+
+    return AuthorityRefsV2(
+        status_policy_ref=data.get("status_policy_ref", ""),
+        direction_policy_ref=data.get("direction_policy_ref", ""),
+        reversal_policy_ref=data.get("reversal_policy_ref", ""),
+        currency_conversion_ref=data.get("currency_conversion_ref", ""),
     )
 
 
@@ -132,6 +146,7 @@ def parse_proposal_v2(raw: Mapping[str, Any]) -> TypedFormulaProposalV2:
                 rounding=RoundingMode(data["decimal"]["rounding"]),
                 overflow=OverflowBehavior(data["decimal"]["overflow"])),
             expected_output=_build_expected_output(data.get("expected_output")),
+            allocation_policy_ref=data.get("allocation_policy_ref", ""),
         )
         validate_semantics_v2(proposal)
     except RecursionError:
