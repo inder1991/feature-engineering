@@ -831,7 +831,11 @@ AGREED ORDER (owner-endorsed 2026-08-10; Step 0 and acceptance criteria added in
    ftr: 23 grounded → 9 shown   14 rejections: 11× CURRENCY_POLICY_REQUIRED, 3× NON_NUMERIC
    cib: 10 grounded → 9 shown    1 rejection:   1× PERSONAL_DATA_POLICY_REQUIRED
    ```
-   `cib`'s survival — an open question since the first draft — is measured: 10→9. And the `ftr`
+   `cib`'s survival — an open question since the first draft — is measured: 10→9.
+   **Deployed 2026-08-10; first live stopwatch readings: the glance is 95ms (`ftr`) /
+   108ms (`cib`) per pass** — cheap, but not the "~free" the caching-rule prose said:
+   ~100ms of the suggestion page's budget at 237 columns. Fine today; exactly the number
+   to watch as catalogs grow, which is why the stopwatch exists. And the `ftr`
    histogram converts Task 5's stranded-proposals bullet into the plan's SINGLE CHEAPEST WIN: **11
    of 14 rejections are "no declared currency", and 6 LLM currency proposals sit unconfirmed in
    the E4a review queue.** One reviewer-hour plausibly turns up to 11 rejections into shown
