@@ -1,0 +1,50 @@
+{
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"sum\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":1,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "lag_prev_period_sum",
+  "expected": "ok",
+  "expected_proposal_hash": "3e3ed9ef1bdcd1af64141f772b5f349a2c9ddd33257ba5021df522a0b4c85fbc",
+  "note": "LAG as a body composition: the previous period's total is the SAME aggregate at offset 1 \u2014 (cutoff \u2212 180d, cutoff \u2212 90d]. No new operation, one new identity-bearing field.",
+  "operation": "composition",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "sum",
+        "filter": null,
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {
+          "table_ref": "authored::public.txns"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "offset_periods": 1,
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "customer",
+      "keys": [
+        "authored::public.txns.cif_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

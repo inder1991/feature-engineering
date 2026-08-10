@@ -34,6 +34,10 @@ class EngineCapabilityV1:
 
     engine_id: str
     supported_aggregations: frozenset[str]
+    # increment 4: window offsets (lag/delta shapes) are an ENGINE capability too — shifting a
+    # window back k periods needs engine support just like an aggregate does. Default False:
+    # an engine advertises it or offset formulas are unsupported_engine on it.
+    supports_window_offset: bool = False
 
 
 def classify_formula_capability_v2(
@@ -53,6 +57,11 @@ def classify_formula_capability_v2(
         return "unsupported_capability"
     if not used <= {member.value for member in AggregateFunctionV2}:
         return "unsupported_capability"
-    if engine is not None and not used <= engine.supported_aggregations:
-        return "unsupported_engine"
+    if engine is not None:
+        if not used <= engine.supported_aggregations:
+            return "unsupported_engine"
+        uses_offset = any(expr.window.offset_periods > 0
+                          for expr in body_expressions_v2(proposal.body))
+        if uses_offset and not engine.supports_window_offset:
+            return "unsupported_engine"
     return "ok"

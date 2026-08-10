@@ -1,9 +1,9 @@
 {
-  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"avg\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"avg\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
   "case_id": "avg_txn_amt_90d",
   "expected": "ok",
-  "expected_proposal_hash": "3f434ed81b3e3c2af345d5a357429c065ebeb41bba4327d0888d4a3d3c867fb8",
-  "note": "increment-1 NEW group: average transaction amount \u2014 the BR-18 tranche-A posted_transaction_average_amount shape [re-keyed in increment 2: aggregation_argument joined the canonical form]",
+  "expected_proposal_hash": "a35c2b573beb0c39543f611ba73ccc23cc5beea2ae6a76936459801d7754b160",
+  "note": "increment-1 NEW group: average transaction amount \u2014 the BR-18 tranche-A posted_transaction_average_amount shape [re-keyed in increment 2: aggregation_argument joined the canonical form] [re-keyed in increment 4: offset_periods + second_operand joined the canonical form]",
   "operation": "avg",
   "proposal": {
     "body": {

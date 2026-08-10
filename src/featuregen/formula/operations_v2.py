@@ -36,6 +36,7 @@ class OperationRuleV1:
     additivity: AdditivityClass
     result_kind: str                  # RESULT_KINDS
     order_sensitive: bool             # needs the event clock to mean anything
+    second_operand: str = "forbidden"   # "forbidden" | "required" (row-level binary ops)
 
 
 _R = OperationRuleV1
@@ -69,6 +70,9 @@ OPERATION_RULES: dict[AggregateFunctionV2, OperationRuleV1] = {rule.aggregation:
        "operand_valued", True),
     _R(AggregateFunctionV2.ZSCORE, True, "forbidden", AdditivityClass.NON_ADDITIVE,
        "dimensionless", True),
+    # increment 4 — row-level date arithmetic, aggregated
+    _R(AggregateFunctionV2.DATE_DIFF_AVG, True, "forbidden", AdditivityClass.NON_ADDITIVE,
+       "duration", False, second_operand="required"),
 )}
 
 

@@ -1,9 +1,9 @@
 {
-  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"zscore\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.balances.eod_bal\",\"source_relation\":{\"table_ref\":\"authored::public.balances\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.balances.as_of_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.balances.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"zscore\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.balances.eod_bal\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.balances\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.balances.as_of_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.balances.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
   "case_id": "zscore_txn_amt_90d",
   "expected": "ok",
-  "expected_proposal_hash": "052210b9cffb903c2d36ed549e8ce4d3265859cc781d6af0e36c749875fdc9cd",
-  "note": "the standardized latest value: (last_known \u2212 mean)/stddev over ONE window and operand \u2014 a single honest aggregate, not a composite; dimensionless",
+  "expected_proposal_hash": "7152fc860bf05bc6ec2d5ad3558873e384e8678ac0a26cc562c43162cdfb036f",
+  "note": "the standardized latest value: (last_known \u2212 mean)/stddev over ONE window and operand \u2014 a single honest aggregate, not a composite; dimensionless [re-keyed in increment 4: offset_periods + second_operand joined the canonical form]",
   "operation": "zscore",
   "proposal": {
     "body": {

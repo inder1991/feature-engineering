@@ -140,3 +140,34 @@ def test_the_at_cutoff_group_and_the_rule_table_are_total():
     bare["body"]["expr"]["operand"] = None
     with pytest.raises(SchemaError, match="requires an operand"):
         parse_proposal_v2(bare)
+
+
+def test_lag_and_delta_are_body_compositions_and_the_offset_is_disciplined():
+    """Increment 4: LAG = the same aggregate at offset 1; DELTA = a difference body over offsets
+    0 and 1. One new identity-bearing window field, zero new operations — and a negative offset
+    (a future window in disguise) or an offset beyond the cap refuses."""
+    lag = parse_proposal_v2(_ok_fixture("16_lag_prev_period_sum.json"))
+    assert lag.body.expr.window.offset_periods == 1
+    delta = parse_proposal_v2(_ok_fixture("17_delta_sum_current_minus_prev.json"))
+    assert (delta.body.minuend.window.offset_periods,
+            delta.body.subtrahend.window.offset_periods) == (0, 1)
+
+    negative = json.loads((_GOLD_V2 / "19_negative_offset_invalid.json").read_text())
+    with pytest.raises(SchemaError):
+        parse_proposal_v2(negative["proposal"])
+    beyond = _ok_fixture("16_lag_prev_period_sum.json")
+    beyond["body"]["expr"]["window"]["offset_periods"] = 13
+    with pytest.raises(SchemaError):
+        parse_proposal_v2(beyond)
+
+
+def test_date_diff_avg_demands_its_second_column_and_nothing_else_may_carry_one():
+    diff = parse_proposal_v2(_ok_fixture("18_date_diff_avg_due_to_paid.json"))
+    assert diff.body.expr.second_operand == "authored::public.txns.due_dt"
+    smuggled = json.loads((_GOLD_V2 / "20_second_operand_on_sum_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="takes no second column"):
+        parse_proposal_v2(smuggled["proposal"])
+    bare = _ok_fixture("18_date_diff_avg_due_to_paid.json")
+    bare["body"]["expr"].pop("second_operand")
+    with pytest.raises(SchemaError, match="requires its second column"):
+        parse_proposal_v2(bare)

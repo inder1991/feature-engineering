@@ -55,3 +55,17 @@ def test_an_engine_advertises_and_the_verdict_distinguishes_engine_from_grammar(
     # authoring-time (no engine) never claims materializability — grammar-ok regardless
     assert classify_formula_capability_v2(avg) == "ok"
     assert classify_formula_capability_v2(p95) == "ok"
+
+
+def test_window_offsets_are_an_engine_capability_too():
+    """Increment 4: an engine that can aggregate but cannot shift windows honestly refuses a lag
+    formula — advertisement covers structure, not just operations."""
+    lag = _proposal("16_lag_prev_period_sum.json")
+    no_offset = EngineCapabilityV1(engine_id="basic",
+                                   supported_aggregations=frozenset({"sum"}))
+    with_offset = EngineCapabilityV1(engine_id="offset-capable",
+                                     supported_aggregations=frozenset({"sum"}),
+                                     supports_window_offset=True)
+    assert classify_formula_capability_v2(lag, engine=no_offset) == "unsupported_engine"
+    assert classify_formula_capability_v2(lag, engine=with_offset) == "ok"
+    assert classify_formula_capability_v2(lag) == "ok", "grammar-ok regardless of engines"

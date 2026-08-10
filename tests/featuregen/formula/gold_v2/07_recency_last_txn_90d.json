@@ -1,9 +1,9 @@
 {
-  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"recency\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_dt\",\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"recency\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_dt\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
   "case_id": "recency_last_txn_90d",
   "expected": "ok",
-  "expected_proposal_hash": "aef72d6224f51b93716886b31a1b0752ae2bb857d0da4d3a77dd7e3faeaadaca",
-  "note": "duration since the latest in-window event at the cutoff \u2014 transaction_recency_days shape (BR-18 tranche A)",
+  "expected_proposal_hash": "99a8ee6ba2addfd2ef886b15308a7f3898b9e55059843b6025eb281b06e2e2d5",
+  "note": "duration since the latest in-window event at the cutoff \u2014 transaction_recency_days shape (BR-18 tranche A) [re-keyed in increment 4: offset_periods + second_operand joined the canonical form]",
   "operation": "recency",
   "proposal": {
     "body": {

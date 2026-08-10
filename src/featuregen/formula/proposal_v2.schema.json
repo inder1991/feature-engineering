@@ -134,7 +134,8 @@
         "end_inclusive": {"enum": ["inclusive", "exclusive"]},
         "timezone": {"type": "string", "minLength": 1},
         "empty_window": {"enum": ["null", "zero", "error"]},
-        "null_input": {"enum": ["ignore", "propagate", "zero"]}
+        "null_input": {"enum": ["ignore", "propagate", "zero"]},
+        "offset_periods": {"type": "integer", "minimum": 0, "maximum": 12}
       },
       "required": [
         "event_time_ref",
@@ -166,10 +167,13 @@
       "type": "object",
       "properties": {
         "aggregation": {
-          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore"]
+          "enum": ["sum", "count_rows", "count_non_null", "count_distinct", "min", "max", "avg", "recency", "stddev", "percentile", "median", "last_known", "first_known", "zscore", "date_diff_avg"]
         },
         "aggregation_argument": {
           "anyOf": [{"type": "number"}, {"type": "null"}]
+        },
+        "second_operand": {
+          "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]
         },
         "operand": {
           "anyOf": [{"$ref": "#/$defs/logicalRef"}, {"type": "null"}]

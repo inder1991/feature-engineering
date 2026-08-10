@@ -25,13 +25,17 @@ from featuregen.formula.schema import (
     MAX_PREDICATES,
     AdditivityClass,
     DecimalPolicy,
+    EmptyWindowResult,
     FilterNode,
     Grain,
+    Inclusivity,
     LogicalRef,
+    NullInput,
     ParameterDecl,
     SchemaError,
     SourceRelation,
-    WindowPolicy,
+    WindowBasis,
+    WindowUnit,
     _check_filter_node,
     _require_column_ref,
     _require_contained_column,
@@ -62,6 +66,8 @@ class AggregateFunctionV2(StrEnum):
     LAST_KNOWN = "last_known"    # the value the world held at the cutoff; semi-additive
     FIRST_KNOWN = "first_known"  # the first value shown inside the window; semi-additive
     ZSCORE = "zscore"            # (last_known − mean) / stddev over one window; dimensionless
+    # increment 4 — row-level date arithmetic, aggregated
+    DATE_DIFF_AVG = "date_diff_avg"   # mean (operand − second_operand) in days across the window
 
 
 class FinalOperationV2(StrEnum):
@@ -70,17 +76,52 @@ class FinalOperationV2(StrEnum):
     DIFFERENCE = "difference"
 
 
+# The offset cap: a year of monthly look-backs. An offset this large is a modelling smell worth a
+# loud stop rather than a silent 10-year scan.
+MAX_WINDOW_OFFSET_PERIODS = 12
+
+
+@dataclass(frozen=True, slots=True)
+class WindowPolicyV2:
+    """v1's window plus ``offset_periods`` — the increment-4 fork that makes LAG and DELTA body
+    COMPOSITIONS instead of new aggregates: offset 0 is the current period (byte-for-byte v1
+    semantics), offset k is the window shifted back k×length — (cutoff − (k+1)·L, cutoff − k·L].
+    A previous-period value is a unary body at offset 1; a delta is a difference body over
+    offsets 0 and 1 of the SAME aggregate. Every offset is inside the identity."""
+
+    event_time_ref: LogicalRef
+    basis: WindowBasis
+    length: int
+    unit: WindowUnit
+    start_inclusive: Inclusivity
+    end_inclusive: Inclusivity
+    timezone: str
+    empty_window: EmptyWindowResult
+    null_input: NullInput
+    offset_periods: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.offset_periods, int) or isinstance(self.offset_periods, bool) \
+                or not 0 <= self.offset_periods <= MAX_WINDOW_OFFSET_PERIODS:
+            raise SchemaError(
+                f"window.offset_periods must be an int in [0, {MAX_WINDOW_OFFSET_PERIODS}], "
+                f"got {self.offset_periods!r}")
+
+
 @dataclass(frozen=True, slots=True)
 class AggregateExpressionV2:
     aggregation: AggregateFunctionV2
     operand: LogicalRef | None            # None IFF aggregation == COUNT_ROWS
     source_relation: SourceRelation
     filter: FilterNode | None
-    window: WindowPolicy
+    window: WindowPolicyV2
     # increment 2: the aggregate's own argument — REQUIRED for percentile (p ∈ (0,100),
     # exclusive), FORBIDDEN for every other operation. A parameterized aggregate carries its
     # parameter in identity, never in a generic label.
     aggregation_argument: float | None = None
+    # increment 4: the second column of a row-level binary operation (date_diff_avg's
+    # subtrahend) — REQUIRED where the rule table says so, FORBIDDEN elsewhere, same-table.
+    second_operand: LogicalRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +190,16 @@ def _check_expression_v2(expr: AggregateExpressionV2, path: str,
         _require_column_ref(expr.operand, f"{path}.operand")
         _require_contained_column(expr.operand, f"{path}.operand",
                                   expr.source_relation.table_ref)
+    if rule.second_operand == "required":
+        if expr.second_operand is None:
+            raise SchemaError(
+                f"{path}.second_operand: {expr.aggregation.value} requires its second column")
+        _require_column_ref(expr.second_operand, f"{path}.second_operand")
+        _require_contained_column(expr.second_operand, f"{path}.second_operand",
+                                  expr.source_relation.table_ref)
+    elif expr.second_operand is not None:
+        raise SchemaError(
+            f"{path}.second_operand: {expr.aggregation.value} takes no second column")
     if expr.filter is not None:
         count = _check_filter_node(expr.filter, f"{path}.filter", 1,
                                    expr.source_relation.table_ref, params)

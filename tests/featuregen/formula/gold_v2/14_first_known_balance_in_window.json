@@ -1,9 +1,9 @@
 {
-  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"first_known\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.balances.eod_bal\",\"source_relation\":{\"table_ref\":\"authored::public.balances\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.balances.as_of_dt\",\"length\":90,\"null_input\":\"ignore\",\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.balances.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"first_known\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.balances.eod_bal\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.balances\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.balances.as_of_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.balances.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
   "case_id": "first_known_balance_in_window",
   "expected": "ok",
-  "expected_proposal_hash": "df883fe70412c0afc4ef944fac66f2fca0d806adf0e5240e172e7bed9f123d3a",
-  "note": "the first value shown inside the window \u2014 balance-at-window-open for drawdown/delta shapes",
+  "expected_proposal_hash": "652e36041a830b4ed1dcfd7085ced22038bf2f03d482deceac6fbef7a559231e",
+  "note": "the first value shown inside the window \u2014 balance-at-window-open for drawdown/delta shapes [re-keyed in increment 4: offset_periods + second_operand joined the canonical form]",
   "operation": "first_known",
   "proposal": {
     "body": {

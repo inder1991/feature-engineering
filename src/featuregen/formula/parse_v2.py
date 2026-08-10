@@ -25,7 +25,6 @@ from featuregen.formula.parse import (
     _build_expected_output,
     _build_filter,
     _build_parameter,
-    _build_window,
     _plain,
     parse_proposal_v1,
 )
@@ -56,6 +55,30 @@ def _validator_v2() -> Draft202012Validator:
     return Draft202012Validator(json.loads(raw))
 
 
+def _build_window_v2(data: dict[str, Any]):
+    from featuregen.formula.schema import (
+        EmptyWindowResult,
+        Inclusivity,
+        NullInput,
+        WindowBasis,
+        WindowUnit,
+    )
+    from featuregen.formula.schema_v2 import WindowPolicyV2
+
+    return WindowPolicyV2(
+        event_time_ref=data["event_time_ref"],
+        basis=WindowBasis(data["basis"]),
+        length=data["length"],
+        unit=WindowUnit(data["unit"]),
+        start_inclusive=Inclusivity(data["start_inclusive"]),
+        end_inclusive=Inclusivity(data["end_inclusive"]),
+        timezone=data["timezone"],
+        empty_window=EmptyWindowResult(data["empty_window"]),
+        null_input=NullInput(data["null_input"]),
+        offset_periods=data.get("offset_periods", 0),
+    )
+
+
 def _build_expression_v2(data: dict[str, Any]) -> AggregateExpressionV2:
     filter_data = data.get("filter")
     return AggregateExpressionV2(
@@ -63,8 +86,9 @@ def _build_expression_v2(data: dict[str, Any]) -> AggregateExpressionV2:
         operand=data.get("operand"),
         source_relation=SourceRelation(table_ref=data["source_relation"]["table_ref"]),
         filter=_build_filter(filter_data) if filter_data is not None else None,
-        window=_build_window(data["window"]),
+        window=_build_window_v2(data["window"]),
         aggregation_argument=data.get("aggregation_argument"),
+        second_operand=data.get("second_operand"),
     )
 
 
