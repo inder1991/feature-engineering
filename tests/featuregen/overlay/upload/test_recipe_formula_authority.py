@@ -202,3 +202,50 @@ def test_authority_envelope_rejects_event_time_without_operational_role(db):
         logical_ref=refs["event"],
         role="event",
     )
+
+
+def test_authority_envelope_rejects_concept_compatible_but_economic_role_unproven(db):
+    """BR-5: the formula path consumes the SAME governed economic-role evidence as the binding
+    policy — a concept-compatible column with no human-confirmed economic role cannot verify a
+    role that demands one, and the additive parameter leaves every legacy caller byte-identical."""
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+
+    source = "authority_econ"
+    rows = [
+        CanonicalRow(source, "txn", "amount", "numeric"),
+        CanonicalRow(source, "txn", "event_ts", "timestamp"),
+        CanonicalRow(source, "txn", "customer_id", "string", is_grain=True),
+    ]
+    build_graph(db, source, rows)
+    refs = {
+        "amount": normalize_ref(source, None, "txn", "amount"),
+        "event": normalize_ref(source, None, "txn", "event_ts"),
+        "entity": normalize_ref(source, None, "txn", "customer_id"),
+    }
+    for role, ref in refs.items():
+        _record_concept(db, ref, {"amount": "monetary_flow", "event": "event_timestamp",
+                                  "entity": "customer_id"}[role])
+    _record_event_time(db, source, refs["event"])
+    db.execute(
+        "UPDATE graph_node SET grain_fact_event_id='grain-event-econ' "
+        "WHERE catalog_source=%s AND object_ref='public.txn.customer_id'", (source,))
+
+    demanded = {refs["amount"]: "settlement_flow"}
+    rejected = build_formula_authority_envelope(
+        db, context=_context(source, refs), expectation=_expectation(refs),
+        required_economic_roles=demanded)
+    assert isinstance(rejected, FormulaAuthorityRejection)
+    assert rejected.reason == "ECONOMIC_ROLE_UNPROVEN"
+    assert rejected.logical_ref == refs["amount"]
+
+    # human-confirmed evidence — and only that — satisfies it, through the same store
+    record_field_evidence(
+        db, logical_ref=refs["amount"], field_name="economic_role",
+        proposed_value="settlement_flow", producer="human", strength="confirmed",
+        producer_ref="user:sme", source_snapshot_id="snap-econ",
+        input_hash=field_input_hash(logical_ref=refs["amount"], field_name="economic_role",
+                                    material="settlement_flow"))
+    accepted = build_formula_authority_envelope(
+        db, context=_context(source, refs), expectation=_expectation(refs),
+        required_economic_roles=demanded)
+    assert isinstance(accepted, FormulaAuthorityEnvelopeV1)

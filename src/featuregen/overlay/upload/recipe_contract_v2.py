@@ -134,6 +134,11 @@ class OperandSpecV2:
     distinct_binding_group: str = ""
     unit_expectation: str = ""
     currency_expectation: str = ""
+    # BR-5: the economic-role constraint for GENERIC monetary concepts — "drawn_credit_exposure"
+    # is not satisfied by any monetary_stock column; a candidate must carry GOVERNED economic-role
+    # evidence matching this value, or the binding is BLOCKED (never bound by concept alone).
+    # "" = the concept alone is specific enough (account_id, event_timestamp, ...).
+    economic_role: str = ""
     sign_direction_expectation: str = ""
     status_policy_ref: str = ""
     relationship_requirement: str = ""
