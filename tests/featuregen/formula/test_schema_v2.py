@@ -115,3 +115,28 @@ def test_the_distributional_group_parses_and_the_argument_is_disciplined():
     edge["body"]["expr"]["aggregation_argument"] = 100
     with pytest.raises(SchemaError, match="strictly between"):
         parse_proposal_v2(edge)
+
+
+def test_the_at_cutoff_group_and_the_rule_table_are_total():
+    """Increment 3: last_known / first_known / zscore parse with the standard operand discipline,
+    the rule table is TOTAL over the enum (a member without a rule cannot ship), and additivity is
+    a view over it — last_known is honestly SEMI-additive, like the balances it reads."""
+    from featuregen.formula.operations_v2 import OPERATION_RULES
+    from featuregen.formula.schema import AdditivityClass
+    from featuregen.formula.schema_v2 import AGGREGATE_ADDITIVITY_V2, AggregateFunctionV2
+
+    for name in ("13_last_known_balance_at_cutoff.json", "14_first_known_balance_in_window.json",
+                 "15_zscore_txn_amt_90d.json"):
+        parse_proposal_v2(_ok_fixture(name))
+    assert set(OPERATION_RULES) == set(AggregateFunctionV2), \
+        "every enum member has a rule row — totality is the table's contract"
+    assert AGGREGATE_ADDITIVITY_V2[AggregateFunctionV2.LAST_KNOWN] is AdditivityClass.SEMI_ADDITIVE
+    assert AGGREGATE_ADDITIVITY_V2[AggregateFunctionV2.ZSCORE] is AdditivityClass.NON_ADDITIVE
+    assert all(OPERATION_RULES[agg].order_sensitive
+               for agg in (AggregateFunctionV2.LAST_KNOWN, AggregateFunctionV2.FIRST_KNOWN,
+                           AggregateFunctionV2.RECENCY, AggregateFunctionV2.ZSCORE)), \
+        "the at-cutoff group is meaningless without the event clock — capability reads this"
+    bare = _ok_fixture("13_last_known_balance_at_cutoff.json")
+    bare["body"]["expr"]["operand"] = None
+    with pytest.raises(SchemaError, match="requires an operand"):
+        parse_proposal_v2(bare)

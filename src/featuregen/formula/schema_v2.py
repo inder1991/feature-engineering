@@ -58,6 +58,10 @@ class AggregateFunctionV2(StrEnum):
     STDDEV = "stddev"
     PERCENTILE = "percentile"    # requires aggregation_argument p ∈ (0, 100)
     MEDIAN = "median"            # percentile 50 as its own authored name — no argument
+    # increment 3 — the at-cutoff group (event-time-ordered)
+    LAST_KNOWN = "last_known"    # the value the world held at the cutoff; semi-additive
+    FIRST_KNOWN = "first_known"  # the first value shown inside the window; semi-additive
+    ZSCORE = "zscore"            # (last_known − mean) / stddev over one window; dimensionless
 
 
 class FinalOperationV2(StrEnum):
@@ -120,10 +124,13 @@ class TypedFormulaProposalV2:
 
 def _check_expression_v2(expr: AggregateExpressionV2, path: str,
                          params: dict[str, ParameterDecl]) -> None:
+    from featuregen.formula.operations_v2 import operation_rule
+
     if not isinstance(expr.aggregation, AggregateFunctionV2):
         raise SchemaError(f"{path}.aggregation: not a v2 aggregate: {expr.aggregation!r}")
+    rule = operation_rule(expr.aggregation)
     _require_table_ref(expr.source_relation.table_ref, f"{path}.source_relation.table_ref")
-    if expr.aggregation is AggregateFunctionV2.PERCENTILE:
+    if rule.argument == "percentile":
         if not isinstance(expr.aggregation_argument, (int, float)) or isinstance(
                 expr.aggregation_argument, bool) or not 0 < expr.aggregation_argument < 100:
             raise SchemaError(
@@ -132,9 +139,10 @@ def _check_expression_v2(expr: AggregateExpressionV2, path: str,
     elif expr.aggregation_argument is not None:
         raise SchemaError(
             f"{path}.aggregation_argument: {expr.aggregation.value} takes no argument")
-    if expr.aggregation is AggregateFunctionV2.COUNT_ROWS:
+    if not rule.operand_required:
         if expr.operand is not None:
-            raise SchemaError(f"{path}.operand: count_rows carries no operand")
+            raise SchemaError(
+                f"{path}.operand: {expr.aggregation.value} carries no operand")
     else:
         if expr.operand is None:
             raise SchemaError(f"{path}.operand: {expr.aggregation.value} requires an operand")
@@ -178,18 +186,15 @@ def validate_semantics_v2(p: TypedFormulaProposalV2) -> None:
         _check_expression_v2(expr, f"body.expr[{index}]", params)
 
 
-# Additivity by v2 result shape — consumed by output validation (BR-2's RESULT_CLASS_ADDITIVITY
-# is the recipe-side mirror; this is the formula-side truth for the increment-1 vocabulary).
-AGGREGATE_ADDITIVITY_V2: dict[AggregateFunctionV2, AdditivityClass] = {
-    AggregateFunctionV2.SUM: AdditivityClass.ADDITIVE,
-    AggregateFunctionV2.COUNT_ROWS: AdditivityClass.ADDITIVE,
-    AggregateFunctionV2.COUNT_NON_NULL: AdditivityClass.ADDITIVE,
-    AggregateFunctionV2.COUNT_DISTINCT: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.MIN: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.MAX: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.AVG: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.RECENCY: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.STDDEV: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.PERCENTILE: AdditivityClass.NON_ADDITIVE,
-    AggregateFunctionV2.MEDIAN: AdditivityClass.NON_ADDITIVE,
-}
+def _aggregate_additivity_v2() -> dict[AggregateFunctionV2, AdditivityClass]:
+    """A VIEW over the operation rule table (operations_v2 owns the semantics since increment 3;
+    lazy so the two modules keep their one-way import)."""
+    from featuregen.formula.operations_v2 import OPERATION_RULES
+
+    return {agg: rule.additivity for agg, rule in OPERATION_RULES.items()}
+
+
+def __getattr__(name: str):
+    if name == "AGGREGATE_ADDITIVITY_V2":
+        return _aggregate_additivity_v2()
+    raise AttributeError(name)
