@@ -220,3 +220,21 @@ def test_the_concentration_group_and_the_optional_second_operand():
     smuggled["body"]["expr"]["second_operand"] = "authored::public.txns.txn_dt"
     with pytest.raises(SchemaError, match="takes no second column"):
         parse_proposal_v2(smuggled)
+
+
+def test_the_future_horizon_carries_contractual_sums_and_refuses_observed_history():
+    """Increment 7: future_horizon reads FORWARD — (cutoff, cutoff+L] — and with an offset it is
+    the maturity LADDER BUCKET (lag pointed forward). Order-sensitive operations refuse it: they
+    read observed history, and a future horizon has none."""
+    runoff = parse_proposal_v2(_ok_fixture("27_future_maturity_runoff_sum.json"))
+    assert runoff.body.expr.window.basis.value == "future_horizon"
+    bucket = parse_proposal_v2(_ok_fixture("28_future_ladder_bucket_offset1.json"))
+    assert bucket.body.expr.window.offset_periods == 1
+
+    doomed = json.loads((_GOLD_V2 / "29_last_known_over_future_invalid.json").read_text())
+    with pytest.raises(SchemaError, match="future horizon has none"):
+        parse_proposal_v2(doomed["proposal"])
+    trend_over_future = _ok_fixture("27_future_maturity_runoff_sum.json")
+    trend_over_future["body"]["expr"]["aggregation"] = "slope"
+    with pytest.raises(SchemaError, match="future horizon has none"):
+        parse_proposal_v2(trend_over_future)

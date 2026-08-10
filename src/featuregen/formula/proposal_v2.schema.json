@@ -127,7 +127,7 @@
       "type": "object",
       "properties": {
         "event_time_ref": {"$ref": "#/$defs/logicalRef"},
-        "basis": {"enum": ["trailing", "calendar_period"]},
+        "basis": {"enum": ["trailing", "calendar_period", "future_horizon"]},
         "length": {"type": "integer", "minimum": 1},
         "unit": {"enum": ["day", "week", "month", "quarter", "year"]},
         "start_inclusive": {"enum": ["inclusive", "exclusive"]},

@@ -38,6 +38,8 @@ class EngineCapabilityV1:
     # window back k periods needs engine support just like an aggregate does. Default False:
     # an engine advertises it or offset formulas are unsupported_engine on it.
     supports_window_offset: bool = False
+    # increment 7: forward horizons need engine support just like offsets do.
+    supports_future_horizon: bool = False
 
 
 def classify_formula_capability_v2(
@@ -63,5 +65,9 @@ def classify_formula_capability_v2(
         uses_offset = any(expr.window.offset_periods > 0
                           for expr in body_expressions_v2(proposal.body))
         if uses_offset and not engine.supports_window_offset:
+            return "unsupported_engine"
+        uses_future = any(expr.window.basis.value == "future_horizon"
+                          for expr in body_expressions_v2(proposal.body))
+        if uses_future and not engine.supports_future_horizon:
             return "unsupported_engine"
     return "ok"

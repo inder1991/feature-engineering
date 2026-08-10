@@ -69,3 +69,15 @@ def test_window_offsets_are_an_engine_capability_too():
     assert classify_formula_capability_v2(lag, engine=no_offset) == "unsupported_engine"
     assert classify_formula_capability_v2(lag, engine=with_offset) == "ok"
     assert classify_formula_capability_v2(lag) == "ok", "grammar-ok regardless of engines"
+
+
+def test_future_horizons_are_an_engine_capability_too():
+    runoff = _proposal("27_future_maturity_runoff_sum.json")
+    trailing_only = EngineCapabilityV1(engine_id="trailing-only",
+                                       supported_aggregations=frozenset({"sum"}))
+    forward = EngineCapabilityV1(engine_id="forward-capable",
+                                 supported_aggregations=frozenset({"sum"}),
+                                 supports_future_horizon=True)
+    assert classify_formula_capability_v2(runoff, engine=trailing_only) == "unsupported_engine"
+    assert classify_formula_capability_v2(runoff, engine=forward) == "ok"
+    assert classify_formula_capability_v2(runoff) == "ok"

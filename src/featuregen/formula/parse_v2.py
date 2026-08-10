@@ -60,14 +60,13 @@ def _build_window_v2(data: dict[str, Any]):
         EmptyWindowResult,
         Inclusivity,
         NullInput,
-        WindowBasis,
         WindowUnit,
     )
-    from featuregen.formula.schema_v2 import WindowPolicyV2
+    from featuregen.formula.schema_v2 import WindowBasisV2, WindowPolicyV2
 
     return WindowPolicyV2(
         event_time_ref=data["event_time_ref"],
-        basis=WindowBasis(data["basis"]),
+        basis=WindowBasisV2(data["basis"]),
         length=data["length"],
         unit=WindowUnit(data["unit"]),
         start_inclusive=Inclusivity(data["start_inclusive"]),

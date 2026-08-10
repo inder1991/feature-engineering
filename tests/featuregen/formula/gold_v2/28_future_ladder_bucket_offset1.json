@@ -1,0 +1,50 @@
+{
+  "canonical_json": "{\"body\":{\"expr\":{\"aggregation\":\"sum\",\"aggregation_argument\":null,\"filter\":null,\"operand\":\"authored::public.deposits.balance\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.deposits\"},\"window\":{\"basis\":\"future_horizon\",\"empty_window\":\"zero\",\"end_inclusive\":\"inclusive\",\"event_time_ref\":\"authored::public.deposits.maturity_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":1,\"start_inclusive\":\"exclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.deposits.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "future_ladder_bucket_offset1",
+  "expected": "ok",
+  "expected_proposal_hash": "998e5acec5694bd9e9942913ab286add5a8a79bb3fe21bca7b637d9a7f825e96",
+  "note": "the LADDER BUCKET: offset 1 on a future horizon reads (cutoff+90d, cutoff+180d] \u2014 the maturity ladder is the lag composition pointed forward",
+  "operation": "sum",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "sum",
+        "filter": null,
+        "operand": "authored::public.deposits.balance",
+        "source_relation": {
+          "table_ref": "authored::public.deposits"
+        },
+        "window": {
+          "basis": "future_horizon",
+          "empty_window": "zero",
+          "end_inclusive": "inclusive",
+          "event_time_ref": "authored::public.deposits.maturity_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "offset_periods": 1,
+          "start_inclusive": "exclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "customer",
+      "keys": [
+        "authored::public.deposits.cif_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

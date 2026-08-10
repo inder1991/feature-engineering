@@ -34,7 +34,6 @@ from featuregen.formula.schema import (
     ParameterDecl,
     SchemaError,
     SourceRelation,
-    WindowBasis,
     WindowUnit,
     _check_filter_node,
     _require_column_ref,
@@ -89,6 +88,18 @@ class FinalOperationV2(StrEnum):
 MAX_WINDOW_OFFSET_PERIODS = 12
 
 
+class WindowBasisV2(StrEnum):
+    """v1's two bases plus increment 7's FUTURE_HORIZON — the contractual-maturity direction:
+    (cutoff, cutoff + L], read from contract terms knowable AT the cutoff (BR-4's
+    contractual_future temporal anchor is the recipe-side twin). With an offset it becomes the
+    LADDER BUCKET: offset k reads (cutoff + k·L, cutoff + (k+1)·L] — the maturity ladder is the
+    lag composition pointed forward."""
+
+    TRAILING = "trailing"
+    CALENDAR_PERIOD = "calendar_period"
+    FUTURE_HORIZON = "future_horizon"
+
+
 @dataclass(frozen=True, slots=True)
 class WindowPolicyV2:
     """v1's window plus ``offset_periods`` — the increment-4 fork that makes LAG and DELTA body
@@ -98,7 +109,7 @@ class WindowPolicyV2:
     offsets 0 and 1 of the SAME aggregate. Every offset is inside the identity."""
 
     event_time_ref: LogicalRef
-    basis: WindowBasis
+    basis: WindowBasisV2
     length: int
     unit: WindowUnit
     start_inclusive: Inclusivity
@@ -188,6 +199,11 @@ def _check_expression_v2(expr: AggregateExpressionV2, path: str,
     elif expr.aggregation_argument is not None:
         raise SchemaError(
             f"{path}.aggregation_argument: {expr.aggregation.value} takes no argument")
+    if expr.window.basis is WindowBasisV2.FUTURE_HORIZON and rule.order_sensitive:
+        raise SchemaError(
+            f"{path}: {expr.aggregation.value} is order-sensitive — it reads OBSERVED history, "
+            "and a future horizon has none. Future windows carry sums, counts, shares and "
+            "flags over contractual rows; they cannot carry last-known state or trends.")
     if not rule.operand_required:
         if expr.operand is not None:
             raise SchemaError(
