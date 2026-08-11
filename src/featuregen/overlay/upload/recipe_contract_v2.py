@@ -62,6 +62,9 @@ RESULT_CLASS_ADDITIVITY: dict[str, tuple[str, ...]] = {
     "snapshot": ("semi_additive",),
     # BR-11: spread statistics (stddev/percentile bands) — a dispersion is never summable.
     "dispersion": ("non_additive",),
+    # BR-12: window extrema (max DPD, worst bucket) and event flags — neither is summable.
+    "extremum": ("non_additive",),
+    "flag": ("non_additive",),
 }
 
 # The side door the one-output rule must close: parameter names that historically selected WHICH
