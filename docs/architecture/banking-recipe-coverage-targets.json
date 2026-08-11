@@ -30,10 +30,6 @@
       "target_increment": "BR-18"
     },
     {
-      "leaf": "credit.monitoring.limit_management",
-      "target_increment": "BR-18"
-    },
-    {
       "leaf": "credit.underwriting.affordability",
       "target_increment": "BR-18"
     },
@@ -47,10 +43,6 @@
     },
     {
       "leaf": "customer.clv",
-      "target_increment": "BR-19"
-    },
-    {
-      "leaf": "customer.overdraft_propensity",
       "target_increment": "BR-19"
     },
     {
@@ -75,14 +67,6 @@
     },
     {
       "leaf": "treasury_alm.cash_management",
-      "target_increment": "BR-18"
-    },
-    {
-      "leaf": "treasury_alm.deposit_stability",
-      "target_increment": "BR-18"
-    },
-    {
-      "leaf": "treasury_alm.liquidity",
       "target_increment": "BR-18"
     },
     {

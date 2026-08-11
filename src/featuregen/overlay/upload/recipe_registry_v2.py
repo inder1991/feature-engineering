@@ -33,6 +33,9 @@ from featuregen.overlay.upload.recipe_contract_v2 import (
 # The production V2 population, populated family by family as the BR-11..16 packs land. Until
 # BR-17's cutover the packs change AUDIT accounting only — no grounding or suggestion path reads
 # this tuple yet.
+from featuregen.overlay.upload.recipes.account_foundation import (  # noqa: E402
+    ACCOUNT_FOUNDATION_RECIPES,
+)
 from featuregen.overlay.upload.recipes.aml import AML_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.asset_management import AM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.collections import COLLECTIONS_RECIPES  # noqa: E402
@@ -60,7 +63,8 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *AM_RECIPES, *INSURANCE_RECIPES,
                                               *ISLAMIC_RECIPES, *ESG_RECIPES,
                                               *CORPORATE_CIB_RECIPES,
-                                              *TRANSACTION_FOUNDATION_RECIPES)
+                                              *TRANSACTION_FOUNDATION_RECIPES,
+                                              *ACCOUNT_FOUNDATION_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a
