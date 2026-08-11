@@ -91,16 +91,18 @@ def _capture_client(captured):
     return _CaptureLLM()
 
 
-def test_flag_off_menu_byte_identical(db, monkeypatch):
+def test_no_env_still_serves_the_rich_context(db, monkeypatch):
+    """Pre-live simplification (2026-08-11): the retired env changes nothing — the rich
+    context (table_context block and enriched columns) egresses with no env at all."""
     _seed(db)
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     captured: list = []
     fa.recommend_features(db, "predict churn", _capture_client(captured), catalog_source="bank",
                           budget=1, critic=False)
-    meta = captured[0]
-    assert "table_context" not in meta                 # no context block flag-off
-    assert all(set(m.keys()) == {"object_ref", "table", "column", "concept", "domain"}
-               for m in meta["columns"])               # thin projection only
+    # The objective-expansion call (also unconditional now) captures first; take the menu call.
+    meta = next(m for m in captured if "columns" in m)
+    assert "table_context" in meta
+    assert any(set(m.keys()) > {"object_ref", "table", "column"} for m in meta["columns"])
 
 
 def test_flag_on_menu_enriched_with_context_and_relevance(db, monkeypatch):

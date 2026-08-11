@@ -110,10 +110,12 @@ def test_the_input_contract_version_was_bumped(monkeypatch):
         feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION)
 
 
-def test_the_base_contract_is_still_version_1(monkeypatch):
-    """Flag off is unchanged: no summary egresses, so the old contract keeps its number."""
+def test_the_base_contract_is_v5_without_env(monkeypatch):
+    """Pre-live simplification (2026-08-11): the on/off gate retired — v1 is unreachable; the
+    ladder default (v5) stamps with no env, and the VERSION override remains the selector."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
-    assert feature_assist._feature_schema_version() == 1
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT_VERSION", raising=False)
+    assert feature_assist._feature_schema_version() == 5
 
 
 # ── the API key must match the evidence field name ───────────────────────────────────────────────

@@ -34,17 +34,21 @@ def _feature_ideas_versions(db):
         "WHERE output_schema_id = 'feature_ideas'").fetchall()
 
 
-def test_flag_default_is_off():
-    assert feature_context_enabled() is False
+def test_feature_context_is_always_on():
+    # Pre-live simplification (2026-08-11): the on/off gate retired; env is inert.
+    assert feature_context_enabled() is True
 
 
-def test_versions_are_1_when_flag_off(db, monkeypatch):
+def test_versions_are_v5_without_any_env(db, monkeypatch):
+    """The retired gate used to drop the contract to v1; now the default ladder version (v5)
+    stamps with no env at all — the version OVERRIDE below remains the only selector."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT_VERSION", raising=False)
     _bank_graph(db)
     recommend_features(db, "predict churn", _fake(), catalog_source="bank", critic=False)
     rows = _feature_ideas_versions(db)
     assert rows, "recommend must record at least one feature_ideas llm_call"
-    assert all(tuple(r) == (1, 1) for r in rows), rows
+    assert all(tuple(r) == (5, 5) for r in rows), rows
 
 
 def test_versions_are_3_when_the_rollback_override_selects_v3(db, monkeypatch):

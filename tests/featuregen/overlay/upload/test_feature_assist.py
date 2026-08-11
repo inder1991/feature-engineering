@@ -663,15 +663,15 @@ def test_the_expansion_is_not_payload_VERSION_gated(db, monkeypatch, version):
     assert fa.OBJECTIVE_EXPANSION_TASK in client.tasks
 
 
-def test_flag_off_issues_no_expansion_call_at_all(db, monkeypatch):
-    """Flag-OFF returns the thin pre-Slice-3 menu without ever ranking, so there is no question to
-    widen and nothing may be billed for one."""
+def test_the_expansion_call_runs_unconditionally(db, monkeypatch):
+    """Pre-live simplification (2026-08-11): FEATUREGEN_FEATURE_CONTEXT retired — the rich
+    menu (and its objective-expansion call) runs with or without env."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     _bank_graph(db)
     client = _task_recorder(["obligor"])
     recommend_features(db, "counterparty exposure", client, catalog_source="bank", budget=1,
                        critic=False)
-    assert fa.OBJECTIVE_EXPANSION_TASK not in client.tasks
+    assert fa.OBJECTIVE_EXPANSION_TASK in client.tasks
 
 
 def test_the_expansion_lands_on_an_llm_call_like_every_other_call(db):

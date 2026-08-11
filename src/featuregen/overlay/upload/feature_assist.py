@@ -393,10 +393,13 @@ FEATURE_CONTEXT_FLAG = "FEATUREGEN_FEATURE_CONTEXT"
 
 
 def feature_context_enabled() -> bool:
-    """The single env gate for the whole Slice-3 enrichment (menu widening, per-table context,
-    relevance, versioned shape). Default OFF ⟹ the thin pre-Slice-3 menu, byte-for-byte.
-    RF-C3: the ONE public definition — 3a-iv imports and reuses this; never redefine it."""
-    return os.environ.get(FEATURE_CONTEXT_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
+    """ALWAYS ON — the FEATUREGEN_FEATURE_CONTEXT gate retired with the pre-live
+    simplification (2026-08-11): the rich Slice-3 context (menu widening, per-table context,
+    relevance, versioned shape) is the platform's core capability and was already ON in every
+    deployment; a dark thin-menu fallback nobody serves is complexity, not safety. The
+    function remains (7 call sites; RF-C3's one-public-definition rule) but no longer reads
+    env. Version fallback stays a separate concern (FEATUREGEN_FEATURE_CONTEXT_VERSION)."""
+    return True
 
 
 #: The input contract's numeric version, stamped on the immutable llm_call record.

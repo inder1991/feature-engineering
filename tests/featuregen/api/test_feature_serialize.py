@@ -150,7 +150,9 @@ def _recommend_fake() -> FakeLLM:
     })
 
 
-def test_recommend_response_has_no_new_field_markers_when_flag_off(make_client, monkeypatch):
+def test_recommend_response_carries_the_rich_fields_unconditionally(make_client, monkeypatch):
+    """Pre-live simplification (2026-08-11): FEATUREGEN_FEATURE_CONTEXT retired — the rich
+    Slice-3 shape serves with or without env; deleting the retired var changes nothing."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
     client: TestClient = make_client(llm_client=_recommend_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
@@ -160,8 +162,5 @@ def test_recommend_response_has_no_new_field_markers_when_flag_off(make_client, 
     assert res.status_code == 200
     proposals = res.json()["proposals"]
     assert len(proposals) == 1
-    assert sorted(proposals[0].keys()) == sorted(_PRE_SLICE3_KEYS)
-    # The new field names never appear anywhere in the raw response bytes.
-    for marker in (b"validation_status", b"operation_kind", b"measure_refs", b"requirements",
-                   b"grouping_refs"):
-        assert marker not in res.content, marker
+    for marker in ("validation_status", "operation_kind", "measure_refs", "requirements"):
+        assert marker in proposals[0], marker

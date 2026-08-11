@@ -343,13 +343,13 @@ def _feature_payload(db, monkeypatch, *, profiles: bool, feature_context: bool) 
 
 
 @pytest.mark.parametrize("profiles", [False, True])
-def test_the_feature_payload_is_byte_identical_with_feature_context_off(catalog, monkeypatch,
-                                                                       profiles):
-    """D8: profile-in-feature-context is governed by BOTH flags. With FEATURE_CONTEXT off there is
-    no context to put a profile in, so the DATASET_PROFILES state must make no difference at all."""
-    off = _feature_payload(catalog, monkeypatch, profiles=False, feature_context=False)
-    got = _feature_payload(catalog, monkeypatch, profiles=profiles, feature_context=False)
-    assert got == off
+def test_the_retired_context_env_is_inert(catalog, monkeypatch, profiles):
+    """Pre-live simplification (2026-08-11): FEATURE_CONTEXT off no longer exists — an explicit
+    falsy env yields the SAME rich payload as on, and the profiles axis behaves identically."""
+    rich = _feature_payload(catalog, monkeypatch, profiles=profiles, feature_context=True)
+    with_falsy_env = _feature_payload(catalog, monkeypatch, profiles=profiles,
+                                      feature_context=False)
+    assert with_falsy_env == rich
 
 
 def test_the_feature_payload_is_byte_identical_with_profiles_off(catalog, monkeypatch):

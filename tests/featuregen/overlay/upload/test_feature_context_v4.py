@@ -97,10 +97,13 @@ def _column(db, object_ref: str) -> dict:
 # ── D8: the rollback ladder ─────────────────────────────────────────────────────────────────────
 
 
-def test_flag_off_is_v1_and_the_thin_menu_byte_for_byte(db, monkeypatch):
+def test_no_env_is_v5_and_the_thin_helper_stays_a_pure_projection(db, monkeypatch):
+    """Pre-live simplification (2026-08-11): v1 is unreachable — no env means the ladder
+    default (v5). `_menu` survives only as a pure projection helper, no longer a serving path."""
     monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT_VERSION", raising=False)
     _bank_graph(db)
-    assert _feature_schema_version() == 1
+    assert _feature_schema_version() == 5
     cols = _candidate_columns(db, _SRC, roles=())
     assert all(set(m) == {"object_ref", "table", "column", "concept", "domain"}
                for m in _menu(cols))
@@ -140,12 +143,10 @@ def test_every_version_the_ladder_can_return_is_registered(db, v4, monkeypatch):
     ids = ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec")
     # Read from the ladder itself, never restated: a version added to `_SELECTABLE_CONTEXT_VERSIONS`
     # without a registered body must fail HERE rather than being invisible to a stale literal.
-    for version in (1, *fa._SELECTABLE_CONTEXT_VERSIONS):
-        if version == 1:
-            monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
-        else:
-            monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
-            monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, str(version))
+    # v1 left the ladder with the retired on/off gate (pre-live, 2026-08-11): only the
+    # selectable versions remain reachable, each through the version override.
+    for version in fa._SELECTABLE_CONTEXT_VERSIONS:
+        monkeypatch.setenv(fa.FEATURE_CONTEXT_VERSION_ENV, str(version))
         stamped = _feature_schema_version()
         assert stamped == version
         for schema_id in ids:
