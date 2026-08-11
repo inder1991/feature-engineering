@@ -98,3 +98,39 @@ def test_signed_versus_unsigned_is_a_declared_policy_choice():
 def test_every_primitive_is_atomic_with_its_own_expectation_ref():
     refs = [r.formula.expectation_ref for r in TRANSACTION_FOUNDATION_RECIPES]
     assert len(refs) == len(set(refs)) == 24
+
+
+# ── tranche B: the analytical primitives ────────────────────────────────────────────────────────
+def test_tranche_b_is_atomic_blocked_and_variant_correct():
+    """19 analytical primitives, every one FORMULA_BLOCKED (no expectation reviewed yet),
+    every grammar operation they need already in the BR-6 vocabulary — and the semantic
+    parameters are identity-bearing: p95 and p99 are different features, each payment
+    category its own."""
+    from featuregen.overlay.upload.recipe_variants import enumerate_variant_identities
+    from featuregen.overlay.upload.recipes.transaction_analytics import (
+        TRANSACTION_ANALYTICS_RECIPES,
+    )
+
+    assert len(TRANSACTION_ANALYTICS_RECIPES) == 19
+    by_id = {r.recipe_id: r for r in TRANSACTION_ANALYTICS_RECIPES}
+    assert all(r.readiness == "FORMULA_BLOCKED" for r in TRANSACTION_ANALYTICS_RECIPES)
+    assert all(r.output_grain == "account" for r in TRANSACTION_ANALYTICS_RECIPES)
+
+    pct = by_id["transaction_amount_percentile"]
+    pct_param = next(p for p in pct.parameters if p.name == "percentile")
+    assert pct_param.parameter_class == "semantic"
+    ids = enumerate_variant_identities(pct)
+    assert len(ids) == len(set(ids)) == 9          # 3 windows × 3 percentiles, all distinct
+
+    cat = by_id["categorized_payment_regularity"]
+    cat_param = next(p for p in cat.parameters if p.name == "payment_category")
+    assert cat_param.allowed_values == ("subscription", "bill", "rent", "loan_payment")
+
+    spread = by_id["fx_conversion_spread"]
+    assert "no authority, no spread" in spread.business_definition
+    assert any(ref.startswith("currency_conversion:foundation-fx-rate")
+               for ref in spread.eligibility.policy_refs)
+
+    fan_in, fan_out = by_id["fan_in_counterparty_count"], by_id["fan_out_counterparty_count"]
+    assert any(op.role == "payer" for op in fan_in.operands)
+    assert any(op.role == "payee" for op in fan_out.operands)

@@ -51,6 +51,9 @@ from featuregen.overlay.upload.recipes.islamic import ISLAMIC_RECIPES  # noqa: E
 from featuregen.overlay.upload.recipes.markets import MARKETS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.payments import PAYMENTS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.retail import RETAIL_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.transaction_analytics import (  # noqa: E402
+    TRANSACTION_ANALYTICS_RECIPES,
+)
 from featuregen.overlay.upload.recipes.transaction_foundation import (  # noqa: E402
     TRANSACTION_FOUNDATION_RECIPES,
 )
@@ -64,6 +67,7 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *ISLAMIC_RECIPES, *ESG_RECIPES,
                                               *CORPORATE_CIB_RECIPES,
                                               *TRANSACTION_FOUNDATION_RECIPES,
+                                              *TRANSACTION_ANALYTICS_RECIPES,
                                               *ACCOUNT_FOUNDATION_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
