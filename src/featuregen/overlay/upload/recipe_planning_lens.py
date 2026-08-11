@@ -20,11 +20,11 @@ What this module deliberately does NOT do (part 2, the gate1 wiring): project ca
 `FeatureIdea`, mint options, or touch the considered set. Nothing imports this module until the
 `FEATUREGEN_SEMANTIC_PLANNING` mode selects it — landing it is byte-identical to today.
 
-KNOWN Tranche-1 limitation, on purpose and on record: `bind_v2_operands` loads the catalog's
-columns internally, so this lens pays one column load PER RECIPE — the exact N+1 class the
-load-once fix removed from template grounding. SE-5's generalized binder takes SE-2's frozen
-capabilities as INPUT, which removes the per-recipe load; until then the lens must not serve
-wide scopes in a hot path (it serves none: nothing calls it in `legacy` mode).
+The Tranche-1 per-recipe column load is GONE (SE-5 full): when a frozen context is supplied,
+binding runs through `bind_planning_request` — shortlists from the context's concept index,
+capabilities in ONE batched read for the whole request, eligibility through SE-4's fold — and
+`graph_node` is never queried per recipe. Without a context (compatibility callers), the lens
+assembles one itself, once.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.recipe_contract_v2 import RecipeDefinitionV2
 from featuregen.overlay.upload.recipe_operand_policy import (
     OperandBindingVerdictV1,
-    bind_v2_operands,
+    bind_planning_request,
 )
 from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
@@ -149,14 +149,21 @@ def _compile_temporal(definition: RecipeDefinitionV2) -> tuple[str, str]:
 
 
 def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
-                         scope: ConfirmedScope,
+                         scope: ConfirmedScope, context=None,
                          ) -> tuple[V2RecipeCandidateV1, ...]:
     """Assemble every eligible recipe's candidate data for one catalog, primary first then
-    authored registry order — deterministic, no score. One binder call per recipe; the verdict
-    tuple IS the shared one (`bind_v2_operands`), so this lens and the formula/suggestion paths
-    cannot disagree about a binding."""
+    authored registry order — deterministic, no score. Binding runs through the SHARED
+    capability-input engine (`bind_planning_request`) over ONE frozen context — this lens and
+    the formula/suggestion paths cannot disagree about a binding, and `graph_node` is read
+    once per run, never per recipe."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
     from featuregen.overlay.upload.recipe_grounding_context import canonical_recipe_v2_hash
 
+    if context is None:
+        context = build_generation_semantic_context(
+            conn, catalog_source=catalog_source, roles=roles)
     applicability = v2_applicability(scope)
     ordered = [recipe for recipe in V2_RECIPES
                if applicability.by_recipe[recipe.recipe_id] == "primary"]
@@ -166,7 +173,7 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
     candidates: list[V2RecipeCandidateV1] = []
     for recipe in ordered:
         request = planning_request_from_recipe(recipe)
-        verdicts = bind_v2_operands(conn, recipe, catalog_source=catalog_source, roles=roles)
+        verdicts, _eligibility = bind_planning_request(conn, request, context)
         revision_hash = canonical_recipe_v2_hash(recipe)
         pit_text, temporal_blocker = _compile_temporal(recipe)
         current, missing_roles = _review_validity(conn, recipe, revision_hash)

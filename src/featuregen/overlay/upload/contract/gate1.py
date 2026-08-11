@@ -746,7 +746,7 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
 def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
                              grounded_ids: frozenset[str],
                              rejected_ids: dict[str, tuple[str, ...]],
-                             context_hash: str = "") -> None:
+                             semantic_context=None) -> None:
     """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
     the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
     savepoint: a shadow failure must not poison the user's request transaction (the same rule
@@ -755,10 +755,12 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
 
     from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
 
+    context_hash = semantic_context.context_hash() if semantic_context is not None else ""
     try:
         with conn.transaction():                      # savepoint — shadow reads stay isolated
             candidates = v2_recipe_candidates(
-                conn, catalog_source=catalog_source, roles=roles, scope=scope)
+                conn, catalog_source=catalog_source, roles=roles, scope=scope,
+                context=semantic_context)
         by_state = Counter(candidate.binding_state for candidate in candidates)
         logger.info(
             "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
@@ -900,8 +902,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
                                  grounded_ids=grounded_template_ids,
                                  rejected_ids=rejected_template_ids,
-                                 context_hash=(semantic_context.context_hash()
-                                               if semantic_context is not None else ""))
+                                 semantic_context=semantic_context)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(

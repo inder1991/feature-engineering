@@ -285,3 +285,159 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
                                     "sign authority — bind distinct columns, or attach the sign "
                                     "policy that separates the directions"))
     return tuple(final)
+
+
+# ── SE-5 (full): the capability-input binder — one engine for every origin ─────────────────────
+#
+# `bind_planning_request` binds an origin-neutral FeaturePlanningRequestV1 over the FROZEN
+# Layer-A context: shortlists come from the context's concept index (the concept-closure rule),
+# capabilities compile in ONE batched read for the whole request, and every (operand, candidate)
+# pair runs through SE-4's `evaluate_operand` — so semantic eligibility, the authority floors
+# (computed, staged), the economic-role law and the shape laws all decide here, identically for
+# recipes, LLM intents and user definitions. `bind_v2_operands` above remains the LIVE-COLUMN
+# compatibility wrapper for its existing callers; new callers take this engine.
+#
+# The plan's step-6 bounds move HERE (the frozen templates module keeps its own copies):
+
+MAX_CANDIDATES_PER_OPERAND = 16
+MAX_BINDING_ASSIGNMENTS = 4096
+
+
+def bind_planning_request(conn, request, context):
+    """Bind every operand of one planning request against one frozen context, fail-closed.
+
+    Returns ``(verdicts, eligibility)``: the binding verdict tuple (the same
+    :class:`OperandBindingVerdictV1` vocabulary every consumer already reads) plus the full
+    per-candidate eligibility audit — ``{(role, object_ref): OperandEligibilityVerdictV1}`` —
+    the losing-shortlist evidence SE-10 persists.
+
+    Selection law: ELIGIBLE candidates outrank PROVISIONAL ones (the authority payoff — a
+    confirmed concept beats a proposed twin without a tie); a tie WITHIN the preferred tier
+    consults the SHARED tie-break store and otherwise fails closed (ambiguous, no selection);
+    blocked / not_applicable candidates never bind and never manufacture a tie."""
+    from featuregen.overlay.upload.column_capabilities import compile_capabilities
+    from featuregen.overlay.upload.semantic_eligibility import evaluate_operand
+
+    index = context.concept_index
+    shortlists: dict[str, tuple[str, ...]] = {}
+    truncated: dict[str, bool] = {}
+    for operand in request.operands:
+        refs: list[str] = []
+        for concept_name in (operand.concept, *operand.alternative_concepts):
+            refs.extend(index.get(concept_name, ()))
+        deduped = list(dict.fromkeys(refs))
+        truncated[operand.role] = len(deduped) > MAX_CANDIDATES_PER_OPERAND
+        shortlists[operand.role] = tuple(deduped[:MAX_CANDIDATES_PER_OPERAND])
+
+    all_refs = list(dict.fromkeys(ref for refs in shortlists.values() for ref in refs))
+    capabilities = compile_capabilities(conn, context, all_refs)   # ONE query, whole request
+
+    columns_by_ref = {c.object_ref: c for c in context.columns}
+    eligibility: dict[tuple[str, str], object] = {}
+    verdicts: list[OperandBindingVerdictV1] = []
+    bound_by_group: dict[str, list[tuple[str, OperandBindingVerdictV1]]] = {}
+
+    for operand in request.operands:
+        tiers: dict[str, list[str]] = {"eligible": [], "provisional": []}
+        blocked_refs: list[tuple[str, tuple[str, ...]]] = []
+        for ref in shortlists[operand.role]:
+            capability = capabilities.get(ref)
+            if capability is None:
+                continue
+            verdict = evaluate_operand(operand, capability)
+            eligibility[(operand.role, ref)] = verdict
+            if verdict.status in tiers:
+                tiers[verdict.status].append(ref)
+            elif verdict.status == "blocked":
+                blocked_refs.append((ref, verdict.reason_codes))
+
+        bindable = tiers["eligible"] or tiers["provisional"]
+        if not bindable:
+            if blocked_refs:
+                codes = tuple(dict.fromkeys(
+                    code for _ref, ref_codes in blocked_refs for code in ref_codes))
+                verdicts.append(OperandBindingVerdictV1(
+                    role=operand.role, status="blocked",
+                    tied_refs=tuple(ref for ref, _codes in blocked_refs),
+                    reason_codes=codes,
+                    resolution=eligibility[(operand.role, blocked_refs[0][0])].resolution))
+            else:
+                verdicts.append(OperandBindingVerdictV1(
+                    role=operand.role, status="unresolved",
+                    reason_codes=(REQUIRED_OPERAND_MISSING,) if operand.required else (),
+                    resolution=("no read-scoped column carries this concept — onboard the "
+                                "data or retire the operand" if operand.required else
+                                "optional operand absent; the recipe's degrade policy applies")))
+            continue
+
+        selected_ref = bindable[0]
+        verdict_ref: str | None = None
+        if len(bindable) > 1:
+            tied_cols = tuple(columns_by_ref[ref] for ref in bindable)
+            tie_verdict, tie_key = _consult_request_tie_break(
+                conn, request, operand, tied_cols)
+            if tie_verdict is None:
+                if operand.required:
+                    verdicts.append(OperandBindingVerdictV1(
+                        role=operand.role, status="ambiguous", tied_refs=tuple(bindable),
+                        reason_codes=(AMBIGUOUS_BY_CLASS[operand.operand_class],),
+                        resolution=("adjudicate this tie at ingest warming, or narrow the "
+                                    "operand's concept/economic role — an unadjudicated tie "
+                                    "never binds in the executable path")))
+                else:
+                    verdicts.append(OperandBindingVerdictV1(
+                        role=operand.role, status="unresolved", tied_refs=tuple(bindable),
+                        resolution="optional operand tied and unadjudicated — left unbound, "
+                                   "never silently selected"))
+                continue
+            selected_ref = tie_verdict.ranking[0]
+            verdict_ref = f"tie_break:{tie_key}"
+
+        selected_eligibility = eligibility[(operand.role, selected_ref)]
+        binding = OperandBindingVerdictV1(
+            role=operand.role, status="bound", selected_ref=selected_ref,
+            tied_refs=tuple(bindable) if len(bindable) > 1 else (),
+            tie_break_verdict_ref=verdict_ref,
+            reason_codes=selected_eligibility.reason_codes,   # floor codes RIDE the binding
+            resolution=selected_eligibility.resolution)
+        verdicts.append(binding)
+        if operand.distinct_binding_group:
+            bound_by_group.setdefault(operand.distinct_binding_group, []).append(
+                (operand.sign_direction_expectation, binding))
+
+    # Opposing legs: identical law to the live-column binder (one rule, two engines is a bug).
+    final: list[OperandBindingVerdictV1] = list(verdicts)
+    for _group, members in bound_by_group.items():
+        refs = [b.selected_ref for _sign, b in members if b.selected_ref]
+        if len(refs) != len(set(refs)):
+            if not all(sign.strip() for sign, _b in members):
+                for _sign, member in members:
+                    position = final.index(member)
+                    final[position] = OperandBindingVerdictV1(
+                        role=member.role, status="blocked", tied_refs=member.tied_refs,
+                        reason_codes=(DISTINCT_BINDING_VIOLATED,),
+                        resolution=("opposing legs bound one physical column with no governed "
+                                    "sign authority — bind distinct columns, or attach the "
+                                    "sign policy that separates the directions"))
+    return tuple(final), eligibility
+
+
+def _consult_request_tie_break(conn, request, operand, tied_cols):
+    """The SAME verdict store, keyed on the planning request's source definition — for a
+    recipe-origin request this is byte-identical to the V2 key (same recipe id, same business
+    definition), so adjudications warmed for the live surface resolve here too."""
+    from featuregen.overlay.upload.tie_break import TieBreakCandidate, find_tie_break_verdict
+    from featuregen.overlay.upload.tie_break import tie_break_input_hash
+
+    tied = tuple(
+        TieBreakCandidate(ref=c.object_ref, definition=c.definition or "",
+                          ai_summary=c.ai_summary or "", semantic_terms=c.semantic_terms or "")
+        for c in tied_cols)
+    key = tie_break_input_hash(
+        template_id=f"v2:{request.source_definition_id}", need_role=operand.role,
+        need_concept=operand.concept,
+        intent=getattr(request, "business_definition", "") or request.source_definition_id,
+        tied=tied)
+    verdict = find_tie_break_verdict(conn, input_hash=key,
+                                     tied_refs=(c.object_ref for c in tied_cols))
+    return (verdict, key) if verdict is not None else (None, key)

@@ -126,3 +126,134 @@ def test_an_empty_catalog_yields_honest_missing_states_not_no_candidates(db):
     required = {op.role for op in EXEMPLAR.operands if op.required}
     unresolved = {v.role for v in candidates[0].verdicts if v.status == "unresolved"}
     assert required <= unresolved
+
+
+# ── SE-5 full: the capability-input binder through the lens ────────────────────────────────────
+
+def _confirm_concept(db, object_ref: str, concept: str) -> None:
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.column_authority import logical_ref_of
+
+    logical = logical_ref_of(db, SOURCE, object_ref)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="concept", proposed_value=concept,
+        producer="human", strength="confirmed", producer_ref="user:sme",
+        source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="concept",
+                                    material=concept))
+
+
+def test_a_confirmed_concept_beats_a_proposed_twin_without_a_tie(db):
+    """THE authority payoff: two columns carry the measure concept; one is human-confirmed.
+    The old lexical binder saw an unadjudicatable tie — the eligibility tiers resolve it."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+
+    rows = _base_rows_with_twin(db)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    request = planning_request_from_recipe(EXEMPLAR)
+    verdicts, eligibility = bind_planning_request(db, request, context)
+    by_role = {v.role: v for v in verdicts}
+    measure_role = next(op.role for op in EXEMPLAR.operands
+                        if op.operand_class == "measure")
+    verdict = by_role[measure_role]
+    assert verdict.status == "bound"
+    assert verdict.selected_ref.endswith(".amount")           # the confirmed one
+    assert verdict.tie_break_verdict_ref is None              # no adjudication needed
+    # The losing twin's eligibility is in the audit: provisional, below the floor.
+    twin = eligibility[(measure_role, "public.transactions.amount_twin")]
+    assert twin.status == "provisional"
+
+
+def _base_rows_with_twin(db):
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.graph import build_graph
+
+    rows = [
+        (CanonicalRow(SOURCE, "transactions", "acct_ref", "integer", is_grain=True,
+                      entity="Account", definition="the posting account"), "account_id"),
+        (CanonicalRow(SOURCE, "transactions", "amount", "numeric", additivity="additive",
+                      currency="USD", definition="signed transaction amount"), "monetary_flow"),
+        (CanonicalRow(SOURCE, "transactions", "amount_twin", "numeric", additivity="additive",
+                      currency="USD", definition="mirrored amount"), "monetary_flow"),
+        (CanonicalRow(SOURCE, "transactions", "dc_flag", "text",
+                      definition="debit/credit indicator"), "debit_credit_indicator"),
+        (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp",
+                      definition="when the transaction was booked"), "event_timestamp"),
+    ]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    _confirm_concept(db, "public.transactions.amount", "monetary_flow")
+    return rows
+
+
+def test_two_equal_proposals_still_fail_closed_as_ambiguous(db):
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.graph import build_graph
+
+    rows = [
+        (CanonicalRow(SOURCE, "transactions", "acct_ref", "integer", is_grain=True,
+                      entity="Account", definition="the posting account"), "account_id"),
+        (CanonicalRow(SOURCE, "transactions", "amount", "numeric", additivity="additive",
+                      currency="USD", definition="signed transaction amount"), "monetary_flow"),
+        (CanonicalRow(SOURCE, "transactions", "amount_twin", "numeric", additivity="additive",
+                      currency="USD", definition="mirrored amount"), "monetary_flow"),
+        (CanonicalRow(SOURCE, "transactions", "dc_flag", "text",
+                      definition="debit/credit indicator"), "debit_credit_indicator"),
+        (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp",
+                      definition="when the transaction was booked"), "event_timestamp"),
+    ]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    verdicts, _ = bind_planning_request(
+        db, planning_request_from_recipe(EXEMPLAR), context)
+    measure_role = next(op.role for op in EXEMPLAR.operands
+                        if op.operand_class == "measure")
+    verdict = {v.role: v for v in verdicts}[measure_role]
+    assert verdict.status == "ambiguous"
+    assert verdict.selected_ref is None
+    assert set(verdict.tied_refs) == {"public.transactions.amount",
+                                      "public.transactions.amount_twin"}
+
+
+def test_the_lens_never_reloads_graph_node_with_a_prebuilt_context(db):
+    """The N+1 killer, proven: binding a whole multi-recipe scope over a prebuilt context
+    issues ZERO graph_node queries — the frozen universe is the only column source."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+
+    _catalog(db)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    calls: list[str] = []
+    original = db.execute
+
+    def counting(query, *args, **kwargs):
+        calls.append(str(query))
+        return original(query, *args, **kwargs)
+
+    db.execute = counting
+    try:
+        candidates = v2_recipe_candidates(
+            db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+            context=context)
+    finally:
+        db.execute = original
+    assert len(candidates) >= 7                               # the whole eligible scope bound
+    assert not [q for q in calls if "FROM graph_node" in q], \
+        "the frozen context is the only column source — no per-recipe reload"
