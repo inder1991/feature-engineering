@@ -68,7 +68,6 @@ from featuregen.overlay.upload.grounding_trace import (
 from featuregen.overlay.upload.join_path import JoinNeighbourhood, table_of_ref
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
-from featuregen.overlay.upload.recipe_formula_expectations import RECIPE_FORMULA_EXPECTATIONS
 from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
 from featuregen.overlay.upload.suggestion_identity import (
     UnresolvableRelationshipPath,
@@ -1632,8 +1631,12 @@ def _fold_v2_definition(recipe, binding_ambiguity: bool):
     The definition's declarations supply the inputs: its computation kind, whether its
     expectation ref is actually in the reviewed registry (a pack may not claim review by
     assertion), and the binding ambiguity this page observed."""
+    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
+        has_reviewed_expectation,
+    )
+
     reviewed = (recipe.formula is not None
-                and recipe.formula.expectation_ref in RECIPE_FORMULA_EXPECTATIONS)
+                and has_reviewed_expectation(recipe.formula.expectation_ref))
     return fold_readiness(ReadinessInputsV1(
         computation_kind=recipe.computation_kind,
         reviewed_expectation=reviewed,

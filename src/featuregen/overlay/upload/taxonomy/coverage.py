@@ -29,7 +29,6 @@ gold gate, and honestly so), and the legacy-debt counters (``legacy_inferred_lea
 """
 from __future__ import annotations
 
-from featuregen.overlay.upload.recipe_formula_expectations import RECIPE_FORMULA_EXPECTATIONS
 from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
 from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY, selectable_leaves
@@ -72,8 +71,12 @@ def execution_readiness_of(recipe_id: str) -> str:
     recipe = v2_recipe_by_id(recipe_id)
     if recipe is None:
         return "UNASSESSED"
+    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
+        has_reviewed_expectation,
+    )
+
     reviewed = (recipe.formula is not None
-                and recipe.formula.expectation_ref in RECIPE_FORMULA_EXPECTATIONS)
+                and has_reviewed_expectation(recipe.formula.expectation_ref))
     return fold_readiness(ReadinessInputsV1(
         computation_kind=recipe.computation_kind,
         reviewed_expectation=reviewed, grammar_verdict="ok")).state

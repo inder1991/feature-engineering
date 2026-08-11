@@ -50,10 +50,6 @@
       "target_increment": "BR-19"
     },
     {
-      "leaf": "customer.engagement",
-      "target_increment": "BR-19"
-    },
-    {
       "leaf": "customer.overdraft_propensity",
       "target_increment": "BR-19"
     },
@@ -76,10 +72,6 @@
     {
       "leaf": "fraud.synthetic_id",
       "target_increment": "BR-21"
-    },
-    {
-      "leaf": "payments.cross_border",
-      "target_increment": "BR-18"
     },
     {
       "leaf": "treasury_alm.cash_management",
