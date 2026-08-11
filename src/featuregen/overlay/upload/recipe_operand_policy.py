@@ -41,8 +41,88 @@ AMBIGUOUS_BY_CLASS = {
 REQUIRED_OPERAND_MISSING = "REQUIRED_OPERAND_MISSING"
 ECONOMIC_ROLE_UNPROVEN = "ECONOMIC_ROLE_UNPROVEN"
 DISTINCT_BINDING_VIOLATED = "DISTINCT_BINDING_VIOLATED"
+# SE-5 (shape half) — structural contradictions, closed. These refuse KNOWN incompatibility
+# only: a missing fact is never a shape refusal (missing evidence and contradictory evidence
+# are different conditions — plan invariant 6). Authority floors are deliberately NOT enforced
+# here: they stage behind the SE-4b confirmation funnel (SE-5 step 8), because on a catalog
+# whose semantics are all proposed they would flood every binding provisional.
+TYPE_INCOMPATIBLE = "TYPE_INCOMPATIBLE"
+IDENTIFIER_NOT_A_MEASURE = "IDENTIFIER_NOT_A_MEASURE"
 
 _ECONOMIC_ROLE_FIELD = "economic_role"
+
+#: Operand classes with a hard physical-type requirement. Other classes (entity_key, status,
+#: dimension, direction, policy_input) legitimately ride many types and get no type rule.
+_CLASS_TYPE_FAMILIES: dict[str, tuple[str, ...]] = {
+    "measure": ("numeric",),
+    "event_timestamp": ("temporal",),
+    "as_of_timestamp": ("temporal",),
+}
+
+
+def _type_family(data_type: str | None) -> str:
+    """The declared type's coarse family — from the DECLARED type only (a structural fact the
+    connector attested), never inferred from a column name."""
+    t = (data_type or "").strip().lower()
+    if not t:
+        return "unknown"
+    if any(t.startswith(p) for p in ("int", "bigint", "smallint", "tinyint", "numeric",
+                                     "decimal", "float", "double", "real", "money", "number")):
+        return "numeric"
+    if any(p in t for p in ("timestamp", "date", "time")):
+        return "temporal"
+    if t.startswith("bool"):
+        return "boolean"
+    if any(t.startswith(p) for p in ("char", "varchar", "nvarchar", "text", "string")):
+        return "text"
+    return "other"
+
+
+def shape_refusal(operand, col) -> tuple[str, str] | None:
+    """``(code, resolution)`` when binding this column to this operand is STRUCTURALLY
+    impossible; ``None`` when shape permits it. Two rules, both contradiction-only:
+
+    * an IDENTIFIER concept (one with a registered namespace) never satisfies a ``measure``
+      operand — an identifier can serve key/grouping/distinct-count roles, never a quantity,
+      regardless of its physical type (plan invariant 9);
+    * a declared type outside the operand class's required family refuses — a varchar cannot
+      be summed, a status code cannot anchor an event window (``unknown``/``other`` types are
+      NOT refused: absence of a type fact is not a contradiction)."""
+    if operand.operand_class == "measure" and col.concept:
+        from featuregen.overlay.upload.concepts import concept as registered_concept
+
+        try:
+            registered = registered_concept(col.concept)
+        except Exception:
+            registered = None
+        if registered is not None and registered.namespace is not None:
+            return (IDENTIFIER_NOT_A_MEASURE,
+                    f"{col.object_ref} carries identifier concept {col.concept!r} "
+                    f"(namespace {registered.namespace!r}) — an identifier can serve entity-key, "
+                    "grouping or distinct-count roles, never a measure; bind a quantity column")
+    allowed = _CLASS_TYPE_FAMILIES.get(operand.operand_class)
+    if allowed:
+        family = _type_family(col.data_type)
+        if family not in ("unknown", "other") and family not in allowed:
+            return (TYPE_INCOMPATIBLE,
+                    f"{col.object_ref} is declared {col.data_type!r} ({family}); operand class "
+                    f"{operand.operand_class!r} requires {'/'.join(allowed)} — bind a column of "
+                    "the right shape or correct the declared type")
+    return None
+
+
+def _shape_filter(operand, ranked):
+    """Split concept-ranked candidates into shape-permitted and shape-refused. Applied BEFORE
+    tie logic on purpose: a structurally impossible column must not manufacture a tie that
+    blocks the one legitimate candidate."""
+    permitted, refused = [], []
+    for score, col in ranked:
+        refusal = shape_refusal(operand, col)
+        if refusal is None:
+            permitted.append((score, col))
+        else:
+            refused.append((col.object_ref, *refusal))
+    return permitted, refused
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +195,18 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
     for operand in definition.operands:
         probe = Need(operand.role, operand.concept, optional=not operand.required)
         ranked, _truncated = _ranked_matches(conn, cols, probe)
+        # SE-5 shape half: structural contradictions filter BEFORE tie logic — a varchar
+        # "amount" must neither bind a measure nor tie against the real one.
+        ranked, shape_refused = _shape_filter(operand, ranked)
+        if not ranked and shape_refused:
+            # Columns with the concept EXIST but every one is structurally impossible — a
+            # CONTRADICTION (blocked), not absence (unresolved): different fact, different code.
+            verdicts.append(OperandBindingVerdictV1(
+                role=operand.role, status="blocked",
+                tied_refs=tuple(ref for ref, _code, _res in shape_refused),
+                reason_codes=tuple(dict.fromkeys(code for _ref, code, _res in shape_refused)),
+                resolution=shape_refused[0][2]))
+            continue
         if not ranked:
             verdicts.append(OperandBindingVerdictV1(
                 role=operand.role, status="unresolved",
