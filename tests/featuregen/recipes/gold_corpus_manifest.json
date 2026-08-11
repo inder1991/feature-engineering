@@ -1,0 +1,9 @@
+{
+  "content_sha256": "faaeb91d8d92b715b584769b4fab70613558c29d2cec3b0032f7149040e29a9e",
+  "corpus_version": "banking-gold-corpus@1",
+  "files": [
+    "synthetic_ledger.json",
+    "posted_debit_amount_expected.json"
+  ],
+  "note": "BR-22 gold-corpus identity: the version and content hash evaluation artifacts cite. Regenerate deliberately (with review) when the corpus changes \u2014 the manifest test recomputes and compares, the no-self-refresh discipline."
+}

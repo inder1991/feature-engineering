@@ -1,0 +1,12 @@
+{
+  "recipe_id": "posted_debit_amount",
+  "window": {"cutoff": "2026-06-30", "trailing_days": 30, "interval": "(2026-05-31, 2026-06-30]"},
+  "note": "Expected values HAND-COMPUTED at review time, independently of any production or test evaluator — the arithmetic is shown so a reviewer re-derives each number from the ledger alone. ACC1: r01 (100) + r02 (200) = 300.00; r03 is a credit, r04 failed, r05+r06 an exact reversal pair (both drop under the reversal policy), r07 after the cutoff, r08 before the window. ACC2: r09 10 USD at the 2026-06-08 booking rate 3.65 = 36.50; r10 10 USD at the 2026-06-20 rate 3.70 = 37.00 (the mid-window rate change is the point — a single-rate shortcut yields 73.00 or 74.00, never 73.50); r11 20.00 AED; r12 pending. 36.50 + 37.00 + 20.00 = 93.50.",
+  "expected": {"ACC1": 300.0, "ACC2": 93.5},
+  "boundary_cases": {
+    "credit_excluded": "r03", "failed_excluded": "r04",
+    "reversal_pair_neutralized": ["r05", "r06"],
+    "post_cutoff_excluded": "r07", "pre_window_excluded": "r08",
+    "pending_excluded": "r12", "mid_window_rate_change": ["r09", "r10"]
+  }
+}

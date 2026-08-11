@@ -1,0 +1,23 @@
+{
+  "note": "BR-22 synthetic transaction ledger — entirely fabricated, no real customer data. Rows cover the posted/pending/failed/reversed lifecycle, credits beside debits, multi-currency with a MID-WINDOW rate change (so at-booking conversion is distinguishable from any single-rate shortcut), a pre-window row and a post-cutoff row. The reference window for the gold expectations: trailing 30 days ending 2026-06-30 inclusive, i.e. (2026-05-31, 2026-06-30].",
+  "base_currency": "AED",
+  "booking_rates_to_base": {
+    "AED": {"always": 1.0},
+    "USD": {"2026-06-08": 3.65, "2026-06-20": 3.7, "2026-06-25": 3.68},
+    "EUR": {"2026-06-15": 4.0}
+  },
+  "rows": [
+    {"id": "r01", "account": "ACC1", "event_ts": "2026-06-05", "amount": 100.0, "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r02", "account": "ACC1", "event_ts": "2026-06-10", "amount": 200.0, "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r03", "account": "ACC1", "event_ts": "2026-06-12", "amount": 50.0,  "currency": "AED", "direction": "C", "status": "posted", "reversal_of": null},
+    {"id": "r04", "account": "ACC1", "event_ts": "2026-06-15", "amount": 75.0,  "currency": "AED", "direction": "D", "status": "failed", "reversal_of": null},
+    {"id": "r05", "account": "ACC1", "event_ts": "2026-06-18", "amount": 40.0,  "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r06", "account": "ACC1", "event_ts": "2026-06-19", "amount": 40.0,  "currency": "AED", "direction": "D", "status": "posted", "reversal_of": "r05"},
+    {"id": "r07", "account": "ACC1", "event_ts": "2026-07-02", "amount": 500.0, "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r08", "account": "ACC1", "event_ts": "2026-05-20", "amount": 30.0,  "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r09", "account": "ACC2", "event_ts": "2026-06-08", "amount": 10.0,  "currency": "USD", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r10", "account": "ACC2", "event_ts": "2026-06-20", "amount": 10.0,  "currency": "USD", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r11", "account": "ACC2", "event_ts": "2026-06-22", "amount": 20.0,  "currency": "AED", "direction": "D", "status": "posted", "reversal_of": null},
+    {"id": "r12", "account": "ACC2", "event_ts": "2026-06-25", "amount": 15.0,  "currency": "USD", "direction": "D", "status": "pending", "reversal_of": null}
+  ]
+}
