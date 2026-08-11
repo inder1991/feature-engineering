@@ -198,3 +198,35 @@ def test_reviewed_existing_recipe_mappings_are_preserved_and_extended():
         )
     for recipe_id in ("deposit_beta", "repricing_gap_exposure"):
         assert "treasury_alm.net_interest_margin" in _spec(recipe_id).secondary
+
+
+def test_adding_a_supporting_tag_never_moves_a_recipes_primary():
+    """BR-9's applicability-level differential: append a use_case tag whose crosswalk target is a
+    selectable leaf (`segmentation` → customer.segmentation, a leaf with NO primary recipe today)
+    to a LEGACY recipe whose primary derives from its own tags — even an IN-FAMILY leaf appended
+    later cannot steal the primary (tag order is preserved); it lands in `secondary` ONLY. A tag
+    edit can extend relevance, never claim ownership."""
+    from dataclasses import replace
+
+    template = _template("balance_trend")
+    before = recipe_applicability(template)
+    widened = replace(template, use_cases=(*template.use_cases, "segmentation"))
+    after = recipe_applicability(widened)
+    assert after.primary == before.primary == "customer.relationship_attrition.churn"
+    assert "customer.segmentation" in after.secondary
+    assert after.source is before.source is ApplicabilitySource.LEGACY_DERIVED
+
+
+def test_an_authored_recipe_ignores_tag_bag_widening_entirely():
+    """Stronger still for AUTHORED recipes: primary AND supporting come exclusively from the
+    authored declarations — an appended tag adds nothing anywhere. Ownership and relevance are
+    both explicit declarations, never tag-bag side effects."""
+    from dataclasses import replace
+
+    template = _template("merchant_mcc_diversity")
+    before = recipe_applicability(template)
+    assert before.source is ApplicabilitySource.AUTHORED
+    widened = replace(template, use_cases=(*template.use_cases, "segmentation"))
+    after = recipe_applicability(widened)
+    assert (after.primary, after.secondary) == (before.primary, before.secondary)
+    assert "customer.segmentation" not in after.secondary
