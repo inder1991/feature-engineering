@@ -1182,6 +1182,166 @@ _ALL: tuple[Concept, ...] = (
             description="Free-prose KYC commentary — nature of business, corporate background, "
                         "high-risk rationale. Uploader-authored text about an identifiable party, so "
                         "it carries a pii floor and is read-scoped rather than freely searchable."),
+
+    # ── §3.20 BR-10 canonical banking event / lifecycle vocabulary ────────────────────────────────
+    # Grounded in the recipe audit's 15 missing-concept admissions and the BR-10 plan list: the
+    # concepts recipes had to APOLOGIZE for ("no dedicated chargeback concept", "no promise_to_pay
+    # concept", "no product_holding concept", ...) now exist as governed vocabulary. Descriptions
+    # state the NEGATIVE deliberately (the bank_bic precedent): the sentences that separate an
+    # authorization feed from a posting ledger from a settlement feed are exactly the sentences
+    # the classifier needs, and the refusal tests pin them. None of these names touches
+    # `_LEGACY_ALIASES` (the BR-plan hard rule) — `counterparty_id` stays retired; counterparty-ness
+    # is a PARTY ROLE, never a revived identifier.
+    #
+    # Payment/card event lifecycle — authorization, posting, clearing, settlement are FOUR stages:
+    Concept("original_transaction_id", "identifier", namespace="core_serial",
+            entity_link="transaction",
+            description="The transaction a correcting event points BACK to — the lineage key a "
+                        "reversal, return, refund or chargeback row carries beside its own "
+                        "transaction_id. Same core_serial namespace (it holds transaction ids); "
+                        "never the row's own id."),
+    Concept("beneficiary_id", "identifier", namespace="payee_registry", entity_link="beneficiary",
+            description="The registered PAYEE record id — the bank's own registry of saved "
+                        "beneficiaries a customer pays. Not beneficiary_bank (the destination "
+                        "bank/BIC), not a CIF (a counterparty who is our customer is customer_id), "
+                        "and not beneficiary_name (the label). Grains payee-level features."),
+    Concept("original_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The instructed / original transaction amount before FX conversion, "
+                        "partial capture or fees — pairs with the posted amount (monetary_flow) "
+                        "and the conversion evidence (fx_conversion_rate)."),
+    Concept("authorization_status", "categorical", is_a="category_code",
+            description="Card/payment authorization OUTCOME (approved / declined / partial / "
+                        "expired) decided at AUTH time. An authorization is a promise, not a "
+                        "posting: never booking_status (core-ledger posting state) and never "
+                        "settlement_status — an approved auth may never settle."),
+    Concept("authorization_timestamp", "temporal", pit_role="event",
+            description="When the authorization decision happened. Marks an AUTHORIZATION feed — "
+                        "a dataset carrying this is not a core-ledger posting table and not a "
+                        "settlement feed; the three are never interchangeable transaction tables."),
+    Concept("booking_status", "categorical", is_a="category_code",
+            description="Posting state on the CORE LEDGER (posted / pending / failed / memo). "
+                        "booking_date says WHEN it posted; this says WHETHER. Not "
+                        "authorization_status (pre-posting) and not settlement_status "
+                        "(interbank finality)."),
+    Concept("clearing_status", "categorical", is_a="category_code",
+            description="Interbank CLEARING state of a payment (submitted / cleared / rejected) — "
+                        "the exchange stage between posting and settlement. Not booking_status and "
+                        "not settlement_status (finality of funds)."),
+    Concept("clearing_timestamp", "temporal", pit_role="event",
+            description="When the payment cleared the interbank exchange. Marks a clearing feed — "
+                        "distinct from booking_date (ledger) and settlement_date (finality)."),
+    Concept("reversal_indicator", "flag", is_a="boolean_flag",
+            description="This row REVERSES or corrects an earlier posting — pairs with "
+                        "original_transaction_id for lineage. An economic undo: distinct from "
+                        "statement_visibility_flag (presentation) and from a return "
+                        "(payment_return_status, the scheme bouncing a payment)."),
+    Concept("payment_return_status", "categorical", is_a="category_code",
+            description="Scheme RETURN / rejection state of a payment (the R-transaction: "
+                        "returned, rejected, recalled). The scheme bounced the payment — distinct "
+                        "from a card dispute (chargeback_status) and from an internal correction "
+                        "(reversal_indicator)."),
+    Concept("return_reason_code", "categorical", is_a="category_code",
+            description="The scheme's coded reason for a payment return (SEPA R-codes, NACHA "
+                        "return codes: closed account, insufficient funds, revoked mandate). Not "
+                        "dispute_reason_code (card chargeback reasons)."),
+    Concept("chargeback_status", "categorical", is_a="category_code",
+            description="Card DISPUTE / chargeback lifecycle state (raised / represented / "
+                        "arbitration / won / lost / written off). The cardholder disputes a "
+                        "settled transaction — scheme-scoped, weeks-long, distinct from a payment "
+                        "return and from a merchant refund (a new credit, not a dispute)."),
+    Concept("dispute_reason_code", "categorical", is_a="category_code",
+            description="The scheme's coded chargeback/dispute reason (fraud, goods not received, "
+                        "duplicate processing). Not return_reason_code (payment R-codes)."),
+
+    # Account / holding / facility state:
+    Concept("account_status", "categorical", is_a="lifecycle_state",
+            description="The ACCOUNT's own lifecycle state (open / active / dormant / blocked / "
+                        "closed). The dormancy-and-reactivation and attrition signals condition on "
+                        "it; generic lifecycle_state stays for non-account lifecycles."),
+    Concept("product_holding", "categorical",
+            description="The customer×product HOLDING fact — that this customer holds this "
+                        "product. product_type says WHICH product; valid_time carries from/to; "
+                        "this says THAT it is held. The product-breadth and cross-hold recipes' "
+                        "anchor."),
+    Concept("notice_period", "temporal", additivity="non_additive", is_a="duration_tenure",
+            description="Contractual NOTICE term of a notice deposit or withdrawal restriction — "
+                        "how long before access, not how long until maturity (tenor) and not the "
+                        "product's age (duration_tenure generally)."),
+    Concept("available_limit", "monetary", additivity="semi_additive", is_a="limit",
+            description="Undrawn HEADROOM under a limit (approved limit minus drawn). Falls as "
+                        "drawings rise — pairs with drawn_principal; never sum with the limit it "
+                        "is carved from."),
+    Concept("drawn_principal", "monetary", additivity="semi_additive", is_a="monetary_stock",
+            description="Drawn principal OUTSTANDING on a facility/card/loan — the balance side "
+                        "of the limit-vs-balance contrast (§E). A stock: latest over time, "
+                        "additive across facilities."),
+
+    # Installments, collections promises and contact effectiveness:
+    Concept("due_date", "temporal", pit_role="maturity",
+            description="Contractual DUE date of an installment, minimum payment or invoice — "
+                        "knowable at the cutoff from the schedule (a contractual-future anchor "
+                        "like maturity_date). Not the date paid (event_timestamp)."),
+    Concept("minimum_due_amount", "monetary", additivity="additive", is_a="scheduled_amount",
+            description="The revolving MINIMUM due for the cycle (cards / revolving credit) — a "
+                        "floor under the full scheduled_amount; paying it is not paying the "
+                        "installment."),
+    Concept("payment_allocation", "categorical", is_a="category_code",
+            description="The governed ORDER a payment applies in (fees → interest → principal, or "
+                        "jurisdiction-specific). Decides what a partial payment paid — an "
+                        "arrears computation without it is guessing."),
+    Concept("promise_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The amount PROMISED in a collections promise-to-pay — a commitment, not "
+                        "the contractual installment (scheduled_amount) and not the payment "
+                        "itself."),
+    Concept("promise_due_date", "temporal", pit_role="maturity",
+            description="When the promise-to-pay falls due — contractual-future, knowable when "
+                        "the promise is taken. Not the installment's due_date."),
+    Concept("promise_outcome", "categorical", is_a="category_code",
+            description="Whether the promise was KEPT / broken / partially kept — the collections "
+                        "behaviour signal promise_to_pay_adherence measures. An outcome of a "
+                        "commitment, not a delinquency label."),
+    Concept("contact_attempt_event", "behavioural",
+            description="An outbound collections/servicing CONTACT ATTEMPT (call, SMS, letter) — "
+                        "an event to count and time. Never the money spent chasing "
+                        "(cost_to_collect): an attempt row is activity, not expense."),
+    Concept("contact_outcome", "categorical", is_a="category_code",
+            description="What the contact attempt reached (answered / no answer / wrong party / "
+                        "promise taken). Pairs with contact_attempt_event."),
+    Concept("right_party_contact_flag", "flag", is_a="boolean_flag",
+            description="The reached party WAS the debtor — the collections-effectiveness signal "
+                        "(RPC rate). A quality of contact_outcome, never derivable from cost."),
+
+    # Instruments, operations and adjacent lifecycles:
+    Concept("matching_status", "categorical", is_a="category_code",
+            description="Pre-settlement trade MATCHING state (matched / unmatched / mismatched) — "
+                        "the confirmation stage BEFORE settlement. Not settlement_status: a "
+                        "matched trade can still fail to settle."),
+    Concept("instruction_execution_outcome", "categorical", is_a="category_code",
+            description="The RESULT of executing a scheduled instruction (standing order / direct "
+                        "debit run: executed / failed / insufficient funds / retried). "
+                        "Instruction-level; the interbank bounce that may follow is "
+                        "payment_return_status."),
+    Concept("lc_guarantee_event", "categorical", is_a="event_type",
+            description="Trade-finance instrument LIFECYCLE event kind (LC/guarantee issue / "
+                        "amendment / utilization / expiry / rollover). The utilization converts "
+                        "contingent_exposure toward drawn exposure."),
+    Concept("claim_status", "categorical", is_a="category_code",
+            description="Insurance claim lifecycle state (open / reopened / closed / declined). "
+                        "Not the reserve (claim_reserve) and not the paid amount."),
+    Concept("claim_paid_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="Amount PAID OUT on a claim — the flow beside the claim_reserve stock; "
+                        "severity = paid + reserve movement."),
+    Concept("invoice_status", "categorical", is_a="category_code",
+            description="Invoice lifecycle state (issued / approved / due / paid / disputed / "
+                        "credit-noted) — the receivables-finance anchor beside invoice_id; "
+                        "due_date carries when it falls due."),
+    Concept("policy_loan_balance", "monetary", additivity="semi_additive", is_a="monetary_stock",
+            description="Loan drawn AGAINST an insurance policy's surrender value — the pre-lapse "
+                        "signal policy_loan_utilisation sizes against surrender_value. A stock."),
+    Concept("customer_income", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The CUSTOMER's declared or salary-credit-derived income — the "
+                        "affordability and needs-analysis input. Never the bank's own "
+                        "interest_income; a salary credit row is evidence FOR it."),
 )
 
 # Public registry: name -> full Concept record.
