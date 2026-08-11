@@ -34,7 +34,9 @@ from featuregen.overlay.upload.recipe_grounding_context import _canonical_datacl
 from featuregen.overlay.upload.taxonomy.versions import CONCEPT_REGISTRY_VERSION
 
 GENERATION_CONTEXT_CONTRACT = "generation-semantic-context"
-GENERATION_CONTEXT_VERSION = "1"
+# v2: ColumnIndexV1 gained schema_name (Layer B keys field_evidence by schema-preserving
+# logical_ref). Pre-live: stored v1 pins verify as drifted against v2 rebuilds — honestly.
+GENERATION_CONTEXT_VERSION = "2"
 _OWNER = "featuregen.overlay.upload.generation_semantic_context"
 
 register_contract_version(GENERATION_CONTEXT_CONTRACT, GENERATION_CONTEXT_VERSION, owner=_OWNER)
@@ -46,6 +48,7 @@ class ColumnIndexV1:
     Field-for-field the shape template grounding loads (`templates._Col`), frozen."""
 
     object_ref: str
+    schema_name: str | None               # the REAL pre-flatten schema ("" ⇒ public)
     table: str
     column: str
     data_type: str | None
@@ -89,8 +92,8 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
     roles-derived one — the freshness comparator rebuilds at a STORED scope, not a caller's."""
     scope = list(scope) if scope is not None else allowed_sensitivities(roles)
     rows = conn.execute(
-        "SELECT object_ref, table_name, column_name, data_type, is_grain, is_as_of, "
-        "       concept, entity, additivity, sensitivity, currency, "
+        "SELECT object_ref, schema_name, table_name, column_name, data_type, is_grain, "
+        "       is_as_of, concept, entity, additivity, sensitivity, currency, "
         "       definition, ai_summary, semantic_terms "
         "FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND visible_requires <@ %s "
@@ -101,10 +104,10 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
         (catalog_source,)).fetchone()
 
     columns = tuple(
-        ColumnIndexV1(object_ref=r[0], table=r[1], column=r[2], data_type=r[3],
-                      is_grain=bool(r[4]), is_as_of=bool(r[5]), concept=r[6], entity=r[7],
-                      additivity=r[8], sensitivity=r[9], currency=r[10], definition=r[11],
-                      ai_summary=r[12], semantic_terms=r[13])
+        ColumnIndexV1(object_ref=r[0], schema_name=r[1], table=r[2], column=r[3],
+                      data_type=r[4], is_grain=bool(r[5]), is_as_of=bool(r[6]), concept=r[7],
+                      entity=r[8], additivity=r[9], sensitivity=r[10], currency=r[11],
+                      definition=r[12], ai_summary=r[13], semantic_terms=r[14])
         for r in rows)
     concept_index: dict[str, list[str]] = {}
     for col in columns:
