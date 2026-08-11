@@ -29,10 +29,26 @@ FLAG_DEFAULTS: dict[str, bool] = {
 }
 
 
+#: SE-14 (semantic-eligibility program) — the pipeline mode for hypothesis feature generation.
+#: A closed-string MODE, not a boolean: it joins this config the way the CSV allowlists did —
+#: its own typed field with its own parser and its own frozen default. `legacy` is today's
+#: pipeline; `semantic_shadow` adds the deterministic semantic-plan comparison beside the
+#: unchanged user response; `semantic_v1` serves the typed-intent + shared-binding response.
+SEMANTIC_PLANNING_MODES = ("legacy", "semantic_shadow", "semantic_v1")
+SEMANTIC_PLANNING_DEFAULT = "legacy"
+
+
 def _truthy(raw: str | None, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _closed_mode(raw: str | None) -> str:
+    """An unknown or absent value falls back to the frozen default — a typo in an env var must
+    degrade to today's behavior, never raise at import or silently enable a promotion."""
+    value = (raw or "").strip().lower()
+    return value if value in SEMANTIC_PLANNING_MODES else SEMANTIC_PLANNING_DEFAULT
 
 
 def _csv(raw: str | None) -> tuple[str, ...]:
@@ -49,11 +65,13 @@ class RecipeRolloutConfig:
     recipe_v2_materialization: bool = FLAG_DEFAULTS["FEATUREGEN_RECIPE_V2_MATERIALIZATION"]
     active_families: tuple[str, ...] = field(default=())
     canary_catalogs: tuple[str, ...] = field(default=())
+    semantic_planning: str = SEMANTIC_PLANNING_DEFAULT
 
     @classmethod
     def from_env(cls) -> RecipeRolloutConfig:
         env = os.environ
         return cls(
+            semantic_planning=_closed_mode(env.get("FEATUREGEN_SEMANTIC_PLANNING")),
             recipe_contract_v2=_truthy(env.get("FEATUREGEN_RECIPE_CONTRACT_V2"),
                                        FLAG_DEFAULTS["FEATUREGEN_RECIPE_CONTRACT_V2"]),
             formula_v2=_truthy(env.get("FEATUREGEN_FORMULA_V2"),

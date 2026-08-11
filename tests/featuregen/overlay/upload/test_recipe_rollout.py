@@ -23,6 +23,25 @@ def test_the_frozen_configuration_defaults_encode_the_reached_stage():
     config = RecipeRolloutConfig()
     assert rollout_stage(config) == 3
     assert config.active_families == () and config.canary_catalogs == ()
+    # SE-14: the semantic-planning MODE is frozen at `legacy` — a fresh deployment runs
+    # today's pipeline; promotion to shadow or v1 is a reviewed decision, never a default.
+    assert config.semantic_planning == "legacy"
+
+
+def test_the_semantic_planning_mode_is_closed_and_degrades_to_legacy():
+    import os
+    from unittest import mock
+
+    from featuregen.overlay.upload.recipe_rollout import SEMANTIC_PLANNING_MODES
+
+    assert SEMANTIC_PLANNING_MODES == ("legacy", "semantic_shadow", "semantic_v1")
+    for raw, expected in (("semantic_shadow", "semantic_shadow"),
+                          ("SEMANTIC_V1", "semantic_v1"),
+                          ("on", "legacy"),            # a bool-style value is NOT a mode
+                          ("typo_mode", "legacy"),
+                          ("", "legacy")):
+        with mock.patch.dict(os.environ, {"FEATUREGEN_SEMANTIC_PLANNING": raw}, clear=False):
+            assert RecipeRolloutConfig.from_env().semantic_planning == expected, raw
 
 
 def test_promotion_is_per_family_and_per_catalog_never_aggregate():
