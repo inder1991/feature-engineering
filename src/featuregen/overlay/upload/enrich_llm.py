@@ -193,6 +193,12 @@ _STRUCTURAL_META_KEYS = frozenset({
     # Task 4b param choice: the registry's own authored parameter tuples per template — repo text,
     # closed vocabulary by construction; the hypothesis rides `objective` (already redacted).
     "parameter_menu",
+    # SE-6 abstract intents: the bounded capability inventory — registry concept names with
+    # column COUNTS (integers), the platform's governed entity vocabulary (uploader-invented
+    # entity strings are filtered OUT before this key is built), closed operation classes,
+    # confirmed taxonomy objectives, offered model-spec ids. No object refs, no table names,
+    # no prose — closed vocabulary by construction; the hypothesis rides `objective`.
+    "capability_inventory",
     # profile Task 4 — Pass-B v3 structural context (closed-vocabulary role tokens + the bounded
     # evidence-ref roster the model must cite from).
     "authority_role", "temporal_storage_model", "evidence_refs", "profile_vocabulary",
@@ -1548,6 +1554,68 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                 "required": ["template_id", "param", "value"]}},
         },
         "required": ["choices"]},
+    # SE-6 — abstract feature intents: meaning WITHOUT columns. The schema carries NO field that
+    # could name physical data (no table/column/ref/SQL fields exist to fill), vocabularies are
+    # enum-closed where the contract's are, and every item is re-parsed code-side through the
+    # STRICT FeatureIntent parser (unknown/physical keys are named refusals; one malformed item
+    # never fails its siblings).
+    ("feature_intents", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "intents": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "display_name": {"type": "string", "maxLength": 120},
+                    "business_definition": {"type": "string", "maxLength": 600},
+                    "primary_objective": {"type": "string", "maxLength": 128},
+                    "computation_kind": {"type": "string", "enum": [
+                        "deterministic_formula", "conceptual_pattern",
+                        "governed_model_output"]},
+                    "operation_class": {"type": "string", "maxLength": 32},
+                    "output_grain_entity": {"type": "string", "maxLength": 64},
+                    "source_grain": {"type": "string", "maxLength": 64},
+                    "output": {"type": "object", "additionalProperties": False,
+                        "properties": {
+                            "output_id": {"type": "string", "maxLength": 80},
+                            "display_label": {"type": "string", "maxLength": 120},
+                            "output_type": {"type": "string", "maxLength": 16},
+                            "additivity": {"type": "string", "maxLength": 16},
+                            "unit_kind": {"type": "string", "maxLength": 16},
+                            "currency_policy": {"type": "string", "maxLength": 300},
+                            "null_input_policy": {"type": "string", "maxLength": 300},
+                            "empty_population_policy": {"type": "string", "maxLength": 300},
+                            "zero_denominator_policy": {"type": "string", "maxLength": 300},
+                        },
+                        "required": ["output_id", "display_label", "output_type",
+                                     "additivity", "unit_kind", "null_input_policy",
+                                     "empty_population_policy"]},
+                    "operands": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {
+                            "role": {"type": "string", "maxLength": 48},
+                            "concept": {"type": "string", "maxLength": 64},
+                            "operand_class": {"type": "string", "maxLength": 24},
+                            "required": {"type": "boolean"},
+                            "temporal_role": {"type": "string", "maxLength": 32},
+                        },
+                        "required": ["role", "concept", "operand_class"]}},
+                    "temporal": {"type": "object", "additionalProperties": False,
+                        "properties": {
+                            "anchor_kind": {"type": "string", "maxLength": 24},
+                            "window_basis": {"type": "string", "maxLength": 120},
+                            "window_unit": {"type": "string", "maxLength": 8},
+                            "cutoff_inclusivity": {"type": "string", "maxLength": 12},
+                        },
+                        "required": ["anchor_kind"]},
+                    "conceptual_reason": {"type": "string", "maxLength": 400},
+                    "model_feature_ref": {"type": "string", "maxLength": 80},
+                    "rationale": {"type": "string", "maxLength": 500},
+                },
+                "required": ["display_name", "business_definition", "primary_objective",
+                             "computation_kind", "output_grain_entity", "source_grain",
+                             "output", "operands", "temporal"]}},
+        },
+        "required": ["intents"]},
     # Task 3 — the near-label critic's closed verdict vocabulary. Deliberately NO token that reads
     # as "cleared" (no_finding ≠ clearance); the enum is re-validated code-side and an off-enum
     # answer degrades to abstain.
