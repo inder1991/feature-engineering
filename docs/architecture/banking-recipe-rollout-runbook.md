@@ -49,6 +49,12 @@ runtime collector yet: their inputs are measurements the SE-14 shadow metrics wi
 until then, gate readings are operator-supplied and the gate's failing defaults are the only
 protection.
 
+**Pre-live simplification (2026-08-11):** the tool is under development with no production
+users. No NEW levers will be added to this table without a load-bearing reason (real spend, a
+shared cluster, review governance). The unconsumed levers above are candidates for RETIREMENT
+rather than wiring — the semantic-eligibility program's direct cutover (validate in shadow →
+flip → delete the legacy path) supersedes the staged promotion they were reserved for.
+
 ## 3. Stage-by-stage promotion
 
 1. **Stage 4 — internal v3 viewing.** No flag change; point internal SME/engineering users at
