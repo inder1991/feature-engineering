@@ -60,6 +60,8 @@ RESULT_CLASS_ADDITIVITY: dict[str, tuple[str, ...]] = {
     "recency": ("non_additive",),
     "slope": ("non_additive",),
     "snapshot": ("semi_additive",),
+    # BR-11: spread statistics (stddev/percentile bands) — a dispersion is never summable.
+    "dispersion": ("non_additive",),
 }
 
 # The side door the one-output rule must close: parameter names that historically selected WHICH

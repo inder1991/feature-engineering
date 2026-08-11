@@ -21,9 +21,12 @@ from featuregen.overlay.upload.recipe_contract_v2 import (
     TemporalSpecV2,
 )
 
-# The production V2 population. EMPTY until family migrations begin — the point of BR-2 is that
-# the contract exists and is enforced, not that content has moved.
-V2_RECIPES: tuple[RecipeDefinitionV2, ...] = ()
+# The production V2 population, populated family by family as the BR-11..16 packs land. Until
+# BR-17's cutover the packs change AUDIT accounting only — no grounding or suggestion path reads
+# this tuple yet.
+from featuregen.overlay.upload.recipes.retail import RETAIL_RECIPES  # noqa: E402
+
+V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES,)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a

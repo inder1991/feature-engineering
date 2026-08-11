@@ -101,13 +101,16 @@ def _additivity_classes(values: Iterable) -> set[str]:
 
 
 def audit_registry(templates: Sequence | None = None,
-                   v2_recipe_ids: Iterable[str] = (),
+                   v2_recipe_ids: Iterable[str] | None = None,
                    v2_definitions: Sequence | None = None) -> RecipeAuditReportV1:
     """The pure audit. ``templates`` defaults to the live registry at call time; ``v2_recipe_ids``
     is the RecipeDefinitionV2 population's replaced-legacy ids — a legacy recipe with a V2
-    replacement stops counting toward ``legacy_recipes_not_in_v2``. ``v2_definitions`` defaults to
-    the production V2 registry and feeds the BR-3 variant-identity collision check (audit-side
-    enumeration; request paths never enumerate)."""
+    replacement stops counting toward ``legacy_recipes_not_in_v2``, and the default is the REAL
+    production registry's replacements (found wired to ``()`` the day BR-11 landed the first
+    pack: the counter would have sat at 157 forever while the migration actually proceeded).
+    Pass ``()`` explicitly to audit the legacy registry as if no replacement existed.
+    ``v2_definitions`` defaults to the production V2 registry and feeds the BR-3
+    variant-identity collision check (audit-side enumeration; request paths never enumerate)."""
     from featuregen.overlay.upload.recipe_formula_expectations import (
         RECIPE_FORMULA_EXPECTATIONS,
     )
@@ -120,6 +123,9 @@ def audit_registry(templates: Sequence | None = None,
     )
 
     ts = list(templates if templates is not None else ALL_TEMPLATES)
+    if v2_recipe_ids is None:
+        from featuregen.overlay.upload.recipe_registry_v2 import v2_replaced_legacy_ids
+        v2_recipe_ids = v2_replaced_legacy_ids()
     v2_ids = set(v2_recipe_ids)
     ex: dict[str, list[str]] = {name: [] for name in RATCHETED_COUNTERS}
 

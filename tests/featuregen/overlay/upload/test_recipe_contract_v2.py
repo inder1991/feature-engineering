@@ -38,9 +38,14 @@ from featuregen.overlay.upload.recipe_registry_v2 import (
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 
-def test_the_probe_recipe_constructs_and_the_production_registry_is_empty():
+def test_the_probe_recipe_constructs_and_the_registry_holds_the_migrated_packs():
+    """BR-2 shipped the contract with an EMPTY production registry; BR-11 landed the first pack.
+    The pin moves with the migration: every member is a validated V2 definition and the registry
+    law holds over the real population."""
     assert PROBE_RECIPE.computation_kind == "deterministic_formula"
-    assert V2_RECIPES == (), "BR-2 ships the contract, not migrated content"
+    assert len(V2_RECIPES) >= 23                     # the retail pack, growing by pack
+    assert all(r.replaces_legacy_ids for r in V2_RECIPES), (
+        "every production V2 recipe so far replaces declared legacy ids")
     validate_v2_registry()
 
 
