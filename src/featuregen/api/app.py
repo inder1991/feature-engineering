@@ -37,6 +37,7 @@ from featuregen.api.routes import (
     learning,
     lineage,
     pii_policies,
+    concept_confirmations,
     profiles,
     quarantine,
     readiness,
@@ -214,6 +215,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(search.router)
     app.include_router(recipe_funnel.router)
     app.include_router(recipe_review.router)
+    app.include_router(concept_confirmations.router)
     app.include_router(selection_telemetry.router)
     # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
     app.include_router(catalogs.router)
