@@ -27,6 +27,7 @@ from featuregen.overlay.upload.recipe_contract_v2 import (
 from featuregen.overlay.upload.recipes.aml import AML_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.asset_management import AM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.collections import COLLECTIONS_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.corporate_cib import CORPORATE_CIB_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.credit import CREDIT_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.cross_sell import CROSS_SELL_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.custody import CUSTODY_RECIPES  # noqa: E402
@@ -45,7 +46,8 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *PAYMENTS_RECIPES, *DEPOSITS_ALM_RECIPES,
                                               *MARKETS_RECIPES, *CUSTODY_RECIPES,
                                               *AM_RECIPES, *INSURANCE_RECIPES,
-                                              *ISLAMIC_RECIPES, *ESG_RECIPES)
+                                              *ISLAMIC_RECIPES, *ESG_RECIPES,
+                                              *CORPORATE_CIB_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a
