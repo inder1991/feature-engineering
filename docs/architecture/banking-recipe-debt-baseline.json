@@ -4,7 +4,7 @@
     "downstream_derivation_recipes": 33,
     "formula_unassessed_recipes": 155,
     "identity_collision_recipes": 145,
-    "legacy_recipes_not_in_v2": 76,
+    "legacy_recipes_not_in_v2": 55,
     "missing_concept_admission_recipes": 15,
     "monetary_flow_without_direction_recipes": 32,
     "monetary_without_currency_policy_recipes": 63,
@@ -27,10 +27,10 @@
     "parameter_combinations": 1122,
     "primary_objective_recipes": 14,
     "recipe_count": 157,
-    "v2_recipe_count": 81
+    "v2_recipe_count": 102
   },
   "measured_at_commit": "2b7b1096",
   "measured_on": "2026-08-11",
-  "note": "BR-1 authoritative baseline, regenerated per the re-baseline amendment. Review-era estimates it supersedes: 'eleven missing-concept admissions' measured 15 under the documented pattern; 'two PIT placeholder defects' confirmed at exactly 2; the additivity-conflict heuristic measures 72. The ratchet holds `counters` only. BR-3 adds v2_variant_identity_collision_recipes (baseline 0) in the same commit as the check \u2014 the missing-counter regression rule demands it. BR-4 fixed both PIT placeholder defects (2 -> 0, intentional decrease): each was a SHARED pit constant borrowed by a recipe with different parameters; each now has its own declaration. BR-11 populates V2_RECIPES with the retail pack (23 atomic recipes, all 12 RETAIL_CHURN ids) and the cross-sell pack (13 recipes + 2 ModelFeatureSpecs, all 10 CROSS_SELL ids): legacy_recipes_not_in_v2 157 -> 135, an intentional decrease; every other counter unchanged. BR-12 credit pack: 20 recipes replacing all 16 CREDIT_RISK ids; counter 135 -> 119. BR-12 collections pack: 14 recipes replacing all 10 COLLECTIONS ids; counter 119 -> 109. BR-13 fraud+aml+payments packs: 39 recipes replacing all 33 legacy ids; counter 109 -> 76.",
+  "note": "BR-1 authoritative baseline, regenerated per the re-baseline amendment. Review-era estimates it supersedes: 'eleven missing-concept admissions' measured 15 under the documented pattern; 'two PIT placeholder defects' confirmed at exactly 2; the additivity-conflict heuristic measures 72. The ratchet holds `counters` only. BR-3 adds v2_variant_identity_collision_recipes (baseline 0) in the same commit as the check \u2014 the missing-counter regression rule demands it. BR-4 fixed both PIT placeholder defects (2 -> 0, intentional decrease): each was a SHARED pit constant borrowed by a recipe with different parameters; each now has its own declaration. BR-11 populates V2_RECIPES with the retail pack (23 atomic recipes, all 12 RETAIL_CHURN ids) and the cross-sell pack (13 recipes + 2 ModelFeatureSpecs, all 10 CROSS_SELL ids): legacy_recipes_not_in_v2 157 -> 135, an intentional decrease; every other counter unchanged. BR-12 credit pack: 20 recipes replacing all 16 CREDIT_RISK ids; counter 135 -> 119. BR-12 collections pack: 14 recipes replacing all 10 COLLECTIONS ids; counter 119 -> 109. BR-13 fraud+aml+payments packs: 39 recipes replacing all 33 legacy ids; counter 109 -> 76. BR-14 deposits/ALM+markets packs: 25 recipes replacing all 21 legacy ids; counter 76 -> 55.",
   "version": "banking-recipe-debt-baseline-v1"
 }

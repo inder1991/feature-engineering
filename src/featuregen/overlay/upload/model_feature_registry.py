@@ -11,8 +11,10 @@ from featuregen.overlay.upload.model_feature_contract import (
     ModelFeatureSpecV1,
 )
 from featuregen.overlay.upload.recipes.cross_sell import CROSS_SELL_MODEL_FEATURES
+from featuregen.overlay.upload.recipes.markets import MARKETS_MODEL_FEATURES
 
-MODEL_FEATURES: tuple[ModelFeatureSpecV1, ...] = (*CROSS_SELL_MODEL_FEATURES,)
+MODEL_FEATURES: tuple[ModelFeatureSpecV1, ...] = (*CROSS_SELL_MODEL_FEATURES,
+                                                  *MARKETS_MODEL_FEATURES)
 
 
 def validate_model_feature_registry(
