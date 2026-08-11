@@ -41,6 +41,7 @@ from featuregen.api.routes import (
     quarantine,
     readiness,
     recipe_funnel,
+    recipe_review,
     search,
     selection_telemetry,
     semantics,
@@ -212,6 +213,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(integrations.router)
     app.include_router(search.router)
     app.include_router(recipe_funnel.router)
+    app.include_router(recipe_review.router)
     app.include_router(selection_telemetry.router)
     # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
     app.include_router(catalogs.router)
