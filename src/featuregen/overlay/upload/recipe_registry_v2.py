@@ -24,9 +24,10 @@ from featuregen.overlay.upload.recipe_contract_v2 import (
 # The production V2 population, populated family by family as the BR-11..16 packs land. Until
 # BR-17's cutover the packs change AUDIT accounting only — no grounding or suggestion path reads
 # this tuple yet.
+from featuregen.overlay.upload.recipes.cross_sell import CROSS_SELL_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.retail import RETAIL_RECIPES  # noqa: E402
 
-V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES,)
+V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a
