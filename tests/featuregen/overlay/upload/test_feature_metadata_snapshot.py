@@ -271,11 +271,14 @@ def test_read_committed_connection_raises_isolation_error(conn) -> None:
 
 # ── Task 0.6 Seam 4 (D6): six pin kinds, compat-safe hashing, kind-dispatched freshness ────────────────
 
-def test_item_kind_vocabulary_is_the_six_pin_list() -> None:
+def test_item_kind_vocabulary_is_the_pinned_list() -> None:
     from featuregen.overlay.upload.feature_metadata_snapshot import ITEM_KINDS
     assert ITEM_KINDS == frozenset({
         "column_field", "dataset_profile", "serving_policy", "source_selection",
-        "physical_binding", "temporal_policy", "row_selection"})
+        "physical_binding", "temporal_policy", "row_selection",
+        # SE-2 (2026-08-11): the frozen Layer-A generation context's identity pin — the one
+        # non-column kind with a REGISTERED comparator (rebuild-at-stored-scope).
+        "generation_semantic_context"})
 
 
 _GOLDEN_MATERIAL = {

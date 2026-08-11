@@ -84,6 +84,8 @@ ITEM_KIND_COLUMN_FIELD = "column_field"
 ITEM_KINDS: frozenset[str] = frozenset({
     ITEM_KIND_COLUMN_FIELD, "dataset_profile", "serving_policy", "source_selection",
     "physical_binding", "temporal_policy", "row_selection",
+    # SE-2: the frozen Layer-A generation context's identity pin (one item per catalog run).
+    "generation_semantic_context",
 })
 
 # Freshness reason (D6): a stored item whose kind has no comparator registered in THIS build — a
@@ -494,7 +496,18 @@ def _build_item(
 # item_kind -> the CURRENT-state item rebuilder ``compare_snapshot_to_current`` dispatches on (D6).
 # Only ``column_field`` has one today; the five reserved kinds gain theirs with their builders — a
 # stored kind absent here is the typed :data:`SNAPSHOT_KIND_UNSUPPORTED` refusal.
-_KIND_COMPARATORS = {ITEM_KIND_COLUMN_FIELD: _build_item}
+def _compare_generation_context(conn, catalog_source, graph_ref, field):
+    """SE-2's freshness dispatch — imported lazily (the context module imports THIS one for the
+    item shape, so a module-level import here would cycle)."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        compare_generation_context_item,
+    )
+
+    return compare_generation_context_item(conn, catalog_source, graph_ref, field)
+
+
+_KIND_COMPARATORS = {ITEM_KIND_COLUMN_FIELD: _build_item,
+                     "generation_semantic_context": _compare_generation_context}
 
 
 def build_metadata_snapshot(
@@ -506,6 +519,7 @@ def build_metadata_snapshot(
     actor: dict | None = None,
     flags: dict | None = None,
     fields: Sequence[str] | None = None,
+    extra_items: Sequence[SnapshotItem] = (),
 ) -> SnapshotContext:
     """Persist an immutable, hashed snapshot of the in-scope catalog state and return a
     :class:`SnapshotContext` (see module docstring).
@@ -539,6 +553,16 @@ def build_metadata_snapshot(
                 continue   # an identical item appears once (mirrors the DB UNIQUE dedup)
             seen_hashes.add(item.item_hash)
             items.append(item)
+    # SE-2: caller-supplied pre-built items (the generation-context identity pin) join the SAME
+    # sealed set — hashed into content_hash below, verified by their registered kind comparator.
+    # Absent extra items, this loop is a no-op: byte-identical to the pre-SE-2 snapshot.
+    for item in extra_items:
+        if item.item_kind not in ITEM_KINDS:
+            raise ValueError(f"unknown extra snapshot item kind {item.item_kind!r}")
+        if item.item_hash in seen_hashes:
+            continue
+        seen_hashes.add(item.item_hash)
+        items.append(item)
 
     content_hash = canonical_hash(
         {

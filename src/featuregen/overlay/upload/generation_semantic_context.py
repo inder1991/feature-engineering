@@ -81,12 +81,13 @@ class GenerationSemanticContextV1:
             {"context": _canonical_dataclass(self)})
 
 
-def build_generation_semantic_context(conn, *, catalog_source: str,
-                                      roles=()) -> GenerationSemanticContextV1:
+def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
+                                      scope=None) -> GenerationSemanticContextV1:
     """Assemble Layer A on the CALLER's connection (the feature-gen path's REPEATABLE READ one —
     isolation is the connection's property, deliberately not re-established here). Exactly two
-    queries, independent of catalog width."""
-    scope = allowed_sensitivities(roles)
+    queries, independent of catalog width. ``scope`` (a sensitivity list) overrides the
+    roles-derived one — the freshness comparator rebuilds at a STORED scope, not a caller's."""
+    scope = list(scope) if scope is not None else allowed_sensitivities(roles)
     rows = conn.execute(
         "SELECT object_ref, table_name, column_name, data_type, is_grain, is_as_of, "
         "       concept, entity, additivity, sensitivity, currency, "
@@ -120,5 +121,58 @@ def build_generation_semantic_context(conn, *, catalog_source: str,
         concept_index={k: tuple(v) for k, v in concept_index.items()})
 
 
-__all__ = ["ColumnIndexV1", "GenerationSemanticContextV1",
-           "build_generation_semantic_context"]
+__all__ = ["ColumnIndexV1", "GENERATION_CONTEXT_ITEM_KIND", "GenerationSemanticContextV1",
+           "build_generation_semantic_context", "compare_generation_context_item",
+           "context_snapshot_item"]
+
+
+# ── the durable seal (SE-2 part 2): the context as a metadata-snapshot item ─────────────────────
+#
+# The frozen context's identity is sealed INTO the C0 metadata snapshot (one additive item kind)
+# before the considered revision is written, so a stored run can prove which Layer-A state its
+# decisions consumed — and the snapshot freshness check can answer "is that state still true?"
+# by REBUILDING the context at the stored scope and comparing hashes: catalog drift since the
+# run is an honest SNAPSHOT_ITEM_DRIFT, never a silent recompute.
+
+GENERATION_CONTEXT_ITEM_KIND = "generation_semantic_context"
+_CONTEXT_GRAPH_REF_PREFIX = "context:"
+
+
+def context_snapshot_item(context: GenerationSemanticContextV1):
+    """The context's one snapshot item. ``graph_ref`` carries the read-scope key because the
+    freshness comparator receives only ``(conn, catalog_source, graph_ref, field)`` and must
+    rebuild the SAME scope's context to verify the pin."""
+    from featuregen.overlay.upload.feature_metadata_snapshot import (
+        SnapshotItem,
+        snapshot_item_hash,
+    )
+
+    context_hash = context.context_hash()
+    item_hash = snapshot_item_hash(GENERATION_CONTEXT_ITEM_KIND, {
+        "catalog_source": context.catalog_source,
+        "read_scope_key": context.read_scope_key,
+        "context_hash": context_hash,
+    })
+    return SnapshotItem(
+        catalog_source=context.catalog_source,
+        graph_ref=f"{_CONTEXT_GRAPH_REF_PREFIX}{context.read_scope_key}",
+        logical_ref=None, physical_ref=None,
+        item_kind=GENERATION_CONTEXT_ITEM_KIND,
+        field_or_fact_type="layer_a",
+        value=context_hash,
+        authority="hint",                 # an identity pin, never an operational value
+        provenance=f"{GENERATION_CONTEXT_CONTRACT}@{GENERATION_CONTEXT_VERSION}",
+        status="not_operational",
+        decision_event_id=None, fact_event_id=None,
+        item_hash=item_hash)
+
+
+def compare_generation_context_item(conn, catalog_source: str, graph_ref: str, field: str):
+    """The freshness comparator for the context item kind (D6 dispatch): rebuild Layer A at the
+    STORED scope and re-derive the item — a hash mismatch is real catalog drift."""
+    del field                                          # one field only: "layer_a"
+    scope_key = graph_ref.removeprefix(_CONTEXT_GRAPH_REF_PREFIX)
+    scope = [s for s in scope_key.split(",") if s]
+    rebuilt = build_generation_semantic_context(
+        conn, catalog_source=catalog_source, scope=scope)
+    return context_snapshot_item(rebuilt)

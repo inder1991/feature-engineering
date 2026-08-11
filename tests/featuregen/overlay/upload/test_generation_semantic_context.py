@@ -73,3 +73,47 @@ def test_layer_a_is_exactly_two_queries_regardless_of_width(db):
     finally:
         db.execute = original
     assert len(calls) == 2, calls
+
+
+# ── SE-2 part 2: the durable seal + kind-dispatched freshness ──────────────────────────────────
+
+def _rr(conn) -> None:
+    import psycopg
+
+    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+
+
+def test_the_context_seals_into_the_snapshot_and_drift_is_caught(conn):
+    """The context item joins the C0 sealed set, verifies CURRENT while the catalog holds, and
+    catches drift the per-ref column pins cannot see — a change to a column that is IN the
+    frozen universe but NOT among the snapshot's candidate refs."""
+    from featuregen.overlay.upload.feature_metadata_snapshot import (
+        build_metadata_snapshot,
+        compare_snapshot_to_current,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        GENERATION_CONTEXT_ITEM_KIND,
+        context_snapshot_item,
+    )
+
+    _rr(conn)
+    _seed(conn)
+    context = build_generation_semantic_context(conn, catalog_source=SOURCE)
+    ctx = build_metadata_snapshot(
+        conn, generation_run_id="genrun_se2", refs=[(SOURCE, "public.accounts.account_id")],
+        read_scope_hash="sha256:scope", fields=["additivity"],
+        extra_items=[context_snapshot_item(context)])
+
+    stored_kinds = [r[0] for r in conn.execute(
+        "SELECT item_kind FROM catalog_metadata_snapshot_item WHERE snapshot_id = %s",
+        (ctx.snapshot_id,)).fetchall()]
+    assert GENERATION_CONTEXT_ITEM_KIND in stored_kinds
+
+    fresh = compare_snapshot_to_current(conn, ctx.snapshot_id)
+    assert (fresh.status, fresh.reason) == ("current", None)
+
+    # Drift a column OUTSIDE the candidate refs: only the context pin can see it.
+    conn.execute("UPDATE graph_node SET additivity = 'non_additive' "
+                 "WHERE object_ref = 'public.transactions.amount'")
+    drifted = compare_snapshot_to_current(conn, ctx.snapshot_id)
+    assert (drifted.status, drifted.reason) == ("drifted", "SNAPSHOT_ITEM_DRIFT")

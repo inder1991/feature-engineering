@@ -28,6 +28,9 @@ from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
 from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
 from featuregen.overlay.upload.contract.param_choice import choose_params
+from featuregen.overlay.upload.generation_semantic_context import (
+    build_generation_semantic_context,
+)
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.enrich_batch import CallLedger
 from featuregen.overlay.upload.feature_assist import (
@@ -694,7 +697,8 @@ def _run_actor(intent: Intent) -> dict:
 
 def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
                                  generation_run_id: str | None, roles, catalog_source: str | None,
-                                 is_live: bool) -> tuple[str | None, str | None, str | None]:
+                                 is_live: bool,
+                                 semantic_context=None) -> tuple[str | None, str | None, str | None]:
     """Mint the generation run (if not supplied), build the immutable catalog snapshot (C0-T3) over the
     considered set's candidate refs, and return the ``(generation_run_id, snapshot_id, content_hash)``
     lineage to record on the contract_considered row. Runs ONLY under REPEATABLE READ (returns all-None
@@ -723,17 +727,26 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
         "refs": [list(r) for r in refs],   # already sorted, deduped
         "roles": sorted(str(r) for r in roles),
     })
+    # SE-2: the frozen Layer-A context's identity pin joins the sealed item set — the run can
+    # prove which semantic state it consumed, and the freshness check can detect drift from it.
+    extra_items = ()
+    if semantic_context is not None:
+        from featuregen.overlay.upload.generation_semantic_context import context_snapshot_item
+
+        extra_items = (context_snapshot_item(semantic_context),)
     snapshot = build_metadata_snapshot(
         conn, generation_run_id=run_id, refs=refs, read_scope_hash=read_scope_hash,
         actor=_run_actor(intent),
         flags={"intake_mode": intent.intake_mode, "catalog_source": catalog_source,
-               "is_live": bool(is_live)})
+               "is_live": bool(is_live)},
+        extra_items=extra_items)
     return run_id, snapshot.snapshot_id, snapshot.content_hash
 
 
 def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
                              grounded_ids: frozenset[str],
-                             rejected_ids: dict[str, tuple[str, ...]]) -> None:
+                             rejected_ids: dict[str, tuple[str, ...]],
+                             context_hash: str = "") -> None:
     """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
     the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
     savepoint: a shadow failure must not poison the user's request transaction (the same rule
@@ -749,12 +762,13 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
         by_state = Counter(candidate.binding_state for candidate in candidates)
         logger.info(
             "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
-            "review_current=%d temporal_blocked=%d | legacy grounded=%d rejected=%d",
+            "review_current=%d temporal_blocked=%d | legacy grounded=%d rejected=%d "
+            "context=%s",
             len(candidates), by_state.get("bound", 0), by_state.get("ambiguous", 0),
             by_state.get("missing", 0), by_state.get("blocked", 0),
             sum(1 for c in candidates if c.review_current),
             sum(1 for c in candidates if c.temporal_blocker),
-            len(grounded_ids), len(rejected_ids))
+            len(grounded_ids), len(rejected_ids), context_hash[:16] or "unassembled")
     except Exception:
         logger.exception("semantic-shadow comparison failed (response unaffected)")
 
@@ -804,6 +818,13 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     redacted_goal = redact_free_text(objective, label="prediction goal")
     gen_objective = (f"{intent.redacted_hypothesis}\n\nprediction goal: {redacted_goal}"
                      if redacted_goal else intent.redacted_hypothesis)
+    # SE-2: freeze the Layer-A semantic context BEFORE any model dispatch — the identity every
+    # downstream decision (and the shadow lens) can be tied to. Assembled on this connection
+    # (REPEATABLE READ on the production path), sealed into the metadata snapshot below.
+    semantic_context = None
+    if catalog_source is not None:
+        semantic_context = build_generation_semantic_context(
+            conn, catalog_source=catalog_source, roles=roles)
     report = recommend_feature_sets_report(
         conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, feedback=feedback, now=now)
@@ -878,7 +899,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if semantic_mode == "semantic_shadow" and catalog_source is not None and scope is not None:
         _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
                                  grounded_ids=grounded_template_ids,
-                                 rejected_ids=rejected_template_ids)
+                                 rejected_ids=rejected_template_ids,
+                                 context_hash=(semantic_context.context_hash()
+                                               if semantic_context is not None else ""))
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(
@@ -937,6 +960,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # row written, and the snapshot + considered set commit atomically in the one feature transaction.
     snap_run_id, snap_id, snap_hash = _persist_considered_snapshot(
         conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
+        semantic_context=semantic_context,
         catalog_source=catalog_source, is_live=is_live)
     cs = _with_option_ids(cs, snap_run_id or f"legacy:{intent.intent_id}")
     revision_id, considered_hash = _persist_considered_revision(
