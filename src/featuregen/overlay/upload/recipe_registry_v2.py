@@ -43,6 +43,7 @@ from featuregen.overlay.upload.recipes.corporate_cib import CORPORATE_CIB_RECIPE
 from featuregen.overlay.upload.recipes.credit import CREDIT_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.cross_sell import CROSS_SELL_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.custody import CUSTODY_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.customer import CUSTOMER_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.deposits_alm import DEPOSITS_ALM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.esg import ESG_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.fraud import FRAUD_RECIPES  # noqa: E402
@@ -50,6 +51,7 @@ from featuregen.overlay.upload.recipes.insurance import INSURANCE_RECIPES  # noq
 from featuregen.overlay.upload.recipes.islamic import ISLAMIC_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.markets import MARKETS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.payments import PAYMENTS_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.rbwm import RBWM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.retail import RETAIL_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.transaction_analytics import (  # noqa: E402
     TRANSACTION_ANALYTICS_RECIPES,
@@ -57,6 +59,7 @@ from featuregen.overlay.upload.recipes.transaction_analytics import (  # noqa: E
 from featuregen.overlay.upload.recipes.transaction_foundation import (  # noqa: E402
     TRANSACTION_FOUNDATION_RECIPES,
 )
+from featuregen.overlay.upload.recipes.wealth import WEALTH_RECIPES  # noqa: E402
 
 V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIPES,
                                               *CREDIT_RECIPES, *COLLECTIONS_RECIPES,
@@ -68,7 +71,9 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *CORPORATE_CIB_RECIPES,
                                               *TRANSACTION_FOUNDATION_RECIPES,
                                               *TRANSACTION_ANALYTICS_RECIPES,
-                                              *ACCOUNT_FOUNDATION_RECIPES)
+                                              *ACCOUNT_FOUNDATION_RECIPES,
+                                              *CUSTOMER_RECIPES, *RBWM_RECIPES,
+                                              *WEALTH_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a

@@ -44,11 +44,16 @@ def test_the_probe_recipe_constructs_and_the_registry_holds_the_migrated_packs()
     law holds over the real population."""
     assert PROBE_RECIPE.computation_kind == "deterministic_formula"
     assert len(V2_RECIPES) >= 23                     # the retail pack, growing by pack
-    # Migration-era packs replace declared legacy ids; the BR-18+ foundation packs are NEW
-    # recipes and replace nothing — both facts pinned.
-    migrated = [r for r in V2_RECIPES if r.family != "transaction_foundation"
-                and not r.family.endswith("_foundation")]
-    assert all(r.replaces_legacy_ids for r in migrated)
+    # Migration-era packs (the BR-11..16 families) replace declared legacy ids; the BR-18+
+    # foundation/expansion packs are NEW recipes and replace nothing — both facts pinned.
+    migration_families = {"retail_churn", "cross_sell", "credit_risk", "collections",
+                          "fraud", "aml", "payments", "deposits_alm", "markets", "custody",
+                          "asset_management", "insurance", "islamic", "esg", "corporate_cib"}
+    for r in V2_RECIPES:
+        if r.family in migration_families:
+            assert r.replaces_legacy_ids, r.recipe_id
+        else:
+            assert not r.replaces_legacy_ids, r.recipe_id
     validate_v2_registry()
 
 

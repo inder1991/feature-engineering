@@ -23,31 +23,23 @@
     },
     {
       "leaf": "credit.collections.recoveries",
-      "target_increment": "BR-18"
+      "target_increment": "BR-21"
     },
     {
       "leaf": "credit.monitoring.credit_mitigation",
-      "target_increment": "BR-18"
+      "target_increment": "BR-21"
     },
     {
       "leaf": "credit.underwriting.affordability",
-      "target_increment": "BR-18"
+      "target_increment": "BR-21"
     },
     {
       "leaf": "credit.underwriting.seasoning",
-      "target_increment": "BR-18"
+      "target_increment": "BR-21"
     },
     {
       "leaf": "credit.underwriting.sme",
-      "target_increment": "BR-18"
-    },
-    {
-      "leaf": "customer.clv",
-      "target_increment": "BR-19"
-    },
-    {
-      "leaf": "customer.relationship_attrition.primacy_loss",
-      "target_increment": "BR-19"
+      "target_increment": "BR-21"
     },
     {
       "leaf": "fraud.account_takeover",
@@ -67,11 +59,7 @@
     },
     {
       "leaf": "treasury_alm.cash_management",
-      "target_increment": "BR-18"
-    },
-    {
-      "leaf": "wealth.asset_outflow",
-      "target_increment": "BR-19"
+      "target_increment": "BR-21"
     }
   ],
   "intentionally_empty": [
