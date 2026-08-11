@@ -1,9 +1,11 @@
-"""Phase-0 coverage report — which selectable use-case leaves the 153 recipes actually populate.
+"""Coverage report over the ACTIVE (V2) registry — which selectable leaves the recipes populate.
 
-This inverts :func:`recipe_applicability` over ``ALL_TEMPLATES`` against ``selectable_leaves()`` to
-answer, per leaf, *which recipes name it as their primary objective* (and, separately, as a secondary).
-It is the human-readable audit behind the Phase-0 exit criteria and is read-only — nothing here touches
-``templates.py`` or grounding.
+Since the BR-17 cutover this inverts the V2 registry's AUTHORED applicability (every
+``RecipeDefinitionV2`` declares its ``primary_objective`` and ``supporting_objectives`` at
+construction) against ``selectable_leaves()`` — legacy applicability INFERENCE no longer exists
+in release coverage, because the active registry has nothing to infer. The legacy crosswalk
+(:func:`recipe_applicability` over ``ALL_TEMPLATES``) survives for the v1/v2 compatibility
+window and its own tests, but this report no longer consults it.
 
 The report distinguishes reviewed primary coverage, supporting-only coverage and true zero coverage.
 Release gates decide which active leaves require a primary anchor; membership in a release list never
@@ -27,13 +29,9 @@ gold gate, and honestly so), and the legacy-debt counters (``legacy_inferred_lea
 """
 from __future__ import annotations
 
-from featuregen.overlay.upload import templates
 from featuregen.overlay.upload.recipe_formula_expectations import RECIPE_FORMULA_EXPECTATIONS
 from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
-from featuregen.overlay.upload.taxonomy.recipe_applicability import (
-    ApplicabilitySource,
-    recipe_applicability,
-)
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY, selectable_leaves
 
 #: BR-9's closed coverage tiers, in rank order. The names say what the count MEANS: a supporting
@@ -65,15 +63,20 @@ def coverage_tier(*, intentionally_empty: bool, authored_primary: bool, legacy_p
 
 
 def execution_readiness_of(recipe_id: str) -> str:
-    """A legacy recipe's execution readiness, from the SAME machinery contract v3 renders (BR-7's
-    fold over the reviewed expectation registry) — never a parallel opinion. Plain legacy recipes
-    are UNASSESSED ideas; the reviewed expectation anchors rest at FORMULA_AUTHORABLE until the
-    gold gate is proven."""
-    if recipe_id not in RECIPE_FORMULA_EXPECTATIONS:
+    """A V2 recipe's execution readiness, from the SAME machinery contract v3 renders (BR-7's
+    fold over the definition's declarations) — never a parallel opinion. Conceptual patterns and
+    model outputs fold to CONCEPTUAL_ONLY; deterministic recipes rest at FORMULA_BLOCKED until
+    their expectation is reviewed, then FORMULA_AUTHORABLE until the gold gate is proven."""
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    recipe = v2_recipe_by_id(recipe_id)
+    if recipe is None:
         return "UNASSESSED"
+    reviewed = (recipe.formula is not None
+                and recipe.formula.expectation_ref in RECIPE_FORMULA_EXPECTATIONS)
     return fold_readiness(ReadinessInputsV1(
-        computation_kind="deterministic_formula",
-        reviewed_expectation=True, grammar_verdict="ok")).state
+        computation_kind=recipe.computation_kind,
+        reviewed_expectation=reviewed, grammar_verdict="ok")).state
 
 
 def coverage_report() -> dict:
@@ -91,21 +94,13 @@ def coverage_report() -> dict:
     legacy_primary_by_leaf: dict[str, list[str]] = {leaf: [] for leaf in leaves}
     formula_authoring_class_by_recipe: dict[str, str] = {}
 
-    for template in templates.ALL_TEMPLATES:
-        spec = recipe_applicability(template)
-        # primary is always a selectable leaf (Task-4 guarantee), so the key exists.
-        by_leaf[spec.primary].append(template.id)
-        target = (
-            authored_primary_by_leaf
-            if spec.source is ApplicabilitySource.AUTHORED
-            else legacy_primary_by_leaf
-        )
-        target[spec.primary].append(template.id)
-        for leaf in spec.secondary:
-            if leaf in secondary_by_leaf:            # secondary is always a selectable leaf too
-                secondary_by_leaf[leaf].append(template.id)
-        formula_authoring_class_by_recipe[template.id] = (
-            template.formula_authoring_class.value)
+    for recipe in V2_RECIPES:
+        by_leaf[recipe.primary_objective].append(recipe.recipe_id)
+        authored_primary_by_leaf[recipe.primary_objective].append(recipe.recipe_id)
+        for leaf in recipe.supporting_objectives:
+            if leaf in secondary_by_leaf:
+                secondary_by_leaf[leaf].append(recipe.recipe_id)
+        formula_authoring_class_by_recipe[recipe.recipe_id] = recipe.computation_kind
 
     empty_intentional = [
         leaf for leaf in leaves if USE_CASE_REGISTRY[leaf].intentionally_empty]
@@ -133,11 +128,9 @@ def coverage_report() -> dict:
     }
     formula_deferred_requirements_by_leaf = {
         leaf: sorted({
-            template.formula_authoring_class.value
-            for template in templates.ALL_TEMPLATES
-            if template.id in effective_by_leaf[leaf]
-            and template.formula_authoring_class.value
-            not in {"formula_v1_authorable", "unassessed"}
+            execution_readiness_of(rid) for rid in effective_by_leaf[leaf]
+            if execution_readiness_of(rid) not in ("FORMULA_AUTHORABLE", "FORMULA_VALIDATED",
+                                                   "MATERIALIZATION_READY")
         })
         for leaf in leaves
     }
@@ -152,7 +145,7 @@ def coverage_report() -> dict:
         for leaf in leaves
     }
     execution_readiness_by_recipe = {
-        template.id: execution_readiness_of(template.id) for template in templates.ALL_TEMPLATES}
+        recipe.recipe_id: execution_readiness_of(recipe.recipe_id) for recipe in V2_RECIPES}
     executable_primary_by_leaf = {
         leaf: [rid for rid in by_leaf[leaf]
                if execution_readiness_by_recipe[rid] in EXECUTABLE_READINESS_STATES]
@@ -163,9 +156,8 @@ def coverage_report() -> dict:
         leaf for leaf in leaves if by_leaf[leaf] and not executable_primary_by_leaf[leaf]]
     legacy_inferred_leaves = [
         leaf for leaf in leaves if coverage_tier_by_leaf[leaf] == "LEGACY_INFERRED"]
-    legacy_derived_recipe_count = sum(
-        1 for template in templates.ALL_TEMPLATES
-        if recipe_applicability(template).source is ApplicabilitySource.LEGACY_DERIVED)
+    # BR-17: the ACTIVE registry declares every applicability — zero inference, structurally.
+    legacy_derived_recipe_count = 0
 
     return {
         # BR-9 keys. `coverage_tier_by_leaf` is the release-quality vocabulary; the older

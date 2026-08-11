@@ -1,6 +1,15 @@
-"""Parametric feature-template engine + the ``retail_churn`` recipe set (build task B2).
+"""The LEGACY template engine and registry — READ-ONLY since the BR-17 cutover.
 
-Three things live here, standalone (NOT wired into the considered-set / generation flow — that is B4):
+Every one of the 157 templates here has an explicit atomic replacement in the ACTIVE V2 registry
+(``recipe_registry_v2`` — the alias map is derived from each definition's ``replaces_legacy_ids``).
+This module survives ONLY for the v1/v2 suggestion contracts' compatibility window: their
+generation still grounds these templates, and historical suggestion revisions keep verifying
+against these exact definitions. NEW RECIPE AUTHORING HERE FAILS CI (the freeze test pins the id
+set) — author in ``recipes/<family>.py`` against Recipe Contract v2. Removal criteria: this
+module is deleted when the v1/v2 contracts retire (BR-24 rollout gates) and no stored suggestion
+revision resolves a legacy template id.
+
+Three things live here:
 
 1. A parametric **template model** (:class:`Need`, :class:`Template`, :class:`GroundedFeature`) — the
    "cookbook" schema. A template is a *scaffold, not a cage* (domain-intelligence spec §5): it seeds

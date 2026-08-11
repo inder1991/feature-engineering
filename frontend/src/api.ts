@@ -2994,6 +2994,9 @@ export interface SuggestionExecutionBlock {
   execution_readiness: string
   readiness_blockers: SuggestionReadinessBlocker[]
   binding_ambiguity: boolean
+  // BR-17: the atomic V2 recipe ids replacing this legacy template (empty on the fallback).
+  // Optional so a pre-cutover backend still parses.
+  v2_replacements?: string[]
 }
 
 // The exact ids a reader compares for CURRENTNESS — and which are excluded from every semantic

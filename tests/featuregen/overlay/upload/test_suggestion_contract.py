@@ -1638,45 +1638,63 @@ def test_the_wire_keeps_every_evidence_axis_on_an_attributed_value(overlay_conn,
         "producer", "strength", "lifecycle", "producer_ref", "evidence_id"}
 
 
-# ── contract v3 (BR-8): the execution block ─────────────────────────────────────────────────────
-def test_a_plain_legacy_template_is_an_unassessed_idea_never_a_failure():
-    """UNASSESSED means "nobody decided yet" — an idea, carried with ZERO blockers, because the
-    absence of a review is not a defect of the suggestion. Its computation kind is the adapter's
-    honest word: a conceptual pattern."""
-    block = execution_block_v3("txn_count_90d", "exact")
-    assert block == {"recipe_contract_version": "legacy-template",
-                     "computation_kind": "conceptual_pattern",
-                     "execution_readiness": "UNASSESSED",
-                     "readiness_blockers": [],
-                     "binding_ambiguity": False}
+# ── contract v3 (BR-8, cut over to V2 by BR-17): the execution block ────────────────────────────
+def test_an_unknown_template_keeps_the_honest_legacy_fallback():
+    """A template the alias map does not know (or a None template) stays an UNASSESSED idea with
+    ZERO blockers — the absence of a mapping is not a defect of the suggestion."""
+    for template_id in ("txn_count_90d", None):
+        block = execution_block_v3(template_id, "exact")
+        assert block == {"recipe_contract_version": "legacy-template",
+                         "computation_kind": "conceptual_pattern",
+                         "execution_readiness": "UNASSESSED",
+                         "readiness_blockers": [],
+                         "binding_ambiguity": False,
+                         "v2_replacements": []}
 
 
-def test_a_reviewed_expectation_anchor_enters_the_fold_and_rests_authorable():
-    """The two expectation-holding anchors are not ideas — a reviewed formula expectation exists,
-    the grammar accepts it, and the ONLY thing between them and validated is the gold gate, named
-    as such and grouped as formula capability."""
+def test_every_real_template_resolves_to_the_v2_registry():
+    """The cutover: contract v3 grounds ONLY in RecipeDefinitionV2 — every legacy template id
+    resolves through the alias map, carries recipe-contract-v2, and names its replacements."""
+    from featuregen.overlay.upload.templates import ALL_TEMPLATES
+
+    for template in ALL_TEMPLATES:
+        block = execution_block_v3(template.id, "exact")
+        assert block["recipe_contract_version"] == "recipe-contract-v2", template.id
+        assert block["v2_replacements"], template.id
+        assert block["execution_readiness"] != "UNASSESSED", template.id
+
+
+def test_the_reviewed_anchors_surface_authorable_through_the_fold():
     for recipe_id in ("merchant_mcc_diversity", "obligor_facility_count"):
         block = execution_block_v3(recipe_id, "exact")
         assert block["execution_readiness"] == "FORMULA_AUTHORABLE"
-        assert block["computation_kind"] == "deterministic_formula"
         assert block["readiness_blockers"] == [
             {"code": "gold_evaluation_unproven", "group": "formula_capability"}]
+        assert block["v2_replacements"] == [recipe_id]
 
 
-def test_an_ambiguous_binding_blocks_an_expectation_anchor_with_the_fact_named():
-    """The engine's own binding verdict is a BR-7 fold input: an ambiguous resolution cannot be
-    authored over, and the blocker says so in the data-meaning group while `binding_ambiguity`
-    carries the flag the card renders."""
+def test_an_ambiguous_binding_blocks_through_the_fold():
     block = execution_block_v3("merchant_mcc_diversity", "ambiguous")
     assert block["execution_readiness"] == "FORMULA_BLOCKED"
     assert block["binding_ambiguity"] is True
+    assert {"code": "ambiguous_operand_binding", "group": "data_meaning"} \
+        in block["readiness_blockers"]
+
+
+def test_a_split_template_presents_its_best_atom_and_names_the_split():
+    """salary_signal split four ways (three deterministic-blocked + one conceptual): the card
+    presents the BEST-ready atom (an idea with an authorable path says so) and every atom is
+    named — the split visible, never smuggled."""
+    block = execution_block_v3("salary_signal", "exact")
+    assert block["execution_readiness"] == "FORMULA_BLOCKED"      # best of blocked/conceptual
+    assert block["computation_kind"] == "deterministic_formula"
+    assert block["v2_replacements"] == ["salary_credit_count", "salary_credit_amount",
+                                        "salary_regularity", "salary_confidence"]
     assert block["readiness_blockers"] == [
-        {"code": "ambiguous_operand_binding", "group": "data_meaning"}]
+        {"code": "no_reviewed_formula_expectation", "group": "governance"}]
 
 
 def test_an_unmapped_blocker_code_lands_in_governance_not_a_crash():
-    """The grouping is display taxonomy, not authority: a code the map does not know means a human
-    needs to look, which is what the governance group says."""
     assert blocker_group_v3("some_future_code") == "governance"
     assert blocker_group_v3("engine_capability_unproven") == "execution"
 

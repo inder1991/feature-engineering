@@ -990,6 +990,14 @@ function SuggestionDetail({
                   ))}
                 </ul>
               )}
+            {/* BR-17: the legacy idea's atomic V2 replacements, named — a split recipe shows
+                its atoms rather than pretending to be one quantity. */}
+            {(s.execution.v2_replacements?.length ?? 0) > 0 && (
+              <p className="hint">
+                Governed recipe{(s.execution.v2_replacements!.length > 1) ? 's' : ''}:{' '}
+                <span className="mono">{s.execution.v2_replacements!.join(', ')}</span>
+              </p>
+            )}
           </>
         )}
         <Micro level={headingLevel}>Business domains</Micro>

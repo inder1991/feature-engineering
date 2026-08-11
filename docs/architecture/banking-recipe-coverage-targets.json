@@ -1,50 +1,170 @@
 {
-  "version": 1,
   "authored": "2026-08-10",
-  "note": "BR-9 coverage targets. Backlog rows name the release increment whose recipe pack owns each leaf currently lacking a primary recipe (coverage arrives by increment, not by demanding shallow coverage of every leaf). Intentionally-empty rows carry the owning role and the reviewed rationale; the coverage gate refuses an intentionally-empty leaf with neither. Owners are ROLES, not invented names.",
   "backlog": [
-    {"leaf": "customer.relationship_attrition.deposit_attrition", "target_increment": "BR-11"},
-    {"leaf": "customer.relationship_attrition.primacy_loss", "target_increment": "BR-11"},
-    {"leaf": "customer.cross_sell.whitespace", "target_increment": "BR-11"},
-    {"leaf": "customer.segmentation", "target_increment": "BR-11"},
-    {"leaf": "customer.campaign", "target_increment": "BR-11"},
-    {"leaf": "customer.overdraft_propensity", "target_increment": "BR-11"},
-    {"leaf": "wealth.asset_outflow", "target_increment": "BR-11"},
-    {"leaf": "credit.underwriting.affordability", "target_increment": "BR-12"},
-    {"leaf": "credit.underwriting.seasoning", "target_increment": "BR-12"},
-    {"leaf": "credit.underwriting.sme", "target_increment": "BR-12"},
-    {"leaf": "credit.monitoring.credit_mitigation", "target_increment": "BR-12"},
-    {"leaf": "credit.collections.hardship", "target_increment": "BR-12"},
-    {"leaf": "credit.collections.self_cure", "target_increment": "BR-12"},
-    {"leaf": "credit.collections.workout", "target_increment": "BR-12"},
-    {"leaf": "fraud.card_fraud", "target_increment": "BR-13"},
-    {"leaf": "fraud.account_takeover", "target_increment": "BR-13"},
-    {"leaf": "fraud.app_scam", "target_increment": "BR-13"},
-    {"leaf": "fraud.synthetic_id", "target_increment": "BR-13"},
-    {"leaf": "aml_cft.structuring", "target_increment": "BR-13"},
-    {"leaf": "aml_cft.sanctions", "target_increment": "BR-13"},
-    {"leaf": "aml_cft.screening", "target_increment": "BR-13"},
-    {"leaf": "aml_cft.kyc", "target_increment": "BR-13"},
-    {"leaf": "aml_cft.correspondent", "target_increment": "BR-13"},
-    {"leaf": "treasury_alm.cash_management", "target_increment": "BR-14"},
-    {"leaf": "islamic.banking", "target_increment": "BR-15"},
-    {"leaf": "esg.climate.transition", "target_increment": "BR-15"},
-    {"leaf": "esg.climate.physical", "target_increment": "BR-15"},
-    {"leaf": "corporate_trade.receivables_finance", "target_increment": "BR-16"}
+    {
+      "leaf": "aml_cft.correspondent",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "aml_cft.kyc",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "aml_cft.sanctions",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "aml_cft.screening",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "aml_cft.structuring",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "credit.collections.recoveries",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "credit.monitoring.credit_mitigation",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "credit.monitoring.limit_management",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "credit.underwriting.affordability",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "credit.underwriting.seasoning",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "credit.underwriting.sme",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "customer.clv",
+      "target_increment": "BR-19"
+    },
+    {
+      "leaf": "customer.engagement",
+      "target_increment": "BR-19"
+    },
+    {
+      "leaf": "customer.overdraft_propensity",
+      "target_increment": "BR-19"
+    },
+    {
+      "leaf": "customer.relationship_attrition.primacy_loss",
+      "target_increment": "BR-19"
+    },
+    {
+      "leaf": "fraud.account_takeover",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "fraud.app_scam",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "fraud.card_fraud",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "fraud.synthetic_id",
+      "target_increment": "BR-21"
+    },
+    {
+      "leaf": "payments.cross_border",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "treasury_alm.cash_management",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "treasury_alm.deposit_stability",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "treasury_alm.liquidity",
+      "target_increment": "BR-18"
+    },
+    {
+      "leaf": "wealth.asset_outflow",
+      "target_increment": "BR-19"
+    }
   ],
   "intentionally_empty": [
-    {"leaf": "wealth.client_attrition", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: private-bank client attrition needs wealth-platform mandate and flow data no current catalog carries; retail attrition leaves cover the near-term need."},
-    {"leaf": "aml_cft.mule_account", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: mule detection needs inbound-network features (fan-in from unrelated payers) whose relationship data is not yet governed; suspicious_transaction_monitoring holds the interim recipes."},
-    {"leaf": "aml_cft.tbml", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: trade-based money laundering needs trade-document and goods-pricing data outside every current catalog profile."},
-    {"leaf": "treasury_alm.irrbb.basis_risk", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: IRRBB basis risk needs curve-decomposed repricing data; the markets basis_risk leaf covers the traded-book need today."},
-    {"leaf": "counterparty_risk.settlement_exposure", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: settlement exposure needs intraday settlement-status events not present in any governed catalog."},
-    {"leaf": "pricing.credit_risk_based_pricing", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: the pricing family is scheduled after the credit packs prove the risk inputs it would price on."},
-    {"leaf": "pricing.deposit_rate_optimisation", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: deposit pricing follows the BR-14 deposit-behaviour pack that produces its elasticity inputs."},
-    {"leaf": "pricing.fee_pricing", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: fee pricing needs fee-event data profiled beyond current catalog coverage."},
-    {"leaf": "pricing.relationship_pricing", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: relationship pricing composes profitability and holdings features that arrive with the BR-11/BR-16 packs."},
-    {"leaf": "operations.process_cost_forecasting", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: operations forecasting needs process-event data outside the current banking catalogs."},
-    {"leaf": "operations.workload_forecasting", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: workload forecasting needs case-management event data outside the current banking catalogs."},
-    {"leaf": "operations.manual_review_optimisation", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: review optimisation needs alert-disposition history the governance store does not yet expose as catalog data."},
-    {"leaf": "profitability.margin_forecasting", "owner": "use-case taxonomy owner", "rationale": "Declared-future objective: margin forecasting composes NIM and cost features that arrive with the BR-14 pack."}
-  ]
+    {
+      "leaf": "wealth.client_attrition",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: private-bank client attrition needs wealth-platform mandate and flow data no current catalog carries; retail attrition leaves cover the near-term need."
+    },
+    {
+      "leaf": "aml_cft.mule_account",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: mule detection needs inbound-network features (fan-in from unrelated payers) whose relationship data is not yet governed; suspicious_transaction_monitoring holds the interim recipes."
+    },
+    {
+      "leaf": "aml_cft.tbml",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: trade-based money laundering needs trade-document and goods-pricing data outside every current catalog profile."
+    },
+    {
+      "leaf": "treasury_alm.irrbb.basis_risk",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: IRRBB basis risk needs curve-decomposed repricing data; the markets basis_risk leaf covers the traded-book need today."
+    },
+    {
+      "leaf": "counterparty_risk.settlement_exposure",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: settlement exposure needs intraday settlement-status events not present in any governed catalog."
+    },
+    {
+      "leaf": "pricing.credit_risk_based_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: the pricing family is scheduled after the credit packs prove the risk inputs it would price on."
+    },
+    {
+      "leaf": "pricing.deposit_rate_optimisation",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: deposit pricing follows the BR-14 deposit-behaviour pack that produces its elasticity inputs."
+    },
+    {
+      "leaf": "pricing.fee_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: fee pricing needs fee-event data profiled beyond current catalog coverage."
+    },
+    {
+      "leaf": "pricing.relationship_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: relationship pricing composes profitability and holdings features that arrive with the BR-11/BR-16 packs."
+    },
+    {
+      "leaf": "operations.process_cost_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: operations forecasting needs process-event data outside the current banking catalogs."
+    },
+    {
+      "leaf": "operations.workload_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: workload forecasting needs case-management event data outside the current banking catalogs."
+    },
+    {
+      "leaf": "operations.manual_review_optimisation",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: review optimisation needs alert-disposition history the governance store does not yet expose as catalog data."
+    },
+    {
+      "leaf": "profitability.margin_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: margin forecasting composes NIM and cost features that arrive with the BR-14 pack."
+    }
+  ],
+  "note": "BR-17 cutover regeneration: coverage now reads the ACTIVE V2 registry (every recipe declares its objectives \u2014 zero legacy inference). Backlog rows name the R5 expansion pack (BR-18 foundation / BR-19 customer-wealth / BR-21 ecosystem) that owns each leaf still lacking a V2 primary. Intentionally-empty rows carry the owning role and reviewed rationale; owners are ROLES, not invented names.",
+  "version": 1
 }

@@ -1,11 +1,20 @@
-"""BR-2 — the V2 recipe registry: empty in production until the family migrations (BR-11..16).
+"""The ACTIVE recipe registry — Recipe Contract v2, fully populated (BR-17 cutover).
 
-``V2_RECIPES`` is the production population — the audit's ``legacy_recipes_not_in_v2`` counter
-falls as replacements land here. ``PROBE_RECIPE`` is the one NON-production definition BR-2
-registers to prove end-to-end construction, serialization and hashing; it never enters
-``V2_RECIPES`` and never grounds. Registry validation runs at import: unique ids, explicit legacy
-replacements only (every replaced id must exist in ``ALL_TEMPLATES`` — no heuristic aliasing),
-and no id squatting on a legacy id it does not replace.
+Every one of the 157 legacy templates has an explicit V2 replacement here (the audit's
+``legacy_recipes_not_in_v2`` counter is ZERO, pinned by test). ``PROBE_RECIPE`` remains the one
+NON-production definition (BR-2's end-to-end construction proof). Registry validation runs at
+import: unique ids, explicit legacy replacements only, no id squatting.
+
+**The alias seam (BR-17):** :data:`LEGACY_ALIAS_MAP` is DERIVED from each definition's
+``replaces_legacy_ids`` — source-controlled, never heuristic. A legacy id with ONE replacement
+resolves directly; a multi-target id (a legacy multi-measure recipe split into atoms) REFUSES to
+resolve without the output alias — :func:`resolve_legacy_alias` raises
+:class:`AmbiguousLegacyAlias` naming the atoms, because silently picking one would smuggle the
+one-output rule's whole defect class back in.
+
+**Compatibility window:** v1/v2 suggestion generation still reads the legacy Template projection;
+contract v3's execution truth grounds HERE. The legacy registry is READ-ONLY (its freeze test
+fails CI on any new Template) and is removed only when the v1/v2 contracts retire (BR-24).
 """
 from __future__ import annotations
 
@@ -141,4 +150,53 @@ def v2_replaced_legacy_ids(recipes: tuple[RecipeDefinitionV2, ...] = V2_RECIPES)
     return frozenset(rid for recipe in recipes for rid in recipe.replaces_legacy_ids)
 
 
+class AmbiguousLegacyAlias(RecipeContractError):
+    """A multi-target legacy id resolved without its output alias — refused, never guessed."""
+
+
+def _build_alias_map() -> dict[str, tuple[str, ...]]:
+    aliases: dict[str, list[str]] = {}
+    for recipe in V2_RECIPES:
+        for legacy_id in recipe.replaces_legacy_ids:
+            aliases.setdefault(legacy_id, []).append(recipe.recipe_id)
+    return {legacy_id: tuple(targets) for legacy_id, targets in aliases.items()}
+
+
+#: legacy recipe id -> the atomic V2 recipe ids replacing it, in pack declaration order.
+LEGACY_ALIAS_MAP: dict[str, tuple[str, ...]] = {}
+
+_BY_ID: dict[str, RecipeDefinitionV2] = {}
+
+
+def v2_recipe_by_id(recipe_id: str) -> RecipeDefinitionV2 | None:
+    return _BY_ID.get(recipe_id)
+
+
+def resolve_legacy_alias(legacy_id: str,
+                         output_alias: str | None = None) -> RecipeDefinitionV2:
+    """One legacy id -> ONE atomic V2 definition, or a refusal that names the choices.
+
+    A single-replacement id resolves directly. A multi-measure id split into atoms REQUIRES
+    ``output_alias`` (one of its target recipe ids): resolving `salary_signal` without saying
+    WHICH of its four outputs you mean is exactly the ambiguity the one-output rule closed."""
+    targets = LEGACY_ALIAS_MAP.get(legacy_id)
+    if targets is None:
+        raise RecipeContractError(f"unknown legacy recipe id {legacy_id!r} — the alias map is "
+                                  "derived from replaces_legacy_ids, never guessed")
+    if output_alias is not None:
+        if output_alias not in targets:
+            raise RecipeContractError(
+                f"{output_alias!r} is not a replacement of {legacy_id!r}; its atoms are "
+                f"{list(targets)}")
+        return _BY_ID[output_alias]
+    if len(targets) == 1:
+        return _BY_ID[targets[0]]
+    raise AmbiguousLegacyAlias(
+        f"legacy id {legacy_id!r} split into {len(targets)} atomic outputs "
+        f"{list(targets)} — name the output alias; resolving it silently would pick a "
+        "quantity nobody chose")
+
+
 validate_v2_registry()
+LEGACY_ALIAS_MAP.update(_build_alias_map())
+_BY_ID.update({recipe.recipe_id: recipe for recipe in V2_RECIPES})

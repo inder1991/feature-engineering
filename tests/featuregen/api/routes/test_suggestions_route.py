@@ -270,16 +270,14 @@ def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  
         block = hit["suggestion"].pop("execution")
         state = block["execution_readiness"]
         tally[state] = tally.get(state, 0) + 1
-        # Every card declares what it IS: today's whole legacy registry projects conceptual-only
-        # ideas (UNASSESSED — "nobody decided yet", carried with ZERO blockers because an idea is
-        # not a failure) except the reviewed expectation anchors, which enter BR-7's fold.
-        assert block["recipe_contract_version"] == "legacy-template"
-        if block["execution_readiness"] == "UNASSESSED":
-            assert block["computation_kind"] == "conceptual_pattern"
-            assert block["readiness_blockers"] == []
-        else:
-            assert block["computation_kind"] == "deterministic_formula"
-            assert all(b["code"] and b["group"] for b in block["readiness_blockers"])
+        # BR-17: every recipe-generated card grounds in the ACTIVE V2 registry — the alias map
+        # resolves its template, the replacements are named, and readiness comes from BR-7's
+        # fold over the replacement definitions. UNASSESSED survives only as the fallback for a
+        # template the map does not know, which a real page never contains.
+        assert block["recipe_contract_version"] == "recipe-contract-v2"
+        assert block["v2_replacements"], hit["suggestion"]["template_id"]
+        assert block["execution_readiness"] != "UNASSESSED"
+        assert all(b["code"] and b["group"] for b in block["readiness_blockers"])
     assert v3["readiness_counts"] == tally and sum(tally.values()) == len(v3["hits"])
 
     del v3["contract_version"], v3["readiness_counts"]

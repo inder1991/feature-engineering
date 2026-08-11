@@ -1596,10 +1596,11 @@ def page_to_json(page: FeatureSuggestionPageV2) -> dict:
     }
 
 
-# ── contract v3 (BR-8): the execution block ─────────────────────────────────────────────────────
-#: A suggestion's declared recipe carriage. Every template-generated suggestion today rides the
-#: legacy Template registry; "recipe-contract-v2" enters this wire the day the BR-17 cutover lets
-#: V2 definitions generate suggestions — the vocabulary exists NOW so that day is additive.
+# ── contract v3 (BR-8, cut over to V2 by BR-17): the execution block ────────────────────────────
+#: A suggestion's declared recipe carriage. Since the BR-17 cutover every legacy template
+#: resolves through the source-controlled alias map to its atomic V2 replacements, so v3 carries
+#: "recipe-contract-v2" for every recipe-generated suggestion; "legacy-template" survives only as
+#: the honest fallback for a suggestion whose template the alias map does not know.
 RECIPE_CONTRACT_LEGACY = "legacy-template"
 RECIPE_CONTRACT_V2 = "recipe-contract-v2"
 
@@ -1626,35 +1627,64 @@ def blocker_group_v3(code: str) -> str:
     return _BLOCKER_GROUPS_V3.get(code, "governance")
 
 
-def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
-    """The additive per-suggestion truthfulness block: what this card IS, execution-wise.
+def _fold_v2_definition(recipe, binding_ambiguity: bool):
+    """One V2 definition through BR-7's REAL fold, with the engine's binding verdict mixed in.
+    The definition's declarations supply the inputs: its computation kind, whether its
+    expectation ref is actually in the reviewed registry (a pack may not claim review by
+    assertion), and the binding ambiguity this page observed."""
+    reviewed = (recipe.formula is not None
+                and recipe.formula.expectation_ref in RECIPE_FORMULA_EXPECTATIONS)
+    return fold_readiness(ReadinessInputsV1(
+        computation_kind=recipe.computation_kind,
+        reviewed_expectation=reviewed,
+        grammar_verdict="ok",
+        binding_blockers=((BLOCKER_AMBIGUOUS_OPERAND_BINDING,) if binding_ambiguity else ()),
+    ))
 
-    A plain legacy template projects exactly what the adapter says it is — a conceptual pattern
-    whose execution was never assessed (UNASSESSED lives on that projection and nowhere else; v3's
-    job is to RENDER it as the idea it is, never as failure and never as readiness). A template
-    holding a REVIEWED formula expectation enters BR-7's fold with that fact — and with the
-    engine's own binding verdict — so the two authorable anchors surface as FORMULA_AUTHORABLE
-    (gold still unproven, honestly named) or FORMULA_BLOCKED when their binding was ambiguous."""
+
+def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
+    """The additive per-suggestion truthfulness block, grounded in the ACTIVE (V2) registry.
+
+    The suggestion's legacy template resolves through the source-controlled alias map to its
+    atomic V2 replacements; each replacement runs through BR-7's fold (with the engine's own
+    binding verdict), and the card presents the BEST-ready atom — an idea that HAS an authorable
+    realization says so, even while a conceptual sibling stays an idea — with every replacement
+    named in ``v2_replacements`` so the split is visible, never smuggled. A template the alias
+    map does not know keeps the honest legacy fallback: UNASSESSED, an idea, zero blockers."""
+    from featuregen.overlay.upload.recipe_readiness import READINESS_LADDER
+    from featuregen.overlay.upload.recipe_registry_v2 import (
+        LEGACY_ALIAS_MAP,
+        v2_recipe_by_id,
+    )
+
     binding_ambiguity = binding_quality == "ambiguous"
-    if template_id in RECIPE_FORMULA_EXPECTATIONS:
-        readiness = fold_readiness(ReadinessInputsV1(
-            computation_kind="deterministic_formula",
-            reviewed_expectation=True,
-            grammar_verdict="ok",
-            binding_blockers=((BLOCKER_AMBIGUOUS_OPERAND_BINDING,) if binding_ambiguity else ()),
-        ))
-        state, blockers = readiness.state, readiness.blockers
-        computation_kind = "deterministic_formula"
-    else:
-        state, blockers = "UNASSESSED", ()
-        computation_kind = "conceptual_pattern"
+    targets = LEGACY_ALIAS_MAP.get(template_id or "")
+    if not targets:
+        return {
+            "recipe_contract_version": RECIPE_CONTRACT_LEGACY,
+            "computation_kind": "conceptual_pattern",
+            "execution_readiness": "UNASSESSED",
+            "readiness_blockers": [],
+            "binding_ambiguity": binding_ambiguity,
+            "v2_replacements": [],
+        }
+
+    rank = {state: index for index, state in enumerate(READINESS_LADDER)}
+    best_recipe, best_readiness = None, None
+    for target in targets:
+        recipe = v2_recipe_by_id(target)
+        readiness = _fold_v2_definition(recipe, binding_ambiguity)
+        if best_readiness is None or (rank[readiness.state] > rank[best_readiness.state]
+                                      and readiness.state != "RETIRED"):
+            best_recipe, best_readiness = recipe, readiness
     return {
-        "recipe_contract_version": RECIPE_CONTRACT_LEGACY,
-        "computation_kind": computation_kind,
-        "execution_readiness": state,
+        "recipe_contract_version": RECIPE_CONTRACT_V2,
+        "computation_kind": best_recipe.computation_kind,
+        "execution_readiness": best_readiness.state,
         "readiness_blockers": [{"code": code, "group": blocker_group_v3(code)}
-                               for code in blockers],
+                               for code in best_readiness.blockers],
         "binding_ambiguity": binding_ambiguity,
+        "v2_replacements": list(targets),
     }
 
 

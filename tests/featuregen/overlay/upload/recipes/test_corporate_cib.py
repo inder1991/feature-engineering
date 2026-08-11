@@ -80,3 +80,34 @@ def test_stress_splits_the_line_count_and_reads_the_governed_threshold():
     assert any(op.status_policy_ref.startswith("threshold:cross-product")
                for op in r.operands)
     assert "counts zero, honestly" in r.business_definition
+
+
+# ── BR-17: the legacy registry is FROZEN ────────────────────────────────────────────────────────
+def test_the_legacy_template_registry_is_frozen():
+    """New recipe authoring through Template fails CI: the legacy id set is pinned EXACTLY.
+    Author new recipes in recipes/<family>.py against Recipe Contract v2 — this is also the
+    enforcement of BR-2's routing rule for the 4c triage cards."""
+    from featuregen.overlay.upload.recipe_registry_v2 import LEGACY_ALIAS_MAP
+
+    legacy_ids = {t.id for t in ALL_TEMPLATES}
+    assert len(legacy_ids) == 157
+    assert legacy_ids == set(LEGACY_ALIAS_MAP), (
+        "the legacy registry changed: a new Template must be authored as a RecipeDefinitionV2 "
+        "in recipes/<family>.py (and a removal needs its alias-map entry retired deliberately)")
+
+
+def test_the_active_registry_carries_zero_reviewed_debt():
+    """BR-17 strict mode: the ACTIVE registry's debt counters are zero — no unreplaced legacy
+    recipe, no variant identity collision, no UNASSESSED (unconstructible), no legacy
+    applicability inference (every V2 recipe declares its primary), no PIT placeholders (typed
+    temporal specs have none)."""
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    counters = audit_registry().counters
+    assert counters["legacy_recipes_not_in_v2"] == 0
+    assert counters["v2_variant_identity_collision_recipes"] == 0
+    assert all(r.primary_objective for r in V2_RECIPES)
+    assert all(r.readiness != "UNASSESSED" for r in V2_RECIPES)
+    # display identity: every output id and display label unique across the active registry
+    output_ids = [r.output.output_id for r in V2_RECIPES]
+    assert len(output_ids) == len(set(output_ids))

@@ -419,6 +419,9 @@ class ExecutionBlockV3Response(_Model):
     execution_readiness: str
     readiness_blockers: list[ReadinessBlockerV3Response]
     binding_ambiguity: bool
+    #: BR-17: the atomic V2 recipe ids replacing this suggestion's legacy template — the split
+    #: made visible; empty only on the legacy fallback.
+    v2_replacements: list[str]
 
 
 class FeatureSuggestionV3Response(FeatureSuggestionV2Response):
