@@ -3911,3 +3911,76 @@ export function postRecipeReview(
     rationale: req.rationale,
   })
 }
+
+// ── concept confirmations (SE-4b) — the authority-bootstrap funnel ───────────────────────────────
+//
+// Bulk BY-EXCEPTION confirmation of proposed concepts, grouped by concept and ordered by how
+// load-bearing each concept is (how many governed recipe operands reference it). Every column
+// carries the CAS anchor the field-correction command re-checks; the batch POST applies one
+// attributable decision per column, and one column's stale anchor never touches its siblings.
+
+export interface ConceptConfirmationColumn {
+  object_ref: string
+  table: string
+  column: string
+  evidence_id: string
+  producer: string
+  strength: string
+  latest_decision_id: string | null
+  evidence_set_hash: string
+  policy_version: string
+}
+
+export interface ConceptConfirmationGroup {
+  concept: string
+  operand_reference_count: number
+  columns: ConceptConfirmationColumn[]
+}
+
+export interface ConceptConfirmationFunnel {
+  active: number
+  human_confirmed: number
+  confirmed_share: number
+}
+
+export interface ConceptConfirmationQueue {
+  catalog_source: string
+  unreferenced_groups_omitted: number
+  funnel: ConceptConfirmationFunnel
+  groups: ConceptConfirmationGroup[]
+}
+
+export interface ConceptDecisionItem {
+  object_ref: string
+  action: 'confirm_existing' | 'reject'
+  evidence_id: string
+  expected_latest_decision_id: string | null
+  expected_evidence_set_hash: string
+  expected_policy_version: string
+}
+
+export interface ConceptConfirmationResult {
+  results: {
+    object_ref: string
+    accepted: boolean
+    status_code: number
+    detail?: string
+    decision_event_id?: string
+  }[]
+  accepted_count: number
+  declined_count: number
+  funnel: ConceptConfirmationFunnel
+}
+
+export function getConceptConfirmations(
+  source: string, includeUnreferenced = false,
+): Promise<ConceptConfirmationQueue> {
+  const suffix = includeUnreferenced ? '&include_unreferenced=true' : ''
+  return request(`/governance/concept-confirmations?source=${encodeURIComponent(source)}${suffix}`)
+}
+
+export function postConceptConfirmations(
+  source: string, items: ConceptDecisionItem[], reason?: string,
+): Promise<ConceptConfirmationResult> {
+  return post('/governance/concept-confirmations', { source, items, reason: reason ?? null })
+}

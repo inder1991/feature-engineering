@@ -6970,3 +6970,32 @@ button.stat:hover {
 
 .rr-event-head { font-size: 13.5px; }
 .rr-event-why { color: var(--ink-soft); font-size: 13px; max-width: 72ch; }
+
+/* ------------------------------------------------- concept confirmations (SE-4b funnel) */
+
+.ccq-group {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ccq-columns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 4px 16px;
+}
+
+.ccq-column {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.ccq-outcome { color: var(--ok); }

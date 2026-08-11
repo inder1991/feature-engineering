@@ -25,6 +25,7 @@ import {
   rejectTableFact,
   reviewBridgeRealization,
 } from '../api'
+import { ConceptConfirmationPanel } from './ConceptConfirmationPanel'
 import { DataUsePolicyPanel } from './DataUsePolicyPanel'
 
 // GOVERNANCE REVIEW — a decision queue, not a search box.
@@ -1699,6 +1700,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
           it, so it has no queue row and would have no home if it were not here. It belongs on the
           DECIDING screen rather than the read-only dashboard: the feature flow's refusal sends the
           reviewer to "Governance -> Data-use policies", and this is where deciding happens. */}
+      <ConceptConfirmationPanel />
       <DataUsePolicyPanel />
     </section>
   )
