@@ -38,6 +38,8 @@ from featuregen.overlay.upload.recipes.account_foundation import (  # noqa: E402
 )
 from featuregen.overlay.upload.recipes.aml import AML_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.asset_management import AM_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.cib_client import CIB_CLIENT_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.cib_risk import CIB_RISK_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.collections import COLLECTIONS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.corporate_cib import CORPORATE_CIB_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.credit import CREDIT_RECIPES  # noqa: E402
@@ -53,8 +55,12 @@ from featuregen.overlay.upload.recipes.markets import MARKETS_RECIPES  # noqa: E
 from featuregen.overlay.upload.recipes.payments import PAYMENTS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.rbwm import RBWM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.retail import RETAIL_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.trade_finance import TRADE_FINANCE_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.transaction_analytics import (  # noqa: E402
     TRANSACTION_ANALYTICS_RECIPES,
+)
+from featuregen.overlay.upload.recipes.transaction_banking import (  # noqa: E402
+    TRANSACTION_BANKING_RECIPES,
 )
 from featuregen.overlay.upload.recipes.transaction_foundation import (  # noqa: E402
     TRANSACTION_FOUNDATION_RECIPES,
@@ -73,7 +79,9 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *TRANSACTION_ANALYTICS_RECIPES,
                                               *ACCOUNT_FOUNDATION_RECIPES,
                                               *CUSTOMER_RECIPES, *RBWM_RECIPES,
-                                              *WEALTH_RECIPES)
+                                              *WEALTH_RECIPES, *CIB_CLIENT_RECIPES,
+                                              *TRANSACTION_BANKING_RECIPES,
+                                              *TRADE_FINANCE_RECIPES, *CIB_RISK_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a

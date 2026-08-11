@@ -6,10 +6,6 @@
       "target_increment": "BR-21"
     },
     {
-      "leaf": "aml_cft.kyc",
-      "target_increment": "BR-21"
-    },
-    {
       "leaf": "aml_cft.sanctions",
       "target_increment": "BR-21"
     },
@@ -55,10 +51,6 @@
     },
     {
       "leaf": "fraud.synthetic_id",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "treasury_alm.cash_management",
       "target_increment": "BR-21"
     }
   ],
