@@ -629,9 +629,23 @@ export function SuggestionCard({
             v2 page the block is absent and NOTHING readiness-shaped renders: a card must not
             synthesize a state the contract did not carry. */}
         {s.execution && (
-          <span className={`badge ${READINESS_TONE[s.execution.execution_readiness] ?? 'gj-none'}`}>
-            {readinessWords(s.execution.execution_readiness)}
-          </span>
+          s.execution.output_selection_required
+            ? (
+              // A multi-output legacy card: its readiness is the BEST atom's — a ceiling, not a
+              // property of the card — so the chip says the honest thing: the choice is pending.
+              <span
+                className="badge gj-none"
+                title={`Up to ${readinessWords(s.execution.execution_readiness)} — readiness is `
+                  + 'per output; open the card to choose'}
+              >
+                varies by output
+              </span>
+            )
+            : (
+              <span className={`badge ${READINESS_TONE[s.execution.execution_readiness] ?? 'gj-none'}`}>
+                {readinessWords(s.execution.execution_readiness)}
+              </span>
+            )
         )}
         {s.binding_quality && <span className="gj-score">binding {s.binding_quality}</span>}
       </div>
@@ -991,8 +1005,26 @@ function SuggestionDetail({
                 </ul>
               )}
             {/* BR-17: the legacy idea's atomic V2 replacements, named — a split recipe shows
-                its atoms rather than pretending to be one quantity. */}
-            {(s.execution.v2_replacements?.length ?? 0) > 0 && (
+                its atoms rather than pretending to be one quantity. When the backend carries
+                per-replacement readiness, each atom shows its OWN state (nothing inherits a
+                sibling's); a multi-output card says the choice is the user's to make. */}
+            {s.execution.output_selection_required && (
+              <p className="hint">
+                This suggestion spans {s.execution.replacement_readiness?.length ?? 'several'}{' '}
+                atomic outputs — the readiness above is the best one&rsquo;s. Choosing which
+                output to build is your call, not the platform&rsquo;s.
+              </p>
+            )}
+            {(s.execution.replacement_readiness?.length ?? 0) > 0 ? (
+              <ul className="sfc-omit">
+                {s.execution.replacement_readiness!.map(r => (
+                  <li key={r.recipe_id}>
+                    <span className="mono">{r.recipe_id}</span>
+                    {' '}— {readinessWords(r.execution_readiness)}
+                  </li>
+                ))}
+              </ul>
+            ) : (s.execution.v2_replacements?.length ?? 0) > 0 && (
               <p className="hint">
                 Governed recipe{(s.execution.v2_replacements!.length > 1) ? 's' : ''}:{' '}
                 <span className="mono">{s.execution.v2_replacements!.join(', ')}</span>

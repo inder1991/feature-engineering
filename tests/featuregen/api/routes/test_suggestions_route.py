@@ -263,13 +263,16 @@ def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  
     v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
     v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
     assert v3["contract_version"] == 3
-    assert set(v3) - set(v2) == {"contract_version", "readiness_counts"}
+    assert set(v3) - set(v2) == {"contract_version", "readiness_counts",
+                                 "output_selection_required_count"}
 
     tally: dict[str, int] = {}
+    selection_required = 0
     for hit in v3["hits"]:
         block = hit["suggestion"].pop("execution")
         state = block["execution_readiness"]
         tally[state] = tally.get(state, 0) + 1
+        selection_required += bool(block["output_selection_required"])
         # BR-17: every recipe-generated card grounds in the ACTIVE V2 registry — the alias map
         # resolves its template, the replacements are named, and readiness comes from BR-7's
         # fold over the replacement definitions. UNASSESSED survives only as the fallback for a
@@ -278,9 +281,15 @@ def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  
         assert block["v2_replacements"], hit["suggestion"]["template_id"]
         assert block["execution_readiness"] != "UNASSESSED"
         assert all(b["code"] and b["group"] for b in block["readiness_blockers"])
+        # Multi-output honesty: a card spanning several atoms says so, and every atom carries
+        # its OWN state — the headline is a ceiling, never an inheritance.
+        assert block["output_selection_required"] == (len(block["v2_replacements"]) > 1)
+        assert [r["recipe_id"] for r in block["replacement_readiness"]] \
+            == block["v2_replacements"]
     assert v3["readiness_counts"] == tally and sum(tally.values()) == len(v3["hits"])
+    assert v3["output_selection_required_count"] == selection_required
 
-    del v3["contract_version"], v3["readiness_counts"]
+    del v3["contract_version"], v3["readiness_counts"], v3["output_selection_required_count"]
     assert v3 == v2
 
 

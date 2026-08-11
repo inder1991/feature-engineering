@@ -1650,10 +1650,14 @@ def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
 
     The suggestion's legacy template resolves through the source-controlled alias map to its
     atomic V2 replacements; each replacement runs through BR-7's fold (with the engine's own
-    binding verdict), and the card presents the BEST-ready atom — an idea that HAS an authorable
-    realization says so, even while a conceptual sibling stays an idea — with every replacement
-    named in ``v2_replacements`` so the split is visible, never smuggled. A template the alias
-    map does not know keeps the honest legacy fallback: UNASSESSED, an idea, zero blockers."""
+    binding verdict). The card presents the BEST-ready atom's readiness — an idea that HAS an
+    authorable realization says so — but a MULTI-output alias additionally declares
+    ``output_selection_required``: the legacy card spans several atomic outputs the user has
+    not chosen between, so its headline readiness is a CEILING, not a property of the card,
+    and ``replacement_readiness`` carries each atom's own state (alias-map order) so nothing
+    inherits silently. This mirrors ``resolve_legacy_alias``'s refusal to pick an output for a
+    multi-target alias — the serializer surveys, it never resolves. A template the alias map
+    does not know keeps the honest legacy fallback: UNASSESSED, an idea, zero blockers."""
     from featuregen.overlay.upload.recipe_readiness import READINESS_LADDER
     from featuregen.overlay.upload.recipe_registry_v2 import (
         LEGACY_ALIAS_MAP,
@@ -1670,13 +1674,21 @@ def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
             "readiness_blockers": [],
             "binding_ambiguity": binding_ambiguity,
             "v2_replacements": [],
+            "output_selection_required": False,
+            "replacement_readiness": [],
         }
 
     rank = {state: index for index, state in enumerate(READINESS_LADDER)}
     best_recipe, best_readiness = None, None
+    replacement_readiness: list[dict] = []
     for target in targets:
         recipe = v2_recipe_by_id(target)
         readiness = _fold_v2_definition(recipe, binding_ambiguity)
+        replacement_readiness.append({
+            "recipe_id": target,
+            "execution_readiness": readiness.state,
+            "computation_kind": recipe.computation_kind,
+        })
         if best_readiness is None or (rank[readiness.state] > rank[best_readiness.state]
                                       and readiness.state != "RETIRED"):
             best_recipe, best_readiness = recipe, readiness
@@ -1688,6 +1700,8 @@ def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:
                                for code in best_readiness.blockers],
         "binding_ambiguity": binding_ambiguity,
         "v2_replacements": list(targets),
+        "output_selection_required": len(targets) > 1,
+        "replacement_readiness": replacement_readiness,
     }
 
 
@@ -1698,10 +1712,15 @@ def page_to_json_v3(page: FeatureSuggestionPageV2) -> dict:
     doc = page_to_json(page)
     doc["contract_version"] = 3
     counts: dict[str, int] = {}
+    selection_required = 0
     for hit_doc, hit in zip(doc["hits"], page.hits, strict=True):
         block = execution_block_v3(hit.suggestion.template_id, hit.suggestion.binding_quality)
         hit_doc["suggestion"]["execution"] = block
         state = block["execution_readiness"]
         counts[state] = counts.get(state, 0) + 1
+        selection_required += bool(block["output_selection_required"])
     doc["readiness_counts"] = counts
+    # Cards whose headline readiness is a best-atom CEILING pending an output choice — kept
+    # beside (not inside) readiness_counts, which tallies readiness STATES only.
+    doc["output_selection_required_count"] = selection_required
     return doc

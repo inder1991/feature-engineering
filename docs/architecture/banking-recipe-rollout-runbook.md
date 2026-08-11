@@ -24,19 +24,30 @@ Two migrations are pending on the cluster and MUST land backend-first:
 Verify after deploy: `GET /recipes/posted_debit_amount/reviews` returns 200 with
 `validity.current: false` and the three required roles named.
 
-## 2. The levers
+## 2. The levers — with their HONEST consumer status
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `FEATUREGEN_SUGGESTION_CONTRACT_V3` | on | v3 by explicit query; off = typed 422, v1/v2 untouched |
-| `FEATUREGEN_RECIPE_CONTRACT_V2` | off | V2 registry may serve suggestions (with allowlists) |
-| `FEATUREGEN_RECIPE_V2_FAMILIES` | empty | per-FAMILY promotion allowlist (CSV) |
-| `FEATUREGEN_RECIPE_V2_CANARY_CATALOGS` | empty | per-CATALOG canary allowlist (CSV) |
-| `FEATUREGEN_FORMULA_V2` | off | Formula-v2 authoring (start: foundation families only) |
-| `FEATUREGEN_RECIPE_V2_MATERIALIZATION` | off | execution of approved recipes on one engine |
+**Read the "Consumer today" column before flipping anything.** Several levers are
+forward-declared controls whose serving-path consumers arrive with the semantic-eligibility
+program's tranches (`docs/superpowers/plans/2026-08-11-semantic-eligibility-feature-generation-workflow.md`).
+Flipping a lever with no consumer changes NOTHING at runtime — it neither promotes nor breaks.
+This column is corrected as consumers land; an operator must never have to read source to learn
+whether a switch is connected.
+
+| Env var | Default | Meaning | Consumer today (2026-08-11) |
+|---|---|---|---|
+| `FEATUREGEN_SUGGESTION_CONTRACT_V3` | on | v3 by explicit query; off = typed 422, v1/v2 untouched | **WIRED** — the suggestions route gates on it |
+| `FEATUREGEN_SEMANTIC_PLANNING` | legacy | semantic-planning pipeline mode (legacy / semantic_shadow / semantic_v1) | **WIRED for shadow** — `semantic_shadow` runs the V2 lens beside Gate-1's template lens (log-only); `semantic_v1` has no consumer yet (Tranche 3) |
+| `FEATUREGEN_RECIPE_CONTRACT_V2` | off | V2 registry may serve suggestions (with allowlists) | **NO CONSUMER YET** — V2 serving arrives with SE Tranche 3 |
+| `FEATUREGEN_RECIPE_V2_FAMILIES` | empty | per-FAMILY promotion allowlist (CSV) | **NO CONSUMER YET** — read by nothing until V2 serving exists |
+| `FEATUREGEN_RECIPE_V2_CANARY_CATALOGS` | empty | per-CATALOG canary allowlist (CSV) | **NO CONSUMER YET** — same |
+| `FEATUREGEN_FORMULA_V2` | off | Formula-v2 authoring (start: foundation families only) | **NO CONSUMER YET** — the authoring orchestrator is v1-only and materialization admission refuses non-v1 by design; the v2 authoring path is unchartered work that must precede stage 6 |
+| `FEATUREGEN_RECIPE_V2_MATERIALIZATION` | off | execution of approved recipes on one engine | **NO CONSUMER YET** — arrives with an engine that advertises Formula-v2 |
 
 A family is active only when the flag is on AND the family is allowlisted. An aggregate pass
-rate promotes nothing.
+rate promotes nothing. The `canary_gate` fold and `review_coverage_report` likewise have no
+runtime collector yet: their inputs are measurements the SE-14 shadow metrics will supply —
+until then, gate readings are operator-supplied and the gate's failing defaults are the only
+protection.
 
 ## 3. Stage-by-stage promotion
 
@@ -47,11 +58,18 @@ rate promotes nothing.
    reads `review_coverage_report` — promote nothing whose reviews are not current.
 3. **Stage 5 — canary suggestions.** `FEATUREGEN_RECIPE_CONTRACT_V2=on`,
    one family (`retail_churn`) + one catalog in the allowlists. Run the canary gates (§4).
+   **PREREQUISITE (not yet met): the serving-path consumer** — today this flag is read by
+   nothing; stage 5 becomes executable when SE Tranche 3 wires V2 serving, and the FIRST
+   such consumer must enforce review validity + the family allowlist IN CODE (the activation
+   invariant), never by runbook discipline alone.
 4. **Stage 6 — authoring.** `FEATUREGEN_FORMULA_V2=on` for the foundation families; the
    exemplar (`posted_debit_amount`) is the first authorable target with reviewed expectation
-   and gold.
+   and gold. **PREREQUISITE (not yet met): a Formula-v2 authoring path** — the orchestrator
+   is v1-only and this flag has no consumer; charter that work before scheduling stage 6.
 5. **Stage 7 — materialization.** Only for recipes with CURRENT review validity, on one
-   engine, after its `EngineCapabilityV1` is registered.
+   engine, after its `EngineCapabilityV1` is registered. **PREREQUISITE (not yet met):**
+   admission deliberately refuses non-v1 formulas until an engine advertises v2; the
+   `FEATUREGEN_RECIPE_V2_MATERIALIZATION` flag has no consumer until then.
 6. **Stages 8-10.** Expand family by family on individual gate passes; make v3 the frontend
    default; v1/v2 retirement is a separate, explicitly approved project.
 

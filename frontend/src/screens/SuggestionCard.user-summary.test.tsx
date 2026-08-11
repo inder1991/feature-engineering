@@ -124,6 +124,66 @@ describe('SuggestionCard execution readiness (contract v3)', () => {
     expect(within(card).getByText(/that is a to-do, not/)).toBeInTheDocument()
   })
 
+  it('a multi-output card says the choice is pending — never one atom\'s readiness', async () => {
+    render(
+      <ul>
+        <SuggestionCard
+          hit={hit({
+            display_name: 'trend_card',
+            execution: block({
+              recipe_contract_version: 'recipe-contract-v2',
+              computation_kind: 'deterministic_formula',
+              execution_readiness: 'FORMULA_AUTHORABLE',   // the best atom — a ceiling
+              output_selection_required: true,
+              v2_replacements: ['balance_slope', 'normalized_balance_slope'],
+              replacement_readiness: [
+                { recipe_id: 'balance_slope', execution_readiness: 'FORMULA_AUTHORABLE',
+                  computation_kind: 'deterministic_formula' },
+                { recipe_id: 'normalized_balance_slope', execution_readiness: 'FORMULA_BLOCKED',
+                  computation_kind: 'deterministic_formula' },
+              ],
+            }),
+          })}
+        />
+      </ul>,
+    )
+    const card = screen.getByRole('heading', { name: 'trend_card' }).closest('.sfc') as HTMLElement
+    // The chip refuses to headline the best atom's state as if it were the card's.
+    const chip = within(card).getByText('varies by output')
+    expect(chip.className).toContain('gj-none')
+    expect(within(card).queryByText('formula ready to author')).toBeNull()
+    // The drawer names each atom's OWN state and says whose choice it is.
+    await userEvent.click(within(card).getByRole('button', { name: /full detail/i }))
+    expect(within(card).getByText(/Choosing which output to build is your call/))
+      .toBeInTheDocument()
+    expect(within(card).getByText('balance_slope')).toBeInTheDocument()
+    expect(within(card).getByText('normalized_balance_slope')).toBeInTheDocument()
+    expect(within(card).getByText(/formula blocked/)).toBeInTheDocument()
+  })
+
+  it('a single-output card keeps the plain readiness chip untouched', () => {
+    render(
+      <ul>
+        <SuggestionCard
+          hit={hit({
+            display_name: 'single_card',
+            execution: block({
+              execution_readiness: 'FORMULA_AUTHORABLE',
+              output_selection_required: false,
+              replacement_readiness: [
+                { recipe_id: 'one_atom', execution_readiness: 'FORMULA_AUTHORABLE',
+                  computation_kind: 'deterministic_formula' },
+              ],
+            }),
+          })}
+        />
+      </ul>,
+    )
+    const card = screen.getByRole('heading', { name: 'single_card' })
+      .closest('.sfc') as HTMLElement
+    expect(within(card).queryByText('varies by output')).toBeNull()
+  })
+
   it('explains each blocker in banking words and keeps the machine code beside it', async () => {
     render(
       <ul>

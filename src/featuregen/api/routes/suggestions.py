@@ -409,6 +409,14 @@ class ReadinessBlockerV3Response(_Model):
     group: str
 
 
+class ReplacementReadinessV3Response(_Model):
+    """One atomic V2 replacement's own execution state on a v3 card."""
+
+    recipe_id: str
+    execution_readiness: str
+    computation_kind: str
+
+
 class ExecutionBlockV3Response(_Model):
     """Contract v3's additive truthfulness block: what this card IS, execution-wise. UNASSESSED
     is the legacy adapter's honest word for "nobody decided yet" — an idea, never a failure and
@@ -422,6 +430,13 @@ class ExecutionBlockV3Response(_Model):
     #: BR-17: the atomic V2 recipe ids replacing this suggestion's legacy template — the split
     #: made visible; empty only on the legacy fallback.
     v2_replacements: list[str]
+    #: True when the legacy template maps to SEVERAL atomic outputs the user has not chosen
+    #: between: ``execution_readiness`` is then the best atom's state — a CEILING, not a
+    #: property of this card — and the choice belongs to the user, never the serializer.
+    output_selection_required: bool
+    #: Each replacement's OWN readiness (alias-map order), so no atom's state is inherited
+    #: silently by its siblings.
+    replacement_readiness: list[ReplacementReadinessV3Response]
 
 
 class FeatureSuggestionV3Response(FeatureSuggestionV2Response):
@@ -454,6 +469,8 @@ class FeatureSuggestionPageV3Response(FeatureSuggestionPageV2Response):
     contract_version: int
     hits: list[FeatureSuggestionHitV3Response]  # type: ignore[assignment]
     readiness_counts: dict[str, int]
+    #: How many hits carry a ceiling readiness pending an output choice (multi-output aliases).
+    output_selection_required_count: int
 
 
 #: Documentation-only: the handler returns plain dicts, so declaring these here publishes both

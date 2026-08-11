@@ -1649,7 +1649,9 @@ def test_an_unknown_template_keeps_the_honest_legacy_fallback():
                          "execution_readiness": "UNASSESSED",
                          "readiness_blockers": [],
                          "binding_ambiguity": False,
-                         "v2_replacements": []}
+                         "v2_replacements": [],
+                         "output_selection_required": False,
+                         "replacement_readiness": []}
 
 
 def test_every_real_template_resolves_to_the_v2_registry():
@@ -1708,5 +1710,5 @@ def test_v3_decorates_a_copy_of_the_v2_page_and_tallies_what_it_added(overlay_co
     assert sum(v3["readiness_counts"].values()) == len(v3["hits"]) == len(v2["hits"]) >= 1
     for hit in v3["hits"]:
         hit["suggestion"].pop("execution")
-    del v3["contract_version"], v3["readiness_counts"]
+    del v3["contract_version"], v3["readiness_counts"], v3["output_selection_required_count"]
     assert v3 == v2

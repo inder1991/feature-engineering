@@ -2997,6 +2997,16 @@ export interface SuggestionExecutionBlock {
   // BR-17: the atomic V2 recipe ids replacing this legacy template (empty on the fallback).
   // Optional so a pre-cutover backend still parses.
   v2_replacements?: string[]
+  // True when this legacy card spans SEVERAL atomic outputs the user has not chosen between:
+  // execution_readiness is then the best atom's state — a ceiling, not a property of the card.
+  // Optional so an older backend still parses.
+  output_selection_required?: boolean
+  // Each replacement's OWN readiness (alias-map order) — nothing inherits a sibling's state.
+  replacement_readiness?: {
+    recipe_id: string
+    execution_readiness: string
+    computation_kind: string
+  }[]
 }
 
 // The exact ids a reader compares for CURRENTNESS — and which are excluded from every semantic
