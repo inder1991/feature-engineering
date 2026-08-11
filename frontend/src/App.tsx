@@ -9,6 +9,7 @@ import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
 import { IntegrationsScreen } from './screens/IntegrationsScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
+import { RecipeReviewScreen } from './screens/RecipeReviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
@@ -142,6 +143,15 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="m6.25 8 1.25 1.25L10 6.5" />
     </NavIcon>
   ),
+  // A signed sheet: a recipe definition with a decision recorded against it. Distinct from
+  // 'governance' (a shield: relationship confirmations) — this is per-definition sign-off.
+  recipes: (
+    <NavIcon>
+      <rect x="3.25" y="2.25" width="9.5" height="11.5" rx="1.25" />
+      <path d="M5.5 5.25h5M5.5 7.5h5" />
+      <path d="m5.5 10.75 1.25 1.25L9.5 9.25" />
+    </NavIcon>
+  ),
   dashboard: (
     // Rollup bars over a baseline: the read-only counts at a glance.
     <NavIcon>
@@ -271,6 +281,16 @@ const PAGES: PageHead[] = [
     description:
       'Every relationship waiting on a person, across every catalog you can see. The system '
       + 'proposes; you decide whether it means what it says.',
+  },
+  {
+    route: 'recipes',
+    label: 'Recipe reviews',
+    eyebrow: 'CATALOG · RECIPE REVIEWS',
+    title: 'Recipe reviews',
+    description:
+      'The governed recipe registry opened for sign-off: what each recipe computes, which reviewer '
+      + 'roles its own declarations require, and where approvals are missing at the current '
+      + 'revision. Recording a decision needs the governance role.',
   },
   {
     route: 'dashboard',
@@ -424,6 +444,7 @@ export default function App() {
         {route === 'governance' && (
           <GovernanceReviewScreen initialSource={params.get('source') ?? ''} />
         )}
+        {route === 'recipes' && <RecipeReviewScreen initialRecipe={params.get('recipe') ?? ''} />}
         {route === 'dashboard' && <GovernanceDashboardScreen onReview={openGovernanceReview} />}
         {route === 'asset' && (
           // Reached via a Details action on a search hit — source + object_ref ride the hash. Keyed

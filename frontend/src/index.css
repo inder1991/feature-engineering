@@ -6750,3 +6750,223 @@ button.stat:hover {
 .ln-wrap .react-flow__controls-button:last-child {
   border-bottom: 0;
 }
+
+/* ------------------------------------------------------- recipe reviews (BR-23 sign-off) */
+
+/* Master–detail: the queue keeps a fixed readable column, the definition takes the rest.
+   Below 960px the panes stack; the queue is capped so the definition stays reachable. */
+.rr-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .rr-layout { grid-template-columns: 1fr; }
+  .rr-queue { max-height: 44vh; }
+}
+
+.rr-queue {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 180px);
+  overflow-y: auto;
+  position: sticky;
+  top: 16px;
+}
+
+.rr-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rr-family-head { margin: 4px 0 0; }
+
+.rr-rows {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A queue row is a button semantically but not visually: undo the global button rule's
+   centering and fixed height (button:where(:not(.nav-item)) sets align-items/justify-content/
+   height, which a display override alone does not clear). */
+.rr-row {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-weight: 400;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  height: auto;
+  gap: 4px;
+}
+
+.rr-row:hover { background: var(--surface-2); }
+
+.rr-row--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.rr-row-label { font-weight: 550; }
+
+.rr-row-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.rr-row-id {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* The three honest validity states — none of them renders as failure. */
+.rr-chip {
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.rr-chip--approved { background: var(--ok-soft); color: var(--ok); }
+.rr-chip--awaiting { background: var(--surface-2); color: var(--ink-soft); }
+.rr-chip--blocked  { background: var(--warn-soft); color: var(--warn); }
+.rr-chip--stale {
+  background: var(--surface-2);
+  color: var(--ink-faint);
+  margin-left: 8px;
+}
+
+.rr-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.rr-head h2 { margin: 0; }
+.rr-head-id { margin: 4px 0 8px; color: var(--ink-faint); font-size: 13px; }
+.rr-head-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+
+.rr-section > h3 { margin: 0 0 8px; }
+.rr-section > p { margin: 0 0 6px; max-width: 72ch; }
+
+.rr-roles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rr-role {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.rr-role--approved { border-color: var(--ok-soft); background: var(--ok-soft); }
+.rr-role--blocked  { border-color: var(--warn-soft); background: var(--warn-soft); }
+
+.rr-role-name { font-weight: 550; }
+.rr-role-state { color: var(--ink-soft); font-size: 13px; text-align: right; }
+.rr-role--approved .rr-role-state { color: var(--ok); }
+.rr-role--blocked .rr-role-state { color: var(--warn); }
+
+.rr-current { color: var(--ok); margin: 8px 0 0; }
+
+.rr-kvs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px 16px;
+}
+
+.rr-kv { display: flex; flex-direction: column; gap: 2px; }
+.rr-kv-label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.rr-kv-value { font-size: 13.5px; }
+
+.rr-operands, .rr-policies, .rr-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rr-operand {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.rr-operand-role { font-size: 12.5px; color: var(--accent); }
+.rr-operand-facts { color: var(--ink-soft); font-size: 13.5px; }
+.rr-policy { font-size: 12.5px; color: var(--ink-soft); }
+
+.rr-decide {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.rr-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 560px;
+}
+
+.rr-form-actions { display: flex; align-items: center; gap: 12px; }
+.rr-recorded { color: var(--ok); font-size: 13.5px; }
+
+.rr-event {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rr-event-head { font-size: 13.5px; }
+.rr-event-why { color: var(--ink-soft); font-size: 13px; max-width: 72ch; }

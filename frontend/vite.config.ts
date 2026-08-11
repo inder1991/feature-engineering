@@ -24,7 +24,11 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   // Phase G's materialization trigger + status. No screen calls it yet — it is here because
   // nginx.conf and this list must agree, and because a missing prefix answers a POST with 405
   // from the SPA rather than a 404 anyone would recognise as routing.
-  '/materialization-runs']
+  '/materialization-runs',
+  // BR-23's recipe-review surface: the summary queue, the definition under review, and the
+  // review history + decision POST (api.ts getRecipeReviewSummary/getRecipeDetail/
+  // getRecipeReviews/postRecipeReview).
+  '/recipes']
 
 export default defineConfig({
   plugins: [react()],

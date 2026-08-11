@@ -104,17 +104,23 @@ def review_validity(recipe,
         single_identity_violation=single_identity)
 
 
+def by_role_at_revision(events, recipe_revision_hash: str) -> dict[str, RecipeReviewEventV1]:
+    """The newest event PER ROLE at this exact revision, from an append-ordered event list —
+    the pure half of the store read, shared by the per-recipe and batch surfaces."""
+    by_role: dict[str, RecipeReviewEventV1] = {}
+    for event in events:                                # oldest first; later wins per role
+        if event.recipe_revision_hash == recipe_revision_hash:
+            by_role[event.reviewer_role] = event
+    return by_role
+
+
 def reviews_by_role_for_revision(conn, *, recipe_id: str,
                                  recipe_revision_hash: str,
                                  ) -> dict[str, RecipeReviewEventV1]:
     """The newest event PER ROLE at this exact revision — the fold's input, from the store."""
     from featuregen.overlay.upload.recipe_review import review_events
 
-    by_role: dict[str, RecipeReviewEventV1] = {}
-    for event in review_events(conn, recipe_id):        # oldest first; later wins per role
-        if event.recipe_revision_hash == recipe_revision_hash:
-            by_role[event.reviewer_role] = event
-    return by_role
+    return by_role_at_revision(review_events(conn, recipe_id), recipe_revision_hash)
 
 
 def review_coverage_report(recipes, validity_by_recipe: Mapping[str, ReviewValidityV1]) -> dict:

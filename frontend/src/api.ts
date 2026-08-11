@@ -3738,3 +3738,166 @@ export function revokeDataUsePolicy(
     expected_pointer_version: req.expectedPointerVersion,
   })
 }
+
+// ── recipe reviews (BR-23) — the governed-recipe sign-off surface ────────────────────────────────
+//
+// Reads are catalog:read; the decision POST needs governance:confirm and carries the revision hash
+// the reviewer actually looked at — a mismatch with the live definition is a 409, never a silent
+// approval of something that changed underneath. Reviewer identity comes from the session.
+
+export interface RecipeReviewValidity {
+  current: boolean
+  required_roles: string[]
+  approved_roles: string[]
+  missing_roles: string[]
+  blocking_decisions: string[]          // "role:decision" for roles whose newest decision blocks
+  single_identity_violation: boolean
+}
+
+export interface RecipeReviewSummaryRow {
+  recipe_id: string
+  family: string
+  readiness: string
+  computation_kind: string
+  display_label: string
+  leakage_classification: string
+  recipe_revision_hash: string
+  validity: RecipeReviewValidity
+}
+
+export interface RecipeReviewSummary {
+  recipes: RecipeReviewSummaryRow[]
+  total: number
+}
+
+// The definition under review, serialized from the backend contract dataclass (RecipeDefinitionV2).
+// Only the fields the review screen renders are typed here; the object carries the full contract.
+export interface RecipeOutputSpec {
+  output_id: string
+  display_label: string
+  output_type: string
+  additivity: string
+  unit_kind: string
+  unit_policy: string
+  currency_policy: string
+  null_input_policy: string
+  empty_population_policy: string
+  zero_denominator_policy: string
+  valid_range: string
+  aggregation_over_entity: string
+  aggregation_over_time: string
+}
+
+export interface RecipeOperandSpec {
+  role: string
+  concept: string
+  operand_class: string
+  required: boolean
+  economic_role: string
+  status_policy_ref: string
+  temporal_role: string
+  unit_expectation: string
+  currency_expectation: string
+}
+
+export interface RecipeParameterSpec {
+  name: string
+  parameter_class: string
+  allowed_values: (string | number)[]
+  identity_projection: string
+  governed_policy_ref: string
+}
+
+export interface RecipeTemporalSpec {
+  anchor_kind: string
+  window_basis: string
+  window_unit: string
+  window_parameter: string
+  timezone_policy: string
+  calendar_policy: string
+  cutoff_inclusivity: string
+  snapshot_policy: string
+  late_arrival_policy: string
+}
+
+export interface RecipeDefinition {
+  recipe_id: string
+  revision: number
+  family: string
+  primary_objective: string
+  supporting_objectives: string[]
+  business_definition: string
+  decision_context: string
+  computation_kind: string
+  readiness: string
+  source_grain: string
+  output_grain: string
+  output: RecipeOutputSpec
+  operands: RecipeOperandSpec[]
+  parameters: RecipeParameterSpec[]
+  temporal: RecipeTemporalSpec
+  eligibility: { included: string; excluded: string; policy_refs: string[] }
+  leakage: { classification: string; permitted_stages: string[]; prohibited_stages: string[] }
+  formula: { formula_schema_version: string; expectation_ref: string; result_class: string } | null
+  conceptual_reason: string
+  model_feature_ref: string
+  replaces_legacy_ids: string[]
+}
+
+export interface RecipeDetail {
+  recipe: RecipeDefinition
+  recipe_revision_hash: string
+  required_reviewer_roles: string[]
+}
+
+export interface RecipeReviewEvent {
+  event_id: string
+  recipe_revision_hash: string
+  decision: string
+  reviewer: string
+  reviewer_role: string
+  rationale: string
+  gold_corpus_refs: string[]
+  policy_dependencies: string[]
+  supersedes_event_id: string | null
+}
+
+export interface RecipeReviews {
+  recipe_id: string
+  recipe_revision_hash: string
+  validity: RecipeReviewValidity
+  events: RecipeReviewEvent[]
+}
+
+// The backend's closed decision vocabulary (recipe_review.py REVIEW_DECISIONS).
+export const RECIPE_REVIEW_DECISIONS = ['approved', 'changes_required', 'rejected', 'retired'] as const
+export type RecipeReviewDecision = (typeof RECIPE_REVIEW_DECISIONS)[number]
+
+export function getRecipeReviewSummary(): Promise<RecipeReviewSummary> {
+  return request('/recipes')
+}
+
+export function getRecipeDetail(recipeId: string): Promise<RecipeDetail> {
+  return request(`/recipes/${encodeURIComponent(recipeId)}`)
+}
+
+export function getRecipeReviews(recipeId: string): Promise<RecipeReviews> {
+  return request(`/recipes/${encodeURIComponent(recipeId)}/reviews`)
+}
+
+export function postRecipeReview(
+  recipeId: string,
+  req: {
+    decision: RecipeReviewDecision
+    reviewerRole: string
+    reviewedRevisionHash: string
+    rationale: string
+  },
+): Promise<{ event_id: string; recipe_revision_hash: string }> {
+  return post(`/recipes/${encodeURIComponent(recipeId)}/reviews`, {
+    decision: req.decision,
+    reviewer_role: req.reviewerRole,
+    reviewed_revision_hash: req.reviewedRevisionHash,
+    rationale: req.rationale,
+  })
+}

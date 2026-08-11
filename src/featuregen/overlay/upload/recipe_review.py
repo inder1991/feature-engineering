@@ -134,6 +134,18 @@ def review_events(conn, recipe_id: str) -> list[RecipeReviewEventV1]:
     return [_event(r) for r in rows]
 
 
+def review_events_all(conn) -> dict[str, list[RecipeReviewEventV1]]:
+    """Every recorded event grouped by recipe, append order within each — ONE query, for the
+    batch surfaces (the review-summary route folds validity over all 317 recipes per request,
+    and 317 per-recipe queries is not a read model)."""
+    rows = conn.execute(
+        f"SELECT {_COLUMNS} FROM recipe_review_event ORDER BY recorded_seq").fetchall()
+    grouped: dict[str, list[RecipeReviewEventV1]] = {}
+    for row in rows:
+        grouped.setdefault(row[1], []).append(_event(row))
+    return grouped
+
+
 def current_review(conn, *, recipe_id: str,
                    recipe_revision_hash: str) -> RecipeReviewEventV1 | None:
     """The newest event for THIS recipe at THIS exact revision hash — None for any edited
