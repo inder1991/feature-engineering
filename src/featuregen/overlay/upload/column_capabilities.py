@@ -37,7 +37,7 @@ from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.recipe_operand_policy import _type_family
 
 #: The evidence fields whose authority pins ride the capability (one batched read).
-_PINNED_FIELDS = ("concept", "entity", "additivity", "currency")
+_PINNED_FIELDS = ("concept", "entity", "additivity", "currency", "economic_role")
 
 #: The honest absences of this compiler version — axes SE-8 compiles later.
 _ABSENT_AXES = ("dataset_profile_absent", "relationship_state_absent", "use_policy_absent")
@@ -69,6 +69,10 @@ class ColumnCapabilityV1:
     additivity_authority: str
     currency: str | None
     currency_authority: str
+    # the GOVERNED economic role (human/confirmed evidence value) — None otherwise. The
+    # eligibility fold enforces economic-role operands over THIS, never concept compatibility.
+    economic_role: str | None
+    economic_role_authority: str
     # honesty
     missing_context: tuple[str, ...]
     # retrieval-only prose — NEVER a capability input
@@ -97,15 +101,19 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
         ref: normalize_ref(context.catalog_source, col.schema_name, col.table, col.column)
         for ref, col in members}
     pins: dict[tuple[str, str], str] = {}
+    economic_roles: dict[str, tuple[str, str]] = {}      # logical_ref -> (value, authority)
     if members:
         rows = conn.execute(
-            "SELECT logical_ref, field_name, producer, strength "
+            "SELECT logical_ref, field_name, producer, strength, proposed_value "
             "FROM field_evidence "
             "WHERE lifecycle = 'active' AND field_name = ANY(%s) AND logical_ref = ANY(%s) "
             "ORDER BY created_at, evidence_id",
             (list(_PINNED_FIELDS), list(logical_by_ref.values()))).fetchall()
-        for logical_ref, field_name, producer, strength in rows:
+        for logical_ref, field_name, producer, strength, proposed_value in rows:
             pins[(logical_ref, field_name)] = f"{producer}/{strength}"   # newest active wins
+            if field_name == "economic_role" and producer == "human" and strength == "confirmed":
+                economic_roles[logical_ref] = (str(proposed_value).strip('"'),
+                                               f"{producer}/{strength}")
 
     from featuregen.overlay.upload.concepts import concept as registered_concept
 
@@ -139,6 +147,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             additivity_authority=_authority(pins, logical_ref, "additivity", col.additivity),
             currency=col.currency,
             currency_authority=_authority(pins, logical_ref, "currency", col.currency),
+            economic_role=economic_roles.get(logical_ref, (None, "absent"))[0],
+            economic_role_authority=economic_roles.get(logical_ref, (None, "absent"))[1],
             missing_context=tuple(missing),
             retrieval_text=" ".join(filter(None, (
                 col.definition, col.ai_summary, col.semantic_terms))))

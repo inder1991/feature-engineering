@@ -1,0 +1,103 @@
+"""SE-4 — the closed eligibility reason vocabulary, grouped into the platform's honest families.
+
+Every code maps to exactly one product FAMILY — the four ways the platform already talks about
+an unmet condition, so a refusal is never a shrug: ``undecided`` (nobody with authority decided
+yet — a confirmation clears it), ``needs_data_check`` (a runtime observation would settle it),
+``structurally_unsuitable`` (no decision or observation can fix it — the binding is wrong), and
+``needs_setup`` (governance/config work is the remedy: a policy, a relationship, a mapping).
+
+Two codes are REUSED from the binder's vocabulary (same strings, one meaning):
+``IDENTIFIER_NOT_A_MEASURE`` and ``TYPE_INCOMPATIBLE`` from ``recipe_operand_policy``.
+"""
+from __future__ import annotations
+
+from featuregen.overlay.upload.recipe_operand_policy import (
+    IDENTIFIER_NOT_A_MEASURE,
+    TYPE_INCOMPATIBLE,
+)
+
+# meaning
+CONCEPT_MISMATCH = "CONCEPT_MISMATCH"
+OPERAND_CLASS_MISMATCH = "OPERAND_CLASS_MISMATCH"
+ECONOMIC_ROLE_UNPROVEN = "ECONOMIC_ROLE_UNPROVEN"          # same string the binder uses
+BUSINESS_EVENT_MISMATCH = "BUSINESS_EVENT_MISMATCH"
+# authority
+SEMANTIC_AUTHORITY_INSUFFICIENT = "SEMANTIC_AUTHORITY_INSUFFICIENT"
+SEMANTIC_CONFLICT = "SEMANTIC_CONFLICT"
+PROPOSED_METADATA_ONLY = "PROPOSED_METADATA_ONLY"
+# shape
+SOURCE_GRAIN_MISMATCH = "SOURCE_GRAIN_MISMATCH"
+SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW = "SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW"
+# type / value
+ADDITIVITY_INCOMPATIBLE = "ADDITIVITY_INCOMPATIBLE"
+UNIT_INCOMPATIBLE = "UNIT_INCOMPATIBLE"
+CURRENCY_POLICY_MISSING = "CURRENCY_POLICY_MISSING"
+# time
+EVENT_TIME_REQUIRED = "EVENT_TIME_REQUIRED"
+AS_OF_TIME_REQUIRED = "AS_OF_TIME_REQUIRED"
+KNOWLEDGE_TIME_REQUIRED = "KNOWLEDGE_TIME_REQUIRED"
+TEMPORAL_POLICY_UNRESOLVED = "TEMPORAL_POLICY_UNRESOLVED"
+# relationship
+RELATIONSHIP_REQUIRED = "RELATIONSHIP_REQUIRED"
+DIRECTIONAL_CARDINALITY_UNPROVEN = "DIRECTIONAL_CARDINALITY_UNPROVEN"
+JOIN_PATH_DENIED = "JOIN_PATH_DENIED"
+# governance
+PERSONAL_DATA_POLICY_REQUIRED = "PERSONAL_DATA_POLICY_REQUIRED"
+PROTECTED_CHARACTERISTIC_BLOCKED = "PROTECTED_CHARACTERISTIC_BLOCKED"
+STATUS_POLICY_UNRESOLVED = "STATUS_POLICY_UNRESOLVED"
+# ambiguity
+REQUIRED_OPERAND_AMBIGUOUS = "REQUIRED_OPERAND_AMBIGUOUS"
+SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
+
+#: code -> product family. A code absent from this table cannot ship — the pin test enforces.
+REASON_FAMILIES: dict[str, str] = {
+    CONCEPT_MISMATCH: "structurally_unsuitable",
+    OPERAND_CLASS_MISMATCH: "structurally_unsuitable",
+    IDENTIFIER_NOT_A_MEASURE: "structurally_unsuitable",
+    TYPE_INCOMPATIBLE: "structurally_unsuitable",
+    BUSINESS_EVENT_MISMATCH: "structurally_unsuitable",
+    SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW: "structurally_unsuitable",
+    SOURCE_GRAIN_MISMATCH: "structurally_unsuitable",
+    UNIT_INCOMPATIBLE: "structurally_unsuitable",
+    ADDITIVITY_INCOMPATIBLE: "structurally_unsuitable",
+    PROTECTED_CHARACTERISTIC_BLOCKED: "structurally_unsuitable",
+    ECONOMIC_ROLE_UNPROVEN: "undecided",
+    SEMANTIC_AUTHORITY_INSUFFICIENT: "undecided",
+    PROPOSED_METADATA_ONLY: "undecided",
+    SEMANTIC_CONFLICT: "needs_data_check",
+    REQUIRED_OPERAND_AMBIGUOUS: "undecided",
+    CURRENCY_POLICY_MISSING: "needs_setup",
+    EVENT_TIME_REQUIRED: "needs_setup",
+    AS_OF_TIME_REQUIRED: "needs_setup",
+    KNOWLEDGE_TIME_REQUIRED: "needs_setup",
+    TEMPORAL_POLICY_UNRESOLVED: "needs_setup",
+    RELATIONSHIP_REQUIRED: "needs_setup",
+    DIRECTIONAL_CARDINALITY_UNPROVEN: "needs_data_check",
+    JOIN_PATH_DENIED: "structurally_unsuitable",
+    PERSONAL_DATA_POLICY_REQUIRED: "needs_setup",
+    STATUS_POLICY_UNRESOLVED: "needs_setup",
+    SOURCE_SELECTION_AMBIGUOUS: "undecided",
+}
+
+#: UI/primary precedence: hard structural truths first, then authority, then setup/checks —
+#: the FIRST code present under this order is the verdict's primary_reason_code.
+REASON_PRECEDENCE: tuple[str, ...] = (
+    PROTECTED_CHARACTERISTIC_BLOCKED, JOIN_PATH_DENIED,
+    IDENTIFIER_NOT_A_MEASURE, OPERAND_CLASS_MISMATCH, TYPE_INCOMPATIBLE,
+    BUSINESS_EVENT_MISMATCH, SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW, SOURCE_GRAIN_MISMATCH,
+    UNIT_INCOMPATIBLE, ADDITIVITY_INCOMPATIBLE, CONCEPT_MISMATCH,
+    SEMANTIC_CONFLICT, ECONOMIC_ROLE_UNPROVEN,
+    SEMANTIC_AUTHORITY_INSUFFICIENT, PROPOSED_METADATA_ONLY,
+    REQUIRED_OPERAND_AMBIGUOUS, SOURCE_SELECTION_AMBIGUOUS,
+    RELATIONSHIP_REQUIRED, DIRECTIONAL_CARDINALITY_UNPROVEN,
+    CURRENCY_POLICY_MISSING, STATUS_POLICY_UNRESOLVED,
+    EVENT_TIME_REQUIRED, AS_OF_TIME_REQUIRED, KNOWLEDGE_TIME_REQUIRED,
+    TEMPORAL_POLICY_UNRESOLVED, PERSONAL_DATA_POLICY_REQUIRED,
+)
+
+
+def reason_family(code: str) -> str:
+    return REASON_FAMILIES[code]
+
+
+__all__ = [name for name in dir() if name.isupper()] + ["reason_family"]
