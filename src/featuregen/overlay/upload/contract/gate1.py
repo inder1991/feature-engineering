@@ -82,7 +82,10 @@ from featuregen.overlay.upload.recipe_grounding_context import (
     RecipeGroundingContextV1,
     build_recipe_grounding_context,
 )
-from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
+from featuregen.overlay.upload.taxonomy.applicability import (
+    ApplicabilityResult,
+    ConfirmedScope,
+)
 from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
@@ -740,13 +743,43 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
     return run_id, snapshot.snapshot_id, snapshot.content_hash
 
 
+def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
+                             grounded_ids: frozenset[str],
+                             rejected_ids: dict[str, tuple[str, ...]]) -> None:
+    """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
+    the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
+    savepoint: a shadow failure must not poison the user's request transaction (the same rule
+    the shadow planner obeys), and the response is byte-identical either way."""
+    from collections import Counter
+
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+
+    try:
+        with conn.transaction():                      # savepoint — shadow reads stay isolated
+            candidates = v2_recipe_candidates(
+                conn, catalog_source=catalog_source, roles=roles, scope=scope)
+        by_state = Counter(candidate.binding_state for candidate in candidates)
+        logger.info(
+            "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
+            "review_current=%d temporal_blocked=%d | legacy grounded=%d rejected=%d",
+            len(candidates), by_state.get("bound", 0), by_state.get("ambiguous", 0),
+            by_state.get("missing", 0), by_state.get("blocked", 0),
+            sum(1 for c in candidates if c.review_current),
+            sum(1 for c in candidates if c.temporal_blocker),
+            len(grounded_ids), len(rejected_ids))
+    except Exception:
+        logger.exception("semantic-shadow comparison failed (response unaffected)")
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None,
                          applicability: ApplicabilityResult | None = None,
                          is_live: bool = False, target_entity: str | None = None,
                          templates: Sequence[Template] | None = None,
-                         generation_run_id: str | None = None) -> ConsideredSet:
+                         generation_run_id: str | None = None,
+                         scope: ConfirmedScope | None = None,
+                         semantic_mode: str = "legacy") -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -850,6 +883,13 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             if governed_ideas:
                 alternatives.append(FeatureSet(lens="templates", features=governed_ideas))
             rejections.extend(governed_rejections)
+    # SE-7 part 2 — the semantic_shadow observation: run the V2 planning lens beside the
+    # template lens and log the divergence. Read-only, fail-soft, response-invisible; the mode
+    # is ROUTE-resolved (the builder never reads env), same discipline as ``is_live``.
+    if semantic_mode == "semantic_shadow" and catalog_source is not None and scope is not None:
+        _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
+                                 grounded_ids=grounded_template_ids,
+                                 rejected_ids=rejected_template_ids)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(

@@ -112,6 +112,7 @@ from featuregen.overlay.upload.recipe_formula_shadow import (
     declare_expected_run,
     recipe_formula_shadow_enabled,
 )
+from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -674,7 +675,13 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             roles=identity.role_claims, target_ref=run_target_ref, objective=run_prediction_goal,
             feedback=run_feedback, now=now, applicability=applicability,
             is_live=is_live, target_entity=scope.target_entity,
-            generation_run_id=generation_run_id)
+            generation_run_id=generation_run_id,
+            # SE-7 part 2: the semantic-planning mode, resolved HERE from the rollout config
+            # (the builder never reads env — same discipline as is_live) with the confirmed
+            # scope the V2 lens classifies against. In `legacy` (the frozen default) the
+            # builder ignores both — byte-identical.
+            scope=scope,
+            semantic_mode=RecipeRolloutConfig.from_env().semantic_planning)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
