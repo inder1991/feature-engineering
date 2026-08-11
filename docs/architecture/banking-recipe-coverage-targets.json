@@ -1,59 +1,6 @@
 {
   "authored": "2026-08-10",
-  "backlog": [
-    {
-      "leaf": "aml_cft.correspondent",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "aml_cft.sanctions",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "aml_cft.screening",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "aml_cft.structuring",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "credit.collections.recoveries",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "credit.monitoring.credit_mitigation",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "credit.underwriting.affordability",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "credit.underwriting.seasoning",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "credit.underwriting.sme",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "fraud.account_takeover",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "fraud.app_scam",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "fraud.card_fraud",
-      "target_increment": "BR-21"
-    },
-    {
-      "leaf": "fraud.synthetic_id",
-      "target_increment": "BR-21"
-    }
-  ],
+  "backlog": [],
   "intentionally_empty": [
     {
       "leaf": "wealth.client_attrition",
@@ -121,6 +68,6 @@
       "rationale": "Declared-future objective: margin forecasting composes NIM and cost features that arrive with the BR-14 pack."
     }
   ],
-  "note": "BR-17 cutover regeneration: coverage now reads the ACTIVE V2 registry (every recipe declares its objectives \u2014 zero legacy inference). Backlog rows name the R5 expansion pack (BR-18 foundation / BR-19 customer-wealth / BR-21 ecosystem) that owns each leaf still lacking a V2 primary. Intentionally-empty rows carry the owning role and reviewed rationale; owners are ROLES, not invented names.",
+  "note": "BR-21 completion: the backlog is EMPTY \u2014 all 75 coverable selectable leaves carry a reviewed V2 primary; the 13 intentionally-empty leaves keep their owner-role and rationale rows. New gaps re-enter as rows here before any release gate accepts them.",
   "version": 1
 }

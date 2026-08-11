@@ -48,9 +48,15 @@ from featuregen.overlay.upload.recipes.custody import CUSTODY_RECIPES  # noqa: E
 from featuregen.overlay.upload.recipes.customer import CUSTOMER_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.deposits_alm import DEPOSITS_ALM_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.esg import ESG_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.fincrime_expansion import (  # noqa: E402
+    FINCRIME_EXPANSION_RECIPES,
+)
 from featuregen.overlay.upload.recipes.fraud import FRAUD_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.insurance import INSURANCE_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.islamic import ISLAMIC_RECIPES  # noqa: E402
+from featuregen.overlay.upload.recipes.lending_lifecycle import (  # noqa: E402
+    LENDING_LIFECYCLE_RECIPES,
+)
 from featuregen.overlay.upload.recipes.markets import MARKETS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.payments import PAYMENTS_RECIPES  # noqa: E402
 from featuregen.overlay.upload.recipes.rbwm import RBWM_RECIPES  # noqa: E402
@@ -81,7 +87,9 @@ V2_RECIPES: tuple[RecipeDefinitionV2, ...] = (*RETAIL_RECIPES, *CROSS_SELL_RECIP
                                               *CUSTOMER_RECIPES, *RBWM_RECIPES,
                                               *WEALTH_RECIPES, *CIB_CLIENT_RECIPES,
                                               *TRANSACTION_BANKING_RECIPES,
-                                              *TRADE_FINANCE_RECIPES, *CIB_RISK_RECIPES)
+                                              *TRADE_FINANCE_RECIPES, *CIB_RISK_RECIPES,
+                                              *LENDING_LIFECYCLE_RECIPES,
+                                              *FINCRIME_EXPANSION_RECIPES)
 
 # The end-to-end probe: a complete, valid, EXECUTABLE-shaped definition exercising every nested
 # spec — deliberately outside V2_RECIPES (non-production) and deliberately FORMULA_BLOCKED with a
