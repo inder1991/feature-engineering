@@ -26,10 +26,7 @@ from featuregen.overlay.upload.contract._serial import (
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
-from featuregen.overlay.upload.contract.near_label_critic import (
-    annotate_near_label,
-    near_label_critic_enabled,
-)
+from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
 from featuregen.overlay.upload.contract.param_choice import choose_params
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.enrich_batch import CallLedger
@@ -201,11 +198,9 @@ _MAX_RATIONALE = 200
 _NEAR_LABEL_MAX_CALLS = 24
 
 
-def _param_choice_enabled() -> bool:
-    """Task 4b — hypothesis-chosen recipe parameters. Default OFF: no dispatch, no override,
-    byte-identical grounding. Unlike the free ordering shadow (Task 4), a shadow here would COST a
-    model call per fresh hypothesis, so flag-off means fully off."""
-    return os.environ.get("FEATUREGEN_PARAM_CHOICE", "0") == "1"
+# Pre-live simplification (2026-08-11): Task 4b's hypothesis-chosen parameters run whenever a
+# client is present — the FEATUREGEN_PARAM_CHOICE flag is retired (fail-soft by construction:
+# any dispatch failure falls back to the authored defaults).
 
 
 def _param_alternatives_line(template: Template, bound: dict) -> str:
@@ -392,11 +387,8 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
             # requirements are untouched.
             # `replace` preserves `grounding_trace` by construction, so the server stamp cannot
             # drop the trace the validator just minted.
-            # Task 4b: the "also available" line rides ONLY under the flag — it feeds _idea_json's
-            # only-when-present emission, so populating it unconditionally would silently change
-            # flag-off snapshot bytes and option identities.
-            alternatives_line = (_param_alternatives_line(by_id[gf.template_id], gf.params)
-                                 if _param_choice_enabled() else "")
+            # Task 4b's "also available" line — unconditional since the flag retired (pre-live).
+            alternatives_line = _param_alternatives_line(by_id[gf.template_id], gf.params)
             ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
                                  planner_applicability="not_applicable_single_catalog",
                                  operand_roles=idea.operand_roles,
@@ -428,13 +420,6 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
 # Normal release mode always narrows to the supplied applicability. The old applicability flag is read
 # only in the explicit legacy_unscoped emergency mode. The narrowing never widens and never relaxes
 # grounding safety.
-def _use_case_ordering_enabled() -> bool:
-    """Task 4 — ORDER the template lens by the signed reading's business_domain. Log-and-compare
-    always runs (pure set math, counters only); the flag gates whether the order is APPLIED.
-    Default OFF: byte-identical."""
-    return os.environ.get("FEATUREGEN_USE_CASE_ORDERING", "0") == "1"
-
-
 def order_ideas_by_use_case(ideas: list[FeatureIdea],
                             domains: tuple[str, ...]) -> list[FeatureIdea]:
     """Task 4's whole ranking step — deterministic set intersection, NO model. Stable descending
@@ -461,7 +446,10 @@ def order_ideas_by_use_case(ideas: list[FeatureIdea],
         return ideas
     changed = [i.name for i in ordered] != [i.name for i in ideas]
     counters.incr(f"overlay.use_case_order.{'changed' if changed else 'unchanged'}")
-    return ordered if _use_case_ordering_enabled() else ideas
+    # Pre-live simplification (2026-08-11): the ordering APPLIES unconditionally — the
+    # FEATUREGEN_USE_CASE_ORDERING flag is retired. The unmappable fallback above already
+    # guarantees a hypothesis with no signed domains keeps the registry order exactly.
+    return ordered
 
 
 def _intent_scoped_applicability_enabled() -> bool:
@@ -838,10 +826,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         to_ground = _templates_to_ground(intent, applicability)
         # Task 4b: hypothesis-chosen parameters — a closed selection from the authored tuples,
         # dispatched ONCE per build for the cache misses only, applied at grounding (BEFORE the
-        # gauntlet and the near-label critic — the walkthrough ordering fix). Flag off / abstain /
-        # no client = empty overrides = the historical first-allowed-value defaults, byte-identical.
+        # gauntlet and the near-label critic — the walkthrough ordering fix). Abstain / no client
+        # = empty overrides = the historical first-allowed-value defaults. Unconditional since
+        # the flag retired (pre-live, 2026-08-11).
         param_overrides: dict[str, dict] = {}
-        if _param_choice_enabled() and client is not None:
+        if client is not None:
             param_overrides = choose_params(
                 conn, client, templates=to_ground,
                 redacted_hypothesis=intent.redacted_hypothesis,
@@ -911,21 +900,21 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # Task 3 — the near-label critic, FLAG-ONLY and ORIGIN-BLIND: every surviving candidate (anchor
     # included, template and LLM alike) gets a {no_finding | too_close | abstain} annotation;
     # nothing is removed (relevance is ORDER, safety is REMOVAL — and this pass is advisory until
-    # the explicit refusal decision). Flag off = byte-identical. The label window is the intake
-    # build's SIGNED reading — no signed window means every verdict abstains at zero model cost.
-    if near_label_critic_enabled():
-        window = signed_reading["target_window_days"] if signed_reading else None
-        ledger = CallLedger(max_provider_calls=_NEAR_LABEL_MAX_CALLS)
-        alternatives = [
-            replace(fs, features=annotate_near_label(
-                conn, client, ideas=fs.features,
-                redacted_hypothesis=intent.redacted_hypothesis,
-                label_window_days=window, call_ledger=ledger))
-            for fs in alternatives]
-        if anchor is not None:
-            anchor = annotate_near_label(
-                conn, client, ideas=[anchor], redacted_hypothesis=intent.redacted_hypothesis,
-                label_window_days=window, call_ledger=ledger)[0]
+    # the explicit refusal decision). Unconditional since the flag retired (pre-live,
+    # 2026-08-11). The label window is the intake build's SIGNED reading — no signed window
+    # means every verdict abstains at zero model cost.
+    window = signed_reading["target_window_days"] if signed_reading else None
+    ledger = CallLedger(max_provider_calls=_NEAR_LABEL_MAX_CALLS)
+    alternatives = [
+        replace(fs, features=annotate_near_label(
+            conn, client, ideas=fs.features,
+            redacted_hypothesis=intent.redacted_hypothesis,
+            label_window_days=window, call_ledger=ledger))
+        for fs in alternatives]
+    if anchor is not None:
+        anchor = annotate_near_label(
+            conn, client, ideas=[anchor], redacted_hypothesis=intent.redacted_hypothesis,
+            label_window_days=window, call_ledger=ledger)[0]
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,

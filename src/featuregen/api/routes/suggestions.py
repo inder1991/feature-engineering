@@ -516,15 +516,9 @@ def table_suggestions(
             "detail": f"unsupported contract_version {contract_version}; this deployment serves "
                       f"{list(SUPPORTED_CONTRACT_VERSIONS)}",
             "error_code": SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION})
-    if contract_version == 3:
-        from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
-
-        if not RecipeRolloutConfig.from_env().suggestion_contract_v3:
-            # The BR-24 rollback lever: v3 can be withdrawn by configuration without touching
-            # v1/v2 behavior or any stored identity — the refusal is the same typed 422.
-            return JSONResponse(status_code=422, content={
-                "detail": "contract_version 3 is disabled by rollout configuration",
-                "error_code": SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION})
+    # Pre-live simplification (2026-08-11): v3 serves unconditionally — the rollback lever was a
+    # switch guarding a read surface with no production users. Version selection stays explicit
+    # via `contract_version`; the closed SUPPORTED set above is the only gate.
     # SET LOCAL is transaction-scoped (the request connection owns the txn), so the bound dies with
     # the request and covers every statement of the read — including the multi-query v2 assembly.
     # SET takes no bound parameters, so the literal is composed — the profiler's own precedent.

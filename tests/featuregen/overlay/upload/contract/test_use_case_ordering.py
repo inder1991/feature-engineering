@@ -34,14 +34,15 @@ def _count(name: str) -> int:
 _IDEAS = [_idea(_OTHER.id, "other_first"), _idea(_DORMANCY.id, "dormancy_second")]
 
 
-def test_shadow_counts_the_would_be_change_and_applies_nothing_by_default(monkeypatch):
-    monkeypatch.delenv("FEATUREGEN_USE_CASE_ORDERING", raising=False)
+def test_the_ordering_applies_unconditionally_and_still_counts(monkeypatch):
+    """Pre-live simplification (2026-08-11): the FEATUREGEN_USE_CASE_ORDERING flag retired —
+    the deterministic ordering APPLIES, and the log-and-compare counter still fires."""
+    monkeypatch.delenv("FEATUREGEN_USE_CASE_ORDERING", raising=False)   # env is inert now
     before = _count("overlay.use_case_order.changed")
     out = order_ideas_by_use_case(_IDEAS, ("engagement",))
-    assert [i.name for i in out] == ["other_first", "dormancy_second"], \
-        "flag off: today's order stands byte-identically"
-    assert _count("overlay.use_case_order.changed") == before + 1, \
-        "…but the would-be change was counted (log-and-compare)"
+    assert [i.name for i in out] == ["dormancy_second", "other_first"], \
+        "the overlap-ranked order is served, not shadow-counted"
+    assert _count("overlay.use_case_order.changed") == before + 1
 
 
 def test_flag_on_orders_by_signed_domain_and_removes_nothing(monkeypatch):

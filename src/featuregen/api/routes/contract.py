@@ -336,10 +336,11 @@ _TEMPLATES_BY_ID = {t.id: t for t in ALL_TEMPLATES}
 
 
 def _intent_ranking_enabled() -> bool:
-    """Deterministic ranking is OFF by default — the scoped considered-set omits ``ranking`` /
-    ``ranking_version`` entirely (Phase-1B/Task-7 byte-identical) unless a deployment opts in with
-    ``FEATUREGEN_INTENT_RANKING=1``."""
-    return os.environ.get("FEATUREGEN_INTENT_RANKING", "0") == "1"
+    """Deterministic ranking is ALWAYS ON — the FEATUREGEN_INTENT_RANKING opt-in retired with
+    the pre-live simplification (2026-08-11): a built, tested, deterministic ordering that
+    nobody could see behind a dark flag is exactly the class of switch the steer removes. The
+    helper remains (three call sites stamp it into provenance) but no longer reads env."""
+    return True
 
 
 def _live_cross_catalog_flag_on() -> bool:

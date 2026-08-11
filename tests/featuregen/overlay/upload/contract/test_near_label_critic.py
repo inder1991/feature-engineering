@@ -145,13 +145,16 @@ def _signed_intent(db):
     return submit_intent(hypothesis=_HYPOTHESIS, actor="ds1")
 
 
-def test_flag_off_is_byte_identical_no_verdicts(db):
+def test_the_critic_annotates_unconditionally(db):
+    """Pre-live simplification (2026-08-11): FEATUREGEN_NEAR_LABEL_CRITIC retired — every
+    surviving candidate carries a verdict without any env (a signed window exists here, so
+    verdicts are real; without one, every verdict abstains at zero model cost)."""
     _churn_catalog(db)
     intent = _signed_intent(db)
     cs = build_considered_set(db, intent, _gen_client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
     ideas = [f for s in cs.alternatives for f in s.features]
-    assert ideas and all(f.near_label_verdict is None for f in ideas)
+    assert ideas and all(f.near_label_verdict is not None for f in ideas)
 
 
 def test_flag_on_annotates_origin_blind_and_the_snapshot_round_trips(db, monkeypatch):

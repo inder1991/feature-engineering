@@ -192,18 +192,15 @@ def test_rankable_recipe_ids_returns_only_eligible():
     assert rankable_recipe_ids([]) == []
 
 
-# ── flag OFF: a scoped call is byte-identical to Task-7 (no ranking keys) ──────────────────────────────
-def test_flag_off_scoped_call_has_no_ranking(make_client, conn, monkeypatch):
+# ── ranking is ALWAYS ON (pre-live simplification 2026-08-11; the env flag is inert) ──────────────────
+def test_ranking_is_always_present_regardless_of_env(make_client, conn, monkeypatch):
     monkeypatch.setenv(SCOPE_FLAG, "1")
-    monkeypatch.delenv(RANK_FLAG, raising=False)   # ranking OFF (default)
+    monkeypatch.delenv(RANK_FLAG, raising=False)   # deleting the retired env changes nothing
     _bank_multi(conn)
 
     body = _post_churn_scoped(make_client(_fake()))
 
-    assert "ranking" not in body and "ranking_version" not in body
-    # Exactly the Task-7 scoped key set — nothing added, nothing removed.
-    assert set(body) == {"intent_id", "anchor", "alternatives", "recommendation", "rejections",
-                         "generation_run_id", "scope_id", "dispositions", "in_scope_count"}
+    assert {"ranking", "ranking_version"} <= set(body)
 
 
 # ── flag ON: eligible set ranked, ordered, cap-respecting, non-eligible absent, versioned ─────────────
@@ -270,30 +267,11 @@ def test_recommendation_is_present_and_distinct_from_ranking(make_client, conn, 
     assert all("recommended_lens" not in r for r in body["ranking"])
 
 
-def test_formula_shadow_ranking_disabled_records_complete_zero_manifest(
-    make_client, conn, monkeypatch
-):
-    monkeypatch.setenv(SCOPE_FLAG, "1")
-    monkeypatch.delenv(RANK_FLAG, raising=False)
-    monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
-    _bank_multi(conn)
-
-    body = _post_churn_scoped(make_client(_fake()))
-
-    assert "ranking" not in body
-    expected = conn.execute(
-        "SELECT ranking_flag, expected_manifest_id "
-        "FROM recipe_formula_shadow_expected_run "
-        "WHERE generation_run_id=%s",
-        (body["generation_run_id"],),
-    ).fetchone()
-    assert expected and expected[0] is False
-    manifest = conn.execute(
-        "SELECT status, expected_observation_count, actual_observation_count, capture_axis "
-        "FROM recipe_formula_shadow_run_manifest WHERE manifest_id=%s",
-        (expected[1],),
-    ).fetchone()
-    assert manifest == ("COMPLETE", 0, 0, "SKIPPED_RANKING_DISABLED")
+# NOTE (pre-live simplification, 2026-08-11): the SKIPPED_RANKING_DISABLED manifest scenario
+# became unrepresentable when the ranking flag retired — ranking is always on, so the expected
+# run always records ranking_flag=True. The enabled manifest path is covered end to end by
+# test_formula_shadow_positive_route_creates_immutable_work_item below (which supplies the
+# REPEATABLE READ connection the capture requires).
 
 
 def test_formula_shadow_expected_declaration_failure_is_loud_503(

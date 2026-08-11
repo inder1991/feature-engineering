@@ -68,9 +68,9 @@ _INSTRUCTION = (
 )
 
 
-def near_label_critic_enabled() -> bool:
-    """Flag-only rollout, read at call time (the platform's pattern). Default OFF: byte-identical."""
-    return os.environ.get("FEATUREGEN_NEAR_LABEL_CRITIC", "0") == "1"
+# Pre-live simplification (2026-08-11): the critic runs unconditionally — the
+# FEATUREGEN_NEAR_LABEL_CRITIC flag is retired. Without a signed label window every verdict
+# abstains at zero model cost, so the no-signal path stays pure code.
 
 
 def _abstain(idea, why: str):

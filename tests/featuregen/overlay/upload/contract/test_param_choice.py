@@ -119,16 +119,18 @@ def _gen_client():
     })
 
 
-def test_flag_off_grounds_the_first_allowed_default_exactly_as_today(db):
+def test_param_choice_runs_unconditionally_and_the_model_pick_applies(db):
+    """Pre-live simplification (2026-08-11): FEATUREGEN_PARAM_CHOICE retired — with a client
+    present the hypothesis-chosen parameter applies without any env, and the "also available"
+    alternatives line is populated."""
     _catalog_for(db, _WINDOWED)
     intent = submit_intent(hypothesis="what is available here", actor="ds1")
     cs = build_considered_set(db, intent, _gen_client(), catalog_source="bank", now=NOW)
     recipe_ideas = [f for s in cs.alternatives for f in s.features
                     if f.recipe_id == _WINDOWED.id]
     if recipe_ideas:   # grounding depends on the fixture matching this template's needs
-        assert f"_{_DEFAULT_WINDOW}d" in recipe_ideas[0].name
-        assert recipe_ideas[0].param_alternatives == "", \
-            "flag off: no new field populated — snapshot bytes unchanged"
+        assert recipe_ideas[0].param_alternatives != "", \
+            "the alternatives line is unconditional now"
 
 
 def test_flag_on_the_hypothesis_chooses_and_identity_carries_it(db, monkeypatch):
