@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
@@ -231,6 +231,12 @@ class ConsideredSetIn(BaseModel):
     recognition_id: str | None = None     # the recognition attempt this scope confirms (lineage)
     confirmed_scope: ConfirmedScopeIn | None = None
     supersedes_scope_id: str | None = None   # broaden lineage: the scope this run's scope supersedes
+    # SE-11: the EXPLICIT response-contract opt-in. 1 (the default) = today's response, byte-
+    # identical — an old client never infers a version from optional fields. 2 = the semantic
+    # candidate contract: top-level contract_version + the resolved semantic-planning mode
+    # (the step-7 diagnostic), with the per-card semantic fields the v2 card serializer already
+    # carries. Never an env flag — the CLIENT asks per request.
+    contract_version: Literal[1, 2] = 1
 
 
 class DraftReqIn(BaseModel):
@@ -711,6 +717,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
                 "dispositions": [_disposition_json(d) for d in dispositions],
                 "in_scope_count": len(disposition_applicability.eligible_ids)}
+    # SE-11: the v2 contract is an EXPLICIT opt-in and the v1 response never carries the new
+    # keys — no newer semantic field silently leaks into the frozen old contract (pinned).
+    if body.contract_version == 2:
+        response["contract_version"] = 2
+        response["semantic_planning_mode"] = semantic_mode
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
@@ -832,6 +843,12 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
     an absent scope. Only the explicit legacy_unscoped emergency mode retains the old one-shot path."""
     if body.confirmed_scope is not None:
         return _scoped_considered_set(body, conn, identity, client)
+    if body.contract_version == 2:
+        # SE-11: the semantic candidate contract needs the scoped pipeline (mode resolution,
+        # dispositions, the semantic engine). The emergency unscoped path stays frozen at v1.
+        raise HTTPException(
+            status_code=422,
+            detail="contract_version 2 requires a confirmed_scope")
     if confirmation_required():
         raise HTTPException(
             status_code=409,
