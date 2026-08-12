@@ -108,6 +108,28 @@ def test_semantic_v1_recipe_cards_carry_projected_provenance(make_client, conn, 
     assert card.get("recipe_id")
 
 
+def test_semantic_v1_dispositions_describe_the_v2_universe(make_client, conn, monkeypatch):
+    """SE-7 part 4: under semantic_v1 the disposition lens folds the universe that was
+    actually planned — V2 recipe ids, with the engine's own grounded/rejected outcomes —
+    never the legacy registry (which would read UNBUILDABLE for every recipe it never ran)."""
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    body = _post(make_client(llm_client=_fake()))
+
+    v2_ids = {r.recipe_id for r in V2_RECIPES}
+    disposition_ids = {d["recipe_id"] for d in body["dispositions"]}
+    assert disposition_ids == v2_ids
+    assert body["in_scope_count"] == len(
+        [d for d in body["dispositions"] if d["relevance_tier"] is not None])
+    # The engine's outcome and the disposition lens agree: anything the projection served or
+    # refused is stamped from those same ids, in the same universe.
+    rows = {r[0] for r in conn.execute(
+        "SELECT DISTINCT source_definition_id FROM semantic_candidate_observation").fetchall()}
+    assert rows <= v2_ids
+
+
 def test_legacy_default_is_untouched_by_the_serving_branch(make_client, conn, monkeypatch):
     """The frozen default: no env var → the semantic serving path must never run."""
     _bank(conn)

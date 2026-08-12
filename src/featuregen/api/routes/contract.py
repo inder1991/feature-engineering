@@ -661,6 +661,17 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
+    # SE-7 part 4: the mode is resolved ONCE here (the builder never reads env). Under
+    # semantic_v1 the DISPOSITION universe is the V2 registry — the universe that was actually
+    # planned — while the legacy object still feeds the legacy machinery (shadow planner,
+    # scoped-grounding narrowing) untouched. In legacy/shadow the two are the same object.
+    semantic_mode = RecipeRolloutConfig.from_env().semantic_planning
+    if semantic_mode == "semantic_v1":
+        from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
+
+        disposition_applicability = v2_applicability_as_result(scope)
+    else:
+        disposition_applicability = applicability
     now = datetime.now(UTC)
     # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
     # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
@@ -682,23 +693,24 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             # scope the V2 lens classifies against. In `legacy` (the frozen default) the
             # builder ignores both — byte-identical.
             scope=scope,
-            semantic_mode=RecipeRolloutConfig.from_env().semantic_planning)
+            semantic_mode=semantic_mode)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
         raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
             status_code=409,
             detail="a concurrent request updated this intent; re-fetch and retry") from e
-    # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
+    # 7. The per-stage disposition lens over the MODE'S applicability universe + this run's
+    #    grounding outcome (the ids the builder actually returned live in the same universe).
     dispositions = evaluate_dispositions(
-        applicability, cs.grounded_template_ids, cs.rejected_template_ids,
+        disposition_applicability, cs.grounded_template_ids, cs.rejected_template_ids,
         evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now,
         incomplete=cs.incomplete_template_ids)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
     response = {**_considered_set_response(conn, intent, cs),
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
                 "dispositions": [_disposition_json(d) for d in dispositions],
-                "in_scope_count": len(applicability.eligible_ids)}
+                "in_scope_count": len(disposition_applicability.eligible_ids)}
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering

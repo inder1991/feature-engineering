@@ -84,6 +84,23 @@ def v2_applicability(scope: ConfirmedScope) -> V2ApplicabilityResult:
     return V2ApplicabilityResult(by_recipe=by_recipe, eligible_ids=eligible)
 
 
+def v2_applicability_as_result(scope: ConfirmedScope):
+    """The V2 classification in the LEGACY ``ApplicabilityResult`` carrier — so under
+    ``semantic_v1`` the disposition lens folds the universe that was actually planned (the V2
+    registry), not the legacy one, without growing a second disposition path. Reason codes use
+    the lens's own vocabulary (the placement is decided by authored objectives here, never by
+    the legacy crosswalk)."""
+    from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
+
+    v2 = v2_applicability(scope)
+    reasons = {"primary": ("primary_match",), "supporting": ("secondary_match",),
+               "out_of_scope": ("no_confirmed_use_case_match",)}
+    return ApplicabilityResult(
+        by_recipe=dict(v2.by_recipe),
+        eligible_ids=v2.eligible_ids,
+        reason_codes={rid: reasons[rel] for rid, rel in v2.by_recipe.items()})
+
+
 def fold_binding_state(verdicts: tuple[OperandBindingVerdictV1, ...],
                        definition: RecipeDefinitionV2) -> str:
     """The candidate-level state, fail-closed in severity order: any BLOCKED required operand
