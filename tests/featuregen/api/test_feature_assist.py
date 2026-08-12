@@ -178,7 +178,8 @@ def test_refine_gauntlet_rejection_is_data_not_an_error(make_client):
         "instruction": "use the balance instead", "catalog_source": "deposits",
         "target_ref": "public.accounts.balance"}, headers=AUTH)
     assert res.status_code == 200
-    assert res.json() == {"rejected": {"reason": "leaks target", "code": "LEAKAGE"}}
+    assert res.json() == {"rejected": {"reason": "leaks target", "code": "LEAKAGE"},
+                          "compatibility_only": True}
 
 
 def _multiset() -> FakeLLM:
@@ -253,3 +254,34 @@ def test_leakage_check_filters_to_used_refs(make_client):
                                  "target_ref": "public.labels.churned"},
                            headers=AUTH).json()["warnings"]
     assert warnings == [{"object_ref": "public.accounts.balance", "reason": "target-adjacent"}]
+
+
+# ── SE-11 step 5: the bypass audit's verdict — compatibility-only, refused when enforced ────────
+
+def test_direct_feature_routes_refuse_in_enforced_semantic_mode(make_client, monkeypatch):
+    """No public endpoint remains a bypass around typed intent, confirmed scope, and semantic
+    eligibility once the pipeline is enforced: the refusal is typed and names the governed
+    route. Checked BEFORE any model dispatch — no spend on a refused request."""
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake())
+    for path, body in (
+        ("/features/recommend", {"objective": "o", "catalog_source": "upl"}),
+        ("/features/recommend-sets", {"objective": "o", "catalog_source": "upl"}),
+        ("/features/recipe", {"query": "q", "catalog_source": "upl"}),
+        ("/features/refine", {
+            "candidate": {"name": "n", "description": "d", "derives_from": [],
+                          "aggregation": None, "grain_table": None},
+            "instruction": "i", "catalog_source": "upl"}),
+    ):
+        res = client.post(path, json=body, headers=AUTH)
+        assert res.status_code == 409, (path, res.text)
+        assert res.json()["detail"]["code"] == "SEMANTIC_ENFORCED_USE_CONTRACT_PIPELINE", path
+
+
+def test_direct_routes_serve_marked_compatibility_only_outside_enforcement(make_client):
+    client = make_client(llm_client=_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/features/recommend",
+                      json={"objective": "o", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200
+    assert res.json()["compatibility_only"] is True

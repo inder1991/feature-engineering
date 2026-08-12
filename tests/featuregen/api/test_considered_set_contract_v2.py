@@ -130,3 +130,54 @@ def test_v2_on_the_emergency_unscoped_path_is_refused(make_client, conn, monkeyp
     }, headers=AUTH)
     assert res.status_code == 422
     assert "confirmed_scope" in res.text
+
+
+def test_draft_refuses_on_a_stale_semantic_snapshot(make_client, conn, monkeypatch):
+    """SE-11 step 6: catalog drift between generation and the human's choice is a typed 409 —
+    the draft never proceeds over a world that no longer exists. The drifted field is OUTSIDE
+    the chosen option's own refs: only the sealed context pin can see it, which is the point.
+    Seeding idiom: the C0 lineage tests' — seal a REAL snapshot and attach it to the mutable
+    considered-set pointer, as a production REPEATABLE READ run would have."""
+    from featuregen.overlay.upload.feature_metadata_snapshot import build_metadata_snapshot
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+        context_snapshot_item,
+    )
+
+    _bank(conn)
+    client = make_client(llm_client=_fake())
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "customers churn when their balance drops",
+        "objective": "predict churn", "catalog_source": "bank"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    names = [f["name"] for s_ in body["alternatives"] for f in s_["features"]]
+    assert names
+
+    # The shared test transaction cannot switch to REPEATABLE READ mid-flight; the seal's
+    # isolation pinning has its own suite (test_feature_gen_isolation) — THIS test proves the
+    # draft route consumes the freshness verdict, so the assertion is stubbed here only.
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.feature_metadata_snapshot._assert_repeatable_read",
+        lambda conn: "repeatable read")
+    context = build_generation_semantic_context(conn, catalog_source="bank")
+    sealed = build_metadata_snapshot(
+        conn, generation_run_id="fgr_stale_probe",
+        refs=[("bank", "public.accounts.balance")],
+        read_scope_hash="sha256:scope", fields=["additivity"],
+        extra_items=[context_snapshot_item(context)])
+    conn.execute(
+        "UPDATE contract_considered SET generation_run_id = %s, snapshot_id = %s, "
+        "snapshot_content_hash = %s WHERE intent_id = %s",
+        ("fgr_stale_probe", sealed.snapshot_id, sealed.content_hash, body["intent_id"]))
+
+    conn.execute("UPDATE graph_node SET additivity = 'non_additive' "
+                 "WHERE object_ref = 'public.accounts.balance'")
+    res = client.post("/contract/draft", json={
+        "intent_id": body["intent_id"],
+        "chosen_option_id": names[0],
+    }, headers=AUTH)
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "SEMANTIC_SNAPSHOT_STALE"
+    assert detail["reason"] == "SNAPSHOT_ITEM_DRIFT"

@@ -103,6 +103,7 @@ from featuregen.overlay.upload.contract.scope_records import (
 )
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
+    compare_snapshot_to_current,
     ensure_generation_run,
 )
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
@@ -1177,6 +1178,25 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     if choice is None:
         raise HTTPException(status_code=422,
                             detail="chosen option is not in the recorded considered set for this intent")
+    # SE-11 step 6: the option's sealed metadata snapshot (which carries the frozen semantic
+    # context pin) is re-verified at the moment of choice — catalog drift since generation is a
+    # typed 409 asking for regeneration, never a silent draft over a world that no longer
+    # exists. "Unverifiable" is logged, not refused: compatibility snapshots (pre-C0 lineage,
+    # kinds this build cannot re-derive) must not brick drafting — absence of proof is not
+    # proof of drift.
+    lineage_snapshot_id = (choice.snapshot_lineage or {}).get("snapshot_id")
+    if lineage_snapshot_id:
+        freshness = compare_snapshot_to_current(conn, lineage_snapshot_id)
+        if freshness.status == "drifted":
+            raise HTTPException(status_code=409, detail={
+                "code": "SEMANTIC_SNAPSHOT_STALE",
+                "message": "the catalog drifted since this considered set was generated; "
+                           "regenerate from the current considered set",
+                "reason": freshness.reason,
+            })
+        if freshness.status == "unverifiable":
+            logger.warning("considered snapshot %s unverifiable at draft time: %s",
+                           lineage_snapshot_id, freshness.reason)
     feature = choice.feature
     target = _target_for_generation(
         conn, intent_id=body.intent_id, snapshot_lineage=choice.snapshot_lineage)
