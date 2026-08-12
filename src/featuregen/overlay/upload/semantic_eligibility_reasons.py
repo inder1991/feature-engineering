@@ -50,6 +50,10 @@ STATUS_POLICY_UNRESOLVED = "STATUS_POLICY_UNRESOLVED"
 # ambiguity
 REQUIRED_OPERAND_AMBIGUOUS = "REQUIRED_OPERAND_AMBIGUOUS"
 SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
+# external runtime checks (SE-9's typed gauntlet emits these as REQUIREMENTS, never refusals:
+# a check nobody has run yet is honest outstanding work, not a defect of the candidate)
+IDENTIFIER_UNIQUENESS = "IDENTIFIER_UNIQUENESS"
+EVENT_HISTORY_VERIFICATION = "EVENT_HISTORY_VERIFICATION"
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {
@@ -80,6 +84,8 @@ REASON_FAMILIES: dict[str, str] = {
     PERSONAL_DATA_POLICY_REQUIRED: "needs_setup",
     STATUS_POLICY_UNRESOLVED: "needs_setup",
     SOURCE_SELECTION_AMBIGUOUS: "undecided",
+    IDENTIFIER_UNIQUENESS: "needs_data_check",
+    EVENT_HISTORY_VERIFICATION: "needs_data_check",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —
@@ -96,6 +102,7 @@ REASON_PRECEDENCE: tuple[str, ...] = (
     CURRENCY_POLICY_MISSING, STATUS_POLICY_UNRESOLVED,
     EVENT_TIME_REQUIRED, AS_OF_TIME_REQUIRED, KNOWLEDGE_TIME_REQUIRED,
     TEMPORAL_POLICY_UNRESOLVED, PERSONAL_DATA_POLICY_REQUIRED,
+    IDENTIFIER_UNIQUENESS, EVENT_HISTORY_VERIFICATION,
 )
 
 
