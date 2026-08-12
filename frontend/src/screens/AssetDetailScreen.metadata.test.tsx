@@ -21,6 +21,7 @@ vi.mock('../api', async importOriginal => {
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
     getTableSuggestionsV2: vi.fn(),
+    getTableSuggestionsV4: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
@@ -35,6 +36,11 @@ beforeEach(() => {
   getAssetDetail.mockReset()
   vi.mocked(api.getTableSuggestionsV2).mockReset()
   vi.mocked(api.getTableSuggestionsV2).mockResolvedValue(suggestionsFixture())
+  vi.mocked(api.getTableSuggestionsV4).mockReset()
+  vi.mocked(api.getTableSuggestionsV4).mockRejectedValue(new api.ApiError(
+    422, 'unsupported contract_version 4; this deployment serves [1, 2, 3]', null,
+    api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  ))
 })
 
 async function openTab(d: api.AssetDetail) {

@@ -7,7 +7,9 @@ import {
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
   type SuggestionGroupV2,
   type SuggestionOmittedCounts,
+  type SuggestionSemanticBlock,
   getTableSuggestionsV2,
+  getTableSuggestionsV4,
 } from '../api'
 import { useIdentityKey } from '../session'
 import { SuggestionCard, TermChip, TruncationNotes } from './SuggestionCard'
@@ -91,10 +93,12 @@ function NeighbourhoodNote({ n }: { n: JoinNeighbourhood | null }) {
 // payload at once — and, more importantly, each is stored WITH the read scope it belongs to.
 type Outcome =
   | { kind: 'loading' }
-  | { kind: 'ok'; page: FeatureSuggestionPageV2 }
+  // `semantic` is present when the deployment served contract v4; absent means the screen fell
+  // back to the older page — the cards render either way, the engine section only with v4.
+  | { kind: 'ok'; page: FeatureSuggestionPageV2; semantic?: SuggestionSemanticBlock }
   | { kind: 'forbidden' }
   | { kind: 'unsupported' }
-  | { kind: 'error'; detail: string }
+  | { kind: 'error', detail: string }
 
 export function SuggestedFeaturesScreen({
   source,
@@ -130,18 +134,29 @@ export function SuggestedFeaturesScreen({
       if (live) setResult({ key: requestKey, outcome: o })
     }
     settle({ kind: 'loading' })
-    getTableSuggestionsV2(source, table)
-      .then(body => settle({ kind: 'ok', page: body }))
+    // SE-13: ask for contract v4 (the v3 execution truth + the engine's semantic block). An
+    // older backend that refuses v4 gets ONE graceful step down to the v2 page this screen has
+    // always rendered — a rolling deploy must not blank the page — and only a deployment that
+    // refuses BOTH is reported as unsupported.
+    getTableSuggestionsV4(source, table)
+      .then(body => settle({ kind: 'ok', page: body, semantic: body.semantic }))
       .catch((e: unknown) => {
         // A 403 is not a failure to report as one: the route is gated on catalog:read and this
         // session's roles do not carry it. Kept a distinct outcome so the screen can say WHICH
         // permission is missing instead of leaking the server's detail string into a red alert.
         if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })
-        // The deployment does not serve the discovery contract this client asks for. Also distinct:
-        // it is not a broken page and not a permission problem.
         else if (e instanceof ApiError
-          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) settle({ kind: 'unsupported' })
-        else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
+          && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) {
+          getTableSuggestionsV2(source, table)
+            .then(body => settle({ kind: 'ok', page: body }))
+            .catch((e2: unknown) => {
+              if (e2 instanceof ApiError && e2.status === 403) settle({ kind: 'forbidden' })
+              else if (e2 instanceof ApiError
+                && e2.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) {
+                settle({ kind: 'unsupported' })
+              } else settle({ kind: 'error', detail: e2 instanceof ApiError ? e2.detail : String(e2) })
+            })
+        } else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
       })
     return () => {
       live = false
@@ -185,7 +200,8 @@ export function SuggestedFeaturesScreen({
           <div className="callout-body">
             <p role="status">
               <strong>This deployment does not serve the discovery contract.</strong> The screen
-              asked for suggestion contract version 2 and the server refused it.
+              asked for suggestion contract version 4, stepped down to version 2, and the server
+              refused both.
             </p>
             <p className="hint">
               The server is older than this screen. Nothing is wrong with the catalog or with your
@@ -352,6 +368,13 @@ export function SuggestedFeaturesScreen({
         />
       ))}
 
+      {/* SE-13: the ENGINE's verdicts — the same lens the hypothesis Workbench serves from,
+          run without a hypothesis and anchored to this table. Evidence beside the cards, never
+          a re-ranking of them; absent entirely when the deployment served the older contract. */}
+      {outcome.semantic && (
+        <SemanticEngineSection semantic={outcome.semantic} />
+      )}
+
       {Object.values(collection.omitted_counts).some(n => (n ?? 0) > 0) && (
         <section className="panel sug-omitted" data-testid="page-truncation">
           <h2>What this page left out</h2>
@@ -373,6 +396,60 @@ export function SuggestedFeaturesScreen({
               ))}
           </ul>
         </section>
+      )}
+    </section>
+  )
+}
+
+// SE-13: the engine's verdicts for this table. Ranked = bound, in the designed composite order
+// (basis stated by the backend, echoed in the title). Actionable = undecided work with its named
+// resolution — shown as a to-do, never as a low rank. One engine serves this and the Workbench,
+// so the two surfaces cannot disagree about a binding's validity; this section is that engine's
+// answer, verbatim.
+function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock }) {
+  if (semantic.ranked.length === 0 && semantic.actionable.length === 0) return null
+  return (
+    <section className="panel sug-semantic" data-testid="semantic-engine">
+      <h2>What the planning engine says</h2>
+      <p className="hint" title={`order basis: ${semantic.order_basis}`}>
+        The same engine that plans hypothesis workbench candidates, run against this table —
+        context <span className="mono">{semantic.semantic_context_hash.slice(0, 12)}</span>.
+      </p>
+      {semantic.ranked.length > 0 && (
+        <ul className="rows" aria-label="bindable recipes">
+          {semantic.ranked.map(entry => (
+            <li key={entry.recipe_id}>
+              <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
+              <span className="badge ok">bindable</span>{' '}
+              <span className="badge">{entry.readiness.toLowerCase().replace(/_/g, ' ')}</span>
+              {entry.review_current
+                ? <span className="badge ok"> reviewed</span>
+                : <span className="badge"> unreviewed</span>}
+              {entry.corroborations.length > 0 && (
+                <span className="hint"> · also arrived at by {entry.corroborations
+                  .map(c => c.origin).join(', ')}</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {semantic.actionable.length > 0 && (
+        <>
+          <h3>Could be useful if…</h3>
+          <ul className="rows" aria-label="recipes needing a decision">
+            {semantic.actionable.map(entry => {
+              const action = entry.verdicts.find(v => v.resolution)?.resolution
+                ?? 'no eligible binding for every required operand'
+              return (
+                <li key={entry.recipe_id}>
+                  <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
+                  <span className="badge stale">{entry.binding_state}</span>{' '}
+                  <span className="hint">{action}</span>
+                </li>
+              )
+            })}
+          </ul>
+        </>
       )}
     </section>
   )

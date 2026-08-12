@@ -13,12 +13,14 @@ vi.mock('./api', async importOriginal => {
     uploadFile: vi.fn(),
     listIntegrations: vi.fn(),
     getTableSuggestionsV2: vi.fn(),
+    getTableSuggestionsV4: vi.fn(),
   }
 })
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
 const listIntegrations = vi.mocked(api.listIntegrations)
 const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
+const getTableSuggestionsV4 = vi.mocked(api.getTableSuggestionsV4)
 
 beforeEach(() => {
   setSession({ user: 'dev', roles: ['data_owner'] })
@@ -28,6 +30,13 @@ beforeEach(() => {
   listIntegrations.mockReset()
   listIntegrations.mockResolvedValue([])
   getTableSuggestions.mockReset()
+  getTableSuggestionsV4.mockReset()
+  // Default: the older-backend answer — the screen steps down to v2, so every existing test
+  // keeps exercising the page exactly as before. v4-specific tests override per-case.
+  getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
+    422, 'unsupported contract_version 4; this deployment serves [1, 2, 3]', null,
+    api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  ))
 })
 
 const ingest = (over: Partial<api.IngestResult>): api.IngestResult => ({

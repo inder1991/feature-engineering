@@ -3180,6 +3180,52 @@ export function getTableSuggestionsV3(
   )
 }
 
+// ── SE-13 contract v4: the v3 page plus ONE addition — the `semantic` block ────────────────────
+// The SAME engine the hypothesis Workbench serves from (frozen context → capability binder →
+// eligibility fold → assembly), run WITHOUT a hypothesis and anchored to this table. The two
+// surfaces cannot disagree about a binding's validity — the block is evidence, not a re-ranking.
+
+export interface SemanticEngineVerdict {
+  role: string
+  status: string                 // bound | ambiguous | unresolved | blocked
+  selected_ref: string | null
+  reason_codes: string[]
+  resolution: string             // the named human action; '' when none is needed
+}
+
+export interface SemanticEngineEntry {
+  recipe_id: string
+  binding_state: string          // bound | ambiguous | missing | blocked
+  readiness: string              // the authored RECIPE_READINESS value
+  review_current: boolean
+  planning_request_hash: string
+  verdicts: SemanticEngineVerdict[]
+  corroborations: { origin: string; source_definition_id: string }[]
+}
+
+export interface SuggestionSemanticBlock {
+  semantic_context_hash: string
+  table: string
+  ranked: SemanticEngineEntry[]      // bound — the designed composite order, basis stated
+  actionable: SemanticEngineEntry[]  // undecided work with named resolutions, never "ranked low"
+  order_basis: string
+}
+
+export interface FeatureSuggestionPageV4 extends Omit<FeatureSuggestionPageV3, 'contract_version'> {
+  contract_version: 4
+  semantic: SuggestionSemanticBlock
+}
+
+export function getTableSuggestionsV4(
+  source: string,
+  table: string,
+): Promise<FeatureSuggestionPageV4> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
+      + '/suggestions?contract_version=4',
+  )
+}
+
 // POST one scalar field-correction. Maps the camelCase request to the backend snake_case body
 // (defaults mirror the server model: selected_evidence_ids [], replacement_value/reason null). A CAS
 // conflict (a concurrent decision/evidence/policy drift) fails closed as HTTP 409, and a four-eyes /

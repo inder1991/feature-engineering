@@ -9,9 +9,10 @@ import { NEEDS_VALIDATION, evidence, hit, label, operand, page, text }
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getTableSuggestionsV2: vi.fn() }
+  return { ...actual, getTableSuggestionsV2: vi.fn(), getTableSuggestionsV4: vi.fn() }
 })
 const getTableSuggestionsV2 = vi.mocked(api.getTableSuggestionsV2)
+const getTableSuggestionsV4 = vi.mocked(api.getTableSuggestionsV4)
 
 const SOURCE = 'core_banking'
 const TABLE = 'public.comp_fin_tran'
@@ -20,6 +21,13 @@ const BASE_SESSION = getSession()
 
 beforeEach(() => {
   getTableSuggestionsV2.mockReset()
+  getTableSuggestionsV4.mockReset()
+  // Default: the older-backend answer — the screen steps down to v2, so every existing test
+  // keeps exercising the page exactly as before. v4-specific tests override per-case.
+  getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
+    422, 'unsupported contract_version 4; this deployment serves [1, 2, 3]', null,
+    api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+  ))
   setSession({ user: 'dev', roles: ['data_owner'] })
 })
 afterEach(() => setSession(BASE_SESSION))
@@ -939,5 +947,70 @@ describe('SuggestedFeaturesScreen', () => {
     expect(screen.getByText(/data_owner/)).toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
     expect(screen.queryAllByRole('button')).toHaveLength(0)
+  })
+})
+
+// ── SE-13: the engine section (contract v4) and its graceful absence ────────────────────────────
+
+describe('the planning-engine section (contract v4)', () => {
+  const SEMANTIC: api.SuggestionSemanticBlock = {
+    semantic_context_hash: 'ctxhash1234567890abcdef',
+    table: TABLE,
+    order_basis: 'binding_state, review_validity, readiness, applicability_strength, signature',
+    ranked: [{
+      recipe_id: 'customer_activity_recency', binding_state: 'bound',
+      readiness: 'FORMULA_VALIDATED', review_current: true,
+      planning_request_hash: 'prh1',
+      verdicts: [{ role: 'who', status: 'bound',
+                   selected_ref: 'public.events.customer_id', reason_codes: [], resolution: '' }],
+      corroborations: [{ origin: 'llm_intent', source_definition_id: 'intent:twin' }],
+    }],
+    actionable: [{
+      recipe_id: 'drawn_exposure_utilisation', binding_state: 'blocked',
+      readiness: 'CONCEPTUAL_ONLY', review_current: false,
+      planning_request_hash: 'prh2',
+      verdicts: [{ role: 'drawn', status: 'blocked', selected_ref: null,
+                   reason_codes: ['ECONOMIC_ROLE_UNPROVEN'],
+                   resolution: 'a human confirms the economic role' }],
+      corroborations: [],
+    }],
+  }
+  const v4 = () => ({
+    ...page(), contract_version: 4 as const, readiness_counts: {}, semantic: SEMANTIC,
+  }) as unknown as api.FeatureSuggestionPageV4
+
+  it('renders the engine verdicts when the deployment serves v4', async () => {
+    getTableSuggestionsV4.mockReset()
+    getTableSuggestionsV4.mockResolvedValue(v4())
+    renderScreen()
+    const section = await screen.findByTestId('semantic-engine')
+    expect(section).toHaveTextContent('customer_activity_recency')
+    expect(section).toHaveTextContent('bindable')
+    expect(section).toHaveTextContent('reviewed')
+    expect(section).toHaveTextContent('also arrived at by llm_intent')
+    // The undecided recipe shows its NAMED action, never a low rank.
+    expect(section).toHaveTextContent('Could be useful if…')
+    expect(section).toHaveTextContent('a human confirms the economic role')
+    // v2 was never asked for: v4 answered.
+    expect(getTableSuggestionsV2).not.toHaveBeenCalled()
+  })
+
+  it('steps down to the older page without the section when v4 is refused', async () => {
+    getTableSuggestionsV2.mockResolvedValue(page())
+    renderScreen()
+    await screen.findByText('account_balance_trend_90d')
+    expect(screen.queryByTestId('semantic-engine')).not.toBeInTheDocument()
+    expect(getTableSuggestionsV4).toHaveBeenCalledWith(SOURCE, TABLE)
+    expect(getTableSuggestionsV2).toHaveBeenCalledWith(SOURCE, TABLE)
+  })
+
+  it('hides the section entirely when the engine returned nothing for this table', async () => {
+    getTableSuggestionsV4.mockReset()
+    getTableSuggestionsV4.mockResolvedValue({
+      ...v4(), semantic: { ...SEMANTIC, ranked: [], actionable: [] },
+    })
+    renderScreen()
+    await screen.findByText('account_balance_trend_90d')
+    expect(screen.queryByTestId('semantic-engine')).not.toBeInTheDocument()
   })
 })
