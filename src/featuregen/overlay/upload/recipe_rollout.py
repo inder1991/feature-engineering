@@ -88,6 +88,57 @@ def canary_gate(inputs: CanaryGateInputsV1) -> CanaryGateVerdictV1:
     return CanaryGateVerdictV1(passed=not failures, failures=tuple(failures))
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticPlanningGateInputsV1:
+    """SE-14's cutover gate readings — ONE member more of the BR-24 gate family, never a
+    parallel mechanism. Each field is the OUTPUT of a measurement made elsewhere (the shadow
+    observation store, the gold suites, the eval fixtures, an operator's rollback drill) and
+    every default is the FAILING side: an unmeasured gate blocks, and the cutover to
+    ``semantic_v1`` needs a verdict whose failure list is EMPTY — never an aggregate score.
+
+    The four zero-tolerance release gates are the plan's, verbatim: no protected/target-leaking
+    candidate accepted, no identifier served as a generic measure, no event-window feature
+    sourced only from a current snapshot, and no clearing decision made from llm/proposed
+    metadata where the operand floor is declared-or-governed."""
+
+    protected_or_target_accepted: int = 1
+    identifier_as_measure_accepted: int = 1
+    snapshot_only_event_features: int = 1
+    proposed_cleared_declared_floor: int = 1
+    gold_suite_failures: int = 1
+    shadow_divergence_unexplained: int = 1
+    observation_rows_present: bool = False       # the shadow actually ran on real catalogs
+    rollback_tested: bool = False
+
+
+def semantic_planning_gate(inputs: SemanticPlanningGateInputsV1) -> CanaryGateVerdictV1:
+    """The cutover gate, as a fold with every failure NAMED — the same verdict type the canary
+    gate returns, because two gate mechanisms is the rollout version of two binders."""
+    failures = []
+    if inputs.protected_or_target_accepted:
+        failures.append(
+            f"protected_or_target_accepted={inputs.protected_or_target_accepted}")
+    if inputs.identifier_as_measure_accepted:
+        failures.append(
+            f"identifier_as_measure_accepted={inputs.identifier_as_measure_accepted}")
+    if inputs.snapshot_only_event_features:
+        failures.append(
+            f"snapshot_only_event_features={inputs.snapshot_only_event_features}")
+    if inputs.proposed_cleared_declared_floor:
+        failures.append(
+            f"proposed_cleared_declared_floor={inputs.proposed_cleared_declared_floor}")
+    if inputs.gold_suite_failures:
+        failures.append(f"gold_suite_failures={inputs.gold_suite_failures}")
+    if inputs.shadow_divergence_unexplained:
+        failures.append(
+            f"shadow_divergence_unexplained={inputs.shadow_divergence_unexplained}")
+    if not inputs.observation_rows_present:
+        failures.append("no_shadow_observations_recorded")
+    if not inputs.rollback_tested:
+        failures.append("rollback_untested")
+    return CanaryGateVerdictV1(passed=not failures, failures=tuple(failures))
+
+
 def rollout_metrics() -> dict:
     """The registry-derived operational metrics — readiness described truthfully, and
     suggestion COUNT is deliberately absent (the plan: never use it as success)."""

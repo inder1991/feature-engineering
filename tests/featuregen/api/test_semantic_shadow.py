@@ -140,3 +140,26 @@ def test_shadow_observations_become_append_only_rows(make_client, conn, monkeypa
     with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         with conn.transaction():
             conn.execute("UPDATE semantic_candidate_observation SET binding_state = 'bound'")
+
+def test_shadow_metrics_fold_the_recorded_observations(make_client, conn, monkeypatch):
+    """SE-14: the cutover gate's measured inputs come from the rows the shadow actually wrote —
+    an empty store reads observation_rows_present=False (which BLOCKS), and a populated one
+    counts states and preventions from the recorded verdicts, never from a projection."""
+    from featuregen.overlay.upload.semantic_candidate_store import semantic_shadow_metrics
+
+    empty = semantic_shadow_metrics(conn)
+    assert empty["observation_rows_present"] is False
+    assert empty["observations"] == 0
+
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
+    _post(make_client(llm_client=_fake()))
+
+    metrics = semantic_shadow_metrics(conn)
+    assert metrics["observation_rows_present"] is True
+    assert metrics["observations"] > 0
+    assert metrics["generation_runs"] == 1 and metrics["distinct_contexts"] == 1
+    assert sum(metrics["candidates_by_binding_state"].values()) == metrics["observations"]
+    assert set(metrics["candidates_by_origin"]) == {"recipe_v2"}
+    assert metrics["identifier_as_measure_preventions"] >= 0   # counted from verdict codes
+

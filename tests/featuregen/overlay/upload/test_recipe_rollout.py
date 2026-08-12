@@ -70,3 +70,45 @@ def test_the_metrics_describe_readiness_truthfully_without_suggestion_counts():
     assert metrics["executable_primary_coverage_leaves"] == 0   # honest: gold gates unrun
     assert metrics["active_primary_coverage_leaves"] == 75
     assert "suggestion_count" not in metrics                    # never a success metric
+
+
+# ── SE-14: the semantic-planning cutover gate — same discipline, one more family member ─────────
+
+def test_the_unmeasured_semantic_cutover_gate_blocks_with_every_failure_named():
+    from featuregen.overlay.upload.recipe_rollout import (
+        SemanticPlanningGateInputsV1,
+        semantic_planning_gate,
+    )
+
+    verdict = semantic_planning_gate(SemanticPlanningGateInputsV1())
+    assert not verdict.passed
+    assert set(verdict.failures) == {
+        "protected_or_target_accepted=1", "identifier_as_measure_accepted=1",
+        "snapshot_only_event_features=1", "proposed_cleared_declared_floor=1",
+        "gold_suite_failures=1", "shadow_divergence_unexplained=1",
+        "no_shadow_observations_recorded", "rollback_untested",
+    }
+
+
+def test_the_cutover_needs_an_empty_failure_list_never_a_score():
+    from featuregen.overlay.upload.recipe_rollout import (
+        SemanticPlanningGateInputsV1,
+        semantic_planning_gate,
+    )
+
+    green = SemanticPlanningGateInputsV1(
+        protected_or_target_accepted=0, identifier_as_measure_accepted=0,
+        snapshot_only_event_features=0, proposed_cleared_declared_floor=0,
+        gold_suite_failures=0, shadow_divergence_unexplained=0,
+        observation_rows_present=True, rollback_tested=True)
+    assert semantic_planning_gate(green).passed
+
+    # Seven of eight readings perfect and ONE zero-tolerance breach: still blocked, by name.
+    one_breach = semantic_planning_gate(
+        SemanticPlanningGateInputsV1(
+            protected_or_target_accepted=0, identifier_as_measure_accepted=1,
+            snapshot_only_event_features=0, proposed_cleared_declared_floor=0,
+            gold_suite_failures=0, shadow_divergence_unexplained=0,
+            observation_rows_present=True, rollback_tested=True))
+    assert not one_breach.passed
+    assert one_breach.failures == ("identifier_as_measure_accepted=1",)

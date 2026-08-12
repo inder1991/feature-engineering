@@ -55,3 +55,47 @@ def persist_semantic_candidates(conn, *, generation_run_id: str, context,
 
 
 __all__ = ["persist_semantic_candidates"]
+
+def semantic_shadow_metrics(conn) -> dict:
+    """SE-14's shadow metrics, computed from the observation rows — the MEASURED inputs the
+    cutover gate consumes. Every number here is a fact about recorded runs, never a projection:
+    an empty store yields zeros and ``observation_rows_present: False``, which the gate reads
+    as blocking (absence of evidence blocks a cutover; it never passes one)."""
+    from collections import Counter
+
+    rows = conn.execute(
+        "SELECT binding_state, source_origin, verdicts, temporal_blocked "
+        "FROM semantic_candidate_observation").fetchall()
+    by_state: Counter = Counter()
+    by_origin: Counter = Counter()
+    reason_codes: Counter = Counter()
+    identifier_preventions = 0
+    snapshot_preventions = 0
+    temporal_blocked = 0
+    for binding_state, origin, verdicts, blocked in rows:
+        by_state[binding_state] += 1
+        by_origin[origin] += 1
+        temporal_blocked += bool(blocked)
+        for verdict in verdicts or ():
+            for code in verdict.get("reason_codes", ()):
+                reason_codes[code] += 1
+                if code == "IDENTIFIER_NOT_A_MEASURE":
+                    identifier_preventions += 1
+                elif code == "SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW":
+                    snapshot_preventions += 1
+    runs = conn.execute(
+        "SELECT COUNT(DISTINCT generation_run_id), COUNT(DISTINCT context_hash) "
+        "FROM semantic_candidate_observation").fetchone()
+    return {
+        "observation_rows_present": bool(rows),
+        "observations": len(rows),
+        "generation_runs": runs[0],
+        "distinct_contexts": runs[1],
+        "candidates_by_binding_state": dict(sorted(by_state.items())),
+        "candidates_by_origin": dict(sorted(by_origin.items())),
+        "reason_code_counts": dict(sorted(reason_codes.items())),
+        "identifier_as_measure_preventions": identifier_preventions,
+        "snapshot_as_event_preventions": snapshot_preventions,
+        "temporal_blocked_candidates": temporal_blocked,
+    }
+
