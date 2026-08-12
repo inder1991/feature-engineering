@@ -404,6 +404,22 @@ interface GeneratedCandidate {
   kept?: boolean
 }
 
+// SE-12 rule 5: requirements are TASKS with owners, not codes. The closed legacy vocabulary
+// maps to a verb phrase; an unknown code from a newer backend renders as itself, never breaks.
+function requirementTask(code: string): string {
+  const tasks: Record<string, string> = {
+    GRAIN_IS_UNIQUE: 'Profile uniqueness at the declared grain',
+    TEMPORAL_IS_POPULATED: 'Verify the time column is populated (event history depth)',
+    TEMPORAL_LAG_BOUNDED: 'Verify arrival lag stays inside the declared bound',
+    JOIN_CONNECTIVITY: 'Govern the join this input rides',
+    UNIT_CONSISTENT: 'Confirm a single unit of measure',
+    CURRENCY_CONSISTENT: 'Declare the currency conversion policy',
+    ADDITIVITY_SUPPORTS_OPERATION: 'Confirm the measure supports this aggregation',
+    TYPE_IS_NUMERIC: 'Verify the column is numeric in the data',
+  }
+  return tasks[code] ?? code
+}
+
 function generationSourceLabel(idea: FeatureIdea): string {
   if (idea.path_authority === 'governed_cross_catalog') {
     return idea.recipe_id ? `Governed recipe · ${idea.recipe_id}` : 'Governed planner'
@@ -2466,9 +2482,19 @@ export function WorkbenchScreen() {
                       {c.kind === 'generated' && c.idea.candidate_status && (
                         <span className="badge">{c.idea.candidate_status}</span>
                       )}
-                      {/* Honest stamp: soft (not solid) so it never outshouts the selection or
-                          registered states. Drafts skip the gauntlet, so they carry no stamp. */}
-                      {c.kind === 'generated' && c.idea.verification && (
+                      {/* Honest stamp — SE-12: the tri-state decides the chip. A candidate the
+                          backend marked NEEDS_EXTERNAL_VALIDATION must never wear the green
+                          "design-checked" badge; it wears the amber checks-outstanding one, with
+                          the count. Drafts skip the gauntlet, so they carry no stamp. */}
+                      {c.kind === 'generated'
+                        && c.idea.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
+                        <span className="badge stale">
+                          needs data checks{c.idea.requirements?.length
+                            ? ` (${c.idea.requirements.length})` : ''}
+                        </span>
+                      )}
+                      {c.kind === 'generated' && c.idea.verification
+                        && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
                         <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
                       )}
                       {/* Pinned through a whole-round regeneration. Registered rows skip the
@@ -2496,6 +2522,43 @@ export function WorkbenchScreen() {
                       <p style={{ color: 'var(--ink-soft)' }} role="note">
                         Near-label check: {c.idea.near_label_rationale}
                       </p>
+                    )}
+                    {/* SE-12 "Inputs and why": one row per typed operand role — the binding
+                        the engine actually chose, its MEASURED authority, and whether Gate-1
+                        confirmation is outstanding. Only engine/recipe candidates carry these;
+                        an LLM free-form idea keeps its untyped derives list below. */}
+                    {c.kind === 'generated' && (c.idea.input_role_bindings?.length ?? 0) > 0 && (
+                      <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2, margin: 0,
+                          paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
+                        {c.idea.input_role_bindings!.map(binding => (
+                          <li key={binding.role}>
+                            <span style={{ fontWeight: 600 }}>{binding.role}</span>
+                            {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
+                            {binding.authority && <> · {binding.authority}</>}
+                            {binding.confirmation_required && (
+                              <span className="badge stale" style={{ marginLeft: 6 }}>
+                                needs confirmation
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {/* SE-12: the outstanding checks, task-first — what somebody DOES, with the
+                        backend's own prose (which names the semantic origin) as the fine print. */}
+                    {c.kind === 'generated' && (c.idea.requirements?.length ?? 0) > 0 && (
+                      <ul aria-label="outstanding checks" style={{ display: 'grid', gap: 2,
+                          margin: 0, paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
+                        {c.idea.requirements!.map(req => (
+                          <li key={`${req.code}:${req.operand[1]}`}>
+                            {requirementTask(req.code)}
+                            {' — '}<span className="mono">{req.operand[1]}</span>
+                            {req.detail && (
+                              <span style={{ display: 'block', fontSize: 12 }}>{req.detail}</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
                     )}
                     {/* Task 4b emission policy: the untaken parameterisations, named on the
                         card — chosen value in brackets. Server populates only under its flag. */}

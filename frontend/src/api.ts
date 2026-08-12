@@ -325,6 +325,37 @@ export interface FeatureIdea {
   // Task 4b (flag-gated server-side): the recipe's untaken parameterisations, chosen value
   // marked — "window: 30/[90]/180". Presentation only; absent when there is nothing to choose.
   param_alternatives?: string
+  // SE-12: the honest tri-state the backend has always computed (DESIGN_CHECKED |
+  // NEEDS_EXTERNAL_VALIDATION) — a SEPARATE axis from the hyphenated `verification` stamp.
+  // Absent on pre-Slice-3 snapshots; an unknown value from a newer backend must still render.
+  validation_status?: 'DESIGN_CHECKED' | 'NEEDS_EXTERNAL_VALIDATION' | string
+  // The typed external checks riding a NEEDS_EXTERNAL_VALIDATION candidate — each names the
+  // operand it concerns. Task-oriented rendering happens client-side; `detail` is the backend's
+  // own prose (which names the semantic origin for engine-projected candidates).
+  requirements?: WorkbenchRequirement[]
+  // One row per typed operand role: the binding the engine actually chose, with its MEASURED
+  // authority ("producer/strength" for engine candidates) and whether Gate-1 confirmation is
+  // outstanding. Present only for recipe/engine candidates; LLM free-form ideas carry none.
+  input_role_bindings?: WorkbenchRoleBinding[]
+}
+
+// One typed external check on a candidate (contract/_serial.requirements_to_json shape).
+export interface WorkbenchRequirement {
+  code: string
+  operand: [string, string]
+  detail: string
+  params?: [string, unknown][]
+  schema_version?: string
+}
+
+// One role→source binding (feature_assist.RoleBinding.to_json shape).
+export interface WorkbenchRoleBinding {
+  role: string
+  authority: string
+  ref?: [string, string]
+  evidence_ids?: string[]
+  fact_ids?: string[]
+  confirmation_required?: boolean
 }
 
 // One gauntlet rejection, shown to the human, never hidden. `code` carries the backend's

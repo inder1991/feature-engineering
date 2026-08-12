@@ -1151,6 +1151,62 @@ describe('verification stamp and rationale', () => {
   })
 })
 
+describe('SE-12: the honest tri-state, typed inputs, and outstanding checks', () => {
+  const ENGINE_IDEA: api.FeatureIdea = {
+    ...idea('activity_recency'),
+    generation_source: 'recipe',
+    recipe_id: 'customer_activity_recency',
+    validation_status: 'NEEDS_EXTERNAL_VALIDATION',
+    requirements: [
+      { code: 'GRAIN_IS_UNIQUE', operand: ['deposits', 'public.events.customer_id'],
+        detail: '[IDENTIFIER_UNIQUENESS] profile this key at the declared grain' },
+      { code: 'TEMPORAL_IS_POPULATED', operand: ['deposits', 'public.events.event_ts'],
+        detail: '[EVENT_HISTORY_VERIFICATION] verify event history depth' },
+    ],
+    input_role_bindings: [
+      { role: 'who', authority: 'llm/proposed',
+        ref: ['deposits', 'public.events.customer_id'], confirmation_required: true },
+      { role: 'when', authority: 'human/confirmed',
+        ref: ['deposits', 'public.events.event_ts'] },
+    ],
+  }
+
+  it('never stamps a NEEDS_EXTERNAL_VALIDATION candidate design-checked', async () => {
+    await renderAndGenerate([ENGINE_IDEA])
+    expect(await screen.findByText('activity_recency')).toBeInTheDocument()
+    expect(screen.getByText('needs data checks (2)')).toBeInTheDocument()
+    expect(screen.queryByText('design-checked')).not.toBeInTheDocument()
+  })
+
+  it('renders one typed input row per role with its measured authority', async () => {
+    await renderAndGenerate([ENGINE_IDEA])
+    const inputs = await screen.findByRole('list', { name: 'typed inputs' })
+    expect(inputs).toHaveTextContent('who')
+    expect(inputs).toHaveTextContent('public.events.customer_id')
+    expect(inputs).toHaveTextContent('llm/proposed')
+    expect(inputs).toHaveTextContent('when')
+    expect(inputs).toHaveTextContent('human/confirmed')
+    // Only the proposed binding asks for Gate-1 confirmation; the confirmed one is settled.
+    expect(screen.getAllByText('needs confirmation')).toHaveLength(1)
+  })
+
+  it('renders outstanding checks as tasks, with the backend prose as fine print', async () => {
+    await renderAndGenerate([ENGINE_IDEA])
+    const checks = await screen.findByRole('list', { name: 'outstanding checks' })
+    expect(checks).toHaveTextContent('Profile uniqueness at the declared grain')
+    expect(checks).toHaveTextContent('Verify the time column is populated (event history depth)')
+    expect(checks).toHaveTextContent('[IDENTIFIER_UNIQUENESS]')
+  })
+
+  it('keeps the design-checked stamp for a DESIGN_CHECKED engine candidate', async () => {
+    await renderAndGenerate([{ ...ENGINE_IDEA, validation_status: 'DESIGN_CHECKED',
+                               requirements: [], input_role_bindings: [] }])
+    expect(await screen.findByText('activity_recency')).toBeInTheDocument()
+    expect(screen.getByText('design-checked')).toBeInTheDocument()
+    expect(screen.queryByText(/needs data checks/)).not.toBeInTheDocument()
+  })
+})
+
 describe('whole-round feedback', () => {
   async function submitSetFeedback(instruction: string, round = 1) {
     await userEvent.type(screen.getByLabelText('Feedback on the whole round'), instruction)
