@@ -16,6 +16,8 @@ from featuregen.overlay.upload.recipe_operand_policy import (
     TYPE_INCOMPATIBLE,
 )
 
+# safety (the legacy _safe_to_bind law, folded — never bindable, whatever the authority)
+TARGET_LEAKAGE_BLOCKED = "TARGET_LEAKAGE_BLOCKED"
 # meaning
 CONCEPT_MISMATCH = "CONCEPT_MISMATCH"
 OPERAND_CLASS_MISMATCH = "OPERAND_CLASS_MISMATCH"
@@ -51,6 +53,7 @@ SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {
+    TARGET_LEAKAGE_BLOCKED: "structurally_unsuitable",
     CONCEPT_MISMATCH: "structurally_unsuitable",
     OPERAND_CLASS_MISMATCH: "structurally_unsuitable",
     IDENTIFIER_NOT_A_MEASURE: "structurally_unsuitable",
@@ -82,7 +85,7 @@ REASON_FAMILIES: dict[str, str] = {
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —
 #: the FIRST code present under this order is the verdict's primary_reason_code.
 REASON_PRECEDENCE: tuple[str, ...] = (
-    PROTECTED_CHARACTERISTIC_BLOCKED, JOIN_PATH_DENIED,
+    TARGET_LEAKAGE_BLOCKED, PROTECTED_CHARACTERISTIC_BLOCKED, JOIN_PATH_DENIED,
     IDENTIFIER_NOT_A_MEASURE, OPERAND_CLASS_MISMATCH, TYPE_INCOMPATIBLE,
     BUSINESS_EVENT_MISMATCH, SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW, SOURCE_GRAIN_MISMATCH,
     UNIT_INCOMPATIBLE, ADDITIVITY_INCOMPATIBLE, CONCEPT_MISMATCH,

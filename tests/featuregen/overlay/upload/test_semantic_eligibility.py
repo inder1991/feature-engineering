@@ -20,6 +20,7 @@ def capability(**over) -> ColumnCapabilityV1:
         declared_type="numeric", type_family="numeric", is_grain=False, is_as_of=False,
         concept="monetary_flow", concept_authority="human/confirmed",
         identifier_namespace=None, identifier_like=False,
+        leakage_anchor=False, blocked_sensitivity=False,
         possible_operand_classes=("measure",),
         operand_class_map_version=OPERAND_CLASS_MAP_VERSION,
         entity=None, entity_authority="absent",
@@ -142,3 +143,45 @@ def test_every_reason_code_has_a_family():
              and not name.startswith("REASON")]
     for code in codes:
         assert R.reason_family(code), code
+
+
+def test_a_leakage_anchor_is_blocked_at_any_authority():
+    """The legacy _safe_to_bind law, folded: a target-defining concept never binds — even
+    human-confirmed, even when a definition is mis-authored to NEED it."""
+    verdict = evaluate_operand(
+        operand(concept="delinquency_flag", operand_class="status"),
+        capability(concept="delinquency_flag", concept_authority="human/confirmed",
+                   declared_type="boolean", type_family="boolean",
+                   possible_operand_classes=("status",), leakage_anchor=True))
+    assert verdict.status == "blocked"
+    assert verdict.reason_codes == (R.TARGET_LEAKAGE_BLOCKED,)
+    assert "leakage" in verdict.resolution
+
+
+def test_a_protected_characteristic_is_blocked_at_any_authority():
+    verdict = evaluate_operand(
+        operand(concept="monetary_flow"),
+        capability(blocked_sensitivity=True))
+    assert verdict.status == "blocked"
+    assert verdict.reason_codes == (R.PROTECTED_CHARACTERISTIC_BLOCKED,)
+    assert "fair-lending" in verdict.resolution
+
+
+def test_the_compiler_carries_the_safety_facts_from_the_registry(db):
+    """End to end: a column classified with a leakage-anchor concept compiles with the flag
+    set, so the fold blocks it in the capability PATH, not only in hand-built fixtures."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.column_capabilities import compile_capabilities
+    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.graph import build_graph
+
+    rows = [(CanonicalRow("safebank", "loans", "dpd_flag", "boolean",
+                          definition="90+ days past due"), "delinquency_flag")]
+    build_graph(db, "safebank", [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    context = build_generation_semantic_context(db, catalog_source="safebank")
+    caps = compile_capabilities(db, context, ["public.loans.dpd_flag"])
+    assert caps["public.loans.dpd_flag"].leakage_anchor is True

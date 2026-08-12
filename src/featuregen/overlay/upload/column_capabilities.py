@@ -60,6 +60,11 @@ class ColumnCapabilityV1:
     concept_authority: str                # "producer/strength" | "graph_hint" | "absent"
     identifier_namespace: str | None
     identifier_like: bool
+    # The legacy _safe_to_bind law, carried as REGISTRY facts on the capability: a leakage
+    # anchor (target/target-defining concept) and a protected/special-category concept are
+    # never valid feature inputs — the fold blocks them for every origin.
+    leakage_anchor: bool
+    blocked_sensitivity: bool
     possible_operand_classes: tuple[str, ...]
     operand_class_map_version: str
     # operational (display value + its evidence authority; "absent" = no active evidence)
@@ -121,12 +126,18 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
     for ref, col in members:
         logical_ref = logical_by_ref[ref]
         namespace = None
+        leakage_anchor = False
+        blocked_sensitivity = False
         if col.concept:
             try:
                 registered = registered_concept(col.concept)
             except Exception:
                 registered = None
-            namespace = registered.namespace if registered is not None else None
+            if registered is not None:
+                namespace = registered.namespace
+                leakage_anchor = bool(getattr(registered, "leakage_anchor", False))
+                blocked_sensitivity = getattr(registered, "sensitivity", "public") in (
+                    "protected_attribute", "special_category")
         classes = allowed_operand_classes(col.concept) if col.concept else None
         missing = list(_ABSENT_AXES)
         if col.concept and classes is None:
@@ -139,6 +150,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             concept_authority=_authority(pins, logical_ref, "concept", col.concept),
             identifier_namespace=namespace,
             identifier_like=namespace is not None,
+            leakage_anchor=leakage_anchor,
+            blocked_sensitivity=blocked_sensitivity,
             possible_operand_classes=classes or (),
             operand_class_map_version=OPERAND_CLASS_MAP_VERSION,
             entity=col.entity,

@@ -59,6 +59,11 @@ def authority_matrix_hash() -> str:
 #: The named human/operator action per primary code — a refusal nobody can act on is a dead
 #: end, not governance.
 _RESOLUTIONS: dict[str, str] = {
+    R.TARGET_LEAKAGE_BLOCKED: "this column carries the target (or a target-defining flag) — "
+                              "reading it is leakage; no confirmation can make it an input",
+    R.PROTECTED_CHARACTERISTIC_BLOCKED: "a protected characteristic / special-category value "
+                                        "is never a feature input — fair-lending and GDPR "
+                                        "hard block",
     R.CONCEPT_MISMATCH: "this column means something else — no action makes it serve this role",
     R.OPERAND_CLASS_MISMATCH: "the concept cannot serve this operand class — bind a column "
                               "whose meaning can",
@@ -111,6 +116,14 @@ def evaluate_operand(operand: RequiredOperandV1,
                      capability: ColumnCapabilityV1) -> OperandEligibilityVerdictV1:
     codes: list[str] = []
     blocked = False
+
+    # 0. The safety law FIRST (the legacy _safe_to_bind, folded): a leakage anchor or a
+    #    protected/special-category concept is never a valid feature input — for any origin,
+    #    at any authority, even when a definition is mis-authored to NEED such a concept.
+    if capability.leakage_anchor:
+        return _verdict(operand, capability, "blocked", [R.TARGET_LEAKAGE_BLOCKED])
+    if capability.blocked_sensitivity:
+        return _verdict(operand, capability, "blocked", [R.PROTECTED_CHARACTERISTIC_BLOCKED])
 
     # 1. Controlled meaning: the concept must MATCH (primary or a declared alternative) —
     #    anything else is a different meaning entirely, not a lesser one.

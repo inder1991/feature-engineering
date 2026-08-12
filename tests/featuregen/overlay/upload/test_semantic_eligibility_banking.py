@@ -25,6 +25,7 @@ def cap(**over) -> ColumnCapabilityV1:
         declared_type="numeric", type_family="numeric", is_grain=False, is_as_of=False,
         concept="monetary_flow", concept_authority="human/confirmed",
         identifier_namespace=None, identifier_like=False,
+        leakage_anchor=False, blocked_sensitivity=False,
         possible_operand_classes=("measure",),
         operand_class_map_version=OPERAND_CLASS_MAP_VERSION,
         entity=None, entity_authority="absent",
