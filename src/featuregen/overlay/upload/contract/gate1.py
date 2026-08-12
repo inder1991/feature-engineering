@@ -1562,6 +1562,42 @@ def _verified_considered_revision_payload(
     return considered, lineage, revision_id, digest
 
 
+def verified_considered_revision_by_id(conn, considered_revision_id: str) -> dict:
+    """SE-11 step 4 — load ONE immutable considered revision by id, verified the same way the
+    Gate-1 choice path verifies it (envelope re-hash against the stored digest), and return the
+    full stored payload. The caller serves option detail FROM THIS STORED REVISION ONLY — never
+    a wider live catalog read to decorate it."""
+    row = conn.execute(
+        "SELECT considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
+        "metadata_snapshot_content_hash, considered_json, considered_content_hash, "
+        "canonicalization_version "
+        "FROM contract_considered_revision WHERE considered_revision_id = %s",
+        (considered_revision_id,),
+    ).fetchone()
+    if row is None:
+        raise Gate1Error("UNKNOWN_CONSIDERED_REVISION")
+    revision_id, intent_id, run_id, snapshot_id, snapshot_hash, considered, digest, version = row
+    if considered.get("version") != version:
+        raise Gate1Error("considered revision lineage is inconsistent")
+    envelope = {
+        "version": version,
+        "intent_id": intent_id,
+        "generation_run_id": run_id,
+        "metadata_snapshot_id": snapshot_id,
+        "metadata_snapshot_content_hash": snapshot_hash,
+        "considered": considered,
+    }
+    if canonical_hash(envelope) != digest:
+        raise Gate1Error("considered revision content hash mismatch")
+    return {
+        "considered_revision_id": revision_id,
+        "intent_id": intent_id,
+        "generation_run_id": run_id,
+        "considered_content_hash": digest,
+        "considered": considered,
+    }
+
+
 def _verified_considered_revision(
     conn,
     intent_id: str,

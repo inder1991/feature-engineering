@@ -75,6 +75,52 @@ def test_v1_default_never_carries_the_new_keys(make_client, conn):
     assert "semantic_planning_mode" not in body
 
 
+def test_v2_carries_the_revision_address_and_the_detail_endpoint_serves_it(
+        make_client, conn, monkeypatch):
+    """SE-11 steps 3+4 round trip: the v2 response names the immutable revision it was minted
+    from; the detail endpoint serves any of its options FROM THAT STORED REVISION, with the
+    run's semantic evidence attached for recipe-sourced options when observations exist."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
+    client = make_client(llm_client=_fake())
+    body = _post(client, contract_version=2)
+    revision_id = body["considered_revision_id"]
+    assert revision_id and body["considered_content_hash"]
+
+    option_ids = [f["option_id"] for s in body["alternatives"] for f in s["features"]]
+    assert option_ids, "the considered set minted addressable options"
+    res = client.get(
+        f"/contract/considered-revisions/{revision_id}/options/{option_ids[0]}",
+        headers=AUTH)
+    assert res.status_code == 200, res.text
+    detail = res.json()
+    assert detail["considered_revision_id"] == revision_id
+    assert detail["considered_content_hash"] == body["considered_content_hash"]
+    assert detail["option"]["canonical_candidate_identity_hash"]
+    identity = detail["option"]["canonical_candidate_identity"]
+    assert identity["feature"]["name"]                        # the exact card the human saw
+    if (identity["feature"].get("recipe_id")
+            and "semantic_evidence" in detail):
+        evidence = detail["semantic_evidence"]
+        assert evidence["binding_state"] in ("bound", "ambiguous", "missing", "blocked")
+        assert evidence["context_hash"]
+
+
+def test_detail_endpoint_404s_unknown_revision_and_option(make_client, conn, monkeypatch):
+    _bank(conn)
+    client = make_client(llm_client=_fake())
+    res = client.get(
+        "/contract/considered-revisions/ccr_nope/options/opt_nope", headers=AUTH)
+    assert res.status_code == 404
+
+    body = _post(client, contract_version=2)
+    res = client.get(
+        f"/contract/considered-revisions/{body['considered_revision_id']}/options/opt_nope",
+        headers=AUTH)
+    assert res.status_code == 404
+    assert "UNKNOWN_CONSIDERED_OPTION" in res.text
+
+
 def test_v2_on_the_emergency_unscoped_path_is_refused(make_client, conn, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_CONFIRMATION_REQUIRED", "0")
     _bank(conn)

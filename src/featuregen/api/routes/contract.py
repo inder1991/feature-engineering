@@ -52,6 +52,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     recorded_gate1_choice_revision,
     recorded_gate1_draft_choice,
     select_and_record_gate1_choice,
+    verified_considered_revision_by_id,
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
@@ -287,6 +288,53 @@ def scope_mode() -> dict:
         "confirmation_required": status.confirmation_required,
         "configuration_valid": status.configuration_valid,
     }
+
+
+@router.get("/contract/considered-revisions/{considered_revision_id}/options/{option_id}",
+            dependencies=[Depends(require_feature_read)])
+def considered_option_detail(considered_revision_id: str, option_id: str,
+                             conn: _FeatureGenConn) -> dict:
+    """SE-11 step 4 — the audit drawer: full eligibility and plan evidence for ONE option,
+    served from the IMMUTABLE stored revision (hash-verified, the same verification the Gate-1
+    choice path runs) plus this run's semantic observations. Never a live-catalog read to
+    decorate it — what the human saw is what this returns."""
+    try:
+        revision = verified_considered_revision_by_id(conn, considered_revision_id)
+    except Gate1Error as e:
+        if str(e) == "UNKNOWN_CONSIDERED_REVISION":
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    option = revision["considered"].get("options_by_id", {}).get(option_id)
+    if option is None:
+        raise HTTPException(status_code=404, detail="UNKNOWN_CONSIDERED_OPTION")
+    detail = {
+        "considered_revision_id": revision["considered_revision_id"],
+        "considered_content_hash": revision["considered_content_hash"],
+        "generation_run_id": revision["generation_run_id"],
+        "option_id": option_id,
+        "option": option,
+    }
+    # The semantic evidence for a recipe-sourced option: this generation run's persisted
+    # observation for that definition — verdicts, per-shortlist eligibility, policy hashes,
+    # and the frozen context hash. Bounded to the newest row; absent means the run predates
+    # the observation store or the option is not recipe-sourced — honest absence, no backfill.
+    identity = option.get("canonical_candidate_identity") or {}
+    recipe_id = (identity.get("feature") or {}).get("recipe_id")
+    if recipe_id:
+        row = conn.execute(
+            "SELECT context_hash, planning_request_hash, binding_state, verdicts, "
+            "eligibility, policy_hashes "
+            "FROM semantic_candidate_observation "
+            "WHERE generation_run_id = %s AND source_definition_id = %s "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (revision["generation_run_id"], recipe_id)).fetchone()
+        if row is not None:
+            detail["semantic_evidence"] = {
+                "context_hash": row[0], "planning_request_hash": row[1],
+                "binding_state": row[2], "verdicts": row[3],
+                "eligibility": row[4], "policy_hashes": row[5],
+            }
+    return detail
 
 
 def _considered_set_response(conn, intent, cs) -> dict:
@@ -722,6 +770,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     if body.contract_version == 2:
         response["contract_version"] = 2
         response["semantic_planning_mode"] = semantic_mode
+        # Step 3's audit-drawer provenance: the immutable revision this response was minted
+        # from — the address of GET /contract/considered-revisions/{id}/options/{option_id}.
+        response["considered_revision_id"] = cs.considered_revision_id
+        response["considered_content_hash"] = cs.considered_content_hash
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
