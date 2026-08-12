@@ -207,3 +207,134 @@ def test_legacy_applied_reapply_rebuilds_search_doc(db):
         "'cust_id', 'Customer', 'applied')")
     build_graph(db, "deposits", rows)   # legacy reapply re-writes entity + rebuilds search_doc
     assert any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)
+
+
+# ── Task 0.6 Seam 2 (D11): TABLE rows get DERIVED read scope — visible iff the caller can see at
+# least one COLUMN of the table (the catalogs.py EXISTS-visible-column shape). build_graph never
+# writes sensitivity on table nodes (visible_requires = {}), so before the repair every table name
+# was world-matchable — an existence oracle over restricted catalogs. Column rows are unchanged. ──
+
+
+def _ingest_restricted_table(db, now):
+    """Source 'hr': table 'salaries' whose EVERY column is sensitivity-restricted."""
+    rows = [
+        CanonicalRow("hr", "salaries", "emp_ref", "text", sensitivity="restricted"),
+        CanonicalRow("hr", "salaries", "amount", "numeric", sensitivity="restricted"),
+    ]
+    assert ingest_upload(db, "hr", rows, actor=_actor(), now=now).status == "ingested"
+
+
+def test_fully_restricted_table_disappears_from_search_for_unprivileged_callers(db):
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_restricted_table(db, now)
+
+    # Name/text match: the table row must NOT surface for a caller who can see none of its columns.
+    unpriv = search(db, "salaries", now=now, roles=())
+    assert not any(h.kind == "table" for h in unpriv.hits)
+    assert unpriv.total == 0
+    # Browse (empty query) must not leak it either.
+    assert not any(h.kind == "table" for h in search(db, "", now=now, roles=()).hits)
+
+    # A privileged caller sees the SAME table row.
+    priv = search(db, "salaries", now=now, roles=("restricted_reader",))
+    assert any(h.kind == "table" and h.table == "salaries" for h in priv.hits)
+
+
+def test_mixed_visibility_table_remains_visible(db):
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("hr", "salaries", "dept", "text"),                          # world-visible
+        CanonicalRow("hr", "salaries", "amount", "numeric", sensitivity="restricted"),
+    ]
+    assert ingest_upload(db, "hr", rows, actor=_actor(), now=now).status == "ingested"
+
+    hits = search(db, "salaries", now=now, roles=()).hits
+    assert any(h.kind == "table" and h.table == "salaries" for h in hits)
+    # The restricted COLUMN itself stays hidden — column scope is untouched by the table rule.
+    assert not any(h.column == "amount" for h in hits)
+
+
+def test_empty_visible_table_set_hides_all_tables_without_error(db):
+    """The visible-table set is computed ONCE per search call (perf hoist) and can be EMPTY — a
+    caller who can see no column anywhere. Every query of the fan-out (hits, total, each facet)
+    must still run — the empty bound array is a legal, all-hiding predicate, never a SQL edge."""
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_restricted_table(db, now)   # ONLY hr exists — roles=() sees no column at all
+
+    res = search(db, "", now=now, roles=())
+    assert res.hits == [] and res.total == 0
+    assert all(buckets == [] or all(b.count == 0 for b in buckets)
+               for buckets in res.facets.values())
+
+
+def test_facet_counts_respect_the_derived_table_scope(db):
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_restricted_table(db, now)
+    _ingest(db, now)   # 'deposits' — world-visible accounts table
+
+    unpriv = search(db, "", now=now, roles=())
+    kind_counts = {b.value: b.count for b in unpriv.facets["kind"]}
+    assert kind_counts.get("table", 0) == 1              # accounts only — salaries not counted
+    source_counts = {b.value: b.count for b in unpriv.facets["source"]}
+    assert "hr" not in source_counts                     # nothing of hr's is visible at all
+
+    priv = search(db, "", now=now, roles=("restricted_reader",))
+    kind_counts_priv = {b.value: b.count for b in priv.facets["kind"]}
+    assert kind_counts_priv.get("table", 0) == 2
+
+
+def test_the_display_axis_is_a_facet_of_its_own_beside_the_enforcement_tag(db):
+    """FROM THE FIRST LIVE RUN (2026-08-09): search showed one `(none) 221` sensitivity bucket
+    while 28 columns carried a real label on their asset pages.
+
+    Two sensitivity columns exist and they are NOT interchangeable:
+
+    * ``graph_node.sensitivity`` — the READ-SCOPE ENFORCEMENT TAG (0993 CHECK) and an input to the
+      generated ``visible_requires``. Only a source file or a human sets it; `axis_projection`
+      deliberately never writes it. On an upload that declares no sensitivity it is NULL on every
+      row — exactly the shipped CIB catalog, hence the single `(none)` bucket.
+    * ``graph_node.sensitivity_display`` (migration 1042) — the DISPLAY axis, filled from
+      ``visible_requires`` else the concept registry's class. It is what the asset page renders.
+
+    THE FIX IS ADDITIVE, and this test exists because the obvious alternative is wrong: repointing
+    the EXISTING `sensitivity` facet at the display column swaps its VOCABULARY ('pii' becomes
+    'restricted'), which silently retires the role-gated `pii` bucket that
+    `test_read_scope_gates_sensitivity_facet_and_filter` pins. So both facets live at once, each
+    bucketing its own column.
+
+    Asserted through a real `search()` call rather than against the facet-map constant: a test that
+    only reads the dict passes whether or not the query layer ever honours it.
+    """
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("hr", "people", "emp_ref", "text", sensitivity="restricted"),
+        CanonicalRow("hr", "people", "desk_no", "text"),
+    ]
+    assert ingest_upload(db, "hr", rows, actor=_actor(), now=now).status == "ingested"
+    # The case that was invisible: the projection labelled it, the SOURCE never tagged it.
+    db.execute("UPDATE graph_node SET sensitivity_display = 'confidential' "
+               "WHERE catalog_source = 'hr' AND column_name = 'desk_no'")
+
+    facets = search(db, "", now=now, roles=("data_owner", "restricted_reader",
+                                            "confidential_reader")).facets
+    buckets = {name: {b.value: b.count for b in rows_} for name, rows_ in facets.items()}
+
+    # The enforcement facet still buckets the TAG — the source-declared value, untouched.
+    assert buckets["sensitivity"].get("restricted") == 1
+
+    # The display facet buckets the PROJECTED label, including the row no source ever tagged.
+    assert buckets["sensitivity_display"].get("confidential") == 1
+
+    # ...and it filters, which is the half a facet-map assertion cannot see.
+    filtered = search(db, "", now=now, filters={"sensitivity_display": ["confidential"]},
+                      roles=("data_owner", "restricted_reader", "confidential_reader")).hits
+    assert [h.object_ref for h in filtered] == ["public.people.desk_no"]
+    assert filtered[0].sensitivity_display == "confidential"
+    assert filtered[0].sensitivity is None      # the tag stays empty; they are different columns
+
+

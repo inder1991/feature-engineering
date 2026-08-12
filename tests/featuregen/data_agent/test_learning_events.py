@@ -79,6 +79,63 @@ def test_a_new_dependency_snapshot_causes_re_evaluation(db):
     assert first != second
 
 
+def test_two_CONCURRENT_writers_of_one_gap_do_not_collide(_dsn):
+    """The SELECT-then-INSERT dedupe was a race, masked only by the production caller minting a
+    fresh uuid per request: with STABLE request ids two in-flight planning requests carrying one
+    gap collide on 1034's partial unique index, and the loser died with a `UniqueViolation` that
+    the caller's fail-soft guard would have logged as "could not record a learning gap".
+
+    B's INSERT must BLOCK on the index while A holds the row uncommitted, then find A's row rather
+    than raise — so the assertion is about disposition, not about a lucky interleaving."""
+    import threading
+
+    import psycopg
+
+    conn_a = psycopg.connect(_dsn)
+    conn_b = psycopg.connect(_dsn)
+    try:
+        conn_a.execute("BEGIN")
+        a_id = record_gap(conn_a, _gap(), now=_NOW)     # deliberately NOT committed yet
+
+        done = threading.Event()
+        box: dict[str, object] = {}
+
+        def _write_b() -> None:
+            try:
+                with conn_b.transaction():
+                    box["id"] = record_gap(conn_b, _gap(), now=_NOW)
+            except Exception as exc:     # noqa: BLE001 — the disposition IS the assertion
+                box["error"] = exc
+            done.set()
+
+        thread = threading.Thread(target=_write_b, name="gap-writer-b")
+        thread.start()
+        try:
+            assert not done.wait(timeout=2.0), "B did not block — the two writes never raced"
+            conn_a.commit()
+            assert done.wait(timeout=15.0), "B never completed after A committed"
+        finally:
+            thread.join(timeout=15.0)
+
+        assert "error" not in box, box.get("error")
+        assert box["id"] == a_id, "the loser must return the row that won, not mint a second id"
+        with psycopg.connect(_dsn) as check:
+            rows = check.execute(
+                "SELECT event_id FROM analysis_learning_event WHERE kind = 'gap'").fetchall()
+        assert [r[0] for r in rows] == [a_id]
+    finally:
+        for c in (conn_a, conn_b):
+            try:
+                c.rollback()
+            except Exception:   # noqa: BLE001
+                pass
+            c.close()
+        # This test COMMITS to the shared test database; clear the table so the next test starts
+        # empty (the `db` fixture's rollback cannot undo another connection's commit).
+        with psycopg.connect(_dsn, autocommit=True) as cleanup:
+            cleanup.execute("DELETE FROM analysis_learning_event")
+
+
 def test_re_evaluation_does_not_FRAGMENT_the_gap(db):
     """A new snapshot produces a new EVENT but the SAME gap — it is still one thing to decide.
 

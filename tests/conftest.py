@@ -89,3 +89,23 @@ def _reset_repair_registry():
     runner._REPAIR_REGISTRY.clear()
     yield
     runner._REPAIR_REGISTRY.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_transient_backoff(request, monkeypatch):
+    """THE SUITE NEVER SLEEPS. `drive_structured_call` waits before a PROVIDER_TRANSIENT re-call
+    (`llm._TRANSIENT_BACKOFF_BASE_S`), so without this every test that scripts a transient fault
+    would pay real wall-clock — 1s + 2s for a two-retry chain — and a future test that happens to
+    hit that path would silently make CI slower with nothing pointing at why.
+
+    The wait is zeroed, NOT removed: `sleep(0.0)` is still called, so a test can still observe THAT
+    the driver waited, only not for how long.
+
+    Zeroing the schedule everywhere would also make a broken schedule invisible, so the tests that
+    assert the real one opt out with `@pytest.mark.real_backoff`. They pay no wall-clock either —
+    they inject a recording `sleep=` and never hand the wait to `time.sleep`."""
+    if "real_backoff" in request.keywords:
+        return
+    from featuregen.intake import llm
+
+    monkeypatch.setattr(llm, "transient_backoff_s", lambda retries_used: 0.0)

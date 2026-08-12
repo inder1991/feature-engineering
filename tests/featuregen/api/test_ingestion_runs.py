@@ -261,8 +261,13 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "enrich_concept", "enrich_concept_critic",
         "enrich_definition", "enrich_domain",
         "enrich_synonyms", "enrich_unit",
+        # semantic Task 5: adjudication of the columns Pass A left unclear, between the stages it
+        # reasons over and the graph persistence that must carry its corrections.
+        "semantic_adjudication",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        # Task 0.6 Seam 5a: the tail re-projection of evidence-bearing table refs now reports.
+        "table_display_reprojection",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         # entity_bridges runs AFTER the drain + table-fact projection: assessing earlier read
         # stale flat grain flags and froze them into the candidate evidence (bridge 6B).
@@ -273,6 +278,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
         # the display-axis projection runs LAST among the graph writers (richness Task 3), so
         # its fill-only-NULL guards see every governed re-projection already applied.
         "axis_projection",
+        # Task 2b: every genuine grounding tie adjudicated once, at the tail, graph final.
+        "tie_break_warming",
         # Step 6c: the ONE summary draft per ingest happens at the tail, from the enriched
         # dossier the axis projection just completed.
         "enrich_summary",

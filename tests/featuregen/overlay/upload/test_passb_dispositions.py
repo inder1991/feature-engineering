@@ -26,7 +26,9 @@ from featuregen.overlay.upload.table_synth import DISPOSITION_FIELDS
 
 _NOW = datetime(2026, 7, 18, tzinfo=UTC)
 _SOURCE = "ftr_disp"
-_FIELDS = {"grain", "availability_time", "table_role", "primary_entity", "event_or_snapshot"}
+# Read off the ONE constant, never re-typed: the set grew from five to nine at the joint Task-4
+# step (profile Task 4 added the four profile suggestions), and what this suite guards is TOTALITY.
+_FIELDS = set(DISPOSITION_FIELDS)
 
 
 def _seal_config():
@@ -95,19 +97,22 @@ def test_dispositions_persist_total_in_stage_detail(db, monkeypatch):
     assert recs[("txn", "grain")]["reason"] == "grain_col_not_in_table"
     assert recs[("txn", "table_role")]["status"] == "dropped_invalid"
     assert recs[("txn", "table_role")]["reason"] == "role_off_vocab"
-    # totality: all five fields present for the evaluated table
+    # totality: EVERY disposition field present for the evaluated table
     assert {f for (t, f) in recs if t == "txn"} == _FIELDS
     for field in ("availability_time", "primary_entity", "event_or_snapshot"):
         assert recs[("txn", field)]["status"] == "abstained"     # absent == the model gave nothing
-    # [F12]: the unresolved table gets the SAME five-field record shape, status not_evaluated
+    # [F12]: the unresolved table gets the SAME record shape, status not_evaluated
     assert {f for (t, f) in recs if t == "orphan"} == _FIELDS
     for field in _FIELDS:
         rec = recs[("orphan", field)]
         assert rec["status"] == "not_evaluated"
         assert rec["reason"] is None
         assert rec["prior_value_staled"] is False
-    # uniform/total: exactly one record per (table, field) — 2 tables x 5 fields, no duplicates
-    assert len(detail["dispositions"]) == 10
+    # uniform/total: exactly one record per (table, field) — 2 tables x |DISPOSITION_FIELDS|, no
+    # duplicates. Read off the constant: the set grew from five to nine at the joint Task-4 step
+    # (profile Task 4 added the four profile suggestions) and the CONTRACT is totality, not a
+    # literal count that has to be chased.
+    assert len(detail["dispositions"]) == 2 * len(DISPOSITION_FIELDS)
     # the existing outcome keys still ride the same detail (dispositions is additive)
     assert detail["resolved"] == 1 and detail["expected"] == 2 and detail["unresolved"] == 1
 
@@ -136,7 +141,15 @@ def test_prior_value_staled_is_live_on_the_ingest_path(db, monkeypatch):
     assert rec2["status"] == "accepted" and rec2["prior_value_staled"] is True
 
 
-def test_disposition_fields_constant_is_the_five_field_contract():
-    """The [F12] totalizer and the accept write the SAME five fields, from ONE constant."""
-    assert DISPOSITION_FIELDS == ("grain", "availability_time", "table_role", "primary_entity",
-                                  "event_or_snapshot")
+def test_disposition_fields_constant_is_the_total_field_contract():
+    """The [F12] totalizer and the accept write the SAME fields, from ONE constant — the five
+    STRUCTURAL ones plus (profile Task 4) the four PROFILE suggestions."""
+    from featuregen.overlay.upload.table_synth import (
+        PROFILE_DISPOSITION_FIELDS,
+        _STRUCTURAL_DISPOSITION_FIELDS,
+    )
+    assert _STRUCTURAL_DISPOSITION_FIELDS == ("grain", "availability_time", "table_role",
+                                              "primary_entity", "event_or_snapshot")
+    assert PROFILE_DISPOSITION_FIELDS == ("table_description", "business_context",
+                                          "authority_role", "temporal_storage_model")
+    assert DISPOSITION_FIELDS == (*_STRUCTURAL_DISPOSITION_FIELDS, *PROFILE_DISPOSITION_FIELDS)

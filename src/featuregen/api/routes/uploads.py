@@ -3,10 +3,11 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import logging
 import os
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import psycopg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
@@ -16,12 +17,16 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.errors import ConcurrencyError
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.catalog_profiles import (
+    CatalogProfileError,
+    build_catalog_profile_revision,
+    parse_narrative_payload,
+)
 from featuregen.overlay.upload.csv_reader import read_csv_rows
 from featuregen.overlay.upload.excel_reader import read_excel_rows
 from featuregen.overlay.upload.ftr_adapter import (
     PreparedFtrUpload,
     glossary_shape_error,
-    is_ftr_glossary,
     is_glossary_mapping,
     read_ftr_glossary,
     to_glossary_upload,
@@ -31,8 +36,7 @@ from featuregen.overlay.upload.glossary_reader import (
     is_glossary_csv,
     read_glossary,
 )
-from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
-from featuregen.overlay.upload.object_ref import normalize_source_name
+from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -41,6 +45,12 @@ from featuregen.overlay.upload.ingestion_run import (
     terminalize_run,
     terminalize_run_durable,
 )
+from featuregen.overlay.upload.object_ref import normalize_source_name
+from featuregen.overlay.upload.profile_store import (
+    record_catalog_profile_revision,
+    upsert_current_catalog_profile,
+)
+from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SOURCE_CAPABILITY_PROFILE_VERSION,
@@ -61,6 +71,36 @@ _RUN_ID_HEADER = RUN_ID_HEADER
 # A catalog upload is a SCHEMA export (column names/types/grain), not a data extract, so a modest cap
 # bounds the whole-file in-memory read + parse against an accidental or malicious oversized upload.
 _MAX_UPLOAD_BYTES = int(os.environ.get("FEATUREGEN_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+
+# The optional catalog-narrative part (Release-A profile Task 3) is a small JSON object of bounded
+# prose fields — cap the raw part well before json.loads sees it.
+_MAX_PROFILE_JSON_BYTES = 64 * 1024
+
+
+def _validated_profile_fields(catalog_profile_json: str | None) -> dict | None:
+    """FULL validation of the optional ``catalog_profile_json`` part BEFORE any write (Task 3).
+
+    Returns the normalized narrative kwargs, or ``None`` when the part is absent OR the profiles
+    flag is off (ignored-with-warning: the response body stays byte-identical either way — a
+    MISSING profile never rejects a valid catalog, and flag-off never grows a new failure mode).
+    An INVALID present part under the flag is a 400 before the ingest opens any write."""
+    if catalog_profile_json is None:
+        return None
+    if not dataset_profiles_enabled():
+        logger.warning("catalog_profile_json ignored: FEATUREGEN_DATASET_PROFILES is off")
+        return None
+    if len(catalog_profile_json.encode("utf-8")) > _MAX_PROFILE_JSON_BYTES:
+        raise HTTPException(status_code=400,
+                            detail="catalog_profile_json exceeds the 64 KiB bound")
+    try:
+        payload = json.loads(catalog_profile_json)
+    except ValueError as exc:
+        raise HTTPException(status_code=400,
+                            detail=f"catalog_profile_json is not valid JSON: {exc}") from exc
+    try:
+        return parse_narrative_payload(payload)
+    except CatalogProfileError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _read_capped(file: UploadFile) -> bytes:
@@ -128,7 +168,11 @@ def create_upload(
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
-) -> IngestResult:
+    catalog_profile_json: Annotated[str | None, Form()] = None,
+) -> dict[str, Any]:
+    # The body is `IngestResult.response_payload()` — the IngestResult serialization with the I3
+    # correction fields SPARSE (omitted when nothing was dropped), which is what keeps the
+    # ordinary upload's body byte-identical to the pre-I3 contract the tests pin.
     # The source id IS the catalog identity (fact keys, snapshots, the brake all key on it raw), so
     # normalize it the way every other identity component is normalized — strip+LOWER, matching
     # object_ref._norm — before anything downstream sees it: 'sales', 'sales ' and 'Sales' must be
@@ -165,6 +209,9 @@ def create_upload(
     selected_profile: SourceCapabilityProfile | None = None   # None until parse selects one
     failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...
     try:
+        # Release-A profile Task 3: FULLY validate the optional narrative part BEFORE any write —
+        # an invalid present part 400s here (nothing ingested); an absent part changes nothing.
+        profile_fields = _validated_profile_fields(catalog_profile_json)
         data = _read_capped(file)
         file_sha256 = hashlib.sha256(data).hexdigest()
         try:
@@ -240,6 +287,18 @@ def create_upload(
                 status_code=500,
                 detail=f"ingest stage failed: {type(exc).__name__} — the upload was not "
                        "applied") from exc
+        # Release-A profile Task 3: the uploader-authored catalog narrative commits ATOMICALLY
+        # with a SUCCESSFUL ingest (same connection, same transaction — an ingest that fails to
+        # commit takes the narrative down with it). A held/rejected ingest leaves the current
+        # pointer untouched; the pointer advance is the serialized ingest-path upsert (the API
+        # PUT keeps the strict body-carried CAS).
+        if profile_fields is not None and result.status == "ingested":
+            revision = build_catalog_profile_revision(
+                catalog_source=source, producer_ref=identity.subject,
+                ingestion_run_id=run_id, **profile_fields)
+            record_catalog_profile_revision(conn, revision)
+            upsert_current_catalog_profile(conn, catalog_source=source,
+                                           revision_id=revision.revision_id)
         # Terminalize ON THE REQUEST CONNECTION: the terminal status (IngestResult.status maps
         # 1:1 onto the run vocabulary) commits atomically with the ingest it describes —
         # 'ingested' can never be recorded for a transaction that then fails to commit.
@@ -258,9 +317,10 @@ def create_upload(
                         profile_version=SOURCE_CAPABILITY_PROFILE_VERSION)
         # #22: the stage reports commit WITH the terminal state on the request connection
         # (flush is savepointed + fail-contained, so it can neither 500 the upload nor change
-        # the response body — which stays exactly the IngestResult serialization).
+        # the response body — which stays exactly the IngestResult serialization, sparse
+        # correction fields included only when a correction was dropped).
         recorder.flush(conn, run_id, now=datetime.now(UTC))
-        return result
+        return result.response_payload()
     except HTTPException as exc:
         # The request transaction is rolling back — terminalize on an independent connection so
         # the failed attempt's manifest survives. Redaction: record the exception CLASS (of the

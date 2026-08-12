@@ -14,13 +14,19 @@ import {
   bulkRejectEntityBridges,
   confirmEntityBridge,
   confirmJoin,
+  confirmSemanticBinding,
+  SEMANTIC_BINDING_REJECT_CATEGORIES,
+  type SemanticBindingRejectCategory,
   confirmTableFact,
   getGovernanceQueue,
   rejectEntityBridge,
   rejectJoin,
+  rejectSemanticBinding,
   rejectTableFact,
   reviewBridgeRealization,
 } from '../api'
+import { ConceptConfirmationPanel } from './ConceptConfirmationPanel'
+import { DataUsePolicyPanel } from './DataUsePolicyPanel'
 
 // GOVERNANCE REVIEW — a decision queue, not a search box.
 //
@@ -78,12 +84,16 @@ const KIND_LABEL: Record<string, string> = {
   approved_join: 'Discovered joins',
   grain: 'Table grain',
   availability_time: 'As-of date',
+  currency_binding: 'Currency bindings',
+  entity_assignment: 'Entity assignments',
 }
 const KIND_LABEL_ONE: Record<string, string> = {
   entity_bridge: 'Cross-catalog identifier link',
   approved_join: 'Discovered join',
   grain: 'Table grain',
   availability_time: 'As-of date',
+  currency_binding: 'Currency binding',
+  entity_assignment: 'Entity assignment',
 }
 // What each kind IS, for the section lead-in — including the fact that a discovered join lives
 // inside ONE catalog: `list_open_approved_join_proposals` filters on `from_ref.catalog_source` only
@@ -95,6 +105,9 @@ const KIND_ABOUT: Record<string, string> = {
     + 'listed under the catalog it starts in.',
   grain: 'What one row of a table is — the key every feature on it aggregates to.',
   availability_time: 'Which column carries the as-of date point-in-time features read.',
+  currency_binding: 'What currency an amount column is in — a fixed code, or the column on the '
+    + 'same table that names it per row. Features that sum money are refused until this is decided.',
+  entity_assignment: 'Which business entity an identifier column denotes.',
 }
 
 function kindLabel(kind: string): string {
@@ -172,6 +185,9 @@ const AVAILABILITY_TONE: Record<string, string> = {
 function rejectCategories(kind: string): readonly string[] {
   if (kind === 'entity_bridge') return ENTITY_BRIDGE_REJECT_CATEGORIES
   if (kind === 'approved_join') return REJECT_CATEGORIES
+  if (kind === 'currency_binding' || kind === 'entity_assignment') {
+    return SEMANTIC_BINDING_REJECT_CATEGORIES
+  }
   return TABLE_FACT_REJECT_CATEGORIES
 }
 
@@ -179,6 +195,7 @@ function rejectCategories(kind: string): readonly string[] {
 // instead of "nothing is waiting". Both table-fact kinds come from the one `table_fact` listing.
 function unreadableListings(kind: string): string[] {
   if (kind === 'grain' || kind === 'availability_time') return ['table_fact']
+  if (kind === 'currency_binding' || kind === 'entity_assignment') return ['semantic_binding']
   return [kind]
 }
 
@@ -226,6 +243,19 @@ function headline(item: GovernanceQueueItem): string {
     if (table && column) return `${table} is as of ${column}`
     if (table) return `The as-of date of ${table}`
   }
+  if (item.kind === 'currency_binding') {
+    const column = item.subject.split('.').pop() ?? item.subject
+    const fixed = asStr(asRec(d.value).currency_code)
+    const target = asStr(asRec(d.target).column)
+    if (fixed) return `${column} is always in ${fixed}`
+    if (target) return `${column} is in the currency named by ${target}`
+    return `The currency of ${column}`
+  }
+  if (item.kind === 'entity_assignment') {
+    const column = item.subject.split('.').pop() ?? item.subject
+    const entity = asStr(d.entity_id)
+    return entity ? `${column} identifies a ${entity}` : `What ${column} identifies`
+  }
   return item.subject
 }
 
@@ -240,9 +270,16 @@ function agreement(item: GovernanceQueueItem): string {
   if (item.kind === 'approved_join') {
     const from = asRec(d.from)
     const to = asRec(d.to)
-    const cardinality = asStr(d.cardinality) || 'the stated cardinality'
+    // Task 5 codegen-review remediation (M3): a blank uploaded cardinality is proposed as null
+    // now, and this sentence IS the agreement the confirmation records — it must never assert
+    // "the stated cardinality" when none was stated. Confirming the join is still meaningful
+    // (the pair and direction), but it stays unusable at runtime until a cardinality exists.
+    const cardinality = asStr(d.cardinality)
+    const atClause = cardinality
+      ? `, at ${cardinality}.`
+      : ', at an unstated cardinality — this join stays unusable until one is supplied.'
     return `I agree that ${asStr(from.table) || 'the from table'} joins into `
-      + `${asStr(to.table) || 'the to table'} in this direction, at ${cardinality}.`
+      + `${asStr(to.table) || 'the to table'} in this direction${atClause}`
   }
   if (item.kind === 'grain') {
     const columns = asStrArr(asRec(d.proposed_value).columns).join(' + ')
@@ -252,6 +289,19 @@ function agreement(item: GovernanceQueueItem): string {
   if (item.kind === 'availability_time') {
     const column = asStr(asRec(d.proposed_value).column) || 'the proposed column'
     return `I agree that ${column} is the as-of date of ${asStr(d.table) || 'this table'}.`
+  }
+  if (item.kind === 'currency_binding') {
+    const fixed = asStr(asRec(item.detail.value).currency_code)
+    const target = asStr(asRec(item.detail.target).column)
+    if (fixed) return `I agree this amount is always denominated in ${fixed}.`
+    if (target) {
+      return `I agree this amount's currency varies per row and is named by ${target}.`
+    }
+    return 'I agree with this currency binding as it is described here.'
+  }
+  if (item.kind === 'entity_assignment') {
+    const entity = asStr(item.detail.entity_id) || 'the proposed entity'
+    return `I agree this column identifies a ${entity}.`
   }
   return 'I agree with this relationship as it is described here.'
 }
@@ -876,14 +926,36 @@ async function confirmItem(item: GovernanceQueueItem, note: string): Promise<Out
       projectionKind: 'review',
     }
   }
-  const result = item.kind === 'approved_join'
-    ? await confirmJoin(item.fact_key, body)
-    : await confirmTableFact(item.fact_key, body)
-  return {
-    governance_status: result.governance_status,
-    projection: result.operational_projection,
-    projectionKind: 'operational',
+  if (item.kind === 'currency_binding' || item.kind === 'entity_assignment') {
+    const result = await confirmSemanticBinding(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
   }
+  if (item.kind === 'approved_join') {
+    const result = await confirmJoin(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
+  }
+  if (item.kind === 'grain' || item.kind === 'availability_time') {
+    const result = await confirmTableFact(item.fact_key, body)
+    return {
+      governance_status: result.governance_status,
+      projection: result.operational_projection,
+      projectionKind: 'operational',
+    }
+  }
+  // VERSION SKEW, named (2026-08-10): an old bundle once met a new queue kind here and fell
+  // through to the TABLE-FACT command — the backend 404ed the wrong-route confirm ("No such
+  // table-fact proposal"), which read as a broken screen. A kind this build does not know gets a
+  // reload instruction, never somebody else's command.
+  throw new Error(
+    `This review screen is older than this decision kind (${item.kind}). Reload the page.`)
 }
 
 async function rejectItem(
@@ -902,7 +974,18 @@ async function rejectItem(
     await rejectJoin(item.fact_key, { category: category as RejectCategory, ...rest })
     return
   }
-  await rejectTableFact(item.fact_key, { category: category as TableFactRejectCategory, ...rest })
+  if (item.kind === 'currency_binding' || item.kind === 'entity_assignment') {
+    await rejectSemanticBinding(item.fact_key,
+      { category: category as SemanticBindingRejectCategory, ...rest })
+    return
+  }
+  if (item.kind === 'grain' || item.kind === 'availability_time') {
+    await rejectTableFact(item.fact_key,
+      { category: category as TableFactRejectCategory, ...rest })
+    return
+  }
+  throw new Error(
+    `This review screen is older than this decision kind (${item.kind}). Reload the page.`)
 }
 
 function projectionNote(projection: string, kind: Outcome['projectionKind']): string {
@@ -1612,6 +1695,13 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
           </button>
         </p>
       )}
+
+      {/* Data-use policies (D14). A STANDING decision rather than a queued one — nothing proposes
+          it, so it has no queue row and would have no home if it were not here. It belongs on the
+          DECIDING screen rather than the read-only dashboard: the feature flow's refusal sends the
+          reviewer to "Governance -> Data-use policies", and this is where deciding happens. */}
+      <ConceptConfirmationPanel />
+      <DataUsePolicyPanel />
     </section>
   )
 }

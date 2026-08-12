@@ -40,9 +40,13 @@ Python lists:
   :meth:`Column.__truediv__`. That is the one place this stand-in deliberately declines to model
   Spark, and the reason is that the NULL would be indistinguishable from a renderer that never
   applied the formula's ``zero_denominator`` policy at all.
-* Nulls in FILTERS, types, coercion, partitioning and every optimisation are OUT of scope. A test
-  that needs any of those needs real Spark, which is L0. Null handling is modelled ONLY where an
-  aggregate, a coalesce or a cast reads it.
+* Comparisons, ``&``/``|``/``~`` and ``isin`` follow SQL's THREE-VALUED logic: a NULL operand
+  answers NULL (Kleene, so ``NULL & False`` is still False), ``where`` drops the NULL rows, and
+  ordering places NULLS FIRST ascending / LAST descending — Spark's defaults. Python's own
+  answers (``None != x`` is True; ``sorted`` raises) would KEEP exactly the rows the cluster
+  drops and make every null-bearing scenario untestable, which is the permissive failure mode.
+* Types, coercion, partitioning and every optimisation remain OUT of scope. A test that needs any
+  of those needs real Spark, which is L0.
 
 **Every method here raises rather than degrading.** An unmodelled cast, an unmodelled ``trunc``
 format and an unparseable ``expr`` all raise :class:`NotImplementedError`. That is the rule that
@@ -166,8 +170,20 @@ class Column:
     # ── comparison and ordering ──────────────────────────────────────────────────────────────────
 
     def _compare(self, other: Any, op: Callable[[Any, Any], Any], symbol: str) -> Column:
-        return Column(f"({self._name} {symbol} {getattr(other, 'name', other)})",
-                      lambda row: op(self._evaluate(row), _value_of(other, row)),
+        """A comparison under SQL's THREE-VALUED logic: a NULL on either side answers NULL.
+
+        Python's own answer — ``None != "cancelled"`` is True — is the permissive one: a rendered
+        ``!=`` filter would KEEP exactly the null rows the cluster drops, and every status-filter
+        test over nullable data would pass against behaviour Spark does not have. The NULL is
+        answered BEFORE ``op`` runs, which is also what lets a null-bearing column reach a
+        comparison at all instead of raising ``TypeError`` out of the operator.
+        """
+        def compare(row: Any) -> Any:
+            left, right = self._evaluate(row), _value_of(other, row)
+            if left is None or right is None:
+                return None
+            return op(left, right)
+        return Column(f"({self._name} {symbol} {getattr(other, 'name', other)})", compare,
                       aggregate=self._aggregate or _is_aggregate(other))
 
     def __le__(self, other: Any) -> Column:
@@ -189,18 +205,41 @@ class Column:
         return self._compare(other, lambda a, b: a != b, "!=")
 
     def __and__(self, other: Column) -> Column:
-        return Column(f"({self._name} AND {other._name})",
-                      lambda row: bool(self._evaluate(row)) and bool(other._evaluate(row)),
+        """KLEENE conjunction: a False conjunct decides ALONE; otherwise a NULL makes it NULL.
+
+        Inside ``where`` the distinction from Python truthiness is invisible — None and False both
+        drop — but ``~`` composes on top: Child-1's NOT-over-AND filter trees render ``~(a & b)``,
+        and there ``NULL & True`` must stay NULL so the negation stays NULL and the row DROPS,
+        where truthiness answered False and its negation kept the row.
+        """
+        def conjoin(row: Any) -> Any:
+            left, right = _as_bool(self._evaluate(row)), _as_bool(other._evaluate(row))
+            if left is False or right is False:
+                return False
+            if left is None or right is None:
+                return None
+            return True
+        return Column(f"({self._name} AND {other._name})", conjoin,
                       aggregate=self._aggregate or _is_aggregate(other))
 
     def __or__(self, other: Column) -> Column:
-        return Column(f"({self._name} OR {other._name})",
-                      lambda row: bool(self._evaluate(row)) or bool(other._evaluate(row)),
+        """KLEENE disjunction — ``__and__``'s dual: a True disjunct decides alone."""
+        def disjoin(row: Any) -> Any:
+            left, right = _as_bool(self._evaluate(row)), _as_bool(other._evaluate(row))
+            if left is True or right is True:
+                return True
+            if left is None or right is None:
+                return None
+            return False
+        return Column(f"({self._name} OR {other._name})", disjoin,
                       aggregate=self._aggregate or _is_aggregate(other))
 
     def __invert__(self) -> Column:
-        return Column(f"(NOT {self._name})", lambda row: not bool(self._evaluate(row)),
-                      aggregate=self._aggregate)
+        """``NOT NULL`` is NULL — negation never converts "unknown" into "keep this row"."""
+        def negate(row: Any) -> Any:
+            value = self._evaluate(row)
+            return None if value is None else not bool(value)
+        return Column(f"(NOT {self._name})", negate, aggregate=self._aggregate)
 
     def __hash__(self) -> int:
         return id(self)
@@ -305,9 +344,20 @@ class Column:
                       aggregate=self._aggregate, sql_type=wanted)
 
     def isin(self, values: Iterable[Any]) -> Column:
+        """SQL's ``IN``, not Python's ``in``: a NULL probe is NULL, and a NULL MEMBER turns a miss
+        into "unknown" (the probe might equal the value the NULL stands for) while a hit stays
+        True. The rendered ``NOT_IN`` filter is ``~isin``, so a permissive False here would KEEP
+        every null row the cluster drops."""
         allowed = list(values)
-        return Column(f"({self._name} IN {allowed})", lambda row: self._evaluate(row) in allowed,
-                      aggregate=self._aggregate)
+
+        def contains(row: Any) -> Any:
+            value = self._evaluate(row)
+            if value is None:
+                return None
+            if any(member is not None and value == member for member in allowed):
+                return True
+            return None if any(member is None for member in allowed) else False
+        return Column(f"({self._name} IN {allowed})", contains, aggregate=self._aggregate)
 
     def desc(self) -> _Ordering:
         return _Ordering(self, descending=True)
@@ -344,6 +394,11 @@ class _When(Column):
 
 def _value_of(value: Any, row: Any) -> Any:
     return value._eval(row) if isinstance(value, Column) else value
+
+
+def _as_bool(value: Any) -> bool | None:
+    """A predicate operand as SQL's three values — NULL stays NULL, everything else is a bool."""
+    return None if value is None else bool(value)
 
 
 def _quantize(value: Any, scale: int, rounding: str) -> _decimal.Decimal:
@@ -424,8 +479,20 @@ class _WindowExpr:
         return Column(self.kind, lambda _row: _MISSING, window=bound)
 
 
+def _null_key(value: Any) -> tuple[bool, Any]:
+    """One ordering key under Spark's default null placement: NULLS FIRST asc, NULLS LAST desc.
+
+    ``(value is not None, value)`` sorts every NULL before every value ascending, and the existing
+    ``reverse`` flag flips the whole tuple, which is exactly Spark's descending default. The NULL's
+    second element is a placeholder 0 rather than None so two NULL keys compare EQUAL instead of
+    raising — and it can never meet a real value of another type, because tuples with unequal
+    first elements never compare their second.
+    """
+    return (value is not None, 0 if value is None else value)
+
+
 def _sort_key(row: dict[str, Any], order: Sequence[_Ordering]) -> tuple[Any, ...]:
-    return tuple(ordering.column._eval(row) for ordering in order)
+    return tuple(_null_key(ordering.column._eval(row)) for ordering in order)
 
 
 def _sorted_partition(rows: list[dict[str, Any]],
@@ -433,7 +500,8 @@ def _sorted_partition(rows: list[dict[str, Any]],
     """Stable multi-key sort, applied least-significant key first (Python's sorts are stable)."""
     ordered = list(rows)
     for ordering in reversed(order):
-        ordered.sort(key=lambda row, o=ordering: o.column._eval(row), reverse=ordering.descending)
+        ordered.sort(key=lambda row, o=ordering: _null_key(o.column._eval(row)),
+                     reverse=ordering.descending)
     return ordered
 
 
@@ -864,7 +932,11 @@ def run_rendered(source: str, func_name: str, *, module_file: str | None = None)
     """
     namespace: dict[str, Any] = {
         "DataFrame": DataFrame, "F": functions, "Window": Window,
-        "hashlib": _hashlib, "json": _json, "pathlib": _pathlib, "Decimal": _decimal.Decimal}
+        "hashlib": _hashlib, "json": _json, "pathlib": _pathlib, "Decimal": _decimal.Decimal,
+        # `from datetime import date` — the import a DATE-literal filter declares (nodes_compute
+        # emits `date.fromisoformat('…')`). Without it every such filter dies with NameError
+        # before it filters anything, which is zero behavioural coverage for DATE comparisons.
+        "date": _dt.date}
     if module_file is not None:
         namespace["__file__"] = module_file
     exec(compile(source, f"<rendered {func_name}>", "exec"), namespace)  # noqa: S102 — the point

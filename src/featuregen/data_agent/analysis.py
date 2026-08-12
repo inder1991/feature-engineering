@@ -11,6 +11,11 @@ every entity that has no events in one period — and for "whose transactions de
 that fell to zero is the most affected one in the answer. So the spine is the left side of the query
 and both period aggregates hang off it, with missing counts coalesced to zero.
 
+The spine is also read RAW — every row of a population IS a member, so there is no row rule to
+apply. That makes "is this table one row per member?" a question about the DATA that nothing in the
+plan can answer, which is what :func:`assert_spine_is_unique` exists for: a history-keeping spine
+does not fail, it multiplies every count by however many versions each member happens to have.
+
 This compiles to SQL for the sandbox slice. The IR remains the artifact of record and can compile to
 a generated Kedro project later without the ontology or the audit trail noticing.
 """
@@ -33,6 +38,12 @@ from featuregen.data_agent.learning import record_refusal
 from featuregen.data_agent.observation import ObservationPlanError, require_identifier
 from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.data_agent.relationship import RelationshipEvidence, join_refusal
+from featuregen.data_agent.snapshots import (
+    LatestSnapshotPolicyV1,
+    SnapshotScope,
+    SnapshotSelectionError,
+    assert_no_snapshot_tie,
+)
 
 
 class AnalysisIRError(ValueError):
@@ -115,6 +126,12 @@ class AnalysisExecutionIRV1:
     #: population without duplicating it.
     dimension_binding: PhysicalDatasetBindingV1 | None = None
     attribution: DimensionAttributionPolicyV1 | None = None
+    #: ENGINE B (Release-B Task 8). The ALTERNATIVE row rule for a dimension source that is a
+    #: SNAPSHOT table rather than an SCD interval table: keep the row at the greatest snapshot value
+    #: at or before the cutoff. Exactly one of `attribution`/`snapshot_selection` may be set — two
+    #: row rules for one dimension source is a contradiction, not a fallback. Defaults to None, so
+    #: every plan built before this field existed compiles and hashes byte-identically.
+    snapshot_selection: LatestSnapshotPolicyV1 | None = None
     #: OBSERVED evidence that the event key and the spine key denote the same entity — the release's
     #: "verified joins". Not validated at construction: like `assert_no_dimension_overlap`, this is a
     #: statement about the state of the data rather than about the shape of the plan, so a plan can
@@ -144,11 +161,26 @@ class AnalysisExecutionIRV1:
                 "ANALYSIS_NO_ELIGIBILITY_POLICY",
                 "no transaction eligibility policy: without one, pending, failed and REVERSED "
                 "transactions count as activity")
-        if self.dimensions and (self.dimension_binding is None or self.attribution is None):
+        if self.attribution is not None and self.snapshot_selection is not None:
+            raise AnalysisIRError(
+                "ANALYSIS_TWO_ROW_RULES",
+                "the dimension source carries BOTH an attribution policy and a latest-snapshot "
+                "selection. They are two different row rules over one table and they disagree on "
+                "any table that has both an interval and a snapshot column; one of them has to be "
+                "the declared one")
+        if self.dimensions and (self.dimension_binding is None
+                                or (self.attribution is None and self.snapshot_selection is None)):
             raise AnalysisIRError(
                 "ANALYSIS_NO_ATTRIBUTION_POLICY",
                 "dimensions were requested with no attribution policy: the renderer must not choose "
                 "between today's segment, the segment at the cutoff, and the segment per period")
+        if self.dimensions and self.snapshot_selection is not None \
+                and self.snapshot_selection.scope is SnapshotScope.PER_TABLE:
+            raise AnalysisIRError(
+                "ANALYSIS_SNAPSHOT_SCOPE_UNJOINABLE",
+                "a per-TABLE latest-snapshot selection has no entity key, so it cannot be joined to "
+                "the population spine — it describes a reference dataset republished whole, not a "
+                "per-customer dimension. Declare the entity key and the per-entity scope")
         for period in (self.current, self.previous):
             if not period.values:
                 raise AnalysisIRError(
@@ -156,6 +188,70 @@ class AnalysisExecutionIRV1:
                     f"period {period.label!r} selects no values; an empty period is either a "
                     "mistake or an unbounded scan awaiting a fallback")
 
+
+    def identity_payload(self) -> dict[str, object]:
+        """WHAT this plan computes, as canonical STRUCTURE rather than a delimiter-joined string.
+
+        Exactly the facts :attr:`plan_hash` joins and nothing else — `question` stays excluded for
+        the same reason it is excluded there. This exists because the Release-B Task-9
+        ``AnalysisExecutionIRV2`` takes its identity from RFC-8785 JCS over structure (D1), and a
+        ``|``-joined string cannot carry a version token and does not escape: a column literally
+        named ``a|b`` and the pair ``a``, ``b`` produce the same bytes, and two IRs differing only
+        in where a boundary falls hash identically.
+
+        **V1's own `plan_hash` is UNCHANGED and still computed from the join.** Nothing stored
+        re-keys; the two enumerations are pinned to each other by a mutation test that moves every
+        identity-bearing field and asserts BOTH hashes move.
+
+        The structure is deliberately TOTAL where the join is conditional: the join appends the
+        attribution and snapshot blocks only when present, because appending is the only way a
+        string can stay backward-compatible. Structure has no such problem, so an absent block is
+        an explicit ``None`` and `current_flag_column` is always a key.
+        """
+        e = self.eligibility
+        if e is None:  # guarded by __post_init__; keeps the identity function total for type checkers
+            raise AssertionError("validated analysis IR has no eligibility policy")
+        return {
+            "spine": {"table_id": self.spine.binding.identity.table_id,
+                      "key_column": self.spine.key_column},
+            "event": {"table_id": self.event_binding.identity.table_id,
+                      "key_column": self.event_key_column,
+                      "period_column": self.period_column},
+            "periods": {"current": list(self.current.values),
+                        "previous": list(self.previous.values)},
+            "measure": self.measure,
+            "comparison": str(self.comparison),
+            "dimensions": [d.column for d in self.dimensions],
+            "dimension_table_id": (self.dimension_binding.identity.table_id
+                                   if self.dimension_binding else None),
+            "eligibility": {
+                "status_column": e.status_column,
+                "included_status_values": list(e.included_status_values),
+                "reversal_mode": str(e.reversal_mode),
+                "reversal_column": e.reversal_column,
+                "non_reversed_values": list(e.non_reversed_values),
+                "null_behavior": str(e.null_behavior),
+            },
+            "bridge_realization_dependencies": [
+                {"realization_revision_id": revision, "dependency_snapshot_id": snapshot}
+                for revision, snapshot in self.bridge_realization_dependencies],
+            "attribution": None if self.attribution is None else {
+                "attribution_basis": str(self.attribution.attribution_basis),
+                "report_cutoff": self.attribution.report_cutoff,
+                "effective_from_column": self.attribution.effective_from_column,
+                "effective_to_column": self.attribution.effective_to_column,
+                "missing_value_behavior": str(self.attribution.missing_value_behavior),
+                "current_flag_column": self.attribution.current_flag_column,
+            },
+            "snapshot_selection": None if self.snapshot_selection is None else {
+                "snapshot_column": self.snapshot_selection.snapshot_column,
+                "cutoff": self.snapshot_selection.cutoff,
+                "scope": str(self.snapshot_selection.scope),
+                "key_column": self.snapshot_selection.key_column,
+                "tie_break_columns": list(self.snapshot_selection.tie_break_columns),
+                "missing_value_behavior": str(self.snapshot_selection.missing_value_behavior),
+            },
+        }
 
     @property
     def plan_hash(self) -> str:
@@ -187,6 +283,24 @@ class AnalysisExecutionIRV1:
             str(self.attribution.attribution_basis), self.attribution.report_cutoff,
             self.attribution.effective_from_column, self.attribution.effective_to_column,
             str(self.attribution.missing_value_behavior),
+            self.dimension_binding.identity.table_id if self.dimension_binding else "",
+        # Both Release-B additions APPEND, and only when the thing they describe is present, so
+        # every plan hash computed before ENGINE A/B existed is byte-identical to what it was. A
+        # `current_flag_column` only exists on a `current_value` policy, which could not be
+        # constructed at all before this release.
+        ]) + ([] if not (self.attribution and self.attribution.current_flag_column) else [
+            self.attribution.current_flag_column,
+        ]) + ([] if self.snapshot_selection is None else [
+            self.snapshot_selection.snapshot_column, self.snapshot_selection.cutoff,
+            str(self.snapshot_selection.scope), self.snapshot_selection.key_column,
+            ",".join(self.snapshot_selection.tie_break_columns),
+            # `missing_value_behavior` is IDENTITY, exactly as it is on the attribution block above
+            # and for the same reason: `compile_analysis` BRANCHES on it — UNKNOWN_BUCKET coalesces
+            # an unclassified customer into a named bucket and RETAIN_NULL leaves the group NULL —
+            # so two IRs differing only here compile to two different statements. Omitting it gave
+            # them ONE plan_hash, which is a cached answer computed under the other definition of
+            # "unclassified".
+            str(self.snapshot_selection.missing_value_behavior),
             self.dimension_binding.identity.table_id if self.dimension_binding else "",
         ]))
         return hashlib.sha256(material.encode()).hexdigest()[:32]
@@ -237,19 +351,29 @@ def compile_analysis(ir: AnalysisExecutionIRV1, *, dialect) -> str:
 
     if ir.dimensions:
         attribution = ir.attribution
-        if attribution is None:  # guarded by __post_init__
+        snapshot = ir.snapshot_selection
+        if attribution is None and snapshot is None:  # guarded by __post_init__
             raise AssertionError("validated dimensional analysis has no attribution policy")
         # The dimension SNAPSHOT is built first, then LEFT JOINed — the same rule as the period
         # aggregates. Effective-date predicates in the outer WHERE would drop every customer with no
         # dimension history, repeating the population-spine mistake one layer up.
         dim_ref = dialect.table_ref(_Shim(ir.dimension_binding))
-        validity = attribution.validity_predicate(_q)
         dim_cols = ", ".join(_q(d.column) for d in ir.dimensions)
-        ctes.append(
-            f"dim AS (SELECT {_q(ir.spine.key_column)} AS k, {dim_cols} "
-            f"FROM {dim_ref} WHERE {validity})")
+        if snapshot is not None:
+            # ENGINE B. The same LEFT-JOINed shape; only the row rule differs, and it needs a
+            # window function rather than a flat predicate because "the greatest snapshot at or
+            # before the cutoff" is not expressible as one.
+            body = snapshot.ranked_selection(
+                _q, table_ref=dim_ref, columns=tuple(d.column for d in ir.dimensions))
+            ctes.append(f"dim AS ({body})")
+            missing_behavior = snapshot.missing_value_behavior
+        else:
+            ctes.append(
+                f"dim AS (SELECT {_q(ir.spine.key_column)} AS k, {dim_cols} "
+                f"FROM {dim_ref} WHERE {attribution.validity_predicate(_q)})")
+            missing_behavior = attribution.missing_value_behavior
         dimension_join = f"LEFT JOIN dim ON dim.k = s.{key}\n"
-        if attribution.missing_value_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
+        if missing_behavior is MissingValueBehavior.UNKNOWN_BUCKET:
             # Totals still reconcile: an unclassified customer is a bucket, not a disappearance.
             dimension_select = "".join(
                 f", COALESCE(dim.{_q(d.column)}, '{UNKNOWN}') AS {_q(d.column)}"
@@ -281,8 +405,12 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
     if not ir.dimensions:
         return
     attribution = ir.attribution
-    if attribution is None:  # guarded by __post_init__
-        raise AssertionError("validated dimensional analysis has no attribution policy")
+    if attribution is None:
+        # ENGINE B's row rule. Overlap is a statement about INTERVALS; a snapshot table has none,
+        # and its analogous defect is a tie at the greatest snapshot — refused by
+        # `assert_no_snapshot_tie`, which `run_analysis` calls instead. Returning rather than
+        # raising keeps this probe honest about what it can answer.
+        return
     class _Shim:
         def __init__(self, b): self.binding = b
     _q = dialect.ident
@@ -306,6 +434,65 @@ def assert_no_dimension_overlap(conn, ir: AnalysisExecutionIRV1, *, dialect) -> 
             f"{attribution.report_cutoff!r}; choosing one would hide a dimension-table defect")
 
 
+def assert_spine_is_unique(conn, ir: AnalysisExecutionIRV1, *, dialect) -> None:
+    """Refuse when the POPULATION SPINE is not one row per member. The mirror of
+    :func:`assert_no_dimension_overlap`, one join to the left.
+
+    The spine is read RAW — `FROM {spine} s`, no predicate — because every row of a population IS a
+    member. That is the design, and it is also the hole: a spine table that keeps history (SCD2, a
+    snapshot republished per day, an event log) does not fail here, it MULTIPLIES. Every count is
+    scaled by however many versions a customer happens to have, group totals inflate, and the
+    result is plausible for exactly the customers who changed the most.
+
+    Selection refuses a history-keeping population before it ever gets here
+    (`source_selector._population_history_refusal`), but that is a check on the DECLARED temporal
+    model, and this is a check on the DATA — the same split as attribution overlap and the snapshot
+    tie, both of which run at execution for the same reason. A population that slipped through
+    undeclared, or whose declared current-row rule does not actually hold, still cannot silently
+    multiply.
+
+    Both failure shapes carry ONE code, because both mean the same thing to the reader — this table
+    is not one row per member: a DUPLICATED key, and a row carrying NO key at all (which can never
+    match an event, so it contributes a permanent zero to every answer while counting as a member).
+
+    Deliberately NOT in `REFUSAL_TO_GAP`: a duplicated population row is a defect in the source or
+    the wrong table, not a decision anybody is waiting to make — the same judgement
+    `ATTRIBUTION_OVERLAPPING_RECORDS` gets, and for the same reason.
+    """
+    class _Shim:
+        def __init__(self, b): self.binding = b
+
+    _q = dialect.ident
+    spine_ref = dialect.table_ref(_Shim(ir.spine.binding))
+    key = _q(ir.spine.key_column)
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            f"SELECT COUNT(*), COUNT({key}), COUNT(DISTINCT {key}) FROM {spine_ref}")
+        rows, keyed, distinct = (int(value) for value in cursor.fetchone()[:3])
+    finally:
+        close = getattr(cursor, "close", None)
+        if callable(close):
+            close()
+    spine_id = ir.spine.binding.identity.table_id
+    if keyed < rows:
+        raise AnalysisIRError(
+            "POPULATION_SPINE_NOT_UNIQUE",
+            f"the population {spine_id!r} has {rows - keyed} row(s) with no "
+            f"{ir.spine.key_column!r}: a member with no identity can never match an event, so it "
+            "contributes a permanent zero to the answer while still counting as a member",
+            subjects=(f"{spine_id}.{ir.spine.key_column}",))
+    if distinct < keyed:
+        raise AnalysisIRError(
+            "POPULATION_SPINE_NOT_UNIQUE",
+            f"the population {spine_id!r} has {rows} rows for {distinct} distinct "
+            f"{ir.spine.key_column!r} values, so it is not one row per member. Every count in this "
+            "answer would be multiplied by the number of rows each member happens to have — the "
+            "answer would not fail, it would be plausible and wrong. Use a current-only population, "
+            "or declare the row rule that reduces this table to one row per member",
+            subjects=(f"{spine_id}.{ir.spine.key_column}",))
+
+
 def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:
     """Refuse to execute a join whose relationship has not been observed to hold.
 
@@ -326,10 +513,32 @@ def assert_join_is_verified(ir: AnalysisExecutionIRV1) -> None:
             f"{spine_id}.{ir.spine.key_column}", f"{event_id}.{ir.event_key_column}"))
 
 
+def assert_snapshot_selection_is_unique(conn, ir: AnalysisExecutionIRV1, *, dialect) -> None:
+    """ENGINE B's data gate: the latest snapshot must be ONE row per entity, or refuse.
+
+    The mirror of :func:`assert_no_dimension_overlap` — both ask a question about the STATE of the
+    data rather than the shape of the plan, which is why both run at execution and not at
+    construction."""
+    if not ir.dimensions or ir.snapshot_selection is None:
+        return
+
+    class _Shim:
+        def __init__(self, b): self.binding = b
+
+    assert_no_snapshot_tie(
+        conn, ir.snapshot_selection,
+        table_ref=dialect.table_ref(_Shim(ir.dimension_binding)), dialect=dialect)
+
+
 def run_analysis(conn, ir: AnalysisExecutionIRV1, *, dialect) -> tuple[AnalysisRow, ...]:
     """Compile and execute, returning one row per entity in the population."""
     assert_join_is_verified(ir)
+    # The spine gate runs FIRST of the data gates: a population that is not one row per member
+    # multiplies everything downstream, so reporting a dimension overlap on top of it would send
+    # the reader to fix the smaller of two problems.
+    assert_spine_is_unique(conn, ir, dialect=dialect)
     assert_no_dimension_overlap(conn, ir, dialect=dialect)
+    assert_snapshot_selection_is_unique(conn, ir, dialect=dialect)
     cursor = conn.cursor()
     try:
         cursor.execute(compile_analysis(ir, dialect=dialect))
@@ -372,7 +581,7 @@ def recording_refusals(learning_conn, *, analysis_request_id: str, dependency_sn
     """
     try:
         yield
-    except (AnalysisIRError, AttributionError, EligibilityError) as exc:
+    except (AnalysisIRError, AttributionError, EligibilityError, SnapshotSelectionError) as exc:
         record_refusal(
             learning_conn, analysis_request_id=analysis_request_id, refusal_code=exc.code,
             subject_refs=getattr(exc, "subjects", ()) or subjects,

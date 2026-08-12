@@ -173,6 +173,35 @@ def build_recipe_grounding_context(
     )
 
 
+# ── BR-2: canonical-recipe-v2, BESIDE v1 — never replacing it ────────────────────────────────────
+# canonical-recipe-v1 (everything above) is preserved byte-for-byte for old contexts; V2
+# definitions get their own field-exhaustive canonical form and hash. Generic over dataclasses so
+# adding a field to any V2 type is AUTOMATICALLY hash-bearing — the exhaustiveness test proves it.
+CANONICAL_RECIPE_V2_VERSION = "canonical-recipe-v2"
+
+
+def _canonical_dataclass(value: Any) -> Any:
+    from dataclasses import fields as _fields
+    from dataclasses import is_dataclass
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _canonical_dataclass(getattr(value, f.name))
+                for f in sorted(_fields(value), key=lambda f: f.name)}
+    if isinstance(value, tuple):
+        return [_canonical_dataclass(item) for item in value]
+    return _json_value(value)
+
+
+def canonical_recipe_v2(definition: Any) -> dict[str, Any]:
+    """The versioned, field-exhaustive serialization of a RecipeDefinitionV2 (or any nested V2
+    spec). Every field of every nested dataclass is hash-bearing by construction."""
+    return {"version": CANONICAL_RECIPE_V2_VERSION,
+            "definition": _canonical_dataclass(definition)}
+
+
+def canonical_recipe_v2_hash(definition: Any) -> str:
+    return content_hash(canonical_recipe_v2(definition))
+
+
 def assert_canonical_recipe_exhaustive() -> None:
     """Import/test seam: every behavior-bearing dataclass field is serialized."""
     template_keys = set(canonical_template(_EXHAUSTIVENESS_TEMPLATE)["template"])

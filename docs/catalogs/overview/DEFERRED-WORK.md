@@ -86,6 +86,7 @@ in place.
 | 2 | `authoring_intent.hypothesis` free text is not field-aware redacted. The `_first_pii` backstop still fails the whole call closed (→ technical), so no leak — but a PII-laden hypothesis fails the run instead of being scrubbed. | `authoring.py` / `redaction.py` |
 | 3 | Trace `payload` is metadata-only by **convention**: the only DB guard is `CHECK (jsonb_typeof = 'object')` — no size bound, no key allowlist. `_jcs` rejects ints outside ±2^53. | migration 1020, `trace.py` |
 | 4 | `validate_draft_formula`'s `detail`/`error` text is now omitted from the **trace** (2026-07-27 fix — the trace row is immutable, so that leak was irreversible), but it still **egresses to the provider** on the next turn's tool trail. Deferred deliberately: it is the model's own text going back to the model, it still passes the egress guard's PII backstop, and unlike a written trace row it is reversible. jsonschema messages quote the offending instance value, and `parse_ref` echoes the model's argument verbatim (`tools.py:129`). | `tools.py:129,239`, `authoring.py` |
+| 5 | `_ROUNDTRIP_PROSE_KEYS` (2026-08-01, Task 0.6): six single-path metadata keys — `definition`, `findings`, `objective`, `feedback`, `fix`, `avoid` — egress **unscanned** by explicit classification. The LLM-authored half (`definition`, `findings`) is the item-4 rationale (model's own text returning to the model); the **human-authored** half (`objective`, `feedback`, `fix`) is caller free text with no field-aware redaction — only `assert_llm_safe`'s PII backstop applies, and like item 2 it fails the call closed rather than scrubbing. Classification honesty (unknown keys fail closed; prose never mislabeled structural) is the shipped control. **Trigger:** the B-2 hardening pass, or the first PII-laden objective/feedback failing a live authoring run. | `enrich_llm.py` `_ROUNDTRIP_PROSE_KEYS` |
 
 ### B-3 Provider-wire risk (🔴 watch on first live run)
 `proposal_v1.schema.json`'s self-recursive `filterNode` and its many `const` keywords are hoisted into the author's turn schema. `schema_projection.provider_incompatibilities` treats `$ref`/`const` as valid shape keys and never checks ref-resolution, recursion depth, or `const` support — **so a shape can pass the static guard and still 400 on a real Anthropic call.** Fails closed (a 400 → provider failure → `output=None` → technical), so there is no leak — but it is a functional risk nobody has exercised against the wire. Fallback if it bites: `const` → single-value `enum`, and inline/bound the recursion.
@@ -359,6 +360,9 @@ session today.
 |---|---|---|
 | 🔴 **No trustworthy full-suite CI signal** | ~82 whole-repo test failures (count is environment/ordering dependent; measured 82 at both `9aee241f` and Child-1 HEAD). Cause: cross-test DB contamination — **all pass in isolation**. Child-1 introduced **zero** (verified by `comm` on sorted FAILED lists at base vs head, empty in both directions). Nobody owns this. | Before relying on CI to gate a merge, or before the next program adds more surface. |
 | ⚪ Frontend `vitest` hangs on worker-start in this environment | Changed files pass individually; CI must run the full frontend suite. | Frontend work. |
+| ⚪ `pointer_version` bumps on an identical catalog-narrative re-upload (2026-08-04) | `profile_store.upsert_current_catalog_profile` advances the pointer unconditionally under the row lock. Re-uploading the SAME words resolves to the same `revision_id` and writes no new revision — the Upload screen's "nothing will be re-versioned" note stays true — but the pointer still moves, so a `CatalogNarrativePanel` tab holding the old version 409s on its next save. Server-side and pre-existing (found during the upload-narrative UI review). Fix shape: skip the bump when the current `revision_id` is unchanged. | When a `data_owner` reports a spurious 409 from the profile editor after a re-upload. |
+| 🟡 Leg-4 `_endpoint_from_legacy_link` trusts the ledger ref's schema (2026-08-03) | `retrieval._link_neighbours` has no guard on a non-`public` schema in a ledger row — a hand-written/migrated row would 500 `/analysis/plan` from an OPTIONAL enrichment leg instead of degrading. Unreachable today: `bridge_assessment._canonical_logical_ref` contract-refuses non-public members, so production's own writer cannot mint one (pinned by test beside the probe that depends on it). | Any migration/backfill that writes `entity_bridge_candidate_evidence` rows directly, or the first schema-preserving bridge contract change. |
+| 🟡 **`test_a_grandchild_holding_the_pipes_cannot_wedge_the_submitter` is flaky under load** | `tests/featuregen/materialize/test_submit.py:283`. The `/bin/sh` stub backgrounds `( sleep 120 ) &` and writes `grandchild.pid` on the *next* line, while the submitter under test has `timeout_seconds=1.0` — so on a loaded machine the process group is killed before the write lands and line 307's `read_text` raises `FileNotFoundError` instead of asserting anything. Observed 2026-08-04 by Phase G: flaked twice, then passed three consecutive runs. The property under test (the whole process GROUP dies, not just the direct child) is sound and is not what failed — the failure is the test's own setup racing the behaviour it is measuring. Not fixed here: the file belongs to the codegen program's submitter task, not to Phase G. | Any CI run that reports it. Closure: poll for the pid file until the submit deadline rather than reading it once — the test already polls for the pid's *death* ten lines down, so it is the same shape one step earlier. |
 
 ---
 
@@ -487,3 +491,1257 @@ probe driver and `test_probe.py`) is 16b's.
 | ⚪ **`_quote` moved to `render/_yaml.py` as `yaml_scalar`** | `render.project` and `render.publish` both emit catalog entries and `project` imports `publish`, so a shared helper could not stay in `project`. A copy would have been a second chance to quote a storage location differently. `project._quote` is now an alias. | Recorded. |
 | ⚪ **Rendering a mechanism into a project built for another environment is refused twice** | `select_publisher` scopes by environment in the SQL, and `render_project` re-checks the selection's `environment_id` and `engine_versions` against its own. The second check is not redundant: a selection is a value that can be carried between calls, and the renderer is where the bytes get written. | Recorded. |
 | ⚪ **Mutation-tested, 7 controls, all caught** | A `passed=` back door on `record_attestation`; an `adds_feature=` parameter on `select_publisher`; a `mechanism=` parameter on `render_publish`; the attestation lookup unscoped from the environment; `matches()` ignoring the spark version; a probe passing having watched no swap; `published_schema=None` failing open. Each mutation failed 1–4 tests. | Recorded. |
+
+### A.27 Legacy fabricated-N:1 approved_join facts (2026-08-01)
+
+Recorded while remediating Task 5 of the codegen review (blank uploaded cardinality no longer
+fabricates `N:1` at the governed-join propose seam; the realization deriver no longer maps a NULL
+edge cardinality to `MANY_TO_ONE`). Because the pair-guard keys on the UNORDERED column pair, it
+also blocks a re-upload that corrects the join's DIRECTION (a reversed `joins_to` on the same two
+columns), not only its cardinality — the same reject-then-re-propose governance path is the
+correction route for both.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Legacy fabricated-N:1 approved_join facts persist under authority-persists** | Facts minted before the remediation carry a fabricated `N:1` that two admins confirmed; a stored `N:1` cannot be distinguished from a genuinely-uploaded one (the proposal value records no "defaulted" marker). Authority-persists is the platform's documented policy, so no data migration rewrites or demotes them; the propose-time pair dedupe also means a cardinality-blank re-upload cannot dislodge them (by design — the confirmed fact stands). | A governance decision to re-review cardinality-blank-origin joins, which requires re-proposal after a cardinality-bearing upload (reject the legacy fact via join governance, then upload with an explicit cardinality). |
+
+### A.28 🟡 half_even ratios refused — engine rounds first (2026-07-31)
+
+Recorded while remediating Task 8 of the codegen review. Empirically confirmed on real Spark:
+decimal `Divide` wraps its result in `CheckOverflow` with hard-coded HALF_UP at the division
+result scale (clamped to `MINIMUM_ADJUSTED_SCALE=6`) BEFORE the emitted `F.bround` runs — at
+published scale 6 the bround re-rounds an already-rounded value and is a no-op (1/2000000 →
+0.000001, not the HALF_EVEN 0.000000).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`half_even` on a RATIO refuses (`PHYSICAL_TYPE_UNSUPPORTED`) instead of being honoured** | Generated code alone cannot honour the declaration — the ties are gone before any explicit rounding call runs — and a governed mode the engine silently ignores must refuse rather than be recorded as applied. `resolve_physical_type` refuses the combination; non-ratio bodies keep both modes (post-aggregate rounding of a narrower-scale value has no engine pre-rounding to fight). The worked ratio fixture now declares `half_up` — the mode the engine actually applies. | A consumer needs banker's rounding on a ratio; requires computing the quotient at guaranteed extra scale or a post-division re-quantization proof. |
+
+### A.29 🔴 DATE clocks refused outside UTC — the IR carries no physical time type (2026-08-01)
+
+Recorded while remediating Task 9 of the codegen review. Empirically confirmed: the emitted window
+comparison `F.col(clock) >= F.to_utc_timestamp(boundary.cast('timestamp'), zone)` shifts the whole
+window by a day when the clock column is Hive `DATE` and the governed zone is west of UTC
+(measured with America/New_York: the first day drops and an extra trailing day is admitted; east
+of UTC is correct by luck).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`prepare_run` refuses (`PHYSICAL_TYPE_UNSUPPORTED`) any run whose `event_time_ref` or `availability_ref` resolves to a DATE-typed column under a non-UTC `window_timezone`** | The IR carries no physical type for the clock (`PitSpec.event_time_ref` is a bare ref), so neither compilation nor rendering can see the dtype; run preparation holds the `ClusterInventoryV1`, whose `TableLayout.columns` is ordered `(name, physical type)`, so the fail-closed gate lives there (`_date_typed_clock_refusal`, after snapshots resolve — layouts present and fingerprint-verified — and before the execution hash). UTC zones still prepare: the shift is zero there. | First feature over a DATE-typed event column in a non-UTC catalog; fix = carry the clock dtype in PitSpec and emit date-typed comparisons. |
+
+### A.30 🔴 SCD spines with DISTINCT time columns cannot validate — one governed as-of per table (2026-08-01)
+
+Recorded while remediating Task 13 of the codegen review (`LatestAvailableAsOf.effective_time_ref`
+now requires the governed `is_as_of` fact its docstring promised). The check is correct and
+fail-closed, but it collides with an invariant enforced independently at THREE layers — a table can
+carry at most ONE governed as-of column:
+
+1. **Ingest** — `src/featuregen/overlay/upload/canonical.py:286-311`: a file declaring 2+ `as_of`
+   columns for one table is QUARANTINED as an ambiguous availability basis; no basis is asserted
+   until a reviewer resolves exactly one.
+2. **Projection** — `src/featuregen/overlay/upload/table_fact_projection.py:76-81, 115-120`:
+   projecting the per-table `availability_time` fact CLEARS every prior `is_as_of` +
+   `availability_fact_event_id` on the table's columns, then sets exactly one — the fact's schema
+   names exactly ONE column.
+3. **Read** — `src/featuregen/materialize/expression_ir.py:521-525`: the expression-side PIT gate
+   refuses a table with 2+ governed as-of columns outright ("the gate a choice nobody made").
+
+Consequently `effective_time_ref == availability_ref` is the ONLY production-reachable accept shape
+for `LatestAvailableAsOf` (legal per `_reject_incoherent_policy` — only tie-break overlap is
+refused — and it passes all three layers: one column, governed once, serving both PIT rule 1
+roles). A declaration with DISTINCT columns now refuses `AVAILABILITY_TIME_NOT_GOVERNED`, and the
+refusal's apparent remedy has **NO FIXED POINT**: confirming `availability_time` for the effective
+column re-projects the per-table fact — clears-then-sets — which UN-GOVERNS the availability
+column, so the availability branch refuses; confirming it back for the availability column flips
+the refusal to the effective-time branch. No sequence of confirmations under the current fact
+model satisfies both checks for two distinct columns.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **A real SCD-2 spine (distinct `effective_time_ref` / `availability_ref`) cannot validate — no catalog state satisfies both governed time checks** | The previous behavior was worse: the effective column was trusted UNGOVERNED, letting an ETL load-timestamp silently decide which record version wins. Refusing is honest; the gap is in the fact model, not the check. Test fixtures model the post-growth state by writing the column-node flag+link directly (bypassing the projection). | First real SCD-2 spine declaration over a table whose effective and availability columns differ; fix = a second governed time fact type (e.g. `effective_time`) or a per-COLUMN availability fact, then the projection stops clearing sibling columns and `expression_ir`'s one-governed-column rule is scoped to availability alone. |
+
+### A.31 🟡 input_snapshots is prepared evidence, not an enforced read scope (2026-08-01)
+
+Recorded while remediating Task 21 of the codegen review (docstring corrected; no semantics
+change). `runprep.parameter_payload` builds the `input_snapshots` run parameter and its snapshot
+ids sit inside `sandbox_execution_hash` (§3.4 calls them *the exact ordered partition set read*),
+but no rendered node consumes the snapshot list: the rendered nodes filter raw sources by the
+window/availability predicates, and L1's `PARTITION_ABSENT` check proves only that the resolved
+partitions still exist at validation time — nothing proves the run read precisely (or only) them.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`input_snapshots` is carried and hashed but never enforced as the run's read scope** | The rendered predicates derive from the same window/availability facts that resolved the snapshots, so absent a metastore change between preparation and execution the two coincide; making the list load-bearing is a render-side semantics change (design-sensitive), out of scope for a docs-honesty remediation. | §3.4 identity is relied on for audit of what a run read; fix = render partition predicates onto raw sources, or record actually-read partitions post-run. |
+
+### A.32 🔴 requirements.lock installs an environment that cannot construct the rendered catalog (2026-08-02)
+
+Recorded while adding the final-review wave's execution-level hook proof (l0_gate's
+`test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session`). An environment
+installed from the artifact's own `requirements.lock` (`kedro==0.19.9`, `kedro-datasets==4.1.0`,
+`pyspark==3.5.1`) dies at CATALOG CONSTRUCTION — before any hook fires — because kedro-datasets
+4.x's `spark_dataset.py` hard-imports `hdfs` (line 18) and `s3fs` (line 30) at module import, and
+neither is in the lock. The obvious fix is WRONG: pinning `kedro-datasets[spark]==4.1.0` is
+uninstallable against the captured cluster — the extra requires `delta-spark>=1.0,<3.0`, and every
+`delta-spark<3.0` pins `pyspark<3.5`, conflicting with the captured `pyspark==3.5.1` (empirically:
+uv resolution fails; pip backtracks into ancient `arrow` sdists and dies). The modern line has the
+same hole one layer up: kedro-datasets **9.5.0**'s `spark_dataset.py` still hard-imports `hdfs`,
+but the 9.x `[spark]` extra (= spark-local + spark-s3) does not install it — an upstream packaging
+gap. The L0 gate installs `hdfs` (+`s3fs` on the 4.x line) explicitly into both venvs (Makefile)
+as gate-environment dependencies, the same way it supplies Temurin 17.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **The 0.19-line lock is incomplete for running the artifact, and the honest pins have no governed source** | `ClusterInventoryV1.engine_versions` captures kedro/kedro-datasets/pyspark/python/java only; `hdfs`/`s3fs` versions were never captured from the cluster, and the renderer inventing them would violate the lock's own doctrine (*what the environment was captured RUNNING, not what resolves today*). The `[spark]` extra is not a substitute (see above). | Deploying the rendered project on a real 0.19-line cluster from its lock; fix = capture the two members' versions into `ClusterInventoryV1` (inventory migration) and render them as exact pins, or move the artifact line to a kedro-datasets version whose spark module lazy-imports its filesystem clients. |
+
+### A.33 🟡 Analysis Task 9 — the snapshot pin kinds, and the join-free sealed envelope (2026-08-03)
+
+Recorded while remediating the Release-B Task-9 review. Two decisions that were argued in module
+prose and belong in the register, because both are reachable in production and neither is visible
+from the code that would need them.
+
+**The six shared snapshot item kinds get no builder.** `feature_metadata_snapshot.ITEM_KINDS`
+registers `dataset_profile`, `serving_policy`, `source_selection`, `physical_binding`,
+`temporal_policy` and `row_selection`, and Task 9's own rule is "use the six shared kinds WHEN
+feature/materialization consumes the same decision". ANALYSIS now consumes all of them — it seals
+them into `AnalysisExecutionIRV2` and revalidates every one immediately before a run — but the
+FEATURE side does not, and a snapshot pin with exactly one producer and no consumer is the inert
+mechanism this programme has found seven times.
+
+**A sealed analysis plan cannot contain a join.** `plan_to_execution_ir` refuses
+`JOIN_REALIZATION_ABSENT` for any `plan.join_refs` unless `inputs.bridge_realizations` carries an
+exact current deterministic directional realization for the fact key — and NOTHING supplies
+`bridge_realizations` on the sealed path: `execution_inputs_for_plan` leaves it at its `()`
+default, so the only plans that can seal are single-catalog ones. The refusal is correct (analysis
+must not infer direction or cardinality from a symmetric link) and the field is not a stub — it is
+a producer that has not landed. The consequence is worth stating plainly: cross-catalog questions
+reach the seal and refuse, rather than sealing something unverified.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **The six `ITEM_KINDS` snapshot builders for the analysis pins** | Building them now ships a comparator whose first real exercise is months away. Nothing is lost by waiting: D6's compat-safe hash rule is already in place, so the builders land ADDITIVELY with no migration and no re-hash of a stored snapshot. | The Phase-G execution-wiring merge-back, or any feature-side consumption of the same six decisions. |
+| 🟡 **Sealed execution refuses every join plan (`JOIN_REALIZATION_ABSENT`), because `bridge_realizations` has no producer on this path** | The alternative is a sealed plan that joins on a declared-but-unmeasured relationship, which is exactly what the verified-join doctrine exists to prevent. Single-catalog analysis — the Release-B pilot — is unaffected. | Release C / Phase-G, when a reader for current directional realizations is wired into `execution_inputs_for_plan`; fix = supply `bridge_realizations` from `bridge_store` at assembly time and pin the chosen revisions (the IR already hashes `bridge_realization_dependencies`). |
+
+**Pin 7's drift refusal names two opaque hashes, not what changed.** The eligibility anchor is
+DERIVED (`eligibility_policy_hash`) because migration `1038_eligibility_policy` is a mutable
+UPSERT row — no revision table, no event, no version — so `SEALED_PLAN_STALE_ELIGIBILITY` cannot
+show a diff the way the six revision-anchored pins can, and 1038 keeps only the current
+`proposed_by`, so the previous definition is gone entirely. Inherent to the 1038 shape, not to the
+seal. **Trigger:** when eligibility gets a revision store, replace the derived hash with the
+revision id and make the refusal name the change.
+
+### A.34 🟡 The feature USE gate — the two surfaces it deliberately does not build (2026-08-04)
+
+> **RESOLVED IN PART, 2026-08-04 — the personal-data policy EXISTS.** The row below marked "THE
+> TRIGGER HAS ALREADY FIRED" is closed: `pii_use_policy` (migration 1056, contract
+> `overlay/upload/pii_policy.py`, store `pii_policy_store.py`, routes
+> `api/routes/pii_policies.py`, panel `frontend/src/screens/DataUsePolicyPanel.tsx`) is the
+> governed policy revision `_use_gate` reads, and the five named recipes light up when their
+> anchors are approved — proved through the real recipe path in
+> `tests/featuregen/overlay/upload/test_pii_policy_acceptance.py`. Design: verified-interfaces
+> **D14**.
+>
+> Three things about the shape it landed in, because they are decisions and not details:
+> * **SINGLE-APPROVER, by explicit user decision.** One platform-admin declares concept + purpose;
+>   the policy is ACTIVE immediately; one action revokes it. This DEVIATES from the four-eyes
+>   convention every other governed declaration on this branch follows. The control is the
+>   immutable who/when/purpose record plus the platform-admin gate. Do not re-add a confirmer
+>   without a new user decision — the migration has no `confirmed_by` column and a route-shape test
+>   pins its absence.
+> * **THE SCOPE AND THE SINGLE APPROVER COMPOUND, and the product is the thing to state.** The two
+>   decisions are argued separately above and below — a policy licenses a CONCEPT for the whole
+>   platform (never a column, never a catalog), and ONE platform-admin signature makes it live —
+>   and each is defensible on its own terms. Multiplied, they mean: **one signature licenses that
+>   personal-data meaning in features across EVERY catalog, present and future, with no second
+>   approval and no per-catalog re-approval.** A catalog uploaded next year inherits the decision
+>   silently, because there is no upload-time re-consult and no catalog axis for a policy to be
+>   scoped to. That is not an accident and it is not a defect of either decision; it is what they
+>   add up to, and it is the sentence a reviewer needs before they click. It is stated at the
+>   click (`DataUsePolicyPanel`'s approve form, `dup-scope-warning`) rather than only here,
+>   because a blast radius recorded in a deferral document is a blast radius nobody reads. If a
+>   later slice wants to narrow it, the axis to add is a catalog scope on the pointer — NOT a
+>   second approver, which would address the wrong half.
+> * **The clearing is ALL-OR-NOTHING per candidate**, and the refusal names the UNCOVERED concepts.
+>   A purpose declared for `pep_flag` licenses nothing about `geolocation`.
+> * **The escape hatch is no longer the only aim.** `FEATUREGEN_FEATURE_USE_GATE=0` still drops all
+>   four classes at once and is still the wrong tool; it is simply no longer needed for the one
+>   class that has a legitimate answer.
+>
+> **RESIDUAL (still open, ⚪):** the purpose is BOUNDED FREE TEXT in v1. A CLOSED purpose taxonomy —
+> so that "AML transaction monitoring" is a governed vocabulary member rather than a sentence
+> somebody typed, and so purpose can eventually gate the `proxy` concepts in the row below — is the
+> named later refinement (D14). **Trigger:** the first request to report or filter policies BY
+> purpose, or the arrival of a declared model purpose on the feature request (which is the same
+> trigger the proxy row names). **Fix shape:** a closed vocabulary beside
+> `pii_policy.normalize_purpose`, a migration widening the CHECK to it, and a data migration that
+> maps the free-text purposes already declared — the store's revisions are immutable, so that is a
+> new revision per concept, not an UPDATE.
+>
+> The OTHER two rows below — the `gate1._governed_cross_catalog_options` defect and the currency
+> CONVERSION policy — are UNCHANGED and still open. So is the `proxy` row.
+
+Recorded while landing the Bar-4 USE gate (`feature_assist._use_gate`), which closes the Release-A
+finding that sensitivity gated VISIBILITY and nothing gated USE. The gate refuses four classes
+outright. Two things a complete answer needs are deliberately NOT in it, and both are governance
+surfaces rather than validator work.
+
+**There is no human-confirmed override path.** A `PROTECTED_CHARACTERISTIC` or
+`DESCRIPTIVE_OPERAND` refusal is structurally_unsuitable and needs none. But
+`PERSONAL_DATA_POLICY_REQUIRED` and `CURRENCY_POLICY_REQUIRED` are `needs_setup` refusals — they
+name an artifact that does not exist yet — and today the only ways past them are to fix the
+concept, bind the currency column, or turn the WHOLE gate off with
+`FEATUREGEN_FEATURE_USE_GATE=0`, which drops all four classes at once and is aimed at nothing. An
+override is a governed decision with an actor, a reason, a scope
+and a review trail; building it inside a validator would produce a bypass flag wearing a
+governance word, which is the failure mode the "a review badge is never a permission" bar already
+exists to prevent.
+
+**A THIRD idea producer does not run the gauntlet at all, and it is not the gate's to fix.** Every
+proposed feature converges on `_validate_idea` — `_vet` (the menu), `contract.review.
+validate_minimum` (the confirm-time MCV), `contract.gate1._template_candidates` (the recipe
+options) and `planner.b_gauntlet` (cross-catalog proposals) — with ONE exception found while
+wiring this: `gate1._governed_cross_catalog_options` builds a `FeatureIdea` straight from a
+compiled binding plan (`_governed_idea_from_result`) and never calls the gauntlet. Its refusals
+speak the planner's closed `ReasonCode` vocabulary, not `RejectCode`, so emitting a USE refusal
+there would mix two closed vocabularies owned by different streams. The CONSEQUENCE is bounded and
+worth stating exactly: such an option can be DISPLAYED as choosable at Gate #1, and is then refused
+at confirm by the MCV — so nothing unsafe is ever persisted, but a reviewer can be shown a choice
+the platform will not honour. Recorded as a defect of the 3C.2b governed-planner surface, not of
+this gate.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`gate1._governed_cross_catalog_options` shows options the confirm-time MCV will refuse** | Gating it means adjudicating whether a `RejectCode` may appear in the planner's `ReasonCode`-shaped rejection dicts — a cross-vocabulary decision belonging to 3C.2b, and the wrong thing to settle inside a validator slice. Nothing unsafe persists: `validate_minimum` runs the same gate at confirm. | The next 3C.2b governed-planner change, or the first reviewer report of a Gate-#1 option that will not confirm. Fix shape: run `_use_gate` over `_plan_read_set_pairs(plan)` inside `_governed_idea_from_result` and map its code onto the planner's own reason vocabulary. |
+| ✅ **RESOLVED 2026-08-04 (see the note above the table). A personal-data USE policy (purpose), read by the gate. THE TRIGGER HAD ALREADY FIRED — this disables five shipped recipes today** | **(the record of why it was deferred, kept verbatim — every present tense below describes 2026-08-04 BEFORE the policy landed)** Not "the first real request that needs a `pii` operand" — the platform's OWN recipe registry already ships five templates whose REQUIRED anchor is a `pii`-classed concept, so every one of them is now permanently refused with `PERSONAL_DATA_POLICY_REQUIRED` on every catalog: **`screening_exposure_365d`** (`pep_flag`, required; the PEP/sanctions/adverse-media KYC marker), **`device_sharing_velocity`** and **`new_device_flag`** (`device_fingerprint`), **`geo_velocity_impossible`** (`geolocation`) — the two account-takeover access markers and the synthetic-ID ring detector — and **`external_own_transfer_trend_90d`** (`pii` + `beneficiary_name`), which `test_grounding_load_once` already asserts as refused with this exact code. Building the store would still ship a policy with one writer and no reader if it landed alone, which is why this is a deferral and not a bug; but the cost is no longer hypothetical, it is a named list of financial-crime recipes the platform advertises and will not build. THE ONLY BYPASS TODAY IS `FEATUREGEN_FEATURE_USE_GATE=0`, which disables ALL FOUR classes at once — protected characteristics and descriptive labels included — for the entire process. That coarseness is part of this record: the escape hatch cannot be aimed at the one class that has a legitimate answer, so using it to run an AML model also un-gates ECOA. | FIRED, and answered. Built as `pii_use_policy` (migration 1056, D14): a governed revision per CONCEPT with a bounded purpose, ACTIVE on one platform-admin action, revoked by another, read by `_use_gate` through ONE bulk query in which absence, revocation and corruption are all refusals. All five recipes above are the acceptance set and all five light up when their anchors (`pep_flag`, `device_fingerprint`, `geolocation`, `pii` + `beneficiary_name`) are approved; revoking one refuses exactly the recipes that used it. Residual: the closed purpose taxonomy, above. ONE DIVERGENCE from the fix shape this row predicted, recorded because it is a decision: the policy is scoped to the CONCEPT, not to `(catalog, purpose)`. A policy licenses a MEANING for the whole platform — scoping it per catalog would mean the same personal data licensed on one upload and unlicensed on another, a distinction nobody could defend and one a reviewer could route around by naming the other catalog. Purpose is recorded ON the revision rather than being part of its key, for the same reason: one concept has one current answer, and a second purpose is a new revision. |
+| 🟡 **A currency CONVERSION policy** — the third way through `CURRENCY_POLICY_REQUIRED`, beside binding the dimension and declaring the column's currency | The refusal message already offers it as an option, so the wording is forward-compatible, but no store exists. Conversion is not a validator decision: it needs a base currency, a point-in-time FX source and a governed rate, which is a materialization concern (`fx_conversion_rate` is already in the registry with nothing reading it). | The first cross-currency aggregate a customer actually asks for. Fix shape: a governed policy naming base currency + rate source; `_use_gate` clears on its presence, and the requirement rides to materialization rather than being dropped. |
+| 🟡 **`sensitivity="proxy"` concepts (`country_code`, `geographic`, `corridor`, `alternative_data`, `fatca_crs_classification`) are NOT gated** | A proxy is context-dependent in a way the other four classes are not: `country_code` is a national-origin proxy for CREDIT and an ordinary risk dimension for AML, and the platform has no use-case axis to tell them apart. Refusing every proxy would refuse legitimate AML features today; refusing none is the honest state until the axis exists. The registry already flags them, so nothing is lost. | The first credit/pricing use case, or the arrival of a declared model PURPOSE on the feature request. Fix shape: gate proxies on purpose, not on the concept alone. |
+| ⚪ **The refusal FAMILY is server-side only; the wire still carries `{name, reason, code}`** | `FEATURE_REFUSAL_FAMILIES` maps every `RejectCode` to a D5 family and an import-time validator refuses a code without one, but the family is not on the `/features/recommend` payload. Putting it there means adjudicating `GOVERNED_CROSS_CATALOG_PLAN_REQUIRED` — a rejection code `gate1` emits that is NOT a `RejectCode` member — and that code belongs to the cross-catalog stream, not this slice. The actionable wording is in `reason` today, and the frontend labels the four new codes. | The rejections-panel reframe (render the family, not a red "rejected" badge). Fix shape: one `_rejection` factory in `feature_assist`, `gate1`'s two non-`RejectCode` sites adjudicated with it, then the field on the wire and `api.ts`. |
+### A.46 🔴 The migration-1020 authoring lane is orphaned: nothing writes it, and nothing reads it any more (2026-08-03)
+
+Found by Phase G T2, which was the first caller ever to try to reach `admit_artifacts` from a
+durable identity. Two complete authoring lanes exist side by side and describe DISJOINT sets of
+runs — a given run is in exactly one of them, never both:
+
+| | 1020 lane | 1022 lane |
+|---|---|---|
+| orchestrator | `formula/authoring.py::run_authoring` | `formula/replay_authoring.py::run_authoring` |
+| trace module | `formula/trace.py` | `formula/replay_trace.py` |
+| tables | `authoring_run`, `authoring_trace_event` | `formula_authoring_run`, `formula_authoring_trace_event` |
+| run ids | `arun_…` (minted internally) | `far_…` (caller may supply) |
+| terminal kinds | `COMPLETED` / `FAILED` | `completed` / `failed` |
+| payload hash | sha256 over RFC 8785 (JCS) bytes | sha256 over `json.dumps(sort_keys, separators, ensure_ascii=False)` |
+| intent hash | `authoring.authoring_intent_hash` — 4 fields | `canonical_hash(replay_authoring._intent_material(…))` — 5 fields |
+| terminal payload | dispositions/axes/hashes only | the same, **plus** `result: _plain(result)` |
+
+The live worker imports `run_authoring` from `formula.replay_authoring`
+(`overlay/upload/recipe_formula_worker.py:35`), so **the 1020 store has never been written by
+anything in `src/`**: its only writer is `formula/trace.py::open_authoring_run`, whose only caller
+is `formula/authoring.py::run_authoring`, whose only callers are tests. `materialize/admission.py`
+proved against 1020 until 2026-08-03 and therefore refused every real governed feature at check 1
+with `AUTHORING_RUN_INCOMPLETE`; it now proves against 1022
+(`materialize/authoring_trace.py`). The consequence of the move is recorded there and in
+`admission.py`: check 6 went from a 4-field to a 5-field digest, so
+`AuthoringIntent.recipe_authoring_context` is now inside the proof.
+
+The 1020 lane is consequently unreferenced from `src/` in both directions. It is not deleted here:
+`formula/**` is not Phase G's to change, and which way to close this is a design decision about
+which orchestrator is the real one — not a wiring detail.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🔴 **`formula/authoring.py` + `formula/trace.py` + migration 1020 have no writer and no reader** | Ownership: `formula/**` was explicitly out of scope for the session that found this, and the fix is a choice between two whole orchestrators rather than a repair. Both lanes remain individually correct and tested; the defect is that only one of them is connected to anything. | Any decision by whoever owns `formula/` about which authoring orchestrator is authoritative. The two closures are: DELETE the 1020 lane (and mark 1020 obsolete), or REPOINT `recipe_formula_worker` at `formula/authoring.py` — in which case `materialize/authoring_trace.py` must move back to the 1020 store and check 6 narrows to four fields again. Note the 1020 terminal payload carries no `result` material, so the second option also needs a durable authoring result before anything can be resolved. |
+
+### A.47 🟡 L0's probe runs inside `_commit`'s open transaction (2026-08-03)
+
+Found and accepted by Phase G T6, which put §11.2's L0 into `compile/chain.py`. `run_l0` launches a
+separate interpreter and waits up to `L0Interpreter.timeout_seconds` for it; that wait happens
+between the plane writes and the terminal append, **inside** the `with conn.transaction()` block
+`_commit` opens.
+
+It is inside deliberately. The terminal event is CHOSEN from L0's verdict, and the verdict is about
+a tree on disk, so the ordering is forced: render → validate → record the terminal that the verdict
+earns. Splitting the transaction so the probe ran outside it would put the generation row and the
+build proof in two separately-committing units, and the failure window between them is exactly the
+"a terminal that claims more than the evidence" shape this task existed to close. The tree is staged
+at a sibling and `os.replace`d into place as the block's last statement, so a rollback anywhere —
+including at the validation write — still leaves nothing at the project's own path.
+
+The cost is transaction duration: a compile that used to hold a transaction for milliseconds now
+holds one for as long as the probe takes (seconds in practice — importing kedro and pyspark and
+constructing the pipeline object — but bounded only by the caller's timeout).
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A PostgreSQL session sits "idle in transaction" for the duration of the L0 probe** | No deployment in this repo sets `idle_in_transaction_session_timeout` (grepped: zero occurrences in `src/`, tests and migrations), so nothing kills it today, and the alternative costs an atomicity guarantee that is worth more than the connection-hold. The bound is the caller's: `L0Interpreter.timeout_seconds` has no default precisely so a trigger surface must choose one. | Setting `idle_in_transaction_session_timeout` anywhere, or moving this chain onto a pooled/shared connection. Either makes the hold a real failure mode, and the closure is to run the probe before the transaction over the STAGED tree and re-read nothing from it — which is sound but needs the report's `location` (the staging path) to stop being operator-facing first. |
+| 🟡 **Two concurrent compiles of ONE `logical_group_name` serialize for the full probe duration** | The consequence that neither of the triggers above would surface, because it needs no timeout and no pool: the first compile to reach `record_group_binding` holds `group_binding`'s unique index until it commits, and it does not commit until its probe finishes — so a second request for the same group blocks on the row lock for seconds rather than milliseconds, however many workers are free. It is correct (one binding per logical name is the §10.1 invariant) and it is bounded by `timeout_seconds`, so it degrades throughput rather than truth. | Any queue lane that fans out several requests for one logical group, or a `lock_timeout` short enough to turn the wait into a spurious failure. Same closure as above — probing before the transaction removes the probe from the critical section entirely. |
+
+### A.35 🟡 A request stranded at `requested` has no legal terminal (2026-08-04)
+
+Found by Phase G T7's review and owned by T13's reconciler (`materialize/reconcile.py`), which
+**finds** the class, reports it and refuses to invent a verdict for it.
+
+The shape: an unconfigured deployment (or an undecodable payload) makes every delivery fail, and
+when the queue's attempt budget runs out the message is dead-lettered while the request is still at
+`requested`. It holds no lease — the lane deliberately does not accept before it has a configuration,
+because accepting first would burn every arriving request into a terminal no operator fix could
+recover. So nothing will ever deliver it again, and §3.2 ships no edge from `requested` to a terminal
+state (`LEGAL_LIFECYCLE_TRANSITIONS[REQUESTED] == {ACCEPTED}`, and migration 1053 carries the state
+vocabulary as a CHECK).
+
+The reconciler will not reach a terminal through `accepted` either: `accept_request` stamps
+`accepted_at` and grants a lease, so walking the row through it to reach `failed` would record that
+a worker claimed work nobody ever claimed — the same edge added quietly, in two hops. The sweep
+therefore returns `NO_LEGAL_TERMINAL`, gauges the standing count
+(`materialize.reconcile.no_legal_terminal`), and changes nothing.
+
+Nothing is lost while it stands: the request is durable, honest about its state, and re-runnable —
+§3.3's rule is that a re-run is a NEW request, and a fresh idempotency key produces one. What an
+operator cannot do today is close the old row.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`requested → failed` is not a legal transition, so P3 requests accumulate non-terminal forever** | It is a §3.2 state-machine decision, not a reconciler detail: the edge would have to be added to `LEGAL_LIFECYCLE_TRANSITIONS` **and** argued against the reason `advance_lifecycle` refuses `accepted` as a target (a lifecycle write that cannot carry a lease must not be able to invent one). T13 deliberately did not make that call on §3.2's behalf. | `materialize.reconcile.no_legal_terminal` standing above zero in any deployment, or the first operator who needs a stuck request closed. Closure: add the edge (Python-only — 1053's CHECK constrains the state vocabulary, not the transitions) with a reason recorded beside the existing `accepted → failed` note, after which the reconciler's `NO_LEGAL_TERMINAL` branch becomes a `FAILED` verdict on the same evidence it already gathers (message unreachable, no lease ever granted, nothing on the plane). |
+
+### A.36 🟡 The bridged (cross-catalog) chain path — chain/lane row CLOSED, `execution_tier` row still OPEN (2026-08-04)
+
+🟡 rather than 🟢 **deliberately**: this entry carries two rows and only the first is done. A reader
+scanning headings must not take A.36 as finished while no triggered run can ask for a SANDBOX-scoped
+realization. The heading turns 🟢 when the second row does.
+
+**CLOSED for the chain/lane row (2026-08-04); the `execution_tier` row below remains OPEN.** The
+durable seed helper is `tests/featuregen/materialize/test_cross_catalog_ir.seed_executable_bridge_realization`
+and the fourth cross-catalog worked feature is `fixtures.BRIDGED_FEATURE_NAME`. A bridged group now
+runs through `compile_feature_group` (`test_chain.py`, five cases) and over HTTP through the worker
+tick (`test_materialization_e2e.py`, two cases), loading its realization from the database in both.
+The seed writes through `bridge_store`'s own writers, so the load exercises
+`executable_bridge_realizations`' full revalidation rather than a SELECT. Everything below is kept
+as the record of what the gap was.
+
+Flagged by Phase G T4's review and again by T11's, which is why it is here rather than in a task
+report: two independent reviews have now recorded the same gap, and neither had a tracked home for it.
+
+What IS proved: `compile/wiring.py` assembles join-gate nodes for a cross-catalog group
+(`test_wiring.py`), and `compile_ir` produces a cross-catalog IR carrying both catalogs and the exact
+realization (`test_cross_catalog_ir.py`). What is NOT proved is that the two **compose through
+`compile_feature_group`** — every cross-catalog test hands `compile_ir` a
+`CurrentBridgeRealizationV1` built in Python, and `chain.py:462` calls `compile_ir` with no
+realization argument at all. So an HTTP- or lane-driven bridged run must load its realizations from
+the database, and no test has ever made it do that. T11's acceptance test covers the same-catalog
+path end to end (the plan's §5 criterion) and deliberately stopped there.
+
+The enabling work is one fixture, and it is the reason this was scoped out rather than squeezed in: a
+**durable** bridge-realization seed helper beside `tests/featuregen/materialize/test_cross_catalog_ir.py`
+that writes through `bridge_store` — binding revisions, endpoints, column pairs, an `ACTIVE`
+lifecycle, a `DETERMINISTICALLY_VALIDATED` safety status and a PRODUCTION applicability scope.
+Nothing in the tree seeds one durably today. Three smaller pieces ride along: a fourth hand-authored
+`TypedFormulaV1` + matching `raw_proposal` in `tests/featuregen/materialize/fixtures.py` whose read
+set genuinely spans catalogs (all three worked features read `hdfc::public.transactions.*`), the
+`crm_banking.customer_master` layout and `logical_schema_map` entry in the inventory, and `crm`
+graph nodes with a governed logical type.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟢 **CLOSED — a cross-catalog group now drives `compile_feature_group` AND the HTTP-triggered lane, loading the realization from the store** | Was a fixture-construction project (a durable `bridge_store` seed plus a fourth authored formula), not an assertion that could be added to an existing test. | Done as described: `seed_executable_bridge_realization` + `bridged_debit_amount_30d`. The discriminator is the `realization_revision_id`, content-addressed over the exact observation only the durable seed writes, asserted present in the sealed `nodes.py`; the control is a bridged run against an EMPTY store, which must refuse at `compile_ir` with `JOIN_CARDINALITY_UNKNOWN`. |
+| 🟡 **The trigger surface carries no `execution_tier`, so every HTTP-driven run compiles at `PRODUCTION`** | `MaterializationJobV1` and `MaterializationRunIn` have no such field, and adding one is a governance decision about who may widen the joins a compile may read — not a wiring change. Harmless today: the applicability tier only decides which joins are readable and forks no execution identity (pinned by `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity`). | Anyone needing a SANDBOX-scoped realization to reach a triggered run. Closure: a declared field on the job, argued the way `published_schema` was — no default, so a caller must state it. |
+
+### A.37 🟡 A pre-seal governed refusal records no stage and no code anywhere queryable (2026-08-04)
+
+Found by Phase G T11 while writing the acceptance test, and the scoping decision it rests on is
+correct — this records the consequence, which had no tracked home.
+
+The plane cannot hold a refusal that happens before the project is sealed:
+`materialization_run_event.generation_id` is a foreign key to a generation row that only exists once
+a project has been rendered and hashed. So `_Stop.refused` (`compile/chain.py`) writes exactly one
+thing — the request's lifecycle, `failed` — and `materialization_run_detail` correctly reports
+`run_status: null` with a reason saying which silence it is.
+
+The consequence is diagnostic, not correctness. An operator holding a `failed` request cannot ask
+the database **which stage** refused it or **which `CompilationRefusalCode`** it carried: those exist
+only in the lane's returned `MaterializationLaneOutcome`, in one `materialize.lane.recorded` log line,
+and in a counter. T11's two refusal probes had to call `process_materialization_once` directly rather
+than drive `run_worker_once`, because through the worker tick the stage and the code are unobservable
+— which is the clearest available statement of the gap.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`ChainStage` and `CompilationRefusalCode` for a pre-seal refusal are unqueryable — log line and counter only** | Closing it means either a nullable-`generation_id` run event (which weakens the plane's "a run event is about a generation" invariant and its one-terminal index) or two new columns on `materialization_request` (a migration Phase G may not add — 1053/1054 are used, 1055 is reserved for G-3). Both are §3.2 decisions rather than a test or lane detail. | The first operator triaging a refused request from the database rather than from logs, or any UI that lists refusals with a reason. Closure: prefer the two write-once columns on `materialization_request` (`refused_at_stage`, `refusal_code`), written by `_Stop.refused` in the same conditional UPDATE that terminalizes the row, so they cannot disagree with the lifecycle; then `materialization_run_detail` reports them beside `run_status_reason` and the acceptance suite's probes can drive `run_worker_once` like every other case. |
+
+### A.38 Phase G G-1 — the §3.6 / §3.4 deferrals, with the consequence a WIRED chain gives them (2026-08-04)
+
+G-1 ran §2's compile half end to end for the first time: trigger → resolve → admit → compile →
+Gate 2 → physical types → contract → plan → bind → select_publisher → render → seal → L0 → a durable
+terminal. Plan §3.6 named six durability deferrals that stay deferred and §3.4 named an identity
+decision. Five of the six already have entries; what none of them had is **the consequence now that
+a chain exists**, which is the thing §3.6 asks to be recorded rather than the name. Each row below
+**extends** the entry it names and does not replace it — the original trigger still stands.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **Atomic multi-write publish — G-1 reaches none of it, which is why the exposure did not grow** (extends the A-head row `:21`) | The multi-write set that row names — data commit + run manifest + active-revision pointer + stats + callback — is all run-side, and G-1 terminates at `PUBLICATION_REFUSED (CAPABILITY_UNPROVEN)` before the first member of it. What G-1 *did* make atomic is the COMPILE half: `compile/chain.py::_commit` writes the generation row, the retained plan + contract (1054), the L0 validation report, the group binding/plan revision and the terminal event inside ONE transaction, so a crash leaves either all of them or none. The consequence to carry forward is that this buys nothing for the run side: the moment G-2 lands `submit` + reconcile, the run-manifest write and the terminal event become a second multi-write with **no** atomicity, and §3.3's reconciler is the only repair path — by design, since the plane is append-only and a mis-sequenced write bricks the fold permanently. | Unchanged (two writers to one feature table, or the first restatement), plus **G-2's first `record_run_manifest` caller** — that is where the un-atomic pair first exists. |
+| 🟡 **The outbox/reconciliation generalization — G-1 shipped one lane's reconciler, not the facility** (extends the A-head row `:22`) | `materialize/reconcile.py` sweeps exactly one class: a `materialization_request` whose queue message is unreachable (`done`/`dead`/absent), judged from two tables it knows by name. It is not "reconciliation when either side is down", because the other side does not exist yet — there is still no external executor, and G-1 submits nothing. Consequence: the verdict vocabulary (`FAILED`, `NO_LEGAL_TERMINAL`, `NO_RUN_EVIDENCE`, `LOCKED`, `REPLAYED`), the lease-expiry rank, the bounded sweep and the `SET LOCAL lock_timeout` discipline are all spelled **inside this module**, so the next lane needing the same guarantee copies them rather than calling them — and a second copy is a second chance to disagree about what "abandoned" means. | Unchanged (the first external, non-in-process executor), plus a second queue lane needing an abandoned-work sweep — at which point the shape is worth lifting into `runtime/` rather than copied a third time. |
+| 🟡 **Content-addressed inputs — G-1 makes the gap REACHABLE for the first time** (extends A.1 `:38`) | A.1 recorded that two runs over the same partitions after an in-place source rewrite share one execution identity. Until this branch nothing could produce a run at all, so the property was theoretical. It is not any more: a governed feature can now be re-triggered on demand, and §3.3's rule is that a re-run is a NEW request and a NEW generation — so "regenerate and compare the hashes" is the natural operator move for *did this number change because the definition moved or because the data moved?*, and it **cannot answer the second half**. The compile-side hashes (`group_plan_hash`, `materialization_contract_hash`, `generated_project_hash`) describe the definition and the governed facts; `catalog_state_stamp` moves only when a governed fact moves. A source rewritten under an unchanged partition list produces byte-identical artifacts with equal hashes, and nothing says so. | Unchanged (reproducibility/replay, restatement), plus **the first operator who compares two generations of one group to attribute a change**. |
+| 🟡 **The full run state machine — G-1 shipped five of its seven states, and one of the five is durably unobservable** (extends the A-head row `:20`) | `RequestLifecycle` (migration 1053) carries `requested`/`accepted`/`running`/`committed`/`failed`; that row's `CANCELLED` and `STALE_INPUT` are absent. `running` exists but no reader ever sees it — the chain enters and leaves it inside `_commit`'s single transaction (`reconcile.py:471-473,514`), so it is a state the code passes through rather than one a status query can return. Three consequences: **(a)** there is no way to cancel an accepted request — an operator's only lever is to let the lease expire and let the reconciler judge it; **(b)** nothing expresses "the inputs moved under this run" as a terminal, so a compile refused because the catalog moved reports a `CompilationRefusalCode` at the stage that saw it, which A.37 records as unqueryable; **(c)** `requested → failed` is missing, which is A.35's own item. | Unchanged (scheduled/unattended runs), plus **the first cancellation request** — the absent state an operator meets first. |
+| 🟡 **The publish pointer — G-1's terminal is the honest statement of its absence** (extends A.26 `:484`) | `sandbox_feature.<group>` is still named in `group_binding.physical_target` and in the rendered README and is still not a queryable object. G-1 is forbidden from claiming otherwise: `compile/chain.py` never appends `RunEventKind.PUBLISHED` and terminates `PUBLICATION_REFUSED` carrying `select_publisher`'s own `CAPABILITY_UNPROVEN`. Stated plainly, because a reader of "G-1 is done" will otherwise misread it: **every run this program can currently produce ends in a refusal, and that is the truthful terminal rather than a failure** — what a consumer holds afterwards is a sealed, build-verified Kedro project on disk plus a plane record of what it would read, and no name by which to read a result. Note the constraint is a test rather than physics: `test_the_chain_can_never_append_PUBLISHED` matches `ast.Name("RunEventKind")`, so an aliased import (`… as REK`) would evade it. | Unchanged — G-3, gated on the live 16b probe and on the §3.5 governance decision. |
+| 🟡 **Recording actually-read partitions — G-1 made the INTENDED read set durable, which is the other half** (extends A.31) | A.31's gap is that `input_snapshots` is carried and hashed but never enforced as the run's read scope. G-1 changes the audit side and not the enforcement side: migration 1054 retains the group plan and the contract body keyed by `generation_id`, so a human holding a `group_plan_hash` can now answer *which features, which columns, which spine, which physical requirements* without re-deriving the compilation from a catalog that has since moved. What is still absent is the run side — nothing records what was actually read, and G-1 runs nothing at all. An auditor can now prove what a generation **intended** to read and still cannot prove what it read. | Unchanged (§3.4 identity relied on for audit), and now a **G-2 obligation** rather than a general wish: the intent half exists, so the actual half is the only missing term. |
+| 🟡 **§3.4 — a production run execution tier needs a second execution-hash scheme or an accepted identity migration** (NEW: nothing recorded this) | `derive_namespace()` takes no arguments by design (`identity.py:28-30`) and the sandbox namespace is inside `sandbox_execution_hash` (`identity.py:34`, "There is no production execution hash"). Introducing a production namespace therefore **forks execution identity**: every hash already recorded would describe a run that could not be reproduced under the new scheme. G-1 introduced no run tier — T10's `execution_tier` reaches only the bridge-realization *applicability* readers, and `test_chain::test_the_applicability_tier_is_NOT_a_run_tier_and_forks_no_execution_identity` pins that both tiers yield identical `generated_project_hash` and `materialization_contract_hash`. The consequence: the platform can compile and seal **sandbox-identity artifacts only**, there is no parameter by which a caller could ask for a production run, and adding one is a governance decision (do the recorded hashes stay valid, or are they migrated?) taken before any code is written. | The first request to materialize a feature for production data. Closure is one of exactly two: a second, explicitly-versioned execution-hash scheme with both kept readable, or an accepted identity migration that restates every existing hash — not a parameter added to `derive_namespace`. |
+
+### A.39 Phase G G-1 — what execution accumulated (2026-08-04)
+
+Consequences G-1 accepted while wiring the chain, each verified against the branch. None is a live
+defect: every one of them fails closed, has no `src/` caller that can reach it, or is bounded by a
+volume G-1 cannot produce. Each is here because someone picking up G-2 would otherwise have to
+rediscover it, and three of the five are met in G-2's first week.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **`_check_wiring` rule 7 is weaker than its own docstring, and `compile_feature_group` has no default assembler** | Rule 7 (`render/project.py:642-647`) requires every bridge-gate output to be READ by some node. Its docstring claims the stronger property — that "merely running a sibling validation node beside a projection leaves the computation free to read the unchecked raw target" is refused — and a node that reads the gate output and does nothing with it satisfies the implemented check. The exposure is the assembler seam: `compile_feature_group(…, assemble_nodes: NodeAssembler, …)` (`chain.py:367`) is keyword-only with **no default**, so `compile/wiring.py` is a convention rather than a floor. A caller supplying a different `NodeAssembler` could seal a bridged projection reading the RAW frame with the gate node running beside it, and the project would pass every wiring rule. Nothing does today: the only `src/` caller is the lane, whose `assemble_nodes` defaults to the wired assembler (`queue_lane.py:560`). | A second `NodeAssembler`, or any bridged group compiled by a caller outside `compile/`. Closure lives in `render/`: the check needs the hop→node map only the assembler has, so rule 7 must be told *which* node has to consume *which* gate rather than that someone did. |
+| 🟡 **The compile-time and authorize-time realization tiers are independent defaults** | `compile_feature_group(execution_tier=…)` threads the tier into `compile_ir` **only** (`chain.py:463`); `authorize_execution_realizations` carries its own `ExecutionTier.PRODUCTION` default (`ir.py:377-382`) and has no `src/` caller yet. G-2 is where the two meet in one chain (`compile → Gate 2 → authorize → prepare_run`). It fails closed in both directions — a disagreement is refused with `realization_execution_tier_mismatch`, never silently granted — so this is ergonomic rather than a correctness hole: a caller must remember to state the same tier twice and nothing structural obliges it to. | G-2, the first code to call both in one chain. Closure: carry the tier on the token that already binds `ir_hashes` and `environment_id` for exactly this reason — `AuthorizedCompilation` or `BridgeExecutionAuthorization`, both `materialize/ir.py` dataclasses and therefore Phase-G-ownable. |
+| ⚪ **The reconciler's three recorded follow-ups** | **(a) Metric-name collision** — `materialize.reconcile.<verdict>` is emitted both as a gauge (this sweep's standing count) and as a counter (cumulative terminalizations) at `reconcile.py:585-587`, so a dashboard globbing the prefix shows two series under one name; the fix is two namespaces (`…verdict.<name>` gauge, `…terminalized.<name>` counter). **(b) No `EXPLAIN` test for the query the sweep depends on** — the plan assertion covers `_EXPIRED_REQUESTS_SQL` (`test_request_store.py:483-491`), while the *sufficient* query is `_UNREACHABLE_MESSAGE_SQL`'s correlated `NOT EXISTS` over `queue.message_id` (`reconcile.py:265-271`), which has none: an index change on `queue` could turn each candidate's lookup into a scan with nothing red. **(c) N+1** — one `_message` read per candidate (`reconcile.py:305`), bounded by the sweep's `limit`, collapsible into a single `= ANY(...)`. | A deployment whose sweep is large enough to measure, or the first dashboard built on the `materialize.reconcile` prefix. All three are cosmetic at G-1 volumes: with the flag off nothing enqueues materialization work at all. |
+| 🟡 **G-2's prepared parameters need their OWN run-keyed table — 1054 can never hold them** | Plan §3.6's amendment, restated here because it is a G-2 precondition and a migration author looks in this file rather than in a plan. Two independent proofs: `prepare_run` is keyed on `run_id`/`business_dt` (`runprep.py:831`) so the parameter set is RUN-scoped while `materialization_compiled_artifact` is `generation_id PRIMARY KEY` — one row could hold only one run's set; and 1054 takes 1034's append-only guards, whose function has no escape branch, so a nullable column reserved today could never be filled by a later `UPDATE`. Numbering consequence: **1053 and 1054 are used; 1055 stays reserved for G-3's active-revision pointer; 1056 is numerically free but claiming it requires appending to the Track-1-owned D7 reservation table in the same commit** — `docs/architecture/2026-08-01-verified-interfaces-semantic-profiles.md`, which is not on this branch. A coordination step, not a unilateral one. | G-2's first migration. Taking 1056 without the D7 append repeats the 1032/1033 double-allocation A.22 records. |
+| 🟡 **`/materialization-runs` is absent from both ingress prefix lists** | `deploy/kind/nginx.conf:16`'s `location ~ ^/(uploads\|search\|…\|data-sources)(/\|$)` and `frontend/vite.config.ts:15-19`'s `API_PATHS` both omit it, so a `POST` through the ingress falls through to the SPA location and answers 405 without ever reaching the API. Harmless today — the flag is default-OFF, both routes 404 while it is off, and no frontend code calls them — but the consequence is precise and easy to lose: **enabling `FEATUREGEN_MATERIALIZE_ENABLED` in a deployed environment is not sufficient to make the trigger reachable.** Not fixed on this branch by decision: both files are shared with a parallel session holding an in-flight `/data-sources` change, and a two-line edit there buys a merge conflict in exchange for a route nothing calls. | Before the flag is turned on in ANY environment reached through the ingress. Closure is one prefix in each list, and it belongs in the same change that enables the flag so the two cannot disagree. |
+
+**Partition-scope matching is presence, not values (2026-08-04, Task-11 review residual).**
+`partition_scope_ref` has no resolver in this repo, so both `bridge_admission` and
+`crosswalk_admission` compare that a scope and its evidence are BOTH partition-scoped, never that
+the evidence covers THIS scope's partitions — the rule proves "somebody scoped something".
+Consistent precedent, named limitation. **Trigger:** a partition-scope resolver, or the first
+incident where mismatched partition scopes admitted a wrong direction.
+
+**R1 (2026-08-04, PII review residual): a wholesale pointer ROLLBACK is not detectable.** The
+per-row attestation seals catch any in-place field forgery, but restoring ALL four sealed pointer
+fields to a genuine earlier tuple verifies and re-licenses a revoked concept — a per-row seal
+cannot distinguish a rollback to a real past state from that state. Catching it needs a chained
+seal or an append-only pointer log. **Trigger:** the first compliance/audit requirement for
+non-repudiable policy history, or any incident involving policy-state disputes.
+
+### A.40 🟡 Phantom-keyed `field_evidence` / `field_decision_event` rows on deployed catalogs (2026-08-03)
+
+Recorded while remediating the final whole-branch review of Release A of the
+suggested-feature semantic-discovery plan (Task 0C minor, carried to the checkpoint).
+Task 0C (`89d78dc4`) changed how `column_authority.logical_ref_of` derives an object's
+logical key: it now reads `kind/schema_name/table_name/column_name` off the canonical
+`graph_node` row instead of guessing from the ref's dot count. Before that change a
+**two-part TABLE ref** — `public.accounts`, which is exactly how `graph.build_graph`
+stores a public-flattened table node — was read positionally as `table="public"`,
+`column="accounts"`, producing the phantom COLUMN key `<src>::public.public.accounts`.
+Any field decision or evidence row written against a table anchor under the old code
+therefore sits under a key nothing resolves to any more: `asset_detail` (`:694`),
+`read_field_cas` (`field_correction.py:196`), `apply_field_correction` (`:272`) and
+`column_readiness` (`:572`) all key off `logical_ref_of`, so they now compute
+`<src>::public.accounts` and find nothing. The rows are not corrupt and not lost —
+they are simply **unreachable from every read path**, and a curator who confirmed a
+table-level field before the fix sees their decision silently gone.
+
+This is invisible in CI and in every test fixture: fixtures are built after the fix, so
+they never write the phantom spelling. It can only exist on a catalog that was
+**deployed and curated before `89d78dc4`** — which today means the kind cluster, if a
+table-anchored field correction was ever issued there.
+
+**How to detect.** The phantom key is a three-part path whose schema and table segments
+are both `public`, with no matching `graph_node` column:
+
+```sql
+SELECT fe.logical_ref, fe.field_name, count(*)
+  FROM field_evidence fe
+ WHERE fe.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+-- and the decision side
+SELECT fde.logical_ref, fde.field_name, count(*)
+  FROM field_decision_event fde
+ WHERE fde.logical_ref ~ '::public\.public\.[^.]+$'
+ GROUP BY 1, 2;
+```
+
+Every hit is a table-anchored decision mis-keyed as a column. A real column named
+`public` under a schema named `public` would false-positive; confirm against
+`graph_node` (`kind='column' AND table_name='public'`) before treating a row as phantom.
+
+**What a remediation would look like.** A migration that, for each phantom row, derives
+the intended table key (`<src>::public.<parts[-1]>`), verifies a `graph_node` row exists
+with `kind='table'` and that `table_name`, and rewrites `logical_ref` — as a NEW appended
+evidence/decision row citing the original event, never an in-place UPDATE, because
+`field_decision_event` is an append-only audit table (the standing directive's
+"irreversible while deferred" exception does **not** apply: nothing is being overwritten,
+the rows are merely orphaned, so the fix stays available indefinitely). Rows whose derived
+table key has no `graph_node` row are quarantined and reported rather than guessed.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **Phantom `public.public.<table>`-keyed field evidence/decisions are unreachable after the Task 0C key fix** | Zero known rows: the defect requires a table-anchored field correction issued on a deployed catalog before `89d78dc4`, and no such correction has been confirmed to exist. Writing a migration for a population that may be empty — against an append-only audit table — costs more than it returns until the population is measured. | Run the two detection queries above against the kind cluster (and any other deployed catalog) at the next deploy. Any non-zero count fires this item; so does the first user report of a confirmed table-level field that "went missing". |
+
+### A.41 🟡 A lagging overlay projection is reported as an authoring failure, and names itself nowhere (2026-08-04)
+
+Found while building A.36's durable bridge seed, and it is not a fixture problem — the fixture is
+only how it was met. The mis-attribution is real in a deployment.
+
+**The mechanism.** `read_operational_value` calls `check_projection_readiness` FIRST, before any read
+is trusted (`overlay/upload/operational_facts.py:441-451`), and that gate compares the overlay
+projection's checkpoint against the GLOBAL event head — `COALESCE(max(global_seq), 0) FROM events`,
+not a per-catalog watermark (`feature_metadata_snapshot.py:145,158-164`). So **any** event appended
+anywhere by anything — an identifier-link proposal, a bridge governance event, a field confirmation
+in an unrelated catalog — puts every governed read in the platform behind the head until the
+projection catches up. That is the correct fail-closed posture and is not the finding.
+
+**The finding is where the verdict surfaces.** `_fail_closed` returns `status="projection_unavailable"`
+carrying the projection's own detail, but nothing downstream keeps it. The authoring lane folds a
+degraded governed read into `NEEDS_AUTHORITY` and the run closes `NEEDS_REVIEW`; the chain's
+resolution seam then reports `NOT_RESOLVED: work item <id> names authoring run <id>, which closed
+NEEDS_REVIEW, not RESOLVED` and stops at `ChainStage.RESOLVE`. **Neither the refusal detail, the
+request row, nor the control plane contains the word `projection_unavailable`, a checkpoint, or a
+head sequence.** An operator holding that refusal is pointed squarely at the LLM authoring layer —
+the model, the critic, the proposal — which is not where the problem is. The problem is that a
+background projection is behind, is probably already catching up, and the run would succeed on
+retry.
+
+Compounded by A.37: a pre-seal refusal has nowhere in the plane to record a stage or a code at all,
+so this diagnosis is not merely absent from the refusal text — it is absent from everything
+queryable.
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **A governed refusal caused by a LAGGED overlay projection is reported as `NEEDS_REVIEW` authoring, and the lag is named nowhere an operator can read** | Surfacing it means threading a distinguishable state from `read_operational_value` through the authoring resolver's `NEEDS_AUTHORITY` fold and into the chain's refusal — three modules across two ownership boundaries (`overlay/upload/`, `formula/`), and the fold currently has one bucket for "a governed read did not answer" whether the cause is no decision, a conflict or a stale read model. Widening that vocabulary is a governed-authority decision, not a wiring change. Harmless to correctness: it fails CLOSED and a retry after the projection drains succeeds. | The first operator who debugs a `NEEDS_REVIEW` that had nothing to do with authoring — likely the first busy environment, since the gate is global rather than per-catalog and any concurrent upload can trip it. Closure: carry `projection_unavailable` (with the checkpoint and head) as its own reason through the fold, so the refusal says *the read model is behind* rather than *the model produced something needing review*; the retry advice follows for free. |
+| ⚪ **Test fixtures that append governance events must drain the projection themselves, and two copies of that drain now exist** | `_bridge_fixtures.seed_verified_bridge` and `test_cross_catalog_ir.seed_executable_bridge_realization` each run `run_projection(db, OverlayProjection())` to exhaustion and assert `projection_degraded` is empty, for exactly the reason above. A third copy is a third chance to get it subtly wrong (drain but not assert, assert but not drain). | The third fixture that needs it. Closure: one shared helper beside `_bridge_fixtures`, called by both. |
+
+### A.42 ✅ CLOSED — L0 proved the build in an interpreter it never compared against the artifact's own pins (raised 2026-08-04, closed 2026-08-04)
+
+**Closed by the engine-version check in L0's build probe.** The row is kept because the reasoning
+below is the design record for `ENGINE_VERSION_MISMATCH`, and because one 🟡 under it is still open.
+
+What landed: `ValidationFindingCode.ENGINE_VERSION_MISMATCH` (§14's finding vocabulary, widened by
+one), classified `GOVERNED_FACT_MISMATCH`. `_BUILD_PROBE` now reads the rendered project's own
+`requirements.lock`, parses every `<distribution>==<version>` pin out of it, and compares each to
+`importlib.metadata` **in the probe's own interpreter** — the one that does the proving — emitting
+one finding per disagreeing distribution, each naming the package, the pin and what is installed. A
+lock that is missing, unreadable or pin-less FAILS CLOSED on the same code: "nothing to compare"
+must not read as "they agree", which is this defect restated.
+
+Three placement decisions carry the fix, and all are asserted by tests rather than described:
+
+* **In the probe, not around it.** A second `subprocess` from `run_l0` asking the same
+  `python_executable` what it has would prove something about a second process merely *believed* to
+  be the one that built — a wrapper script, a re-pointed symlink or an install landing between the
+  two launches makes that belief false, which is this very defect at a smaller scale. It would also
+  need its own "the interpreter never answered" channel beside `_probe_verdict`'s `None`.
+* **First, before `sys.path.insert(0, root + "/src")` and before any import**, so nothing the
+  artifact ships has executed when the pins are read. Short-circuiting is also correct routing: a
+  build that fails *because* the engines are wrong would otherwise be filed
+  `PROJECT_DOES_NOT_BUILD`, a `RENDERER_DEFECT`, sending an operator to fix a renderer that did
+  nothing wrong.
+* **With every `sys.path` entry inside the project REMOVED for the query, and restored before the
+  import.** The first attempt at this fix shipped without it and *reopened the defect it closed* —
+  see below; it is recorded rather than quietly amended, because the reasoning that produced the
+  hole is more instructive than the patch.
+
+**The fix's own regression, found by adversarial review and closed in the same branch.** Ordering
+alone was claimed to be sufficient and is not: `_probe_verdict` launches the probe as `python -c`
+with `cwd=root`, and `python -c` puts the cwd at `sys.path[0]` — so the project root was on the
+metadata search path *before the probe's first statement*. Because `_files_on_disk` deliberately
+skips `*.egg-info` from `generated_project_hash` (an editable install writes one by *using* a
+project, so it is correctly not drift), a root-level `kedro.egg-info/PKG-INFO` was **invisible to
+`PROJECT_HASH_MISMATCH` and authoritative for `importlib.metadata` at the same time**: `run_l0`
+returned `passed` with zero findings for a project pinning `kedro==0.19.9` under an interpreter with
+no kedro. The original test missed it because it only ever forged metadata under `src/`.
+
+The probe now strips every `sys.path` entry resolving inside the project before the query and
+restores the list exactly before the import. In-probe rather than `-P` / `PYTHONSAFEPATH`, on three
+grounds: those close only the cwd door and leave `PYTHONPATH=<root>` open (tested); `-P` is 3.11+
+and would fail the launch of an older L0 interpreter, reported as "the environment did not answer";
+and `PYTHONSAFEPATH=1` in the overlay would silently break `run_l0`'s documented contract that
+`env=None` inherits this process's environment unchanged. The regression test is parametrized over
+four placements — project root `.egg-info`, root `.dist-info`, `src/`, and an arbitrary nested
+directory — plus a `PYTHONPATH`-aimed-at-the-project case, plus a test that the restore is exact
+(a project whose registry imports a module living at the project root still builds).
+
+**And a second one, found by the re-review: the probe's OWN imports ran before its sanitization.**
+The first executable line was `import importlib, importlib.metadata, json, os.path, sys, traceback`,
+executed while `cwd=root` still had the project at `sys.path[0]` — so a tree shipping `<root>/json.py`
+executed arbitrary code with the live verdict nonce in `sys.argv[1]` and forged a passing build
+verdict: `passed`, zero findings, again. Strictly weaker than the first hole, and the row says so
+rather than dramatising it: `json.py` **is** inside `generated_project_hash` (it is not `*.egg-info`),
+so a dropped-in copy is `PROJECT_HASH_MISMATCH` and `_prove_the_build`'s identity check keeps the
+chain safe — the exploit needs an adversary-*sealed* tree, not a hand edit. But it falsified two
+sentences the fix's own comments made, and a false comment is worse than none.
+
+The probe now imports `sys` alone (a built-in: never resolved from `sys.path`, so unshadowable),
+drops the cwd entries with pure `sys` and no import at all, then imports `os.path`, then does the
+`realpath` pass, then imports the rest. Regression test ships a hostile module in a **sealed** tree
+so it exercises the probe's import order rather than the hash check. Reverting the import line kills
+the `json` / `traceback` / `importlib` parameters; the `os` / `encodings` parameters survive it,
+because CPython startup already has those in `sys.modules` — they are defence in depth against the
+import list growing, and the test says which is which.
+
+**And a third, one layer earlier again: `PYTHONPATH` is live during SITE INITIALIZATION.** A sealed
+`<root>/sitecustomize.py` under `PYTHONPATH=<root>` executes before the interpreter runs a line of
+`-c` source — before `import sys`, before any pass the probe could add — and forged `passed []` off
+the nonce in `sys.argv[1]`. Not fixable inside the probe by construction, so it is closed
+parent-side: `_probe_environment` drops `PYTHONPATH` entries resolving inside the project before the
+subprocess is launched (`realpath`, resolved against `root` because that is the child's cwd, so
+`.`, `<root>/./` and `<root>/src/../` all collapse). `-P`/`PYTHONSAFEPATH` do not close it — they
+drop the cwd entry and honour `PYTHONPATH` regardless; `-S` would, by also removing `site-packages`
+and blinding the probe to the engines it exists to check.
+
+This **knowingly amends** `run_l0`'s documented "`env=None` inherits this process's environment
+unchanged" to "unchanged except for project-internal `PYTHONPATH` entries" — the same contract cited
+when rejecting `PYTHONSAFEPATH`, so the amendment is written down at `_probe_environment`, at the
+`env` argument and here. The contract existed so a caller could give the probe what the interpreter
+needs, not so an artifact could be handed a way to execute before it is inspected; an entry pointing
+into the tree under validation is never load-bearing, since the probe puts `<root>/src` on the path
+itself and the cwd still supplies `<root>`. A `PYTHONPATH` pointing OUTSIDE the tree is untouched,
+and a test pins that — it is the mechanism the engine check's own fixtures run on.
+
+It needed two non-default conditions together (an adversary-**sealed** tree, since a dropped-in file
+is `PROJECT_HASH_MISMATCH`, **and** a `PYTHONPATH` naming the root, which nothing in `src/` or
+`deploy/` sets). Fixed rather than documented as an exception, because this row says ✅ CLOSED and a
+known forgery path under that word is the precise failure A.42 exists to stop.
+
+Deliberately NOT stripped: a `sys.path` entry that passes *through* the tree by symlink to a target
+outside it. `realpath` resolves to the target, the target is not the artifact, and a project cannot
+author a `sys.path` entry — only files under its own root. Recorded so it reads as a decision.
+
+**Adversarial-review score across three rounds**, since the shape is the lesson: round 1 shipped the
+check with a false sufficiency claim (root on `sys.path` via cwd); round 2 fixed that and left the
+probe's own import line exposed; round 3 fixed that and left site initialization exposed. Each hole
+was one layer earlier in interpreter startup than the last, and each was found by attacking the
+comment rather than the code. The three are closed by three different mechanisms — in-probe path
+sanitization, import ordering, and parent-side environment filtering — and each has its own mutant
+recorded above.
+
+The classification was contested and settled against the code: `status="error"` cannot carry a
+finding (`ValidationReportV1.__post_init__`), and A.42's whole complaint is that the condition names
+itself nowhere — so the verdict has to be the one that can carry a code.
+
+`tests/featuregen/materialize/l0_gate.py::test_the_environment_really_has_the_engines_the_project_pins`
+is no longer a second implementation of the comparison: it drives a real `run_l0` and asserts the
+PRODUCTION verdict — `PASSED` under `.venv-artifact`, `ENGINE_VERSION_MISMATCH` naming each package
+under `.venv-l0-modern` and under the kind image. It is consequently GREEN in all three, and the red
+it replaces has moved into the product. The gate's three build-proof tests take a
+`the_declared_environment` fixture and SKIP outside the artifact line, naming the disagreement: L0
+refuses to prove a build there, so there is no build verdict for them to assert. That fixture
+decides from **one real session-scoped `run_l0`** over a sealed copy of the golden tree, not from a
+parse — an earlier draft decided it from a second pin parser that stripped neither inline comments,
+extras nor environment markers where the probe strips all three, which is how a gate goes quiet
+instead of red. The gate retains one parser, used ONLY to write an expected-value table; if it
+drifts, the test it feeds fails loudly rather than skipping.
+
+Also corrected here, because A.42 is about claiming more than was true: `chain._unproven_detail` no
+longer tells an operator "this project does not build" on the engine path. The probe stops at the
+pin comparison and never imports, so the build is UNPROVEN, and the detail says which.
+
+---
+
+Found by the adversarial review of `e1d471a7`, which put a kedro/pyspark interpreter into the kind
+backend image so `FEATUREGEN_MATERIALIZE_L0_PYTHON` had something real to point at. The interpreter
+is correct and the image change stands; what the review could not establish is that a PASS from it
+means anything about the artifact that passed.
+
+**Everything from here to the table is the defect AS RAISED**, kept verbatim because it is the
+argument for why the check exists. Line references are to the pre-fix code.
+
+**The mechanism, in one line: `_BUILD_PROBE` never bootstraps the project, so the one thing that
+enforces the declared pin is never consulted.**
+
+The generated project pins itself from the mounted inventory, not from anything in the image:
+`_render_requirements` and `_render_pyproject` (`render/project.py:1005-1017`, `:969-997`) take
+`kedro` / `kedro-datasets` / `pyspark` — and an EXACT `requires-python` — straight from
+`ClusterInventoryV1.engine_versions`. So the artifact declares whatever a human captured from the
+target cluster, while the L0 interpreter's versions were frozen when the image was built
+(`pyspark==3.5.3`, `kedro==1.5.0`, `kedro-datasets[spark]==9.5.0`).
+
+Nothing compares the two. `_BUILD_PROBE` (`materialize/validation.py:430-462`) inserts `<root>/src`
+on `sys.path`, imports the package and calls `register_pipelines()`. It never calls
+`bootstrap_project` and never creates a `KedroSession`, so `kedro_init_version` — the mechanism that
+would refuse a mismatched project — is never reached. `run_l0` (`:548-647`) compares the project hash
+against the lock and nothing else; `codes.py` ships no engine-version finding at all. The result is
+that L0 returns `PASSED`, and the chain records "the build was proven", for a project pinned to
+engines the prover does not have.
+
+**Why this is 🔴 and not 🟡.** It is a false PROOF, not a missing feature. Every other Phase G
+refusal fails closed; this one fails *open* and says the reassuring thing. It is also latent by
+construction rather than by luck: it becomes live the moment a real inventory is mounted, which is
+the single remaining blocker on turning `FEATUREGEN_MATERIALIZE_ENABLED` on
+(`20-backend.yaml:88-91`). Whoever captures that inventory is implicitly deciding whether the image's
+three pins are right, and will get no signal whatsoever if they are not.
+
+Distinct from **A.32**, which is its neighbour and worth reading beside it: A.32 says the lock is
+*incomplete* (kedro-datasets' spark module hard-imports `hdfs`/`s3fs`, which the lock cannot carry),
+so an environment installed FROM the lock cannot construct the catalog. A.42 says nothing ever checks
+the interpreter AGAINST the lock in the first place. A.32 is about the contents of the pins; A.42 is
+about the absence of the comparison. **A.32 remains open**; closing A.42 did not touch it.
+
+| Item | Status | Notes |
+|---|---|---|
+| ✅ **`run_l0` reported `PASSED` for a project whose declared engines the L0 interpreter does not have** | **CLOSED.** `ENGINE_VERSION_MISMATCH` added to `ValidationFindingCode`; the comparison lives in `_BUILD_PROBE`, ahead of the `sys.path` insert and the import, with every path inside the project stripped for the query and restored before it; one finding per disagreeing distribution, naming package, pin and installed version; a missing, unreadable or pin-less lock fails closed on the same code. | Proved by `test_validation.py`'s engine section (agreement → `PASSED`; per-package mismatch; not-installed vs wrong-version; four forgery placements incl. the project root; `PYTHONPATH` aimed at the tree; the path restore; non-UTF-8 lock; the fail-closed degenerate cases) and by the real chain in `test_chain.py::test_the_chain_calls_the_REAL_run_l0_...`, whose finding is now `ENGINE_VERSION_MISMATCH` rather than the mis-routed `PROJECT_DOES_NOT_BUILD`/`RENDERER_DEFECT`. Mutants "the comparison always agrees" and "run the check after the import" kill 8 and 3 tests respectively. |
+
+| Item | Why deferred | Trigger to revisit |
+|---|---|---|
+| 🟡 **`may_regenerate` / `may_regenerate_for` have NO production callers, so a finding's CLASS gates nothing** | Found while closing A.42, and it is why this row says the classification is *declared*. `GOVERNED_FACT_MISMATCH` is documented as blocking regeneration, and `may_regenerate` correctly returns `False` — but the only callers are tests, and the chain's decision is `built = report.status is ValidationStatus.PASSED` (`chain.py`), which never reads a class. Not fixed here because G-1 has no regeneration path to gate: wiring it means deciding when regeneration is attempted at all, which is a governed-authority call and not a review-wave change. | The first code that regenerates a refused artifact — i.e. G-2's re-drive. Closure: route it through `may_regenerate_for(conn, generation_id=…)` so `GOVERNED_FACT_MISMATCH` and `UNCLASSIFIED` actually hold, and the §11.2 asymmetry stops being documentation. Until then, do not write "so it blocks regeneration" anywhere; it does not yet. |
+| ⚪ **The version comparison is exact string equality — false positives only, never false negatives** | Distribution NAMES are normalized (`importlib.metadata`, PEP 503, so `kedro-datasets` == `kedro_datasets`); VERSIONS are not, so a capture writing `kedro: "1.5"` against an installed `1.5.0` is reported as a disagreement though PEP 440 calls them equal, as is `1.5.0RC1` vs `1.5.0rc1`. Deliberate: a pin that is not byte-exact is a pin nobody can reproduce, and importing `packaging` into a stdlib-only probe is the worse trade. Nothing can slip through by being merely equivalent. | An operator confused by `expected kedro==1.5 / observed kedro==1.5.0`. Cheapest closure is validating full versions at capture (`EngineVersions.__post_init__` checks only non-blank today), not loosening the comparison. Documented in the probe. |
+| 🟡 **The kind image's pins are the SANDBOX's, and the sandbox is not the cluster** | `Dockerfile.backend` installs the same three versions as `sandbox/Dockerfile.spark` on the sandbox's ANSI-semantics reasoning, which is sound for choosing *a* Spark 3 line but says nothing about the target cluster. Left as-is because the alternative — deriving the image's pins from an inventory that does not yet exist — is circular, and because the check above **is now in place**, so a wrong pin is loud instead of silent: L0 refuses with `ENGINE_VERSION_MISMATCH` naming each package rather than reporting a build it proved somewhere else. | The inventory capture. If its `engine_versions` differ from 3.5.3 / 1.5.0 / 9.5.0, the image needs rebuilding against them, and that dependency belongs in the capture procedure rather than being discovered by a failing run — which is now what would happen, loudly. |
+
+### A.44 Release C Task 12 — adversarial-review residuals (2026-08-04)
+
+Four findings the Task-12 review returned that were RECORDED rather than fixed on that branch. The
+two D11 items are the same shape as the one that WAS fixed there (Gate 2's table anchor, F1) and are
+here precisely so the difference is deliberate rather than forgotten: Gate 2 now enforces the table
+anchor conjunctively while every display surface still substitutes.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **D11's derived table rule correlates on `table_name` with NO `schema_name` term** | `read_scope.anchor_visibility_predicate`'s EXISTS probe (`read_scope.py:88-89`) matches `c.catalog_source = gn.catalog_source AND c.table_name = gn.table_name` and never compares schemas. Two tables of the same NAME in different schemas of ONE catalog source therefore pool their columns: a visible column on `staging.accounts` makes the fully-restricted `secure.accounts` table node visible. Pre-existing and shipped — nothing in this task introduced it — and unreachable on every catalog today because each `catalog_source` holds one schema. **Gate 2's conjunctive variant does not close it either**: the new clause adds the table row's OWN requirement, and the EXISTS half it ANDs with is the same homonym-pooling probe. | Any second schema landing under one `catalog_source` (a multi-schema upload, or a source that ingests `staging` + `secure` together) — or the D11-wide review below, whichever comes first. Closure is one `AND c.schema_name IS NOT DISTINCT FROM gn.schema_name` term, but it changes six call sites' semantics at once and wants the same review. |
+| 🟡 **The SHARED `anchor_visibility_predicate` still DISCARDS a table's own `visible_requires` on five surfaces** | Same shape as F1, on the surfaces F1 deliberately did not touch. The table branch is SUBSTITUTIVE: it replaces the row's own requirement with "can the caller see at least one column", so a governed `restricted` — or `prohibited` — floor set on a TABLE node decides nothing at `field_correction.py:357`, `asset_detail.py:142`, `crosswalk_discovery.py:214`, `crosswalk_store.py:321` or `source_selection.py:738`. On a read/visibility surface that is a defensible reading of D11 (the table is listed because there is something on it you may see, and every column still filters on its own account) and it is why F1 was scoped to the gate instead: changing the shared predicate changes five surfaces in one move and is a controlling-doc-level decision about what D11 MEANS, not an implementation fix. **The asymmetry now exists and should be read as intentional**: `ir._hidden` binds `materialization_anchor_visibility_predicate` (conjunctive — it grants a SCAN), everything else binds the substitutive one. | The next D11 review, or the first governed floor written to a TABLE node in anger. Closure is a decision first: either D11 adopts the conjunctive rule everywhere (and the display surfaces lose an existence-oracle they currently permit), or it records the split and says why — but not a silent edit to `anchor_visibility_predicate`, which would move five surfaces with no test naming them. |
+| 🟡 **The crosswalk boot refusal is API-process-scoped; the worker performs NO flag-dependency check** | `api/app.py::_startup_crosswalk_flag_refusal` raises on the one illegal combination, and `__main__.py:153`'s worker bootstrap performs neither that check nor Release B's warning (`_startup_flag_dependency_check`). So `FEATUREGEN_CROSSWALK_EXECUTION=1` with the source/temporal feature disabled REFUSES to boot the API and boots the worker silently. Harmless today because the reader fails closed independently (`crosswalk_execution_enabled()` re-reads both flags on every call, and `test_the_flag_being_SET_alone_is_not_enough` pins that a compile refuses in exactly that configuration) — so a worker in the illegal state can compile nothing a correctly-booted one could not. The gap is that the deployment's misconfiguration is INVISIBLE on the process that would actually run the work. | The first worker-side crosswalk consumer — Phase G's lane calling `compile_feature_group` with `crosswalks=(…)`, which is where "the API refused to boot and the worker did not" stops being cosmetic. Closure: call `require_valid_crosswalk_configuration()` from the worker bootstrap beside the migration check, so one function is the refusal on both processes. |
+| ✅ **The two-leg crosswalk path is COMPILED capability, not WIRED capability** (extends A.39) — **HALF CLOSED 2026-08-05 by Release C Task 13** | Stated plainly because "Task 12 is done" reads otherwise. `AdmittedCrosswalkV1` has **no `src/` constructor at all** — every instance in the repo comes from `tests/featuregen/materialize/crosswalk_fixtures.py`, so nothing in production assembles a definition + execution + decision + row-selection + observation + the three bindings into one. And `authorize_execution_realizations` still has **zero `src/` callers** (A.39's tier row records the same fact from the other side), so the pre-run revalidation a crosswalk leg's realization pins is code that no chain reaches. What Task 12 established is that a governed two-leg traversal CAN be planned, authorized, rendered and sealed, proved end to end through the shipped stages by the fixture bank; what does not exist is anything that hands it a real crosswalk. **CLOSURE (assembler half):** `src/featuregen/overlay/upload/crosswalk_assembly.py` is the store-side constructor this row asked for. `assemble_admitted_crosswalk` reads the definition through its CURRENT pointer (1050), the composed measurement for the requested scope (1057), all three physical bindings by the revision ids the pins name (1036), the active-mapping count for the endpoint pair, and revalidates every pinned bridge realization — then RE-DERIVES the admission decision and the execution revision (neither is stored, and neither may be: a persisted verdict outlives the evidence it was read from, which DoD 17 forbids). `AdmittedCrosswalkV1.__post_init__` now runs its cross-checks on real rows, proved by `tests/featuregen/overlay/upload/test_crosswalk_assembly.py` (26 tests against the real stores). **STILL OPEN (the other half):** `authorize_execution_realizations` still has zero `src/` callers. The assembler revalidates a leg's realization against the CURRENT pointer at assembly time (`_legs_currently_executable`, fail-closed), which is the same question from the read side — but the pre-RUN revalidation immediately before run preparation is Phase G's lane to call, and nothing in this task acquired a run to prepare. **WHAT THE ASSEMBLER IS NOT: a WIRED chain.** `assemble_admitted_crosswalk` has **zero `src/` callers**, and so do `record_crosswalk_gaps`, `crosswalk_learning_events` and `reconcile_crosswalk` — every reference to the four outside their own modules is a test or a mutation. This row exists to keep exactly that distinction, so stating the closure without it would repeat the error it was written to prevent: what Task 13 built is a store-side CONSTRUCTOR that works against real rows, not a path any request or worker takes. A caller is Phase G's lane. | Task 13's consumers and Phase G's lane — the two places a real `AdmittedCrosswalkV1` must be built from stored Task-11 artifacts. Closure is a store-side assembler that reads the definition, the current execution revision, the admission decision, the resolved row selection and the three bindings, and constructs the bundle so `__post_init__`'s cross-checks run on real rows rather than on fixture ones. |
+
+### A.45 Release C Task 13 — adversarial-review residuals (2026-08-05)
+
+Two findings the Task-13 review returned that were RECORDED rather than fixed on that branch. Both
+are shapes the branch fixed *as far as it could without a migration or a caller*, and both are here
+so the remainder is deliberate rather than forgotten.
+
+| Item | Detail | Trigger |
+|---|---|---|
+| 🟡 **A composed observation does not persist WHICH SCOPE it ran under — only the scope's NAME** | Migration 1057 writes `scope_id` and no `execution_tier`, `environment` or `purposes`; those live on the caller's `RealizationApplicabilityScopeV1`, which nothing writes down. So two scopes sharing a `scope_id` string and differing in TIER were one row to every reader, and the review's probe recorded under `scope_id="probe-scope"` at SANDBOX, read it back under a PRODUCTION scope of the same name, and got a clean production-admissible bundle. **Closed as far as no-DDL allows**: `crosswalk_observation.scope_binding_id` binds the scope's whole `identity_payload()` into the one value that IS persisted (`<scope_id>#scope:<hash>`), and `crosswalk_assembly` refuses a production read of any measurement that DECLARED no such identity (`OBSERVATION_SCOPE_IDENTITY_UNPROVED`). That is a check on the WRITER, not a proof about the run: `scope_binding_id` is a public pure function, so a producer can compute a binding for a scope it never executed under. It closes accidental COLLISION, not forgery — and neither would the DDL below, since a caller-written `execution_tier` column is exactly as forgeable, which is why that fix is justified by readability and audit rather than by trust (closing forgery needs a trusted execution attestation, which nothing here produces). What the binding also does NOT give is a scope anybody can READ back: the binding is a digest, so "which tier was this measured at?" is answerable only by re-deriving the hash from a scope you already hold, and no operator, audit query or admin screen can ask it of a stored row. Bare `scope_id` rows also remain readable at the sandbox tier by design, so the store still holds evidence in two shapes. **AND NOTHING IN `src/` BINDS A SCOPE TODAY, so every production read of a REAL measurement currently refuses.** The one measurement producer in the repository (`data_agent/crosswalk_measurement.py:284,415`) passes `plan.scope_id` straight through, and `CrosswalkProbePlanV1.scope_id` (`data_agent/crosswalk_probe.py:132`) is a bare `str` with no scope object anywhere near it — so `scope_binding_id` has zero `src/` callers and every measurement a real probe writes is name-only. The direction is right (fail-closed: an unbound measurement is refused as production evidence, never silently accepted), but the consequence is that production assembly from a real measurement is structurally impossible until the producer carries a scope OBJECT rather than a string. That is part of this row's closure, not a separate task. | The first PRODUCTION Hive measurement — the point at which somebody has to answer "what was this measured at?" from the record rather than from the caller. Closure is DDL plus a producer change: `execution_tier`, `environment` and `purposes` as their own columns on `crosswalk_observation_revision`, written from the scope at compose time, and `CrosswalkProbePlanV1` carrying the scope object that supplies them. **1058 was the next free number at the time of writing and is NOT a reservation** — no D7 row exists for it, correctly, because D7 reserves in the same commit as the migration. Re-check the pool before taking a number (Phase G-2/G-3 draws from it) and add the D7 row in that same commit, with the assembler's provability check reading the columns instead of the digest and the binding kept only as the backfill discriminator for pre-1058 rows. One more clause for that producer change (review N7): the naming/writing separation the scope-name guard buys holds only while `CrosswalkProbePlanV1.scope_id` is supplied by the SAME principal that writes the measurement — if that field ever becomes API- or config-supplied while the writer is a more-trusted service, the bare-string write path bypasses what the dataclass guard bought, so the producer change must validate or bind the scope at the trust boundary, not just carry it. |
+| ⚪ **The context payload's `leg_pins` renders a field the server always sends as `[]`** | `CrosswalkContextV1.leg_pins` is D3's shape and is EMPTY at discovery by contract (Task 10): a leg is pinned by RESOLVING it, and nothing on the listing path resolves anything — `relationship_context_from_crosswalk` is called with no decision and no execution revision. The screen's lineage block (`AssetDetailScreen.CrosswalkFraming`) renders both legs whenever they arrive and is covered by a fixture-fed test, so the UI is correct and dead at once: it is written against a payload shape the server cannot currently produce. Recorded rather than removed, because deleting the block would mean rebuilding it — and the honest half (`pinned_revisions`) does render today. | Wiring `crosswalk_assembly.assemble_admitted_crosswalk` into the context payload, which is the only thing that resolves leg pins from stored rows. At that point the block lights up with real data and its test stops being the only thing that has ever seen one. |
+### A.48 Two homes for the D2 semantic-value contracts (2026-08-05, main-merge reconciliation)
+
+The 2026-08-05 reconciliation merge united two trains that had each implemented the same D2/§2
+concept in parallel: `EvidenceAuthorityV1` and `SemanticValueV1` exist in
+`contracts/evidence_axes.py` (suggestion-discovery train: enum-coerced fields, consumed by
+`contracts/resolvers`, `grounding_trace`, `suggestion_contract`, `template_discovery`) AND in
+`overlay/upload/semantic_context.py` (semantic/profile train: string-validated wire shape with
+defaults, consumed by the Release-A wire surface — `context_graph`, `dataset_profiles`,
+`semantic_adjudication`, `analysis/retrieval` and others). The shapes are near-twins but not
+substitutable: one stores enum members and requires all five fields, the other stores validated
+strings with defaulted audit ids, and each has its own byte-stability/consumer expectations.
+Unifying in the merge commit would have silently changed one train's wire or comparison semantics,
+so the split is pinned instead
+(`tests/featuregen/contracts/test_shared_contract_ownership.py::test_the_dual_home_classes_…` —
+exactly these two homes, never a third). `AttributedLabelV1`/`AttributedTextV1` remain
+single-owned by `evidence_axes`.
+
+**Trigger:** the first change to either shape, or the first consumer that needs to pass one
+train's value into the other's reader. **Closure:** one review-sized task that picks the owner
+(the ownership test's own `_FOREIGN_OWNED_CLASSES` comment records the discovery train's
+expectation that the landed semantic plan owns these names), re-exports from the loser, proves
+wire byte-stability both ways, and collapses the pin back into `_SINGLE_OWNER_CLASSES`.
+
+### A.49 Every `APITimeoutError` is classified as a generation overrun, and a long `retry-after` cannot reach the retry decision (2026-08-06, Task 4 review)
+
+Task 4 set `llm_claude._SDK_MAX_RETRIES = 0` to stop the Anthropic SDK multiplying the per-attempt
+wall clock by 3 (its default `max_retries=2` retries `APITimeoutError` internally, so a 300s ceiling
+cost up to 900s per physical attempt, held under the source advisory lock). That was the right call
+for the bound — worst-case chain 8100s → 2702s — but the SDK's retry layer was also silently
+absorbing two classes that nothing else covers. One is now recovered, two are not.
+
+**Recovered in Task 4:** provider-side capacity — 529 `overloaded_error` and transient 5xx. These
+map to `PROVIDER_TRANSIENT`, and `llm.drive_structured_call` previously re-called in the SAME tick
+(no `sleep` existed anywhere in the module), so three attempts completed inside a few milliseconds
+and were three guaranteed failures. `llm._TRANSIENT_BACKOFF_BASE_S` now waits 1s then 2s, capped at
+5s per wait, on the transient class only — deterministic classes (`PROVIDER_MAX_TOKENS`,
+`PROVIDER_SCHEMA_FAULT`) are excluded because waiting cannot change their outcome.
+
+**🟡 NOT recovered — connection-level timeouts are terminal.** The SDK raises `APITimeoutError` from
+*any* `httpx.TimeoutException` — connect, pool and write, not only a slow generation.
+`APITimeoutError` subclasses `APIConnectionError`, and `llm_claude`'s arm maps it to
+`PROVIDER_NON_RETRYABLE`, which `llm.py` treats as terminal. So a sub-second TCP connect blip now
+kills its chunk with **no retry at any layer**, and the backoff above does not help because that arm
+is never reached. Before Task 4 the SDK absorbed this invisibly. The arm's comment says so; the code
+does not yet act on it.
+
+**🟡 NOT recovered — a long `retry-after` never reaches the decision.** A per-minute token quota
+commonly returns `retry-after: 30`–`60`. `LLMResult` carries `status` as a bare `PROVIDER_*` token
+with no metadata channel, so the header the provider sent cannot influence how long the driver
+waits. Bounded backoff of ≤5s does not clear that class; it only converts an instant triple-failure
+into a slightly spaced one.
+
+**Trigger:** the first real 429/529 or connect-blip incident on a deployed catalog — or any change
+that raises ingestion concurrency above the single sequential caller `run_batched` is today, which
+is the assumption making the un-recovered classes tolerable.
+
+**Closure** (one review-sized task, both halves together since both are about the same seam):
+1. Give the timeout arm a discriminator so a connect/pool/write timeout maps to `PROVIDER_TRANSIENT`
+   while a generation overrun stays `PROVIDER_NON_RETRYABLE`. `APITimeoutError` is raised `from` the
+   underlying `httpx` exception, so `__cause__` is the likely discriminator — **verify against the
+   installed SDK rather than assuming**, since `anthropic` lives in the `llm` extra and is not
+   installed in CI, and add a guard test that fails if the SDK stops preserving the cause.
+2. Add a metadata channel for `retry-after` (an optional field on `LLMResult`, populated by the
+   adapter from the response headers) and honour it in `llm._TRANSIENT_BACKOFF_*` bounded by the
+   stage deadline, so the wait is the provider's number rather than ours.
+Both change the §9.2 taxonomy's contract, which is why Task 4 documented them instead of widening
+what counts as retryable inside a configuration change.
+
+### A.50 The enrichment call count at the raised caps was DERIVED, never measured (2026-08-06, Task 4b)
+
+Task 4b raised every prose and item cap on the enrichment path for zero truncation
+(`MAX_DEFINITION_LEN` 600 → 4000, `_MAX_LEN_DEFAULT` 200 → 1000, `_MAX_COLUMN_PROFILES` 64 → 512,
+`ADAPTER_LIST_LIMIT` 40 → 256, `NEIGHBOUR_LIMIT` 64 → 512) and raised the per-task chunk token
+budgets and `OVERLAY_ENRICH_MAX_PROVIDER_CALLS` (100 → 512) with them.
+
+The task's original plan settled the cost question with a before/after catalog ingest. **That
+measurement is NOT authorised** (human decision, 2026-08-06: no upload, no `deploy.sh`, no LLM
+spend), so both steps were replaced with offline bounds:
+
+* **The ceiling cannot bind.** `test_deployment_llm_bounds.py::test_the_call_ceiling_cannot_bind_before_the_wall_clock_does`
+  derives the degenerate one-item-per-chunk worst case (237 items × 2 attempts + 8 fallbacks = 482)
+  from the live budget under the manifest's own environment and asserts 512 clears it.
+* **The chunking did not shatter.** `test_enrichment_context_wiring.py::test_the_concept_stage_still_packs_multiple_items_per_chunk_at_the_new_caps`
+  runs the REAL `chunk_items` over items built at a saturated resolved roster and asserts packing is
+  still bound by `max_items` (20/chunk), not by tokens.
+
+**What that does NOT establish.** The true per-stage call count against a real catalog is still
+unobserved. The two tests bound the FAILURE MODE — the ceiling cannot truncate a stage, and packing
+has not collapsed to one item per chunk — without observing the actual number, the actual latency,
+or the actual bill. Do not read them as a verified cost.
+
+**The cost that was accepted, plainly:** 512 physical provider calls per stage is a much larger
+worst-case bill than 100 was, and the ceiling is no longer what stops a runaway —
+`OVERLAY_ENRICH_STAGE_DEADLINE_S` (1800s) is.
+
+**Trigger:** the next authorised ingest of a real catalog. **Closure:** ingest one catalog with the
+enrichment stages on, read the per-stage physical call counts and elapsed times out of the `llm_call`
+audit rows, and record them against the derivation above — confirming it or replacing it.
+
+#### A.50 addendum — `source_attributes` producer caps, and the degenerate fill (2026-08-06, Task 4b review)
+
+The review's Important #1 found that **both** `ftr_adapter` producer caps bound before every
+downstream cap on this field, so Task 4b's raises to `enrich_llm._MAX_SOURCE_ATTRIBUTES` (256) and
+`enrich._MAX_META_LEN` (1000) were **inert on `source_attributes`**, and a 240+ character governance
+value was still being silently cut. Both producer caps were raised in step:
+`_MAX_SOURCE_ATTRIBUTES` 40 → 256 and `_MAX_SOURCE_ATTRIBUTE_LEN` 240 → 1000.
+
+**No residual truncation remains on this field.** Both values are now set exactly to the egress gates
+they feed and neither may go higher: a longer list is egress-REJECTED on count (`_item_shape_ok`), and
+a longer value has the column's whole item EXCLUDED + audited on length (`_item_len_ok` via
+`_max_len_for("source_attributes")` = `_MAX_LEN_DEFAULT`). Exceeding either would trade a silent trim
+for a dropped column.
+
+**What IS newly deferred: the degenerate fill.** Raising the COUNT cap 40 → 256 admits a shape that
+was previously impossible. Measured against the real builders and the real `chunk_items`:
+
+| source-attribute fill | tok/item (`definition`) | packed |
+|---|---|---|
+| 17 × ≤240 (the real FTR export — 17 headers in total) | 9_162 | 8 of 8 |
+| 40 × 240 (the old producer caps) | 10_565 | 8 of 8 |
+| **17 × 1000 (realistic count, new max length)** | **12_392** | **8 of 8** |
+| 256 × 1000 (the new theoretical maximum) | 72_381 | **2 of 8** |
+
+The realistic fill packs a full chunk on every stage, so the raise costs nothing in practice. The
+degenerate fill degrades packing ~4×. That is the *acceptable* failure mode — `chunk_items` never
+drops an item for size, so the stage degrades proportionally into more calls, and the degraded chunk
+count (`ceil(237/2) × 2 + 8 = 246`) still clears the deployed 512 per-stage ceiling. Both rows are
+pinned by tests (`test_a_realistic_source_attribute_fill_still_packs_a_full_chunk`,
+`test_a_DEGENERATE_source_attribute_fill_degrades_proportionally_and_never_truncates`).
+
+**Trigger:** a real mapping export with more than ~40 unmapped governance headers. None has been
+observed; CIB's header count is unmeasurable here because the file is absent. **Closure:** if such a
+file appears, decide whether the count cap should track the observed header count rather than the
+egress ceiling — the length cap should not move.
+
+#### A.50 addendum 2 — a 32_000-char definition is now PRODUCIBLE, which makes the v4 trim reachable on a narrow catalog (2026-08-06)
+
+Two changes closed the inbound half of the zero-truncation work: the definition accept gate and its
+paired schema `maxLength` moved from 500 to `MAX_DEFINITION_LEN` (32_000), and `enrich._bounded`'s
+blanket newline ban was replaced with a targeted `_is_enumeration` guard, so a model may now return a
+paragraphed definition instead of having it discarded whole.
+
+**The consequence to record:** `FEATURE_CONTEXT_BYTE_BUDGET` (1_500_000) ÷ 32_000 ≈ **46 columns** of
+full-length definitions before `_V4_TRIM_ORDER` starts shedding `definition` from the
+feature-generation payload. That shed was always reachable on catalog WIDTH (~1_470 columns at the
+measured ~1_019 bytes/column). It is now also reachable on a NARROW catalog, because 32_000-char
+drafted definitions are producible for the first time — 46 such columns is a small table.
+
+The degradation is graceful and already implemented: `_V4_TRIM_ORDER` sheds prose per-kind, longest
+category first, and a mandatory column is never dropped — a missing grain or time column would
+produce a confidently wrong feature, which is why the trim policy exists. So this is a recorded
+interaction, not a defect.
+
+**No action taken.** Raising the byte budget again to cover it would be premature: no catalog has
+produced even one 32_000-char definition yet, the figure is a ceiling rather than an expectation
+(the widest real definition measured is 960 chars), and the right response depends on whether long
+definitions turn out to be common or pathological.
+
+**Trigger:** the first ingest that produces definitions averaging over ~10_000 chars, or any
+observation of `_V4_TRIM_ORDER` shedding `definition` on a catalog under ~200 columns. **Closure:**
+decide whether the budget should scale with observed definition length, or whether the drafting
+prompt should target a shorter definition, rather than raising a constant against a hypothetical.
+
+---
+
+## A.51–A.57 — "LLM enrichment reaches feature generation" (2026-08-06 → 2026-08-09)
+
+Nineteen tasks against `docs/superpowers/plans/2026-08-06-llm-enrichment-reaches-feature-generation.md`,
+each individually reviewed, then a whole-branch review returning READY WITH FIXES. **The branch's
+working ledger lives under `.superpowers/`, which `.gitignore:8` excludes — so it does not survive
+the merge.** These seven entries are the curated record of what must outlive it. They are not the
+ledger: its per-round narrative, fix-loop bookkeeping and cosmetic minors were left behind
+deliberately.
+
+### A.51 The four binding human decisions, and what has NOT been run (2026-08-09)
+
+Recorded because each closed a question the next author would otherwise re-open from scratch, and
+because two of them are the reason parts of this branch look unfinished.
+
+| # | Decision | The reasoning, so it is not re-litigated |
+|---|---|---|
+| 1 | 🔴 **A live before/after ingest to MEASURE the enrichment call count was REFUSED** (2026-08-06). Task 4b Steps 2 and 8 were rewritten as OFFLINE derivations. | Live LLM spend against a real catalog is a standing approval gate here. The replacement derives the ceiling from the code's own constants (237 items × `max_batch_attempts` 2 + `max_single_fallback` 8 = 482 → ceiling 512) and guards it with a test, and asserts the real `chunk_items` still packs >1 item/chunk at the new caps instead of re-measuring a run. **The true per-stage call count REMAINS UNMEASURED and must never be presented as verified** — A.50 owns that gap. |
+| 2 | 🔴 **The `domain` egress exposure was FIXED, not accepted** (2026-08-07, `c62ab49d`): `domain` moved from identity grade to `_FEATURE_COLUMN_PROSE_KEYS`. | `domain` is uploader text reaching the provider unredacted — a CSV satisfying `is_glossary_csv` but not `is_glossary_mapping` routes to `read_glossary`, which builds `domain=_cell(...)` with NO redaction; it is then persisted as SOURCE evidence, projected to `graph_node.domain`, and emitted by `for_feature_generation`. **The key insight for whoever revisits this:** `redact_free_text`'s `_scan` and `assert_llm_safe`'s `_first_pii` walk the SAME `_PII_PATTERNS`, and NO `IntentRedactor` is registered anywhere in `src/`. So the prose grade buys FAILURE DIRECTION (scrub-and-proceed instead of an `EgressViolation` that kills the whole call), an audit span, and the DI seam — and **no additional detection**. A personal NAME still egresses at either grade. Registering a NER-backed `IntentRedactor` is the change that closes the name-leak class, on both seams. |
+| 3 | 🟡 **Task 2b was ADDED: an author-attested `SchemaValidationError` subclass** carrying a value-free reason that `_safe_reason` prefers. | `analysis/intent.py`'s seven hand-authored validation errors have no `jsonschema` `__cause__`, so `_safe_reason` returned the generic constant for the whole intent flow — including the deliberately actionable "that is a TABLE. `entity_ref` must be a COLUMN" message, written expressly so a second attempt could correct it. The default stays sanitised and every exemption is greppable. The implementer did NOT attest the interpolated text: it authored seven new value-free reasons beside them, dropping the model-supplied `{ref!r}` at every site — that would re-egress where `assert_llm_safe` has already run for the last time, and land verbatim in `llm_call.repair_attempts` / `llm_dispatch.redacted_input`. |
+| 4 | 🔴 **ONE live dry run with the real catalog IS APPROVED — but only after comprehensive observability landed.** The user's words: "have proper logging for everything that will help to find real issues". | This is why Task 9c exists and why it was sequenced immediately before the run. Its deliverable — the exact query answering each question a run raises — is now `docs/runbooks/enrichment-run-reading-guide.md`. |
+
+**🔴 NO LIVE RUN HAS HAPPENED.** Nothing on this branch has been deployed, no catalog has been
+uploaded, and no LLM budget has been spent. Every number in the branch's tests and comments is
+DERIVED from code constants or measured against fixtures — never observed against a provider. The
+single approved live run is the next task after merge. Treat any claim about provider cost, latency
+or call count on this branch as derived until that run happens.
+
+### A.52 🔴 Non-glossary columns have no evidence-ref strategy — and the WARN it causes is permanent (2026-08-07)
+
+*This entry exists because the branch ledger cited "DEFERRED-WORK A.7" for this deferral. A.7 is an
+unrelated 2026-07-27 entry about source-engine assumptions, so the deferral was recorded nowhere
+tracked — while a permanent user-visible warning depends on it.*
+
+On a glossary-LESS upload the drafted synonyms have **ZERO consumers**: `_write_synonym_evidence` is
+gated on the glossary, `_project_semantic_terms` is unreachable, and the same-run summary ride-along
+is `not_applicable` — while `draft_synonyms` runs over EVERY column and pays for every one. The
+stage used to report a clean `succeeded`.
+
+**What Task 4c changed: the LABELLING only.** The stage now reports `partial` /
+`evidence_not_stored` with `{resolved, expected, evidence_skipped}`. No migration (`partial` is
+already in 0996's CHECK list; `reason_code` is unconstrained text — verified against the constraint,
+not against the report).
+
+**The underlying waste is UNFIXED**, and it was the highest-value open item in the plan: giving
+non-glossary columns a ref strategy so their drafted values can be stored at all. The blocker is
+that `field_evidence` keys on the glossary's schema-preserving `logical_ref`, and a technical column
+has none.
+
+**🔴 The user-visible consequence, permanent until this lands:** every glossary-less upload with a
+client configured now shows a standing **"enrichment partial" WARN** (`IngestResultCallout`
+`WARN_STATES`). That is intended honesty — the run really did discard what it drafted — but it is a
+warning a user can neither act on nor clear.
+
+**Scope check for the CIB catalog:** the user's CIB file IS a glossary upload (111 rows, `term_name`
++ `description_business_definition` 111/111 filled), so this does not bite for it. But the mapping
+covers 111 columns while the plan works from a 144-column `BO_CIB_CUSTOMER`, so ~33 columns would
+still lose their synonyms.
+
+**Trigger:** the first technical (non-glossary) upload whose enrichment matters, or the first user
+who asks why every upload warns. **Fix shape:** mint a technical logical_ref that `field_evidence`
+can key on, or gate `draft_synonyms` off where nothing can consume it — the second is cheaper but
+makes the platform quietly less capable rather than visibly incomplete.
+
+### A.53 🔴 The first run after merge re-critiques EVERY identifier column — and `CONCEPT_REGISTRY_VERSION` was deliberately not bumped (2026-08-08)
+
+**The warning.** Task 9b added 102 `is_a` parents to `CONCEPT_REGISTRY` (coverage 52 → 152 of 324;
+zero parents overwritten, no other field changed, namespaces byte-identical, all 324 chains proven
+terminating by a cycle-detecting walk). `concept_critic._registry_fingerprint()` folds `is_a`, so
+the fingerprint MOVES — and it is part of every stored verdict's replay identity.
+
+**The consequence the operator must know before reading the first run's output:** every stored
+identifier verdict re-rolls, non-deterministically, because the verdict comes from a model. And the
+verdicts are not cosmetic — `is_a` rides in the critic's PROMPT, not only its replay hash
+(`CRITIC_RENDERED_KEYS` includes `concept_path`; the critic is scoped to
+`{identifier, monetary, temporal, label}`), and `enrich._apply_concept_critic` applies it:
+
+- `REVISED` → a different concept, therefore a different **namespace**, therefore different **join
+  candidacy**;
+- `REFUTED` → `unclassified`, and the column **LOSES bridge candidacy** entirely.
+
+Nothing shipped is wrong — `concept_critic` names a re-parented `is_a` as a reason to re-critique,
+which is exactly what it is for. But a different feature set on that run is explained HERE, not by
+enrichment coverage. `docs/runbooks/enrichment-run-reading-guide.md` Q1 is the query that separates
+the two, and it must be read before anything else in that run's output.
+
+**The paired decision: `CONCEPT_REGISTRY_VERSION` (`taxonomy/versions.py`, `"concepts@2"`) was NOT
+bumped, and that is deliberate.** It is folded into `planner_input_hash`,
+`PlannerReplayEnvelopeV1`, `shadow_capture`, `live_activation`, and the
+`concept-registry:concepts@2` provenance citation on every attributed label. So registry content
+changed while the tag did not — the critic's content fingerprint says "changed, re-critique" while
+the sealed planner identity says "same registry".
+
+**Why that is right and not an oversight:** nothing outside `concepts.py` and `concept_critic.py`
+reads `is_a`. Planner behaviour is genuinely unaffected, so bumping the version would re-key and
+falsely invalidate every sealed planner artifact for a change none of them can observe.
+`_registry_fingerprint()` moving is the correct and sufficient consequence — it is scoped to exactly
+the consumer that DOES read `is_a`. **Revisit the moment anything outside those two modules starts
+reading `is_a`.** Ancestor-based search expansion is the obvious candidate, and `retrieval.py`
+already *documents* it while not implementing it (it absorbs name/group/entity_link/namespace only).
+At that point the version tag becomes load-bearing and must move.
+
+### A.54 ✅ FIXED 2026-08-09 (was: the concept-critic stage has no call ceiling, no deadline and no `not_attempted`)
+
+**Closed by the readiness wave, ahead of its stated trigger.** The record below deferred the bound
+until the first live run could measure it. That inverted once the run itself became the goal: an
+unbounded loop is what makes the run unsafe to start, so the measurement cannot come first.
+
+`critique_concept_batch` now takes `call_ledger`, `deadline_s`, `now` and `stats`. `enrich_concepts`
+builds ONE `CallLedger` for the concept stage and hands it to BOTH `run_batched` and the critic —
+exactly what `CallLedger`'s own docstring prescribes — and `_drive`, the single dispatch point,
+charges it, so the critique AND the revise call are both counted. Omitting both bounds is the
+historical behaviour byte-for-byte.
+
+**The design decision the record said was owed, made and recorded: FAIL-OPEN.** An item either
+bound skipped resolves through `_not_attempted` to ABSTAINED — the classifier's concept stands
+un-refuted, which is what ABSTAINED already means here ("absence of support is not an eviction").
+Refusing instead would let a budget ceiling strip columns of their concept and therefore of their
+join candidacy, which is far worse than an un-criticised proposal standing. `skipped_reason`
+(`critic_call_ceiling` / `critic_deadline`) is what keeps it honest rather than silent: the run can
+tell "the critic looked and had nothing to say" from "the critic never looked".
+
+**The trap worth carrying:** `_critique_one` ends `REVISED if revised else REFUTED`, so a naive
+bound REFUTES any deterministically-conflicted item whose one revise pass it cannot fund —
+evicting a concept for an accounting reason. Both budget checks return `_not_attempted` BEFORE
+that tail. Pinned by `test_a_budget_STOP_can_never_refute_a_concept`.
+
+The original record follows.
+
+
+`critique_concept_batch` is a plain per-item loop. Unlike every batched enrichment stage it has **no
+call ceiling** (`OVERLAY_ENRICH_MAX_PROVIDER_CALLS` does not reach it), **no stage deadline**, and
+no `not_attempted` accounting — so nothing stops it and nothing records what it skipped. On a
+144-column catalog that is roughly 70–100 sequential provider calls at up to 300s each. By A.53 it
+is also exactly the stage that runs hardest on the first run after merge.
+
+**What was fixed instead (2026-08-09): the MEASUREMENT.** `enrich_concepts` records the critic's own
+start instant and `ingest` passes it as `started_at`, so `ingestion_run_stage` carries a real
+duration instead of a NULL beside a clean `succeeded`; and Q6 of the reading guide gives the
+`llm_call` count-and-span query for `overlay.enrich.concept_critique` /
+`overlay.enrich.concept_revision`. Note `llm_call.latency_ms` is NULL on every enrichment path (no
+call site sets it), so per-call duration is unavailable — the first-to-last span read against the
+stage wall clock is what there is.
+
+**A ceiling was NOT added.** It is a design change, not a cheap fix: the critic's loop has no
+salvage/trim ladder to degrade into, so a bound must decide what an un-criticised identifier
+assignment MEANS (keep the classifier's answer un-refuted? refuse it?) — and keeping it is the
+fail-OPEN direction, which is why the loop has no bound today. **Trigger: the first live run** — its
+measured duration and call count are the input to that decision. **Fix shape:** share the stage's
+`CallLedger` and `deadline_s` with the critic, and give an un-critiqued item an explicit disposition
+rather than silence.
+
+### A.55 🟡 One over-long or unscannable value refuses the WHOLE feature-generation payload (2026-08-09)
+
+Every branch of `sanitize_feature_context`'s classifier loop fails closed to `(None, ...)` for the
+**whole payload**, which the caller turns into a blocked call with no dispatch. So one over-long
+`sub_domain` on one column costs feature generation for all 237. A comment in `enrich_llm.py`
+claimed the opposite ("excludes the column and is audited") — corrected 2026-08-09.
+
+**Direction accepted, opacity fixed.** Refusing is right (the alternative is egressing a value
+nobody scanned), but it used to be silent: a 237-column run returned nothing, with no record of
+which key tripped it, and re-running does not narrow it. Every refusal now routes through
+`_refuse(path, rule)`, which logs the element, the key and a closed rule code — value-free by
+construction. See Q3b of the reading guide.
+
+**✅ The granularity is CLOSED (2026-08-09), and here is the argument it owed.** The line between
+DROP and REFUSE is the one `_ADVISORY_CONTEXT_KEYS` already drew: a value that is CONTEXT ABOUT the
+subject may be dropped — losing it degrades the payload and cannot falsify it, and the model is
+never told the key exists — while a value that IS the subject must refuse. A column's `definition`
+is the meaning the generator reasons from, so `_FEATURE_COLUMN_DEFINITION_KEYS` still refuse the
+whole payload. The prose FACETS beside it (`domain`, `sub_domain`, `bian_path`, `process_path`)
+now drop by key through the same audited `_drop_advisory` seam.
+
+**The safety property is unchanged** — a value that failed its scan still never egresses. Only the
+blast radius moved, from 237 columns to one key. Two pre-existing tests asserted the catastrophic
+scope (`test_redaction_can_grow_a_domain_past_the_structural_bound`,
+`test_an_axis_longer_than_the_structural_bound_refuses_rather_than_truncates`); both were rewritten
+to assert what they were actually protecting — that the offending value does not egress and is
+never clipped — rather than the radius.
+
+### A.56 The four items the whole-branch review recorded rather than fixed (2026-08-09)
+
+| # | Item | Detail, and what acting on it requires |
+|---|---|---|
+| F4 | ✅ **FIXED 2026-08-09 — and it was THREE keys, not one.** The audit this row asked for ("audit the rest of `_column_profile_shape_ok`'s admitted keys against the two prose lists") found `term_type` and `process_path` beside `domain`: all three are emitted by `table_synth._descriptor` from the uploader's sidecar, and `_SCALAR_PROSE_META_KEYS` already graded two of them as prose one namespace up. `_descriptor`'s docstring called them "bounded structural tokens (200 cap)" — that misreading is what let them ride, and a 200-char slice is a length bound, not a safety property. The fix adds a descriptor-local classification (`_COLUMN_PROFILE_{STRUCTURAL,DEFINITION,PROSE}_KEYS`) mirroring the feature seam's `_FEATURE_COLUMN_PROSE_KEYS` precedent, routes every free-text descriptor key through its grade at `column_profiles.<key>`, and adds the D10 fail-closed gate one level down so a future key added to `_COLUMN_PROFILE_KEYS` cannot ride unscanned. **Graded PROSE, not definition, deliberately:** the definition grade's marker gate fails closed on five literal sample-clause phrases and these facets ride EVERY Pass-B item, so definition grade would hand one ordinary uploader sentence ("Values Such As Payments" as a domain label) a kill switch over the whole table's synthesis — the `_ADVISORY_CONTEXT_KEYS` blast radius. Verified by falsification: under definition grade that value blanks to `''`, and a test now holds the line. Original text follows. 🟡 **`domain` is unscanned on the Pass-B `column_profiles` seam** | `_redact_free_text_meta` routes `column_profiles[*].business_definition` through the definition sanitizer, but a profile's `domain` is not in that per-descriptor scan — so the value A.51 #2 moved to prose grade on the feature seam still egresses unredacted on the Pass-B synthesis seam. **It compounds with the zero-truncation raise:** `_MAX_COLUMN_PROFILES` went 64 → 512, so one call carries up to 8× as many unscanned values. **Fix shape:** add `domain` to the per-descriptor prose scan, and audit the rest of `_column_profile_shape_ok`'s admitted keys against the two prose lists. **Trigger:** before Pass B runs on any catalog whose `domain` is uploader-authored — i.e. before the live run, if Pass B is on. |
+| F7 | ✅ **FIXED 2026-08-09.** `SemanticValueV1` gained `proposed_authority`, read from the SAME LLM evidence row `proposed_value` is looked up from (`EvidenceProducer.LLM`) rather than inferred from `entries[0]`; `for_feature_generation` emits it beside `proposed_value`, and `_FEATURE_FACT_SUBKEYS` classifies it (a platform-minted `producer/strength` pair, like `authority`) or the column would fail closed on an unknown subkey. This CHANGES THE PAYLOAD — the trigger the row itself named. Original: 🟡 **`proposed_value` is misattributed on the LLM seam** | `proposed_value` is ALWAYS the LLM's own row, but `semantic_authority[field]` carries the STRONGEST producer for that field — so a model reading the payload can see its own unconfirmed proposal labelled `rulebook/proposed` or `human/confirmed`. Task 9 fixed exactly this shape on the UI (the proposal branch takes its word from the LLM label, and the tooltip names the strongest record AS the strongest record); the LLM seam was left. **Fix shape:** mirror Task 9 — carry the proposal's own producer beside it rather than inferring from the lead. **Trigger:** the first generated feature citing an authority it did not have, or the next feature-context version bump (it changes the payload). |
+| F9 | ✅ **FIXED 2026-08-09.** `_single_fallback` now returns a `BatchItemOutcome` (the same type the batch path produces) instead of `(value, status)` — it was collapsing the acceptor's reason into a bare `FALLBACK_FAILED` one frame before `_fallback` dropped the status too. Both dispositions route through the ONE `_account` seam, so a per-item refusal carries its rule and raw length into `rejects`/`outcomes` and the greppable `enrich_reject` line. **The trap:** `_account` skips `VALID`, but a RESCUED fallback carries `FALLBACK_VALID` — wiring it without teaching `_account` that second success token counts every rescue as a reject, inverting the signal. Pinned by `test_a_RESOLVED_fallback_is_not_counted_as_a_rejection`. Original: 🟡 **`_fallback` discards acceptor reasons** | `enrich_batch._account(res.outcomes)` has ONE call site, in the batch path. `_fallback` calls `_single_fallback`, keeps `value` and drops `status`, so a per-item retry the acceptor refuses appears in neither `rejects` nor `outcomes`. Task 9c's "every rejection is attributable" claim therefore holds for the batch path only. **Fix shape:** account the fallback's status through the same `_account` seam. **Trigger:** any stage showing high `fallback_calls` with unexplained `unresolved` — the reading guide's Q3 flags this as a coverage limit. |
+| F10 | ✅ **FIXED 2026-08-09.** `_SYN_INSTRUCTION` now states the budget, INTERPOLATED from `_MAX_SYNONYMS_LEN` so the two cannot drift, and tells the model to return fewer terms rather than a longer line. **The root cause is a class, not a field:** `schema_projection.PROVIDER_UNSUPPORTED_KEYWORDS` strips `maxLength` from the wire (Anthropic's `json_schema` rejects it) while `validate_output` still checks it on the response — so EVERY schema length bound in `enrich_llm` is invisible to the model that must satisfy it, and the instruction is the only channel left. Pinned by `test_the_prompt_and_the_gate_AGREE_about_LENGTH_not_just_shape`. Original: 🟡 **the ask widened ~5× against a cap the model is never told** | `_SYN_INSTRUCTION` asks for "15 to 20 terms"; `_MAX_SYNONYMS_LEN` is 1000 chars and the paired schema `maxLength` is 1000 — and the instruction never states a length. 20 terms at ~50 chars sits at the cap, and the acceptor's failure is WHOLE-VALUE: the column gets no synonyms at all, not a truncated list. **Fix shape:** state the character budget in the instruction, or accept a prefix of the comma-separated list rather than refusing it. **Trigger:** any run whose `enrich_synonyms` `rejects` shows `over_length`. |
+
+### A.58 The readiness wave — what was fixed to make ingestion testable, and what deliberately was not (2026-08-09)
+
+Goal: make the ingestion workflow safe to run against the real catalog. That REORDERED the ledger —
+several entries here deferred a fix until the first live run could measure it, but an unbounded loop
+and an uninterpretable spend account are precisely what make the run unsafe to start, so the
+measurement cannot come first.
+
+| # | Fixed | Why it blocked a test run |
+|---|---|---|
+| 1 | **[F4]** the Pass-B `column_profiles` egress gap | Pass B is ON (`OVERLAY_TABLE_SYNTH: "1"`), so uploader text egressed unscanned, up to 512 values per call. The audit A.56 asked for found THREE keys, not one. |
+| 2 | **[A.54]** the concept critic is bounded | Unbounded per-item loop, ~70–100 sequential calls at up to 300s, on exactly the stage A.53 says the first run hits hardest. |
+| 3 | **[A.55]** refusal narrowed from payload to key | One over-long facet cost feature generation for all 237 columns. |
+| 4 | **token spend on failures** | `_failed()` hard-coded `cost_metadata={}`, so a run under-counted by exactly its failures — and BOTH arms reported only the LAST attempt, so every retried call under-counted too. A run whose cost cannot be read cannot be evaluated. |
+| 5 | **[F10]** the synonyms length contract | An over-run fails the WHOLE chunk, and the bound is structurally unreachable by the model. |
+| 6 | **[F9]** fallback rejection accounting | `fallback_calls` beside an unexplained `unresolved` is the reading-guide Q3 question, and the fallback path is what a first run exercises most. |
+| 7 | **[F7]** `proposed_value` attribution | The generator reads this seam; a guess wearing another producer's name gets weighted as a fact. |
+| 8 | **`FEATUREGEN_LLM_TIMEOUT` code default** | 60s in code vs 300 in the manifest — the same drift class `DEFAULT_MAX_PROVIDER_CALLS` closed. `.env.example` also documented two stale defaults (60, and 32 for a ceiling that is now 512). |
+
+**✅ `fibo_path` — CLOSED (migration 1058), and the handover was wrong about the size of it.** The
+handover called it "the sole remaining `UNCARRIED_GAPS` entry; one line to close". That counted only
+the `_FEATURE_COLUMN_PROSE_KEYS` grade — the LAST of six steps. `fibo_path` appeared in NO migration,
+NOT in `field_policies` and NOT in `field_resolution`: migration 1051 gave `bian_path`,
+`process_path` and `sub_domain` their display-projection columns and skipped it, so there was
+nothing for the grade to carry.
+
+It was invisible **precisely because its two siblings worked**. All three come from the same FTR
+sidecar and are captured identically as SOURCE `field_evidence` by the glossary reader — evidence
+that had somewhere to land for two of them and nowhere for the third. A field captured, stored, and
+then silently unreachable reads from the outside exactly like a field nobody sent.
+
+Closed as: migration **1058** (`graph_node.fibo_path`), a `_GLOSSARY_TERM` field policy, a
+`field_resolution` projection, the `semantic_context` anchor query + `_DISPLAY_FIELDS` + bundle
+emission, and the prose egress grade. The D7 reservation table was appended **in the same change**
+(the pool note now reads 1059+), which is the coordination step A.22's 1032/1033 double-allocation
+exists to enforce. `UNCARRIED_GAPS` is now EMPTY.
+
+**✅ The budget-fixture blindness — CLOSED, and it cost two re-pins.** `saturated_catalogs` populates
+every added field through its real writer: the projection columns via the same `UPDATE graph_node`
+`resolve_and_project` performs, the source fields via `record_field_evidence` under the FTR glossary
+profile, the LLM proposal via an `llm/proposed` row on `_MEASURE_ANNOTATION` fields, and adjudication
+via `adjudicate_targets`.
+
+| | payload | floor |
+|---|---|---|
+| sparse (`wide_catalogs`) | 268_902 | 223_930 |
+| **saturated** | **405_863** | **360_891** |
+
+Three things this measurement produced that the old one could not:
+
+1. **A trap worth carrying.** The first saturation attempt wrote evidence keyed on
+   `graph_node.object_ref` (public-flattened) instead of the schema-preserving logical ref, and
+   `related_terms` silently stayed at 1/237 — the SAME failure `feature_assist` documents for the
+   adjudication lookup ("the keys would simply never appear and the feature would look
+   implemented"). The coverage assertion in
+   `test_the_saturation_fixture_ACTUALLY_populates_what_it_claims` exists because of it: a
+   saturation fixture that quietly stops saturating is worse than none.
+2. **Two fields stay structurally low, and that is a PRODUCT FACT, not a gap.** Adjudication
+   (`confidence_band` / `concept_alternatives`) is capped at `adjudication_bounds()`'s
+   `max_provider_calls` = 12 columns per run — it is the exception path, so it can never scale with
+   catalog width. Forcing all 237 would have pinned a number production cannot produce. The one
+   honest remaining zero is `relationships`/`outbound_cardinality`, which needs cross-catalog link
+   rows the fixture does not stand up; it is asserted as 0 rather than left unstated.
+3. **The handover's "measured if all populate" figures were BOTH LOW.** It quoted payload 313_197 /
+   floor 268_225; the real saturated pair is 405_863 / 360_891 — 29% and 34% higher. They came from
+   the gitignored `budget-coherence-report.md`, the same provenance that made `171_347` and
+   `203_629` wrong. They are now asserted rather than described.
+
+**Still comfortably safe:** saturated is 27.1% of the 1_500_000 budget, 3.7x under. The rungs on the
+saturated rate are ~876 columns (first shed) and ~985 (refusal) — unreachable on any realistic
+catalog, so the budget remains a runaway backstop rather than a working constraint.
+
+### A.57 Load-bearing deferred minors carried from the 19 tasks (2026-08-09)
+
+The ledger recorded ~40 deferred minors. The cosmetic ones (docstring typos, a testid collision, a
+shadowed import name) were left in the working log deliberately. These are the load-bearing ones —
+each is a claim the code makes that is not quite true, or a guard that does not guard what it says.
+
+**Bounds, budgets and the driver**
+
+- 🔴 **The 2702s worst-case logical call exceeds the 1800s stage deadline, which cannot interrupt an
+  in-flight call.** The deadline is checked only BETWEEN chunks, so a hung chain runs to its own
+  ceiling; worst-case advisory-lock hold ~4502s. The fix is a logical-call deadline inside
+  `drive_structured_call`. **This is the standing concern for the live run.**
+- 🟡 **The concept stage's 400_000-token chunk budget is ~1.4MB of JSON in one provider call**, and
+  `estimate_tokens` is `len(json)//4`, which UNDERSTATES real tokenisation. Nothing bounds a single
+  chunk against the model's context window except that budget.
+- 🟡 `.env.example` and `20-backend.yaml` document the same bounds with DIFFERENT values and
+  formulas, and `test_every_bound_is_DOCUMENTED_in_both_deployment_files` asserts bare substring
+  presence — so the drift it exists to prevent is present and undetected.
+- ⚪ `test_deployment_llm_bounds.py` re-implements `_escalated` by hand rather than driving it, in
+  the one place the codebase claims the number is derived.
+
+**Egress and grading**
+
+- 🟡 **`fibo_path` is one line from the `domain` exposure of A.51 #2** — built unredacted by the same
+  `glossary_reader` branch, and genuinely not emitted on any LLM-facing seam TODAY. The guard is
+  "fail closed, then human judgement", not "correct grade already applied": emitting it without
+  grading it prose re-opens the closed exposure.
+- 🟡 **The Pass-B `shared_metadata` seam has NO per-item redaction** — `assert_llm_safe` RAISES
+  rather than scrubs — and sits outside the replay identity. That is why Pass A and adjudication do
+  NOT see the catalog narrative (Task 7b leverage point (a)); opening that channel needs its own
+  task, and refusing to open it was right.
+- 🟡 **The citable-ref set is computed PRE-redaction**, so an advisory-dropped narrative key stays
+  forgeable (needs the profiles flag on + an authored narrative + a marker failure). The comment
+  claiming it "cannot disagree with what egressed" is false in exactly that case.
+- 🟡 **The unscannable-advisory drop leaves no audit trace** — a log line only, no `sample_audits`
+  entry — contradicting `_drop_advisory`'s "never silent".
+
+**What the model is told, and what it is told about**
+
+- 🟡 **`_grain_block` legitimately returns `{}`** while the grounding clause tells the model to name
+  "whichever of the three" statuses it is — so the model is told to pick one of three and given
+  none, on the free-text field that clause widened to PROTECT the audit trail. One sentence fixes it
+  ("if the block states no status, say so").
+- 🟡 **The grain/as-of vocabulary has no SERVABILITY axis** — a LAPSED human-signed grain still
+  reports `human_confirmed` in both label and grounding entry. Deliberate (the stamp survives by
+  design), but the model cannot tell a live sign-off from an expired one.
+- 🟡 **`confidence_band` and `concept_alternatives` ride with NO producer marker** in
+  `semantic_authority`, so the model cannot tell the shortlist came from an LLM adjudicator.
+- 🟡 **The ~600-byte grounding directive is appended AFTER the `ContextTooLarge` guard** on the
+  recipe path, so it sits outside the measured budget.
+- ⚪ **`_FEATURE_CONTEXT_SCHEMA_VERSION` now moves for an OUTPUT-only change** (Task 6c), so an
+  `llm_call` can stamp 5 for a payload byte-identical to v4.
+
+**Guards that do not guard what they claim**
+
+- 🟡 **Five `test_feature_context_coverage.py` exclusions state a machine-checkable reason the test
+  does not machine-check** (`semantic_type`, `temporal_role`, `leakage_anchor`, `feature_role`,
+  excluded for having no `_DISPLAY_COLUMN` entry). If one later gains one, the exclusion stays and
+  the guard goes silent — the exact leak class that test closes, for five named fields. **The
+  highest-value follow-up on this branch:** one derived assertion closes it.
+- 🟡 **Four more of its exclusions rest on an emitter behind `FEATUREGEN_DATASET_PROFILES`, which
+  defaults OFF** — so in the default config `authority_role` / `temporal_storage_model` /
+  `business_context` reach generation nowhere, while the accounting says they do.
+- 🟡 **Nothing couples `_EXPANSION_INSTRUCTION` to `OBJECTIVE_EXPANSION_VERSION`** — the bump
+  discipline is prose only, while the local precedent (`concept_critic._input_hash` folding the
+  registry fingerprint) does it structurally.
+- 🟡 **`_is_enumeration` needs TWO marker-led lines**, so a single-bullet answer passes as prose;
+  `+`, `>`, markdown headings, multi-line JSON objects and YAML all slip through. Erring loose is
+  deliberate — a false negative caches an ugly but VISIBLE definition; a false positive leaves the
+  column with NO definition and a failure indistinguishable from a provider blip.
+- 🟡 **`table_synth` has `max_items == min_split == 4`**, so its split tier is unreachable; and
+  `budget(short)` never reads `short` (every field is a global env read), so per-stage lowering was
+  never available. The old 4+4 split gave each half a FRESH `max_batch_attempts` at zero fallback
+  cost, so `left_uncached` now arrives earlier on a run with several failing chunks.
+
+**Diagnosis and attribution**
+
+- 🟡 **A timeout and a 400 schema rejection persist a byte-identical failure reason**
+  ("non-retryable provider outcome (non_retryable)"); the only distinguisher is an ephemeral
+  WARNING. A durable sub-reason seam on `_fail` is what it needs — fold into A.49.
+- 🟡 **`llm.py`'s `reason = errors[-1] if errors else ...` can record a STALE reason** when a schema
+  failure is followed by `PROVIDER_INVALID` — now more consequential, since `reason` is the audit
+  record's only remaining description of what went wrong.
+- 🟡 **The SDK-inheritance guard runs in NO automatic job** (`anthropic` lives in the `llm` extra;
+  CI runs `uv sync --extra dev`). A RENAME or REMOVAL of an SDK exception class surfaces as an
+  `AttributeError` escaping `call()` on the failure path. Cheapest hardening: add `anthropic` to
+  whatever extra the live-canary job installs.
+- 🟡 **Per-column match attribution is RECONSTRUCTIBLE but not surfaced** — the objective expansion
+  logs the derived term set and `structured_result` stores it against the subject hash, so "matched
+  on `obligor`, which we derived from your word `counterparty`" is recoverable by intersecting
+  stored terms with `_column_tokens(col)`. Nothing joins them.
+- 🟡 **`taxonomy/recognizer.py` puts a full `str(exc)` into a CALLER-FACING result**, and that
+  validator sits OUTSIDE `drive_structured_call`, so it gets no repair feedback at all. Adjacent to
+  Task 2b, unfixed.
+- ⚪ **Task 2b's repair names the FIELD, not the offending ref.** If the live run shows intent
+  repairs still failing, echoing the ref is the next lever and needs its own decision.
+
+**Pre-existing, found here, not caused here**
+
+- 🔴 **`formula_dispatches_reconciled` appears unconditionally FALSE on the frozen-configuration
+  path.** `freeze_provider_contract` hashes `(role, instruction_sha256, output_schema_sha256)` via
+  JCS; reconciliation recomputes `(call_role, provider, model, prompt_content_hash,
+  schema_content_hash)`. Both were computed for identical inputs and differ. The only e2e test
+  asserting the gate green runs WITHOUT a frozen configuration, and worker tests monkeypatch the
+  gate out. **It is a HARD GATE — it wants its own task.**
+- 🟡 **`ingest._assert_fact` AUTO-CONFIRMS every file-declared grain/as-of** with
+  `authority_basis=source_declared`, so an ordinary upload's declared grain lands on `confirmed`
+  with nobody having reviewed anything. The wire token `confirmed` therefore covers both a human
+  endorsement and an uploader CSV flag, and no prompt anywhere defines the vocabulary — the model
+  reads the English word. `bridge_assessment._human_reviewed` is the surface that can draw the line.
+- 🟡 **The COLUMN's `semantic_terms` renders as a space-joined blob under a single authority chip**
+  in "What the platform resolved", while `ingest` builds that string as glossary term + synonyms +
+  BIAN/FIBO/process paths UNIONED WITH the LLM's terms — one producer named as author of text with
+  two authors. Task 9 fixed the section it introduced; the principle ("index material does not
+  belong here") is enforced only there.
+- 🟡 **The source glossary's own synonyms are persisted NOWHERE but the unsplittable projection**
+  (`enrich.py` excludes them from `field_evidence` by design), so "why is this column findable" is
+  only half-answerable — a user sees the AI's terms, not the ones their own glossary supplied. And
+  `semantic_terms` is absent from `asset_detail._METADATA_FIELDS`, so there is no decision surface
+  and search terms can never wear a confirmed state. **Raised to the human as a PRODUCT concern.**

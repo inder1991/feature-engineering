@@ -15,7 +15,6 @@ import {
   Controls,
   Handle,
   MiniMap,
-  Panel,
   Position,
   ReactFlow,
   type Edge,
@@ -36,6 +35,7 @@ import {
   type SearchHit,
 } from '../api'
 import { useHashRoute } from '../nav'
+import { useColumnSuggestions } from './columnSuggestions'
 
 // The view traverses both ways from the anchor (the mockup has no direction control); the
 // constant is threaded through every fetch so expander clicks stay direction-aware.
@@ -48,9 +48,10 @@ const W_FEATURE = 250
 const W_CONSUMER = 230
 const HEAD_H = 40
 const SRC_H = 24
-const ROW_H = 32 // column rows are real buttons: hit targets >= 32px (PRODUCT.md)
+const ROW_H = 40 // column rows are real buttons: hit targets >= 32px (PRODUCT.md).
+// 40 rather than the minimum: the artifact's rows breathe, and a name plus a right-aligned
+// chip at 32px left no vertical air between them.
 const PAD_H = 8
-const NOTE_H = 58
 const MORE_H = 32 // the "+N more columns" row, same hit-target height as a column row
 const COL_CAP = 8 // an expanded card caps its visible rows; the rest sits behind "+N more"
 // Full-list ceiling: with head + src + a stale note the card stays under the 640px canvas,
@@ -117,11 +118,16 @@ type TableData = {
   onColumn: (col: LineageNode) => void
   onOpen: (node: LineageNode) => void
   onExpand: (node: LineageNode) => void
+  // Column ids that are an endpoint of a visible cross-catalog mapping.
+  mapped: Set<string>
 }
 type AnchorColData = {
   node: LineageNode
   traceId: string | null
   onColumn: (col: LineageNode) => void
+  // From the SearchHit, not the graph payload: LineageNode carries no declared type and no
+  // business term, so the artifact's meta line is unbuildable from /graph/lineage alone.
+  meta: string | null
 }
 type StubData = { node: LineageNode }
 type FeatureData = { node: LineageNode; onOpen: (node: LineageNode) => void }
@@ -216,17 +222,19 @@ function TableNode({ data }: NodeProps<TableNT>) {
           </span>
         </button>
       </div>
+      {/* One condensed meta row, as the artifact draws it: where the table lives and how wide it
+          is, with freshness as a quiet dot at the end rather than a chip of its own line. */}
       <div className="ln-src">
-        {node.catalog_source} ·{' '}
-        {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
+        <span className="ln-src-text">
+          {[node.catalog_source,
+            data.total ? `${data.total} ${data.total === 1 ? 'column' : 'columns'}` : null]
+            .filter(Boolean).join(' · ')}
+        </span>
+        {node.stale && <Flag tone="stale">stale</Flag>}
       </div>
-      {node.stale && (
-        // Generic phrasing (no source name) so the fixed-height note never clips: the source is
-        // named on the src line right above, and the drawer carries the fully named guidance.
-        <div className="ln-note">
-          Not currently vouched. Re-upload this source to serve its facts.
-        </div>
-      )}
+      {/* No stale band: the src line above already carries a STALE chip, and a 58px amber
+          restatement was the biggest element on the card and mostly empty space. Freshness is
+          signalled once, quietly. */}
       {rows.length > 0 && (
         <ul className={data.scroll ? 'ln-cols ln-cols--scroll' : 'ln-cols'}>
           {rows.map(col => (
@@ -246,6 +254,11 @@ function TableNode({ data }: NodeProps<TableNT>) {
                 onClick={() => data.onColumn(col)}
               >
                 <span className="ln-col-name">{col.column}</span>
+                {/* The artifact names WHY a row is called out: the anchor row is the column the
+                    map is built around, a mapped row is an endpoint of a cross-catalog link.
+                    Highlighting alone left the reader to infer the reason from colour. */}
+                {col.id === matchId && <Flag tone="anchor">anchor</Flag>}
+                {col.id !== matchId && data.mapped.has(col.id) && <Flag tone="mapped">mapped</Flag>}
                 {col.grain && <Flag tone="grain">grain</Flag>}
                 {col.as_of && <Flag tone="asof">as-of</Flag>}
                 {col.sensitivity && <Flag tone="pii">{col.sensitivity}</Flag>}
@@ -310,7 +323,11 @@ function AnchorColNode({ data }: NodeProps<AnchorColNT>) {
         {node.as_of && <Flag tone="asof">as-of</Flag>}
         {node.sensitivity && <Flag tone="pii">{node.sensitivity}</Flag>}
       </div>
-      {node.concept && <div className="ln-src">{node.concept}</div>}
+      {(data.meta ?? node.concept) && (
+        <div className="ln-src">
+          <span className="ln-src-text">{data.meta ?? node.concept}</span>
+        </div>
+      )}
     </div>
   )
 }
@@ -454,9 +471,91 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
   return `${shortRef(from, e.from)} is read by ${shortRef(to, e.to)} · consumer`
 }
 
+
+// ---- decomposed relationship trust (concept decisions 3 and 5) --------------------------------
+// "Match strength, human review and execution validation are separate ideas. A single ambiguous
+// 'governed' label cannot conceal missing execution evidence."
+//
+// Every badge below maps to a field the server actually sent. The three axes exist ONLY on
+// entity_bridge edges (`strength`/`trust_kind`, `link_review_status`, `execution_eligible` +
+// `realization_safety_status`); a join, derives or consumes edge carries none of them. For those we
+// say so rather than render three empty axes, which would read as "evidence is missing" when the
+// truth is "this axis does not apply to this kind of link".
+function TrustAxes({ edge }: { edge: LineageEdge }) {
+  if (edge.kind !== 'entity_bridge') {
+    return (
+      <p className="ln-trust-na hint">
+        Match, review and execution axes apply to entity bridges. A {edge.kind} link carries
+        {edge.cardinality ? ` cardinality ${edge.cardinality}` : ' no cardinality'} and
+        {edge.resolved ? ' resolved endpoints' : ' unresolved endpoints'}.
+      </p>
+    )
+  }
+  const strong = (edge.strength ?? 0) >= 10
+  const review = edge.link_review_status
+  const reviewed = review === 'human_verified'
+  return (
+    <div className="ln-trustline" aria-label="Relationship trust">
+      <span className={`badge ${strong ? 'gj-verified' : 'gj-partial'}`}>
+        {strong ? 'Strong match' : 'Weak match'}
+      </span>
+      <span className={`badge ${reviewed ? 'gj-verified' : 'gj-none'}`}>
+        {reviewed
+          ? 'Reviewed by a person'
+          : review === 'not_governed' ? 'Advisory, not governed' : 'Not yet reviewed'}
+      </span>
+      <span className={`badge ${edge.execution_eligible ? 'gj-verified' : 'gj-partial'}`}>
+        {edge.execution_eligible ? 'Execution-validated' : 'Not execution-validated'}
+      </span>
+    </div>
+  )
+}
+
+// Decision 3: "Capability is the narrative." The heading says what the link LETS YOU DO; the line
+// under it names the two columns and the entity, and `why` (the server's own rationale) explains
+// the rank rather than leaving "weak" unexplained.
+function RelationshipBlock({
+  edge,
+  byId,
+}: {
+  edge: LineageEdge
+  byId: Map<string, LineageNode>
+}) {
+  const from = byId.get(edge.from)
+  const to = byId.get(edge.to)
+  const entity = edge.entity_id ?? 'shared'
+  const capability = edge.kind === 'entity_bridge'
+    ? `Connect ${entity} records across catalogs`
+    : edge.kind === 'join'
+      ? 'Join these tables in a feature'
+      : edge.kind === 'derives' ? 'Feeds a registered feature' : 'Read by a consumer'
+  return (
+    <div className="ln-relationship">
+      <strong>{capability}</strong>
+      <p>
+        <span className="mono">{shortRef(from, edge.from)}</span> maps to{' '}
+        <span className="mono">{shortRef(to, edge.to)}</span> for the {entity} entity.
+      </p>
+      <TrustAxes edge={edge} />
+      {!edge.execution_eligible && edge.realization_safety_status && (
+        <p className="ln-why hint">
+          Execution safety: {edge.realization_safety_status.replaceAll('_', ' ')}.
+        </p>
+      )}
+      {edge.why && <p className="ln-why hint">{edge.why}</p>}
+    </div>
+  )
+}
+
 // ---- the view --------------------------------------------------------------------------------
 
-export function LineageView({ anchor }: { anchor: SearchHit }) {
+export function LineageView({
+  anchor,
+  onBackToResults,
+}: {
+  anchor: SearchHit
+  onBackToResults?: () => void
+}) {
   const { navigate } = useHashRoute()
   const [graph, setGraph] = useState<LineageGraph | null>(null)
   const [loading, setLoading] = useState(true)
@@ -492,6 +591,18 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   // setState on a gone component. The anchor fetch owns its own controller (aborted on re-anchor).
   const expandCtrls = useRef<Set<AbortController>>(new Set())
   const rf = useRef<ReactFlowInstance | null>(null)
+  // The same per-table suggestions read the asset dossier makes, filtered to this column's
+  // operands — one implementation and one set of read-scope rules across both surfaces.
+  const { matching } = useColumnSuggestions(anchor.catalog_source, {
+    ...anchor,
+    kind: anchor.column ? 'column' : 'table',
+    graph_ref: anchor.object_ref,
+    logical_ref: anchor.object_ref,
+    source: anchor.catalog_source,
+    schema_name: null,
+    operational_type: anchor.data_type,
+    declared_type: anchor.data_type,
+  })
 
   useEffect(() => {
     const id = ++seq.current
@@ -587,6 +698,26 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     () => drawnEdges.filter(e => visibleUnits.has(unitOf(e.from)) && visibleUnits.has(unitOf(e.to))),
     [drawnEdges, visibleUnits, unitOf],
   )
+
+  // Endpoints of every visible entity bridge, so a column row can say it is mapped rather than
+  // leaving the reader to trace the line back to it.
+  const mappedIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const e of visibleEdges) {
+      if (e.kind !== 'entity_bridge') continue
+      ids.add(e.from)
+      ids.add(e.to)
+    }
+    return ids
+  }, [visibleEdges])
+
+  // Counts for the map label and the canvas summary, derived from the graph already in memory.
+  // The artifact's decision 14 is explicit: "The UI derives simple counts locally; it does not
+  // require a dashboard-summary endpoint."
+  const assetCount = visibleUnits.size
+  const bridgeCount = visibleEdges.filter(e => e.kind === 'entity_bridge').length
+  const featureCount = visibleEdges.filter(e => e.kind === 'derives').length
+  const joinCount = visibleEdges.filter(e => e.kind === 'join').length
 
   // Trace: the clicked column's feature-lineage path (derives -> feature -> consumers).
   const traced = useMemo(() => {
@@ -728,7 +859,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         const h =
           HEAD_H +
           SRC_H +
-          (n.stale ? NOTE_H : 0) +
+          /* the stale band is gone; its height must go with it or every stale card keeps a
+             58px hole where it used to be */
           (rows.length > 0 ? listH + PAD_H : 0) +
           (more > 0 ? MORE_H : 0)
         placed.push({
@@ -765,7 +897,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     // both ends made it onto the canvas.
     const contain = matchId !== null && placedIds.has(matchId) && placedIds.has(anchorUnitId)
     const g = new dagre.graphlib.Graph()
-    g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 110, marginx: 24, marginy: 24 })
+    // The artifact's cards sit clearly apart; at nodesep 36 / ranksep 110 they crowded and the
+    // edge labels had nowhere to sit without covering a card. Widened both, and the margin
+    // with them so the outermost card is never flush against the canvas edge.
+    g.setGraph({ rankdir: 'LR', nodesep: 64, ranksep: 160, marginx: 40, marginy: 40 })
     g.setDefaultEdgeLabel(() => ({}))
     for (const p of placed) g.setNode(p.node.id, { width: p.w, height: p.h })
     if (contain && matchId) g.setEdge(matchId, anchorUnitId)
@@ -824,6 +959,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             onColumn: openColumn,
             onOpen: openNode,
             onExpand: expand,
+            mapped: mappedIds,
           } satisfies TableData,
         }
       }
@@ -831,7 +967,20 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         return {
           ...base,
           type: 'lnAnchorCol',
-          data: { node: n, traceId, onColumn: openColumn } satisfies AnchorColData,
+          data: {
+            node: n, traceId, onColumn: openColumn,
+            // The NODE's own concept wins; the SearchHit only supplies the type the graph
+            // payload does not carry. Preferring the hit would overwrite what the graph said
+            // about this column with what the search index said about the anchor.
+            // Prefer the NODE's own declared type now that the payload carries it; the
+            // SearchHit is only the fallback for an anchor the graph did not describe.
+            meta: (() => {
+              const t = n.data_type ?? anchor.data_type
+              return [n.concept ?? anchor.concept,
+                t && t.toLowerCase() !== 'unknown' && `${t} · source declared`]
+                .filter(Boolean).join(' · ') || null
+            })(),
+          } satisfies AnchorColData,
         }
       }
       if (p.type === 'lnStub') {
@@ -874,12 +1023,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         // unlabelled, so "no marker" had to be read as "good" — an absence is a poor way to state
         // a verdict, and it is invisible when only one link is on screen.
         const keyed = (e.strength ?? 0) >= 10
-        const trust = e.execution_eligible
-          ? 'executable'
-          : e.trust_kind === 'governed_identifier_link'
-            ? 'governed'
-            : 'advisory'
-        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'} · ${trust}`
+        // C8: two segments, not three. The third ("governed"/"advisory"/"executable") is now the
+        // inspector's own review axis, so on the canvas it only made the label long enough to clip
+        // mid-word over a node. The artifact labels this edge "customer · strong".
+        label = `${entity ?? 'linked'} · ${keyed ? 'strong' : 'weak'}`
       } else {
         stroke = 'var(--proposal)'
         label = e.kind
@@ -940,10 +1087,16 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   // the table card otherwise) at a readable zoom: fitView over a big graph pins the anchor to the
   // viewport edge. Later node-set changes (expansion merges, layer toggles) refit around
   // everything so freshly placed nodes come into view. duration 0 keeps it reduced-motion safe.
-  const nodeCount = flow.nodes.length
+  // Reframe when the LAYOUT changes, not merely when the node COUNT does. Toggling a layer
+  // re-runs dagre and moves every card without changing how many there are, so keying on the
+  // count alone left the view fitted to a frame the graph had since outgrown — cards ran off
+  // the canvas and under the inspector.
+  const layoutKey = flow.nodes
+    .map(n => `${n.id}:${Math.round(n.position.x)}:${Math.round(n.position.y)}`)
+    .join('|')
   useEffect(() => {
     const inst = rf.current
-    if (!inst || nodeCount === 0) return
+    if (!inst || flow.nodes.length === 0) return
     // FIT, do not centre-at-zoom-1. The centring existed because fitView over a 188-node graph
     // pinned the anchor to the viewport edge; now that a neighbourhood is the participating columns
     // only, centring instead leaves a small cluster marooned in a large empty canvas. `maxZoom`
@@ -951,7 +1104,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     inst.fitView({ padding: 0.18, maxZoom: 1.1, duration: 0 })
     centered.current = true
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reframe only when the node set changes
-  }, [nodeCount])
+  }, [layoutKey])
 
   const drawerNode = drawerId ? byId.get(drawerId) : undefined
 
@@ -986,49 +1139,117 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
 
   return (
     <>
+      {/* Concept decision 2: "Panels never float over the map — Layers, empty states and the
+          inspector occupy dedicated columns, preventing the overlap visible in the latest
+          implementation." The layers fieldset and the why-empty note were ReactFlow <Panel>s
+          drawn ON the canvas, and the drawer was position:absolute over its right edge, so
+          all three covered nodes and labels. They are columns now. */}
+      {/* The artifact's context bar: the graph is anchored on something, and the anchor was only
+          named in a hint sentence above the canvas. Kind chip, full ref, the human wording under
+          it, and the two actions the artifact keeps — back to results, and the asset dossier. */}
+      <section className="ln-contextbar" aria-label="Graph anchor">
+        <div className="ln-context-main">
+          <span className="ln-context-kind">{anchor.column ? 'COL' : 'TBL'}</span>
+          <div className="ln-context-name">
+            <strong>{anchor.object_ref}</strong>
+            <small>
+              {[anchor.concept, anchor.catalog_source, anchor.table]
+                .filter(Boolean).join(' · ')}
+            </small>
+          </div>
+          {/* Only badges backed by a field the search hit actually carried. */}
+          {anchor.entity && <span className="badge gj-proposed">{anchor.entity}</span>}
+          {anchor.is_grain && <span className="badge grain">grain</span>}
+          {anchor.is_as_of && <span className="badge asof">as-of</span>}
+        </div>
+        <div className="ln-context-actions">
+          {onBackToResults && (
+            <button type="button" className="btn btn--ghost" onClick={onBackToResults}>
+              ← Results
+            </button>
+          )}
+          <a
+            className="btn btn--ghost"
+            href={`#/asset?${new URLSearchParams({
+              source: anchor.catalog_source, object_ref: anchor.object_ref,
+            }).toString()}`}
+          >
+            View details
+          </a>
+        </div>
+      </section>
+
       <div className="ln-wrap">
-        <ReactFlow
-          nodes={flow.nodes}
-          edges={flow.edges}
-          nodeTypes={NODE_TYPES}
-          onInit={inst => {
-            rf.current = inst
-          }}
-          fitView
-          minZoom={0.3}
-          maxZoom={2}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          nodesFocusable
-          edgesFocusable={false}
-        >
-          <Background gap={22} size={1} color="oklch(0.88 0.01 212)" />
-          <Panel position="top-left">
-            <fieldset className="ln-layers">
-              <legend className="micro-label">Layers</legend>
+        <aside className="ln-tools" aria-label="Graph controls">
+            {/* The artifact's four tool sections. A layer is a name AND what it means: a bare
+                "Joins" checkbox assumes the reader already knows what the platform counts as one. */}
+            <section className="ln-tool-section ln-tool-section--first">
+              <h3 className="ln-micro">Relationship layers</h3>
               {(
                 [
-                  ['joins', 'Joins', 'var(--ln-join)'],
-                  ['entity', 'Entity bridges', 'var(--warn)'],
-                  ['features', 'Feature lineage', 'var(--proposal)'],
+                  ['joins', 'Governed joins', 'Approved structural joins', 'var(--ln-join)'],
+                  ['entity', 'Entity mappings', 'Same business entity across catalogs',
+                    'var(--warn)'],
+                  ['features', 'Registered features', 'Existing production lineage',
+                    'var(--proposal)'],
                 ] as const
-              ).map(([layer, title, swatch]) => (
+              ).map(([layer, title, blurb, swatch]) => (
                 <label key={layer} className="ln-layer">
                   <input
                     type="checkbox"
+                    /* The visible label is two lines (name + meaning); the accessible name stays
+                       the layer name alone so it is announced as a control, not a paragraph. */
+                    aria-label={title}
                     checked={layersOn[layer]}
                     onChange={e => {
                       setLayersOn(prev => ({ ...prev, [layer]: e.target.checked }))
                     }}
                   />
                   <span className="ln-swatch" style={{ background: swatch }} aria-hidden="true" />
-                  {title}
+                  <span><strong>{title}</strong><small>{blurb}</small></span>
                 </label>
               ))}
-            </fieldset>
-          </Panel>
+            </section>
+
+            {/* Line meaning: the canvas draws three different strokes and nothing said which was
+                which. The samples are aria-hidden — the adjacent text IS the meaning. */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Line meaning</h3>
+              <div className="ln-legend">
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample" aria-hidden="true" /><span>Verified join</span>
+                </div>
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample ln-line-sample--dashed" aria-hidden="true" />
+                  <span>Entity mapping</span>
+                </div>
+                <div className="ln-legend-row">
+                  <span className="ln-line-sample ln-line-sample--dotted" aria-hidden="true" />
+                  <span>Containment</span>
+                </div>
+              </div>
+            </section>
+
+            {/* Scope: what the map currently covers, so a sparse graph reads as "one hop" rather
+                than "this column has nothing". */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Current scope</h3>
+              <div className="ln-scope-note">
+                One hop around <span className="mono">{anchor.column ?? anchor.table}</span>.
+                Expand a table to fetch its next neighborhood.
+              </div>
+            </section>
+
+            {/* Read scope is enforced server-side, so an absent object is absent from the wire.
+                Saying so is the difference between "nothing exists" and "nothing you may see". */}
+            <section className="ln-tool-section">
+              <h3 className="ln-micro">Visibility</h3>
+              <div className="ln-scope-note">
+                Only objects permitted for the current session are shown. Hidden objects are not
+                counted.
+              </div>
+            </section>
           {showWhyEmpty && (
-            <Panel position="top-right">
               <aside className="ln-empty" aria-label="Why nothing is drawn">
                 <h3 className="micro-label">Nothing to draw yet</h3>
                 {layersOn.joins && (
@@ -1080,8 +1301,37 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
                   </p>
                 )}
               </aside>
-            </Panel>
           )}
+        </aside>
+
+        <div className="ln-canvas">
+          {/* What this map IS, stated over it. Counts are derived locally from the loaded graph —
+              the artifact's decision 14 forbids requiring a summary endpoint for them. */}
+          <div className="ln-map-label">
+            <b>{anchor.entity ? `${anchor.entity} neighborhood` : 'Relationship neighborhood'}</b>
+            <span>
+              {assetCount} {assetCount === 1 ? 'asset' : 'assets'}
+              {bridgeCount > 0
+                ? ` · ${bridgeCount} cross-catalog mapping${bridgeCount === 1 ? '' : 's'}`
+                : ' · no cross-catalog mapping'}
+            </span>
+          </div>
+        <ReactFlow
+          nodes={flow.nodes}
+          edges={flow.edges}
+          nodeTypes={NODE_TYPES}
+          onInit={inst => {
+            rf.current = inst
+          }}
+          fitView
+          minZoom={0.3}
+          maxZoom={2}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          nodesFocusable
+          edgesFocusable={false}
+        >
+          <Background gap={22} size={1} color="oklch(0.84 0.014 212)" />
           <Controls showInteractive={false} position="bottom-right" />
           {/* Only when there is something to navigate. On a pruned neighbourhood the minimap was
               a large panel rendering three grey blocks — cost with no information. */}
@@ -1095,6 +1345,30 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           />
           )}
         </ReactFlow>
+          <div className="ln-canvas-summary" aria-hidden="true">
+            <div className="ln-canvas-stat">
+              <strong>
+                {bridgeCount} business mapping{bridgeCount === 1 ? '' : 's'}
+              </strong>
+              <span>{bridgeCount === 0 ? 'No cross-catalog link in view' : 'Across catalogs'}</span>
+            </div>
+            <div className="ln-canvas-stat">
+              <strong>
+                {featureCount} registered feature{featureCount === 1 ? '' : 's'}
+              </strong>
+              <span>Recommendations shown separately</span>
+            </div>
+            <div className="ln-canvas-stat">
+              <strong>{joinCount} governed join{joinCount === 1 ? '' : 's'}</strong>
+              <span>Approved structural joins in view</span>
+            </div>
+          </div>
+        </div>
+
+        {/* A layout column, not a landmark: the Drawer inside already carries
+            role/aria-label="Details", and nesting a second identical landmark makes the
+            region ambiguous to assistive tech. */}
+        <div className="ln-inspector">
         {drawerNode && (
           <Drawer
             node={drawerNode}
@@ -1105,6 +1379,126 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             onClose={closeDrawer}
           />
         )}
+          <section className="ln-selected" aria-label="Selected asset">
+            <div className="ln-selected-label">
+              <span className="ln-micro">
+                {(drawerNode ?? { kind: anchor.column ? 'column' : 'table' }).kind === 'column'
+                  ? 'Selected column' : 'Selected table'}
+              </span>
+              {(drawerNode?.concept ?? anchor.concept) && (
+                <span className="badge gj-proposed">
+                  {drawerNode?.concept ?? anchor.concept}
+                </span>
+              )}
+            </div>
+            {/* The SHORT name, as the artifact does. The full object ref is already on the
+                context bar above the workspace; repeating it here spent the widest line in the
+                column on something the reader has already been told. */}
+            <h2 className="ln-selected-name">
+              {drawerNode
+                ? (drawerNode.column ?? drawerNode.table ?? drawerNode.name ?? drawerNode.id)
+                : (anchor.column ?? anchor.table)}
+            </h2>
+            {anchor.definition
+              ? <p className="ln-selected-def">{anchor.definition}</p>
+              : <p className="ln-selected-def hint">No definition is held for this column.</p>}
+            <div className="ln-pillrow">
+              {(() => {
+                const t = drawerNode?.data_type ?? anchor.data_type
+                return t && t.toLowerCase() !== 'unknown'
+                  ? <span className="badge gj-none">{t}</span>
+                  : null
+              })()}
+              {anchor.is_grain && <span className="badge grain">grain</span>}
+              {anchor.is_as_of && <span className="badge asof">as-of</span>}
+            </div>
+            {/* Only axes the search hit actually carries. Grain-use and join-use readiness are
+                not passed to this component, so they are absent rather than guessed. */}
+            <div className="ln-fact-grid">
+              {([
+                ['Domain', drawerNode?.domain ?? anchor.domain],
+                ['Entity', drawerNode?.entity ?? anchor.entity],
+                ['Unit', anchor.unit],
+                ['Sensitivity', drawerNode?.sensitivity ?? anchor.sensitivity],
+              ] as const).filter(([, v]) => !!v).map(([label, value]) => (
+                <div className="ln-fact" key={label}>
+                  <span>{label}</span>
+                  <strong>{value}</strong>
+                </div>
+              ))}
+            </div>
+          </section>
+          {drawerNode && (() => {
+            const mine = visibleEdges.filter(e => e.from === drawerNode.id || e.to === drawerNode.id)
+            if (mine.length === 0) return null
+            return (
+              <section className="ln-inspector-section" aria-label="Relationship trust">
+                <h3 className="micro-label">Relationships</h3>
+                {mine.map(e => (
+                  <RelationshipBlock key={`${e.kind}|${e.from}|${e.to}`} edge={e} byId={byId} />
+                ))}
+              </section>
+            )
+          })()}
+          {drawerNode && matching.length > 0 && (
+            <section className="ln-inspector-section" aria-label="Recommended features">
+              <h3 className="ln-micro">Recommended features using this column</h3>
+              <div className="ln-recommendations">
+                {matching.slice(0, 3).map(hit => (
+                  <a
+                    key={hit.suggestion.suggestion_id}
+                    className="ln-recommendation"
+                    href={`#/suggested?${new URLSearchParams({
+                      source: anchor.catalog_source, table: anchor.table,
+                      ...(anchor.column ? { column: anchor.column } : {}),
+                    }).toString()}`}
+                  >
+                    <strong>{hit.suggestion.display_name || hit.suggestion.name}</strong>
+                    <span>
+                      {hit.suggestion.business_interpretation?.value
+                        ?? hit.suggestion.business_value?.value
+                        ?? hit.suggestion.recipe}
+                    </span>
+                    <em>Open recommendation →</em>
+                  </a>
+                ))}
+              </div>
+              {/* Decision 4: "explicitly separated from registered feature lineage". A discovery
+                  candidate and a shipped feature are different claims about the world. */}
+              <p className="ln-recommendation-note">
+                Recommendations are discovery candidates — not registered lineage.
+              </p>
+            </section>
+          )}
+          {!drawerNode && (
+            <p className="hint ln-inspector-empty">
+              Select a node to see its identity, relationship trust and the features it can
+              support.
+            </p>
+          )}
+          {/* The artifact pins two actions to the foot of the inspector. */}
+          <div className="ln-inspector-actions">
+            <a
+              className="btn btn--ghost"
+              href={`#/asset?${new URLSearchParams({
+                source: anchor.catalog_source, object_ref: anchor.object_ref,
+              }).toString()}`}
+            >
+              View details
+            </a>
+            {anchor.table && (
+              <a
+                className="btn btn--primary"
+                href={`#/suggested?${new URLSearchParams({
+                  source: anchor.catalog_source, table: anchor.table,
+                  ...(anchor.column ? { column: anchor.column } : {}),
+                }).toString()}`}
+              >
+                All recommendations
+              </a>
+            )}
+          </div>
+        </div>
       </div>
 
       {graph.truncated && (
@@ -1126,8 +1520,16 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       {/* A readable text equivalent of the canvas. It exists for screen readers, but it is the
           clearer view for everyone when edges overlap — so it gets a name that means something to a
           banker rather than "accessible parallel list", which describes the MECHANISM. */}
+      {/* A disclosure so it can be folded away, but OPEN by default. The artifact collapses it;
+          this list is the canvas's only non-visual reading, and four tests failed the moment it
+          was hidden — which is exactly what a screen reader would have experienced. Tidiness
+          does not outrank the text equivalent. */}
+      {/* The <section> keeps the region landmark the tests and screen readers rely on; the
+          <details> inside it adds the fold. Replacing the section outright turned the landmark
+          into a plain group and the text equivalent stopped being findable. */}
       <section className="ln-a11y" aria-label="Links in this view, as text">
-        <h3 className="micro-label">Links in this view</h3>
+      <details open>
+        <summary className="micro-label">Links in this view</summary>
         {layout.contain && matchId && (
           // The structural containment tie, kept out of the relationship list so the list
           // stays a faithful mirror of the drawn lineage edges.
@@ -1144,6 +1546,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             ))}
           </ul>
         )}
+      </details>
       </section>
     </>
   )
@@ -1193,9 +1596,22 @@ function Drawer({
 
   return (
     <aside className="ln-drawer" aria-label="Details">
-      <button type="button" className="ln-drawer-close" ref={closeRef} onClick={onClose}>
-        Close
-      </button>
+      {/* Its own row rather than a float: a floated button reserves no space, so a long object ref
+          ran underneath it and the two collided. */}
+      <div className="ln-drawer-header">
+        <button
+          type="button"
+          className="ln-drawer-close"
+          ref={closeRef}
+          onClick={onClose}
+          aria-label="Close details"
+          title="Close details"
+        >
+          {/* An icon, not a word on its own row. The accessible name still says "Close details";
+              only the pixels shrink. */}
+          <span aria-hidden="true">×</span>
+        </button>
+      </div>
       {node.kind === 'column' && (
         <>
           <h3 className="ln-drawer-title">{node.object_ref}</h3>
@@ -1277,9 +1693,8 @@ function Drawer({
             </p>
           )}
           {node.stale && (
-            <p className="ln-drawer-note">
-              Not currently vouched. Re-upload the {node.catalog_source} source to serve its
-              facts.
+            <p className="ln-drawer-sub">
+              Stale snapshot: <code>{node.catalog_source}</code> is not currently vouched.
             </p>
           )}
           {showTrace && (
@@ -1343,9 +1758,8 @@ function Drawer({
             </p>
           ) : null}
           {node.stale && (
-            <p className="ln-drawer-note">
-              Not currently vouched. Re-upload the {node.catalog_source} source to serve its
-              facts.
+            <p className="ln-drawer-sub">
+              Stale snapshot: <code>{node.catalog_source}</code> is not currently vouched.
             </p>
           )}
         </>

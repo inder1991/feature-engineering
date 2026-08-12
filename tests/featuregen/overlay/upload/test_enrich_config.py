@@ -14,9 +14,18 @@ from featuregen.overlay.upload import enrich_config
 
 def test_conservative_default_ceilings():
     assert enrich_config._DEFAULT_MAX_ITEMS == {
-        "concept": 20, "definition": 8, "domain": 8, "synonyms": 8, "unit": 8,
+        "concept": 20,
+        # `definition` LOWERED 8 -> 4 (2026-08-06). Not a contamination re-tune: it is the only
+        # stage whose OUTPUT can approach the response ceiling, because `MAX_DEFINITION_LEN` is
+        # 32_000 chars (~8_000 output tokens). At 8 a full-length chunk needs ~64_000 tokens, which
+        # is EXACTLY `llm._MAX_TOKENS_CEILING` — unservable even after the single truncation
+        # escalation. See `test_enrich_output_bounds.py` for the asserted arithmetic.
+        "definition": 4,
+        "domain": 8, "synonyms": 8, "unit": 8,
         # `summary` runs over EVERY column, so it is the widest fan-out of any task — it sits at the
         # prose-task ceiling rather than above it, keeping cross-item contamination equally bounded.
+        # It KEEPS 8: its accept bound is 1000 chars (~250 output tokens), so a full chunk is ~2_000
+        # — it does not have `definition`'s response-ceiling problem.
         "summary": 8,
         "table_synth": 4}
 

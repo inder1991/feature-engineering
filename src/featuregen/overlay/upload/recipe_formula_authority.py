@@ -1,6 +1,7 @@
 """Fail-closed authority envelope for one recipe-backed formula shadow item."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,12 +53,19 @@ def build_formula_authority_envelope(
     *,
     context,
     expectation,
+    required_economic_roles: Mapping[str, str] | None = None,
 ) -> FormulaAuthorityEnvelopeV1 | FormulaAuthorityRejection:
     """Verify exact recipe roles against raw authoritative concept evidence and grain facts.
 
     The graph's display concept remains only a discovery hint. Every formula-bearing role must
     resolve through the planner-specific concept authority reader and equal the recipe-authored
     expected concept. Every output grain key must additionally carry a current VERIFIED grain fact.
+
+    ``required_economic_roles`` (BR-5, additive — every legacy caller passes nothing and is
+    byte-identical): ``logical_ref -> economic_role`` demands the SAME governed evidence the V2
+    binding policy reads (`recipe_operand_policy.governed_economic_role`) — a concept-compatible
+    column with no human-confirmed economic role REJECTS with ``ECONOMIC_ROLE_UNPROVEN``. One
+    verdict source for the formula path and the suggestion path, by construction.
     """
     by_ref = {binding.logical_ref: binding for binding in context.need_bindings}
     required_refs = {
@@ -94,6 +102,19 @@ def build_formula_authority_envelope(
                 logical_ref=logical_ref,
                 role=source_binding.role,
             )
+        required_role = (required_economic_roles or {}).get(logical_ref)
+        if required_role:
+            from featuregen.overlay.field_evidence import read_active_field_evidence
+            rows = read_active_field_evidence(conn, logical_ref, "economic_role")
+            confirmed = [r for r in rows
+                         if r.producer == "human" and r.strength == "confirmed"]
+            governed = str(confirmed[-1].proposed_value) if confirmed else None
+            if governed != required_role:
+                return FormulaAuthorityRejection(
+                    "ECONOMIC_ROLE_UNPROVEN",
+                    logical_ref=logical_ref,
+                    role=source_binding.role,
+                )
         bindings.append({
             "role": source_binding.role,
             "logical_ref": logical_ref,

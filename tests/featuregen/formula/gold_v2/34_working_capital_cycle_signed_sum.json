@@ -1,0 +1,104 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"final_operation\":\"signed_sum\",\"terms\":[{\"expr\":{\"aggregation\":\"date_diff_avg\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.wc.ar_paid_dt\",\"second_operand\":\"authored::public.wc.ar_invoice_dt\",\"source_relation\":{\"table_ref\":\"authored::public.wc\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.wc.event_dt\",\"length\":365,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"name\":\"dso\",\"sign\":1},{\"expr\":{\"aggregation\":\"date_diff_avg\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.wc.inv_sold_dt\",\"second_operand\":\"authored::public.wc.inv_received_dt\",\"source_relation\":{\"table_ref\":\"authored::public.wc\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.wc.event_dt\",\"length\":365,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"name\":\"dio\",\"sign\":1},{\"expr\":{\"aggregation\":\"date_diff_avg\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.wc.ap_paid_dt\",\"second_operand\":\"authored::public.wc.ap_invoice_dt\",\"source_relation\":{\"table_ref\":\"authored::public.wc\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.wc.event_dt\",\"length\":365,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"name\":\"dpo\",\"sign\":-1}]},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"obligor\",\"keys\":[\"authored::public.wc.obligor_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "working_capital_cycle_signed_sum",
+  "expected": "ok",
+  "expected_proposal_hash": "9cff4de050b355bfab0fd3e72008c9a8b675238f90788c9e7483db20adc6b2ae",
+  "note": "the multi-expression MINIMUM: a signed sum of named terms \u2014 DSO + DIO \u2212 DPO, the working-capital cycle (BR-16/BR-20 shape). \u00b11 only: weights are not a thing this combiner does, and anything richer stays honestly unsupported",
+  "operation": "signed_sum",
+  "proposal": {
+    "body": {
+      "final_operation": "signed_sum",
+      "terms": [
+        {
+          "expr": {
+            "aggregation": "date_diff_avg",
+            "filter": null,
+            "operand": "authored::public.wc.ar_paid_dt",
+            "second_operand": "authored::public.wc.ar_invoice_dt",
+            "source_relation": {
+              "table_ref": "authored::public.wc"
+            },
+            "window": {
+              "basis": "trailing",
+              "empty_window": "null",
+              "end_inclusive": "exclusive",
+              "event_time_ref": "authored::public.wc.event_dt",
+              "length": 365,
+              "null_input": "ignore",
+              "start_inclusive": "inclusive",
+              "timezone": "Asia/Dubai",
+              "unit": "day"
+            }
+          },
+          "name": "dso",
+          "sign": 1
+        },
+        {
+          "expr": {
+            "aggregation": "date_diff_avg",
+            "filter": null,
+            "operand": "authored::public.wc.inv_sold_dt",
+            "second_operand": "authored::public.wc.inv_received_dt",
+            "source_relation": {
+              "table_ref": "authored::public.wc"
+            },
+            "window": {
+              "basis": "trailing",
+              "empty_window": "null",
+              "end_inclusive": "exclusive",
+              "event_time_ref": "authored::public.wc.event_dt",
+              "length": 365,
+              "null_input": "ignore",
+              "start_inclusive": "inclusive",
+              "timezone": "Asia/Dubai",
+              "unit": "day"
+            }
+          },
+          "name": "dio",
+          "sign": 1
+        },
+        {
+          "expr": {
+            "aggregation": "date_diff_avg",
+            "filter": null,
+            "operand": "authored::public.wc.ap_paid_dt",
+            "second_operand": "authored::public.wc.ap_invoice_dt",
+            "source_relation": {
+              "table_ref": "authored::public.wc"
+            },
+            "window": {
+              "basis": "trailing",
+              "empty_window": "null",
+              "end_inclusive": "exclusive",
+              "event_time_ref": "authored::public.wc.event_dt",
+              "length": 365,
+              "null_input": "ignore",
+              "start_inclusive": "inclusive",
+              "timezone": "Asia/Dubai",
+              "unit": "day"
+            }
+          },
+          "name": "dpo",
+          "sign": -1
+        }
+      ]
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "obligor",
+      "keys": [
+        "authored::public.wc.obligor_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

@@ -1,6 +1,15 @@
-"""Parametric feature-template engine + the ``retail_churn`` recipe set (build task B2).
+"""The LEGACY template engine and registry — READ-ONLY since the BR-17 cutover.
 
-Three things live here, standalone (NOT wired into the considered-set / generation flow — that is B4):
+Every one of the 157 templates here has an explicit atomic replacement in the ACTIVE V2 registry
+(``recipe_registry_v2`` — the alias map is derived from each definition's ``replaces_legacy_ids``).
+This module survives ONLY for the v1/v2 suggestion contracts' compatibility window: their
+generation still grounds these templates, and historical suggestion revisions keep verifying
+against these exact definitions. NEW RECIPE AUTHORING HERE FAILS CI (the freeze test pins the id
+set) — author in ``recipes/<family>.py`` against Recipe Contract v2. Removal criteria: this
+module is deleted when the v1/v2 contracts retire (BR-24 rollout gates) and no stored suggestion
+revision resolves a legacy template id.
+
+Three things live here:
 
 1. A parametric **template model** (:class:`Need`, :class:`Template`, :class:`GroundedFeature`) — the
    "cookbook" schema. A template is a *scaffold, not a cage* (domain-intelligence spec §5): it seeds
@@ -30,18 +39,25 @@ the honest limit is that grounding asserts intent, not enforcement.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
-from collections.abc import Iterable, Sequence
+import os
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from itertools import product
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.column_authority import logical_ref_of
-from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept
+from featuregen.overlay.upload.concepts import (
+    canonical_concept_name,
+    concept,
+    is_classifier_producible,
+)
 from featuregen.overlay.upload.entity import GOVERNED_ENTITY, effective_entity
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.runtime.observability import counters
 
 # Concept-level sensitivities that a feature input may NEVER carry (a hard eligibility block, Part D.4).
 # Distinct from the column-STORED sensitivity (pii/restricted) that read_scope filters on: these are
@@ -77,15 +93,32 @@ class ResolvedSourceEntityRole:
 @dataclass(frozen=True, slots=True)
 class Need:
     """One binding slot of a template — a required (or optional) concept the grounding engine must find a
-    column for. ``concept`` is a NAME that must exist in ``CONCEPT_REGISTRY`` (validated at import)."""
+    column for. ``concept`` must resolve, THROUGH the one alias seam, to a name the classifier can
+    PRODUCE today (router plan Task 1; validated at import) — bare registry membership let a need
+    target a retired alias with no successor and silently never ground again.
+
+    The AUTHORED spelling is preserved deliberately (verified against the registry-wide grounding
+    baseline before choosing): canonicalizing ``counterparty_id`` -> ``customer_id`` at
+    construction would make `fan_in_fan_out`'s counterparty leg and entity leg the SAME concept
+    and merge their bindings onto one column. Instead, matching is two-tier
+    (:func:`_candidate_score`): an exact authored match outranks a cross-alias canonical match, so
+    the counterparty leg still prefers a stored-alias column where one exists, while a FRESH
+    catalog (whose enrichment can only write successors) still grounds through the canonical tier.
+
+    ``alternates`` (SME triage F1): ordered fallback concepts, FIRST MATCH WINS — tried only when
+    the primary finds no column at all. ``tenure_days``' author wanted
+    ``(origination_date, effective_date)`` and could only write it as a comment; the one-concept
+    Need is why that template binds KYC dates while true origination columns sit unused. The
+    primary stays the need's identity everywhere (keys, metadata derivation, dispositions)."""
     role: str            # binding slot, e.g. "stock_col", "asof", "entity", "flow_col", "event_ts"
-    concept: str         # required concept NAME (must exist in CONCEPT_REGISTRY)
+    concept: str         # required concept NAME (authored; must canonicalize to a producible name)
     optional: bool = False
     # ── 3B.1 cross-catalog binding metadata (optional; need_metadata derives the unset ones) ──
     allowed_source_grains: tuple[str, ...] = ()   # acceptable source grains; () = unconstrained
     join_role: JoinRole | None = None             # explicit override; None -> derived (NEVER tuple position)
     temporal_role: TemporalRole | None = None     # explicit override; None -> derived from concept.pit_role
     distinct_binding_group: str | None = None     # members must bind different physical columns
+    alternates: tuple[str, ...] = ()              # ordered fallback concepts; first match wins
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +280,12 @@ class _Col:
     additivity: str | None
     sensitivity: str | None
     currency: str | None
+    # Task 2: the enrichment text the tie-break deliberation reads. Trailing + defaulted so every
+    # positional constructor keeps working; loaded by `_load_columns`, consulted ONLY among tied
+    # candidates (the plan's implementation note), never by the scorer.
+    definition: str | None = None
+    ai_summary: str | None = None
+    semantic_terms: str | None = None
 
 
 def _load_columns(conn, catalog_source: str, roles: Iterable[str]) -> list[_Col]:
@@ -256,7 +295,8 @@ def _load_columns(conn, catalog_source: str, roles: Iterable[str]) -> list[_Col]
     filter — a restricted column the caller can't see simply isn't a grounding candidate."""
     rows = conn.execute(
         "SELECT catalog_source, object_ref, table_name, column_name, data_type, is_grain, is_as_of, "
-        "       concept, entity, additivity, sensitivity, currency "
+        "       concept, entity, additivity, sensitivity, currency, "
+        "       definition, ai_summary, semantic_terms "
         "FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s "
         "  AND visible_requires <@ %s "
@@ -289,11 +329,22 @@ def _candidate_score(conn, col: _Col, need: Need, *, prefer_table: str | None) -
     want_as_of = bool(expected and expected.pit_role == "as_of")
     want_entity = bool(expected and expected.entity_link)
     score = 0
+    # Task 1 two-tier concept match. Tier 1 (-4): the column's STORED concept equals the need's
+    # AUTHORED spelling — today's behaviour, byte-identical for every unaliased pairing. Tier 2
+    # (-3): the two spellings meet through the one alias seam (`counterparty_id` stored yesterday
+    # satisfies an authored `customer_id`, and vice versa) — WEAKER on purpose: where a template
+    # authored the alias to mean a distinct PARTY LEG (fan_in_fan_out), the exact column still
+    # outranks the cross-alias one, so the two legs never merge onto one column; and where only
+    # one spelling exists in the catalog, the recipe still grounds instead of silently dying.
+    concept_match = 0
     if col.concept == need.concept:
-        score -= 4
+        concept_match = -4
+    elif col.concept and canonical_concept_name(col.concept) == canonical_concept_name(need.concept):
+        concept_match = -3
+    score += concept_match
     if want_as_of and col.is_as_of:
         score -= 2
-    if want_entity and col.concept != need.concept and col.is_grain:
+    if want_entity and concept_match == 0 and col.is_grain:
         entity = effective_entity(conn, col.catalog_source, col.object_ref)
         if entity.authority == GOVERNED_ENTITY and entity.entity == expected.entity_link:
             score -= 2
@@ -304,18 +355,28 @@ def _candidate_score(conn, col: _Col, need: Need, *, prefer_table: str | None) -
 
 def _ranked_matches(conn, cols: Sequence[_Col], need: Need, *,
                     prefer_table: str | None = None) -> tuple[list[tuple[int, _Col]], bool]:
-    ranked = [
-        (score, col)
-        for col in cols
-        if (score := _candidate_score(
-            conn, col, need, prefer_table=prefer_table)) is not None
-    ]
-    ranked.sort(key=lambda item: (
-        item[0], item[1].table, item[1].column, item[1].object_ref))
-    return (
-        ranked[:MAX_GROUNDING_CANDIDATES_PER_NEED],
-        len(ranked) > MAX_GROUNDING_CANDIDATES_PER_NEED,
-    )
+    # Task 1 alternates: FIRST MATCH WINS — the primary concept is tried exactly as always, and an
+    # alternate is consulted only when the concept before it yielded NOTHING (an alternate never
+    # competes with or widens a primary that matched). A need with no alternates (all 157 authored
+    # templates today) takes the identical single pass.
+    for concept_name in (need.concept, *need.alternates):
+        probe = (need if concept_name == need.concept
+                 else dataclasses.replace(need, concept=concept_name, alternates=()))
+        ranked = [
+            (score, col)
+            for col in cols
+            if (score := _candidate_score(
+                conn, col, probe, prefer_table=prefer_table)) is not None
+        ]
+        if not ranked:
+            continue
+        ranked.sort(key=lambda item: (
+            item[0], item[1].table, item[1].column, item[1].object_ref))
+        return (
+            ranked[:MAX_GROUNDING_CANDIDATES_PER_NEED],
+            len(ranked) > MAX_GROUNDING_CANDIDATES_PER_NEED,
+        )
+    return [], False
 
 
 def _match(conn, cols: Sequence[_Col], need: Need, *,
@@ -378,6 +439,39 @@ def _is_as_of_concept(concept_name: str | None) -> bool:
         return False
     c = concept(concept_name)
     return bool(c and c.pit_role == "as_of")
+
+
+def _tie_break_binding_enabled() -> bool:
+    """Phase B of the tie-break rollout (router plan, Task 2). Default OFF: flag-off grounding is
+    byte-identical to the historical alphabetical order — the platform's own rollout pattern. The
+    SHADOW half (verdict lookup + agree/disagree counters) runs regardless: it is the evidence the
+    flag decision is made on."""
+    return os.environ.get("FEATUREGEN_TIE_BREAK_BINDING", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _consult_tie_break(conn, template: Template, need: Need,
+                       tied_cols: Sequence[_Col]) -> tuple[str, ...] | None:
+    """The warmed verdict for THIS tie, or None. READ-ONLY and dispatch-free by design: the model
+    was consulted at ingest (warming) or not at all — a request never pays for, or waits on, a
+    deliberation. The key is recomputed from the columns' own enrichment text, so a correction
+    since warming changes the key and honestly misses (deterministic fallback) until the worker or
+    the next warming re-adjudicates."""
+    from featuregen.overlay.upload.tie_break import (
+        TieBreakCandidate,
+        find_tie_break_verdict,
+        tie_break_input_hash,
+    )
+
+    tied = tuple(
+        TieBreakCandidate(ref=c.object_ref, definition=c.definition or "",
+                          ai_summary=c.ai_summary or "", semantic_terms=c.semantic_terms or "")
+        for c in tied_cols)
+    key = tie_break_input_hash(template_id=template.id, need_role=need.role,
+                               need_concept=need.concept, intent=template.intent, tied=tied)
+    verdict = find_tie_break_verdict(conn, input_hash=key,
+                                     tied_refs=(c.object_ref for c in tied_cols))
+    return verdict.ranking if verdict is not None else None
 
 
 def ground_template_outcome(conn, template: Template, *, catalog_source: str,
@@ -527,14 +621,27 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
                 None,
                 ("required_need_missing", need.role),
             )
-        bindings[need.role] = col
         if need.role not in resolutions:
             top_score = ranked[0][0]
-            tied = tuple(
-                candidate.object_ref
-                for score, candidate in ranked
-                if score == top_score
-            )
+            tied_cols = tuple(
+                candidate for score, candidate in ranked if score == top_score)
+            tied = tuple(candidate.object_ref for candidate in tied_cols)
+            if len(tied) > 1:
+                # Task 2: consult the warmed deliberation. SHADOW always (the counters are the
+                # SME's disagreement feed); BINDING only behind the flag — flag-off stays
+                # byte-identical to the alphabetical order, and a missing verdict keeps it under
+                # either flag state. Requests never dispatch a model.
+                ranking = _consult_tie_break(conn, template, need, tied_cols)
+                if ranking is None:
+                    counters.incr("overlay.tie_break.shadow_unadjudicated")
+                elif ranking[0] == col.object_ref:
+                    counters.incr("overlay.tie_break.shadow_agree")
+                else:
+                    counters.incr("overlay.tie_break.shadow_disagree")
+                if ranking is not None and _tie_break_binding_enabled():
+                    by_ref = {c.object_ref: c for c in tied_cols}
+                    col = by_ref[ranking[0]]
+            bindings[need.role] = col
             resolutions[need.role] = GroundedNeedResolution(
                 role=need.role,
                 resolution=(
@@ -545,6 +652,8 @@ def ground_template_outcome(conn, template: Template, *, catalog_source: str,
                 selected_object_ref=col.object_ref,
                 tied_candidate_refs=tied if len(tied) > 1 else (),
             )
+        else:
+            bindings[need.role] = col
 
     # Provenance: the (catalog_source, object_ref) of each bound column, deduped, in needs order.
     derives: list[tuple[str, str]] = []
@@ -637,7 +746,8 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
                         roles: Iterable[str] = (),
                         use_case: str | None = None,
                         table: str | None = None,
-                        also_tables: Iterable[str] = ()) -> list[GroundingOutcome]:
+                        also_tables: Iterable[str] = (),
+                        params_by_id: Mapping[str, dict] | None = None) -> list[GroundingOutcome]:
     """Ground ``templates`` against ``catalog_source``, one outcome per template.
 
     ``table`` narrows the candidate columns to that one table. It is a pure NARROWING applied AFTER
@@ -658,6 +768,12 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
     the columns ``_load_columns`` already cleared — so it cannot widen a read scope. It is IGNORED
     when ``table is None``: there is no anchor to widen FROM, and the catalog-wide pass is already
     every table.
+
+    ``params_by_id`` (Task 4b) carries hypothesis-chosen parameter OVERRIDES per template id —
+    validated upstream against the authored tuples and re-guarded by :func:`_bind_params` here
+    regardless (an off-menu value raises, never silently grounds). Absent id = the historical
+    first-allowed-value default; ``None`` (the default) is byte-identical to today for every
+    template.
     """
     # The read-scoped column list is IDENTICAL for every template in this pass, so load it ONCE and
     # hand it down — grounding the whole registry re-read the entire catalog per template (157 full
@@ -676,6 +792,7 @@ def ground_all_outcomes(conn, templates: Iterable[Template], *, catalog_source: 
             template,
             catalog_source=catalog_source,
             roles=roles,
+            params=(params_by_id or {}).get(template.id),
             columns=cols,
         ))
     return outcomes
@@ -696,6 +813,79 @@ def ground_all(conn, templates: Iterable[Template], *, catalog_source: str,
         )
         if outcome.feature is not None
     ]
+
+
+# ── Step 0: the catalog-wide recipe funnel (read-only diagnostic) ────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class RecipeFunnelEntryV1:
+    """One template's fate against one catalog: the REAL grounding verdict, its reason codes, and —
+    the part no other surface carries — EVERY unmet required need with role AND concept.
+    ``GroundingOutcome`` early-returns at the first unmet need and names only the role; the funnel
+    exists because "which concepts block how many recipes" is the number that sized every task in
+    the router plan and had no product surface (it was computed by hand, in kubectl, four times)."""
+
+    template_id: str
+    status: str                          # GroundingStatus value
+    reason_codes: tuple[str, ...]
+    unmet: tuple[tuple[str, str], ...]   # (need role, need concept), required needs only
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeFunnelV1:
+    entries: tuple[RecipeFunnelEntryV1, ...]
+    registry_total: int
+    grounded: int
+    #: concept -> templates it blocks, sorted most-blocking first. tuple-of-pairs, not a dict, so
+    #: the wire order IS the histogram order.
+    blocked_concepts: tuple[tuple[str, int], ...]
+    #: The Task-2b stopwatch: grounding cost per pass, as a NUMBER. The verdict-store design leans
+    #: on "the glance is ~free"; this is where that stays measured instead of remembered.
+    elapsed_ms: float
+
+
+def recipe_funnel(conn, *, catalog_source: str, roles: Iterable[str] = (),
+                  templates: Sequence[Template] | None = None) -> RecipeFunnelV1:
+    """Every template's fate against ``catalog_source``, read-scoped exactly like grounding itself.
+
+    The verdict per template is the REAL one — :func:`ground_template_outcome`, never a parallel
+    re-derivation that could drift from the distinct-binding or assignment-cap semantics. The unmet
+    sweep then re-walks the REQUIRED needs of every non-grounded template so the entry names them
+    ALL (the outcome stops at the first). Both run over ONE `_load_columns` list — the load-once
+    lesson — and read scope is inherited from it: a column the caller cannot see is not a candidate
+    here either, so the funnel can never become a side channel around visibility."""
+    import time as _time
+
+    if templates is None:
+        templates = ALL_TEMPLATES   # defined at module tail; resolved at call time on purpose
+    started = _time.perf_counter()
+    cols = _load_columns(conn, catalog_source, roles)
+    entries: list[RecipeFunnelEntryV1] = []
+    blocked: dict[str, int] = {}
+    grounded = 0
+    for template in templates:
+        outcome = ground_template_outcome(
+            conn, template, catalog_source=catalog_source, roles=roles, columns=cols)
+        unmet: tuple[tuple[str, str], ...] = ()
+        if outcome.status is GroundingStatus.GROUNDED:
+            grounded += 1
+        else:
+            unmet = tuple(
+                (need.role, need.concept)
+                for need in template.needs
+                if not need.optional and _match(conn, cols, need) is None)
+            for _role, concept_name in unmet:
+                blocked[concept_name] = blocked.get(concept_name, 0) + 1
+        entries.append(RecipeFunnelEntryV1(
+            template_id=template.id, status=outcome.status.value,
+            reason_codes=outcome.reason_codes, unmet=unmet))
+    return RecipeFunnelV1(
+        entries=tuple(entries),
+        registry_total=len(templates),
+        grounded=grounded,
+        blocked_concepts=tuple(sorted(blocked.items(), key=lambda kv: (-kv[1], kv[0]))),
+        elapsed_ms=(_time.perf_counter() - started) * 1000.0,
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1431,7 +1621,11 @@ FRAUD_TEMPLATES: tuple[Template, ...] = (
         additivity="non_additive",
         explain="H",
         use_cases=("fraud", "merchant_analytics"),
-        pit=_FRAUD_PIT_REALTIME,
+        pit=("trailing {window}-day observation window (as_of − {window}d, as_of]: distinct MCC breadth "
+            "accumulated from BOOKED transactions knowable strictly ≤ as_of. NOT a real-time "
+            "pre-authorization signal: this recipe reads batch booked data, and real-time wording is "
+            "earned only by binding a governed pre-decision feed (BR-4: the borrowed fraud constant "
+            "referenced a minutes parameter, window_min, that this recipe never declared)."),
         degrade="missing merchant, MCC or event-time authority -> SKIP.",
         stage="merchant-monitoring",
         eligibility=_FRAUD_BEHAVIOUR,
@@ -2289,7 +2483,11 @@ DEPOSITS_TEMPLATES: tuple[Template, ...] = (
         params={"horizon_days": (30, 90, 365), "measure": ("runoff_share", "runoff_amount")},
         aggregation="maturity_runoff", additivity="non_additive", explain="H",
         use_cases=("deposit_stability", "alm", "liquidity_risk"),
-        pit=_DEPOSIT_PIT_STATE,
+        pit=("FORWARD contractual-maturity ladder: deposits whose contractual maturity falls in "
+            "(as_of, as_of + {horizon_days}d], bucketed from contract terms knowable strictly "
+            "≤ as_of — a FUTURE horizon read from effective contracts, never a trailing "
+            "observation window (BR-4: the borrowed deposit-state constant described a trailing "
+            "lookback over a window parameter this recipe has no parameter for)."),
         degrade="no maturity_date (a non-maturity deposit) -> SKIP; use nmd_stickiness for NMDs.",
         stage="runoff-prone",
         eligibility=_ALM_SINGLE_CCY,
@@ -4495,7 +4693,10 @@ CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
         additivity="non_additive",
         explain="H",
         use_cases=("trade_finance", "limit_management"),
-        pit=_CORP_PIT_STATE,
+        pit=("trailing {window}-day facility-ACTIVITY window (as_of − {window}d, as_of]: facilities "
+            "counted for the obligor from records active in the window, knowable strictly ≤ as_of "
+            "(BR-4: its own activity declaration — the borrowed corporate-state constant describes "
+            "latest exposure/limit/covenant/utilisation state, which is a different recipe shape)."),
         degrade="missing obligor, facility or event-time authority -> SKIP.",
         stage="obligor-monitoring",
         eligibility="Identifiers only; facility activity must be knowable by the as-of cutoff.",
@@ -4643,9 +4844,16 @@ def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[
             raise ValueError(f"template {t.id!r} has duplicate need roles")
         distinct_groups: dict[str, list[str]] = {}
         for need in t.needs:
-            if need.concept not in CONCEPT_REGISTRY:
-                raise ValueError(
-                    f"template {t.id!r} need {need.role!r} references unknown concept {need.concept!r}")
+            # Task 1: producible-by-the-classifier-TODAY (through the alias seam), not bare
+            # registry membership — the registry keeps retired aliases (byte-stable fact keys), so
+            # the old check let a need target one and silently never ground again. An authored
+            # alias WITH a successor passes (matching handles both spellings); a successorless
+            # retired alias or an unknown name fails loudly here.
+            for concept_name in (need.concept, *need.alternates):
+                if not is_classifier_producible(canonical_concept_name(concept_name)):
+                    raise ValueError(
+                        f"template {t.id!r} need {need.role!r} references concept "
+                        f"{concept_name!r}, which no fresh classification can produce")
             if need.distinct_binding_group is not None:
                 if not need.distinct_binding_group.strip():
                     raise ValueError(

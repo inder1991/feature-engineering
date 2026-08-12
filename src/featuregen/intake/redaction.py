@@ -20,6 +20,15 @@ INPUT_KEY_CATALOG = "catalog_metadata"
 INPUT_KEY_CLASSIFICATION = "raw_input_classification"
 INPUT_KEY_REDACTION_VERSION = "redaction_version"
 INPUT_KEY_REDACTION = "input_redaction"
+#: The TRANSIENT driver key carrying the validation errors that refuted the previous answer, read
+#: back by the provider adapter to render the repair turn. `_`-prefixed so `compute_input_hash`
+#: excludes it and the repair keeps its parent's identity while differing on the wire.
+#:
+#: A constant and not a literal because the writer (`llm.drive_structured_call`) and the reader
+#: (`llm_claude._wire_prompt`) live in different modules and the coupling is SILENT: rename one
+#: side and every repair reverts to a byte-identical re-call that buys nothing, with no error
+#: anywhere. That is the exact failure Task 2 exists to prevent, on the path a live run exercises.
+INPUT_KEY_REPAIR_ERRORS = "_repair_errors"
 
 REDACTION_VERSION = "default-redactor@1"
 

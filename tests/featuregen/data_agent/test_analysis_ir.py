@@ -438,12 +438,29 @@ def test_a_missing_cutoff_is_refused_rather_than_defaulting_to_today(pilot):
 @pytest.mark.parametrize("basis", [
     AttributionBasis.PERIOD_END_PER_PERIOD,
     AttributionBasis.TRANSACTION_EVENT_TIME,
-    AttributionBasis.CURRENT_VALUE,
 ])
 def test_an_unimplemented_attribution_basis_is_refused(basis):
-    """All are defensible business definitions giving different answers. The renderer must not pick."""
+    """Both are defensible business definitions giving different answers. The renderer must not pick.
+
+    CHANGE OF INTENT (Release-B Task 8): `current_value` used to be in this list. It is now
+    IMPLEMENTED — see `test_current_value_is_now_implemented_because_the_declaration_exists` below
+    and the `dimensions` module docstring. What changed is not the engine's ambition but the
+    availability of a DECLARATION of which row is today's; the two bases left here are still
+    business decisions nobody has made.
+    """
     with pytest.raises(AttributionError, match="basis"):
         _attribution(attribution_basis=basis)
+
+
+def test_current_value_is_now_implemented_because_the_declaration_exists(pilot):
+    """ENGINE A. The flag the temporal policy declares decides which row is current; a cutoff on a
+    "today" question is a contradiction and is refused rather than ignored."""
+    policy = _attribution(attribution_basis=AttributionBasis.CURRENT_VALUE,
+                          report_cutoff="", current_flag_column="is_current")
+    assert policy.validity_predicate(PostgresDialect().ident) == '"is_current" = TRUE'
+    with pytest.raises(AttributionError, match="ATTRIBUTION_CUTOFF_ON_CURRENT_VALUE"):
+        _attribution(attribution_basis=AttributionBasis.CURRENT_VALUE,
+                     current_flag_column="is_current")
 
 
 def test_changing_the_attribution_policy_changes_the_plan_hash(pilot):

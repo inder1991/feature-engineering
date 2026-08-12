@@ -1,0 +1,65 @@
+{
+  "canonical_json": null,
+  "case_id": "vacuous_authority_block",
+  "expected": "schema_error",
+  "expected_proposal_hash": null,
+  "note": "an authority block with every ref blank is a lie \u2014 omit the block instead",
+  "operation": "sum",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "sum",
+        "authority_refs": {
+          "currency_conversion_ref": "",
+          "direction_policy_ref": "",
+          "reversal_policy_ref": "",
+          "status_policy_ref": ""
+        },
+        "filter": {
+          "kind": "predicate",
+          "left": "authored::public.txns.direction",
+          "op": "equal",
+          "right_literal": {
+            "type": "string",
+            "value": "debit"
+          },
+          "right_param": null,
+          "right_set": null
+        },
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {
+          "table_ref": "authored::public.txns"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "zero",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.txns.booking_ts",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "account",
+      "keys": [
+        "authored::public.txns.acct_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

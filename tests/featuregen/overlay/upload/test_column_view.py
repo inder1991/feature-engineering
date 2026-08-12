@@ -212,15 +212,22 @@ def test_none_pass_a_maps_normalized_to_empty():
 
 
 def test_business_definition_falls_back_to_draft_and_is_bounded():
+    from featuregen.overlay.upload.enrich_llm import MAX_DEFINITION_LEN
+
     rows = [_row("txn", "fee")]
     h = content_hash(rows[0])
-    long_draft = ("A very long drafted definition sentence. " * 30).strip()   # > 600 chars
+    # Sized OFF the bound so it keeps testing the bound: the 2026-08-06 raises took
+    # MAX_DEFINITION_LEN 600 -> 4000 -> 32_000, and a fixed 1_229-char draft now rides through
+    # WHOLE — which is the intent, but it would have left this test asserting nothing.
+    sentence = "A very long drafted definition sentence. "
+    long_draft = (sentence * (MAX_DEFINITION_LEN // len(sentence) + 4)).strip()
+    assert len(long_draft) > MAX_DEFINITION_LEN
     v = build_table_views(rows, glossary=None, bindings=None,
                           concepts={h: "fee_amount"}, definitions={h: long_draft}, domains={})
     col = v["txn"].columns[0]
     assert col.concept == "fee_amount"
     assert col.drafted_definition == long_draft            # the raw Pass-A draft stays visible
-    assert col.business_definition and len(col.business_definition) <= 600
+    assert col.business_definition and len(col.business_definition) <= MAX_DEFINITION_LEN
 
 
 def test_multiple_tables_indexed_by_name_columns_in_row_order():

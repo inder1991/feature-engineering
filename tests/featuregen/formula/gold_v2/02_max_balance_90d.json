@@ -1,0 +1,49 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"expr\":{\"aggregation\":\"max\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.txns.txn_amt\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "max_balance_90d",
+  "expected": "ok",
+  "expected_proposal_hash": "cc2c2c0fa71a45e7447c41862f2ab1b933ccd111191de6e8f966ae471b7cc3f9",
+  "note": "increment-1 NEW group: maximum daily balance shape [re-keyed in increment 2: aggregation_argument joined the canonical form] [re-keyed in increment 4: offset_periods + second_operand joined the canonical form] [re-keyed in increment 8: authority_refs + allocation_policy_ref joined the canonical form]",
+  "operation": "max",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "max",
+        "filter": null,
+        "operand": "authored::public.txns.txn_amt",
+        "source_relation": {
+          "table_ref": "authored::public.txns"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "customer",
+      "keys": [
+        "authored::public.txns.cif_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

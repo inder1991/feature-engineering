@@ -3,15 +3,21 @@
 Resolving and validating exact partitions is worthless if the generated project then reads whatever
 it likes, so submission passes :attr:`~featuregen.materialize.runprep.RunPreparation.parameters` —
 **not ``business_dt`` alone**. This module makes that structural rather than advisory: a submitter
-that is handed anything but exactly ``REQUIRED_RUN_PARAMETERS`` refuses before a process is started,
-naming what is missing and what is extra. "Unexpected" matters as much as "missing": a parameter
-nobody planned for is a value the pipeline may read and run preparation never resolved, and the
-rendered ``RunParametersHook`` refuses it at the other end with ``RUN_PARAMETERS_MISSING``. Refusing
-here as well means the run does not start rather than starting and failing inside Spark.
+that is handed anything but exactly the parameters the RENDERED project requires refuses before a
+process is started, naming what is missing and what is extra. That set is
+``REQUIRED_RUN_PARAMETERS`` plus whatever the artifact's own nodes wire — one more name,
+``bridge_predicate_values``, for a group with a cross-catalog hop, and nothing extra for a group
+without one. "Unexpected" matters as much as "missing": a parameter nobody planned for is a value
+the pipeline may read and run preparation never resolved, and the rendered ``RunParametersHook``
+refuses it at the other end with ``RUN_PARAMETERS_MISSING``. Refusing here as well means the run
+does not start rather than starting and failing inside Spark.
 
 **The parameters cross the boundary as ONE canonical JSON document**, given to
-``KedroSession.create(runtime_params=…)`` — the same ``runtime_params`` the rendered catalog
-interpolates (``${runtime_params:staging_root}``). They are not flattened into ``key=value`` pairs:
+``KedroSession.create`` under whichever keyword the installed kedro names it — ``runtime_params``
+on kedro >= 1.0, ``extra_params`` on the 0.19.x line; the run script asks
+``inspect.signature`` rather than remembering either. Both feed the same ``runtime_params``
+resolver the rendered catalog interpolates (``${runtime_params:staging_root}``). They are not
+flattened into ``key=value`` pairs:
 ``input_snapshots`` is a list of objects, and any flattening of it invents a text encoding that the
 project would have to invent back.
 
@@ -29,8 +35,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -69,35 +76,60 @@ class PipelineSubmitter(Protocol):
 
     def submit(self, project_root: str | os.PathLike[str], *,
                run_parameters: Mapping[str, Any],
-               pipeline_name: str = PIPELINE_NAME) -> SubmissionOutcome:
+               pipeline_name: str = PIPELINE_NAME,
+               required_parameters: Sequence[str] = REQUIRED_RUN_PARAMETERS,
+               ) -> SubmissionOutcome:
         """Run the generated project with EXACTLY these prepared parameters."""
         ...
 
 
-#: Executed by the target interpreter, never imported here. ``runtime_params`` is kedro 1.5.0's
-#: parameter name — verified against the installed signature, not remembered — and it is the one the
-#: rendered catalog resolves ``${runtime_params:…}`` against.
+#: Executed by the target interpreter, never imported here. The keyword is ``runtime_params`` on
+#: kedro >= 1.0 but ``extra_params`` on the 0.19.x line — both supported targets — so the script
+#: asks the INSTALLED signature at run time instead of remembering either name. Whichever it is,
+#: the rendered catalog resolves ``${runtime_params:…}`` against the same values.
 _RUN_SCRIPT = r'''
-import json, sys
+import inspect, json, sys
 
 from kedro.framework.session import KedroSession
 from kedro.framework.startup import bootstrap_project
 
 root, params_json, pipeline_name = sys.argv[1], sys.argv[2], sys.argv[3]
 bootstrap_project(root)
-with KedroSession.create(project_path=root,
-                         runtime_params=json.loads(params_json)) as session:
+kwargs = {("runtime_params"
+           if "runtime_params" in inspect.signature(KedroSession.create).parameters
+           else "extra_params"): json.loads(params_json)}
+with KedroSession.create(project_path=root, **kwargs) as session:
     session.run(pipeline_name=pipeline_name)
 '''
 
 
-def check_run_parameters(run_parameters: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Refuse anything but EXACTLY §11.1's prepared parameters, and return them unchanged.
+def check_run_parameters(
+    run_parameters: Mapping[str, Any],
+    *,
+    required_parameters: Sequence[str] = REQUIRED_RUN_PARAMETERS,
+) -> Mapping[str, Any]:
+    """Refuse anything but EXACTLY this artifact's prepared parameters, and return them unchanged.
+
+    ``required_parameters`` is what the RENDERED project requires, which is not a constant: a group
+    whose expression carries a ``CrossCatalogJoinStepV1`` renders a join-gate node wired to
+    ``params:bridge_predicate_values``, so ``render_project`` puts that name into the artifact's own
+    required set (``render/project.py:1231``) and the rendered ``RunParametersHook`` demands it. A
+    same-catalog group renders no such node and no such parameter. The requirement is therefore a
+    property of the ARTIFACT, and this is the same seam ``prepare_run`` already carries — the caller
+    passes the set the artifact declared, and the check is equality against it.
+
+    Equality, in both directions, is the whole point and is unchanged. Widening the constant instead
+    would let a same-catalog run carry a value nothing in its project reads; softening this into a
+    subset test would let any run carry anything. ``REQUIRED_RUN_PARAMETERS`` is a FLOOR rather than
+    a default a caller may drop below: a ``required_parameters`` that omits one of them is refused
+    outright, exactly as ``prepare_run`` refuses it (``runprep.py:912``), because a project that did
+    not require ``staging_root`` is not a project this renderer produced.
 
     Raises:
         TypeError: ``run_parameters`` is not a mapping — ``business_dt`` passed as a bare string is
             the shape §11.1 explicitly rules out.
-        ValueError: a required parameter is missing or an unplanned one is present.
+        ValueError: ``required_parameters`` omits one of ``REQUIRED_RUN_PARAMETERS``, or a required
+            parameter is missing, or an unplanned one is present.
     """
     if not isinstance(run_parameters, Mapping):
         raise TypeError(
@@ -105,12 +137,18 @@ def check_run_parameters(run_parameters: Mapping[str, Any]) -> Mapping[str, Any]
             f"§11.1 says submission passes RunPreparation.parameters and NOT business_dt alone, "
             f"because the partitions this run may read are resolved into those parameters and "
             f"nowhere else")
-    missing = sorted(set(REQUIRED_RUN_PARAMETERS) - set(run_parameters))
-    unexpected = sorted(set(run_parameters) - set(REQUIRED_RUN_PARAMETERS))
+    expected = set(required_parameters)
+    if not set(REQUIRED_RUN_PARAMETERS) <= expected:
+        raise ValueError(
+            f"required_parameters {sorted(expected)} omitted one or more base run parameters "
+            f"{sorted(set(REQUIRED_RUN_PARAMETERS) - expected)}: every rendered project requires "
+            f"all of them, so a set that drops one describes no artifact this renderer produces")
+    missing = sorted(expected - set(run_parameters))
+    unexpected = sorted(set(run_parameters) - expected)
     if missing or unexpected:
         raise ValueError(
             f"the run parameters are {sorted(run_parameters)} and execution requires exactly "
-            f"{sorted(REQUIRED_RUN_PARAMETERS)} (missing {missing}, unexpected {unexpected}): the "
+            f"{sorted(expected)} (missing {missing}, unexpected {unexpected}): the "
             f"rendered hook refuses a run that is missing one OR carries one nothing planned to "
             f"read, so anything but equality cannot run — and refusing here means it never starts")
     return run_parameters
@@ -134,8 +172,20 @@ class LocalClusterSubmitter:
     ``python_executable`` has no default for L0's reason — nothing may silently run the artifact in
     the control plane's own interpreter, which does not have ``pyspark`` and must not acquire it.
     ``env`` is overlaid on this process's environment; ``PYSPARK_PYTHON`` and
-    ``PYSPARK_DRIVER_PYTHON`` must BOTH be in it, or Spark launches its workers on whichever Python
-    is first on the path.
+    ``PYSPARK_DRIVER_PYTHON`` must BOTH be present in the merged result — ``submit`` refuses to
+    start a process without them, because Spark would launch its workers on whichever Python is
+    first on the path and die deep inside an executor.
+
+    The run is its own session (``start_new_session=True``), so a timeout kills the whole process
+    group: killing only the direct child would leave a ``spark-submit`` grandchild orphaned,
+    holding the inherited pipes and writing into ``staging_root`` after the submitter gave up.
+
+    Known residual limitation: ``os.killpg`` reaches only descendants that STAYED in the submitted
+    session's process group. A descendant that itself calls ``setsid()`` acquires a different pgid
+    and escapes this kill entirely — the orphan-writes-into-``staging_root`` defect recurring one
+    level deeper. That is inherent to the process-group mechanism; a cluster-mode application must
+    be bounded by cluster-side controls (the resource manager killing the application), not by
+    this local kill.
     """
 
     python_executable: str
@@ -144,28 +194,56 @@ class LocalClusterSubmitter:
 
     def submit(self, project_root: str | os.PathLike[str], *,
                run_parameters: Mapping[str, Any],
-               pipeline_name: str = PIPELINE_NAME) -> SubmissionOutcome:
-        """Run the project. The parameters are checked BEFORE a process exists."""
-        check_run_parameters(run_parameters)
+               pipeline_name: str = PIPELINE_NAME,
+               required_parameters: Sequence[str] = REQUIRED_RUN_PARAMETERS,
+               ) -> SubmissionOutcome:
+        """Run the project. Parameters AND environment are checked BEFORE a process exists.
+
+        ``required_parameters`` is the rendered artifact's own set — see
+        :func:`check_run_parameters`. Omitting it means "this project renders no node that reads
+        anything beyond §11.1's base set", which is true of every same-catalog group and false of
+        every cross-catalog one.
+        """
+        check_run_parameters(run_parameters, required_parameters=required_parameters)
+        merged = os.environ | self.env if self.env is not None else dict(os.environ)
+        missing_env = [name for name in ("PYSPARK_PYTHON", "PYSPARK_DRIVER_PYTHON")
+                       if not merged.get(name)]
+        if missing_env:
+            raise ValueError(
+                f"env is missing {missing_env}: without them Spark launches workers on "
+                f"whatever python is on PATH and dies deep inside an executor")
         root = pathlib.Path(project_root)
         command = submission_command(self.python_executable, root, run_parameters, pipeline_name)
         try:
-            completed = subprocess.run(                                   # noqa: S603 - fixed argv
-                command, capture_output=True, text=True, check=False, cwd=str(root),
-                timeout=self.timeout_seconds,
-                env=None if self.env is None else {**os.environ, **self.env})
-        except subprocess.TimeoutExpired:
-            return SubmissionOutcome(
-                completed=False, returncode=None,
-                detail=f"the run exceeded {self.timeout_seconds}s and was killed: it produced no "
-                       f"verdict about the pipeline, which is not the same as failing")
+            process = subprocess.Popen(                                   # noqa: S603 - fixed argv
+                command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                cwd=str(root), env=merged, start_new_session=True)
         except (OSError, subprocess.SubprocessError) as error:
             return SubmissionOutcome(
                 completed=False, returncode=None,
-                detail=f"execution never started ({type(error).__name__}): the interpreter "
-                       f"{self.python_executable!r} could not be launched")
+                detail=f"execution never started ({type(error).__name__}): {error}")
+        try:
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)   # pgid == pid: start_new_session
+            except ProcessLookupError:                   # the group died AT the timeout boundary
+                pass
+            try:
+                stdout, stderr = process.communicate(timeout=30.0)
+            except subprocess.TimeoutExpired:            # a pipe survived even SIGKILL
+                stdout, stderr = "", ""
+                try:
+                    process.wait(timeout=0)              # explicit reap of the SIGKILLed leader —
+                except subprocess.TimeoutExpired:        # not left to a GC finalizer; if it is not
+                    pass                                 # reapable yet, still return, never hang
+            return SubmissionOutcome(
+                completed=False, returncode=None,
+                detail=f"the run exceeded {self.timeout_seconds}s; its process group was "
+                       f"killed. stderr: {stderr.strip()[-1000:]}")
         return SubmissionOutcome(
-            completed=completed.returncode == 0, returncode=completed.returncode,
-            # Operator-facing and bounded: the run's own last words, never a value it computed —
-            # the control plane does not read feature data, including out of a log.
-            detail=(completed.stderr or completed.stdout or "").strip()[-2000:])
+            completed=process.returncode == 0, returncode=process.returncode,
+            # Operator-facing and bounded: the run's own last words from BOTH streams, labeled and
+            # never a value it computed — the control plane does not read feature data, including
+            # out of a log.
+            detail=f"stderr: {stderr.strip()[-1500:]} | stdout: {stdout.strip()[-500:]}")

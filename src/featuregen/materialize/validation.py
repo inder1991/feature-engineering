@@ -3,8 +3,9 @@
 **A finding's CODE says what was seen; its CLASS says who fixes it, and the class is what routes a
 decision.** §11 names four: ``RENDERER_DEFECT`` (fix the renderer and regenerate),
 ``GOVERNED_FACT_MISMATCH`` (the code is right and the catalog is wrong — re-attest, and
-**regeneration is blocked**), ``ENVIRONMENT_OR_DATA`` (the operator acts) and ``UNCLASSIFIED``
-(**fails closed**, and never silently environmental).
+**regeneration is declared blocked**: see :class:`FindingClass`, the policy is written down and
+proved but no production caller consults it yet), ``ENVIRONMENT_OR_DATA`` (the operator acts) and
+``UNCLASSIFIED`` (**fails closed**, and never silently environmental).
 
 The asymmetry is the design. A missing partition is data that has not landed; nobody attests that a
 partition exists, and the fix is upstream. A type contradiction, an absent column or a denied read
@@ -34,6 +35,18 @@ generated project imports ``kedro`` and ``pyspark``, which are **not** dependenc
 (``src/`` never imports either); the L0 gate runs it against the environment that has them, and the
 suite runs the same code against ``sys.executable`` and hand-authored stdlib-only projects, which is
 what keeps this module's behaviour proved without a pyspark import.
+
+**A build proof is a proof about ONE environment, and the artifact names which.** The project pins
+itself — ``requirements.lock``, rendered from ``ClusterInventoryV1.engine_versions`` and inside
+``generated_project_hash`` — and until DEFERRED-WORK A.42 nothing compared those pins to the
+interpreter doing the proving, so a project declaring engines the prover did not have came back
+``PASSED``. That was the one failure in this chain that failed OPEN. The probe therefore reads the
+declared pins and compares them to ``importlib.metadata`` **in its own interpreter**, and reports
+``ENGINE_VERSION_MISMATCH`` — one finding per disagreeing distribution, naming the package, the pin
+and what is installed — before it imports anything. Before, because the check must not be
+answerable by code the artifact ships, and because a build that failed *because* the engines are
+wrong would otherwise be filed as ``RENDERER_DEFECT`` and send an operator to fix a renderer that
+did nothing wrong.
 """
 from __future__ import annotations
 
@@ -41,6 +54,7 @@ import json
 import os
 import pathlib
 import subprocess
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -50,6 +64,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
+    REQUIREMENTS_LOCK_FILENAME,
     RenderedArtifactIdentity,
     generated_project_hash,
     read_lock,
@@ -75,6 +90,8 @@ __all__ = [
     "ValidationStatus",
     "classify",
     "may_regenerate",
+    "may_regenerate_for",
+    "read_validation_reports",
     "record_validation_report",
     "run_l0",
     "run_l1",
@@ -102,15 +119,24 @@ class ValidationStatus(StrEnum):
 
 
 class FindingClass(StrEnum):
-    """§11.2's routing: not how bad a finding is, but WHOSE problem it is."""
+    """§11.2's routing: not how bad a finding is, but WHOSE problem it is.
+
+    **"Blocks regeneration" below is a POLICY these classes declare, not a gate they currently
+    close.** :func:`may_regenerate` and :func:`may_regenerate_for` implement it correctly and are
+    called only by tests; as of G-1 the chain decides on ``report.status is PASSED`` alone and reads
+    no class. Stated here as well as at the two functions because a reader meets the vocabulary
+    first, and DEFERRED-WORK A.42 exists precisely because something claimed more than it did.
+    """
 
     #: The renderer emitted something that does not build. Fix the renderer, regenerate.
     RENDERER_DEFECT = "renderer_defect"
-    #: The catalog and the cluster disagree about a governed fact. Re-attest. BLOCKS regeneration.
+    #: The catalog and the cluster disagree about a governed fact. Re-attest. Declares that
+    #: regeneration is blocked (see the class docstring: declared, not yet enforced).
     GOVERNED_FACT_MISMATCH = "governed_fact_mismatch"
     #: The environment or the data is not in the state the run needs. The operator acts.
     ENVIRONMENT_OR_DATA = "environment_or_data"
-    #: Unrecognized. FAILS CLOSED — blocks regeneration, and is never silently environmental.
+    #: Unrecognized. FAILS CLOSED — declares regeneration blocked, and is never silently
+    #: environmental.
     UNCLASSIFIED = "unclassified"
 
 
@@ -135,10 +161,30 @@ class FindingSeverity(StrEnum):
 #: must therefore not be blocked. The three L1 read-set findings are all governed facts the
 #: compilation relied on (a column, its type, and Gate 2's read authorization); a partition is the
 #: one L1 checks that nobody attests, so it alone is data.
+#:
+#: ``ENGINE_VERSION_MISMATCH`` is a GOVERNED_FACT_MISMATCH on this table's own criterion, and the
+#: reasoning is worth stating because two other classes look plausible. The pins are not the
+#: renderer's opinion — it copied them faithfully out of §0's captured
+#: ``ClusterInventoryV1.engine_versions`` — so ``RENDERER_DEFECT`` would send a reader to fix code
+#: that is correct. And it is not ``ENVIRONMENT_OR_DATA``, which that class is reserved for by the
+#: test that pins ``PROJECT_HASH_MISMATCH`` there: regeneration must be a legitimate remedy. Here it
+#: is not. Re-rendering from the same mounted inventory produces the same three pins and the same
+#: disagreement — "rebuilding from the same wrong facts produces the same wrong project faster",
+#: which is precisely GOVERNED_FACT_MISMATCH. The remedy is to re-capture the inventory or to point
+#: L0 at the environment the artifact declares, and a later L0 that passes supersedes this one
+#: through :func:`may_regenerate_for`, so the refusal is a hold rather than a dead end.
+#:
+#: **What "blocks regeneration" means here today: the classification is DECLARED, not enforced.**
+#: :func:`may_regenerate` and :func:`may_regenerate_for` have no production callers as of G-1 — the
+#: chain decides on ``report.status is PASSED`` alone (``chain.py``'s ``built``) and never consults
+#: a class. So this entry states the policy a regeneration path must honour when one is wired; it
+#: does not gate anything yet. Said explicitly because A.42 exists precisely because something
+#: claimed more than it did, and repeating that shape in its own fix would be the same defect.
 FINDING_CLASSES: Mapping[ValidationFindingCode, FindingClass] = {
     ValidationFindingCode.PROJECT_DOES_NOT_BUILD: FindingClass.RENDERER_DEFECT,
     ValidationFindingCode.PIPELINE_NOT_CONSTRUCTIBLE: FindingClass.RENDERER_DEFECT,
     ValidationFindingCode.PROJECT_HASH_MISMATCH: FindingClass.ENVIRONMENT_OR_DATA,
+    ValidationFindingCode.ENGINE_VERSION_MISMATCH: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.COLUMN_ABSENT: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.COLUMN_TYPE_MISMATCH: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.READ_DENIED: FindingClass.GOVERNED_FACT_MISMATCH,
@@ -304,6 +350,13 @@ def may_regenerate(report: ValidationReportV1) -> bool:
     ``False`` for ``error`` as well, with no findings to point at: an unreachable cluster is not
     evidence that regeneration is the right move, and treating "nothing was found" as "nothing is
     wrong" is exactly the confusion §11.2's zero-finding rule exists to prevent.
+
+    **NOTHING IN PRODUCTION CALLS THIS YET.** Its only callers are tests; the chain gates on
+    ``report.status is PASSED`` and never consults a class. So this function is the §11.2 rule
+    written down and proved, not a door that is currently shut — see DEFERRED-WORK A.42's 🟡 row.
+    The first code that regenerates a refused artifact (G-2's re-drive) should route through
+    :func:`may_regenerate_for`; until it does, do not describe a finding as "blocking regeneration"
+    without that qualification.
     """
     if not isinstance(report, ValidationReportV1):
         raise TypeError(
@@ -331,6 +384,66 @@ def record_validation_report(conn: DbConn, report: ValidationReportV1) -> None:
          report.started_at, report.finished_at, json.dumps(report.findings_payload())))
 
 
+def _finding_from_payload(payload: Mapping[str, Any]) -> ValidationFinding:
+    """The exact inverse of :meth:`ValidationFinding.payload`.
+
+    ``classification`` is deliberately NOT read back: it was derived from ``code`` on the way out
+    and the constructor derives it again on the way in, so a stored row cannot smuggle in a routing
+    its own code contradicts.
+    """
+    return ValidationFinding(
+        code=ValidationFindingCode(payload["code"]),
+        location=payload["location"],
+        expected=payload["expected"],
+        observed=payload["observed"],
+        count=payload["count"],
+        severity=FindingSeverity(payload["severity"]))
+
+
+def read_validation_reports(conn: DbConn, *, generation_id: str
+                            ) -> tuple[ValidationReportV1, ...]:
+    """Every report recorded for one generation, oldest ``started_at`` first.
+
+    The exact inverse of :func:`record_validation_report`: the eleven columns it INSERTs come back
+    through the shapes they went in — the enums through their enums, the findings through the
+    inverse of :meth:`ValidationReportV1.findings_payload` — so a read-back report compares EQUAL
+    (``==`` over the frozen dataclass) to the one recorded, and every constructor invariant
+    (``error`` has no findings, ``failed`` has at least one) re-runs on the way out. ``started_at``
+    is ISO-8601 text, so its lexicographic order is its chronological order; ``recorded_at`` and
+    ``report_id`` only make a tie deterministic.
+    """
+    rows = conn.execute(
+        "SELECT report_id, generation_id, run_id, generated_project_hash, group_plan_hash, "
+        "level, environment_id, status, started_at, finished_at, findings "
+        "FROM pipeline_validation_report WHERE generation_id = %s "
+        "ORDER BY started_at, recorded_at, report_id",
+        (generation_id,)).fetchall()
+    return tuple(
+        ValidationReportV1(
+            report_id=row[0], generation_id=row[1], run_id=row[2],
+            generated_project_hash=row[3], group_plan_hash=row[4],
+            level=ValidationLevel(row[5]), environment_id=row[6],
+            status=ValidationStatus(row[7]), started_at=row[8], finished_at=row[9],
+            findings=tuple(_finding_from_payload(payload) for payload in row[10]))
+        for row in rows)
+
+
+def may_regenerate_for(conn: DbConn, *, generation_id: str) -> bool:
+    """The CROSS-PROCESS form of :func:`may_regenerate` — the recorded rule, not the in-memory one.
+
+    :func:`may_regenerate` judges the report object its caller happens to hold, which binds only
+    the process that ran the validation. This reads what was RECORDED and applies the same rule to
+    the NEWEST report of each level: a re-validation re-checked the findings of the report it
+    supersedes, so a superseded blocker no longer blocks — and every level's newest verdict must
+    permit regeneration, because L1's clean re-run says nothing about L0's standing refusal. No
+    recorded reports block nothing: ``True``.
+    """
+    newest: dict[ValidationLevel, ValidationReportV1] = {}
+    for report in read_validation_reports(conn, generation_id=generation_id):
+        newest[report.level] = report        # ordered oldest-first, so the last one seen is newest
+    return all(may_regenerate(report) for report in newest.values())
+
+
 class ClusterUnreachable(Exception):
     """The environment could not be asked — NOT a verdict about what it contains.
 
@@ -343,27 +456,187 @@ class ClusterUnreachable(Exception):
 
 # ── L0: the generated project itself ─────────────────────────────────────────────────────────────
 
-#: What the build probe prints, on its own line, so the project's own output cannot be mistaken for
-#: a verdict. A project that prints during import is legal; a project that prints something shaped
-#: like a verdict would otherwise be able to declare itself buildable.
-_VERDICT_MARKER = "@@L0-VERDICT@@ "
+#: The fixed PREFIX of the marker the build probe prints before its verdict, kept stable so a human
+#: can find the line in a log. The marker the probe is actually GIVEN — and the only string the
+#: scan matches — is minted fresh per invocation (:func:`_verdict_marker`): a project that prints
+#: during import is legal, but a project that printed a fixed, verdict-shaped line would otherwise
+#: be able to declare itself buildable, and the nonce did not exist until the probe was launched.
+_VERDICT_MARKER_PREFIX = "@@L0-VERDICT@@"
+
+
+def _verdict_marker() -> str:
+    """One probe invocation's marker. Fresh every call — yesterday's log teaches a forger nothing.
+
+    The trailing space is the delimiter between the marker and the verdict JSON, exactly as the
+    probe prints it (``MARKER + json.dumps(...)``).
+    """
+    return f"{_VERDICT_MARKER_PREFIX}{uuid.uuid4().hex} "
+
+#: The probe's stage for the declared-pin comparison. Bound INTO the probe's source below rather
+#: than spelled a second time inside it: :func:`run_l0` dispatches on this exact value, and a stage
+#: the two sides spelled differently would silently route an engine mismatch to
+#: ``PIPELINE_NOT_CONSTRUCTIBLE`` — a wrong code that still fails, which is the kind of drift no
+#: test notices.
+_ENGINE_STAGE = "engines"
 
 #: The probe. Stdlib ONLY and run in ANOTHER interpreter, which is what lets the suite exercise it
 #: against ``sys.executable`` and hand-authored projects while the gate runs the identical code
 #: against the environment that has ``kedro`` and ``pyspark``. It duck-types the registry's answer
 #: rather than importing ``kedro.pipeline.Pipeline``: importing it here would put this platform's
 #: control plane one dependency away from the artifact it validates.
-_BUILD_PROBE = r'''
-import importlib, json, sys, traceback
+#:
+#: **The engine comparison is IN HERE rather than around this call, and it is FIRST.** In here,
+#: because ``importlib.metadata`` answers for the interpreter it is executed by: the alternative —
+#: a second ``subprocess`` from :func:`run_l0` asking the same ``python_executable`` what it has —
+#: proves something about a second process that is merely BELIEVED to be the one that built, and a
+#: wrapper script, a re-pointed symlink or an install landing between the two launches makes that
+#: belief false. That is A.42's own defect at a smaller scale, and it would need a second "the
+#: interpreter never answered" channel besides :func:`_probe_verdict`'s ``None``.
+#:
+#: First, so that no module the artifact ships has executed when the pins are read — which is
+#: exactly the residual forgery :func:`_probe_verdict` documents and cannot close for the build
+#: verdict. **Ordering alone is not enough, and two successive reviews found that out the hard way;
+#: both holes are recorded because the reasoning that produced them is more instructive than the
+#: patch.**
+#:
+#: 1. ``importlib.metadata`` SCANS ``sys.path``, and the probe is launched ``python -c`` with
+#:    ``cwd=root``, so **the project root is already at ``sys.path[0]`` before the probe's first
+#:    statement**. A tree shipping a root-level ``kedro.egg-info/`` answered for its own pin — and
+#:    because :func:`_files_on_disk` deliberately skips ``*.egg-info`` (an editable install writes
+#:    one by *using* a project, so it is correctly not drift), that forgery was invisible to
+#:    ``PROJECT_HASH_MISMATCH`` too: ``PASSED``, zero findings. A.42 through its own fix.
+#: 2. The probe's own first line was
+#:    ``import importlib, importlib.metadata, json, os.path, sys, traceback`` — and it ran on that
+#:    same unsanitized path. A tree shipping ``<root>/json.py`` therefore executed arbitrary code
+#:    with the live verdict nonce in ``sys.argv[1]`` and forged a passing build verdict. Strictly
+#:    weaker than (1): ``json.py`` IS inside ``generated_project_hash``, so a dropped-in copy is
+#:    ``PROJECT_HASH_MISMATCH`` and :func:`~featuregen.materialize.compile.chain._prove_the_build`'s
+#:    identity check keeps the chain honest — it needs an adversary-SEALED tree, not a hand edit.
+#:    Weaker, but it falsified the sentence above, and a false comment is worse than none.
+#:
+#: So the probe imports ``sys`` alone (a built-in: unshadowable), REMOVES every ``sys.path`` entry
+#: that lies inside the project, imports everything else, asks, and restores the list exactly before
+#: it imports the artifact. Sanitizing inside the probe rather than launching it differently,
+#: deliberately:
+#:
+#: * it is COMPLETE — it does not matter how an entry under ``root`` got onto the path (the ``-c``
+#:   cwd entry, a caller's ``PYTHONPATH``, a future interpreter's own additions); ``-P`` /
+#:   ``PYTHONSAFEPATH`` close only the cwd door and leave ``PYTHONPATH=<root>`` wide open;
+#: * it does not depend on HOW the probe was launched, so it cannot be undone by a caller;
+#: * ``-P`` is 3.11+, and passing it to an older L0 interpreter would fail the launch and be
+#:   reported as "the environment did not answer" — a regression dressed as a hardening;
+#: * ``PYTHONSAFEPATH=1`` in the env would silently change ``run_l0``'s documented contract that
+#:   ``env=None`` inherits this process's environment unchanged, and still closes only one door.
+#:
+#: The restore is exact. This narrows the METADATA QUERY; the build that follows must import the
+#: project under precisely the path it always did, or the engine fix would have changed what
+#: ``PROJECT_DOES_NOT_BUILD`` means.
+_BUILD_PROBE = f"ENGINE_STAGE = {_ENGINE_STAGE!r}\n" + r'''
+# `sys` ONLY, and nothing else yet. It is a built-in module (`sys.builtin_module_names`), so it can
+# never be loaded from `sys.path` and no tree can shadow it. Every other import waits until the
+# project is off the path: this probe's own first line used to be
+# `import importlib, importlib.metadata, json, os.path, sys, traceback`, executed while `cwd=root`
+# still had the project at `sys.path[0]`, so a tree shipping `<root>/json.py` ran arbitrary code —
+# with the live verdict nonce in `sys.argv[1]` — and forged a passing build verdict.
+import sys
 
-MARKER, root, package = sys.argv[1], sys.argv[2], sys.argv[3]
-sys.path.insert(0, root + "/src")
+MARKER, root, package, lockfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
+# Pass 1, with NOTHING imported: drop the cwd entries. `python -c` puts "" at `sys.path[0]` and
+# `_probe_verdict` launches with `cwd=root`, so those ARE the project. Done with pure `sys` because
+# importing anything at all — even `os` — is what pass 2 needs and pass 1 must therefore precede.
+whole_path = list(sys.path)
+sys.path[:] = [entry for entry in whole_path if entry not in ("", ".")]
+
+# Safe now: `os` cannot be resolved from the tree. (`os` is normally already in `sys.modules` from
+# `site`, but this does not rely on that.)
+import os.path
+
+# Pass 2: every remaining entry that RESOLVES inside the project — a caller's `PYTHONPATH=<root>`,
+# a relative entry (`cwd` is the project, so it resolves inside), `<root>/./`, `<root>/src/../`, a
+# symlink whose target is the tree, a nested directory. `realpath` collapses all of those and the
+# `+ os.sep` guard stops `<root>-sibling` matching as if it were inside.
+#
+# DELIBERATELY NOT stripped: an entry that merely passes THROUGH the tree by symlink to a target
+# outside it. `realpath` resolves to the target, the target is not the artifact, and the artifact
+# cannot create it — a project cannot author a `sys.path` entry, only files under its own root.
+inside = os.path.realpath(root)
+sys.path[:] = [entry for entry in sys.path
+               if os.path.realpath(entry) != inside
+               and not os.path.realpath(entry).startswith(inside + os.sep)]
+
+# The rest, resolved with the project off the path — so these are the interpreter's own modules.
+import importlib, importlib.metadata, json, traceback
+
+importlib.invalidate_caches()
 
 
-def emit(stage, ok, observed=""):
-    print(MARKER + json.dumps({"stage": stage, "ok": ok, "observed": observed}))
+def emit(stage, ok, observed="", pins=()):
+    print(MARKER + json.dumps(
+        {"stage": stage, "ok": ok, "observed": observed, "pins": [list(pin) for pin in pins]}))
     raise SystemExit(0)
 
+
+try:
+    with open(os.path.join(root, lockfile), encoding="utf-8") as handle:
+        lock_lines = handle.read().splitlines()
+except (OSError, UnicodeDecodeError):
+    # UnicodeDecodeError is a ValueError, NOT an OSError. Uncaught it kills the probe, prints no
+    # verdict, and `run_l0` reports "the environment did not answer" — blaming the interpreter for
+    # a lock the ARTIFACT wrote unreadable, which is the mis-routing this whole change exists to
+    # stop. It is a finding about the project, and the tree's PROJECT_HASH_MISMATCH survives it.
+    emit(ENGINE_STAGE, False, lockfile + " could not be read")
+
+declared = []
+for lock_line in lock_lines:
+    requirement = lock_line.split("#", 1)[0].strip()
+    if "==" not in requirement:
+        continue
+    name, _, pinned = requirement.partition("==")
+    # The pin names a DISTRIBUTION, which is not an import name: `kedro-datasets` installs the
+    # module `kedro_datasets`. `importlib.metadata.version` is asked for the distribution and
+    # normalizes the spelling itself; importing the name would fail on the dash, and reading a
+    # module's `__version__` would trust an attribute the package may ship stale or not at all.
+    name = name.split(";", 1)[0].split("[", 1)[0].strip()          # drop markers and extras
+    pinned = pinned.split(";", 1)[0].strip()
+    if name and pinned:
+        declared.append((name, pinned))
+
+if not declared:
+    # Fails CLOSED. A project that declares no environment cannot have its prover checked against
+    # one, and "nothing to compare" must not read as "they agree" — that IS A.42.
+    emit(ENGINE_STAGE, False, lockfile + " pins no distribution")
+
+disagreements = []
+for name, pinned in sorted(set(declared)):
+    try:
+        installed = importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        installed = None
+    # EXACT string equality, on a name `importlib.metadata` has already normalized (PEP 503, so
+    # `kedro-datasets` and `kedro_datasets` are one distribution). Versions are NOT normalized:
+    # `1.5` vs `1.5.0` and `1.5.0RC1` vs `1.5.0rc1` are PEP 440-equal and are reported here as
+    # disagreements. That is FALSE POSITIVES ONLY — no version string can slip through by being
+    # merely equivalent — which is the direction to be wrong in, and the alternative is `packaging`
+    # inside a stdlib-only probe. A capture that writes `kedro: "1.5"` renders a lock that can
+    # never pass; the fix is to capture the full version. Note also that a `--hash=` annotation or
+    # an unevaluated environment marker rides along in `pinned` and always disagrees: today's
+    # `_render_requirements` emits bare `name==version`, and a pip-compile-style lock would need
+    # this parser widened rather than discovering it as a mystery refusal.
+    if installed != pinned:
+        disagreements.append([name, pinned, installed])
+
+# Restored EXACTLY, before anything is imported: the narrowing above is scoped to the metadata
+# query, and the build must run under the path it always did.
+sys.path[:] = whole_path
+importlib.invalidate_caches()
+
+if disagreements:
+    emit(ENGINE_STAGE, False,
+         str(len(disagreements)) + " of " + str(len(set(declared))) + " declared pin(s) disagree",
+         disagreements)
+
+sys.path.insert(0, root + "/src")
 
 try:
     importlib.import_module(package)
@@ -388,6 +661,44 @@ emit("build", True, str(max(counts.values())) + " nodes")
 '''
 
 
+def _probe_environment(root: pathlib.Path, env: Mapping[str, str] | None) -> dict[str, str]:
+    """The child's environment, with ``PYTHONPATH`` entries INSIDE the project removed.
+
+    The one sanitization the probe cannot do for itself, because it happens before the probe exists.
+    ``PYTHONPATH`` is on ``sys.path`` during **site initialization**, so a project shipping
+    ``<root>/sitecustomize.py`` runs at interpreter startup — ahead of ``import sys``, ahead of
+    everything — and can print a forged verdict using the nonce in ``sys.argv[1]``. No ordering
+    inside the probe reaches earlier than that, and ``-P`` / ``PYTHONSAFEPATH`` do not help: they
+    drop the cwd entry and honour ``PYTHONPATH`` regardless. ``-S`` would stop it and would also
+    take ``site-packages`` away, leaving the probe unable to see the engines it exists to check.
+
+    Entries are resolved against ``root`` because that is the child's cwd, so a relative
+    ``PYTHONPATH`` entry means a directory in the project.
+
+    **This knowingly amends ``run_l0``'s "``env=None`` inherits this process's environment
+    unchanged".** It is now *unchanged except for project-internal ``PYTHONPATH`` entries*, and the
+    amendment is deliberate: the contract existed so a caller could reach the probe with what the
+    interpreter needs, not so an artifact could be handed a way to execute before it is inspected.
+    Nothing in ``src/`` or ``deploy/`` sets ``PYTHONPATH``, and an entry pointing INTO the tree
+    being validated is never load-bearing — the probe puts ``<root>/src`` on ``sys.path`` itself and
+    the cwd still supplies ``<root>``, so the build imports exactly what it always did.
+    """
+    merged = dict(os.environ) if env is None else {**os.environ, **env}
+    declared = merged.get("PYTHONPATH")
+    if not declared:
+        return merged
+    inside = os.path.realpath(root)
+    kept = [entry for entry in declared.split(os.pathsep)
+            if entry and os.path.realpath(os.path.join(str(root), entry)) != inside
+            and not os.path.realpath(
+                os.path.join(str(root), entry)).startswith(inside + os.sep)]
+    if kept:
+        merged["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        merged.pop("PYTHONPATH", None)
+    return merged
+
+
 def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
                    timeout_seconds: float,
                    env: Mapping[str, str] | None) -> dict[str, Any] | None:
@@ -398,18 +709,41 @@ def _probe_verdict(root: pathlib.Path, package: str, *, python_executable: str,
     line are all *the validation did not run*, which §11.2 records as ``status="error"`` with no
     findings. Turning any of them into ``PROJECT_DOES_NOT_BUILD`` would blame the artifact for the
     environment.
+
+    The verdict line is matched against a marker minted for THIS invocation and handed to the probe
+    through its argv. That defeats fixed-string forgery and log replay — a project that prints a
+    verdict-shaped line carrying the well-known prefix, or one copied from an earlier run's log,
+    matches nothing. It does NOT defeat an in-interpreter echo: the probe imports the project in its
+    own interpreter, so module code that reads ``sys.argv[1]`` at import time can print the live
+    marker and forge a verdict. Closing that would mean not importing the artifact in the process
+    that holds the marker, which is out of scope at this seam.
+
+    The ENGINE verdict is decided before that exposure begins, but "by construction" was too strong
+    a phrase and is not used here: it is true only because the probe now takes the project off
+    ``sys.path`` before importing anything but ``sys``. Until it did, its own
+    ``import … json …`` line ran off the artifact's root and could be answered by ``<root>/json.py``
+    — the marker forged from inside the probe's *own* imports rather than the project's. The
+    property is real; it rests on that ordering **and** on :func:`_probe_environment`, which closes
+    the one door earlier than any line the probe can execute: ``sitecustomize`` off a
+    ``PYTHONPATH`` that names the tree, run during site initialization.
+
+    The lock filename travels through argv rather than being spelled inside the probe's source, so
+    the file the renderer WRITES and the file the probe READS are one constant
+    (:data:`~featuregen.materialize.identity.REQUIREMENTS_LOCK_FILENAME`).
     """
+    marker = _verdict_marker()
     try:
         completed = subprocess.run(                                       # noqa: S603 - fixed argv
-            [python_executable, "-c", _BUILD_PROBE, _VERDICT_MARKER, str(root), package],
+            [python_executable, "-c", _BUILD_PROBE, marker, str(root), package,
+             REQUIREMENTS_LOCK_FILENAME],
             capture_output=True, text=True, timeout=timeout_seconds, check=False,
-            cwd=str(root), env=None if env is None else {**os.environ, **env})
+            cwd=str(root), env=_probe_environment(root, env))
     except (OSError, subprocess.SubprocessError):
         return None
     for line in reversed(completed.stdout.splitlines()):
-        if line.startswith(_VERDICT_MARKER):
+        if line.startswith(marker):
             try:
-                verdict = json.loads(line[len(_VERDICT_MARKER):])
+                verdict = json.loads(line[len(marker):])
             except json.JSONDecodeError:
                 return None
             return verdict if isinstance(verdict, dict) else None
@@ -462,6 +796,46 @@ def _lock_of(root: pathlib.Path) -> RenderedArtifactIdentity:
     return read_lock(lock.read_text(encoding="utf-8"))
 
 
+def _engine_findings(verdict: Mapping[str, Any]) -> list[ValidationFinding]:
+    """The probe's engine verdict, as findings — ONE per disagreeing distribution.
+
+    Per distribution rather than one aggregate, because each field of a finding has to stay a fact
+    about one thing: an aggregate would have to write three pins into ``expected`` and three
+    installed versions into ``observed``, and the reader would be back to parsing prose. Each
+    finding names the package in all three of ``location``, ``expected`` and ``observed``, so no
+    single field of it reads as a bare "mismatch" — recreating A.42's own complaint one level up.
+
+    The fallback is not defensive padding. The probe emits this stage for two conditions that name
+    no package at all — the lock could not be read, and the lock pins nothing — and both must still
+    produce a finding, because ``FAILED`` with an empty findings tuple is refused by
+    :class:`ValidationReportV1` and would abort the validation with a ``ValueError`` instead of
+    reporting it. Any unrecognized payload lands there too, which is the fail-closed answer.
+    """
+    findings: list[ValidationFinding] = []
+    for entry in verdict.get("pins") or ():
+        if not isinstance(entry, list | tuple) or len(entry) != 3:
+            continue
+        name, pinned, installed = entry
+        if not isinstance(name, str) or not name.strip() or \
+                not isinstance(pinned, str) or not pinned.strip():
+            continue
+        findings.append(ValidationFinding(
+            code=ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+            location=f"{REQUIREMENTS_LOCK_FILENAME}:{name}",
+            expected=f"{name}=={pinned}",
+            observed=(f"{name} is not installed" if installed is None
+                      else f"{name}=={installed}"),
+            count=1))
+    if findings:
+        return findings
+    return [ValidationFinding(
+        code=ValidationFindingCode.ENGINE_VERSION_MISMATCH,
+        location=REQUIREMENTS_LOCK_FILENAME,
+        expected="a <distribution>==<version> pin for every engine the project runs on",
+        observed=str(verdict.get("observed") or "unknown") or "unknown",
+        count=1)]
+
+
 def run_l0(
     root: str | os.PathLike[str],
     *,
@@ -473,7 +847,8 @@ def run_l0(
     env: Mapping[str, str] | None = None,
     timeout_seconds: float = 300.0,
 ) -> ValidationReportV1:
-    """L0 (§11.2): the project on disk hashes to its lock, imports, and yields a pipeline.
+    """L0 (§11.2): the project hashes to its lock, is proved in the environment it DECLARES, and
+    imports and yields a pipeline there.
 
     It takes a DIRECTORY, not a
     :class:`~featuregen.materialize.identity.SealedProject`. A sealed object's files are by
@@ -482,8 +857,12 @@ def run_l0(
     only exists on disk. Materializing a sealed project to a temporary directory is
     :func:`~featuregen.materialize.render.project.materialize_to`; L0 validates what that wrote.
 
-    Both checks always run: a project may be edited *and* fail to build, and reporting one of the
-    two would send an operator to fix the half that was visible.
+    The hash check and the probe always both run: a project may be edited *and* fail to build, and
+    reporting one of the two would send an operator to fix the half that was visible. Inside the
+    probe the ENGINE comparison is the exception — it short-circuits, because the build verdict
+    that would follow it is not a fact about the artifact but about the wrong environment, and this
+    module does not record verdicts nobody can act on. ``ENGINE_VERSION_MISMATCH`` is therefore the
+    only L0 code that appears without one of the build codes beside it.
 
     Args:
         root: the materialized project.
@@ -494,14 +873,22 @@ def run_l0(
         python_executable: the interpreter the project is imported in. It is a parameter because
             the generated project imports ``kedro`` and ``pyspark``, which this platform does not
             depend on; there is no default, so nothing can silently validate the artifact against
-            the validator's own environment.
+            the validator's own environment. It is also the interpreter whose INSTALLED
+            distributions the project's own ``requirements.lock`` is compared against, so handing
+            L0 an interpreter other than the declared one now yields ``ENGINE_VERSION_MISMATCH``
+            instead of a build proof about somewhere else.
         clock: read twice — once before the work and once after — so ``finished_at`` is the time
             the validation ended rather than a value the caller supplied in advance.
         env: variables OVERLAID on this process's environment for the probe. The environment that
             has ``pyspark`` needs several of them, and the one that costs a debugging cycle is that
             ``PYSPARK_PYTHON`` and ``PYSPARK_DRIVER_PYTHON`` must BOTH name the same interpreter —
             without them Spark launches workers on the system Python and its own ``types.py`` dies
-            on ``X | Y``. ``None`` inherits this process's environment unchanged.
+            on ``X | Y``. ``None`` inherits this process's environment — unchanged **except** that
+            ``PYTHONPATH`` entries resolving inside ``root`` are dropped, whether they came from
+            here or from this process. That exception is not incidental: ``PYTHONPATH`` is live
+            during site initialization, so a tree naming itself there executes
+            ``<root>/sitecustomize.py`` before the probe's first statement and can forge a verdict.
+            :func:`_probe_environment` states the full reasoning.
         timeout_seconds: after which the probe is *unreachable*, not failing.
 
     Raises:
@@ -542,7 +929,16 @@ def run_l0(
                 group_plan_hash=lock.compilation.group_plan_hash, level=ValidationLevel.L0,
                 environment_id=environment_id, status=ValidationStatus.ERROR,
                 started_at=started_at, finished_at=clock(), findings=())
-        if not verdict.get("ok"):
+        if verdict.get("stage") == _ENGINE_STAGE:
+            # The probe stopped BEFORE importing anything, so there is no build verdict to report
+            # and none is invented. A build attempted in an interpreter the artifact does not
+            # declare would fail for reasons that are not the renderer's, and filing that as
+            # PROJECT_DOES_NOT_BUILD (a RENDERER_DEFECT) is the mis-routing this ordering avoids.
+            # Dispatched on the STAGE and not on `ok`: the probe emits this stage only to refuse,
+            # so an "engines are fine" verdict is not one it can produce — and a forged one lands
+            # on `_engine_findings`' fallback and still FAILS, rather than skipping both checks.
+            findings.extend(_engine_findings(verdict))
+        elif not verdict.get("ok"):
             findings.append(ValidationFinding(
                 code=(ValidationFindingCode.PROJECT_DOES_NOT_BUILD
                       if verdict.get("stage") == "import"
@@ -633,11 +1029,15 @@ def _read_set(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec,
 
     The spine's refs are catalog-side (§3.5 flattens their schema segment), so only the column
     segment is taken from them; the physical table is the one its own resolved requirement names.
+
+    Keys are CASE-FOLDED, exactly as every column comparison already is: unquoted Hive identifiers
+    fold, so ``RISK.TXN`` and ``risk.txn`` are one table, and unfolded keys would ask the metastore
+    about it twice and report each answer as its own finding.
     """
     read: dict[tuple[str, str], list[str]] = {}
 
     def add(schema: str, table: str, column: str) -> None:
-        columns = read.setdefault((schema, table), [])
+        columns = read.setdefault((_fold(schema), _fold(table)), [])
         if column not in columns:
             columns.append(column)
 
@@ -736,6 +1136,9 @@ def run_l1(
 
     findings: list[ValidationFinding] = []
     try:
+        # Finding locations spell schema.table FOLDED (Hive-canonical, the read-set key) for the
+        # read/column/type findings below, and in the snapshot requirement's OWN spelling for
+        # PARTITION_ABSENT — intentional: two observed casings have no single observed spelling.
         denied: set[tuple[str, str]] = set()
         for (schema, table), columns in _read_set(irs, spine, spine_table).items():
             if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):
@@ -780,14 +1183,18 @@ def run_l1(
             if snapshot.partition_specs is None:
                 continue
             physical = (snapshot.requirement.schema, snapshot.requirement.table)
-            if physical in denied:
+            # `denied` and `live` are keyed by the FOLDED pair (the read-set loop's keys), so a
+            # requirement spelling the same table in another case still hits the denial and the
+            # cached partition listing; the finding below keeps the requirement's own spelling.
+            folded = (_fold(physical[0]), _fold(physical[1]))
+            if folded in denied:
                 continue
-            if physical not in live:
-                live[physical] = {
+            if folded not in live:
+                live[folded] = {
                     _canonical_partition(partition) for partition
                     in metastore.list_partitions(schema=physical[0], table=physical[1])}
             absent = [spec for spec in snapshot.partition_specs
-                      if _canonical_partition(spec.columns) not in live[physical]]
+                      if _canonical_partition(spec.columns) not in live[folded]]
             if absent:
                 findings.append(ValidationFinding(
                     code=ValidationFindingCode.PARTITION_ABSENT,

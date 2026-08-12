@@ -1,0 +1,423 @@
+{
+  "gold_set_version": 1,
+  "gold_set_id": "catalog_profile_gold_v1",
+  "owner": "profile plan Task 6 (Release-A evaluation step), jointly with semantic Task 10",
+  "purpose": "Replay/fixture gold set for the Release-A catalog-profile evaluation. Table-grain, not column-grain: each entry is a DATASET whose kind, authority and temporal model a reviewer has fixed in advance. No live catalog rows, no live provider.",
+  "how_the_oracle_works": "Pass B's profile synthesis is replayed, never called. Each dataset declares the synthesis OUTPUT a reviewer accepts (`expected_synthesis`); the harness records that output into the REAL `structured_results` store under result_type `table_profile_synthesis` and replays it back by recomputed input hash, proving a full no-client round trip. The thin/rich contrast is the `FEATUREGEN_DATASET_PROFILES` flag: with it off, table selection sees only the lexical surface; with it on, the data_role / authority_role / temporal_storage_model / business_context projections are available to search, feature generation and retrieval.",
+  "invariants_enforced_by_the_self_check": [
+    "every expected data_role is a DataRole member; every authority_role an AuthorityRole member; every temporal_storage_model a TemporalStorageModel member",
+    "every family carries at least one `case` and at least one `counterexample`",
+    "no two datasets share a (catalog_source, table)",
+    "every `prefer` / `avoid` table named by a selection question is a declared dataset",
+    "`load_bearing` is true ONLY where the fixture supplies source-attested or human-confirmed evidence -- an llm_proposed fixture that claimed load-bearing would be the very defect under test"
+  ],
+  "catalog_source": "ftr",
+  "families": [
+    {
+      "family": "event_fact_vs_snapshot_fact",
+      "defect": "A periodic balance snapshot aggregated as though each row were an event (double counting), or an event log point-in-time-joined as though each row were a state (silent gaps).",
+      "datasets": [
+        {
+          "id": "event_fact_vs_snapshot_fact/comp_fin_tran",
+          "role": "case",
+          "table": "comp_fin_tran",
+          "columns": ["tran_serial_num", "pstd_date", "actual_counter_party_amt", "tran_crncy"],
+          "narrative": "One row per financial transaction posted to the compliance extract.",
+          "business_context": "Feeds transaction monitoring. One row per posting; never restated.",
+          "expected": {
+            "data_role": "event_fact",
+            "authority_role": "authoritative_replica",
+            "temporal_storage_model": "event_log",
+            "primary_entity": "counterparty"
+          },
+          "expected_synthesis": {
+            "table_description": "One row per financial transaction posted to the compliance extract.",
+            "business_context": "Feeds transaction monitoring. One row per posting; never restated.",
+            "authority_role": "authoritative_replica",
+            "temporal_storage_model": "event_log"
+          },
+          "evidence": {
+            "table_role": {"value": "event_fact", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "authoritative_replica", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "event_log", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": false},
+          "why": "the table role is source-attested so it IS load-bearing; the two LLM-proposed classifications are DISPLAYED and never load-bearing -- the discrimination this whole family rests on"
+        },
+        {
+          "id": "event_fact_vs_snapshot_fact/acct_bal_eod",
+          "role": "counterexample",
+          "table": "acct_bal_eod",
+          "columns": ["dr_acct_num", "bal_date", "ledger_bal_amt", "bal_crncy"],
+          "narrative": "End-of-day ledger balance per account per business date.",
+          "business_context": "One row per account per day. Balances are states, not flows; summing across dates double counts.",
+          "expected": {
+            "data_role": "snapshot_fact",
+            "authority_role": "system_of_record",
+            "temporal_storage_model": "snapshot",
+            "primary_entity": "account"
+          },
+          "expected_synthesis": {
+            "table_description": "End-of-day ledger balance per account per business date.",
+            "business_context": "One row per account per day. Balances are states, not flows; summing across dates double counts.",
+            "authority_role": "system_of_record",
+            "temporal_storage_model": "snapshot"
+          },
+          "evidence": {
+            "table_role": {"value": "snapshot_fact", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "system_of_record", "producer": "human", "strength": "confirmed"},
+            "temporal_storage_model": {"value": "snapshot", "producer": "human", "strength": "confirmed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": true, "temporal_storage_model": true},
+          "why": "the human four-eyes confirmation is what makes an authority classification load-bearing; this dataset is the positive control for that path"
+        }
+      ]
+    },
+    {
+      "family": "customer_dimension_vs_population",
+      "defect": "A conformed customer dimension used as the analysis POPULATION spine, so customers outside the study cohort silently enter every count; or a curated study population used as a dimension, so joins drop rows.",
+      "datasets": [
+        {
+          "id": "customer_dimension_vs_population/cust_master",
+          "role": "case",
+          "table": "cust_master",
+          "columns": ["cust_cif_id", "cust_dob", "cust_ctzn_ctry_cd", "cust_seg_cd"],
+          "narrative": "The conformed customer master: one current row per customer information file identifier.",
+          "business_context": "A DIMENSION, not a study population. Every customer the bank has ever onboarded is present, including closed relationships.",
+          "expected": {
+            "data_role": "dimension",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "current_only",
+            "primary_entity": "customer"
+          },
+          "expected_synthesis": {
+            "table_description": "The conformed customer master: one current row per customer information file identifier.",
+            "business_context": "A DIMENSION, not a study population. Every customer the bank has ever onboarded is present, including closed relationships.",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "current_only"
+          },
+          "evidence": {
+            "table_role": {"value": "dimension", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "mastered_view", "producer": "human", "strength": "confirmed"},
+            "temporal_storage_model": {"value": "current_only", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": true, "temporal_storage_model": false},
+          "why": "a dimension is never a population spine; the business_context says so in words a retrieval leg can read"
+        },
+        {
+          "id": "customer_dimension_vs_population/aml_review_population",
+          "role": "counterexample",
+          "table": "aml_review_population",
+          "columns": ["cust_cif_id", "review_cycle_dt", "in_scope_flag"],
+          "narrative": "The customers in scope for a given AML periodic-review cycle.",
+          "business_context": "A curated POPULATION spine. Left-join facts onto it; never use it as a lookup dimension.",
+          "expected": {
+            "data_role": "reference",
+            "authority_role": "derived",
+            "temporal_storage_model": "snapshot",
+            "primary_entity": "customer"
+          },
+          "expected_synthesis": {
+            "table_description": "The customers in scope for a given AML periodic-review cycle.",
+            "business_context": "A curated POPULATION spine. Left-join facts onto it; never use it as a lookup dimension.",
+            "authority_role": "derived",
+            "temporal_storage_model": "snapshot"
+          },
+          "evidence": {
+            "table_role": {"value": "reference", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "derived", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "snapshot", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": false},
+          "why": "derived-from-a-rule is exactly the authority class that must never be mistaken for a system of record"
+        }
+      ]
+    },
+    {
+      "family": "system_of_record_vs_replica",
+      "defect": "A lagging non-authoritative replica read as the system of record. Every downstream 'as of' claim then quietly means 'as of whenever the copy last ran'.",
+      "datasets": [
+        {
+          "id": "system_of_record_vs_replica/core_acct_sor",
+          "role": "case",
+          "table": "core_acct_sor",
+          "columns": ["dr_acct_num", "acct_open_dt", "acct_stat_cd"],
+          "narrative": "The core banking account master -- the system of record for account existence and status.",
+          "business_context": "Authoritative. Any disagreement with a downstream copy is resolved in favour of this table.",
+          "expected": {
+            "data_role": "dimension",
+            "authority_role": "system_of_record",
+            "temporal_storage_model": "current_only",
+            "primary_entity": "account"
+          },
+          "expected_synthesis": {
+            "table_description": "The core banking account master -- the system of record for account existence and status.",
+            "business_context": "Authoritative. Any disagreement with a downstream copy is resolved in favour of this table.",
+            "authority_role": "system_of_record",
+            "temporal_storage_model": "current_only"
+          },
+          "evidence": {
+            "table_role": {"value": "dimension", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "system_of_record", "producer": "source", "strength": "attested"},
+            "temporal_storage_model": {"value": "current_only", "producer": "human", "strength": "confirmed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": true, "temporal_storage_model": true},
+          "why": "source-attested authority is load-bearing without a human step -- the OTHER accepted producer on the operational rule"
+        },
+        {
+          "id": "system_of_record_vs_replica/acct_mirror_daily",
+          "role": "counterexample",
+          "table": "acct_mirror_daily",
+          "columns": ["dr_acct_num", "acct_stat_cd", "rec_load_ts"],
+          "narrative": "A nightly mirror of the core account master, landed into the analytics zone.",
+          "business_context": "A NON-AUTHORITATIVE replica with up to 24 hours of lag. Never cite it for a point-in-time status.",
+          "expected": {
+            "data_role": "dimension",
+            "authority_role": "non_authoritative_replica",
+            "temporal_storage_model": "snapshot",
+            "primary_entity": "account"
+          },
+          "expected_synthesis": {
+            "table_description": "A nightly mirror of the core account master, landed into the analytics zone.",
+            "business_context": "A NON-AUTHORITATIVE replica with up to 24 hours of lag. Never cite it for a point-in-time status.",
+            "authority_role": "non_authoritative_replica",
+            "temporal_storage_model": "snapshot"
+          },
+          "evidence": {
+            "table_role": {"value": "dimension", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "non_authoritative_replica", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "snapshot", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": false},
+          "why": "the LLM is RIGHT here and still must not be load-bearing -- correctness is not authority"
+        }
+      ]
+    },
+    {
+      "family": "scd2_vs_current_only",
+      "defect": "A current-only table used for an as-of-date join (it silently answers with today's value for every historical date), or an SCD2 table joined without its validity predicate (it fans out one row per version).",
+      "datasets": [
+        {
+          "id": "scd2_vs_current_only/cust_addr_hist",
+          "role": "case",
+          "table": "cust_addr_hist",
+          "columns": ["cust_cif_id", "addr_line_1", "valid_from_dt", "valid_to_dt"],
+          "narrative": "Slowly changing customer address history with half-open validity intervals.",
+          "business_context": "SCD2. Every join MUST carry the validity predicate or the row count fans out per version.",
+          "expected": {
+            "data_role": "dimension",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "scd2",
+            "primary_entity": "customer"
+          },
+          "expected_synthesis": {
+            "table_description": "Slowly changing customer address history with half-open validity intervals.",
+            "business_context": "SCD2. Every join MUST carry the validity predicate or the row count fans out per version.",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "scd2"
+          },
+          "evidence": {
+            "table_role": {"value": "dimension", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "mastered_view", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "scd2", "producer": "human", "strength": "confirmed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": true},
+          "why": "the temporal model is the load-bearing one here because a wrong answer changes row counts, so it went through four eyes"
+        },
+        {
+          "id": "scd2_vs_current_only/cust_addr_current",
+          "role": "counterexample",
+          "table": "cust_addr_current",
+          "columns": ["cust_cif_id", "addr_line_1"],
+          "narrative": "The customer's current address only. No history is retained.",
+          "business_context": "CURRENT ONLY. An as-of-date join against this table answers with today's value for every historical date.",
+          "expected": {
+            "data_role": "dimension",
+            "authority_role": "derived",
+            "temporal_storage_model": "current_only",
+            "primary_entity": "customer"
+          },
+          "expected_synthesis": {
+            "table_description": "The customer's current address only. No history is retained.",
+            "business_context": "CURRENT ONLY. An as-of-date join against this table answers with today's value for every historical date.",
+            "authority_role": "derived",
+            "temporal_storage_model": "current_only"
+          },
+          "evidence": {
+            "table_role": {"value": "dimension", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "derived", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "current_only", "producer": "human", "strength": "confirmed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": true},
+          "why": "same shape, opposite answer -- the pair is what proves the classification carries information rather than a constant"
+        }
+      ]
+    },
+    {
+      "family": "real_crosswalk_vs_ordinary_reference",
+      "defect": "An ordinary code lookup treated as an identifier crosswalk (it then licenses a two-leg join that maps nothing), or a genuine crosswalk demoted to a lookup (the only legal path between two namespaces is discarded).",
+      "datasets": [
+        {
+          "id": "real_crosswalk_vs_ordinary_reference/cif_to_swift_xref",
+          "role": "case",
+          "table": "cif_to_swift_xref",
+          "columns": ["cust_cif_id", "cust_swift_cd", "eff_from_dt"],
+          "narrative": "Maps a customer information file identifier to the SWIFT code of the institution the customer banks at.",
+          "business_context": "A genuine CROSSWALK between two identifier namespaces. It is the only legal path from cif to swift_bic.",
+          "expected": {
+            "data_role": "crosswalk",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "scd2",
+            "primary_entity": "customer"
+          },
+          "expected_synthesis": {
+            "table_description": "Maps a customer information file identifier to the SWIFT code of the institution the customer banks at.",
+            "business_context": "A genuine CROSSWALK between two identifier namespaces. It is the only legal path from cif to swift_bic.",
+            "authority_role": "mastered_view",
+            "temporal_storage_model": "scd2"
+          },
+          "evidence": {
+            "table_role": {"value": "bridge", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "mastered_view", "producer": "human", "strength": "confirmed"},
+            "temporal_storage_model": {"value": "scd2", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": true, "temporal_storage_model": false},
+          "why": "the canonical table_role stays `bridge` and only DISPLAYS as crosswalk -- derive, never duplicate. Crosswalk EXECUTION is Release C; Release A only has to classify it honestly."
+        },
+        {
+          "id": "real_crosswalk_vs_ordinary_reference/tran_stat_code_ref",
+          "role": "counterexample",
+          "table": "tran_stat_code_ref",
+          "columns": ["tran_stat_cd", "tran_stat_desc"],
+          "narrative": "The code-to-label lookup for transaction settlement statuses.",
+          "business_context": "An ordinary REFERENCE lookup. It maps a code to its label, not one identifier namespace to another.",
+          "expected": {
+            "data_role": "reference",
+            "authority_role": "external_reference",
+            "temporal_storage_model": "current_only",
+            "primary_entity": "transaction"
+          },
+          "expected_synthesis": {
+            "table_description": "The code-to-label lookup for transaction settlement statuses.",
+            "business_context": "An ordinary REFERENCE lookup. It maps a code to its label, not one identifier namespace to another.",
+            "authority_role": "external_reference",
+            "temporal_storage_model": "current_only"
+          },
+          "evidence": {
+            "table_role": {"value": "reference", "producer": "source", "strength": "attested"},
+            "authority_role": {"value": "external_reference", "producer": "llm", "strength": "proposed"},
+            "temporal_storage_model": {"value": "current_only", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": true, "authority_role": false, "temporal_storage_model": false},
+          "why": "two columns and a code-to-label shape is NOT a crosswalk; over-calling it manufactures a join path"
+        }
+      ]
+    },
+    {
+      "family": "honestly_unknown_tables",
+      "defect": "The failure this family grades is the OPPOSITE of the others: a staging table with no declared role being assigned one anyway, because the model would rather answer than decline.",
+      "datasets": [
+        {
+          "id": "honestly_unknown_tables/stg_raw_landing",
+          "role": "case",
+          "table": "stg_raw_landing",
+          "columns": ["misc_fld_017", "col_a1", "rec_load_ts"],
+          "narrative": null,
+          "business_context": null,
+          "expected": {
+            "data_role": "unknown",
+            "authority_role": "unknown",
+            "temporal_storage_model": "unknown",
+            "primary_entity": null
+          },
+          "expected_synthesis": null,
+          "evidence": {},
+          "load_bearing": {"data_role": false, "authority_role": false, "temporal_storage_model": false},
+          "why": "no evidence at all. Every field must come back `undecided:no_evidence` -- not `unknown` dressed as a decision, and never a guess"
+        },
+        {
+          "id": "honestly_unknown_tables/stg_partial_landing",
+          "role": "counterexample",
+          "table": "stg_partial_landing",
+          "columns": ["dr_acct_num", "rec_load_ts"],
+          "narrative": "Raw landing zone for the nightly account extract.",
+          "business_context": null,
+          "expected": {
+            "data_role": "unknown",
+            "authority_role": "non_authoritative_replica",
+            "temporal_storage_model": "unknown",
+            "primary_entity": null
+          },
+          "expected_synthesis": {
+            "table_description": "Raw landing zone for the nightly account extract.",
+            "business_context": null,
+            "authority_role": "non_authoritative_replica",
+            "temporal_storage_model": null
+          },
+          "evidence": {
+            "authority_role": {"value": "non_authoritative_replica", "producer": "llm", "strength": "proposed"}
+          },
+          "load_bearing": {"data_role": false, "authority_role": false, "temporal_storage_model": false},
+          "why": "PARTIAL knowledge must not become total knowledge: one answerable field does not license filling in the other two. `data_role` and `temporal_storage_model` stay undecided while `authority_role` shows an llm_proposed display value."
+        }
+      ]
+    }
+  ],
+  "table_selection_questions": {
+    "purpose": "Profile table-selection quality. `prefer` tables are the datasets a correct answer must reach for; `avoid` tables are the ones whose profile makes them wrong for this question. Scored thin (flag off) vs rich (flag on).",
+    "questions": [
+      {
+        "id": "p_balance_as_of",
+        "question": "what was each account's balance at the end of last month",
+        "prefer": ["acct_bal_eod"],
+        "avoid": ["comp_fin_tran"],
+        "why": "a balance is a state; the transaction event log is the wrong grain and summing it double counts"
+      },
+      {
+        "id": "p_transaction_volume",
+        "question": "how many transactions did each counterparty send last quarter",
+        "prefer": ["comp_fin_tran"],
+        "avoid": ["acct_bal_eod"],
+        "why": "the mirror image: counting rows of a daily snapshot counts days, not events"
+      },
+      {
+        "id": "p_current_account_status",
+        "question": "what is the authoritative current status of each account",
+        "prefer": ["core_acct_sor"],
+        "avoid": ["acct_mirror_daily"],
+        "why": "the lagging replica answers, plausibly and wrongly, up to a day late"
+      },
+      {
+        "id": "p_address_at_date",
+        "question": "what address did the customer have on the date of the transaction",
+        "prefer": ["cust_addr_hist"],
+        "avoid": ["cust_addr_current"],
+        "why": "the current-only table answers every historical date with today's value"
+      },
+      {
+        "id": "p_cif_to_bank",
+        "question": "how do I get from a customer's CIF to the SWIFT code of their bank",
+        "prefer": ["cif_to_swift_xref"],
+        "avoid": ["tran_stat_code_ref"],
+        "why": "only one of these two lookups crosses an identifier namespace"
+      },
+      {
+        "id": "p_review_cohort",
+        "question": "which customers were in scope for the last AML review cycle",
+        "prefer": ["aml_review_population"],
+        "avoid": ["cust_master"],
+        "why": "the dimension contains every customer ever onboarded; using it as the spine silently widens the cohort"
+      }
+    ]
+  },
+  "unsafe_physical_assertions": {
+    "purpose": "The `zero new unsafe physical assertions` bar. Each entry is an assertion the profile surface must NEVER make about physical data, however confident the narrative sounds.",
+    "cases": [
+      {"id": "row_count", "assertion": "row_count", "why": "no Release-A path counts rows; a synthesized row count would be an invented physical fact"},
+      {"id": "uniqueness", "assertion": "grain_is_unique", "why": "a sample may DISPROVE uniqueness and never establish it; Release A observes nothing at all"},
+      {"id": "null_rate", "assertion": "null_fraction", "why": "a column-level physical measurement with no observation behind it"},
+      {"id": "join_cardinality", "assertion": "max_matches_per_row", "why": "directional cardinality is an OBSERVATION, and Release A has no observation source"},
+      {"id": "freshness", "assertion": "data_as_of", "why": "a freshness claim needs a physical read; the narrative's prose about lag is prose, not a fact"}
+    ]
+  }
+}

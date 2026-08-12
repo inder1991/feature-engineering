@@ -274,3 +274,108 @@ describe('failures are about the question', () => {
       .not.toBeInTheDocument()
   })
 })
+
+// ── Release B: where the answer comes from ──────────────────────────────────────────────────────
+
+function selection(over: Partial<api.AnalysisSelection> = {}): api.AnalysisSelection {
+  return {
+    resolved: true,
+    sources: [
+      { need_role: 'population', withheld: false,
+        dataset_ref: 'ftr::dpl_eib.customer_master', selection_basis: 'explicit_request',
+        authority_basis: 'load_bearing_profile', authority_role: 'master',
+        considered: [{ dataset_ref: 'ftr::dpl_eib.customer_master', disposition: 'selected',
+                       reason_codes: ['explicit_request'] }],
+        considered_withheld: 0, considered_total: 1 },
+      { need_role: 'event_source', withheld: false,
+        dataset_ref: 'ftr::dpl_eib.tran_repos', selection_basis: 'serving_policy',
+        authority_basis: 'policy_declaration', authority_role: 'master',
+        considered: [{ dataset_ref: 'ftr::dpl_eib.tran_repos', disposition: 'selected',
+                       reason_codes: ['policy_preferred'] }],
+        considered_withheld: 1, considered_total: 2 },
+    ],
+    rows: [{ dataset_ref: 'ftr::dpl_eib.cust_dim', selection_kind: 'valid_at_report_cutoff',
+             cutoff_value_ref: 'report_cutoff_param',
+             predicates: [{ column_ref: 'ftr::dpl_eib.cust_dim.effective_from', operator: '<=' },
+                          { column_ref: 'ftr::dpl_eib.cust_dim.effective_to', operator: '>' }],
+             predicates_withheld: false }],
+    refusals: [],
+    warnings: [],
+    ...over,
+  }
+}
+
+describe('where the answer comes from', () => {
+  it('names the source chosen for each need and how it was chosen', async () => {
+    planAnalysis.mockResolvedValue(response({ selection: selection() }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/who is in the answer/i)).toBeInTheDocument()
+    expect(within(block).getByText('dpl_eib.customer_master')).toBeInTheDocument()
+    expect(within(block).getByText(/declared in the request/i)).toBeInTheDocument()
+    expect(within(block).getByText(/named by the serving policy/i)).toBeInTheDocument()
+  })
+
+  it('states the ROW rule and the predicates under it, not just its label', async () => {
+    planAnalysis.mockResolvedValue(response({ selection: selection() }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/valid at the report cutoff/i)).toBeInTheDocument()
+    expect(within(block).getByText(/effective_from <=/)).toBeInTheDocument()
+  })
+
+  it('reports a hidden alternative as a COUNT and never as a name', async () => {
+    planAnalysis.mockResolvedValue(response({ selection: selection() }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/1 you cannot see/i)).toBeInTheDocument()
+    // The server already withheld it; the screen must not invent a way to say what it was.
+    expect(block).not.toHaveTextContent(/archive/i)
+  })
+
+  it('shows a PROPOSED authority warning beside the decision it rode on', async () => {
+    planAnalysis.mockResolvedValue(response({
+      selection: selection({ warnings: ['PROPOSED_AUTHORITY_USED'] }) }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/nobody has confirmed/i)).toBeInTheDocument()
+  })
+
+  it('frames an undecided source as a choice, never as a failure', async () => {
+    planAnalysis.mockResolvedValue(response({
+      selection: selection({
+        resolved: false,
+        refusals: [{ code: 'SELECTION_POPULATION_UNDECLARED',
+                     subjects: ['ftr::dpl_eib.tran_repos'], subjects_withheld: 0,
+                     detail: 'no population is declared for this plan', family: 'undecided' }],
+      }) }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/nobody has decided this yet/i)).toBeInTheDocument()
+    expect(within(block).getByText(/a person chooses; nothing is wrong with the data/i))
+      .toBeInTheDocument()
+    // Not an alert, not an error region: an undecided thing is not a broken thing.
+    expect(within(block).queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('separates a data check from a decision nobody has made', async () => {
+    planAnalysis.mockResolvedValue(response({
+      selection: selection({
+        resolved: false,
+        refusals: [{ code: 'TEMPORAL_SCD_OVERLAP', subjects: ['ftr::dpl_eib.cust_dim'],
+                     subjects_withheld: 0, detail: 'two rows claim the same instant',
+                     family: 'needs_data_check' }],
+      }) }))
+    await ask()
+    const block = await screen.findByRole('region', { name: /where this answer comes from/i })
+    expect(within(block).getByText(/needs a look at the data/i)).toBeInTheDocument()
+  })
+
+  it('is absent entirely while the selection flag is off', async () => {
+    planAnalysis.mockResolvedValue(response({ selection: null }))
+    await ask()
+    await screen.findByRole('region', { name: /what this would compute/i })
+    expect(screen.queryByRole('region', { name: /where this answer comes from/i }))
+      .not.toBeInTheDocument()
+  })
+})

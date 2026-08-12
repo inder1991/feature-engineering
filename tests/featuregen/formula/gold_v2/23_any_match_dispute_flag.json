@@ -1,0 +1,59 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"expr\":{\"aggregation\":\"any_match\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":{\"kind\":\"predicate\",\"left\":\"authored::public.txns.txn_type\",\"op\":\"equal\",\"right_literal\":{\"type\":\"string\",\"value\":\"dispute\"},\"right_param\":null,\"right_set\":null},\"operand\":null,\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.txns\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.txns.txn_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"customer\",\"keys\":[\"authored::public.txns.cif_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "any_match_dispute_flag",
+  "expected": "ok",
+  "expected_proposal_hash": "9f1d53802dca5cd7376de00f1a6481f84dc19f22ab2d5abd1e018575551a4b52",
+  "note": "the honest flag: did ANY in-window row satisfy the condition \u2014 boolean, never a smuggled count [re-keyed in increment 8: authority_refs + allocation_policy_ref joined the canonical form]",
+  "operation": "any_match",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "any_match",
+        "filter": {
+          "kind": "predicate",
+          "left": "authored::public.txns.txn_type",
+          "op": "equal",
+          "right_literal": {
+            "type": "string",
+            "value": "dispute"
+          },
+          "right_param": null,
+          "right_set": null
+        },
+        "operand": null,
+        "source_relation": {
+          "table_ref": "authored::public.txns"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.txns.txn_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "customer",
+      "keys": [
+        "authored::public.txns.cif_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

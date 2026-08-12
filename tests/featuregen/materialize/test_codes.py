@@ -17,8 +17,9 @@ from featuregen.materialize.codes import (
 def test_compilation_codes_are_exactly_the_spec_set():
     assert {c.value for c in CompilationRefusalCode} == {
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
-        "FORMULA_HASH_MISMATCH", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
-        "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "AMBIGUOUS_TABLE_NAME",
+        "FORMULA_HASH_MISMATCH", "FORMULA_SCHEMA_UNSUPPORTED", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
+        "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
+        "AMBIGUOUS_TABLE_NAME",
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
         "GRAIN_PATH_NOT_GOVERNED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
         "SPINE_SOURCE_NOT_DECLARED", "SPINE_DECLARATION_REJECTED_BY_FACTS",
@@ -48,6 +49,7 @@ def test_gate_codes_are_exactly_the_spec_set():
 def test_finding_codes_are_exactly_the_spec_set():
     assert {c.value for c in ValidationFindingCode} == {
         "PROJECT_DOES_NOT_BUILD", "PROJECT_HASH_MISMATCH", "PIPELINE_NOT_CONSTRUCTIBLE",
+        "ENGINE_VERSION_MISMATCH",
         "COLUMN_ABSENT", "COLUMN_TYPE_MISMATCH", "PARTITION_ABSENT", "READ_DENIED",
         "UNKNOWN_FINDING"}
 

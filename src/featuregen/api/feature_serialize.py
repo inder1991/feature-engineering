@@ -66,6 +66,21 @@ def serialize_feature_idea_v2(idea: FeatureIdea) -> dict:
         out["metadata_input_fingerprint"] = idea.metadata_input_fingerprint
     if idea.binding_fact_keys:
         out["binding_fact_keys"] = list(idea.binding_fact_keys)
+    # D14 (review F2) — V2 ONLY, and only when non-empty. v1 emits EXACTLY the pre-Slice-3 field set
+    # so a flag-OFF response stays byte-identical; adding a field there would break that pin for
+    # every caller, including the ones that bind no personal data and would carry an empty list for
+    # nothing. Emitted only when non-empty for the same only-when-non-default reason the H1a fields
+    # are: a feature that licensed nothing has byte-identical v2 output to before.
+    if idea.personal_data_policy_revision_ids:
+        out["personal_data_policy_revision_ids"] = list(idea.personal_data_policy_revision_ids)
+    # Task 6c — V2 ONLY, and only when non-empty, for the two reasons the fields above are: v1 emits
+    # EXACTLY the pre-Slice-3 field set, and a candidate that returned no grounding (every recipe /
+    # planner candidate, every contract version below v5, and any model that skipped the key) has
+    # byte-identical v2 output to before. EXPLANATORY: the UI renders it as the model's account of
+    # itself, never as a validity or confidence signal — the honest disposition is `validation_status`
+    # and its requirements, which were decided without reading a word of this.
+    if idea.grounding:
+        out["grounding"] = [g.to_json() for g in idea.grounding]
     if idea.planner_applicability != "not_applicable_nonrecipe":
         out["planner_applicability"] = idea.planner_applicability
     if idea.physical_plan_id is not None:

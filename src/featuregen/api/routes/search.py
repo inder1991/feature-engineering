@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, Query
 from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import current_overlay_config
-from featuregen.overlay.upload.search import SearchResult, search
+from featuregen.overlay.upload.search import SearchResult, column_facets, search
 
 router = APIRouter()
 
@@ -25,9 +25,23 @@ def search_catalog(
     source: _Facet,
     domain: _Facet,
     sensitivity: _Facet,
+    # The projected display axis — a facet in its own right, beside (never instead of) the
+    # enforcement tag above. Read scope gates its counts like every other facet.
+    sensitivity_display: _Facet,
     additivity: _Facet,
     entity: _Facet,
     kind: _Facet,
+    # Release-A profile facets (profile Task 5 + D13.1/D13.2). Always ACCEPTED as params, but only
+    # APPLIED while `FEATUREGEN_DATASET_PROFILES` is on — `search.column_facets()` is the one
+    # definition of what is active, and a filter it does not name is ignored rather than erroring.
+    # A 422 here would make the flag state probeable from an unauthenticated-shaped request; being
+    # ignored is the same answer the surface gives for any facet it does not have.
+    data_role: _Facet,
+    authority_role: _Facet,
+    temporal_storage_model: _Facet,
+    bian_path: _Facet,
+    process_path: _Facet,
+    sub_domain: _Facet,
     q: str = "",
     grain: bool = False,
     as_of: bool = False,
@@ -40,13 +54,18 @@ def search_catalog(
     # AND across facet groups, OR within one. q is optional — an empty q browses ALL fresh,
     # read-scoped rows. Roles come from the authenticated session — NEVER from the request (M6
     # read-scope); freshness fail-closed and read-scope are enforced inside search().
+    active = column_facets()
     filters: dict[str, list[str]] = {
         name: values
         for name, values in (
             ("source", source), ("domain", domain), ("sensitivity", sensitivity),
+            ("sensitivity_display", sensitivity_display),
             ("additivity", additivity), ("entity", entity), ("kind", kind),
+            ("data_role", data_role), ("authority_role", authority_role),
+            ("temporal_storage_model", temporal_storage_model), ("bian_path", bian_path),
+            ("process_path", process_path), ("sub_domain", sub_domain),
         )
-        if values
+        if values and name in active
     }
     if grain:
         filters["grain"] = ["true"]

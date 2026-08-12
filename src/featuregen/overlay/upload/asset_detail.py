@@ -35,8 +35,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterable
 from dataclasses import asdict
+from datetime import UTC, datetime
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -46,10 +48,13 @@ from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.column_usability import column_usability, table_rollup
 from featuregen.overlay.upload.cross_catalog_links import cross_catalog_links
+from featuregen.overlay.upload.feature_metadata_snapshot import projection_lag_marker
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.semantic_binding_governance import caller_binding_actions
+
+logger = logging.getLogger(__name__)
 
 # The response contract version — bump on a breaking shape change so a client can negotiate.
 ASSET_DETAIL_VERSION = "asset-detail/v1"
@@ -65,6 +70,13 @@ _HISTORY_RUN_LIMIT = 20
 _F0_SECTIONS: tuple[str, ...] = (
     "identity", "effective_metadata", "evidence", "relationships", "readiness", "history", "actions",
     "audit", "source_glossary",
+    # semantic Task 5: the adjudicator's reviewable second opinion for a column Pass A could not
+    # settle — alternatives, closed reason/missing-context codes and any ontology-gap suggestion.
+    "semantic_adjudication",
+    # semantic Task 7: Context Graph V1. A SECTION, not a route — the review killed the separate
+    # `/context` design because a second endpoint serves a snapshot this dossier's single
+    # repeatable-read transaction and `consistency_token` do not cover.
+    "context",
 )
 
 # The subject-linked LLM-audit-summaries section returns at most this many newest dispatches.
@@ -81,6 +93,11 @@ _METADATA_FIELDS: tuple[tuple[str, str, str], ...] = (
     # humanises underscores for display already.
     ("ai_summary", "ai_summary", "ai_summary"),
     ("domain", "domain", "domain"),
+    # D13.2 — the FINER LLM-proposed axis beside the coarse source `domain`. Rendered exactly like
+    # every other recommendation field, which is the point: it arrives with its `llm_proposed`
+    # authority label from `_authority_label`, never as a governed value and never in place of
+    # `domain`. A column with no proposal simply has no entry (no fabricated empty).
+    ("sub_domain", "sub_domain", "sub_domain"),
     ("additivity", "additivity", "additivity"),
     ("unit", "unit", "unit"),
     ("currency", "currency", "currency"),
@@ -102,7 +119,8 @@ _PROJECTED_AXES = frozenset({"sensitivity_display", "party_role"})
 # entity_status / entity_fact_key / entity_fact_event_id back the F12 entity-authority gate below.
 _ANCHOR_COLUMNS = (
     "catalog_source, object_ref, kind, table_name, column_name, schema_name, data_type, "
-    "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sensitivity, "
+    "declared_type, definition, ai_summary, is_grain, is_as_of, concept, domain, sub_domain, "
+    "sensitivity, "
     "sensitivity_display, party_role, additivity, "
     "unit, currency, entity, entity_status, entity_fact_key, entity_fact_event_id, "
     "grain_fact_event_id, availability_fact_event_id"
@@ -112,14 +130,17 @@ _ANCHOR_COLUMNS = (
 def _load_anchor(conn: DbConn, source: str, object_ref: str, allowed: list[str]) -> dict | None:
     """The anchor ``graph_node`` row, loaded UNDER read-scope. Returns ``None`` when the ref does
     not exist OR carries a sensitivity the caller's roles can't see — the two are deliberately
-    indistinguishable so a hidden object never leaks its existence via a different status/shape."""
+    indistinguishable so a hidden object never leaks its existence via a different status/shape.
+    A TABLE anchor's scope is DERIVED from its columns (D11, the shared predicate): table nodes
+    carry ``visible_requires = {}``, so the raw clause alone would hand out the identity of a
+    fully-restricted table — an existence oracle."""
     row = conn.execute(
-        f"SELECT {_ANCHOR_COLUMNS} FROM graph_node "
+        f"SELECT {_ANCHOR_COLUMNS} FROM graph_node gn "
         # F7: object_ref is canonical lowercase, so equality against lower(%s) uses the (source,
         # object_ref) PK directly instead of forcing a functional scan over lower(object_ref).
-        "WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND visible_requires <@ %s",
-        (source, object_ref, allowed),
+        "WHERE gn.catalog_source = %s AND gn.object_ref = lower(%s) "
+        f"AND {anchor_visibility_predicate()}",
+        (source, object_ref, allowed, allowed),
     ).fetchone()
     if row is None:
         return None
@@ -655,6 +676,94 @@ def _audit_section(conn: DbConn, source: str, object_ref: str, logical_ref: str)
     return {"status": "available", "summaries": summaries, "truncated": truncated}
 
 
+def _semantic_adjudication_section(conn: DbConn, logical_ref: str) -> dict:
+    """The column's CURRENT semantic adjudication, read through the migration-1046 subject/current
+    pointer — one pointer row plus one revision row, never a scan over ``output_json``.
+
+    ``status`` is ``available`` or ``absent``; ABSENT is the NORMAL state (adjudication is the
+    exception path — most columns are clear and were never referred), so it is rendered as a plain
+    empty section, never as a gap or a failure. ``confidence_band`` rides here as EXPLANATION for
+    the reader: nothing on this surface, or behind it, may treat it as authority — the adjudicated
+    concept is `llm/proposed` evidence like any other, and its authority is shown by the
+    ``evidence``/``effective_metadata`` sections that already carry the producer/strength triple.
+
+    The anchor passed read-scope before this runs, and nothing here reaches beyond its own
+    ``logical_ref``."""
+    from featuregen.overlay.upload.semantic_adjudication import load_current_adjudication
+
+    adjudication, result_id = load_current_adjudication(conn, logical_ref)
+    if adjudication is None:
+        return {"status": "absent"}
+    gap = adjudication.ontology_gap
+    return {
+        "status": "available",
+        "structured_result_id": result_id,
+        "selected_concept": adjudication.selected_concept,
+        "alternatives": list(adjudication.alternatives),
+        # Explanatory only — never authority (semantic Task 5 contract).
+        "confidence_band": adjudication.confidence_band,
+        "reason_codes": list(adjudication.reason_codes),
+        "missing_context": list(adjudication.missing_context),
+        "ontology_gap": None if gap is None else gap.as_dict(),
+    }
+
+
+def _context_section(
+    conn: DbConn, source: str, anchor: dict, logical_ref: str, roles: Iterable[str],
+) -> dict:
+    """Context Graph V1 (semantic Task 7) as ONE dossier section, assembled inside this dossier's
+    repeatable-read transaction so its bytes ride the same ``consistency_token``.
+
+    The assembled dataset profile and the current catalog-narrative revision are resolved HERE and
+    handed down, so the section reuses the SAME ``build_dataset_profile`` output feature generation
+    and retrieval consume — never a second assembly that could disagree with them. When the
+    profiles flag is off, both are simply absent and the section says so through the profile's own
+    missing-context codes rather than fabricating a blank node.
+
+    Never raises into the dossier: an assembly fault degrades to an explicit ``unavailable`` status
+    (the F0 contract), because a context tab that 500s takes the whole asset page with it.
+
+    THE GUARD IS A SAVEPOINT, not just an ``except``. Catching the exception does not un-abort the
+    transaction a DATABASE fault aborted: PostgreSQL then refuses every later statement with
+    ``InFailedSqlTransaction``, so this section degraded politely to ``unavailable`` and
+    ``relationships`` — assembled next, in the SAME repeatable-read transaction — died on a fault it
+    had nothing to do with, taking the whole dossier with it. ``with conn.transaction():`` scopes the
+    rollback to this read (the ``runtime.dispatch`` idiom), so the sections after it still answer."""
+    from featuregen.overlay.upload.context_graph import build_context_section
+    from featuregen.overlay.upload.dataset_profiles import build_dataset_profile, profile_payload
+    from featuregen.overlay.upload.profile_store import current_catalog_profile_revision_id
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    dataset_profile: dict | None = None
+    revision_id: str | None = None
+    try:
+        with conn.transaction():
+            if dataset_profiles_enabled():
+                revision_id = current_catalog_profile_revision_id(conn, source)
+                table_logical_ref = logical_ref if anchor["kind"] == "table" else (
+                    _table_logical_ref(logical_ref))
+                assembled = build_dataset_profile(
+                    conn, source=source, dataset_logical_ref=table_logical_ref,
+                    catalog_profile_revision_id=revision_id)
+                dataset_profile = None if assembled is None else profile_payload(assembled)
+            return build_context_section(
+                conn, source=source, object_ref=anchor["object_ref"], kind=anchor["kind"],
+                logical_ref=logical_ref, roles=roles, now=datetime.now(UTC),
+                dataset_profile=dataset_profile, catalog_profile_revision_id=revision_id)
+    except Exception:  # noqa: BLE001 — one section must never take the dossier down
+        logger.warning("context section unavailable for %r %r", source, anchor["object_ref"],
+                       exc_info=True)
+        return {"status": "unavailable"}
+
+
+def _table_logical_ref(column_logical_ref: str) -> str:
+    """The TABLE logical ref of a COLUMN logical ref — the dataset profile is table-grain."""
+    from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+
+    source, schema, table, _column = parse_ref(column_logical_ref)
+    return normalize_ref(source, schema, table)
+
+
 def _consistency_token(body: dict) -> str:
     """A content-hash fingerprint of the assembled snapshot — the ``consistency_token`` and HTTP
     ``ETag``. Canonical JSON (sorted keys, ``default=str`` for datetimes) so the same snapshot
@@ -721,6 +830,18 @@ def build_asset_detail(
         body["source_glossary"] = _source_glossary_section(conn, logical_ref)
         built.append("source_glossary")
 
+    if "semantic_adjudication" in requested:
+        # Columns only: adjudication answers "which concept is this column?", a question a TABLE
+        # anchor does not have. An honest empty section beats a fabricated one.
+        body["semantic_adjudication"] = (
+            _semantic_adjudication_section(conn, logical_ref) if is_column
+            else {"status": "absent", "note": "table asset — no column adjudication"})
+        built.append("semantic_adjudication")
+
+    if "context" in requested:
+        body["context"] = _context_section(conn, norm_source, anchor, logical_ref, roles)
+        built.append("context")
+
     if "relationships" in requested:
         relationships, rel_unavailable = _relationships_section(
             conn, norm_source, anchor, allowed, roles, identity)
@@ -753,5 +874,10 @@ def build_asset_detail(
 
     body["included_sections"] = built
     body["unavailable_sections"] = unavailable
+    # Semantic Task 6 — projection lag is DETECTED and REPORTED, never silently absorbed. It is set
+    # BEFORE the token is computed on purpose: the token then fingerprints "this snapshot, taken
+    # under a lagged projection", so a lagged read and a ready read of the same values are not
+    # interchangeable to any client that caches on it. Not a refusal: the dossier still serves.
+    body["projection"] = projection_lag_marker(conn).as_dict()
     body["consistency_token"] = _consistency_token(body)
     return body

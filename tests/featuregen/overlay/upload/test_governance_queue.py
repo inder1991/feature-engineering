@@ -62,7 +62,6 @@ from featuregen.overlay.upload.governance_queue import (
     bridge_usage,
     governance_queue,
 )
-from featuregen.overlay.upload.governed_grain import GovernedGrain, read_governed_grain
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
 
 _NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
@@ -613,3 +612,70 @@ def _record_published_feature(conn, *, feature: str, contract: str, marker: str)
         " logical_ref, item_hash) VALUES (%s, 'core', %s, %s, %s) "
         "ON CONFLICT (contract_id, item_hash) DO NOTHING",
         (contract, marker, marker, f"h-{contract}-{marker}"))
+
+
+# ── semantic bindings join the unified queue (the currency-review gap, 2026-08-10) ───────────────
+#
+# THE LIVE FAILURE THIS CLOSES: six service-proposed currency_binding DRAFTs sat behind a four-eyes
+# confirm gate while the ONE screen humans review from (this queue) never listed the kind at all —
+# `KIND_ORDER` stopped at table facts. A dual-control over an invisible queue is a lock on a door
+# nobody can find. The list/confirm/reject ROUTES existed and worked; the kind was simply never
+# merged here.
+
+def _seed_currency_binding(db, source: str = "pay", *, uploader: str = "user:uploader") -> str:
+    from featuregen.overlay.identity import CatalogObjectRef, fact_key
+    from featuregen.overlay.proposal_commands import propose_fact
+
+    _load(db, source, [
+        (CanonicalRow(source, "txns", "amt", "numeric"), "monetary_flow"),
+        (CanonicalRow(source, "txns", "ccy", "text"), "currency_code"),
+    ])
+    ref = CatalogObjectRef(catalog_source=source, object_kind="column", schema="public",
+                           table="txns", column="amt")
+    cmd = Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "currency_binding",
+         "proposed_value": {"currency_column": {
+             "catalog_source": source, "object_kind": "column", "schema": "public",
+             "table": "txns", "column": "ccy"}},
+         # SOURCE-provenance four-eyes: the uploading human recorded on the SERVICE proposal.
+         "source_uploader": uploader},
+        SERVICE_ACTOR, f"seed-ccy-{source}")
+    result = propose_fact(db, cmd)
+    assert result.accepted, result.denied_reason
+    return fact_key(ref, "currency_binding")
+
+
+def test_a_service_proposed_currency_binding_reaches_the_unified_queue(queue_db):
+    fk = _seed_currency_binding(queue_db)
+    reviewer = mint_test_identity(subject="user:reviewer", role_claims=("platform-admin",))
+    queue = governance_queue(queue_db, roles=("platform-admin",), actor=reviewer)
+    item = next((i for i in queue.items if i.kind == "currency_binding"), None)
+    assert item is not None, f"currency_binding missing from queue kinds {_kinds(queue)}"
+    assert item.fact_key == fk
+    assert item.catalogs == ("pay",)
+    assert "amt" in item.subject
+    assert "confirm" in item.available_actions and "reject" in item.available_actions
+    # the target currency column rides the detail, so the reviewer sees WHAT binds to WHAT
+    assert (item.detail.get("target") or {}).get("column") == "ccy"
+
+
+def test_the_queue_never_advertises_confirm_to_the_uploading_principal(queue_db):
+    """The queue item contract PROMISES four-eyes already applied to `available_actions`. The
+    execute path enforces it (a 409, verified live 2026-08-10); the queue must not advertise a
+    button the server will refuse — that is exactly the confusion the live review hit."""
+    _seed_currency_binding(queue_db, uploader="user:dev")
+    uploader = mint_test_identity(subject="user:dev", role_claims=("platform-admin",))
+    queue = governance_queue(queue_db, roles=("platform-admin",), actor=uploader)
+    item = next(i for i in queue.items if i.kind == "currency_binding")
+    assert "confirm" not in item.available_actions, (
+        "the uploading principal may not confirm a value born of their own upload; advertising "
+        "the button invites a guaranteed 409")
+    assert "reject" in item.available_actions   # rejecting your own declared value stays allowed
+
+
+def test_currency_binding_rides_the_kind_counts(queue_db):
+    _seed_currency_binding(queue_db)
+    reviewer = mint_test_identity(subject="user:reviewer", role_claims=("platform-admin",))
+    queue = governance_queue(queue_db, roles=("platform-admin",), actor=reviewer)
+    assert dict(queue.items_visible_to_you_by_kind).get("currency_binding") == 1

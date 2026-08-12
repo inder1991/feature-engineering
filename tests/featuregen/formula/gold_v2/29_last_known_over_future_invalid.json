@@ -1,0 +1,49 @@
+{
+  "canonical_json": null,
+  "case_id": "last_known_over_future",
+  "expected": "schema_error",
+  "expected_proposal_hash": null,
+  "note": "an order-sensitive operation reads OBSERVED history \u2014 a future horizon has none; last-known state over unmaterialized time is refused",
+  "operation": "last_known",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "last_known",
+        "filter": null,
+        "operand": "authored::public.deposits.balance",
+        "source_relation": {
+          "table_ref": "authored::public.deposits"
+        },
+        "window": {
+          "basis": "future_horizon",
+          "empty_window": "zero",
+          "end_inclusive": "inclusive",
+          "event_time_ref": "authored::public.deposits.maturity_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "exclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "customer",
+      "keys": [
+        "authored::public.deposits.cif_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

@@ -1,0 +1,73 @@
+{
+  "authored": "2026-08-10",
+  "backlog": [],
+  "intentionally_empty": [
+    {
+      "leaf": "wealth.client_attrition",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: private-bank client attrition needs wealth-platform mandate and flow data no current catalog carries; retail attrition leaves cover the near-term need."
+    },
+    {
+      "leaf": "aml_cft.mule_account",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: mule detection needs inbound-network features (fan-in from unrelated payers) whose relationship data is not yet governed; suspicious_transaction_monitoring holds the interim recipes."
+    },
+    {
+      "leaf": "aml_cft.tbml",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: trade-based money laundering needs trade-document and goods-pricing data outside every current catalog profile."
+    },
+    {
+      "leaf": "treasury_alm.irrbb.basis_risk",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: IRRBB basis risk needs curve-decomposed repricing data; the markets basis_risk leaf covers the traded-book need today."
+    },
+    {
+      "leaf": "counterparty_risk.settlement_exposure",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: settlement exposure needs intraday settlement-status events not present in any governed catalog."
+    },
+    {
+      "leaf": "pricing.credit_risk_based_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: the pricing family is scheduled after the credit packs prove the risk inputs it would price on."
+    },
+    {
+      "leaf": "pricing.deposit_rate_optimisation",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: deposit pricing follows the BR-14 deposit-behaviour pack that produces its elasticity inputs."
+    },
+    {
+      "leaf": "pricing.fee_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: fee pricing needs fee-event data profiled beyond current catalog coverage."
+    },
+    {
+      "leaf": "pricing.relationship_pricing",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: relationship pricing composes profitability and holdings features that arrive with the BR-11/BR-16 packs."
+    },
+    {
+      "leaf": "operations.process_cost_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: operations forecasting needs process-event data outside the current banking catalogs."
+    },
+    {
+      "leaf": "operations.workload_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: workload forecasting needs case-management event data outside the current banking catalogs."
+    },
+    {
+      "leaf": "operations.manual_review_optimisation",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: review optimisation needs alert-disposition history the governance store does not yet expose as catalog data."
+    },
+    {
+      "leaf": "profitability.margin_forecasting",
+      "owner": "use-case taxonomy owner",
+      "rationale": "Declared-future objective: margin forecasting composes NIM and cost features that arrive with the BR-14 pack."
+    }
+  ],
+  "note": "BR-21 completion: the backlog is EMPTY \u2014 all 75 coverable selectable leaves carry a reviewed V2 primary; the 13 intentionally-empty leaves keep their owner-role and rationale rows. New gaps re-enter as rows here before any release gate accepts them.",
+  "version": 1
+}

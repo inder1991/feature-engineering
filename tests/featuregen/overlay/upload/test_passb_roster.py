@@ -13,12 +13,14 @@ from featuregen.overlay.upload import table_synth as ts
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.column_view import build_table_views
 from featuregen.overlay.upload.enrich_llm import (
+    _MAX_COLUMN_PROFILES,
     _MAX_ROSTER,
     _item_egress_ok,
     _roster_entry_ok,
 )
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.table_synth import (
+    _SYNTH_PROMPT_VERSION,
     _roster_entry,
     assemble_table_items,
     synthesize_tables,
@@ -123,7 +125,10 @@ def test_roster_entry_validator_rejects_unknown_keys_and_flat_strings():
 
 
 def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
-    n = 70                                                     # >64 -> 2 chunks
+    # Sized off the router constant, not a literal. `_MAX_COLUMN_PROFILES` is Pass B's narrow/wide
+    # ROUTER as well as an egress cap, and the 2026-08-06 raise took it 64 -> 512 — at a fixed 70
+    # columns this test silently stopped exercising the two-phase path it exists to cover.
+    n = _MAX_COLUMN_PROFILES + 6                               # wide -> 2 chunks
     rows = [_row("ftr", f"c{i}", typ="integer") for i in range(n)]
     records = [_rec("s::banking.ftr", is_table=True, definition="All FTR postings.")]
     items = assemble_table_items(_views(rows, records=records))
@@ -147,13 +152,17 @@ def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
     assert meta["column_roster"][0] == {"column": "c0", "operational_type": "integer",
                                         "declared_type": ""}  # structured, not "c0:integer"
     # both phases ship the Slice-2 contract via the Task-1 seam: prompt v3, canonical schema
-    # STAYS v2 ([F1] — the role vocab is code-side + prompt-side, never a schema enum)
-    assert synth_req.prompt_version == 3 and synth_req.output_schema_version == 2
+    # Profile Task 4 moved the contract to prompt v4 / schema v3 — a REAL v3 body, because v2 is a
+    # byte-alias of v1 with `additionalProperties: false` and would REJECT the profile suggestions.
+    # Task 7b moved it to prompt v5 (the catalog narrative: what it IS, and that it is citable);
+    # the SCHEMA is unmoved because the response shape did not change, only the question.
+    # ONE generation across the whole run: the chunk-summary call stamps the same pair.
+    assert synth_req.prompt_version == _SYNTH_PROMPT_VERSION and synth_req.output_schema_version == 3
     summary_req = [r for r in client.requests if r.task == "table_synth_summary"][0]
-    assert summary_req.prompt_version == 3 and summary_req.output_schema_version == 2
+    assert summary_req.prompt_version == _SYNTH_PROMPT_VERSION and summary_req.output_schema_version == 3
 
 
-def test_narrow_fast_path_ships_v3_prompt_v2_schema(db):
+def test_narrow_fast_path_ships_the_CURRENT_prompt_and_v3_schema(db):
     rows = [_row("narrow", "c0")]
     items = assemble_table_items(_views(rows))
     client = _RecordingLLM({"table_synth": FakeResponse(output={"results": [
@@ -161,7 +170,7 @@ def test_narrow_fast_path_ships_v3_prompt_v2_schema(db):
     out = synthesize_tables(db, client, items, columns_by_table={"narrow": {"c0"}}, actor=None)
     assert out["narrow"]["grain"] == {"columns": ["c0"], "is_unique": True}
     req = [r for r in client.requests if r.task == "table_synth"][0]
-    assert req.prompt_version == 3 and req.output_schema_version == 2
+    assert req.prompt_version == _SYNTH_PROMPT_VERSION and req.output_schema_version == 3
 
 
 # ── v2 schemas + instructions describe the dual-type contract ───────────────────────────────────
@@ -174,9 +183,10 @@ def test_v2_synth_schemas_are_registered(db):
     )
     register_enrichment_schemas(db)
     reg = DocumentSchemaRegistry(db)
-    assert reg.schema_for("overlay_table_synth_batch", 2) is not None
-    assert reg.schema_for("overlay_table_synth", 2) is not None
-    assert reg.schema_for("overlay_table_synth_summary_batch", 2) is not None
+    for version in (2, 3):     # v2 stays registered (the rollback rung); v3 is what ships
+        assert reg.schema_for("overlay_table_synth_batch", version) is not None, version
+        assert reg.schema_for("overlay_table_synth", version) is not None, version
+        assert reg.schema_for("overlay_table_synth_summary_batch", version) is not None, version
 
 
 def test_instructions_describe_operational_vs_declared():

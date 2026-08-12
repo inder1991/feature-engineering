@@ -6,10 +6,18 @@ two phases:
 
 * Phase 1 (NO fact output): its column profiles are split into consecutive chunks of
   ``<=_MAX_COLUMN_PROFILES`` and each chunk is SUMMARIZED (candidate grain/id + temporal/as-of +
-  entity signals + event/snapshot hint). Each chunk item is egress-safe (<=64 profiles).
+  entity signals + event/snapshot hint). Each chunk item is egress-safe.
 * Phase 2 (single synthesis): ONE call per table over ALL its chunk summaries PLUS a compact COMPLETE
   column roster (names/types only). Emits the SAME table-fact result shape ``_propose_table_facts``
   already consumes, so downstream proposal/projection is unchanged.
+
+EVERY WIDTH IN THIS FILE IS DERIVED FROM ``_MAX_COLUMN_PROFILES`` (see ``_WIDE``), never written as
+a literal. That constant is Pass B's narrow/wide ROUTER, and the 2026-08-06 zero-truncation raise
+moved it 64 -> 512: the 126/70/80-column tables these tests used to build became NARROW overnight,
+which would have quietly retired the whole file's coverage rather than failing it honestly. Note the
+consequence recorded in ``canonical.MAX_COLUMNS_PER_TABLE``: ingestion caps a table at 200 columns,
+so the two-phase path this file covers is no longer reachable THROUGH INGESTION at all — it is the
+backstop for a direct ``synthesize_tables`` caller, and these tests are now its only exercise.
 
 A NARROW table keeps the today's single-call fast path (no phase-1 summary). A wide table that fails
 to summarize every chunk resolves to NOTHING — never a phantom "resolved". Slice 2: an invalid
@@ -42,6 +50,12 @@ class _RecordingLLM(FakeLLM):
         return super().call(request)
 
 
+#: A width that is WIDE by construction and splits into exactly two chunks (one full, one partial),
+#: whatever `_MAX_COLUMN_PROFILES` currently is. Every test below sizes off this.
+_WIDE = _MAX_COLUMN_PROFILES * 2 - 2
+_WIDE_CHUNKS = 2
+
+
 def _profiles(n):
     return [{"column": f"c{i}", "operational_type": "integer", "declared_type": ""}
             for i in range(n)]
@@ -61,8 +75,8 @@ def _summary(**kw):
 # --- the bug + the fix -------------------------------------------------------------------------
 
 def test_old_giant_item_would_egress_reject_but_a_chunk_is_admissible():
-    """The bug: a 126-profile single item is egress-REJECTED (>64); a <=64 chunk is admissible."""
-    profiles = _profiles(126)
+    """The bug: an over-cap single item is egress-REJECTED; an at-cap chunk is admissible."""
+    profiles = _profiles(_WIDE)
     assert _item_egress_ok({"table": "ftr", "column_profiles": profiles}) is False
     assert _item_egress_ok(
         {"table": "ftr", "column_profiles": profiles[:_MAX_COLUMN_PROFILES]}) is True
@@ -70,12 +84,13 @@ def test_old_giant_item_would_egress_reject_but_a_chunk_is_admissible():
 
 def test_phase2_wide_item_is_egress_admissible():
     """The phase-2 item carries chunk summaries + a complete STRUCTURED roster — admissible even
-    though the roster is longer than 64 (it is bounded identity entries, not full profiles)."""
+    though the roster is longer than the profile cap (it is bounded identity entries, not full
+    profiles)."""
     meta = {"table": "ftr",
             "chunk_summaries": [_summary(grain_candidates=["c0"], temporal_candidates=["c1"],
                                          entity_signals=["transaction"], event_or_snapshot="event")],
             "column_roster": [{"column": f"c{i}", "operational_type": "integer",
-                               "declared_type": ""} for i in range(126)]}
+                               "declared_type": ""} for i in range(_WIDE)]}
     assert _item_egress_ok(meta) is True
     # a summary carrying a data-value / unknown key is rejected (egress-safe: bounded fields only)
     bad = {"table": "ftr", "chunk_summaries": [{"grain_candidates": ["c0"], "rows": ["secret"]}]}
@@ -83,8 +98,8 @@ def test_phase2_wide_item_is_egress_admissible():
 
 
 def test_wide_table_two_phase_produces_proposal(db):
-    """126-col table -> 2 chunk summaries (phase 1) + 1 synthesis (phase 2) -> a proposal (was: none)."""
-    n = 126
+    """A wide table -> 2 chunk summaries (phase 1) + 1 synthesis (phase 2) -> a proposal (was: none)."""
+    n = _WIDE
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
     summary = _summary(grain_candidates=["c0"], temporal_candidates=["c1"],
@@ -108,7 +123,7 @@ def test_wide_table_two_phase_produces_proposal(db):
     assert out["ftr"]["primary_entity"] == "transaction"
     assert out["ftr"]["event_or_snapshot"] == "event"
 
-    # phase 1 summarized ceil(126/64)=2 consecutive chunks
+    # phase 1 summarized ceil(_WIDE/_MAX_COLUMN_PROFILES)=2 consecutive chunks
     summary_reqs = [r for r in client.requests if r.task == "table_synth_summary"]
     chunk_refs = {it["ref"] for r in summary_reqs for it in _items_of(r)}
     assert chunk_refs == {"ftr#chunk0", "ftr#chunk1"}
@@ -123,14 +138,15 @@ def test_wide_table_two_phase_produces_proposal(db):
     assert len(synth_items) == 1
     meta = synth_items[0]
     assert "column_profiles" not in meta                    # NOT the giant profile list
-    assert len(meta["chunk_summaries"]) == 2                # both chunk summaries
+    assert len(meta["chunk_summaries"]) == _WIDE_CHUNKS      # both chunk summaries
     assert len(meta["column_roster"]) == n                  # the complete structured roster
     assert meta["column_roster"][0] == {"column": "c0", "operational_type": "integer",
                                         "declared_type": ""}
 
 
 def test_narrow_table_keeps_the_fast_path(db):
-    """A <=64-col table takes today's single synthesis call directly — no phase-1 summary call."""
+    """A <=_MAX_COLUMN_PROFILES table takes the single synthesis call directly — no phase-1
+    summary. Since the 2026-08-06 raise this is EVERY table ingestion can produce."""
     profiles = _profiles(3)
     synthesis = {"grain_columns": ["c0"], "as_of_column": None, "as_of_basis": None,
                  "table_role": "dim", "primary_entity": "thing", "event_or_snapshot": "snapshot"}
@@ -147,9 +163,9 @@ def test_wide_partial_chunk_summary_still_synthesizes(db):
     """[enrich-fix passb-gate] Phase-1 loses ONE chunk (chunk1 unreturned) but chunk0 DID summarize.
     The complete roster is built from ALL profiles (independent of summaries — an advisory phase-2
     input), so phase-2 STILL runs over the full roster + whatever summaries LANDED and yields REAL
-    grain/availability dispositions. The whole 126-col table is no longer dropped to five
+    grain/availability dispositions. The whole wide table is no longer dropped to five
     ``not_evaluated`` (the ingrun_01KY2VN3787R302JGCDM45MHW8 Pass B failure)."""
-    n = 126
+    n = _WIDE
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
     synthesis = {"grain_columns": ["c0"], "as_of_column": "c1", "as_of_basis": "posted_at",
@@ -194,7 +210,7 @@ def test_wide_zero_chunk_summaries_is_skipped(db):
     """[enrich-fix passb-gate] A wide table where NO chunk summarized is STILL skipped honestly —
     no phantom resolve, no phase-2 synthesis attempted, and the zero-summary skip counter fires.
     Zero landed summaries is the only remaining drop condition."""
-    n = 126
+    n = _WIDE
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
     client = _RecordingLLM({
@@ -216,7 +232,7 @@ def test_wide_ghost_grain_drops_field_only_no_phantom_grain(db):
     """All chunks summarize but phase-2 names a GHOST grain column -> Slice-2 per-field salvage:
     the grain FIELD is dropped (never a phantom grain proposal) while the table still resolves,
     counted honestly as an ABSTENTION (no grain/availability survived)."""
-    n = 70                                                  # wide (>64) -> 2 chunks (64 + 6)
+    n = _WIDE                                               # wide -> 2 chunks (64 + 6)
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
     summ = _summary(grain_candidates=["c0"])
@@ -238,7 +254,7 @@ def test_wide_ghost_grain_drops_field_only_no_phantom_grain(db):
 def test_mixed_narrow_and_wide_both_resolve(db):
     """A batch of one narrow + one wide table: narrow via the fast path, wide via two-phase — both
     reach _propose_table_facts' result shape."""
-    wide = _profiles(80)                                    # >64 -> 2 chunks
+    wide = _profiles(_WIDE)                                 # wide -> 2 chunks
     narrow = _profiles(2)
     summ = _summary(grain_candidates=["c0"])
     client = _RecordingLLM({
@@ -251,7 +267,7 @@ def test_mixed_narrow_and_wide_both_resolve(db):
     items = [BatchItem("wide", {"table": "wide", "column_profiles": wide}),
              BatchItem("narrow", {"table": "narrow", "column_profiles": narrow})]
     out = synthesize_tables(db, client, items,
-                            columns_by_table={"wide": {f"c{i}" for i in range(80)},
+                            columns_by_table={"wide": {f"c{i}" for i in range(_WIDE)},
                                               "narrow": {"c0", "c1"}}, actor=None)
     assert set(out) == {"wide", "narrow"}
     assert out["wide"]["grain"] == {"columns": ["c0"], "is_unique": True}

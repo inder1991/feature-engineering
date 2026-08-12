@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from tests.featuregen.formula import factories as f
+
 from featuregen.formula.capability import (
     CAPABILITY_POLICY_VERSION,
     classify_formula_capability,
@@ -26,7 +28,6 @@ from featuregen.formula.schema import (
     WindowUnit,
     validate_semantics,
 )
-from tests.featuregen.formula import factories as f
 
 # A second catalog source ("core"), distinct from the factories' "ftr" source.
 OTHER_TABLE_REF = "core::bank.transactions"

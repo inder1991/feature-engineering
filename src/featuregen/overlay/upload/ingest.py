@@ -55,9 +55,12 @@ from featuregen.overlay.upload.enrich import (
     _unit_targets,
     _write_definition_evidence,
     _write_domain_evidence,
+    _write_sub_domain_evidence,
     _write_summary_evidence,
     _write_synonym_evidence,
     _write_unit_evidence,
+    adjudicate_semantics,
+    build_enrichment_context,
     classify_domains,
     content_hash,
     draft_definitions,
@@ -97,6 +100,7 @@ from featuregen.overlay.upload.ingestion_run import record_run_facts, record_run
 from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
 from featuregen.overlay.upload.object_ref import _norm, normalize_ref, parse_ref
 from featuregen.overlay.upload.passc.projection import (
+    _pair_key,
     list_approved_join_refs,
     project_confirmed_joins,
 )
@@ -243,6 +247,15 @@ class IngestResult:
     semantic_binding_proposed: int = 0
     semantic_binding_abstained: int = 0
     semantic_binding_failed: int = 0
+    # Final-review I3: corrections the governed-join pair-guard DROPPED, surfaced where a human
+    # sees them. A re-upload declaring a different cardinality/direction for a humanly-confirmed
+    # pair is not proposed (the confirmed fact stands; the correction path is join governance),
+    # and the operator who authored the correction must learn it went nowhere without reading
+    # server logs. `governed_join_divergence` cannot carry this without a migration (its `kind`
+    # CHECK is closed to retargeted/dropped, and its re-affirmation path deletes a same-pair row
+    # in the same ingest), so the account rides here: one human-readable warning per drop.
+    governed_join_corrections_dropped: int = 0
+    governed_join_correction_warnings: tuple[str, ...] = ()
     # Cross-catalog entity-bridge accounting (all 0 when OVERLAY_ENTITY_BRIDGES is off). Human
     # confirmation records review but does not gate availability.
     entity_bridges_proposed: int = 0
@@ -251,9 +264,97 @@ class IngestResult:
     entity_bridge_candidates_suppressed: int = 0
     entity_bridge_candidates_truncated: int = 0
 
+    def response_payload(self) -> dict:
+        """The OUTWARD shape of this result (HTTP bodies, stored import records): ``asdict``,
+        with the I3 correction fields SPARSE — both are omitted when no correction was dropped.
+
+        Sparse deliberately, unlike every other counter above (which emits its 0): those fields
+        predate the byte-identical upload-response contract that
+        ``test_upload_response_body_byte_identical_with_stage_reports`` pins, and adding two
+        always-present fields would break it for every ordinary upload. Omission-when-empty keeps
+        the ordinary body byte-for-byte what it was, and makes the surfacing appear exactly when
+        a drop happened — which is also the honest shape: an absent account and "nothing was
+        dropped" are the same claim here, where a 0 next to a () would just restate the default.
+        """
+        payload = asdict(self)
+        if not (self.governed_join_corrections_dropped
+                or self.governed_join_correction_warnings):
+            del payload["governed_join_corrections_dropped"]
+            del payload["governed_join_correction_warnings"]
+        return payload
+
+
+#: Task 9c — the ``run_batched`` report keys that ride into the stage detail verbatim. Counts and
+#: closed codes only; ``not_attempted`` is deliberately absent because ``_enrichment_outcome``
+#: clamps and places it itself. A key here that the ladder did not write is simply not emitted.
+_BATCH_DETAIL_KEYS: tuple[str, ...] = (
+    "provider_calls", "fallback_calls", "chunks_planned", "chunks_issued", "stopped_by", "bounds",
+    "timed_out", "outcomes", "rejects")
+
+
+def _batch_detail(batch: dict | None) -> dict:
+    """The ladder's physical account, projected into stage-detail keys.
+
+    Correct on the FAILURE path by construction, which is the whole point: ``run_batched`` writes
+    these into the caller's dict as they happen, so a stage whose enrichment raised still reports
+    the calls it spent and the bound it hit — the states an observability record exists to explain.
+    An absent key means the ladder never got that far (batch mode not used, or it died before the
+    first chunk), never "zero"."""
+    if not batch:
+        return {}
+    return {k: batch[k] for k in _BATCH_DETAIL_KEYS if k in batch}
+
+
+def _passb_batch_detail(stats: dict | None) -> dict:
+    """Pass B's physical account, projected per PHASE.
+
+    Pass B runs up to three ladders per ingest — narrow synthesis, wide phase-1 summary, wide
+    phase-2 synthesis — each with its own chunking, bounds and cost. They are reported side by side
+    rather than summed: "which bound stopped it" has a different answer per phase, and adding a
+    chunk-granular phase-1 count to a table-granular phase-2 one would produce a number that means
+    nothing. A phase absent from the map never ran (a narrow-only catalog has no wide phases)."""
+    by_phase = (stats or {}).get("batch_by_phase") or {}
+    projected = {phase: account for phase, report in by_phase.items()
+                 if (account := _batch_detail(report))}
+    return {"batch": projected} if projected else {}
+
+
+def _evidence_detail(counts: dict | None, writer: str | None,
+                     rolled_back: bool = False) -> dict:
+    """The PERSISTENCE half of a stage's account, as ``detail["evidence"]``.
+
+    ``resolved``/``expected`` count what the MODEL produced. They say nothing about what was
+    stored, and the two diverge silently: a technical upload has no ``source_snapshot_id``, so the
+    evidence writer is gated out entirely and every drafted value is discarded after being paid
+    for. ``writer`` names that case (``not_run:<reason>``); ``counts`` is the per-disposition
+    account when the writer DID run, including ``skipped_*`` reason keys.
+
+    ``rolled_back`` is the failure-path correction, and it is not optional: these writers run
+    inside the stage's savepoint, so an escape rolls the rows back while the in-memory counters
+    keep their increments. Reporting ``written: 5`` for five rows that no longer exist would be
+    worse than reporting nothing, so the flag rides with the numbers.
+
+    It rides ONLY when there are numbers to qualify. The flag exists to say "do not believe these
+    counts"; on a stage that raised before the writer ever ran there are no counts to disbelieve,
+    and emitting it there would assert that evidence rows were lost when none were written. The
+    stage's own ``failed`` state already carries that the savepoint went down."""
+    if not counts:
+        return {"evidence": {"writer": writer}} if writer is not None else {}
+    account: dict = dict(counts)
+    if writer is not None:
+        account["writer"] = writer
+    if rolled_back:
+        account["rolled_back"] = True
+    return {"evidence": account}
+
 
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
-                        not_attempted: int = 0) -> tuple[str, str | None, dict]:
+                        not_attempted: int = 0,
+                        evidence_skipped: int = 0,
+                        batch: dict | None = None,
+                        evidence_counts: dict | None = None,
+                        evidence_writer: str | None = None,
+                        rolled_back: bool = False) -> tuple[str, str | None, dict]:
     """``(state, reason_code, detail)`` for a per-item stage (#22) — the honest account. ``None``
     (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING (and
     nothing merely truncated) is ``failed``; SOME items unresolved — or the stage caught per-item
@@ -270,10 +371,26 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     When unresolved is (partly) truncation, its count rides in ``detail["not_attempted"]`` and — if
     there is no GENUINE dispatched failure — the reason_code is the distinct, honest ``truncated``.
     ``items_failed`` stays reserved for items actually dispatched and rejected/failed (a run with
-    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``)."""
+    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``).
+
+    ``evidence_skipped`` (from an evidence writer's ``counts`` out-param) is the third way a stage
+    can resolve every item and still leave nothing behind: the items were drafted, and the WRITER
+    declined to store them by design — for ``enrich_synonyms``, every column without a glossary
+    record, because there is no schema-preserving ref to key evidence on. Like ``not_attempted``
+    this is NOT a failure and must not be laundered into ``items_failed``; unlike it, the items were
+    both dispatched AND resolved, so it cannot be inferred from ``unresolved`` either — a stage that
+    drafted all 126 columns and stored 0 has ``resolved == expected`` and zero failures, which is
+    exactly the shape that used to return a clean ``succeeded``. It reports ``partial`` /
+    ``evidence_not_stored`` instead. Ranked LAST of the three: a real failure outranks truncation,
+    which outranks a designed non-write."""
+    # Task 9c: the physical account and the evidence-writer account are attached FIRST, so they
+    # survive the early `failed` return. A stage that raised is exactly the one whose call cost and
+    # bound need explaining, and the old shape reported `{"expected": n}` and nothing else.
+    account = {**_batch_detail(batch),
+               **_evidence_detail(evidence_counts, evidence_writer, rolled_back)}
     if result is None:
-        return "failed", "exception", {"expected": expected}
-    detail: dict = {"resolved": len(result), "expected": expected}
+        return "failed", "exception", {"expected": expected, **account}
+    detail: dict = {"resolved": len(result), "expected": expected, **account}
     unresolved = max(expected - len(result), 0)
     if unresolved:
         detail["unresolved"] = unresolved
@@ -289,6 +406,10 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     not_attempted = min(max(not_attempted, 0), unresolved)
     if not_attempted:
         detail["not_attempted"] = not_attempted
+    # Clamped to what was actually resolved: a writer cannot decline more items than the stage drafted.
+    evidence_skipped = min(max(evidence_skipped, 0), len(result))
+    if evidence_skipped:
+        detail["evidence_skipped"] = evidence_skipped
     dispatched_failures = unresolved - not_attempted   # unresolved items that WERE tried
     if expected and not result and not not_attempted:
         return "failed", "no_items_resolved", detail
@@ -296,6 +417,8 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
         return "partial", "items_failed", detail
     if not_attempted:
         return "partial", "truncated", detail
+    if evidence_skipped:
+        return "partial", "evidence_not_stored", detail
     return "succeeded", None, detail
 
 
@@ -391,9 +514,14 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
     return outcome
 
 
-def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
+def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> list[str]:
     """Route each declared `joins_to` into the governed approved_join path via `propose_fact`, behind
     OVERLAY_GOVERNED_JOINS=1 (the caller gates on `governed_joins_enabled()`).
+
+    Returns the human-readable account of every CORRECTION the pair-guard dropped (final-review I3):
+    a re-upload declaring a different cardinality/direction for a humanly-confirmed pair is not
+    proposed, and the operator who authored that correction must learn it went nowhere. The caller
+    threads these onto `IngestResult`; an empty list is the normal case.
 
     ADVISORY / fail-soft (spec §12.1): this NEVER aborts the upload. A malformed `joins_to` is
     skipped-loud with its parse diagnostic; a `propose_fact` failure is logged and counted.
@@ -416,7 +544,27 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
         logger.warning("OVERLAY_GOVERNED_JOINS is on but no catalog adapter is registered in the "
                        "upload flow — skipping approved_join proposals (Phase-1: wire the "
                        "upload-context adapter). Display-only edges are still marked.")
-        return
+        return []
+
+    # Task 5 codegen-review remediation (F2): `fact_key` digests cardinality, so re-declaring an
+    # already-confirmed pair with a DIFFERENT cardinality (e.g. a blank re-upload of a pair
+    # verified as N:1) would mint a RIVAL DRAFT for the same unordered column pair — and two
+    # VERIFIED refs on one pair is a state `project_confirmed_joins` treats as impossible. Dedupe
+    # at proposal time: a pair whose approved_join fact was ever HUMAN-CONFIRMED and has not been
+    # humanly retired accepts no new proposal under another fact_key. The confirmed fact STANDS
+    # (authority-persists); correcting it goes through the join-governance reject/re-propose
+    # flow, never a silent upload rival.
+    #   * Folded VERIFIED is not enough: the SAME re-upload's changed cell (the blanked/altered
+    #     cardinality) STALEs the fact via catalog-change detection BEFORE this seam runs, so the
+    #     standing claim folds STALE (or REVERIFY after expiry) at guard time while it awaits
+    #     re-confirmation. Those states still hold the pair. A human REJECT retires the claim and
+    #     does NOT block — reject -> re-propose stays the correction path (mirrors Pass C
+    #     `decide_action`).
+    #   * Built lazily ONCE per ingest (not per row — the load-once lesson) from the same
+    #     enumeration + pair key the projector uses, so the seams cannot disagree about "the pair".
+    confirmed_pair_to_key: dict[tuple[str, str], str] | None = None
+    _PAIR_HOLDING = ("VERIFIED", "STALE", "REVERIFY")
+    dropped_corrections: list[str] = []
 
     for r in rows:
         if not r.joins_to:
@@ -426,6 +574,30 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             counters.incr("overlay.governed_joins.skipped_malformed")
             logger.warning("skipping governed join for %s.%s: %s", r.table, r.column,
                            parse_join_ref(r.joins_to).diagnostic)
+            continue
+        if confirmed_pair_to_key is None:
+            confirmed_pair_to_key = {}
+            for existing in list_approved_join_refs(conn, ref.from_ref.catalog_source):
+                k = fact_key(existing, "approved_join")
+                stream = load_fact(conn, k)
+                if (any(e.type == "OVERLAY_FACT_CONFIRMED" for e in stream)
+                        and fold_overlay_state(stream).status in _PAIR_HOLDING):
+                    confirmed_pair_to_key[_pair_key(existing)] = k
+        rival = confirmed_pair_to_key.get(_pair_key(ref))
+        if rival is not None and rival != fact_key(ref, "approved_join"):
+            # Final-review I3: this drop is an operator's CORRECTION going nowhere, so it must be
+            # VISIBLE, not an info-level log line. `governed_join_divergence` cannot honestly carry
+            # it without a migration — its `kind` CHECK is closed to ('retargeted', 'dropped'), and
+            # the drift detector's re-affirmation branch DELETES any row for a same-pair
+            # re-declaration in this very ingest — so the account rides `IngestResult` (warnings +
+            # count) alongside the WARNING and the counter.
+            counters.incr("overlay.governed_joins.skipped_verified_rival")
+            dropped_corrections.append(
+                f"governed-join correction dropped: {r.table}.{r.column} -> {r.joins_to} declares "
+                f"a different identity (direction/cardinality) for a column pair already held by "
+                f"human-confirmed approved_join fact {rival}; the confirmed fact stands — correct "
+                f"it via join governance (reject, then re-propose), not a re-upload")
+            logger.warning("%s", dropped_corrections[-1])
             continue
         value = {
             "from_ref": asdict(ref.from_ref),
@@ -454,6 +626,7 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             counters.incr("overlay.governed_joins.propose_denied")
             logger.info("governed-join proposal for %s.%s not accepted: %s", r.table, r.column,
                         result.denied_reason)
+    return dropped_corrections
 
 
 @dataclass(frozen=True, slots=True)
@@ -969,6 +1142,22 @@ def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
             continue
         out.setdefault(table, schema)
     return out
+
+
+def _evidence_bearing_table_refs(conn, expected_refs: Sequence[str]) -> list[str]:
+    """The subset of ``expected_refs`` — this upload's schema-agreeing TABLE logical refs — that
+    still carry ACTIVE field evidence (Task 0.6 Seam 5a). These are the table display projections
+    ``build_graph``'s DELETE just wiped: their evidence/decisions survive, so they must re-project
+    on EVERY upload, not only under Pass B or a matching glossary table term. Keyed on the exact
+    refs (indexed ``= ANY``), which also honors the [F8] schema fence — evidence recorded under a
+    schema this upload's columns do not declare is left alone."""
+    expected = sorted(set(expected_refs))
+    if not expected:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT logical_ref FROM field_evidence "
+        "WHERE lifecycle = 'active' AND logical_ref = ANY(%s)", (expected,)).fetchall()
+    return sorted(r[0] for r in rows)
 
 
 def _source_is_schema_less(conn, catalog_source: str) -> bool:
@@ -1521,7 +1710,8 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
                               now: datetime | None, stats: dict | None = None,
-                              changed_sink: list[ChangedRef] | None = None) -> int:
+                              changed_sink: list[ChangedRef] | None = None,
+                              projected_table_sink: set[str] | None = None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
     revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
     resolve-and-project + a readiness diagnostic (spec §6.3).
@@ -1711,6 +1901,9 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     try:
         with conn.transaction():
             resolve_and_project(conn, source=source, logical_refs=attachable_refs, now=now)
+        if projected_table_sink is not None:   # Seam 5a: the projected TABLE-term refs, on success
+            projected_table_sink.update(
+                ref for ref in attachable_refs if parse_ref(ref)[3] is None)
     except Exception:  # noqa: BLE001 — resolver failure: continue with the raw graph (degraded)
         contained_failures += 1
         logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
@@ -2123,6 +2316,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is
     # the source_snapshot_id that keys per-field evidence + staleness for THIS upload (review #5). ──
     is_glossary = glossary is not None
+    # NO SNAPSHOT ID ON THE TECHNICAL PATH, and therefore NO field evidence on it: every
+    # `field_evidence` row requires a NOT-NULL `source_snapshot_id`, so a technical upload's
+    # LLM-derived values (Pass A's classification and, since semantic Task 5, the adjudicator's
+    # corrections alike) reach `graph_node` through the in-memory `concepts`/`definitions` maps and
+    # `build_graph`, with no evidence row, no producer-scoped staleness and no decision link behind
+    # them. That is Pass A's PRE-EXISTING behaviour, not a Task-5 regression — adjudication
+    # deliberately matches it rather than inventing a second rule for one stage — and the
+    # adjudication stage detail counts those items as `evidence_skipped` so the run says so. The
+    # governed read surfaces treat such a value as an unbacked display value, which is exactly what
+    # it is; a technical upload that needs governed metadata is one that needs a glossary sidecar.
     snapshot_id = mint_id("ing") if is_glossary else None
     bindings: dict[str, ObjectBinding] | None = None
     if glossary is not None:
@@ -2153,6 +2356,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # E1a T3: {(table, column): domain} for the columns whose domain OVERRIDES their table's default
     # (the classifier's out-param). Stays empty with no client / no overrides -> every column inherits.
     domain_overrides: dict[tuple[str, str], str] = {}
+    # D13.2: {(table, column): sub_domain} — the FINER LLM-proposed axis beside the coarse source
+    # `domain`, produced by the SAME domain call (no second LLM request). Empty with no client.
+    column_sub_domains: dict[tuple[str, str], str] = {}
+    # Joint Task 4: the run's semantic context, assembled once inside the concept stage's savepoint
+    # and threaded into every later Pass-A stage. `{}` when that stage never ran (no client, or a
+    # contained failure) — every stage then falls back to building its own.
+    enrichment_context: dict = {}
     if client is None:
         # No LLM provider configured: the enrichment stages honestly never ran (#22) — recorded as
         # skipped, never as a failure, and ingestion continues normally. The concept CRITIC is
@@ -2162,7 +2372,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # NOT in this list: Step 6c moved it to the ingest tail, which records its own outcome
         # (skipped_no_client there too when no client is configured).
         for _stage in ("enrich_concept", "enrich_concept_critic", "enrich_definition",
-                       "enrich_domain", "enrich_synonyms", "enrich_unit"):
+                       "enrich_domain", "enrich_synonyms", "enrich_unit",
+                       # Adjudication is an LLM stage end to end (selection without a model to ask
+                       # produces nothing), so with no client it is honestly skipped, not "run with
+                       # zero targets".
+                       "semantic_adjudication"):
             record_stage(stage_recorder, _stage, "skipped_no_client")
     else:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
@@ -2181,6 +2395,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # (a failed call is simply absent from the returned dict; a contained concept-evidence
         # write failure is threaded out via `stats`), so an outer success is not evidence.
         concept_stats: dict = {}
+        # Task 9c: set by the advisory handler below. The stage's savepoint takes the evidence rows
+        # down with it, so the in-memory write counts must be labelled as describing rolled-back work.
+        concept_rolled_back = False
         consume_audit_degradations()   # #13 gap D: discard any stale count before the first stage
         stage_started = datetime.now(UTC)
         try:
@@ -2190,20 +2407,37 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # pre-audited + attributed to THIS run and the object subjects it enriches. `None`
             # (a direct caller with no run) dispatches unattributed — byte-for-byte as before.
             with conn.transaction():
+                # Joint Task 4: ONE semantic-context assembly for the whole run, threaded into
+                # every Pass-A stage below (each would otherwise repeat the same batched
+                # table-context read and the same pure per-column build).
+                enrichment_context = build_enrichment_context(conn, vr.good, glossary)
                 concepts = (
                     enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
                                     bindings=bindings, source_snapshot_id=snapshot_id,
-                                    stats=concept_stats, ingestion_run_id=ingestion_run_id)
+                                    stats=concept_stats, ingestion_run_id=ingestion_run_id,
+                                    bundles=enrichment_context)
                     if is_glossary
                     else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats,
-                                         ingestion_run_id=ingestion_run_id)
+                                         ingestion_run_id=ingestion_run_id,
+                                         bundles=enrichment_context)
                 )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
+            concept_rolled_back = True
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
             internal_failures=concept_stats.get("evidence_write_failures", 0),
-            not_attempted=concept_stats.get("not_attempted", 0))
+            not_attempted=concept_stats.get("not_attempted", 0),
+            batch=concept_stats.get("batch"),
+            evidence_counts=concept_stats.get("evidence_counts"),
+            evidence_writer=concept_stats.get("evidence_writer"),
+            rolled_back=concept_rolled_back)
+        # Task 9c: the run's join-candidacy shape and the registry generation that produced it.
+        # Attached AFTER the outcome so it rides the FAILED detail too — a stage that died holding
+        # a partial classification is exactly the one whose namespace picture needs reading.
+        for _key in ("namespaces", "vocab_fingerprint"):
+            if _key in concept_stats:
+                detail[_key] = concept_stats[_key]
         record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         # Stage honesty for the Pass-A ACCEPTANCE critic (ingestion-richness Task 2 step 6): the
@@ -2211,29 +2445,57 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # separate pipeline step), and its report rides out via `stats`. Zero identifier items ->
         # `not_applicable`, NEVER silent; a concept stage that died before acceptance -> `not_run`;
         # a contained critic fault -> `failed`.
+        #
+        # The critic's own START (final branch review, 2026-08-09). Every other stage passes
+        # `started_at`, so `ingestion_run_stage.started_at` is NULL for this one alone and it has no
+        # DURATION — while reporting a clean `succeeded`. That is the wrong stage to leave
+        # unmeasured: Task 9b's 102 added `is_a` parents move `_registry_fingerprint()`, so the
+        # FIRST run after merge re-critiques every stored identifier verdict. On a 144-column
+        # catalog that is ~70-100 sequential calls at up to 300s each.
+        #
+        # [A.54, fixed 2026-08-09] That loop is now BOUNDED — it shares the concept stage's
+        # `CallLedger` and deadline, and reports `not_attempted`/`stopped_by`. The duration below
+        # is what says whether either bound actually bit. `enrich_concepts` records the instant it
+        # started; absent (an older caller, or a fault before the critic block) it stays NULL, which
+        # is honest rather than a fabricated zero.
+        # The MARKER states below keep `started_at=None` per `StageRecorder.record`'s contract — a
+        # `not_run` never began, and a `not_applicable` critic dispatched nothing to time.
+        critic_started = concept_stats.get("concept_critic_started_at")
         critic_report = concept_stats.get("concept_critic")
         if concepts is None or critic_report is None:
             record_stage(stage_recorder, "enrich_concept_critic", "not_run",
                          reason_code="enrich_concept_failed")
         elif critic_report.get("failed"):
             record_stage(stage_recorder, "enrich_concept_critic", "failed",
-                         reason_code="exception")
+                         reason_code="exception", started_at=critic_started)
         elif not critic_report.get("items"):
             record_stage(stage_recorder, "enrich_concept_critic", "not_applicable",
                          reason_code="no_identifier_assignments")
         else:
+            # Task 9c: `critic_report` now carries `verdict_changes` — the per-column before→after
+            # concept and namespace for every assignment the critic MOVED. If the concept stage's
+            # savepoint went down after the critic's own committed (a commit-time fault at the
+            # `with` exit), those evictions are gone while the in-memory report still describes
+            # them; label the report rather than publish a verdict trail for rows that do not exist.
+            critic_detail = dict(critic_report)
+            if concept_rolled_back:
+                critic_detail["rolled_back"] = True
             record_stage(stage_recorder, "enrich_concept_critic", "succeeded",
-                         detail=dict(critic_report))
+                         detail=critic_detail, started_at=critic_started)
         stage_started = datetime.now(UTC)
         def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         def_evidence_failures = 0
+        def_ev_counts: dict[str, int] = {}   # Task 9c: written/reused/skipped_<reason>/failed
+        def_ev_writer: str | None = None     # set when the writer is GATED OUT (never ran)
+        def_rolled_back = False
         try:
             with conn.transaction():
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
                 # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
                                                 glossary=glossary,
-                                                ingestion_run_id=ingestion_run_id, stats=def_stats)
+                                                ingestion_run_id=ingestion_run_id, stats=def_stats,
+                                                bundles=enrichment_context or None)
                 # E1a: the drafted definition is not display-only — promote it to governed
                 # `llm/proposed` evidence so asset-detail shows the AI as its author, and RECONCILE
                 # the columns that dropped out of this run (a suppressed / no-longer-blank column
@@ -2245,7 +2507,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         def_evidence_failures = _write_definition_evidence(
                             conn, source=catalog_source, rows=vr.good, definitions=definitions,
                             glossary=glossary, concepts=concepts, bindings=bindings,
-                            source_snapshot_id=snapshot_id)
+                            source_snapshot_id=snapshot_id, counts=def_ev_counts)
                     except Exception:  # noqa: BLE001 — T2-M2: an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise to
@@ -2254,6 +2516,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
+            def_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                def_ev_writer = ("not_run:no_glossary" if glossary is None
+                                 else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             definitions,
             # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
@@ -2261,7 +2528,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # target set the drafter selects with and the reconciler keeps — one definition, no drift.
             len(_definition_targets(vr.good, glossary)),
             internal_failures=def_evidence_failures,
-            not_attempted=def_stats.get("not_attempted", 0))
+            not_attempted=def_stats.get("not_attempted", 0),
+            batch=def_stats.get("batch"), evidence_counts=def_ev_counts,
+            evidence_writer=def_ev_writer, rolled_back=def_rolled_back)
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 
@@ -2273,11 +2542,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         domain_evidence_failures = 0
+        domain_ev_counts: dict[str, int] = {}   # Task 9c — covers BOTH domain and sub_domain
+        domain_ev_writer: str | None = None
+        domain_rolled_back = False
         try:
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor,
                                            ingestion_run_id=ingestion_run_id, stats=domain_stats,
-                                           column_domains=domain_overrides)
+                                           column_domains=domain_overrides,
+                                           column_sub_domains=column_sub_domains,
+                                           glossary=glossary,
+                                           bundles=enrichment_context or None)
                 # E1a T3: the classified domain is not display-only either — promote it to governed
                 # `llm/proposed` evidence at BOTH levels (the table's default on the TABLE node; a
                 # column's only where it OVERRIDES that default — inheritance is never fabricated as
@@ -2289,7 +2564,14 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         domain_evidence_failures = _write_domain_evidence(
                             conn, source=catalog_source, rows=vr.good, domains=domains,
                             column_domains=domain_overrides, glossary=glossary, bindings=bindings,
-                            source_snapshot_id=snapshot_id)
+                            source_snapshot_id=snapshot_id, counts=domain_ev_counts)
+                        # D13.2 — the finer axis rides the SAME stage/savepoint/report as the
+                        # coarse one it refines: one call produced both, so one failure domain.
+                        domain_evidence_failures += _write_sub_domain_evidence(
+                            conn, source=catalog_source, rows=vr.good,
+                            column_sub_domains=column_sub_domains, glossary=glossary,
+                            bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=domain_ev_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
@@ -2298,16 +2580,26 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
+            domain_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                domain_ev_writer = ("not_run:no_glossary" if glossary is None
+                                    else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             domains, len({r.table for r in vr.good}),
             internal_failures=domain_evidence_failures,
-            not_attempted=domain_stats.get("not_attempted", 0))
+            not_attempted=domain_stats.get("not_attempted", 0),
+            batch=domain_stats.get("batch"), evidence_counts=domain_ev_counts,
+            evidence_writer=domain_ev_writer, rolled_back=domain_rolled_back)
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         synonyms = None
         syn_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
+        syn_counts: dict[str, int] = {}   # honest-labeling: the WRITER's per-item dispositions
         syn_evidence_failures = 0
+        syn_ev_writer: str | None = None
+        syn_rolled_back = False
         try:
             with conn.transaction():
                 # E1a T4: the AI's synonyms are FIRST-CLASS `llm/proposed` `semantic_terms` evidence —
@@ -2317,24 +2609,48 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # the definition/domain evidence (glossary + snapshot); its CONTAINED failures ride
                 # into the stage report.
                 synonyms = draft_synonyms(conn, vr.good, client, actor, concepts=concepts,
-                                          ingestion_run_id=ingestion_run_id, stats=syn_stats)
+                                          ingestion_run_id=ingestion_run_id, stats=syn_stats,
+                                          glossary=glossary,
+                                          bundles=enrichment_context or None)
                 if glossary is not None and snapshot_id is not None:
                     try:
                         syn_evidence_failures = _write_synonym_evidence(
                             conn, source=catalog_source, rows=vr.good, synonyms=synonyms,
-                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id)
+                            glossary=glossary, bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=syn_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
                         # to the advisory handler below, which logs it.
                         syn_evidence_failures = 1
                         raise
+                elif synonyms:
+                    # THE WRITER NEVER RAN. `_write_synonym_evidence` is gated on a glossary AND a
+                    # snapshot id, so a TECHNICAL upload drafts synonyms for EVERY column — at full
+                    # LLM cost, since `draft_synonyms` above is gated only on `client` — and stores
+                    # none of them. On that path the drafted terms have no consumer at all: this
+                    # writer is skipped, `_project_semantic_terms` is unreachable (its only call
+                    # sites are inside `_ingest_glossary_evidence`), and the same-run summary
+                    # ride-along does not run either (`enrich_summary` is `not_applicable` when
+                    # `glossary is None`). Counting the whole draft as SKIPPED here is what stops
+                    # the stage reporting a clean `succeeded` for a run that persisted nothing.
+                    # It is honest labeling only — the fix for the drafting itself (a ref strategy
+                    # for non-glossary columns) is a design decision, deliberately not made here.
+                    syn_counts["skipped"] = len(synonyms)
         except Exception:  # noqa: BLE001
             logger.warning("advisory synonym enrichment failed for %r", catalog_source, exc_info=True)
+            syn_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                syn_ev_writer = ("not_run:no_glossary" if glossary is None
+                                 else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             synonyms, len({content_hash(r) for r in vr.good}),
             internal_failures=syn_evidence_failures,
-            not_attempted=syn_stats.get("not_attempted", 0))
+            not_attempted=syn_stats.get("not_attempted", 0),
+            evidence_skipped=syn_counts.get("skipped", 0),
+            batch=syn_stats.get("batch"), evidence_counts=syn_counts,
+            evidence_writer=syn_ev_writer, rolled_back=syn_rolled_back)
         record_stage(stage_recorder, "enrich_synonyms", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
@@ -2342,6 +2658,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         unit_stats: dict = {}      # honest-labeling: receives batch not_attempted (budget/deadline)
         unit_currencies: dict[str, str] = {}   # {content_hash: ISO-4217} — monetary measures only
         unit_evidence_failures = 0
+        unit_ev_counts: dict[str, int] = {}   # Task 9c — covers BOTH unit and currency
+        unit_ev_writer: str | None = None
+        unit_rolled_back = False
         try:
             with conn.transaction():
                 # E4a T2: the measure annotation the FILE never declared. The AI's unit/currency is
@@ -2354,13 +2673,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # evidence (glossary + snapshot); its CONTAINED failures ride into the stage report.
                 units = draft_units(conn, vr.good, client, actor, concepts=concepts,
                                     currencies=unit_currencies,
-                                    ingestion_run_id=ingestion_run_id, stats=unit_stats)
+                                    ingestion_run_id=ingestion_run_id, stats=unit_stats,
+                                    glossary=glossary,
+                                    bundles=enrichment_context or None)
                 if glossary is not None and snapshot_id is not None:
                     try:
                         unit_evidence_failures = _write_unit_evidence(
                             conn, source=catalog_source, rows=vr.good, units=units,
                             currencies=unit_currencies, concepts=concepts, glossary=glossary,
-                            bindings=bindings, source_snapshot_id=snapshot_id)
+                            bindings=bindings, source_snapshot_id=snapshot_id,
+                            counts=unit_ev_counts)
                     except Exception:  # noqa: BLE001 — an ESCAPE (a throw outside the writer's
                         # per-item try) rolls this savepoint back, so leaving the count at 0 would
                         # report `succeeded` for a run that wrote nothing. Count it, then re-raise
@@ -2369,15 +2691,70 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         raise
         except Exception:  # noqa: BLE001
             logger.warning("advisory unit enrichment failed for %r", catalog_source, exc_info=True)
+            unit_rolled_back = True
+        else:
+            if glossary is None or snapshot_id is None:
+                unit_ev_writer = ("not_run:no_glossary" if glossary is None
+                                  else "not_run:no_source_snapshot")
         state, reason, detail = _enrichment_outcome(
             # The SAME target set the drafter selects with and the reconciler keeps — a measure
             # column whose file declares no unit. A non-measure (or an already-declared) column was
             # never asked, so it must not count as an unresolved item degrading the stage.
             units, len(_unit_targets(vr.good, concepts)),
             internal_failures=unit_evidence_failures,
-            not_attempted=unit_stats.get("not_attempted", 0))
+            not_attempted=unit_stats.get("not_attempted", 0),
+            batch=unit_stats.get("batch"), evidence_counts=unit_ev_counts,
+            evidence_writer=unit_ev_writer, rolled_back=unit_rolled_back)
         record_stage(stage_recorder, "enrich_unit", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
+
+        # ── semantic Task 5: targeted adjudication ────────────────────────────────────────────
+        # The columns Pass A and the critic left UNCLEAR get one bounded second opinion, and the
+        # vocabulary gets a channel for saying "you have no word for this". Selection is
+        # deterministic (never a model-confidence threshold), the call count is explicitly capped,
+        # and a `selected` correction lands as normal llm/proposed evidence PLUS the in-memory
+        # `concepts` correction — so `build_graph` below persists the same answer the evidence
+        # asserts. Savepointed + advisory like every enrichment side-effect: a fault degrades to an
+        # honest `failed` stage, never a lost upload. The six OUTCOMES ride the stage DETAIL
+        # (D12.3); the stage STATE stays inside the 0996 vocabulary.
+        stage_started = datetime.now(UTC)
+        adjudication_detail: dict | None = None
+        if concepts is not None:
+            # A concept stage that DIED leaves no classification to adjudicate: every column would
+            # look `unclassified_column` and burn the call cap re-deriving what Pass A failed to
+            # produce. The stage records `not_run` below instead.
+            try:
+                with conn.transaction():
+                    adjudication_detail = adjudicate_semantics(
+                        conn, client, vr.good, concepts=concepts, glossary=glossary,
+                        bindings=bindings, source_snapshot_id=snapshot_id, actor=actor,
+                        critic_outcomes=concept_stats.get("concept_critic_outcomes"),
+                        ingestion_run_id=ingestion_run_id,
+                        bundles=enrichment_context or None)
+            except Exception:  # noqa: BLE001 — advisory: adjudication never fails an upload
+                logger.warning("advisory semantic adjudication failed for %r", catalog_source,
+                               exc_info=True)
+        if concepts is None:
+            record_stage(stage_recorder, "semantic_adjudication", "not_run",
+                         reason_code="enrich_concept_failed")
+        elif adjudication_detail is None:
+            record_stage(stage_recorder, "semantic_adjudication", "failed",
+                         reason_code="exception", started_at=stage_started)
+        elif not adjudication_detail.get("targets"):
+            # Every column was CLEAR — the designed normal case, and never a failure.
+            record_stage(stage_recorder, "semantic_adjudication", "not_applicable",
+                         reason_code="no_unclear_columns", detail=adjudication_detail,
+                         started_at=stage_started)
+        elif (adjudication_detail.get("not_attempted") or adjudication_detail.get("invalid")
+              or adjudication_detail.get("evidence_write_failures")):
+            record_stage(stage_recorder, "semantic_adjudication", "partial",
+                         reason_code="items_not_adjudicated",
+                         detail=_with_audit_degradations(adjudication_detail),
+                         started_at=stage_started)
+        else:
+            record_stage(stage_recorder, "semantic_adjudication", "succeeded",
+                         detail=_with_audit_degradations(adjudication_detail),
+                         started_at=stage_started)
     stage_started = datetime.now(UTC)
     # Additive schema preservation (round-4 #5): object_ref-keyed maps from the glossary's
     # schema-carrying records; None/empty for technical and generic-glossary uploads, whose
@@ -2386,6 +2763,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 column_domains=domain_overrides,
                 schemas=schema_by_ref(glossary), declared_types=declared_type_by_ref(glossary))
     record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
+    governed_join_correction_warnings: tuple[str, ...] = ()   # I3: () when the seam is off/failed
     if governed_joins_enabled() or pass_c_enabled():
         # Governed seam (Task 7 / §12.1) — Pass C (Task 10) implies it: the raw 'joins' edges just
         # written are display-only; route each declared join into the governed approved_join path so
@@ -2397,8 +2775,14 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
-                _propose_governed_joins(conn, vr.good, actor=actor)
+                governed_join_correction_warnings = tuple(
+                    _propose_governed_joins(conn, vr.good, actor=actor))
             record_stage(stage_recorder, "governed_joins", "succeeded",
+                         reason_code=("corrections_dropped"
+                                      if governed_join_correction_warnings else None),
+                         detail=({"corrections_dropped":
+                                  len(governed_join_correction_warnings)}
+                                 if governed_join_correction_warnings else None),
                          started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: the governed-join seam never fails an upload
             counters.incr("overlay.governed_joins.error")
@@ -2437,6 +2821,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # MF-5: the Pass B syntheses drive the truthful proposed/abstained split at the success return.
     # Initialised empty so it is ALWAYS in scope — Pass B off, no client, or an advisory failure
     # before it binds all leave `syntheses` at {} (proposed == abstained == 0).
+    # Task 0.6 Seam 5a: TABLE logical refs a stage this round already resolve_and_project-ed
+    # (Pass B below; the glossary table-term pass), so the unconditional table display
+    # re-projection at the tail skips them instead of appending duplicate decision events.
+    projected_table_refs: set[str] = set()
     syntheses: dict = {}
     if not table_synth_enabled():
         record_stage(stage_recorder, "pass_b", "disabled")
@@ -2491,13 +2879,40 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # Computed HERE (pure — no DB) so the C5-T5 dispatch subjects key each table under
                 # the SAME schema its fact proposals use below; reused by the propose block.
                 schema_by_table = _schema_by_table(glossary)
+                # Profile Task 4: does this catalog HAVE authored narrative to judge an
+                # authority claim against? The deterministic `authority_claim_without_source_context`
+                # rule fires only when it does — with no narrative anywhere, "unsupported" and
+                # "unknown" are indistinguishable and the rule abstains rather than refuting every
+                # claim in the catalog. Read fail-soft: an unavailable narrative store degrades to
+                # abstention, never to a wrong refutation.
+                #
+                # Task 7b: read the NARRATIVE ITSELF, not just whether one exists. This probe had
+                # the prose in reach and threw it away — Pass B was told "a human wrote something
+                # about this catalog" and never shown what, while the upload form promised the
+                # description is "used by the AI when it interprets tables". The boolean is now
+                # derived from the same read, so the contradiction rule's behaviour is unchanged.
+                try:
+                    from featuregen.overlay.upload.profile_store import (
+                        current_catalog_narrative_block,
+                        current_catalog_profile_revision_id,
+                    )
+                    _catalog_context = current_catalog_profile_revision_id(
+                        conn, catalog_source) is not None
+                    _catalog_narrative = current_catalog_narrative_block(conn, catalog_source)
+                except Exception:  # noqa: BLE001 — advisory: abstain rather than misfire
+                    logger.warning("advisory catalog-narrative probe failed for %r",
+                                   catalog_source, exc_info=True)
+                    _catalog_context = False
+                    _catalog_narrative = {}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
                                               dispositions=dispositions,
                                               # C5-T5: run + table-subject dispatch attribution
                                               ingestion_run_id=ingestion_run_id,
                                               catalog_source=catalog_source,
-                                              schema_by_table=schema_by_table, stats=passb_stats)
+                                              schema_by_table=schema_by_table, stats=passb_stats,
+                                              catalog_context_available=_catalog_context,
+                                              catalog_narrative=_catalog_narrative)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
@@ -2528,6 +2943,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     for t in sorted({r.table for r in vr.good})]
                 resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
                                     now=now)
+            # committed (savepoint released): the tail re-projection must not double these refs
+            projected_table_refs.update(pass_b_table_refs)
             # [F12] totality: a table that never RESOLVED (egress-excluded, provider-failed,
             # timed out, whole-rejected raw, or missing from the batch result — run_batched
             # returns resolved refs only) has no disposition records; give it the uniform five
@@ -2540,13 +2957,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             state, reason, detail = _enrichment_outcome(
                 syntheses, len(items), not_attempted=passb_stats.get("not_attempted", 0))
             detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
+            detail.update(_passb_batch_detail(passb_stats))
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
             counters.incr("overlay.table_synth.error")
             logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
                            "intact", catalog_source, exc_info=True)
+            # Task 9c: the failed record used to carry NOTHING. Pass B's ladders write their
+            # account into `passb_stats` as they go, so the stage that died can still say which
+            # phase it died in and what it had spent — the state an observability record exists for.
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
+                         detail=_with_audit_degradations(_passb_batch_detail(passb_stats)) or None,
                          started_at=stage_started)
 
     # [13] `_retire_dropped_field_decisions` (invoked per-column below) also COLLECTS into
@@ -2562,7 +2984,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
                 bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now,
-                stats=glossary_stats, changed_sink=deferred_invalidations)
+                stats=glossary_stats, changed_sink=deferred_invalidations,
+                projected_table_sink=projected_table_refs)
             # The helper CONTAINS per-column failures (savepoint + warning); `partial` surfaces
             # them instead of laundering the outer no-raise as success (#22). A table-term schema
             # mismatch is NOT a failure (the upload still succeeds) but IS surfaced in the detail so
@@ -2602,6 +3025,51 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory technical evidence wiring failed for %r — facts + graph "
                            "intact", catalog_source, exc_info=True)
+
+    # Task 0.6 Seam 5a: build_graph recreated every table node with NULL display columns, and the
+    # only table-ref reprojections above are Pass-B-gated (table_synth_enabled, default OFF) or
+    # scoped to THIS glossary's table terms — so a plain re-upload wiped confirmed table display
+    # projections (table_role / primary_entity / event_or_snapshot / domain ...) whose evidence and
+    # decisions survive untouched. Re-project every schema-agreeing table ref that still carries
+    # ACTIVE field evidence, UNCONDITIONALLY; refs a stage above already projected this round are
+    # skipped (no duplicate decision events). Savepointed fail-soft PER REF (one bad ref never
+    # kills the remaining projections); never fails the upload. The honest outcome rides the run's
+    # stage account like every other tail stage.
+    stage_started = datetime.now(UTC)
+    try:
+        with conn.transaction():   # savepoint: even the pending-set read must not poison the tx
+            _schema_of = _schema_by_table(glossary)
+            _expected_table_refs = {
+                normalize_ref(catalog_source, _schema_of.get(t.strip().lower()), t)
+                for t in {r.table for r in vr.good}}
+            _pending_table_refs = sorted(
+                set(_evidence_bearing_table_refs(conn, sorted(_expected_table_refs)))
+                - projected_table_refs)
+        _reprojected = _reproject_failed = 0
+        for _table_ref in _pending_table_refs:
+            try:
+                with conn.transaction():   # per-ref savepoint
+                    resolve_and_project(conn, source=catalog_source,
+                                        logical_refs=[_table_ref], now=now)
+                _reprojected += 1
+            except Exception:  # noqa: BLE001 — advisory: one ref's fault is contained
+                _reproject_failed += 1
+                logger.warning("advisory table display re-projection failed for %r ref %r — "
+                               "evidence intact, remaining refs still projected",
+                               catalog_source, _table_ref, exc_info=True)
+        _detail: dict = {"reprojected": _reprojected}
+        if _reproject_failed:
+            _detail["failed"] = _reproject_failed
+        record_stage(
+            stage_recorder, "table_display_reprojection",
+            ("failed" if _reprojected == 0 else "partial") if _reproject_failed else "succeeded",
+            reason_code="items_failed" if _reproject_failed else None,
+            detail=_detail, started_at=stage_started)
+    except Exception:  # noqa: BLE001 — advisory: display re-projection never fails an upload
+        logger.warning("advisory table display re-projection failed for %r — evidence intact",
+                       catalog_source, exc_info=True)
+        record_stage(stage_recorder, "table_display_reprojection", "failed",
+                     reason_code="exception", started_at=stage_started)
 
     entity_bridges_proposed = 0
     entity_bridge_derivation = BridgeCandidateDerivationV1(
@@ -3064,6 +3532,31 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         record_stage(stage_recorder, "axis_projection", "failed", reason_code="exception",
                      started_at=stage_started)
 
+    # ── Tie-break warming (router-plan Task 2b): adjudicate every genuine grounding tie ONCE, now,
+    # while the catalog is the thing that just changed and the LLM machinery is already paid for.
+    # AFTER axis_projection so the graph (and the enrichment text the deliberation reads) is final.
+    # Advisory like its neighbours: own savepoint, fail-soft, counted account on the stage detail.
+    # Requests never dispatch — they read verdicts; a skipped tie keeps the deterministic order.
+    stage_started = datetime.now(UTC)
+    if client is None:
+        record_stage(stage_recorder, "tie_break_warming", "skipped_no_client")
+    else:
+        try:
+            from featuregen.overlay.upload.tie_break import warm_tie_break_verdicts
+
+            with conn.transaction():
+                warm_stats = warm_tie_break_verdicts(
+                    conn, catalog_source=catalog_source, client=client, actor=actor)
+            record_stage(stage_recorder, "tie_break_warming", "succeeded",
+                         detail=warm_stats, started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: a warming fault never fails an upload
+            counters.incr("overlay.tie_break_warming.error")
+            logger.warning("advisory tie-break warming failed for %r — grounding falls back to "
+                           "the deterministic order at request time", catalog_source,
+                           exc_info=True)
+            record_stage(stage_recorder, "tie_break_warming", "failed", reason_code="exception",
+                         started_at=stage_started)
+
     # ── Step 6c: the ONE summary draft per ingest, at the TAIL, from the FULL enriched dossier —
     # concept, party_role (projected just above), grain/as-of role, table role, the Step-6b
     # sidecar fields and the AI's synonyms — assembled per column and passed as the drafting
@@ -3077,6 +3570,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     summaries: dict[str, str] = {}
     summary_stats: dict = {}
     summary_evidence_failures = 0
+    # Task 9c: the summary stage drafts ONE value per column from the full enriched dossier, which
+    # makes it plausibly the largest single call cost of the run — and it was the one stage of the
+    # six the inventory named that reported neither which bound stopped it nor whether anything was
+    # stored. `_write_summary_evidence` already took a `counts=` parameter that no call site passed.
+    summary_ev_counts: dict[str, int] = {}
+    summary_ev_writer: str | None = None
+    summary_rolled_back = False
     if client is None:
         record_stage(stage_recorder, "enrich_summary", "skipped_no_client")
     elif glossary is None:
@@ -3087,18 +3587,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 summary_extras = _summary_dossier_extras(
                     conn, catalog_source, vr.good, glossary=glossary, concepts=concepts,
                     domains=domains, domain_overrides=domain_overrides, synonyms=synonyms)
+                # ONE bundle set for the drafter AND the evidence writer: the summary's
+                # `input_hash` must hash exactly what it was drafted from, so both sides must see
+                # the SAME context (`summary_payload` folds the adapter output into the material).
+                summary_context = enrichment_context or build_enrichment_context(
+                    conn, vr.good, glossary)
                 summaries = draft_summaries(conn, vr.good, client, actor, glossary=glossary,
                                             concepts=concepts,
                                             ingestion_run_id=ingestion_run_id,
                                             stats=summary_stats,
-                                            extras_by_hash=summary_extras)
+                                            extras_by_hash=summary_extras,
+                                            bundles=summary_context)
                 if snapshot_id is not None:
                     try:
                         summary_evidence_failures = _write_summary_evidence(
                             conn, source=catalog_source, rows=vr.good, summaries=summaries,
                             glossary=glossary, bindings=bindings,
                             source_snapshot_id=snapshot_id,
-                            extras_by_hash=summary_extras)
+                            extras_by_hash=summary_extras,
+                            bundles=summary_context, counts=summary_ev_counts)
                     except Exception:  # noqa: BLE001 — an escape past the writer's per-item
                         # guard would otherwise report `succeeded` for a run that wrote nothing.
                         summary_evidence_failures = 1
@@ -3116,10 +3623,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory summary enrichment failed for %r", catalog_source,
                            exc_info=True)
+            summary_rolled_back = True
+        else:
+            # This branch is only reached with a glossary AND a client (both gated above), so the
+            # snapshot is the only remaining way the writer can be gated out.
+            if snapshot_id is None:
+                summary_ev_writer = "not_run:no_source_snapshot"
         state, reason, detail = _enrichment_outcome(
             summaries, len(_summary_targets(vr.good, glossary)),
             internal_failures=summary_evidence_failures,
-            not_attempted=summary_stats.get("not_attempted", 0))
+            not_attempted=summary_stats.get("not_attempted", 0),
+            batch=summary_stats.get("batch"), evidence_counts=summary_ev_counts,
+            evidence_writer=summary_ev_writer, rolled_back=summary_rolled_back)
         record_stage(stage_recorder, "enrich_summary", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
 
@@ -3147,6 +3662,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         semantic_binding_proposed=sembind_proposed,
                         semantic_binding_abstained=sembind_abstained,
                         semantic_binding_failed=sembind_failed,
+                        governed_join_corrections_dropped=len(
+                            governed_join_correction_warnings),
+                        governed_join_correction_warnings=governed_join_correction_warnings,
                         entity_bridges_proposed=entity_bridges_proposed,
                         entity_bridge_candidates_considered=(
                             entity_bridge_derivation.considered_count),

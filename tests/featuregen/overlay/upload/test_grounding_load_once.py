@@ -239,7 +239,23 @@ def test_every_column_a_filtered_pass_binds_is_one_the_caller_could_already_see(
 def test_two_callers_with_different_roles_get_correspondingly_different_suggestions(db):
     """End to end on the read-only endpoint: ``roles`` comes from the authenticated session and is
     handed to the same narrowed grounding pass, so a column the caller may not see is not a candidate
-    and cannot be suggested — the per-table pass changes nothing about that."""
+    and cannot be suggested — the per-table pass changes nothing about that.
+
+    REWRITTEN 2026-08-04, when the feature USE gate landed. The observable this test used to read
+    was the SUGGESTION ``external_own_transfer_trend_90d``, and the fixture's only role-
+    differentiating columns are ``full_name`` and ``beneficiary_name``, both concept-tagged
+    personal data. That recipe's own ``eligibility`` field says "consent / purpose / residency
+    REQUIRED"; no such policy exists, so ``_use_gate`` refuses it — and refuses it for BOTH
+    callers, because whether a feature may be BUILT is a property of the feature, not of who is
+    looking. Weakening the gate to keep the old observable would have been weakening it to keep a
+    test green.
+
+    So the same guarantee is stated where it now shows. The two callers still get correspondingly
+    different results; the difference moved from ``suggestions`` to ``rejections``, which is the
+    honest place for it — the pii_reader is told what exists and why it cannot be built, and the
+    caller who cannot see the columns is not told the recipe exists at all. That second half is the
+    one that actually matters for read scope, and it is the half this test always owned.
+    """
     _one_table_catalog(db)
     unscoped = suggest_features_for_table(
         db, catalog_source=_ONE_SOURCE, table="cards", roles=())
@@ -252,7 +268,22 @@ def test_two_callers_with_different_roles_get_correspondingly_different_suggesti
     def _used(out):
         return {ref for g in out["groups"] for s in g["suggestions"] for ref in s["uses"]}
 
-    assert "external_own_transfer_trend_90d" in _suggested(pii)
-    assert _suggested(unscoped) < _suggested(pii)
+    def _refused(out):
+        return {(r.get("name"), r.get("code")) for r in out["rejections"]}
+
+    # READ SCOPE, which is what this test is for: the pii-only recipe reaches the pii_reader's
+    # result and is entirely absent from the unscoped caller's — not as a suggestion, not as a
+    # rejection, not as an existence hint.
+    assert ("external_own_transfer_trend_90d", "PERSONAL_DATA_POLICY_REQUIRED") in _refused(pii)
+    assert not any(name.startswith("external_own_transfer_trend")
+                   for name, _code in _refused(unscoped)), _refused(unscoped)
+    assert "external_own_transfer_trend_90d" not in _suggested(unscoped)
+
+    # THE USE GATE, which is role-INDEPENDENT: neither caller may build it, so the two suggestion
+    # sets are now equal and NEITHER binds a restricted column.
+    assert _suggested(unscoped) == _suggested(pii), (
+        "a use refusal became a function of the caller's roles — the same feature must not be "
+        "safe for one reviewer and unsafe for another")
     assert not (_used(unscoped) & _RESTRICTED)
-    assert _used(pii) & _RESTRICTED
+    assert not (_used(pii) & _RESTRICTED)
+    assert _suggested(pii), "both callers got nothing at all; the comparison above is vacuous"

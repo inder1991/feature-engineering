@@ -41,32 +41,51 @@ schemas. Only two *known, different* schemas for one table name refuse.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TypedDict
 
 from featuregen.contracts.db import DbConn
+from featuregen.data_agent.physical import PhysicalDatasetBindingV1
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.overlay.upload.bridge_realization import (
     BridgeJoinRealizationRevisionV1,
     BridgeRealizationCurrentV1,
     Cardinality,
+    CardinalityBasis,
+    ExecutionTier,
     StructuredPredicateV1,
     eligible_for_production,
 )
 from featuregen.overlay.upload.bridge_store import CurrentBridgeRealizationV1
+from featuregen.overlay.upload.crosswalk import JoinLegPinV1
+from featuregen.overlay.upload.crosswalk_admission import AdmittedCrosswalkV1
+from featuregen.overlay.upload.crosswalk_observation import (
+    COMPOSED_DIRECTIONS,
+    MAPPING_TO_TARGET,
+    SOURCE_TO_MAPPING,
+    SOURCE_TO_TARGET,
+)
 from featuregen.overlay.upload.join_path import (
     JoinOutcome,
     JoinStep,
     classify_join_path,
     table_of_ref,
 )
+from featuregen.overlay.upload.temporal_policy import PREDICATE_KINDS, PREDICATE_OPERATORS
 
 __all__ = [
+    "CROSSWALK_EXECUTION_AUTHORITY",
+    "RENDERED_OPERATORS",
+    "CROSSWALK_EXECUTION_OUTCOME",
     "CrossCatalogJoinStepV1",
+    "CrosswalkJoinStepV1",
     "JoinPlan",
+    "MappingRowPredicateV1",
     "PhysicalIdentity",
     "plan_cross_catalog_join",
+    "plan_crosswalk_join",
     "plan_join",
 ]
 
@@ -100,7 +119,11 @@ class JoinPlan:
     them could not be re-checked.
     """
 
-    steps: tuple[JoinStep | CrossCatalogJoinStepV1, ...]
+    #: The THREE governed step kinds this module produces — a same-catalog hop, a directional
+    #: cross-catalog bridge, and one leg of a two-leg crosswalk. All three are in the union because
+    #: consumers narrow on it: with a kind missing, `isinstance` narrowing silently stopped working
+    #: and every attribute read on the narrowed value was unchecked.
+    steps: tuple[JoinStep | CrossCatalogJoinStepV1 | CrosswalkJoinStepV1, ...]
     outcome_kind: str
     roles_used: tuple[str, ...]
     fans_out: bool
@@ -127,6 +150,19 @@ _DIRECTIONAL_CARDINALITY = {
     Cardinality.ONE_TO_MANY: "1:N",
     Cardinality.MANY_TO_MANY: "N:N",
 }
+
+
+#: The bases on which a directional cardinality claim counts as ATTESTED — exactly the two the
+#: shipped producers establish deterministically: ``infer_metadata_cardinality`` concludes
+#: GOVERNED_KEY from declared complete keys, and deterministic profile admission concludes
+#: EXACT_PROFILE from an exact observed scan. The other members (approximate profile, metadata
+#: inference, none) record HOW WELL the direction is known rather than establishing it, and the
+#: store rehydrates the basis independently of the claim — so a MANY_TO_ONE on an unattested basis
+#: is refused, because "we do not know" is not "it is safe" (rule 2 above).
+_ATTESTED_CARDINALITY_BASES = frozenset({
+    CardinalityBasis.GOVERNED_KEY,
+    CardinalityBasis.EXACT_PROFILE,
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +201,193 @@ class CrossCatalogJoinStepV1:
             "realization_revision_id": self.realization_revision_id,
             "dependency_snapshot_id": self.dependency_snapshot_id,
         }
+
+
+#: The governed outcome/authority words a two-leg crosswalk traversal travels under. Minted here
+#: rather than reusing ``DIRECTIONAL_REALIZATION_OPERATIONAL`` because the renderer's authority check
+#: is what stops a crosswalk step being read as a bridge step and vice versa — one word for one
+#: kind of governed approval.
+CROSSWALK_EXECUTION_OUTCOME = "CROSSWALK_EXECUTION_OPERATIONAL"
+CROSSWALK_EXECUTION_AUTHORITY = "crosswalk_execution"
+
+#: The row-predicate vocabularies, IMPORTED from the contract that owns them rather than restated.
+#: Release B decides which rows of a dataset answer a question; this module renders that decision
+#: and never invents one, so the two sets must be the same set — a second copy here is how a
+#: governed predicate silently stops being applied. The adapter below still fails CLOSED on a member
+#: it has no rendered form for, which is what an EXTENSION of the vocabulary would hit.
+_MAPPING_ROW_OPERATORS = PREDICATE_OPERATORS
+_MAPPING_ROW_KINDS = PREDICATE_KINDS
+
+#: How each governed operator renders. A member of the vocabulary that is absent here refuses.
+RENDERED_OPERATORS: dict[str, str] = {
+    "<": "<", "<=": "<=", ">": ">", ">=": ">=", "=": "==",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class MappingRowPredicateV1:
+    """One predicate of the pinned ``DatasetRowSelectionV1``, in the shape a renderer can emit.
+
+    Built from ``DatasetRowSelectionV1.predicate_payloads`` by :func:`mapping_row_predicates`, which
+    refuses an unknown ``kind``/``operator`` rather than passing it through. The compiler never
+    decides WHICH rows of the mapping table answer the question — Release B's temporal resolver
+    does, and its answer arrives here already made and already pinned into the measurement the
+    crosswalk was admitted on.
+
+    ``parameter_ref`` names a run parameter (never a literal date — ``DatasetRowSelectionV1``
+    refuses one), so the rendered filter binds a value the run supplies.
+    """
+
+    kind: str
+    column_ref: str
+    operator: str
+    parameter_ref: str | None = None
+
+    def identity_payload(self) -> dict[str, object]:
+        return {"kind": self.kind, "column_ref": self.column_ref, "operator": self.operator,
+                "parameter_ref": self.parameter_ref}
+
+
+def mapping_row_predicates(
+    payloads: Iterable[Mapping[str, object]],
+) -> tuple[MappingRowPredicateV1, ...] | MaterializationRefused:
+    """Adapt a pinned row selection's payloads, or refuse an operator this slice cannot render."""
+    built: list[MappingRowPredicateV1] = []
+    for index, payload in enumerate(payloads):
+        kind = str(payload.get("kind", ""))
+        operator = str(payload.get("operator", ""))
+        column_ref = str(payload.get("column_ref", ""))
+        parameter = payload.get("parameter_ref")
+        renderable = operator == "is_true" or operator in RENDERED_OPERATORS
+        if kind not in _MAPPING_ROW_KINDS or operator not in _MAPPING_ROW_OPERATORS or (
+                not renderable):
+            return _refuse(
+                CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                f"the pinned mapping row selection's predicate {index} is "
+                f"{kind!r}/{operator!r}, which this compiler has no rendered form for: the mapping "
+                f"row rule decides WHICH mapping rows the uniqueness was measured over, so a "
+                f"predicate that cannot be rendered would execute the traversal over a different "
+                f"row set than the one that was measured")
+        if not column_ref.strip():
+            return _refuse(
+                CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+                f"the pinned mapping row selection's predicate {index} names no column")
+        built.append(MappingRowPredicateV1(
+            kind=kind, column_ref=column_ref.strip(), operator=operator,
+            parameter_ref=None if parameter is None else str(parameter)))
+    return tuple(built)
+
+
+@dataclass(frozen=True, slots=True)
+class CrosswalkJoinStepV1:
+    """ONE leg of a governed two-leg mapping-table traversal (Release C Task 12).
+
+    A crosswalk is not a bridge and this is not a ``CrossCatalogJoinStepV1``: a bridge step carries
+    ONE realization that is itself the governed safety decision, while a crosswalk leg is one half
+    of a composition whose safety decision is the COMPOSED measurement. ``JoinLegPinV1`` refuses to
+    pretend every leg is an entity bridge, and so does this: a same-catalog leg pins no fact key and
+    no realization revision, and the fields for them are empty rather than fabricated.
+
+    **``cardinality`` is the COMPOSED verdict, and both legs carry the same value.** This is the
+    whole reason a two-leg traversal is plannable at all (see ``expression_ir._plan_to_grain``):
+    ``expression_ir`` used to refuse a grain assembled from two joins because it "would need two
+    [fan-out verdicts], which no single plan can state", and a composed observation states exactly
+    one — measured over the joined shape, never multiplied out of the two legs' bounds. So neither
+    step claims a per-leg cardinality nobody measured; each carries the direction's one verdict, and
+    the renderer's amplification gate spans the pair rather than checking each half in isolation.
+    """
+
+    leg: str                       # the DEFINITION's side name — source_to_mapping / mapping_to_target
+    direction: str                 # the REQUESTED traversal — source_to_target / target_to_source
+    from_catalog_source: str
+    to_catalog_source: str
+    from_ref: str
+    to_ref: str
+    column_pairs: tuple[tuple[str, str], ...]
+    cardinality: str
+    crosswalk_definition_revision_id: str
+    crosswalk_execution_revision_id: str
+    mapping_dataset_ref: str
+    mapping_binding_revision_id: str
+    #: True on the leg that ARRIVES at the mapping dataset — the one the row filter applies to.
+    arrives_at_mapping: bool
+    leg_kind: str
+    leg_plan_hash: str
+    leg_read_set_hash: str
+    leg_binding_revision_ids: tuple[str, ...] = ()
+    leg_fact_keys: tuple[str, ...] = ()
+    leg_realization_revision_ids: tuple[str, ...] = ()
+    leg_dependency_snapshot_ids: tuple[str, ...] = ()
+    mapping_row_predicates: tuple[MappingRowPredicateV1, ...] = ()
+    mapping_temporal_policy_revision_id: str | None = None
+    mapping_row_selection_hash: str | None = None
+    composed_observation_revision_id: str | None = None
+    leg_measurement_ids: tuple[str, ...] = ()
+    authority: str = CROSSWALK_EXECUTION_AUTHORITY
+    #: Present so generic diagnostics that read a step's approved-join fields do not have to know
+    #: which kind they hold. A crosswalk leg is never backed by one.
+    approved_join_fact_key: str | None = None
+    approved_join_status: str | None = None
+
+    def identity_payload(self) -> dict[str, object]:
+        return {
+            "leg": self.leg,
+            "direction": self.direction,
+            "from_catalog_source": self.from_catalog_source,
+            "to_catalog_source": self.to_catalog_source,
+            "column_pairs": [list(pair) for pair in self.column_pairs],
+            "cardinality": self.cardinality,
+            "crosswalk_definition_revision_id": self.crosswalk_definition_revision_id,
+            "crosswalk_execution_revision_id": self.crosswalk_execution_revision_id,
+            "mapping_dataset_ref": self.mapping_dataset_ref,
+            "mapping_binding_revision_id": self.mapping_binding_revision_id,
+            "leg_kind": self.leg_kind,
+            "leg_plan_hash": self.leg_plan_hash,
+            "leg_read_set_hash": self.leg_read_set_hash,
+            "leg_binding_revision_ids": list(self.leg_binding_revision_ids),
+            "leg_fact_keys": list(self.leg_fact_keys),
+            "leg_realization_revision_ids": list(self.leg_realization_revision_ids),
+            "leg_dependency_snapshot_ids": list(self.leg_dependency_snapshot_ids),
+            "mapping_row_predicates": [
+                predicate.identity_payload() for predicate in self.mapping_row_predicates],
+            "mapping_temporal_policy_revision_id": self.mapping_temporal_policy_revision_id,
+            "mapping_row_selection_hash": self.mapping_row_selection_hash,
+            "composed_observation_revision_id": self.composed_observation_revision_id,
+            "leg_measurement_ids": list(self.leg_measurement_ids),
+        }
+
+
+class _SharedLegFields(TypedDict):
+    """The step fields BOTH legs of one crosswalk carry identically — execution-level pins.
+
+    Typed rather than a bare ``dict``: the two steps are built by splatting this into
+    :class:`CrosswalkJoinStepV1`, and under ``dict[str, object]`` a type checker can say nothing
+    about the result — a key renamed on the step and not here, or a ``str`` where a tuple belongs,
+    would land at run time inside a generated project.
+    """
+
+    direction: str
+    cardinality: str
+    crosswalk_definition_revision_id: str
+    crosswalk_execution_revision_id: str
+    mapping_dataset_ref: str
+    mapping_binding_revision_id: str
+    mapping_temporal_policy_revision_id: str | None
+    mapping_row_selection_hash: str | None
+    composed_observation_revision_id: str | None
+    leg_measurement_ids: tuple[str, ...]
+
+
+class _LegPinFields(TypedDict):
+    """One ``JoinLegPinV1`` flattened onto a step — PER LEG, and so never shared."""
+
+    leg_kind: str
+    leg_plan_hash: str
+    leg_read_set_hash: str
+    leg_binding_revision_ids: tuple[str, ...]
+    leg_fact_keys: tuple[str, ...]
+    leg_realization_revision_ids: tuple[str, ...]
+    leg_dependency_snapshot_ids: tuple[str, ...]
 
 
 def _cardinality_verdict(cardinality: str | None) -> _CardinalityVerdict:
@@ -294,6 +517,22 @@ def plan_join(
                     fans_out=False)
 
 
+def _matches_binding(
+    identity: PhysicalIdentity, binding: PhysicalDatasetBindingV1
+) -> bool:
+    """Is the table this compilation RESOLVED the table the governance pinned? (§3.5)
+
+    All three parts, and the schema is the one that matters: a re-pointed environment schema map
+    changes only that member, so a comparison on catalog + table alone reads ``dpl_eib_v2`` while
+    claiming the uniqueness measured on ``dpl_eib``.
+    """
+    return (
+        _fold(identity.catalog_source) == _fold(binding.identity.catalog_source)
+        and _fold(identity.schema) == _fold(binding.identity.schema)
+        and _fold(identity.table) == _fold(binding.identity.table)
+    )
+
+
 def _matches_physical_identity(
     identity: PhysicalIdentity,
     revision: BridgeJoinRealizationRevisionV1,
@@ -302,12 +541,7 @@ def _matches_physical_identity(
 ) -> bool:
     endpoint = revision.from_endpoint if from_side else revision.to_endpoint
     binding = endpoint.physical_binding
-    return (
-        binding is not None
-        and _fold(identity.catalog_source) == _fold(binding.identity.catalog_source)
-        and _fold(identity.schema) == _fold(binding.identity.schema)
-        and _fold(identity.table) == _fold(binding.identity.table)
-    )
+    return binding is not None and _matches_binding(identity, binding)
 
 
 def plan_cross_catalog_join(
@@ -365,6 +599,15 @@ def plan_cross_catalog_join(
             f"directional realization {revision.realization_revision_id} has unresolved "
             "additional-key requirements",
         )
+    if revision.cardinality_basis not in _ATTESTED_CARDINALITY_BASES:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"directional realization {revision.realization_revision_id} claims "
+            f"{revision.cardinality.value.value} on basis {revision.cardinality_basis.value!r}, "
+            "which is not an attested basis (governed_key, exact_profile): the basis records how "
+            "well the direction is actually known, and a claim on an unattested basis may BE "
+            "fanning — \"we do not know\" is not \"it is safe\"",
+        )
 
     pairs = tuple(
         (
@@ -393,6 +636,274 @@ def plan_cross_catalog_join(
         roles_used=tuple(roles),
         fans_out=False,
     )
+
+
+#: What a composed directional verdict may say for a traversal that is allowed to be COMPUTED ON.
+#: Same rule as every other join in this module: fanning is refused rather than repaired, and
+#: "we do not know" is not "it is safe".
+_CROSSWALK_FANS_IN = frozenset({Cardinality.ONE_TO_ONE, Cardinality.MANY_TO_ONE})
+
+
+def plan_crosswalk_join(
+    admitted: AdmittedCrosswalkV1,
+    *,
+    direction: str,
+    from_identity: PhysicalIdentity,
+    to_identity: PhysicalIdentity,
+    mapping_identity: PhysicalIdentity,
+    execution_tier: ExecutionTier,
+    roles: Iterable[str] = (),
+) -> JoinPlan | MaterializationRefused:
+    """Adapt ONE admitted crosswalk into TWO governed join steps, or refuse the traversal.
+
+    **What replaced the either/or refusal, and why it is not a bypass.** ``expression_ir`` refused a
+    grain reached through two joins with a stated reason: each join "would need [its own] fan-out
+    verdict, which no single plan can state". That was true of two INDEPENDENT joins and it is still
+    true of them. It is not true of a crosswalk, because Task 11 measures the composition itself:
+    ``CrosswalkExecutionObservationV1.source_to_target_max_matches`` is measured over the JOINED
+    shape ("never the product of the leg maxima, which is a bound"), and
+    ``crosswalk_admission._direction_verdict`` turns it into ONE directional verdict per direction.
+    So the plan does state one fan-out verdict for the traversal it is planning — the refusal's own
+    condition, satisfied. The two legs travel under that one verdict and neither claims a per-leg
+    cardinality nobody measured.
+
+    **The two directions are gated independently**, exactly as they are admitted: a mapping table
+    that is 1:1 forward and N:1 in reverse is ordinary, and the execution revision's
+    ``combined_cardinality`` is the FORWARD verdict by construction
+    (``admitted_crosswalk_execution`` fills it from ``decision.forward``), so a reverse traversal is
+    gated on ``decision.reverse`` and refuses on its own evidence.
+
+    ``execution_tier`` is the applicability scope this compilation reads at. A SANDBOX-scoped
+    execution refuses at ``PRODUCTION``; that is the correct answer, not a bug.
+    """
+    if direction not in COMPOSED_DIRECTIONS:
+        raise ValueError(
+            f"direction must be one of {COMPOSED_DIRECTIONS}, got {direction!r}: which way a "
+            "traversal runs decides which measured verdict gates it, and guessing would gate the "
+            "reverse traversal on the forward direction's evidence")
+    execution = admitted.execution
+    definition = admitted.definition
+    verdict = admitted.verdict_for(direction)
+    roles_used = tuple(roles)
+
+    scope_tier = execution.applicability_scope.execution_tier
+    if execution_tier is ExecutionTier.PRODUCTION and scope_tier is not ExecutionTier.PRODUCTION:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"crosswalk execution {execution.execution_revision_id} is admitted only under the "
+            f"{scope_tier.value} applicability scope {execution.applicability_scope.scope_id!r} "
+            "and this is a production compilation: a mapping proved safe for sandbox data is not "
+            "thereby proved safe for production data")
+    admissible = (verdict.production_admissible if execution_tier is ExecutionTier.PRODUCTION
+                  else verdict.sandbox_admissible)
+    if not admissible:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"the {direction} direction of crosswalk {definition.definition_id} is "
+            f"{verdict.safety_status.value} and not admissible at the {execution_tier.value} tier: "
+            f"{', '.join(verdict.reason_codes) or '(no reason recorded)'}")
+
+    if execution.composition_observation_revision_id is None:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"crosswalk {definition.definition_id} carries no composed observation, so nothing "
+            "states the fan-out of the composition. Two safe legs do not compose into a safe "
+            "crosswalk, and a plan built without the composed verdict is exactly the two-verdict "
+            "gap the old either/or refusal named")
+    composed = verdict.cardinality.value
+    if composed is None:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"the {direction} direction of crosswalk {definition.definition_id} has an unknown "
+            "composed cardinality: an unmeasured composition may BE fanning, and \"we do not "
+            "know\" is not \"it is safe\"")
+    if composed not in _CROSSWALK_FANS_IN:
+        return _refuse(
+            CompilationRefusalCode.JOIN_FANOUT_UNSUPPORTED,
+            f"the {direction} direction of crosswalk {definition.definition_id} composes "
+            f"{composed.value} toward {to_identity.schema}.{to_identity.table}: allocating one row "
+            "across many is a governed business decision and no allocation policy exists — the "
+            "traversal is refused, not deduplicated")
+
+    pinned_policy = execution.mapping_temporal_policy_revision_id
+    selection = admitted.mapping_row_selection
+    if pinned_policy is not None and selection is None:
+        return _refuse(
+            CompilationRefusalCode.JOIN_CARDINALITY_UNKNOWN,
+            f"crosswalk {definition.definition_id} pins mapping temporal policy {pinned_policy} "
+            "and no resolved row selection was supplied: the mapping rows this traversal reads "
+            "would be whatever the table holds, which is a different row set from the one its "
+            "uniqueness was measured over")
+    row_predicates: tuple[MappingRowPredicateV1, ...] = ()
+    if selection is not None:
+        adapted = mapping_row_predicates(selection.predicate_payloads)
+        if isinstance(adapted, MaterializationRefused):
+            return adapted
+        row_predicates = adapted
+
+    # ── the three tables must be the three tables that were MEASURED (§3.5) ──────────────────────
+    #
+    # Every pin above is a revision ID, and an id cannot be compared with a table this compilation
+    # resolved onto the cluster. Nothing between admission and here asked whether the resolved
+    # addresses are the pinned ones, so re-pointing the environment's schema map moved all three
+    # tables of a measured crosswalk and the traversal planned cleanly: a mapping table whose row
+    # uniqueness was measured on `dpl_eib.acct_xref` was read from `dpl_eib_v2.acct_xref`, and the
+    # composed fan-out verdict gating the whole plan describes the other table. The check is the
+    # bridge family's own (`_matches_physical_identity`), applied to three tables instead of two.
+    unresolved = _refuse_unpinned_physical(
+        admitted, direction=direction, from_identity=from_identity, to_identity=to_identity,
+        mapping_identity=mapping_identity)
+    if unresolved is not None:
+        return unresolved
+
+    forward = direction == SOURCE_TO_TARGET
+    # The DEFINITION's sides are canonically ordered and its pair tuples travel with their endpoint,
+    # so which side a traversal STARTS from decides which pin and which pair tuple each leg uses.
+    if forward:
+        first_pin, second_pin = execution.source_leg, execution.target_leg
+        first_pairs = tuple((pair.endpoint_member_ref, pair.mapping_member_ref)
+                            for pair in definition.source_to_mapping_pairs)
+        second_pairs = tuple((pair.mapping_member_ref, pair.endpoint_member_ref)
+                             for pair in definition.mapping_to_target_pairs)
+        first_leg, second_leg = SOURCE_TO_MAPPING, MAPPING_TO_TARGET
+    else:
+        first_pin, second_pin = execution.target_leg, execution.source_leg
+        first_pairs = tuple((pair.endpoint_member_ref, pair.mapping_member_ref)
+                            for pair in definition.mapping_to_target_pairs)
+        second_pairs = tuple((pair.mapping_member_ref, pair.endpoint_member_ref)
+                             for pair in definition.source_to_mapping_pairs)
+        first_leg, second_leg = MAPPING_TO_TARGET, SOURCE_TO_MAPPING
+
+    mapping_catalog = definition.mapping_dataset_ref.split("::", 1)[0]
+    cardinality = _DIRECTIONAL_CARDINALITY[composed]
+    shared = _SharedLegFields(
+        direction=direction,
+        cardinality=cardinality,
+        crosswalk_definition_revision_id=definition.revision_id,
+        crosswalk_execution_revision_id=execution.execution_revision_id,
+        mapping_dataset_ref=definition.mapping_dataset_ref,
+        mapping_binding_revision_id=execution.mapping_binding_revision_id,
+        mapping_temporal_policy_revision_id=pinned_policy,
+        mapping_row_selection_hash=None if selection is None else selection.content_hash,
+        composed_observation_revision_id=execution.composition_observation_revision_id,
+        leg_measurement_ids=tuple(execution.leg_measurement_ids),
+    )
+    steps = (
+        CrosswalkJoinStepV1(
+            leg=first_leg,
+            from_catalog_source=from_identity.catalog_source,
+            to_catalog_source=mapping_catalog,
+            from_ref=first_pairs[0][0], to_ref=first_pairs[0][1],
+            column_pairs=first_pairs,
+            arrives_at_mapping=True,
+            # The row filter belongs to the leg that ARRIVES at the mapping dataset, because that is
+            # the frame it scopes — and it is emitted before that frame's uniqueness gate, so the
+            # rows whose uniqueness is checked are the rows the join will use.
+            mapping_row_predicates=row_predicates,
+            **_leg_pin_fields(first_pin), **shared),
+        CrosswalkJoinStepV1(
+            leg=second_leg,
+            from_catalog_source=mapping_catalog,
+            to_catalog_source=to_identity.catalog_source,
+            from_ref=second_pairs[0][0], to_ref=second_pairs[0][1],
+            column_pairs=second_pairs,
+            arrives_at_mapping=False,
+            **_leg_pin_fields(second_pin), **shared),
+    )
+    unresolved = _refuse_unpinned_mapping(mapping_identity, definition.mapping_dataset_ref)
+    if unresolved is not None:
+        return unresolved
+    return JoinPlan(steps=steps, outcome_kind=CROSSWALK_EXECUTION_OUTCOME,
+                    roles_used=roles_used, fans_out=False)
+
+
+def _leg_pin_fields(pin: JoinLegPinV1) -> _LegPinFields:
+    """One ``JoinLegPinV1`` flattened onto a step — the pin's own values, never re-derived."""
+    return _LegPinFields(
+        leg_kind=pin.kind.value,
+        leg_plan_hash=pin.plan_hash,
+        leg_read_set_hash=pin.read_set_hash,
+        leg_binding_revision_ids=tuple(pin.binding_revision_ids),
+        leg_fact_keys=tuple(pin.fact_keys),
+        leg_realization_revision_ids=tuple(pin.realization_revision_ids),
+        leg_dependency_snapshot_ids=tuple(pin.dependency_snapshot_ids),
+    )
+
+
+def _refuse_unpinned_physical(
+    admitted: AdmittedCrosswalkV1,
+    *,
+    direction: str,
+    from_identity: PhysicalIdentity,
+    to_identity: PhysicalIdentity,
+    mapping_identity: PhysicalIdentity,
+) -> MaterializationRefused | None:
+    """All THREE resolved tables against the bindings the composed measurement pinned.
+
+    The definition's sides are canonical and the traversal's are directional, so which pinned
+    binding a resolved endpoint is compared against depends on the requested direction — comparing
+    a reverse traversal's origin against the source binding would refuse every legal reverse plan
+    and admit an illegal one.
+
+    Refuses with ``PHYSICAL_SCHEMA_NOT_RESOLVED`` and names both addresses: the operator's question
+    is always "which table did it actually read", and an id-only message cannot answer it.
+    """
+    if direction == SOURCE_TO_TARGET:
+        origin, destination = admitted.source_binding, admitted.target_binding
+    else:
+        origin, destination = admitted.target_binding, admitted.source_binding
+    for identity, binding, role in (
+            (from_identity, origin, "source relation"),
+            (mapping_identity, admitted.mapping_binding, "mapping dataset"),
+            (to_identity, destination, "target relation")):
+        if not _matches_binding(identity, binding):
+            pinned = binding.identity
+            return _refuse(
+                CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+                f"the {role} resolved to {identity.catalog_source}::{identity.schema}."
+                f"{identity.table} and crosswalk "
+                f"{admitted.definition.definition_id} was measured against "
+                f"{pinned.catalog_source}::{pinned.schema}.{pinned.table} "
+                f"(binding revision {binding.binding_revision_id}): every verdict gating this "
+                "traversal — the composed fan-out, both legs' uniqueness, the mapping row rule — "
+                "was measured over THAT table, so planning against this one would carry the "
+                "evidence of a table nobody is reading")
+    return None
+
+
+def _refuse_unpinned_mapping(
+    mapping_identity: PhysicalIdentity, mapping_dataset_ref: str
+) -> MaterializationRefused | None:
+    """The mapping dataset's resolved LOGICAL identity must be the crosswalk's mapping dataset.
+
+    The logical half of the question :func:`_refuse_unpinned_physical` answers physically, and kept
+    because the two are answered from different governed sources: this one against the DEFINITION's
+    own ``mapping_dataset_ref``, that one against the binding the MEASUREMENT pinned. A definition
+    and an execution that disagreed about which table the mapping is would satisfy either check
+    alone.
+
+    Task 5 owns resolution and refuses on its own when it cannot answer; this only refuses the
+    case resolution cannot see — a caller passing an identity for some other table. The mapping
+    dataset is the one table on a crosswalk nobody named in the formula, so it is exactly the one
+    whose mis-resolution nothing else would catch.
+    """
+    expected = mapping_dataset_ref.split("::", 1)
+    if len(expected) != 2:
+        return _refuse(
+            CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+            f"the mapping dataset ref {mapping_dataset_ref!r} names no catalog source")
+    catalog, remainder = expected
+    bare_table = remainder.split(".")[-1]
+    if (_fold(mapping_identity.catalog_source), _fold(mapping_identity.table)) != (
+            _fold(catalog), _fold(bare_table)):
+        return _refuse(
+            CompilationRefusalCode.PHYSICAL_SCHEMA_NOT_RESOLVED,
+            f"the resolved mapping identity {mapping_identity.catalog_source}::"
+            f"{mapping_identity.schema}.{mapping_identity.table} is not the crosswalk's mapping "
+            f"dataset {mapping_dataset_ref!r}: the mapping table is the one relation on a crosswalk "
+            "that no formula names, so a traversal resolved onto the wrong one would join real "
+            "rows through a table nobody governed for it")
+    return None
 
 
 def _refuse_outcome(

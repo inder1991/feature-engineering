@@ -16,7 +16,19 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance',
   '/gate', '/catalog', '/catalogs', '/ingestion-runs',
   // The data agent's planning surface, and the learning-gap queue.
-  '/analysis', '/learning']
+  '/analysis', '/learning',
+  // The connection/catalog registry (api.ts getDataSourceConnections/getDataSourceCatalogs).
+  // nginx.conf has carried this since the screen shipped; this list did not, so the dev server
+  // answered those calls itself instead of proxying them.
+  '/data-sources',
+  // Phase G's materialization trigger + status. No screen calls it yet — it is here because
+  // nginx.conf and this list must agree, and because a missing prefix answers a POST with 405
+  // from the SPA rather than a 404 anyone would recognise as routing.
+  '/materialization-runs',
+  // BR-23's recipe-review surface: the summary queue, the definition under review, and the
+  // review history + decision POST (api.ts getRecipeReviewSummary/getRecipeDetail/
+  // getRecipeReviews/postRecipeReview).
+  '/recipes']
 
 export default defineConfig({
   plugins: [react()],

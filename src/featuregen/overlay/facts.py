@@ -115,7 +115,10 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
                     "additionalProperties": False,
                 },
             },
-            "cardinality": {"type": "string", "enum": ["1:1", "1:N", "N:1"]},
+            # null = UNKNOWN: an upload that omitted cardinality still proposes its declared join
+            # (Task 5, codegen-review remediation — the "N:1" safe-fan default was a fabrication).
+            # plan_join refuses an unknown-cardinality hop until a human supplies one.
+            "cardinality": {"type": ["string", "null"], "enum": ["1:1", "1:N", "N:1", None]},
         },
         "additionalProperties": False,
     },

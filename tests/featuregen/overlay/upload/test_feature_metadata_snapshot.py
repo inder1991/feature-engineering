@@ -245,14 +245,19 @@ def test_snapshot_drift_seals_non_governed(conn) -> None:
     assert ctx.facts(_SRC, _BAL_OBJ, "additivity").authority == "hint"
 
 
-def test_unknown_field_is_skipped_not_fabricated(conn) -> None:
+def test_unknown_requested_field_raises_naming_it(conn) -> None:
+    # D6 (Task 0.6): an unknown requested field used to be silently dropped — a caller asking for a
+    # field the adapter does not model got a snapshot that quietly lacked it. It must RAISE.
     _rr(conn)
     _seed_graph(conn)
-    ctx = build_metadata_snapshot(
-        conn, generation_run_id="genrun_skip", refs=[(_SRC, _BAL_OBJ)],
-        read_scope_hash="sha256:scope", fields=["additivity", "not_a_real_field"])
-    captured_fields = {i.field_or_fact_type for i in ctx.items()}
-    assert captured_fields == {"additivity"}   # the unmodeled field is skipped, not fabricated
+    with pytest.raises(ValueError, match="not_a_real_field"):
+        build_metadata_snapshot(
+            conn, generation_run_id="genrun_skip", refs=[(_SRC, _BAL_OBJ)],
+            read_scope_hash="sha256:scope", fields=["additivity", "not_a_real_field"])
+    # pure input validation — nothing was written for the doomed request
+    assert conn.execute(
+        "SELECT 1 FROM feature_generation_run WHERE generation_run_id = 'genrun_skip'"
+    ).fetchone() is None
 
 
 # ── 5. a non-REPEATABLE-READ connection is a hard isolation error ──────────────────────────────────────
@@ -262,3 +267,87 @@ def test_read_committed_connection_raises_isolation_error(conn) -> None:
     with pytest.raises(SnapshotIsolationError, match="REPEATABLE READ"):
         build_metadata_snapshot(
             conn, generation_run_id="genrun_iso", refs=_REFS, read_scope_hash="sha256:scope")
+
+
+# ── Task 0.6 Seam 4 (D6): six pin kinds, compat-safe hashing, kind-dispatched freshness ────────────────
+
+def test_item_kind_vocabulary_is_the_pinned_list() -> None:
+    from featuregen.overlay.upload.feature_metadata_snapshot import ITEM_KINDS
+    assert ITEM_KINDS == frozenset({
+        "column_field", "dataset_profile", "serving_policy", "source_selection",
+        "physical_binding", "temporal_policy", "row_selection",
+        # SE-2 (2026-08-11): the frozen Layer-A generation context's identity pin — the one
+        # non-column kind with a REGISTERED comparator (rebuild-at-stored-scope).
+        "generation_semantic_context"})
+
+
+_GOLDEN_MATERIAL = {
+    "catalog_source": "bank",
+    "graph_ref": "public.accounts.balance",
+    "field": "additivity",
+    "value": "additive",
+    "authority": "governed",
+    "provenance": "fde_add_1",
+    "status": "resolved",
+}
+
+
+def test_legacy_column_field_hash_is_byte_identical_to_the_pinned_literal() -> None:
+    """Hash-compat golden (D6): `column_field` keeps the EXACT legacy computation — `item_kind`
+    excluded — so every already-stored snapshot hash stays valid. The literal below was computed
+    with the pre-seam code; changing it means invalidating stored snapshots."""
+    from featuregen.overlay.upload.feature_metadata_snapshot import snapshot_item_hash
+    assert snapshot_item_hash("column_field", _GOLDEN_MATERIAL) == \
+        "6d654ba49047a4f0d57eeb3f56e315a3b3145f13aa3384c537cfc703a47b31c0"
+    assert snapshot_item_hash("column_field", _GOLDEN_MATERIAL) == \
+        canonical_hash(_GOLDEN_MATERIAL)
+
+
+def test_identical_payloads_under_different_kinds_hash_differently() -> None:
+    """Property (D6): a NEW kind hashes `item_kind` into its material, so two kinds can never
+    collide on an identical payload — without touching any legacy column_field row."""
+    from featuregen.overlay.upload.feature_metadata_snapshot import ITEM_KINDS, snapshot_item_hash
+    hashes = {kind: snapshot_item_hash(kind, _GOLDEN_MATERIAL) for kind in sorted(ITEM_KINDS)}
+    assert len(set(hashes.values())) == len(hashes)   # pairwise distinct across all six kinds
+    with pytest.raises(ValueError, match="unregistered_kind"):
+        snapshot_item_hash("unregistered_kind", _GOLDEN_MATERIAL)
+
+
+def _restamp_item_kind(conn, snapshot_id: str, kind: str) -> None:
+    """Restamp ONE stored item's kind, bypassing the 1006 write-once seal the way a future writer
+    of the new kinds legitimately would (the seal guards items, not this test's simulation)."""
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE")   # flush the deferred item->header FK events
+    conn.execute("ALTER TABLE catalog_metadata_snapshot_item DISABLE TRIGGER USER")
+    conn.execute(
+        "UPDATE catalog_metadata_snapshot_item SET item_kind = %s WHERE snapshot_id = %s "
+        "AND field_or_fact_type = 'additivity'", (kind, snapshot_id))
+    conn.execute("ALTER TABLE catalog_metadata_snapshot_item ENABLE TRIGGER USER")
+
+
+def test_stored_kind_without_a_comparator_is_a_typed_refusal_not_drift(conn) -> None:
+    from featuregen.overlay.upload.feature_metadata_snapshot import compare_snapshot_to_current
+    _rr(conn)
+    _seed_graph(conn)
+    ctx = build_metadata_snapshot(
+        conn, generation_run_id="genrun_kind", refs=[(_SRC, _BAL_OBJ)],
+        read_scope_hash="sha256:scope", fields=["additivity"])
+    # a registered vocabulary kind whose builder ships in a LATER task: typed refusal
+    _restamp_item_kind(conn, ctx.snapshot_id, "dataset_profile")
+    freshness = compare_snapshot_to_current(conn, ctx.snapshot_id)
+    assert (freshness.status, freshness.reason) == ("unverifiable", "SNAPSHOT_KIND_UNSUPPORTED")
+    # a kind outside the vocabulary entirely: the SAME typed refusal — never drift, never a crash
+    _restamp_item_kind(conn, ctx.snapshot_id, "bogus_kind")
+    freshness = compare_snapshot_to_current(conn, ctx.snapshot_id)
+    assert (freshness.status, freshness.reason) == ("unverifiable", "SNAPSHOT_KIND_UNSUPPORTED")
+
+
+def test_column_field_snapshot_still_verifies_current(conn) -> None:
+    # dispatch regression: the one SUPPORTED kind keeps comparing exactly as before
+    from featuregen.overlay.upload.feature_metadata_snapshot import compare_snapshot_to_current
+    _rr(conn)
+    _seed_graph(conn)
+    ctx = build_metadata_snapshot(
+        conn, generation_run_id="genrun_cur", refs=[(_SRC, _BAL_OBJ)],
+        read_scope_hash="sha256:scope", fields=["additivity"])
+    freshness = compare_snapshot_to_current(conn, ctx.snapshot_id)
+    assert (freshness.status, freshness.reason) == ("current", None)

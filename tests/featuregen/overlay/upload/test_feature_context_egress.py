@@ -44,6 +44,64 @@ def test_thin_menu_with_null_identity_untouched():
     assert (spans, audits, ver) == ([], [], None)
 
 
+def test_thin_menu_domain_is_prose_redacted_on_every_menu_version():
+    """`domain` rides EVERY menu version — the v1 thin menu and the v3 enriched menu
+    (`_MENU_IDENTITY_FIELDS`) as well as v4 (`for_feature_generation`) — and every one of them lands
+    in this adapter, because `audited_structured_call` runs it on every call. It is uploader-TYPED:
+    the generic `glossary_reader.read_glossary` builds it with a bare `_cell(...)` and no redaction,
+    so "already scrubbed at ingest" is not true of it.
+
+    Put `domain` back in `_FEATURE_COLUMN_IDENTITY_KEYS` and the raw token below reaches the
+    provider, on all three versions at once. This is a change of GRADE, not of detection: the same
+    `_PII_PATTERNS` back both seams and no `IntentRedactor` is registered in `src/`."""
+    meta = {"columns": [{"object_ref": "public.t.c", "table": "t", "column": "c",
+                         "concept": None, "domain": f"Retail Ops ({_PII_TOKEN})"}]}
+    safe, spans, _audits, ver = sanitize_feature_context(meta)
+    assert safe is not None                                  # redacted, NOT fail-closed
+    assert _PII_TOKEN not in json.dumps(safe)
+    assert "[REDACTED:EMAIL]" in safe["columns"][0]["domain"]
+    assert "Retail Ops" in safe["columns"][0]["domain"]      # kept, minus the PII
+    assert [s["key"] for s in spans] == ["columns[0].domain"]
+    assert all(s["type"] == "EMAIL" and "value" not in s for s in spans)
+    assert ver
+    # A CLEAN domain is content-identical: prose grade rebuilds the dict and stamps a version
+    # (the value WAS scanned, which "metadata-only" would misreport), but never edits the text.
+    clean = {"columns": [{"object_ref": "public.t.c", "domain": "Retail Ops"}]}
+    ok, ok_spans, _a, ok_ver = sanitize_feature_context(clean)
+    assert ok == clean and ok_spans == []
+    assert ok_ver                                            # scanned, and honestly recorded
+
+
+def test_redaction_can_grow_a_domain_past_the_structural_bound():
+    """The byte budget does NOT only shrink. `DefaultIntentRedactor` substitutes a
+    `[REDACTED:LABEL]` placeholder that is LONGER than several tokens it replaces (16 chars for a
+    6-char email), and the prose branch bounds AFTER redaction — so a near-budget value carrying PII
+    can cross `_FEATURE_STRUCTURAL_MAX_LEN` on the way out and be refused where the same-length
+    un-scrubbed value was admitted. Fail-closed direction, and deliberate: bounding before redaction
+    would bound a string that is not the one egressing.
+
+    [A.55, 2026-08-09] What this pins is the VALUE never egressing, which is the safety property.
+    It used to assert the whole payload went `None`; a facet that fails its scan is now dropped by
+    key instead (see `test_one_bad_facet_drops_its_KEY_and_the_other_columns_survive`), so the
+    refusal is scoped rather than catastrophic. The fail-closed DIRECTION is unchanged — only the
+    blast radius moved."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    email = " a@b.co"                                         # 7 chars in, 17 chars out
+    at_budget = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email)) + email
+    assert len(at_budget) == _FEATURE_STRUCTURAL_MAX_LEN      # admitted at identity grade
+    grown, *_ = sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": at_budget}]})
+    assert "domain" not in grown["columns"][0]                # refused — by dropping the key
+    assert at_budget not in json.dumps(grown)                 # and the value did not egress
+    # One char shorter and the SAME value survives redaction inside the bound — the refusal above
+    # is the placeholder's growth, not a blanket ban on a near-budget domain.
+    under = "x" * (_FEATURE_STRUCTURAL_MAX_LEN - len(email) - 10) + email
+    kept, *_ = sanitize_feature_context(
+        {"columns": [{"object_ref": "public.t.c", "domain": under}]})
+    assert kept["columns"][0]["domain"].startswith("x")       # admitted, redacted in place
+
+
 def test_definition_sample_clause_stripped_and_audited():
     meta = {"columns": [{"object_ref": "public.t.amount", "table": "t", "column": "amount",
                         "definition": _SAMPLE,
@@ -271,10 +329,13 @@ def test_planted_sample_token_never_egresses_and_is_audited(db, monkeypatch):
 
     # 1. Absent from the actual provider request.
     assert captured, "the model was never called"
-    req_meta = captured[0]["catalog_metadata"]
+    # Task 6d put the menu assembly's objective-expansion call AHEAD of the generation call, so the
+    # generation request is now selected by its SHAPE rather than by position — and the planted
+    # token is asserted absent from EVERY captured request, which is what this test always meant.
+    req_meta = next(c["catalog_metadata"] for c in captured if "columns" in c["catalog_metadata"])
     col = next(c for c in req_meta["columns"] if c["object_ref"] == "public.transactions.amount")
     assert _PLANTED not in col["definition"]
-    assert _PLANTED not in json.dumps(captured[0])
+    assert _PLANTED not in json.dumps(captured)
 
     # 2. Absent from the persisted llm_call.redacted_input.
     row = db.execute("SELECT redacted_input, input_redaction FROM llm_call "
@@ -288,3 +349,45 @@ def test_planted_sample_token_never_egresses_and_is_audited(db, monkeypatch):
     hit = next((a for a in sample_strip if a["path"] == "columns[0].definition"), None)
     assert hit is not None and hit["removed_count"] >= 1
     assert hit["state"] == "stripped"
+
+
+# ---- A.55: a bad FACET costs its key, not the catalog ---------------------------------------------
+
+
+def test_one_bad_facet_drops_its_KEY_and_the_other_columns_survive():
+    """[A.55] Every branch of the classifier loop failed closed for the WHOLE payload, so one
+    over-long `domain` on ONE column cost feature generation for all 237 — the model saw nothing at
+    all rather than 236 good columns and one missing facet.
+
+    The line between DROP and REFUSE is the one `_ADVISORY_CONTEXT_KEYS` already argued: a value
+    that is CONTEXT ABOUT the subject may be dropped (losing it degrades the payload; it cannot
+    falsify it), while a value that IS the subject must refuse. A column's `definition` is the
+    meaning the model reasons from — it still refuses. `domain` / `sub_domain` / `bian_path` /
+    `process_path` are facets beside it, and the model is never told a facet exists.
+
+    The safety property is UNCHANGED: the offending value never egresses. Only the blast radius
+    narrows."""
+    from featuregen.overlay.upload.enrich_llm import _FEATURE_STRUCTURAL_MAX_LEN
+
+    bad = "x" * (_FEATURE_STRUCTURAL_MAX_LEN + 1)
+    out, _pii, _sa, _v = sanitize_feature_context({"columns": [
+        {"object_ref": "public.t.bad", "domain": bad, "definition": "A good definition."},
+        {"object_ref": "public.t.good", "domain": "Payments"},
+    ]})
+
+    assert out is not None, "one bad facet still refused the whole payload"
+    assert "domain" not in out["columns"][0]              # the offending KEY is gone…
+    assert out["columns"][0]["definition"] == "A good definition."   # …its column survives…
+    assert out["columns"][1]["domain"] == "Payments"      # …and so does every sibling
+    assert bad not in json.dumps(out)                     # the value NEVER egresses
+
+
+def test_a_bad_DEFINITION_still_refuses_the_whole_payload():
+    """The other side of the line, pinned so the narrowing above cannot creep into the subject. A
+    column whose meaning cannot be scanned must not be sent with the meaning silently missing — the
+    model would answer confidently about a column nobody could describe."""
+    out, _pii, _sa, _v = sanitize_feature_context({"columns": [
+        {"object_ref": "public.t.c", "definition": "sample values: OPN; CLS; PND"},
+        {"object_ref": "public.t.d", "domain": "Payments"},
+    ]})
+    assert out is None

@@ -189,3 +189,20 @@ def get_llm_optional(request: Request) -> LLMClient | None:
     """The app's optional LLM client (ingest enrichment): None means 'run without enrichment' —
     unlike get_llm, absence is a supported mode here, not an error."""
     return getattr(request.app.state, "llm_client", None)
+
+
+def get_analysis_engine():
+    """The provider that opens the ANALYSIS ENGINE a sealed plan runs against (Release-B Task 9).
+
+    A dependency rather than a direct call for the reason `get_conn` is one: the warehouse a plan
+    executes against is deployment state, and the suite has to substitute the pilot's own fixture
+    engine for it — the same `dependency_overrides` seam the API tests already use for the catalog
+    connection.
+
+    The shipped default REFUSES (`engine.default_analysis_engine`): running a sealed plan against
+    the bank's warehouse is a separate approval gate, and a route that opened the connection anyway
+    would take that decision on someone's behalf.
+    """
+    from featuregen.analysis.engine import default_analysis_engine
+
+    return default_analysis_engine

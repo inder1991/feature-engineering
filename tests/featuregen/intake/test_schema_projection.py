@@ -137,3 +137,21 @@ def test_maxitems_inside_not_is_stripped_and_detected():
     out = project_for_anthropic(schema)
     assert "maxItems" not in out["not"]
     assert provider_incompatibilities(out) == []
+
+
+def test_x_wire_enum_becomes_enum_on_the_wire_and_never_reaches_the_response_validator():
+    """The `x-wire-required` bargain, applied to a CLOSED VOCABULARY (Task 6c).
+
+    `enum` is provider-SUPPORTED, so it is the one strictness keyword that would be enforced in
+    BOTH directions from a canonical schema — constraining generation (wanted) and failing the
+    whole response on one off-vocabulary answer (not wanted, on a body whose leniency is the point).
+    `x-wire-enum` splits the two: the wire carries the vocabulary, the canonical stays a plain
+    string, and the closure is enforced per item in code.
+    """
+    canonical = {"type": "object",
+                 "properties": {"role": {"type": "string", "x-wire-enum": ["a", "b"]}}}
+    wire = project_for_anthropic(canonical)
+    assert wire["properties"]["role"] == {"type": "string", "enum": ["a", "b"]}
+    # The canonical is NOT mutated — the response validator still sees a plain string.
+    assert canonical["properties"]["role"] == {"type": "string", "x-wire-enum": ["a", "b"]}
+    assert provider_incompatibilities(wire) == []

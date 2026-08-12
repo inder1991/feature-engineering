@@ -151,6 +151,19 @@ def pit_completeness(t: Template) -> PITCompleteness:
     return PITCompleteness.PARTIAL
 
 
+def pit_completeness_v2(compiled) -> PITCompleteness:
+    """BR-4: PIT completeness for a V2 recipe consumes the temporal COMPILER's verdict — never
+    keyword markers. ``compiled`` is a ``recipe_temporal_v2.CompiledTemporalV1``: a compiled
+    contract is COMPLETE by construction (the text was rendered from typed fields, placeholder-
+    free); a blocked one is PARTIAL — a typed intent exists but a load-bearing piece is missing
+    and NAMED in ``blockers``. COMPLETE is unreachable while any blocker exists, which is the
+    acceptance rule "PIT status cannot be complete when the temporal anchor is missing, ambiguous
+    or ungoverned" made structural. The legacy keyword path above is untouched — it dies with the
+    legacy registry at BR-17."""
+    return (PITCompleteness.COMPLETE if compiled.status == "compiled"
+            else PITCompleteness.PARTIAL)
+
+
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 # ModellingContextFit — Phase-2A stub (Task B3 supplies the real fit)
 # ──────────────────────────────────────────────────────────────────────────────────────────────────

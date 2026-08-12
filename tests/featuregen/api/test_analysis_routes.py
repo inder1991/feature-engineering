@@ -1,16 +1,17 @@
-"""`POST /analysis/plan` and `/analysis/clarify` — the data agent's only surface.
+"""`POST /analysis/plan` and `/analysis/clarify` — the data agent's PLANNING surface.
 
 Seven read models existed with no route. A read model nobody can call is the same inert mechanism
 this programme has found six times, so these tests care most about the seams between the pieces:
 that the caller's read scope reaches retrieval, that a hallucinated ref cannot survive the round
 trip, and that a plan which cannot execute says so rather than pretending.
 
-Nothing here executes a statement — see the route module for why that is a design decision and not
-caution.
+Nothing in THESE routes executes a statement. That is still true of `/analysis/plan` and
+`/analysis/clarify` by design — running a sealed plan is `/analysis/execute`, which has its own
+suite (`test_analysis_execute_route.py`) and its own approval gate.
 """
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -21,6 +22,10 @@ from featuregen.intake.llm import FakeLLM, FakeResponse
 #: clock passes it, and every column reads as stale. Pinning it broke this file at midnight.
 _NOW = datetime.now(UTC)
 _QUESTION = "which customers had fewer transactions this month than last"
+#: Matches NO readable column in the fixture catalog (neither lexeme appears in any definition,
+#: column name or table name), yet every word is CONTROLLED platform vocabulary — so the refusal is
+#: reached AND it has something recordable to say.
+_UNANSWERABLE = "counterparty exposure"
 
 
 def _h(roles: str = "feature_engineer") -> dict:
@@ -294,6 +299,165 @@ def test_a_question_matching_nothing_is_422_not_500(make_client, catalog):
                                   json={"question": "zzzz nonexistent terminology"}, headers=_h())
     assert r.status_code == 422
     assert "matched" in r.json()["detail"]
+
+
+# ── the learning gap, at the PRODUCTION caller ───────────────────────────────────────────────────
+
+def _gap_rows(conn) -> list[tuple]:
+    return conn.execute(
+        "SELECT analysis_request_id, gap_key, dependency_snapshot_id "
+        "FROM analysis_learning_event WHERE kind = 'gap' ORDER BY created_at").fetchall()
+
+
+def test_three_identical_questions_record_ONE_gap(make_client, catalog):
+    """`record_gap` dedupes on (request, gap, snapshot) — and the route defeated it by minting a
+    fresh `areq-{uuid4}` per call, so the SAME unanswered question asked three times filled the
+    learning store with three identical rows and `GET /learning/gaps` reported demand 3 for one
+    thing to decide."""
+    client = _client(make_client)
+    for _ in range(3):
+        r = client.post("/analysis/plan", json={"question": _UNANSWERABLE}, headers=_h())
+        assert r.status_code == 422, r.text
+    rows = _gap_rows(catalog)
+    assert len(rows) == 1, rows
+    assert rows[0][0].startswith("areq-")
+
+
+def test_a_CHANGED_catalog_state_records_a_SECOND_gap(make_client, catalog):
+    """A stable id must not become a permanent mute: the same question after an upload IS new
+    information, because the gap may have been resolved. The id is derived from the dependency
+    snapshot as well as the question, so a moved drift watermark re-records."""
+    client = _client(make_client)
+    assert client.post("/analysis/plan", json={"question": _UNANSWERABLE},
+                       headers=_h()).status_code == 422
+    catalog.execute("UPDATE overlay_drift_watermark SET last_completed_at = %s",
+                    (_NOW - timedelta(minutes=7),))
+    assert client.post("/analysis/plan", json={"question": _UNANSWERABLE},
+                       headers=_h()).status_code == 422
+    rows = _gap_rows(catalog)
+    assert len(rows) == 2, rows
+    # Same THING TO DECIDE, different request id and different snapshot.
+    assert rows[0][1] == rows[1][1]
+    assert rows[0][0] != rows[1][0]
+    assert rows[0][2] != rows[1][2]
+
+
+def test_the_same_question_from_a_DIFFERENT_asker_still_dedupes(make_client, catalog):
+    """The id is derived from the question and the catalog state, never from the session — two
+    analysts blocked by one missing term are one gap, and `open_gaps` counts demand by DISTINCT
+    request id, so a per-session id would have inflated it."""
+    client = _client(make_client)
+    client.post("/analysis/plan", json={"question": _UNANSWERABLE}, headers=_h())
+    client.post("/analysis/plan", json={"question": _UNANSWERABLE},
+                headers={"X-User": "someone-else", "X-Roles": "feature_engineer"})
+    assert len(_gap_rows(catalog)) == 1
+
+
+def test_the_refusal_COMMITS_the_learning_write_instead_of_rolling_it_back(conn, catalog):
+    """`get_conn` rolls the request transaction back on ANY raised exception — and a raised
+    `HTTPException` is one. So the 422 this route answers an unanswerable question with DISCARDED
+    the gap written moments earlier, which is the entire reason that write exists: the store had no
+    production producer at all. The refusal is RETURNED as a response, byte-identical to what the
+    handler would have produced, so the transaction reaches its commit."""
+    from fastapi.testclient import TestClient
+
+    from featuregen.analysis.intent import TASK
+    from featuregen.api.app import create_app
+    from featuregen.api.deps import get_conn, get_feature_gen_conn
+
+    disposition: list[str] = []
+
+    def _probe_conn():
+        try:
+            yield conn
+            disposition.append("commit")
+        except Exception:
+            disposition.append("rollback")
+            raise
+
+    app = create_app(llm_client=FakeLLM(script={TASK: FakeResponse(output=_intent_output())}))
+    app.dependency_overrides[get_conn] = _probe_conn
+    app.dependency_overrides[get_feature_gen_conn] = _probe_conn
+    with TestClient(app) as client:
+        r = client.post("/analysis/plan", json={"question": _UNANSWERABLE}, headers=_h())
+
+    assert r.status_code == 422
+    assert r.json()["detail"], "the refusal must still carry its reason"
+    assert disposition == ["commit"], disposition
+    assert len(_gap_rows(conn)) == 1
+
+
+# ── the SELECTION, on the production path (Release-B Task 8 review) ─────────────────────────────
+#
+# The review's probe: a HISTORICAL plan grounded through the real route came back with
+# `row_selections=()`, `refusals=()` and `resolved=True` — the row rule raised, a blanket except
+# swallowed it, and the agent had no row rule while claiming resolution. The invariant these pin is
+# that the two can never happen together again: either the decisions are there, or their absence is
+# on the response.
+
+
+@pytest.fixture
+def selecting(monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
+    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
+
+
+def test_the_selection_is_never_EMPTY_AND_RESOLVED(make_client, catalog, selecting):
+    """THE PROBE. "Decreased this month vs last" is historical by construction, so it has a row
+    rule to resolve — and if nothing could be decided, the response says which needs were not."""
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    selection = body["selection"]
+    assert selection is not None, "the flag is on; the decisions must be visible"
+    assert selection["rows"] or selection["refusals"], selection
+    assert not (selection["resolved"] and not selection["rows"]), selection
+
+
+def test_a_selection_refusal_is_RENDERED_as_a_question(make_client, catalog, selecting):
+    """Every typed refusal becomes a clarification when interactive (plan rule 10). Reaching the
+    person is the whole point of returning it instead of raising it."""
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    codes = {c["code"] for c in body["clarifications"]}
+    assert {r["code"] for r in body["selection"]["refusals"]} & codes, body["clarifications"]
+    # The population is asked ONCE, whichever half of the system noticed it is undeclared.
+    assert [c["code"] for c in body["clarifications"]].count("population") == 1
+
+
+def test_with_the_flag_OFF_the_response_carries_no_selection_at_all(make_client, catalog,
+                                                                   monkeypatch):
+    monkeypatch.delenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", raising=False)
+    _bind(catalog)
+    body = _client(make_client).post(
+        "/analysis/plan", json={"question": _QUESTION}, headers=_h()).json()
+    assert body["selection"] is None
+
+
+def test_a_route_level_refusal_writes_ONE_learning_gap(make_client, catalog, selecting):
+    """`record_selection_gaps` had NO production caller — the same inert-mechanism shape this
+    programme has found repeatedly. This is it, at the surface a refusal reaches a person."""
+    _bind(catalog)
+    client = _client(make_client)
+    assert client.post("/analysis/plan", json={"question": _QUESTION},
+                       headers=_h()).status_code == 200
+    gaps = {row[1] for row in _gap_rows(catalog)}
+    assert gaps, "a visible refusal recorded nothing to decide"
+    assert len(_gap_rows(catalog)) == len(gaps), "one row per thing to decide"
+
+
+def test_asking_the_SAME_blocked_question_twice_is_one_thing_to_decide(make_client, catalog,
+                                                                      selecting):
+    """The derived request id, at the route: `record_gap` dedupes on (request, gap, snapshot), and
+    a minted id would make each retry a new row and read as demand 2 for one decision."""
+    _bind(catalog)
+    client = _client(make_client)
+    for _ in range(2):
+        client.post("/analysis/plan", json={"question": _QUESTION}, headers=_h())
+    rows = _gap_rows(catalog)
+    assert len(rows) == len({(row[0], row[1], row[2]) for row in rows})
+    assert len({row[0] for row in rows}) == 1, "two askings, one request id"
 
 
 def test_a_model_that_cannot_express_the_question_is_422_not_500(make_client, catalog):

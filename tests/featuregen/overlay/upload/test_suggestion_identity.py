@@ -1,0 +1,447 @@
+"""Task 2 — the stable suggestion identity and the immutable revision identity (freeze 0F-8/0F-10).
+
+Two identities, deliberately separated, and this suite is where the separation is PROVED:
+
+* ``suggestion_id`` names the LOGICAL candidate — which recipe, bound to which operands in which
+  roles, for which entity/grain/time, over which per-operand relationship path assignment. It is
+  independent of the screen it was opened from, of the validation outcome and of every build
+  observation.
+* ``suggestion_revision_id`` names the exact CONTENT that produced this rendering of it.
+
+The relationship-path input is the subtle one, and it has TWO failure modes this suite pins from
+both sides.
+
+``GroundingDecisionTraceV1.ordered_relationship_path`` is a deduplicated leg SET (0F-7 as amended),
+so it cannot distinguish two candidates whose operands swapped chains — hence the per-operand
+``JOIN_PATH`` assignment (``test_two_candidates_that_swap_their_operand_chains_are_not_one``).
+
+But the pin's ``content_hash`` cannot be that assignment either: it covers the realization content,
+which includes ``approved_join_fact_key``, ``approved_join_status`` and ``edge_authority``. Using it
+meant an admin CONFIRMING a file-declared join re-keyed every suggestion crossing it — same recipe,
+same columns, same endpoints, same direction. Rule 23 says the opposite in as many words. So the
+assignment is the LOGICAL projection, ``(relationship_kind, from_ref, to_ref)`` per leg
+(``test_the_assignment_is_the_logical_chain_not_the_attested_one``), and the attestation state
+travels in the revision instead.
+"""
+from __future__ import annotations
+
+import itertools
+
+import pytest
+
+from featuregen.overlay.upload import read_scope as read_scope_module
+from featuregen.overlay.upload.grounding_trace import (
+    JOIN_PATH,
+    READ_SCOPE,
+    SuggestionDependencyClass,
+    build_trace,
+    column_dependency_key,
+    dependency_pin,
+    join_path_pin_content,
+    relationship_leg,
+)
+from featuregen.overlay.upload.read_scope import allowed_classes
+from featuregen.overlay.upload.suggestion_identity import (
+    PRODUCER_CONTRACT_VERSION,
+    SuggestionReadScopeV1,
+    UnresolvableRelationshipPath,
+    build_read_scope,
+    build_universe_independent_trace_hash,
+    dependency_content_hashes,
+    join_path_assignment,
+    suggestion_id,
+    suggestion_revision_id,
+)
+
+SOURCE = "cat"
+_G = "public.cust.cif_id"
+_A = "public.txn.amt"
+_B = "public.bal.amt"
+
+
+def _leg(from_ref: str, to_ref: str, *, fact: str | None = "ajf") -> object:
+    return relationship_leg(
+        relationship_ref=f"{SOURCE}:joins:{from_ref}->{to_ref}", relationship_kind="direct_equality",
+        from_ref=(SOURCE, from_ref), to_ref=(SOURCE, to_ref),
+        realization_content={"from": from_ref, "to": to_ref, "fact": fact},
+        cardinality="N:1", safety_status="clearing", review_status="VERIFIED")
+
+
+def _join_pin(operand_ref: str, *, from_table: str, to_table: str, legs) -> object:
+    """Exactly what the gauntlet mints (``feature_assist`` at the JOIN_PATH decision point): the
+    hashed content AND the readable copy of this operand's own ordered leg list."""
+    return dependency_pin(
+        dependency_class=SuggestionDependencyClass.VALIDATION, dependency_kind=JOIN_PATH,
+        dependency_key=column_dependency_key(SOURCE, operand_ref),
+        content=join_path_pin_content(from_table=from_table, to_table=to_table,
+                                      outcome_kind="OPERATIONAL", legs=legs),
+        path_realization_hashes=[leg.realization_content_hash for leg in legs])
+
+
+def _identity(**overrides) -> dict:
+    base = dict(
+        template_id="balance_trend",
+        bound_params=(("window", 90),),
+        operands=((SOURCE, "cust.cif_id", "entity"), (SOURCE, "txn.amt", "flow_col")),
+        entity_id="customer",
+        grain_refs=((SOURCE, _G),),
+        time_ref=(SOURCE, "public.cust.as_of_dt"),
+        relationship_path_assignment=(),
+    )
+    base.update(overrides)
+    return base
+
+
+def _revision(**overrides) -> dict:
+    base = dict(
+        suggestion_id=suggestion_id(**_identity()),
+        recipe_revision_id="recipe-hash",
+        discovery_metadata_revision_id="discovery-hash",
+        semantic_context_hashes=(),
+        dataset_profile_hashes=(),
+        trace_projection_hash="trace-projection-hash",
+        dependency_content_hashes=("dep-a", "dep-b"),
+        validation_rule_content_hashes=("rule-a",),
+        read_scope_rule_content_hashes=("scope-a",),
+        validation_status="DESIGN_CHECKED",
+    )
+    base.update(overrides)
+    return base
+
+
+# ── suggestion_id: the logical candidate ────────────────────────────────────────────────────────
+def test_the_same_logical_candidate_always_hashes_to_the_same_id():
+    assert suggestion_id(**_identity()) == suggestion_id(**_identity())
+
+
+def test_display_order_of_the_operands_does_not_move_the_id():
+    """Operands are a SET of role bindings: which order the engine happened to emit them in is an
+    implementation detail of the needs loop, not a different candidate."""
+    forward = _identity()
+    reversed_ = _identity(operands=tuple(reversed(forward["operands"])))
+    assert suggestion_id(**forward) == suggestion_id(**reversed_)
+
+
+def test_the_composite_grain_is_ORDERED_and_reordering_it_is_a_different_candidate():
+    """Rule 25: grain is an ordered tuple of key operands. ``BY (customer, account)`` and
+    ``BY (account, customer)`` are different groupings, so they are different candidates."""
+    two = ((SOURCE, _G), (SOURCE, "public.cust.acct_id"))
+    assert suggestion_id(**_identity(grain_refs=two)) != suggestion_id(
+        **_identity(grain_refs=tuple(reversed(two))))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("template_id", "other_recipe"),
+    ("bound_params", (("window", 30),)),
+    ("operands", ((SOURCE, "cust.cif_id", "entity"), (SOURCE, "bal.amt", "flow_col"))),
+    ("entity_id", "account"),
+    ("entity_id", None),
+    ("grain_refs", ((SOURCE, "public.cust.acct_id"),)),
+    ("grain_refs", ()),
+    ("time_ref", None),
+])
+def test_every_identity_input_actually_moves_the_id(field, value):
+    """A mutation on any frozen input must die. Without this the payload could silently drop a
+    member and every candidate that differs only there would collapse into one card."""
+    assert suggestion_id(**_identity(**{field: value})) != suggestion_id(**_identity())
+
+
+def test_a_role_change_alone_is_a_different_candidate():
+    """The recipe ROLE is part of the binding: the same column read as the flow and as the stock is
+    not the same feature."""
+    swapped = ((SOURCE, "cust.cif_id", "entity"), (SOURCE, "txn.amt", "stock_col"))
+    assert suggestion_id(**_identity(operands=swapped)) != suggestion_id(**_identity())
+
+
+# ── rule 23: the relationship path is logical identity ──────────────────────────────────────────
+def test_the_same_columns_over_a_different_relationship_path_are_two_candidates():
+    """Rule 23, minimally: identical operands, different traversed path -> different identity."""
+    direct_legs = (_leg(_G, _A),)
+    bridged_legs = (_leg(_G, "public.bridge.cif"), _leg("public.bridge.txn", _A))
+    direct = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=direct_legs),)
+    bridged = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=bridged_legs),)
+    assert suggestion_id(**_identity(
+        relationship_path_assignment=join_path_assignment_of(direct, direct_legs))) != \
+        suggestion_id(**_identity(
+            relationship_path_assignment=join_path_assignment_of(bridged, bridged_legs)))
+
+
+def test_two_candidates_that_swap_their_operand_chains_are_not_one():
+    """THE 0F-7 AMENDMENT, as identity. Two operands, two chains — and the two candidates differ
+    ONLY in which operand used which chain. Their ``ordered_relationship_path`` leg SETS are equal,
+    so an identity derived from that field alone would fuse them into one card. The per-operand
+    ``JOIN_PATH`` assignment keeps them apart."""
+    leg_a, leg_b = _leg(_G, _A), _leg(_G, _B)
+    straight = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg_a,)),
+                _join_pin("bal.amt", from_table="cust", to_table="bal", legs=(leg_b,)))
+    crossed = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg_b,)),
+               _join_pin("bal.amt", from_table="cust", to_table="bal", legs=(leg_a,)))
+    # the leg SETS really are identical — otherwise this proof would be trivial
+    assert {(leg.from_ref, leg.to_ref) for leg in (leg_a, leg_b)} == {
+        (leg.from_ref, leg.to_ref) for leg in (leg_b, leg_a)}
+    assert suggestion_id(**_identity(
+        relationship_path_assignment=join_path_assignment_of(straight, (leg_a, leg_b)))) != \
+        suggestion_id(**_identity(
+            relationship_path_assignment=join_path_assignment_of(crossed, (leg_a, leg_b))))
+
+
+def join_path_assignment_of(pins, path=()) -> tuple:
+    """The assignment as it is read off a real trace, built here from bare pins.
+
+    ``path`` is the trace's ``ordered_relationship_path`` — the deduplicated UNION of the legs the
+    pins reference, exactly as the recorder accumulates it. The projection joins the two."""
+    trace = build_trace(
+        candidate_key="k", ordered_operand_roles=(), ordered_relationship_path=tuple(path),
+        validation_status="DESIGN_CHECKED", requirements=(),
+        dependency_pins=(*pins, dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=READ_SCOPE, dependency_key="scope", content={"classes": []})),
+        validation_rule_content_hashes=(), read_scope_rule_content_hashes=("r",))
+    return join_path_assignment(trace)
+
+
+def test_the_assignment_reads_only_the_join_path_pins():
+    """Every OTHER pin (the governed type read, the grain lookup, the read scope) belongs to the
+    revision, not to the logical identity: a column whose governed type was re-attested is the same
+    candidate."""
+    legs = (_leg(_G, _A),)
+    pins = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=legs),)
+    assert len(join_path_assignment_of(pins, legs)) == 1
+    assert join_path_assignment_of(pins, legs)[0][0] == column_dependency_key(SOURCE, "txn.amt")
+
+
+def test_a_candidate_with_no_traversed_path_has_an_empty_assignment():
+    assert join_path_assignment_of(()) == ()
+
+
+def test_the_assignment_is_the_logical_chain_not_the_attested_one():
+    """THE GOVERNANCE-CHURN GUARD, at the unit. Two pins over the SAME logical hop that differ only
+    in the governing ``approved_join`` fact — the exact difference an admin makes by confirming a
+    file-declared join — must project to the identical assignment. The physical realization hashes
+    differ (they cover the fact key, the status and the edge authority), which is precisely why the
+    hash cannot be the identity."""
+    declared = (_leg(_G, _A, fact=None),)
+    verified = (_leg(_G, _A, fact="ajf-verified"),)
+    assert declared[0].realization_content_hash != verified[0].realization_content_hash
+
+    before = join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=declared),), declared)
+    after = join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=verified),), verified)
+    assert before == after
+    assert before[0][1] == (("direct_equality", SOURCE, _G, SOURCE, _A),)
+    assert suggestion_id(**_identity(relationship_path_assignment=before)) == suggestion_id(
+        **_identity(relationship_path_assignment=after))
+
+
+def test_the_projection_keeps_the_direction_of_travel():
+    """A reverse hop is a different traversal, and the logical triple says so — otherwise
+    ``customer -> transaction`` and ``transaction -> customer`` would be one candidate."""
+    forward = (_leg(_G, _A),)
+    backward = (_leg(_A, _G),)
+    assert join_path_assignment_of(
+        (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=forward),),
+        forward) != join_path_assignment_of(
+            (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=backward),), backward)
+
+
+def test_a_pin_naming_a_realization_the_path_lacks_fails_closed():
+    """FAIL CLOSED. If the chain cannot be projected there is no honest identity to mint, and
+    falling back to the physical hash would silently restore the churn. The caller counts the
+    refusal instead."""
+    legs = (_leg(_G, _A),)
+    pins = (_join_pin("txn.amt", from_table="cust", to_table="txn", legs=legs),)
+    with pytest.raises(UnresolvableRelationshipPath, match="does not"):
+        join_path_assignment_of(pins, ())          # the path lost the leg the pin names
+
+
+def _scope_pin(*classes: str):
+    return dependency_pin(
+        dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY, dependency_kind=READ_SCOPE,
+        dependency_key="read-scope", content={"allowed_classes": list(classes)},
+        current_revision_id="rev-1")
+
+
+def _trace(*, candidate_key: str = "k", scope_classes: tuple[str, ...] = (), leg=None,
+           validation_status: str = "DESIGN_CHECKED"):
+    leg = _leg(_G, _A) if leg is None else leg
+    pin = _join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg,))
+    return build_trace(
+        candidate_key=candidate_key, ordered_operand_roles=(), ordered_relationship_path=(leg,),
+        validation_status=validation_status, requirements=(),
+        dependency_pins=(pin, _scope_pin(*scope_classes)),
+        validation_rule_content_hashes=(), read_scope_rule_content_hashes=("r",))
+
+
+def test_the_dependency_content_hashes_are_content_only_and_order_independent():
+    """The revision's dependency input covers every CANDIDATE read plus every selected realization —
+    as a sorted set, because the gauntlet's check order is not meaning, and as CONTENT, because
+    ``current_revision_id`` and evidence occurrence ids are provenance."""
+    leg = _leg(_G, _A)
+    pin = _join_pin("txn.amt", from_table="cust", to_table="txn", legs=(leg,))
+    trace = _trace(leg=leg)
+    hashes = dependency_content_hashes(trace)
+    assert hashes == tuple(sorted(hashes)) and len(hashes) == 2
+    assert leg.realization_content_hash in hashes and pin.content_hash in hashes
+    assert "rev-1" not in hashes
+    assert dependency_content_hashes(None) == ()
+
+
+def test_the_callers_own_visibility_classes_are_not_a_dependency_of_the_candidate():
+    """The read-scope pin's content is the CALLER's allowed classes, so hashing it gave one logical
+    candidate a different revision per reader. Withholding is total — a card a caller receives is
+    the same card every caller receives — so the classes belong to the page's ``read_scope_key``,
+    not to the card. The RULE that was evaluated still travels, as
+    ``read_scope_rule_content_hashes``."""
+    narrow, wide = _trace(scope_classes=()), _trace(scope_classes=("pii", "restricted"))
+    assert narrow.trace_content_hash != wide.trace_content_hash          # the TRACE still says so
+    assert dependency_content_hashes(narrow) == dependency_content_hashes(wide)
+    assert build_universe_independent_trace_hash(narrow) == build_universe_independent_trace_hash(
+        wide)
+
+
+def test_the_trace_projection_ignores_the_candidate_key_and_nothing_else():
+    """``candidate_key`` folds in each role's tie set, which is a property of the grounding UNIVERSE
+    (anchor + neighbourhood + ``max_hops`` + read scope), not of the candidate — so the revision
+    hashes a projection without it. Everything else the trace says still moves the projection."""
+    here, there = _trace(candidate_key="k"), _trace(candidate_key="k-from-the-other-anchor")
+    assert here.trace_content_hash != there.trace_content_hash
+    assert build_universe_independent_trace_hash(here) == build_universe_independent_trace_hash(
+        there)
+    # ...and the projection is not a constant: a different decision is a different projection.
+    assert build_universe_independent_trace_hash(here) != build_universe_independent_trace_hash(
+        _trace(validation_status="NEEDS_EXTERNAL_VALIDATION"))
+    assert build_universe_independent_trace_hash(here) != build_universe_independent_trace_hash(
+        _trace(leg=_leg(_A, _G)))
+
+
+# ── suggestion_revision_id: exact content ───────────────────────────────────────────────────────
+def test_the_same_content_always_yields_the_same_revision():
+    assert suggestion_revision_id(**_revision()) == suggestion_revision_id(**_revision())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("suggestion_id", "another"),
+    ("recipe_revision_id", "recipe-hash-2"),
+    ("discovery_metadata_revision_id", "discovery-hash-2"),
+    ("discovery_metadata_revision_id", None),
+    ("semantic_context_hashes", ("sem-a",)),
+    ("dataset_profile_hashes", ("prof-a",)),
+    ("trace_projection_hash", "trace-projection-hash-2"),
+    ("dependency_content_hashes", ("dep-a", "dep-c")),
+    ("validation_rule_content_hashes", ("rule-b",)),
+    ("read_scope_rule_content_hashes", ("scope-b",)),
+    ("validation_status", "NEEDS_EXTERNAL_VALIDATION"),
+])
+def test_every_meaning_bearing_input_moves_the_revision(field, value):
+    assert suggestion_revision_id(**_revision(**{field: value})) != suggestion_revision_id(
+        **_revision())
+
+
+def test_unordered_hash_sets_are_order_independent():
+    """These are SETS of content hashes; the order the producer collected them in is not meaning."""
+    assert suggestion_revision_id(**_revision(dependency_content_hashes=("dep-b", "dep-a"))) == (
+        suggestion_revision_id(**_revision()))
+    assert suggestion_revision_id(**_revision(
+        semantic_context_hashes=("s2", "s1"))) == suggestion_revision_id(
+            **_revision(semantic_context_hashes=("s1", "s2")))
+
+
+def test_the_producer_contract_version_is_part_of_the_revision():
+    """A change to what the BUILDER means by these fields re-revisions every suggestion — that is
+    the point of an explicit producer contract version (0F-10)."""
+    assert suggestion_revision_id(**_revision(),
+                                  producer_contract_version="other") != suggestion_revision_id(
+                                      **_revision())
+    assert PRODUCER_CONTRACT_VERSION
+
+
+def test_the_revision_refuses_the_provenance_fields_it_must_never_hash():
+    """0F-10's exclusion list, enforced by the SIGNATURE rather than by discipline: a producer
+    commit, refresh id, snapshot id or timestamp cannot be passed in at all, so it cannot leak into
+    identity through a later careless edit."""
+    for forbidden in ("producer_commit", "refresh_id", "generated_at", "metadata_snapshot_ids",
+                      "scope_set_id", "evidence_event_ids", "discovery_registry_content_hash"):
+        with pytest.raises(TypeError):
+            suggestion_revision_id(**_revision(), **{forbidden: "x"})
+
+
+def test_the_identity_refuses_the_anchor_it_must_never_hash():
+    """The requested anchor is excluded so one candidate has ONE identity on its table, column and
+    global surfaces (0F-10). Same signature-level proof."""
+    for forbidden in ("anchor_table_ref", "anchor_catalog_source", "requested_table", "max_hops"):
+        with pytest.raises(TypeError):
+            suggestion_id(**_identity(), **{forbidden: "x"})
+
+
+# ── read scope (0F-8) ───────────────────────────────────────────────────────────────────────────
+def test_the_scope_is_the_canonical_allowed_class_tuple_never_the_roles():
+    scope = build_read_scope(("feature_engineer", "pii_reader"))
+    assert isinstance(scope, SuggestionReadScopeV1)
+    assert scope.allowed_classes == ("pii",)
+    assert scope.tenant is None
+
+
+def test_two_different_functional_roles_with_the_same_data_scope_share_one_key():
+    """Functional roles and user ids may never mint scope variants (0F-8/D8)."""
+    assert build_read_scope(("feature_engineer", "pii_reader")).scope_key == build_read_scope(
+        ("data_owner", "pii_reader", "catalog_viewer")).scope_key
+
+
+def test_a_wider_scope_is_a_different_key():
+    assert build_read_scope(("pii_reader",)).scope_key != build_read_scope(
+        ("pii_reader", "restricted_reader")).scope_key
+    assert build_read_scope(()).scope_key != build_read_scope(("pii_reader",)).scope_key
+
+
+def test_the_scope_lattice_bound_is_recomputed_from_the_role_registries():
+    """IMPORT GATE (0F-8). The bound is ``2 ** |grantable classes|``, recomputed from the two role
+    maps — never the literal 8 — so a fourth grantable class fails loudly here instead of silently
+    widening every scope-keyed structure."""
+    universe = set(read_scope_module.SENSITIVITY_ROLES) | set(read_scope_module.RESTRICTION_ROLES)
+    keys = set()
+    for size in range(len(universe) + 1):
+        for combo in itertools.combinations(sorted(universe), size):
+            roles = tuple(
+                {**read_scope_module.SENSITIVITY_ROLES,
+                 **read_scope_module.RESTRICTION_ROLES}[cls] for cls in combo)
+            scope = build_read_scope(roles)
+            assert tuple(allowed_classes(roles)) == scope.allowed_classes
+            keys.add(scope.scope_key)
+    assert len(keys) == 2 ** len(universe)
+
+
+def test_an_unknown_role_claim_contributes_nothing_to_the_scope():
+    assert build_read_scope(("wizard", "root")).scope_key == build_read_scope(()).scope_key
+
+
+# ── BR-3: suggestion_id_v3 — the corrected identity, emitted only through contract v3 ───────────
+def test_v3_exists_beside_v2_and_v2_is_untouched():
+    from featuregen.overlay.upload.recipe_registry_v2 import PROBE_RECIPE
+    from featuregen.overlay.upload.recipe_variants import resolve_variant
+    from featuregen.overlay.upload.suggestion_identity import suggestion_id_v3
+
+    variant = resolve_variant(PROBE_RECIPE)
+    base = _identity()
+    v3 = suggestion_id_v3(
+        variant_identity=variant.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=())
+    # deterministic, and DIFFERENT from the v2 id of the same bindings — v3 carries the recipe
+    # revision + output + parameters through the variant identity, v2 never did
+    assert v3 == suggestion_id_v3(
+        variant_identity=variant.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=())
+    assert v3 != suggestion_id(**_identity())
+    # a different SELECTION of the same recipe is a different v3 candidate
+    other = resolve_variant(PROBE_RECIPE, {"window": 90})
+    assert suggestion_id_v3(
+        variant_identity=other.variant_identity,
+        operands=base["operands"], entity_id=base["entity_id"],
+        grain_refs=base["grain_refs"], time_ref=base["time_ref"],
+        relationship_path_assignment=()) != v3
+    # and the LEGACY identity of the same logical candidate is byte-stable against all of this
+    assert suggestion_id(**_identity()) == suggestion_id(**_identity())

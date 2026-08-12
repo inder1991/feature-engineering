@@ -12,11 +12,22 @@ export class ApiError extends Error {
   // record stays inspectable via GET /ingestion-runs/{id}. null when the server sent no header;
   // optional in the constructor so existing throw/new sites keep working unchanged.
   ingestionRunId: string | null
-  constructor(status: number, detail: string, ingestionRunId: string | null = null) {
+  // The machine-readable `error_code` a HANDLER-level refusal carries beside `detail` (e.g.
+  // SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION on a 422). null whenever the server sent none —
+  // framework validation errors deliberately have no code, so a caller must never read the
+  // absence as "some other code".
+  errorCode: string | null
+  constructor(
+    status: number,
+    detail: string,
+    ingestionRunId: string | null = null,
+    errorCode: string | null = null,
+  ) {
     super(detail)
     this.status = status
     this.detail = detail
     this.ingestionRunId = ingestionRunId
+    this.errorCode = errorCode
   }
 }
 
@@ -42,6 +53,7 @@ async function requestWithResponse<T>(
   if (!res.ok) {
     // statusText is empty under HTTP/2, so never let the message end up blank.
     let detail = res.statusText || `HTTP ${res.status}`
+    let errorCode: string | null = null
     try {
       const body = await res.json()
       if (typeof body.detail === 'string') {
@@ -52,12 +64,16 @@ async function requestWithResponse<T>(
           .map((e: { loc?: unknown[]; msg?: string }) => `${(e.loc ?? []).join('.')}: ${e.msg}`)
           .join('; ')
       }
+      // Two 422 bodies exist on the same route and neither may crash the client: a HANDLER
+      // refusal is {detail: string, error_code: string}, while a type failure caught before the
+      // handler ran keeps FastAPI's native list-`detail` and carries NO code.
+      if (typeof body.error_code === 'string') errorCode = body.error_code
     } catch {
       // non-JSON error body (proxy HTML page and the like): keep the status fallback
     }
     // A failed ingest still opened a run: keep its id (header) on the error, or it is lost —
     // the JSON body of a 4xx/5xx never carries it.
-    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'))
+    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'), errorCode)
   }
   return { body: (await res.json()) as T, response: res }
 }
@@ -193,6 +209,10 @@ export interface SearchHit {
   concept: string | null
   domain: string | null
   sensitivity: string | null
+  // The projected DISPLAY label (migration 1042) — what the asset page renders. Distinct from
+  // `sensitivity` above, which is the raw read-scope tag a source file declares; on a catalog that
+  // declares none, this is the only sensitivity a column has.
+  sensitivity_display: string | null
   additivity: string | null
   unit: string | null
   currency: string | null
@@ -215,7 +235,7 @@ export const SEARCH_PAGE_SIZE = 20
 // The repeated-value facet groups, in the order they ride the /search query string. AND across
 // groups, OR within one. grain/as_of are boolean flags carried separately (=true restricts).
 export const SEARCH_FACET_KEYS = [
-  'source', 'domain', 'sensitivity', 'additivity', 'entity', 'kind',
+  'source', 'domain', 'sensitivity', 'sensitivity_display', 'additivity', 'entity', 'kind',
 ] as const
 export type SearchFacetKey = (typeof SEARCH_FACET_KEYS)[number]
 
@@ -231,10 +251,24 @@ export type SearchFilters = {
 // GET /search response. `facets` is keyed by group name (the six above plus grain/as_of, which
 // always emit a single "true" bucket that may be count 0); each list is capped 50, count desc.
 // `total` counts tables AND columns (kind is a facet), so render honest "N result(s)" copy.
+/**
+ * Whether a load-bearing catalog projection was BEHIND when a read was served (semantic Task 6).
+ * `ready` on the happy path — ALWAYS present, because an omitted field cannot distinguish
+ * "checked and fine" from "never checked". A `lagged` marker is a disclosure, never a refusal:
+ * the rows are still served, and the UI should say the view may not yet reflect the newest
+ * resolved semantics rather than hide it.
+ */
+export interface ProjectionStatus {
+  status: 'ready' | 'lagged'
+  code: string
+  detail: string
+}
+
 export interface SearchResult {
   hits: SearchHit[]
   facets: Record<string, FacetBucket[]>
   total: number
+  projection: ProjectionStatus
 }
 
 export interface QuarantineItem {
@@ -283,6 +317,14 @@ export interface FeatureIdea {
   rationale: string
   // The critic's dissent note when it flagged but did not block the idea; "" when clean.
   critic_note: string
+  // Task 3 near-label critic (flag-only, origin-blind): {no_finding | too_close | abstain},
+  // absent when the critic did not run. Deliberately no value that reads as "cleared" — the
+  // critic cannot clear anything. Only `too_close` renders a warning; nothing is ever removed.
+  near_label_verdict?: 'no_finding' | 'too_close' | 'abstain' | null
+  near_label_rationale?: string
+  // Task 4b (flag-gated server-side): the recipe's untaken parameterisations, chosen value
+  // marked — "window: 30/[90]/180". Presentation only; absent when there is nothing to choose.
+  param_alternatives?: string
 }
 
 // One gauntlet rejection, shown to the human, never hidden. `code` carries the backend's
@@ -369,10 +411,20 @@ export interface FeatureSpecIn {
   derives_from: { catalog_source: string; object_ref: string }[]
 }
 
-export async function uploadFile(file: File, source: string): Promise<IngestResult> {
+export async function uploadFile(
+  file: File,
+  source: string,
+  // Optional catalog-narrative JSON (Release-A profiles): validated server-side BEFORE any write
+  // and committed atomically with a successful ingest; ignored (with a server warning) while
+  // FEATUREGEN_DATASET_PROFILES is off. Never required — a missing profile never blocks a catalog.
+  catalogProfileJson?: string,
+): Promise<IngestResult> {
   const form = new FormData()
   form.append('file', file)
   form.append('source', source)
+  if (catalogProfileJson !== undefined && catalogProfileJson.trim() !== '') {
+    form.append('catalog_profile_json', catalogProfileJson)
+  }
   const { body, response } = await requestWithResponse<IngestResult>('/uploads', {
     method: 'POST',
     body: form,
@@ -653,6 +705,31 @@ export function confirmTableFact(
 ): Promise<{ governance_status: string; operational_projection: string }> {
   return post(`/governance/table-facts/${encodeURIComponent(factKey)}/confirm`, {
     note: body.note ?? null,
+  })
+}
+
+// ── semantic bindings (currency / entity) — the E4a four-eyes confirm surface ─────────────────
+// The reject vocabulary is the server's closed set (RejectSemanticBindingRequest).
+export const SEMANTIC_BINDING_REJECT_CATEGORIES = [
+  'wrong_entity', 'wrong_currency_column', 'not_a_binding', 'needs_data_check',
+] as const
+export type SemanticBindingRejectCategory = (typeof SEMANTIC_BINDING_REJECT_CATEGORIES)[number]
+
+export function confirmSemanticBinding(
+  factKey: string,
+  body: { note?: string },
+): Promise<{ governance_status: string; operational_projection: string }> {
+  return post(`/governance/semantic-bindings/${encodeURIComponent(factKey)}/confirm`, {
+    note: body.note ?? null,
+  })
+}
+
+export function rejectSemanticBinding(
+  factKey: string,
+  body: { category: SemanticBindingRejectCategory; note?: string },
+): Promise<{ governance_status: string; category: string }> {
+  return post(`/governance/semantic-bindings/${encodeURIComponent(factKey)}/reject`, {
+    category: body.category, note: body.note ?? null,
   })
 }
 
@@ -1027,6 +1104,8 @@ export interface LineageNode {
   // table's as-of column — the availability basis (posted_at | ingested_at) from its as-of fact.
   concept?: string
   domain?: string
+  // Declared type from graph_node, so a card can state what a column IS as well as what it means.
+  data_type?: string
   as_of_basis?: string
   // feature stamps (omitted when absent): the honest verification stamp (e.g. DESIGN-CHECKED) and
   // the causal WHY it was born (its hypothesis); rationale is absent for directly-registered features.
@@ -1333,6 +1412,83 @@ export function contractRecognitions(
     objective,
     feedback: opts.feedback ?? null,
     supersedes_scope_id: opts.supersedesScopeId ?? null,
+  })
+}
+
+// The mandatory read's DRAFT ticket (intake build, router-quality plan 2026-08-10). Never a
+// decision: `pinned` means code matched a name the user literally typed (recorded server-side
+// without a click); a fuzzy `target_column` is a model reading awaiting the confirm screen;
+// `contradiction` is the warning when the prose disagreed with a typed name.
+export interface IntakeTicket {
+  target_column: string | null
+  target_window_days: number | null
+  target_type: 'binary_classification' | 'regression' | 'multiclass' | 'abstain'
+  business_domain: string[]
+  confidence: 'high' | 'medium' | 'abstain'
+  pinned: boolean
+  contradiction: string | null
+  // The Change-it menu (prompt v2): ranked next-best readings, subset of the catalog shortlist,
+  // never the chosen target. [] on older-backend replays and honest nothing-else-comes-close.
+  runners_up: string[]
+}
+
+export interface IntakeResp {
+  intent_id: string
+  // extracted = fresh model call; replayed = cached (free); unavailable/call_ceiling = degraded —
+  // the pinned target (pure code) still lands, everything else honestly abstains.
+  reason: 'extracted' | 'replayed' | 'unavailable' | 'call_ceiling'
+  ticket: IntakeTicket
+  // The confirm screen's one-liner: "I understood your target as `ref` — <ai_summary>".
+  target_detail: {
+    ref: string; catalog_source: string; concept: string; ai_summary: string
+  } | null
+  // The runners-up with the same one-liner material — the Change-it panel's one-click buttons.
+  runner_up_details: { ref: string; catalog_source: string; concept: string; ai_summary: string }[]
+}
+
+// One hypothesis in, one draft reading out. Cached server-side by content (hypothesis + shortlist
+// + vocabulary + prompt version), so re-asking the same question is free.
+export function contractIntake(
+  hypothesis: string,
+  opts: { catalogSource?: string } = {},
+): Promise<IntakeResp> {
+  return post('/contract/intake', {
+    hypothesis,
+    catalog_source: opts.catalogSource ?? null,
+  })
+}
+
+// The recorded reading after the human's answer — provenance is the audit fact: 'human_confirmed'
+// (a person clicked), 'user_typed' (they literally named it), 'exploring' (explicit no-target).
+export interface IntakeReading {
+  intent_id: string
+  target_ref: string | null
+  target_window_days: number | null
+  target_type: string | null
+  business_domain: string[]
+  target_provenance: string | null
+  target_confirmed_by: string | null
+}
+
+// Record the human's answer to the confirm screen. Author-only (403 otherwise); the signed ref is
+// validated against the read-scoped catalog server-side — a column you cannot see cannot be your
+// target; off-vocabulary domain tokens are refused, never silently dropped.
+export function contractIntakeTarget(
+  intentId: string,
+  decision: 'confirmed' | 'corrected' | 'exploring',
+  opts: {
+    targetRef?: string; targetWindowDays?: number; targetType?: string
+    businessDomain?: string[]; catalogSource?: string
+  } = {},
+): Promise<IntakeReading> {
+  return post('/contract/intake/target', {
+    intent_id: intentId,
+    decision,
+    target_ref: opts.targetRef ?? null,
+    target_window_days: opts.targetWindowDays ?? null,
+    target_type: opts.targetType ?? null,
+    business_domain: opts.businessDomain ?? [],
+    catalog_source: opts.catalogSource ?? null,
   })
 }
 
@@ -2172,6 +2328,267 @@ export interface AuditSection {
   truncated: boolean
 }
 
+/** One suggested addition to the concept vocabulary — for human review, never auto-applied. */
+export interface OntologyGapSuggestion {
+  proposed_label: string
+  parent_concept: string | null
+  definition: string
+  aliases: string[]
+}
+
+/**
+ * The current semantic adjudication of one column. `confidence_band` is EXPLANATION for the
+ * reader, never authority: the adjudicated concept is llm/proposed evidence like any other, and
+ * its authority is shown by the evidence/effective_metadata sections.
+ */
+export interface SemanticAdjudicationSection {
+  status: 'available' | 'absent'
+  note?: string
+  structured_result_id?: string
+  selected_concept?: string
+  alternatives?: string[]
+  confidence_band?: 'high' | 'medium' | 'low'
+  reason_codes?: string[]
+  missing_context?: string[]
+  ontology_gap?: OntologyGapSuggestion | null
+}
+
+// ---- Context Graph V1 (semantic Task 7) ------------------------------------------------------
+// A composition of readers that already shipped — the semantic bundle, the lineage builder, the
+// assembled dataset profile and the current adjudication — served as ONE dossier section so every
+// fact belongs to the snapshot the consistency_token fingerprints.
+
+export interface ContextValue {
+  field: string
+  value: unknown
+  // The LLM's own answer where it did NOT win resolution — the normal state for a field whose
+  // policy excludes the model (`_MEASURE_ANNOTATION`: unit/currency), where `graph_node` never
+  // receives the proposal at all. Carried BESIDE `value`, never folded into it: `value` is what the
+  // operational read model resolved, and a reader that cannot tell the two apart is how a guess
+  // clears a safety check. Optional: an older backend omits the key entirely.
+  proposed_value?: unknown
+  resolution_status: string
+  operational_influence: string | null
+  // The DERIVED D2 display label (source_attested | source_proposed | human | llm_proposed |
+  // deterministic | governed | system). For the chip only — never branch on it; the triple below
+  // is the real authority.
+  authority_label: string
+  producer: string | null
+  strength: string | null
+  lifecycle: string | null
+  evidence_ids: string[]
+}
+
+export interface ContextNode {
+  id: string
+  kind: string
+  label: string
+  detail: Record<string, unknown>
+}
+
+export interface ContextEdge {
+  from: string
+  to: string
+  kind: string
+  // 'structural' for containment (an explicit basis, empty evidence), else the D2 display label
+  // or the edge layer's own authority word.
+  authority: string
+  status: string | null
+  why: string
+  producer: string | null
+  strength: string | null
+  lifecycle: string | null
+  current: boolean
+  evidence_ids: string[]
+}
+
+export interface ContextRealization {
+  realization_revision_id: string
+  from_ref: string
+  to_ref: string
+  lifecycle: string
+  safety_status: string
+  // Fan-out never travels without its direction (from/to) and applicability scope.
+  cardinality: string | null
+  scope_id: string | null
+  sandbox_eligible: boolean
+  // A PURE predicate over the stored record: it labels history, never a live capability.
+  production_eligible: boolean
+  // The ONLY live-capability answer, from the revalidating reader.
+  executable_now: boolean
+}
+
+// What a composed measurement of a crosswalk FOUND. Numbers only — verdicts live per direction.
+// `caveats` rides on the same object as the counts deliberately: a reader who sees "3 rows, 1:1"
+// without "measured over unfiltered history" has been told something true and understood something
+// false.
+export interface ContextCrosswalkMeasurement {
+  observation_revision_id: string
+  scope_id: string
+  observed_at: string
+  as_of: string | null
+  method: string
+  row_coverage: string
+  complete: boolean
+  composed_row_count: number
+  source_to_target_max_matches: number
+  target_to_source_max_matches: number
+  mapping_row_count: number
+  mapping_temporal_policy_revision_id: string | null
+  caveats: string[]
+  failures: string[]
+}
+
+// One NAMED direction's verdict. The two are SIDES of the definition, never traversal order, and
+// they are independent: 1:1 forward with N:1 reverse is ordinary and admits forward only.
+export interface ContextCrosswalkDirection {
+  direction: string
+  safety_status: string
+  cardinality: string | null
+  sandbox_admissible: boolean
+  production_admissible: boolean
+  reason_codes: string[]
+}
+
+// ONE leg of a crosswalk, as its real owner pinned it. A same-catalog leg resolves through the
+// join planner and carries NO fact key or realization revision; a cross-catalog leg resolves
+// through one governed bridge realization and carries both. Empty at discovery by contract — a leg
+// is pinned by RESOLVING it, which admission does.
+export interface ContextCrosswalkLegPin {
+  kind: string
+  plan_hash: string
+  from_dataset_ref: string
+  to_dataset_ref: string
+  from_binding_revision_id: string
+  to_binding_revision_id: string
+  read_set_hash: string
+  binding_revision_ids?: string[]
+  fact_keys?: string[]
+  realization_revision_ids?: string[]
+  dependency_snapshot_ids?: string[]
+  predicate_content_hashes?: string[]
+}
+
+// One category's answer to "what already depends on this". Reuses the governance-queue tri-state:
+// `count` is null unless `state === 'counted'`, so the type itself makes "unmeasured" impossible to
+// render as 0. Never show a number this does not carry.
+export interface ContextCrosswalkUsage {
+  category: string
+  state: 'counted' | 'not_tracked_yet' | 'unreadable'
+  count: number | null
+  display: string
+  store: string
+  basis: string
+  reason: string
+}
+
+// The Release-C crosswalk extension. It says what the crosswalk IS — which mapping dataset, which
+// revision, both legs — plus, since Task 11, what a measurement found and what admission concluded
+// per direction, and since Task 13 the three-family reading of every reason code, whether this
+// DEPLOYMENT enables crosswalk execution at all, what already depends on it, and every pinned
+// revision a traversal would carry. `executable_now` is carried explicitly rather than derived
+// from `production_admissible`: that predicate labels history, not a live capability.
+// `measurement: null` with empty `directions` is "discoverable, unmeasured" — a state, never a
+// failure.
+export interface ContextCrosswalk {
+  definition_id: string
+  definition_revision_id: string
+  mapping_dataset_ref: string
+  source_to_mapping_refs: string[]
+  mapping_to_target_refs: string[]
+  mapping_temporal_policy_revision_id: string | null
+  leg_pins: ContextCrosswalkLegPin[]
+  measurement?: ContextCrosswalkMeasurement | null
+  directions?: ContextCrosswalkDirection[]
+  admission_policy_version?: string | null
+  executable_now?: boolean
+  // code -> undecided | needs_data_check | structurally_unsuitable. The UI renders the FAMILY;
+  // a bare reason code reads as a fault.
+  unresolved_families?: Record<string, string>
+  // This installation's switch, separate from the evidence. False means every crosswalk is
+  // discoverable and structurally non-executable here — a deployment fact, not a verdict.
+  execution_enabled?: boolean
+  already_depended_on_by?: ContextCrosswalkUsage[]
+  pinned_revisions?: Record<string, string>
+}
+
+export interface ContextRelationship {
+  relationship_ref: string
+  kind: string
+  // Present only on a crosswalk. A direct bridge and a crosswalk between the same two endpoints
+  // are different records answering different questions, and both appear.
+  crosswalk?: ContextCrosswalk | null
+  left_ref: string
+  right_ref: string
+  // available | unavailable, and nothing else — availability never encodes safety.
+  availability: string
+  review_status: string | null
+  assessment_revision_id: string | null
+  producer: string
+  strength: string
+  lifecycle: string
+  current: boolean
+  evidence_ids: string[]
+  executable_now: boolean
+  realizations: ContextRealization[]
+}
+
+export interface ContextProfileField {
+  value: string | null
+  producer?: string
+  strength?: string
+  lifecycle?: string
+  state: string | null
+  unresolved_family: string | null
+}
+
+export interface ContextProfiles {
+  catalog_profile_revision_id: string | null
+  dataset_profile_hash: string | null
+  data_role: ContextProfileField | null
+  primary_entity: ContextProfileField | null
+  authority_role: ContextProfileField | null
+  temporal_storage_model: ContextProfileField | null
+  missing_context: string[]
+}
+
+// Per-kind accounting of what the bounded reads left out. `truncated` keeps its shipped meaning —
+// a BUDGET cut — while `omitted` counts everything not returned, so "no joins" and "joins that did
+// not fit" are never the same answer.
+export interface ContextTruncation {
+  truncated: boolean
+  omitted: Record<string, number>
+}
+
+export interface ContextSection {
+  // available (column) | table | projection_unavailable | unavailable. None of these is an error.
+  status: string
+  version?: string
+  anchor_id?: string
+  note?: string
+  projection?: { code: string; detail: string }
+  source_meaning?: ContextValue[]
+  resolved_meaning?: ContextValue[]
+  table_context?: ContextValue[]
+  concept_path?: string[]
+  identifier_namespace?: { scheme: string; issuer_scope: string | null; basis: string } | null
+  related_columns?: {
+    object_ref: string
+    column: string
+    concept: string | null
+    party_role: string | null
+  }[]
+  relationships?: ContextRelationship[]
+  profiles?: ContextProfiles
+  uncertainty?: { missing_context: string[]; not_supplied: string[] }
+  // Context this platform has no producer for. Rendered as "not supplied", never as zero.
+  not_supplied?: string[]
+  nodes?: ContextNode[]
+  edges?: ContextEdge[]
+  truncation?: ContextTruncation
+  content_hash?: string
+}
+
 export interface AssetDetail {
   version: string
   source: string
@@ -2189,8 +2606,18 @@ export interface AssetDetail {
   // Server-calculated commands the caller may run; F0 keeps this empty.
   actions?: unknown[]
   audit?: AuditSection
+  // The adjudicator's reviewable second opinion for a column Pass A could not settle (Task 5).
+  // `absent` is the NORMAL state — adjudication is the exception path, not a gap in the data.
+  semantic_adjudication?: SemanticAdjudicationSection
+  // Context Graph V1 (Task 7). A SECTION, deliberately not its own endpoint: it rides this
+  // response's single repeatable-read snapshot and its consistency_token.
+  context?: ContextSection
   included_sections: string[]
   unavailable_sections: string[]
+  // Whether a load-bearing projection was behind when this dossier was assembled (Task 6). It is
+  // INSIDE the fingerprinted body, so a lagged snapshot never shares a consistency_token with a
+  // ready one.
+  projection?: ProjectionStatus
   // The snapshot fingerprint, echoed as the ETag header (the OCC token).
   consistency_token: string
 }
@@ -2263,10 +2690,19 @@ export interface FieldDecisionResult {
 // hypothesis, no intent, no LLM), and v1 offers no verb to accept, dismiss or govern a suggestion.
 // Every field below is the engine's own — statuses are the gauntlet's tri-state, `binding_quality`
 // is the signal it already returns. There is no relevance score in this system, so there is none here.
+// A registry-typed requirement parameter value. Tuples become lists on the wire, scalars pass
+// through; `requirements_to_json` emits `params` ADDITIVELY, only when a requirement has any.
+export type RequirementParamValue =
+  | string | number | boolean | null | (string | number | boolean | null)[]
+
 export interface SuggestionRequirement {
   code: string            // the closed REQUIREMENT_CODES vocabulary (UNIT_CONSISTENT, ...)
   operand: string[]       // [catalog_source, object_ref] the requirement concerns
   detail: string
+  // Additive v2 fields (`contract._serial.requirements_to_json`): present only when the typed
+  // requirement carries registry params / a non-default schema version. A v1 body has neither.
+  params?: [string, RequirementParamValue][]
+  schema_version?: string
 }
 
 export interface RecipeParts {
@@ -2342,6 +2778,377 @@ export function getTableSuggestions(source: string, table: string): Promise<Tabl
   )
 }
 
+// ---- Release A v2: the per-table DISCOVERY contract (`?contract_version=2`) -------------------
+// The same read-only route, asked for its richer payload EXPLICITLY. v1 remains the server default
+// for the whole of Release A, so a client that wants v2 says so in the URL — it never sniffs for an
+// optional field on a v1 body, which would make "an older deployment" and "a suggestion with no
+// category" the same observation.
+//
+// Everything below mirrors `overlay/upload/suggestion_contract.page_to_json` field-for-field. The
+// closed vocabularies are typed as unions because they ARE closed server-side; every renderer still
+// falls back for an unknown member rather than crashing on a newer backend.
+
+export type EvidenceProducer =
+  | 'source' | 'structural_connector' | 'parser' | 'llm' | 'profiler' | 'taxonomy'
+  | 'human' | 'legacy'
+export type AssertionStrength = 'proposed' | 'supported' | 'attested' | 'confirmed'
+export type EvidenceLifecycle = 'active' | 'stale' | 'rejected' | 'superseded'
+
+// One evidence OCCURRENCE on the real three-axis vocabulary. A value may carry several at once
+// (source + LLM + human); collapsing them into one "best authority" is forbidden by the contract,
+// so this always travels as a list and the UI renders every member.
+export interface EvidenceAuthority {
+  producer: EvidenceProducer
+  strength: AssertionStrength
+  lifecycle: EvidenceLifecycle
+  producer_ref: string | null
+  evidence_id: string | null
+}
+
+// WHERE a value came from, as a kind of authorship. Distinct from `strength`, which is how hard
+// its producer asserts it: an `llm_proposed` basis with `proposed` strength is the weakest pair.
+export type AttributedBasis = 'template_authored' | 'catalog_resolved' | 'human' | 'llm_proposed'
+// Read from governed state, never inferred. null for every Release-A discovery value.
+export type OperationalInfluence = 'governed' | 'hint'
+
+// A CONTROLLED registry id with provenance. `id` is the stable audit key; `display_name` is what a
+// human reads. Never minted from free text — catalog wording travels as AttributedText below.
+export interface AttributedLabel {
+  id: string
+  display_name: string
+  basis: AttributedBasis
+  evidence: EvidenceAuthority[]
+  operational_influence: OperationalInfluence | null
+  source_refs: string[]
+}
+
+// Attributed FREE TEXT: displayable and searchable, never a facet id. This is what unmapped
+// catalog domain/entity wording arrives as, and the UI must not badge it as a controlled value.
+export interface AttributedText {
+  value: string
+  basis: AttributedBasis
+  evidence: EvidenceAuthority[]
+  operational_influence: OperationalInfluence | null
+  source_refs: string[]
+}
+
+// What an operand IS to the computation, read from the engine's typed refs — never guessed from a
+// column name, a type or an AI-proposed concept.
+export type SuggestionOperandClassification = 'measure' | 'grain' | 'time' | 'grouping' | 'other'
+
+export interface SuggestionOperand {
+  catalog_source: string
+  logical_ref: string
+  graph_object_ref: string
+  table_ref: string
+  recipe_role: string       // the TEMPLATE AUTHOR's declared slot name; '' when none bound
+  classification: SuggestionOperandClassification
+  visibility_requires_current: string[]   // non-empty = this input is visibility-restricted
+  evidence_refs: string[]
+}
+
+// Release A's only `profile_status`: the profile plan has not landed, so the descriptive roles are
+// null because nobody has decided them, NOT because the dataset has none. Left as `string` because
+// the vocabulary's remaining members are owned by that plan and are not frozen here.
+export const PROFILE_STATUS_UNAVAILABLE = 'unavailable'
+
+export interface SuggestionSourceDataset {
+  catalog_source: string
+  table_ref: string
+  data_role: AttributedLabel | null
+  authority_role: AttributedLabel | null
+  temporal_storage_model: AttributedLabel | null
+  primary_entity: AttributedLabel | null
+  dataset_profile_hash: string | null
+  profile_status: string
+}
+
+// One TRAVERSED relationship leg, in the direction travelled.
+//
+// The last three are LEFT AS `string` ON PURPOSE, and the reason is worth stating because the rest
+// of this block narrows aggressively. Each is written by TWO producers that do not agree, and the
+// dataclass carrying them validates only `relationship_kind` — so a TS union here would be a claim
+// the server does not enforce, and a payload that violated it would type-check as impossible while
+// rendering as garbage. The renderer maps every member below to words and degrades unknown members
+// gracefully, which is the honest equivalent.
+//
+//   cardinality   — the join-path walker passes the `graph_edge` column through verbatim, whose DB
+//                   CHECK is '1:1' | '1:N' | 'N:1' | NULL; the planner instead emits the taxonomy's
+//                   `Cardinality` StrEnum: 'one_to_one' | 'one_to_many' | 'many_to_one' |
+//                   'many_to_many'. NULL becomes 'unknown' — never guessed at 1:1. Nothing
+//                   normalizes the two notations.
+//   safety_status — 'clearing' (governed-verified, or declared with no contradicting fact) or
+//                   'unverified'. Closed by call-site enumeration only, not by any validator.
+//   review_status — 'file_declared' when nobody confirmed it. Otherwise the approved_join status
+//                   column, whose CHECK admits 'DRAFT' | 'PARTIALLY_CONFIRMED' | 'VERIFIED' |
+//                   'REJECTED' | 'STALE' | 'REVERIFY' (only VERIFIED is reachable on an
+//                   operational edge today), or the planner's own 'governed_bridge' | 'unlinked'.
+export interface SuggestionRelationshipDependency {
+  relationship_ref: string
+  relationship_kind: string
+  from_ref: [string, string]
+  to_ref: [string, string]
+  realization_content_hash: string | null
+  cardinality: string
+  safety_status: string
+  review_status: string
+}
+
+// The CLOSED warning vocabulary. Prose renders a code; it is never an alternative decision field.
+// Staleness is deliberately absent: it is projection state, not a property of the suggestion.
+export const SUGGESTION_WARNING_CODES = [
+  'NEAR_LABEL', 'SENSITIVE_INPUT', 'MISSING_TEMPORAL_EVIDENCE', 'MISSING_UNIT', 'MISSING_CURRENCY',
+  'RELATIONSHIP_UNCONFIRMED', 'RELATIONSHIP_SAFETY_UNPROVEN',
+  'DIRECTIONAL_CARDINALITY_UNAVAILABLE', 'PROFILE_PROPOSED',
+] as const
+export type SuggestionWarningCode = (typeof SUGGESTION_WARNING_CODES)[number]
+
+export interface SuggestionWarning {
+  code: SuggestionWarningCode
+  operand_refs: [string, string][]
+  detail: string
+}
+
+export type SuggestionValidationStatus = 'DESIGN_CHECKED' | 'NEEDS_EXTERNAL_VALIDATION'
+// How completely the discovery registry maps this recipe. `needs_sme` is UNREPRESENTABLE in v1 —
+// the contract has no carrier for its provenance — so a UI chip for it could never occur.
+export type SuggestionDiscoveryDisposition = 'complete' | 'partial' | 'unclassified'
+// The server-stamped generation vocabulary. This surface emits only `recipe`.
+export type SuggestionGenerationSource = 'recipe' | 'llm_freeform' | 'user_defined'
+
+export interface FeatureSuggestionV2 {
+  schema_version: string          // 'feature-suggestion-v2'
+  suggestion_id: string           // STABLE logical candidate identity — the React key, not the name
+  suggestion_revision_id: string  // exact content/context revision
+  generation_source: SuggestionGenerationSource
+
+  template_id: string | null
+  recipe_revision_id: string | null
+  discovery_metadata_revision_id: string | null
+  validation_rule_content_hashes: string[]
+  read_scope_rule_content_hashes: string[]
+  name: string
+  display_name: string
+  business_interpretation: AttributedText | null
+  business_value: AttributedText | null
+
+  feature_category: AttributedLabel | null
+  // The provenance-badge signal a consumer must NOT read off `basis`, which says
+  // `template_authored` for a taxonomy-DERIVED category as well as for an authored one.
+  feature_category_derived_from_family_mapping: boolean
+  discovery_disposition: SuggestionDiscoveryDisposition
+  recipe_family: AttributedLabel | null
+  business_domains: AttributedLabel[]        // empty in Release A: no controlled resolver
+  contextual_domain_terms: AttributedText[]  // catalog wording, NOT a controlled domain
+  use_cases: AttributedLabel[]
+  keywords: AttributedText[]
+
+  entity: AttributedLabel | null
+  contextual_entity_terms: AttributedText[]
+  grain_refs: [string, string][]             // ordered composite key
+  operation_kind: string
+  window: string | null
+  time_ref: [string, string] | null
+  recipe: string
+  recipe_parts: RecipeParts
+
+  // The remaining AUTHORED recipe declarations. null means the SME wrote none: silence, not an
+  // empty value.
+  recipe_stage: AttributedText | null
+  eligibility_note: AttributedText | null
+  authoring_notes: AttributedText[]
+  output_additivity: AttributedText | null
+  point_in_time_declaration: AttributedText | null
+
+  source_datasets: SuggestionSourceDataset[]
+  operands: SuggestionOperand[]
+  relationship_dependencies: SuggestionRelationshipDependency[]
+  validation_status: SuggestionValidationStatus
+  requirements: SuggestionRequirement[]
+  warnings: SuggestionWarning[]
+  binding_quality: string
+
+  semantic_context_hashes: string[]   // empty in Release A: the semantic plan has not landed
+  dataset_profile_hashes: string[]    // empty in Release A: the profile plan has not landed
+  grounding_trace_content_hash: string
+
+  // BR-8 contract v3 ONLY: the execution-truthfulness block. Absent on a v2 page — a card must
+  // render nothing readiness-shaped from its absence, never synthesize a state.
+  execution?: SuggestionExecutionBlock
+}
+
+// One named fact about why a suggestion is not further up the execution ladder. `group` is the
+// display taxonomy (data_meaning / time / currency / relationship / formula_capability /
+// governance / execution); `code` is the machine vocabulary the audit drawer keeps.
+export interface SuggestionReadinessBlocker {
+  code: string
+  group: string
+}
+
+// What this card IS, execution-wise — a SEPARATE axis from design checking. UNASSESSED is the
+// legacy registry's honest word for "nobody decided yet": an idea, never a failure and never
+// readiness. States are OPEN strings: a newer backend's member renders as words, never crashes.
+export interface SuggestionExecutionBlock {
+  recipe_contract_version: string
+  computation_kind: string
+  execution_readiness: string
+  readiness_blockers: SuggestionReadinessBlocker[]
+  binding_ambiguity: boolean
+  // BR-17: the atomic V2 recipe ids replacing this legacy template (empty on the fallback).
+  // Optional so a pre-cutover backend still parses.
+  v2_replacements?: string[]
+  // True when this legacy card spans SEVERAL atomic outputs the user has not chosen between:
+  // execution_readiness is then the best atom's state — a ceiling, not a property of the card.
+  // Optional so an older backend still parses.
+  output_selection_required?: boolean
+  // Each replacement's OWN readiness (alias-map order) — nothing inherits a sibling's state.
+  replacement_readiness?: {
+    recipe_id: string
+    execution_readiness: string
+    computation_kind: string
+  }[]
+}
+
+// The exact ids a reader compares for CURRENTNESS — and which are excluded from every semantic
+// hash for exactly that reason, so a replay under a new event id churns no revision.
+export interface SuggestionBuildProvenance {
+  scope_set_id: string | null
+  metadata_snapshot_ids: string[]
+  dependency_revision_ids: string[]
+  evidence_event_ids: string[]
+  relationship_realization_revision_ids: string[]
+  producer_commit: string | null
+  refresh_id: string | null
+  generated_at: string | null
+}
+
+export type SuggestionProjectionStateName =
+  | 'current' | 'stale' | 'pending' | 'partial' | 'failed' | 'retired'
+
+// Release-B projection currentness. Release A reports `null` rather than inventing a `current` it
+// cannot prove, so a UI must never synthesize a freshness badge from an absent projection.
+export interface SuggestionProjectionState {
+  state: SuggestionProjectionStateName
+  scope_set_id: string | null
+  read_scope_key: string
+  scope_epoch: number
+  target_fingerprint: string
+  current_fingerprint: string | null
+  generated_at: string | null
+  stale_reason: string | null
+  // The SAME closed key vocabulary the collection's identical field carries — a projection omits
+  // things for the same reasons a live page does, so it may not be the looser type.
+  omitted_counts: SuggestionOmittedCounts
+}
+
+export interface FeatureSuggestionHit {
+  suggestion: FeatureSuggestionV2
+  projection: SuggestionProjectionState | null
+  provenance: SuggestionBuildProvenance
+}
+
+// V1's counts with `clean_ready` renamed to what it actually means. `groups` keeps V1's `entities`
+// semantics: the number of NAMED grain buckets.
+export interface SuggestionSummaryV2 {
+  suggested: number
+  design_checked: number
+  needs_external_validation: number
+  groups: number
+}
+
+export interface SuggestionGroupV2 {
+  entity: AttributedLabel | null
+  contextual_entity_terms: AttributedText[]
+  grain_refs: [string, string][]
+  suggestion_ids: string[]
+}
+
+export interface SuggestionRejectionV2 {
+  template_id: string | null
+  candidate_name: string
+  code: string
+  explanation: string
+}
+
+// What a bound left out. Every key is a count of values the page did NOT show; an unknown key from
+// a newer backend degrades to its de-underscored words rather than disappearing. Scope-revealing
+// keys are dropped server-side, so a caller cannot tell "nothing withheld" from "N withheld".
+export type SuggestionOmissionKey =
+  | 'operands' | 'business_domains' | 'contextual_domain_terms' | 'contextual_entity_terms'
+  | 'use_cases' | 'keywords' | 'authoring_notes' | 'relationship_dependencies'
+  | 'evidence_refs' | 'term_evidence'
+  | 'withheld_missing_trace' | 'withheld_incomplete_trace' | 'withheld_missing_context'
+  | 'withheld_unresolvable_path' | 'withheld_non_recipe_generation_source'
+export type SuggestionOmittedCounts = Partial<Record<SuggestionOmissionKey, number>>
+
+export interface SuggestionCollectionContextV2 {
+  anchor_catalog_source: string | null
+  anchor_table_ref: string | null
+  anchor_column_ref: string | null
+  // false = this catalog holds no such table FOR THIS CALLER. Keeps the empty screen's DIAGNOSIS
+  // honest, exactly as in v1.
+  table_known: boolean | null
+  summary: SuggestionSummaryV2
+  groups: SuggestionGroupV2[]
+  rejections: SuggestionRejectionV2[]
+  neighbourhood: JoinNeighbourhood | null
+  omitted_counts: SuggestionOmittedCounts
+}
+
+// Named apart from the catalog-search `FacetBucket` above: the two contracts are versioned by
+// different owners and a shared name would silently couple them.
+export interface SuggestionFacetBucket {
+  id: string
+  display_name: string
+  count: number
+}
+
+export interface FeatureSuggestionPageV2 {
+  read_mode: 'on_demand' | 'projected'
+  read_scope_key: string          // opaque hash of the caller's visibility CLASSES; not authz
+  projection: SuggestionProjectionState | null
+  collection: SuggestionCollectionContextV2
+  hits: FeatureSuggestionHit[]
+  facets: Record<string, SuggestionFacetBucket[]>   // empty until Release B
+  next_cursor: string | null
+}
+
+// The typed handler-level refusal for a version this deployment does not serve. A NON-integer
+// `contract_version` is a different thing: it keeps FastAPI's native 422, whose `detail` is a LIST
+// and which carries no code at all.
+export const SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION = 'SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION'
+
+// Ask for v2 EXPLICITLY. The version is a literal, not a probe: if this deployment does not serve
+// it the route answers 422 with the code above and the caller says so, rather than silently
+// rendering a v1 body with every discovery field missing.
+export function getTableSuggestionsV2(
+  source: string,
+  table: string,
+): Promise<FeatureSuggestionPageV2> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
+      + '/suggestions?contract_version=2',
+  )
+}
+
+// The BR-8 v3 page: the v2 page plus its declared version, an `execution` block on every hit and
+// the page-level readiness tally. v2 stays this frontend's DEFAULT until the BR-24 rollout gates
+// pass; callers opt into v3 deliberately, exactly as v2 was introduced.
+export interface FeatureSuggestionPageV3 extends FeatureSuggestionPageV2 {
+  contract_version: 3
+  readiness_counts: Record<string, number>
+}
+
+export function getTableSuggestionsV3(
+  source: string,
+  table: string,
+): Promise<FeatureSuggestionPageV3> {
+  return request(
+    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
+      + '/suggestions?contract_version=3',
+  )
+}
+
 // POST one scalar field-correction. Maps the camelCase request to the backend snake_case body
 // (defaults mirror the server model: selected_evidence_ids [], replacement_value/reason null). A CAS
 // conflict (a concurrent decision/evidence/policy drift) fails closed as HTTP 409, and a four-eyes /
@@ -2370,9 +3177,13 @@ export function postFieldDecision(
 }
 
 // ── the data agent: a question, planned and previewed ────────────────────────────────────────────
-// Nothing here executes. `/analysis/plan` retrieves, extracts, grounds and previews; the API has no
-// run endpoint, because execution needs inputs a deployment must configure first. The screen must
-// not offer a Run control it cannot honour.
+// `/analysis/plan` retrieves, extracts, grounds, previews and — behind the source/temporal flag —
+// SEALS, returning the identity a caller executes that exact plan by. It never runs the statement.
+// The API DOES have a run endpoint now (`POST /analysis/execute`, Release-B Task 9), and this
+// client deliberately does not call it: running a sealed plan against the bank's warehouse is a
+// separate approval gate, and a Run control that 409'd on it would teach people to click through a
+// governance decision. The screen offers no Run button for that reason, not because nothing can
+// execute.
 
 export interface AnalysisFinding {
   code: string
@@ -2414,10 +3225,63 @@ export interface AnalysisClarification {
   options: ClarificationOption[]
 }
 
+// ── Release B: which copy answered, which of its rows, and what else was considered ─────────────
+// The candidate list is READ-SCOPED server-side: a dataset this caller may not see never appears
+// by name, only in `considered_withheld`. The UI renders that count and must never try to
+// reconstruct what is behind it.
+
+export interface AnalysisCandidate {
+  dataset_ref: string
+  disposition: string
+  reason_codes: string[]
+}
+
+export interface AnalysisSourceDecision {
+  need_role: string
+  withheld: boolean
+  dataset_ref?: string
+  selection_basis?: string
+  authority_basis?: string
+  authority_role?: string
+  considered?: AnalysisCandidate[]
+  considered_withheld?: number
+  considered_total?: number
+}
+
+export interface AnalysisRowDecision {
+  dataset_ref: string
+  selection_kind: string
+  cutoff_value_ref: string | null
+  predicates: { column_ref: string; operator: string }[]
+  predicates_withheld: boolean
+}
+
+export interface AnalysisSelectionRefusal {
+  code: string
+  subjects: string[]
+  subjects_withheld: number
+  detail: string
+  // undecided | needs_data_check | structurally_unsuitable | needs_setup. The UI renders the
+  // FAMILY: an undecided thing is not a failure and must never be drawn as one.
+  family: string
+}
+
+export interface AnalysisSelection {
+  resolved: boolean
+  sources: AnalysisSourceDecision[]
+  rows: AnalysisRowDecision[]
+  refusals: AnalysisSelectionRefusal[]
+  warnings: string[]
+}
+
 export interface AnalysisPlanResponse {
   preview: AnalysisPreview
   clarifications: AnalysisClarification[]
   retrieval?: { tables_considered: string[]; dropped_columns: number }
+  // null while FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off.
+  selection?: AnalysisSelection | null
+  // The identity this exact plan can later be executed by. null when nothing was sealed.
+  sealed_plan_hash?: string | null
 }
 
 export function planAnalysis(question: string): Promise<AnalysisPlanResponse> {
@@ -2548,4 +3412,575 @@ export interface EntityMap {
 
 export function getEntityMap(): Promise<EntityMap> {
   return request('/catalog/entity-map')
+}
+
+// ── Release-A dataset/catalog profiles ──────────────────────────────────────────────────────────
+// Every route here is flag-gated server-side (FEATUREGEN_DATASET_PROFILES): while the flag is off
+// the routes 404, and the UI treats that as "surface absent" (render nothing), never as an error.
+
+// One resolved profile value + its authority triple VERBATIM (producer × strength × lifecycle).
+// A proposed value is USABLE and labeled — the UI must never frame it as failure (no-blocked rule).
+export interface ProfileSemanticValue {
+  value: string
+  producer: string
+  strength: string
+  lifecycle: string
+  evidence_ids: string[]
+}
+
+// unresolved_family ∈ {undecided, needs_data_check, structurally_unsuitable} — the UI renders the
+// FAMILY, never a raw failure string; null when the field is in a normal display/load state.
+export interface EffectiveProfileField {
+  display: ProfileSemanticValue | null
+  load_bearing: ProfileSemanticValue | null
+  state: string
+  unresolved_reason: string | null
+  unresolved_family: string | null
+  reason_codes: string[]
+}
+
+export interface GovernedFactHead {
+  fact_key: string
+  folded_status: string
+  confirmed_event_id: string | null
+}
+
+export interface AssetProfile {
+  dataset_logical_ref: string
+  catalog_profile_revision_id: string | null
+  description: EffectiveProfileField
+  business_context: EffectiveProfileField
+  domains: EffectiveProfileField
+  data_role: EffectiveProfileField
+  primary_entity: EffectiveProfileField
+  authority_role: EffectiveProfileField
+  temporal_storage_model: EffectiveProfileField
+  event_or_snapshot: EffectiveProfileField
+  grain_fact: GovernedFactHead | null
+  availability_fact: GovernedFactHead | null
+  missing_context: string[]
+  dataset_profile_hash: string
+}
+
+export function getAssetProfile(source: string, objectRef: string): Promise<AssetProfile> {
+  return request(
+    `/catalog/asset-profiles/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`)
+}
+
+// The data_owner proposal surface: writes HUMAN/PROPOSED evidence for the three new profile
+// fields. expectedDatasetProfileHash is the aggregate CAS anchor — any drift 409s server-side.
+export interface AssetProfilePut {
+  expectedDatasetProfileHash: string
+  businessContext?: string
+  authorityRole?: string
+  temporalStorageModel?: string
+  note?: string
+}
+
+export interface AssetProfilePutResult {
+  written: string[]
+  dataset_profile_hash: string
+  profile: AssetProfile
+}
+
+export function putAssetProfile(
+  source: string,
+  objectRef: string,
+  req: AssetProfilePut,
+): Promise<AssetProfilePutResult> {
+  return request(
+    `/catalog/asset-profiles/${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        expected_dataset_profile_hash: req.expectedDatasetProfileHash,
+        business_context: req.businessContext ?? null,
+        authority_role: req.authorityRole ?? null,
+        temporal_storage_model: req.temporalStorageModel ?? null,
+        note: req.note ?? null,
+      }),
+    },
+  )
+}
+
+// One catalog the caller may see. `tables`/`columns` are READ-SCOPED counts (honest about the
+// caller's scope, never about the catalog). `display_name`/`has_profile` ride only while
+// FEATUREGEN_DATASET_PROFILES is on — optional, so a flag-off payload types identically.
+export interface VisibleCatalog {
+  source: string
+  tables: number
+  columns: number
+  display_name?: string | null
+  has_profile?: boolean
+}
+
+// The catalogs THIS caller may see (derived, column-level scope). Never 404s and never errors:
+// "no catalogs you may see" and "no catalogs at all" are deliberately the same answer, so the
+// response cannot be used to probe for hidden catalogs.
+export function listCatalogs(): Promise<{ catalogs: VisibleCatalog[] }> {
+  return request('/catalogs')
+}
+
+export interface CatalogProfileRevision {
+  catalog_source: string
+  display_name: string | null
+  description: string | null
+  business_context: string | null
+  business_domains: string[]
+  producer: string
+  strength: string
+  lifecycle: string
+  producer_ref: string
+  ingestion_run_id: string | null
+  content_hash: string
+  revision_id: string
+}
+
+export interface CatalogProfile {
+  source: string
+  pointer_version: number   // 0 == no narrative yet; the version a first PUT must carry
+  profile: CatalogProfileRevision | null
+}
+
+export function getCatalogProfile(source: string): Promise<CatalogProfile> {
+  return request(`/catalogs/${encodeURIComponent(source)}/profile`)
+}
+
+// expectedPointerVersion rides IN THE BODY (the repo's CAS convention); a miss 409s.
+export function putCatalogProfile(
+  source: string,
+  req: {
+    expectedPointerVersion: number
+    displayName?: string
+    description?: string
+    businessContext?: string
+    businessDomains?: string[]
+  },
+): Promise<{ source: string; revision_id: string; pointer_version: number }> {
+  return request(`/catalogs/${encodeURIComponent(source)}/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      display_name: req.displayName ?? null,
+      description: req.description ?? null,
+      business_context: req.businessContext ?? null,
+      business_domains: req.businessDomains ?? [],
+    }),
+  })
+}
+
+// ── Release-B dataset policies (flag-gated: 404 while FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off,
+// or while its FEATUREGEN_DATASET_PROFILES dependency is unmet — the panel then renders nothing).
+//
+// expectedPointerVersion rides IN THE BODY and is REQUIRED (0 == "no policy existed when I opened
+// this form"). A miss 409s; the panel keeps the author's draft and shows the other version beside it.
+
+export interface PolicyProvenance {
+  evidence: {
+    producer: string
+    strength: string
+    lifecycle: string
+    producer_ref: string | null
+    evidence_id: string | null
+  }[]
+  decision_refs: string[]
+}
+
+export interface ServingPolicyRevision {
+  revision_id: string
+  content_hash: string
+  eligible_dataset_refs: string[]
+  preferred_dataset_refs: string[]
+  provenance: PolicyProvenance
+}
+
+export interface ServingPolicyView {
+  entity_id: string
+  need_role: string
+  serving_purpose: string
+  pointer_version: number
+  declared_by?: string
+  // True when the policy cannot by itself pick one dataset. Shown as an explicit statement, never
+  // resolved by rendering the first element first.
+  ambiguous: boolean
+  policy: ServingPolicyRevision | null
+}
+
+export function getServingPolicy(
+  entityId: string, needRole: string, servingPurpose: string,
+): Promise<ServingPolicyView> {
+  return request('/catalog/dataset-policies/serving/'
+    + `${encodeURIComponent(entityId)}/${encodeURIComponent(needRole)}`
+    + `/${encodeURIComponent(servingPurpose)}`)
+}
+
+export function putServingPolicy(
+  entityId: string, needRole: string, servingPurpose: string,
+  req: {
+    expectedPointerVersion: number
+    eligibleDatasetRefs: string[]
+    preferredDatasetRefs: string[]
+  },
+): Promise<{ revision_id: string; pointer_version: number; ambiguous: boolean }> {
+  return request('/catalog/dataset-policies/serving/'
+    + `${encodeURIComponent(entityId)}/${encodeURIComponent(needRole)}`
+    + `/${encodeURIComponent(servingPurpose)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      eligible_dataset_refs: req.eligibleDatasetRefs,
+      preferred_dataset_refs: req.preferredDatasetRefs,
+    }),
+  })
+}
+
+export interface TemporalPolicyRevision {
+  revision_id: string
+  content_hash: string
+  temporal_storage_model: string
+  current_selection: string
+  historical_selection: string
+  effective_from_ref: string | null
+  effective_to_ref: string | null
+  snapshot_ref: string | null
+  current_flag_ref: string | null
+  availability_ref: string | null
+  tie_break_refs: string[]
+  provenance: PolicyProvenance
+}
+
+export interface TemporalPolicyView {
+  dataset_logical_ref: string
+  // The PROFILE's answer. Non-null means a governed classification exists and the policy must agree
+  // with it; null means nobody has decided, and the policy IS the operational declaration.
+  load_bearing_temporal_storage_model: string | null
+  displayed_temporal_storage_model: string | null
+  pointer_version: number
+  declared_by?: string
+  policy: TemporalPolicyRevision | null
+}
+
+export interface TemporalPolicyPut {
+  expectedPointerVersion: number
+  temporalStorageModel: string
+  currentSelection: string
+  historicalSelection: string
+  effectiveFromRef?: string
+  effectiveToRef?: string
+  snapshotRef?: string
+  currentFlagRef?: string
+  availabilityRef?: string
+  tieBreakRefs?: string[]
+}
+
+export function getTemporalPolicy(source: string, objectRef: string): Promise<TemporalPolicyView> {
+  return request('/catalog/dataset-policies/temporal/'
+    + `${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`)
+}
+
+export function putTemporalPolicy(
+  source: string, objectRef: string, req: TemporalPolicyPut,
+): Promise<{ dataset_logical_ref: string; revision_id: string; pointer_version: number }> {
+  return request('/catalog/dataset-policies/temporal/'
+    + `${encodeURIComponent(source)}/${encodeObjectRefPath(objectRef)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      expected_pointer_version: req.expectedPointerVersion,
+      temporal_storage_model: req.temporalStorageModel,
+      current_selection: req.currentSelection,
+      historical_selection: req.historicalSelection,
+      effective_from_ref: req.effectiveFromRef || null,
+      effective_to_ref: req.effectiveToRef || null,
+      snapshot_ref: req.snapshotRef || null,
+      current_flag_ref: req.currentFlagRef || null,
+      availability_ref: req.availabilityRef || null,
+      tie_break_refs: req.tieBreakRefs ?? [],
+    }),
+  })
+}
+
+// ── data-use policies (D14) — the PII allow-policy surface the feature use gate reads ───────────
+//
+// `status` is a CLOSED three-value vocabulary and NOT a boolean, deliberately: "nobody has decided
+// yet" and "somebody withdrew a decision" are different facts, and only the GATE may collapse them.
+export type DataUsePolicyStatus = 'none' | 'active' | 'revoked'
+
+export interface DataUsePolicyState {
+  concept_name: string
+  description: string
+  group: string
+  status: DataUsePolicyStatus
+  pointer_version: number          // 0 == never declared; the version a first approve must carry
+  purpose: string | null
+  revision_id: string | null
+  approved_by: string | null       // who first authored this revision's content
+  approved_at: string | null
+  declared_by: string | null       // who made it current (the two differ after a re-declaration)
+  updated_at: string | null
+}
+
+export interface DataUsePolicyListing {
+  concepts: DataUsePolicyState[]
+  purpose_bounds: { min: number; max: number }
+}
+
+export function getDataUsePolicies(): Promise<DataUsePolicyListing> {
+  return request('/governance/data-use-policies')
+}
+
+export function approveDataUsePolicy(
+  conceptName: string, req: { expectedPointerVersion: number; purpose: string },
+): Promise<{ concept_name: string; revision_id: string; pointer_version: number; status: string }> {
+  return post(`/governance/data-use-policies/${encodeURIComponent(conceptName)}/approve`, {
+    expected_pointer_version: req.expectedPointerVersion,
+    purpose: req.purpose,
+  })
+}
+
+export function revokeDataUsePolicy(
+  conceptName: string, req: { expectedPointerVersion: number },
+): Promise<{ concept_name: string; revision_id: string; pointer_version: number; status: string }> {
+  return post(`/governance/data-use-policies/${encodeURIComponent(conceptName)}/revoke`, {
+    expected_pointer_version: req.expectedPointerVersion,
+  })
+}
+
+// ── recipe reviews (BR-23) — the governed-recipe sign-off surface ────────────────────────────────
+//
+// Reads are catalog:read; the decision POST needs governance:confirm and carries the revision hash
+// the reviewer actually looked at — a mismatch with the live definition is a 409, never a silent
+// approval of something that changed underneath. Reviewer identity comes from the session.
+
+export interface RecipeReviewValidity {
+  current: boolean
+  required_roles: string[]
+  approved_roles: string[]
+  missing_roles: string[]
+  blocking_decisions: string[]          // "role:decision" for roles whose newest decision blocks
+  single_identity_violation: boolean
+}
+
+export interface RecipeReviewSummaryRow {
+  recipe_id: string
+  family: string
+  readiness: string
+  computation_kind: string
+  display_label: string
+  leakage_classification: string
+  recipe_revision_hash: string
+  validity: RecipeReviewValidity
+}
+
+export interface RecipeReviewSummary {
+  recipes: RecipeReviewSummaryRow[]
+  total: number
+}
+
+// The definition under review, serialized from the backend contract dataclass (RecipeDefinitionV2).
+// Only the fields the review screen renders are typed here; the object carries the full contract.
+export interface RecipeOutputSpec {
+  output_id: string
+  display_label: string
+  output_type: string
+  additivity: string
+  unit_kind: string
+  unit_policy: string
+  currency_policy: string
+  null_input_policy: string
+  empty_population_policy: string
+  zero_denominator_policy: string
+  valid_range: string
+  aggregation_over_entity: string
+  aggregation_over_time: string
+}
+
+export interface RecipeOperandSpec {
+  role: string
+  concept: string
+  operand_class: string
+  required: boolean
+  economic_role: string
+  status_policy_ref: string
+  temporal_role: string
+  unit_expectation: string
+  currency_expectation: string
+}
+
+export interface RecipeParameterSpec {
+  name: string
+  parameter_class: string
+  allowed_values: (string | number)[]
+  identity_projection: string
+  governed_policy_ref: string
+}
+
+export interface RecipeTemporalSpec {
+  anchor_kind: string
+  window_basis: string
+  window_unit: string
+  window_parameter: string
+  timezone_policy: string
+  calendar_policy: string
+  cutoff_inclusivity: string
+  snapshot_policy: string
+  late_arrival_policy: string
+}
+
+export interface RecipeDefinition {
+  recipe_id: string
+  revision: number
+  family: string
+  primary_objective: string
+  supporting_objectives: string[]
+  business_definition: string
+  decision_context: string
+  computation_kind: string
+  readiness: string
+  source_grain: string
+  output_grain: string
+  output: RecipeOutputSpec
+  operands: RecipeOperandSpec[]
+  parameters: RecipeParameterSpec[]
+  temporal: RecipeTemporalSpec
+  eligibility: { included: string; excluded: string; policy_refs: string[] }
+  leakage: { classification: string; permitted_stages: string[]; prohibited_stages: string[] }
+  formula: { formula_schema_version: string; expectation_ref: string; result_class: string } | null
+  conceptual_reason: string
+  model_feature_ref: string
+  replaces_legacy_ids: string[]
+}
+
+export interface RecipeDetail {
+  recipe: RecipeDefinition
+  recipe_revision_hash: string
+  required_reviewer_roles: string[]
+}
+
+export interface RecipeReviewEvent {
+  event_id: string
+  recipe_revision_hash: string
+  decision: string
+  reviewer: string
+  reviewer_role: string
+  rationale: string
+  gold_corpus_refs: string[]
+  policy_dependencies: string[]
+  supersedes_event_id: string | null
+}
+
+export interface RecipeReviews {
+  recipe_id: string
+  recipe_revision_hash: string
+  validity: RecipeReviewValidity
+  events: RecipeReviewEvent[]
+}
+
+// The backend's closed decision vocabulary (recipe_review.py REVIEW_DECISIONS).
+export const RECIPE_REVIEW_DECISIONS = ['approved', 'changes_required', 'rejected', 'retired'] as const
+export type RecipeReviewDecision = (typeof RECIPE_REVIEW_DECISIONS)[number]
+
+export function getRecipeReviewSummary(): Promise<RecipeReviewSummary> {
+  return request('/recipes')
+}
+
+export function getRecipeDetail(recipeId: string): Promise<RecipeDetail> {
+  return request(`/recipes/${encodeURIComponent(recipeId)}`)
+}
+
+export function getRecipeReviews(recipeId: string): Promise<RecipeReviews> {
+  return request(`/recipes/${encodeURIComponent(recipeId)}/reviews`)
+}
+
+export function postRecipeReview(
+  recipeId: string,
+  req: {
+    decision: RecipeReviewDecision
+    reviewerRole: string
+    reviewedRevisionHash: string
+    rationale: string
+  },
+): Promise<{ event_id: string; recipe_revision_hash: string }> {
+  return post(`/recipes/${encodeURIComponent(recipeId)}/reviews`, {
+    decision: req.decision,
+    reviewer_role: req.reviewerRole,
+    reviewed_revision_hash: req.reviewedRevisionHash,
+    rationale: req.rationale,
+  })
+}
+
+// ── concept confirmations (SE-4b) — the authority-bootstrap funnel ───────────────────────────────
+//
+// Bulk BY-EXCEPTION confirmation of proposed concepts, grouped by concept and ordered by how
+// load-bearing each concept is (how many governed recipe operands reference it). Every column
+// carries the CAS anchor the field-correction command re-checks; the batch POST applies one
+// attributable decision per column, and one column's stale anchor never touches its siblings.
+
+export interface ConceptConfirmationColumn {
+  object_ref: string
+  table: string
+  column: string
+  evidence_id: string
+  producer: string
+  strength: string
+  latest_decision_id: string | null
+  evidence_set_hash: string
+  policy_version: string
+}
+
+export interface ConceptConfirmationGroup {
+  concept: string
+  operand_reference_count: number
+  columns: ConceptConfirmationColumn[]
+}
+
+export interface ConceptConfirmationFunnel {
+  active: number
+  human_confirmed: number
+  confirmed_share: number
+}
+
+export interface ConceptConfirmationQueue {
+  catalog_source: string
+  unreferenced_groups_omitted: number
+  funnel: ConceptConfirmationFunnel
+  groups: ConceptConfirmationGroup[]
+}
+
+export interface ConceptDecisionItem {
+  object_ref: string
+  action: 'confirm_existing' | 'reject'
+  evidence_id: string
+  expected_latest_decision_id: string | null
+  expected_evidence_set_hash: string
+  expected_policy_version: string
+}
+
+export interface ConceptConfirmationResult {
+  results: {
+    object_ref: string
+    accepted: boolean
+    status_code: number
+    detail?: string
+    decision_event_id?: string
+  }[]
+  accepted_count: number
+  declined_count: number
+  funnel: ConceptConfirmationFunnel
+}
+
+export function getConceptConfirmations(
+  source: string, includeUnreferenced = false,
+): Promise<ConceptConfirmationQueue> {
+  const suffix = includeUnreferenced ? '&include_unreferenced=true' : ''
+  return request(`/governance/concept-confirmations?source=${encodeURIComponent(source)}${suffix}`)
+}
+
+export function postConceptConfirmations(
+  source: string, items: ConceptDecisionItem[], reason?: string,
+): Promise<ConceptConfirmationResult> {
+  return post('/governance/concept-confirmations', { source, items, reason: reason ?? null })
 }

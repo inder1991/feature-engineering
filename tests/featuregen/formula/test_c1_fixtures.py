@@ -8,9 +8,6 @@ That is what proves Task 6's output-authority tests exercise C1 itself, not a mo
 """
 from __future__ import annotations
 
-from featuregen.overlay.upload.column_authority import read_column_facts
-from featuregen.overlay.upload.operational_facts import read_operational_value
-
 from tests.featuregen.formula.c1_fixtures import (
     clear_projection_unavailable,
     seed_conflict,
@@ -22,6 +19,9 @@ from tests.featuregen.formula.c1_fixtures import (
     seed_resolved,
     seed_retired,
 )
+
+from featuregen.overlay.upload.column_authority import read_column_facts
+from featuregen.overlay.upload.operational_facts import read_operational_value
 
 
 def _read(db, col):

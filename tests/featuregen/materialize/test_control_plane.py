@@ -18,6 +18,8 @@ import re
 
 import psycopg
 import pytest
+from tests.featuregen.materialize.test_group_plan import _contract as _real_contract
+from tests.featuregen.materialize.test_group_plan import _plan as _real_plan
 
 from featuregen.materialize import control_plane
 from featuregen.materialize.binding import (
@@ -25,9 +27,12 @@ from featuregen.materialize.binding import (
     GroupPlanRevision,
     current_plan_revision,
 )
+from featuregen.materialize.canonical import materialize_hash
+from featuregen.materialize.contract import contract_hash
 from featuregen.materialize.control_plane import (
     RUN_MANIFEST_FIELDS,
     TERMINAL_RUN_EVENT_KINDS,
+    CompiledArtifactV1,
     MaterializationGeneration,
     MaterializationRunEvent,
     RunEventKind,
@@ -36,16 +41,19 @@ from featuregen.materialize.control_plane import (
     append_run_event,
     fold_run_status,
     published_generation_ids,
+    read_compiled_artifact,
     read_group_binding,
     read_plan_revisions,
     read_run_events,
     read_run_manifest,
+    record_compiled_artifact,
     record_generation,
     record_group_binding,
     record_plan_revision,
     record_run_manifest,
     run_status,
 )
+from featuregen.materialize.group_plan import group_plan_hash
 
 GEN = "gen-cp"
 RUN = "run-cp"
@@ -112,7 +120,8 @@ def test_RunManifestV1_carries_EXACTLY_spec_12s_fields_in_order() -> None:
 
 
 @pytest.mark.parametrize("record",
-                         [MaterializationGeneration, MaterializationRunEvent, RunManifestV1])
+                         [MaterializationGeneration, MaterializationRunEvent, RunManifestV1,
+                          CompiledArtifactV1])
 def test_every_record_is_a_frozen_slotted_dataclass(record) -> None:
     assert dataclasses.is_dataclass(record)
     params = record.__dataclass_params__
@@ -156,9 +165,13 @@ def test_the_module_issues_no_UPDATE_DELETE_or_TRUNCATE() -> None:
 
 def test_the_module_reads_no_table_outside_the_control_plane() -> None:
     """"The control plane never reads feature data" is only true if it never reads anything else.
-    Every table it touches is one migration 1034 created."""
+    Every table it touches is one this plane owns: 1034's six, plus 1054's
+    ``materialization_compiled_artifact`` (Phase G §3.6), which is evidence about a compilation and
+    carries no data value either — a packing list names columns, types and refs, and a contract
+    names keys, classes and policies."""
     plane = {"materialization_generation", "materialization_run_event",
-             "materialization_run_manifest", "group_binding", "group_plan_revision"}
+             "materialization_run_manifest", "materialization_compiled_artifact",
+             "group_binding", "group_plan_revision"}
     for sql in _executed_sql():
         for table in re.findall(r"(?:FROM|INTO|UPDATE|JOIN)\s+([a-z_][a-z0-9_]*)", sql):
             assert table in plane, f"the control plane touches {table!r}: {sql!r}"
@@ -345,17 +358,21 @@ def test_run_status_refuses_a_run_nobody_recorded(conn) -> None:
 
 def test_a_second_event_at_the_same_seq_is_REFUSED_by_the_database(conn) -> None:
     """`append_run_event` does not compute seq — that read-modify-write is a race two appenders can
-    both win. The unique key turns the race into a refusal the caller must handle."""
+    both win. Since 1044 the ordering trigger refuses the non-extending seq BEFORE INSERT, so this
+    is the refusal a caller sees; the unique key remains the arbiter of the true concurrent race
+    the trigger's reads cannot see (proven in test_migration_1034)."""
     record_generation(conn, _generation())
     append_run_event(conn, _event(0, RunEventKind.RUN_PREPARED))
-    with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+    with pytest.raises(psycopg.errors.RaiseException, match="does not extend"), conn.transaction():
         append_run_event(conn, _event(0, RunEventKind.RUN_SUBMITTED))
 
 
 def test_a_second_terminal_event_is_REFUSED_by_the_database(conn) -> None:
+    """Since 1044 the ordering trigger refuses ANY event after a terminal one BEFORE INSERT; the
+    one-terminal partial index remains the concurrent-race backstop (test_migration_1034)."""
     record_generation(conn, _generation())
     append_run_event(conn, _event(0, RunEventKind.PUBLISHED))
-    with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+    with pytest.raises(psycopg.errors.RaiseException, match="terminal"), conn.transaction():
         append_run_event(conn, _event(1, RunEventKind.RUN_FAILED))
 
 
@@ -460,3 +477,131 @@ def test_the_current_plan_is_DERIVED_from_what_the_events_say_published(conn) ->
         read_plan_revisions(conn, "bnd-1"),
         published_generation_ids=published_generation_ids(conn))
     assert current == published
+
+
+# ── 6. the compiled artifact — the BODIES the hashes name (§3.6, migration 1054) ─────────────────
+
+
+def _compiled(conn):
+    """A REAL plan, the REAL contract it was planned under, and the generation the plane records.
+
+    Built through ``build_group_plan`` from a real ``ContractGroup`` (``test_group_plan``'s own
+    fixtures) rather than hand-rolled. A fake plan would round-trip a shape nothing compiles, and
+    the equality this section exists to prove — *the stored body re-derives to the hash the plane
+    already holds* — would be an equality between two inventions.
+    """
+    plan = _real_plan()
+    contract = _real_contract()
+    record_generation(conn, MaterializationGeneration(
+        generation_id=GEN, logical_group_name=plan.logical_group_name,
+        materialization_contract_hash=plan.materialization_contract_hash,
+        group_plan_hash=group_plan_hash(plan), generated_project_hash="proj-hash", created_at=T0))
+    return plan, contract
+
+
+def test_the_fixture_plan_really_was_planned_under_the_fixture_contract(conn) -> None:
+    """The premise of every test below, asserted rather than assumed: the plan's contract hash IS
+    this contract's. If the two fixtures ever drift apart, the round-trip below would compare the
+    stored contract against a hash for some other contract and the mismatch would be reported as a
+    store defect."""
+    plan, contract = _compiled(conn)
+    assert plan.materialization_contract_hash == contract_hash(contract)
+
+
+def test_the_artifact_round_trips_and_its_BODIES_re_derive_to_the_planes_own_hashes(conn) -> None:
+    """THE property. Only hashes used to survive a compile, so a human holding a ``group_plan_hash``
+    could not answer "which features, which columns?" without re-deriving the whole compilation.
+
+    The equality is the point three times over: the stored hashes are the plane's, the stored bodies
+    hash BACK to them through the package's one hasher, and the second is what makes the first
+    evidence rather than a pair of strings written side by side.
+    """
+    plan, contract = _compiled(conn)
+    record_compiled_artifact(conn, generation_id=GEN, group_plan=plan, contract=contract)
+
+    stored = read_compiled_artifact(conn, generation_id=GEN)
+    assert stored is not None
+    plane = conn.execute(
+        "SELECT group_plan_hash, materialization_contract_hash FROM materialization_generation "
+        "WHERE generation_id = %s", (GEN,)).fetchone()
+    assert (stored.group_plan_hash, stored.contract_hash) == plane
+    assert materialize_hash(stored.group_plan) == stored.group_plan_hash
+    assert materialize_hash(stored.materialization_contract) == stored.contract_hash
+
+
+def test_the_stored_body_IS_the_identity_payload_not_a_second_serialization(conn) -> None:
+    """One hasher, ONE serialization (§14). The bodies stored are the very payloads
+    ``materialize_hash`` consumes — not a ``dataclasses.asdict``, not a JSON rendering of the object
+    — because a second serialization is a second identity, and a body that hashed to something the
+    plane never recorded would be evidence about nothing."""
+    plan, contract = _compiled(conn)
+    record_compiled_artifact(conn, generation_id=GEN, group_plan=plan, contract=contract)
+
+    stored = read_compiled_artifact(conn, generation_id=GEN)
+    assert stored.group_plan == plan.identity_payload()
+    assert stored.materialization_contract == contract.identity_payload()
+    # ...and it is the PACKING LIST, readable without re-deriving the compile.
+    assert [feature["column_name"] for feature in stored.group_plan["features"]] == \
+        [feature.column_name for feature in plan.features]
+
+
+def test_the_writer_accepts_no_caller_supplied_hash(conn) -> None:
+    """The hashes are RE-DERIVED on write, never accepted. A convenience parameter would let a
+    caller store a digest that does not describe the body beside it — and on an append-only table
+    nothing could correct it afterwards."""
+    parameters = set(inspect.signature(record_compiled_artifact).parameters)
+    assert parameters == {"conn", "generation_id", "group_plan", "contract"}
+
+
+def test_a_plan_and_a_contract_that_do_not_belong_together_are_REFUSED(conn) -> None:
+    """The two arguments are not independent, and only one of them is checked by anything else.
+
+    ``build_group_plan`` guarantees the plan carries **its own group's** contract hash — it does not
+    and cannot guarantee that the contract handed to this writer is that group's contract. Nothing
+    downstream would catch the difference either: each body would re-derive to the digest stored
+    beside it, so the row would look internally consistent while describing two different
+    compilations, and ``contract_hash`` would disagree with the ``materialization_contract_hash``
+    the plane already holds for the generation. On a table where nothing can be corrected
+    afterwards, that is the one mistake worth refusing at the door.
+
+    A ``ValueError``, not a §14 code: this is a call assembled wrongly, not a governed verdict about
+    a feature.
+    """
+    plan, contract = _compiled(conn)
+    someone_elses = dataclasses.replace(contract, sensitivity_class="confidential")
+    assert contract_hash(someone_elses) != plan.materialization_contract_hash
+
+    with pytest.raises(ValueError, match="materialization_contract_hash"):
+        record_compiled_artifact(conn, generation_id=GEN, group_plan=plan,
+                                 contract=someone_elses)
+    assert read_compiled_artifact(conn, generation_id=GEN) is None, \
+        "the mismatched pair was refused only AFTER it was written"
+
+
+def test_a_second_artifact_for_one_generation_is_REFUSED(conn) -> None:
+    """One generation compiles one plan under one contract. A second row would be a second answer
+    to a question that has one, and the append-only guard means nothing could ever say which."""
+    plan, contract = _compiled(conn)
+    record_compiled_artifact(conn, generation_id=GEN, group_plan=plan, contract=contract)
+    with pytest.raises(psycopg.errors.UniqueViolation), conn.transaction():
+        record_compiled_artifact(conn, generation_id=GEN, group_plan=plan, contract=contract)
+
+
+def test_reading_an_artifact_no_compile_wrote_yields_None(conn) -> None:
+    assert read_compiled_artifact(conn, generation_id="no-such-generation") is None
+
+
+@pytest.mark.parametrize("body,digest", [("group_plan", "group_plan_hash"),
+                                          ("materialization_contract", "contract_hash")])
+def test_a_body_that_does_not_re_derive_to_its_hash_is_REFUSED(body: str, digest: str) -> None:
+    """The record checks itself, so the guarantee holds on the way OUT as well as in. The table's
+    triggers stop a rewrite through ordinary DML; this is what stops a row that reached the table by
+    any other means from being read back as evidence about a compile it does not describe."""
+    fields = {"generation_id": GEN,
+              "group_plan": {"logical_group_name": "cif_daily"},
+              "group_plan_hash": materialize_hash({"logical_group_name": "cif_daily"}),
+              "materialization_contract": {"entity": "customer"},
+              "contract_hash": materialize_hash({"entity": "customer"})}
+    assert CompiledArtifactV1(**fields).generation_id == GEN      # the must-survive control
+    with pytest.raises(ValueError, match=digest):
+        CompiledArtifactV1(**{**fields, body: {"tampered": True}})

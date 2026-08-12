@@ -32,6 +32,11 @@ from featuregen.data_agent.binding_store import (
     record_connection,
 )
 from featuregen.data_agent.connection import DataSourceConnectionV1
+from featuregen.overlay.upload.identifier_scope import (
+    DECLARED_SCOPE_BASES,
+    declare_catalog_semantic_scope,
+    read_catalog_semantic_scope,
+)
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -173,3 +178,57 @@ def put_catalog_engine(catalog_source: str, body: CatalogEngineIn, conn: _Conn,
                            tier=body.tier, declared_by=identity.subject)
     declared = read_catalog_engine(conn, catalog_source)
     return {"catalog_source": catalog_source, "engine": declared[0], "tier": declared[1]}
+
+
+# ── the catalog SEMANTIC scope: which institution issues this catalog's identifiers ──────────────
+# `Concept.namespace` names an identifier SCHEME; cross-catalog equality also needs the ISSUER
+# (semantic Task 2 — scheme alone is never proof). One declaration per catalog, like the engine
+# declaration above; no institution name is ever hardcoded — the operator supplies it here.
+
+
+class SemanticScopeIn(BaseModel):
+    issuer_scope: str = Field(min_length=1, max_length=64)
+    basis: str = "catalog_scope"
+
+
+def _require_uploaded_catalog(conn: psycopg.Connection, catalog_source: str) -> None:
+    if not conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s LIMIT 1",
+                        (catalog_source,)).fetchone():
+        # Same shape as the engine declaration: configuring a catalog nobody uploaded is a typo
+        # that would sit there looking configured.
+        raise HTTPException(status_code=404, detail=f"no catalog {catalog_source!r} has been uploaded")
+
+
+@router.get("/data-sources/catalogs/{catalog_source}/semantic-scope",
+            dependencies=[Depends(require_catalog_read)])
+def get_catalog_semantic_scope(catalog_source: str, conn: _Conn) -> dict:
+    """One catalog's declared issuer scope. An UNDECLARED scope returns nulls, never an invented
+    issuer — 'unresolved' is honest state the bridge path treats as advisory, not an error."""
+    _require_uploaded_catalog(conn, catalog_source)
+    scope = read_catalog_semantic_scope(conn, catalog_source)
+    return {
+        "catalog_source": catalog_source,
+        "issuer_scope": scope.issuer_scope if scope else None,
+        "basis": scope.basis if scope else None,
+        "declared_by": scope.declared_by if scope else None,
+    }
+
+
+@router.put("/data-sources/catalogs/{catalog_source}/semantic-scope")
+def put_catalog_semantic_scope(
+        catalog_source: str, body: SemanticScopeIn, conn: _Conn,
+        identity: Annotated[IdentityEnvelope, Depends(require_confirmer)]) -> dict:
+    """Declare which institution issues this catalog's catalog-scoped identifiers. Administrator
+    only: the declaration changes which cross-catalog joins are even proposable."""
+    if body.basis not in DECLARED_SCOPE_BASES:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"semantic-scope basis must be one of {list(DECLARED_SCOPE_BASES)}; "
+                    "'unresolved' is the honest absence of a declaration, never declared"))
+    _require_uploaded_catalog(conn, catalog_source)
+    declare_catalog_semantic_scope(
+        conn, catalog_source=catalog_source, issuer_scope=body.issuer_scope, basis=body.basis,
+        declared_by=identity.subject)
+    scope = read_catalog_semantic_scope(conn, catalog_source)
+    return {"catalog_source": catalog_source, "issuer_scope": scope.issuer_scope,
+            "basis": scope.basis}

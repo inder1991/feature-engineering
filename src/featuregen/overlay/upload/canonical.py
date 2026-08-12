@@ -27,10 +27,15 @@ _VALID_AS_OF_BASIS = frozenset({"posted_at", "ingested_at"})
 # table widths are bounded" — lineage.py), so validation upholds that bound here — the single seam
 # every ingestion entry (CSV/Excel ingest, glossary, OpenMetadata connector) already flows through.
 # Keep the value in LOCKSTEP with lineage.MAX_NODES (test-enforced); raising one requires the other.
-# NOT the 64-profile LLM synthesis egress cap (enrich_llm._MAX_COLUMN_PROFILES): that is a flags-on
-# concern table_synth enforces itself — a 65..200-column table ingests fine and simply gets no LLM
-# table synthesis, whereas quarantining at 64 rejected legitimate wide bank tables (denormalized /
-# regulatory extracts) even with no LLM configured.
+# NOT the LLM synthesis egress cap (enrich_llm._MAX_COLUMN_PROFILES): that is a flags-on concern
+# table_synth enforces itself, whereas quarantining here rejected legitimate wide bank tables
+# (denormalized / regulatory extracts) even with no LLM configured.
+#
+# NOTE THE ORDERING SINCE 2026-08-06: that cap is now 512 while this one is 200, so THIS bound is
+# the binding one and no ingestible table can reach the synthesis cap. Pass B's two-phase wide path
+# is consequently unreachable through ingestion (only a direct `synthesize_tables` caller can hit
+# it) and every real table takes the single-call fast path over its complete profiles. Raising this
+# past 512 would silently re-enable the two-phase route.
 MAX_COLUMNS_PER_TABLE = 200
 
 # The glossary sentinel for a physical type the source declares but does NOT attest (spec §U). A

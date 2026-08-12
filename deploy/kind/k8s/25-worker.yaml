@@ -1,0 +1,76 @@
+# The durable-runtime worker — the process that keeps the read models current.
+#
+# WHY THIS EXISTS. `runtime/worker.py`'s own header records it: "Review BLOCKER #3 + MAJOR #11: the
+# durable runtime was LIBRARY-ONLY — nothing in production drove the queue / relay / timers /
+# projections, there was no entrypoint". The CODE half of that blocker landed (`run_forever` plus the
+# `featuregen worker` subcommand); the DEPLOYMENT half did not, so on this cluster nothing had ever
+# driven a tick. The only thing advancing the overlay projection was the inline `run_projection` call
+# at the tail of an ingest (`overlay/upload/ingest.py`), which means projections only moved when
+# somebody uploaded a CSV.
+#
+# THE FAILURE THAT FOUND IT (2026-08-09). A join confirm from the UI appended event 54; the overlay
+# checkpoint stayed at 53 because no ingest followed. Suggestions are computed ON DEMAND and read
+# GOVERNED values (grain, join authority) through `_governed_read`, whose gate is a bare
+# `checkpoint < head` with NO tolerance — so every suggestions call failed closed, and would have
+# kept failing until the next upload happened to drain the backlog.
+#
+# WHAT A TICK DRIVES, all of which had never run here: the job queue, the outbox relay, timers,
+# overlay expiry, PRE-EXPIRY RENEWAL (opens re-verify tasks before a confirmed fact lapses), the
+# catalog-drift scan, ingestion-run crash recovery, and the projections.
+#
+# REPLICAS. One is sufficient and is what this sets. More than one is SAFE rather than forbidden —
+# the tick takes `FOR UPDATE SKIP LOCKED` on the queue and a global advisory lock on the shared
+# stages, and `run_projection` claims its checkpoint row with `try_lock_checkpoint_nowait` — but a
+# second replica buys nothing here and doubles the idle connection count.
+#
+# NO SERVICE, NO PROBES. This process serves no traffic, so it has no port to probe. Liveness is
+# visible through the counters the tick publishes (`projection.lag.*`, `queue.depth`) rather than an
+# HTTP endpoint.
+#
+# NO MIGRATE INIT CONTAINER, deliberately: `20-backend.yaml` already runs migrations before serving,
+# and a second concurrent migrator racing it at rollout buys nothing. The worker instead waits for
+# the schema to exist, so a cold cluster where both roll out together cannot crash-loop the worker
+# while the backend is still migrating.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: featuregen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      initContainers:
+        # Wait for the schema the backend's own init container applies. `migrate` is idempotent, so
+        # this is a readiness WAIT rather than a competing migrator.
+        - name: wait-for-schema
+          image: featuregen-backend:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: backend-config }
+          command:
+            - sh
+            - -c
+            - "until python -m featuregen migrate; do echo 'waiting for postgres...'; sleep 3; done"
+      containers:
+        - name: worker
+          image: featuregen-backend:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: backend-config }
+          env:
+            # Same secret as the backend. The tick's stages are catalog/runtime work, not LLM calls,
+            # but the composition root wires the same registries, so it gets the same environment
+            # rather than a subtly different one.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef: { name: featuregen-llm, key: ANTHROPIC_API_KEY }
+          # One tick per second: the projections a UI action depends on land well inside the time it
+          # takes a user to navigate to the page that reads them.
+          command: ["python", "-m", "featuregen", "worker", "--interval", "1.0"]

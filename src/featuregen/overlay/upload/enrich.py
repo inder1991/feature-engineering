@@ -4,9 +4,13 @@ import hashlib
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from featuregen.intake.llm import LLMClient
+from featuregen.materialize.canonical import materialize_hash
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
@@ -23,6 +27,7 @@ from featuregen.overlay.field_evidence import (
 from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.attest.concept_critic import (
+    CRITIC_GROUPS,
     ConceptCriticItemV1,
     ConceptDisposition,
     critique_concept_batch,
@@ -30,12 +35,13 @@ from featuregen.overlay.upload.attest.concept_critic import (
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
     UNCLASSIFIED,
+    canonical_concept_name,
     classification_vocabulary,
     is_known_concept,
 )
 from featuregen.overlay.upload.concepts import concept as concept_record
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
-from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
+from featuregen.overlay.upload.enrich_batch import BatchItem, CallLedger, run_batched
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
     MAX_DEFINITION_LEN,
@@ -43,7 +49,11 @@ from featuregen.overlay.upload.enrich_llm import (
 )
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+from featuregen.overlay.upload.read_scope import RESTRICTION_ROLES, SENSITIVITY_ROLES
 from featuregen.overlay.upload.sample_parser import strip_sample_values
+
+if TYPE_CHECKING:
+    from featuregen.overlay.upload.semantic_context import SemanticContextBundleV1
 
 logger = logging.getLogger(__name__)
 
@@ -52,21 +62,45 @@ _TASK = "overlay.enrich.concept"
 # Cap on any single glossary-sidecar metadata value placed in an LLM request. Matches the per-value
 # bound the metadata-only egress filter (`enrich_llm._item_egress_ok`) enforces, so a long business
 # definition is trimmed to its leading meaning rather than silently excluding the whole column.
-_MAX_META_LEN = 200
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000, tracking `enrich_llm._MAX_LEN_DEFAULT`. The two
+# must move TOGETHER: this one truncates, that one excludes, so this being the larger of the pair
+# would turn a trim into a dropped column.
+_MAX_META_LEN = 1000
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 _SYN_TASK = "overlay.enrich.synonyms"
 _UNIT_TASK = "overlay.enrich.unit"
 _SUMMARY_TASK = "overlay.enrich.summary"
 
-# Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
-_MAX_SYNONYMS_LEN = 200
+# Cap on ONE column's drafted SUMMARY — the accept gate on what the model may WRITE, paired with
+# `overlay_summary_batch`'s schema maxLength (pinned equal by `test_enrich_output_bounds.py`).
+#
+# ZERO-TRUNCATION RAISE (2026-08-06): 400 -> 1000. It is an ACCEPT gate, so 400 did not shorten a
+# long sentence, it DISCARDED the whole summary — the column then has none at all. 1000 is
+# deliberately `enrich_llm._MAX_LEN_DEFAULT` and not `MAX_DEFINITION_LEN`: a summary is ONE sentence
+# by instruction, and `ai_summary` is graded under `_MAX_LEN_DEFAULT` when it is re-threaded into
+# item metadata, so accepting above 1000 would mint a value its own egress gate later EXCLUDES —
+# the same inversion documented at `table_synth._MAX_PROFILE_PROSE`.
+_MAX_SUMMARY_LEN = 1000
 
-# Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
-# definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
+# Cap on ONE column's drafted synonym list — a short comma-separated line of aliases, not prose.
+# ZERO-TRUNCATION RAISE (2026-08-06): 200 -> 1000. This is an ACCEPT gate on MODEL OUTPUT
+# (`_accept_bounded`), so the old 200 silently REJECTED a rich alias line rather than shortening it;
+# the widest real `synonyms_aliases` value in the FTR export is 54 chars, so 1000 is far past any
+# legitimate list while still refusing a model that starts writing paragraphs.
+_MAX_SYNONYMS_LEN = 1000
+
+# Larger bound for a SANITIZED business definition specifically. The `_MAX_META_LEN` default cut
+# every real definition mid-sentence; sanitized definitions are the intended payload, so allow a bigger
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
 # DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
 # B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
+# ZERO-TRUNCATION RAISE (2026-08-06): that shared constant moved 600 -> 4000 -> 32_000, so this
+# window follows it with no edit here. MEASURED, and the two files are DIFFERENT measurements (an
+# earlier revision of this comment merged them): the committed fixture's widest definition is 802
+# chars with **1** of its 127 rows over the shipped 600; the REAL FTR export
+# (`FTR_Column_Mapping_final.csv`, gitignored) has a raw max of 960 (727 post-sanitize) with **41**
+# of its 127 over 600. The 41 is the real export's number, never the fixture's.
 _MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 
@@ -86,11 +120,55 @@ def bounded_definition(text: str, limit: int) -> str:
 _CONCEPT_VOCABULARY: list[dict] = list(classification_vocabulary())
 
 
+#: The registry fields RENDERED to the classifier — exactly the keys `classification_vocabulary`
+#: emits. Frozen as data so the fingerprint below and the payload can never drift: a field added to
+#: the rendered vocabulary MUST appear here (and re-key the cache); a registry field that is not
+#: rendered MUST NOT (and must not churn identity). Semantic Task 3's two property tests are the
+#: enforcement.
+CLASSIFIER_RENDERED_REGISTRY_FIELDS: tuple[str, ...] = ("name", "group", "hint")
+
+#: The classifier request's contract identity: the prompt ids and the schema id/version pair BOTH
+#: seams may stamp, plus the exact rendered-key list of the purpose adapter. Folded into the cache
+#: version so a prompt bump, a schema-version bump, or a widened/narrowed context SHAPE re-asks the
+#: question instead of serving an answer given under a different contract.
+#:
+#: D12.5 RECONCILIATION (controlling doc wins over the plan's literal wording): semantic Task 3 says
+#: "hash the exact purpose-filtered context bytes". D12.5 says the sibling roster and table context
+#: enter the PROMPT but NOT the per-column cache key / `input_hash`, precisely so one column's
+#: reclassification cannot stale and rewrite every sibling's evidence. Both are honoured by hashing
+#: the context SHAPE (which keys the adapter renders) rather than the per-column context VALUES:
+#: widening what the classifier sees re-keys every column exactly once, while a neighbour's edit
+#: re-keys nothing.
+_CONTEXT_SHAPE = ("overlay_concept_v1", "overlay_concept_batch_v1", "overlay_concept",
+                  "overlay_concept_batch", 1)
+
+
+def _classifier_contract_fingerprint() -> str:
+    from featuregen.overlay.upload.semantic_context import CONCEPT_ENRICHMENT_RENDERED_KEYS
+    return canonical_hash({
+        "contract": list(_CONTEXT_SHAPE),
+        "rendered_context_keys": sorted(CONCEPT_ENRICHMENT_RENDERED_KEYS),
+        "rendered_registry_fields": sorted(CLASSIFIER_RENDERED_REGISTRY_FIELDS),
+    })[:12]
+
+
 def _vocab_fingerprint() -> str:
-    """Short, stable fingerprint of the concept vocabulary (names only) — bumps the concept cache
-    version whenever the classification targets change (spec C6)."""
-    raw = json.dumps([c["name"] for c in _CONCEPT_VOCABULARY])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    """Canonical, ORDER-INSENSITIVE fingerprint of everything the classifier actually sees
+    (semantic Task 3).
+
+    Was: a names-only `json.dumps` over the registry in DECLARATION ORDER — so a re-worded hint or a
+    re-grouped concept replayed a verdict reached against different meaning, while merely moving a
+    `Concept(...)` line invalidated every cached classification in the platform. Both are fixed by
+    hashing a SORTED list of the exact `{name, group, hint}` dicts `classification_vocabulary`
+    renders, through the one `canonical_hash` (JSON, sorted keys), and folding in the request
+    contract (prompt/schema versions + the adapter's rendered-key shape)."""
+    return canonical_hash({
+        "vocabulary": sorted(
+            ({"name": c["name"], "group": c["group"], "hint": c["hint"]}
+             for c in _CONCEPT_VOCABULARY),
+            key=lambda entry: entry["name"]),
+        "contract": _classifier_contract_fingerprint(),
+    })[:12]
 
 
 # Cache versions fold prompt/schema/vocabulary identity into the cache key (spec C6). Bump the vN
@@ -99,7 +177,19 @@ def _vocab_fingerprint() -> str:
 # metadata — term/declared type/domain/synonyms/BIAN/FIBO — not just the sidecar-blind definition).
 # The version bump versions pre-existing v1 rows out explicitly (intentional one-time re-key) rather
 # than leaving them orphaned under a same-version key.
-_CONCEPT_CACHE_VERSION = f"concept:v2:{_vocab_fingerprint()}"
+# v3 (joint Task 4 / semantic Task 3): the classifier payload is now the `for_concept_enrichment`
+# purpose adapter (sibling roster + table grain + the full sidecar semantics), and the fingerprint
+# below is canonical over every RENDERED registry field rather than names in declaration order. A v2
+# row was answered from a different payload under a different fingerprint scheme; the literal bump
+# versions those rows out explicitly rather than leaving them to be served under a key that no
+# longer means what it did.
+#
+# A FUNCTION, not a module constant: the fingerprint now folds in the purpose adapter's rendered-key
+# shape, and reaching `semantic_context` at enrich-IMPORT time closes the
+# `semantic_context -> field_resolution -> graph -> enrich` cycle. Computed per call (three calls
+# per run) rather than cached, so a test that repairs the registry sees the repaired identity.
+def _concept_cache_version() -> str:
+    return f"concept:v3:{_vocab_fingerprint()}"
 _DEFINITION_CACHE_VERSION = "definition:v1"
 # The summary is written FROM the metadata, so the key folds in the metadata it was written from —
 # an enriched payload (a new source_attributes column, a corrected term_name) must re-draft rather
@@ -108,7 +198,10 @@ _SUMMARY_CACHE_VERSION = "summary:v1"
 # v2 (E1a T3): a domain result is no longer a bare table-domain string but the TWO-LEVEL envelope
 # (`_accept_domain_result`) — the table default plus the column overrides. The bump versions the v1
 # bare-string rows out rather than leaving them to decode as a domain with no overrides.
-_DOMAIN_CACHE_VERSION = "domain:v2"
+# v3 (D13.2): the envelope gained `column_sub_domains` and the request moved to prompt
+# v2 / schema v2 (a REAL new batch body). A v2 row was produced under a contract with no
+# finer axis at all, so replaying it would silently report "no sub-domains" forever.
+_DOMAIN_CACHE_VERSION = "domain:v3"
 
 
 def content_hash(row: CanonicalRow) -> str:
@@ -127,9 +220,9 @@ def concept_cache_key(row: CanonicalRow, rec: GlossaryRecord | None) -> str:
     the canonical ``_concept_metadata`` payload (sorted keys; ``rec=None`` for a technical CSV
     yields the base names/types payload) plus the source (M5/M6: one source's entry is never
     reused for another's same-named column) and the prompt/schema/vocabulary identity
-    (``_CONCEPT_CACHE_VERSION``) — so a corrected sidecar re-classifies and an unchanged
+    (``_concept_cache_version()``) — so a corrected sidecar re-classifies and an unchanged
     re-upload still hits."""
-    raw = json.dumps([row.source, _CONCEPT_CACHE_VERSION, _concept_metadata(row, rec)],
+    raw = json.dumps([row.source, _concept_cache_version(), _concept_metadata(row, rec)],
                      sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -177,7 +270,8 @@ def _cache_put(conn, cache_table: str, content_hash_: str, value: str, cache_ver
 def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
           catalog_metadata: dict, out_key: str, instruction: str, actor,
           dispatch_audit: DispatchAuditContext | None = None,
-          cacheable_metadata_keys: tuple[str, ...] = ()) -> str | None:
+          cacheable_metadata_keys: tuple[str, ...] = (),
+          prompt_version: int = 1, schema_version: int = 1) -> str | None:
     """Run one GOVERNED enrichment call (attached schema, reserved keys, egress guard, audit record —
     so a real provider works and PII can't leak). Returns None on any failure/empty so a transient
     failure never poisons the cache (M3). ``dispatch_audit`` (C5-T5) threads the ingestion-run
@@ -187,7 +281,8 @@ def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
     return audited_enrich_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, out_key=out_key, instruction=instruction, actor=actor,
-        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys)
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys,
+        prompt_version=prompt_version, schema_version=schema_version)
 
 
 def _column_subject(row: CanonicalRow) -> dict:
@@ -219,32 +314,133 @@ def _single_ctx(ingestion_run_id: str | None, stage: str,
                                 subjects=(subject,))
 
 
+#: A line that opens with an ENUMERATION marker — `- x`, `* x`, `• x`, `1. x`, `2) x`, `(3) x`,
+#: `a. x`. Anchored at line start, so prose that merely contains a dash or a number is untouched.
+_ENUMERATION_LINE_RE = re.compile(r"[ \t]*(?:[-*•·–—]|\(?\d{1,3}[.)]|\(?[a-zA-Z][.)])[ \t]+\S")
+
+
+def _is_enumeration(val: str) -> bool:
+    """True when the value is a multi-line LIST rather than multi-paragraph PROSE.
+
+    M9's newline ban used to catch this, at the cost of also refusing every legitimate paragraphed
+    definition. Two or more marker-led lines is the signal: one is an ordinary sentence that happens
+    to start with a dash or a numeral, several is a model answering with a bulleted list.
+    """
+    lines = [ln for ln in val.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    return sum(1 for ln in lines if _ENUMERATION_LINE_RE.match(ln)) >= 2
+
+
 def _bounded(val: str | None, max_len: int) -> str | None:
-    """Accept a plausible short single-line label/definition; reject empty, over-long, multiline,
-    or list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching."""
-    if not val or len(val) > max_len or "\n" in val or val.startswith("["):
-        return None
-    return val
+    """Accept a plausible label/definition; reject empty, over-long, LIST-SHAPED, or
+    list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching.
+
+    NEWLINES ARE ALLOWED (2026-08-06, human decision). The blanket `"\\n" in val` ban was written
+    when the definition cap was 200-600 chars, where "a definition is one line" was a fair
+    description. At `MAX_DEFINITION_LEN` = 32_000 it had become the binding ceiling on ACHIEVABLE
+    length: a model writing a long definition paragraphs it, and the whole value was DISCARDED —
+    not shortened, not salvaged — leaving the column with no AI definition and a failure that looked
+    like a provider blip.
+
+    M9's intent is kept by two narrower guards:
+      * `startswith("[")` catches the stringified-list form INDEPENDENTLY — relaxing newlines never
+        weakened it (the earlier claim that it did was wrong);
+      * `_is_enumeration` catches the multi-line bulleted or numbered answer.
+
+    WHAT IS NOW ADMISSIBLE AND WAS NOT — stated rather than glossed, because an earlier revision of
+    this note claimed the enumeration was the ONLY thing the newline ban uniquely caught, and it was
+    not: a multi-line JSON OBJECT or YAML dump (`{\\n  "definition": "..."\\n}`) now passes every
+    relaxed gate. `startswith("[")` covers arrays only, so nothing refuses an object.
+
+    DELIBERATELY NOT GUARDED. The asymmetry decides it: a false negative caches an ugly but VISIBLE
+    value that a human can see and fix, while a false positive leaves the column with NO definition
+    and a silent failure indistinguishable from a provider blip. Erring loose is right here, and a
+    structural-output model returning a JSON blob inside a JSON string field is a schema-level
+    malfunction that a shape guard on this seam would only half-catch anyway.
+    """
+    return None if _bounded_reject(val, max_len) else val
+
+
+#: Task 9c — the closed rule vocabulary `_bounded` refuses under. Every member is a RULE NAME; none
+#: of them is derived from the value.
+BOUNDED_REJECT_CODES: tuple[str, ...] = ("blank", "over_length", "list_prefix", "enumeration")
+
+
+def _bounded_reject(val: str | None, max_len: int) -> str | None:
+    """WHICH of `_bounded`'s four rules refuses `val`, or None when it is accepted.
+
+    `_bounded` collapsed four distinct rules into one `None`, and `_accept_bounded` collapsed that
+    further into the single reason code `invalid_value`. From outside, a definition discarded for
+    one leading `[`, one discarded for being a bulleted list, and one discarded for exceeding a
+    32_000-char cap were the same event — and all three were indistinguishable from a provider
+    blip. This is the ONE place the rules are evaluated; `_bounded` delegates rather than
+    re-stating them, so the diagnosis can never drift from the decision."""
+    if not val:
+        return "blank"
+    if len(val) > max_len:
+        return "over_length"
+    if val.startswith("["):
+        return "list_prefix"
+    if _is_enumeration(val):
+        return "enumeration"
+    return None
 
 
 def _accept_concept(raw: str) -> tuple[str | None, str]:
     """The concept response contract (spec C3), shared by BOTH batch and single mode (#5 — a single
     off-vocabulary response must not be coerced/counted resolved just because it took the un-batched
     path): the literal 'unclassified' is a real classification and IS cached; a known concept is
-    cached; anything else is invalid -> NOT cached, NOT counted resolved (retried next ingest)."""
+    cached; anything else is invalid -> NOT cached, NOT counted resolved (retried next ingest).
+
+    NEW selections canonicalize through the ONE alias seam (semantic Task 2): a legacy alias with
+    an unambiguous successor is stored under the successor (`counterparty_id` -> `customer_id`).
+    Stored historical values are untouched — only what a fresh classification writes changes."""
     v = raw.strip()
     if v == UNCLASSIFIED:
         return UNCLASSIFIED, "valid"
     if is_known_concept(v):
-        return v, "valid"
-    return None, "invalid_value"
+        return canonical_concept_name(v), "valid"
+    return None, "off_vocabulary"
 
 
 def _accept_bounded(max_len: int):
-    """Accept a plausible short single-line value (reuses _bounded); else invalid -> not cached."""
+    """Accept a plausible bounded, non-list-shaped value (reuses `_bounded`); else invalid -> not
+    cached. NEWLINES ARE ALLOWED — see `_bounded`. A gate whose value must stay on ONE line uses
+    `_accept_single_line` instead."""
     def _accept(raw: str) -> tuple[str | None, str]:
-        v = _bounded(raw, max_len)
-        return (v, "valid") if v is not None else (None, "invalid_value")
+        # Task 9c: the reason code names the RULE (`over_length` / `list_prefix` / `enumeration` /
+        # `blank`) rather than the catch-all `invalid_value`. The batch outcome STATUS is still
+        # `invalid_value` — only the reason narrowed — so nothing that switches on status moves.
+        code = _bounded_reject(raw, max_len)
+        return (None, code) if code else (raw, "valid")
+    return _accept
+
+
+def _accept_single_line(max_len: int):
+    """`_accept_bounded` PLUS the single-line rule `_bounded` no longer enforces globally.
+
+    `_bounded` stopped rejecting newlines so a long DEFINITION could be paragraphed. Two gates must
+    NOT inherit that relaxation, and both keep their pre-relaxation behaviour byte-for-byte:
+
+      * `domain` — a grouping-key LABEL, never prose. A multi-line label mints a malformed group,
+        and it flows into `_accept_domain_result` as both the table default and the column overrides.
+      * `synonyms` — the answer is parsed by splitting on COMMAS
+        (`ingest._project_semantic_terms`: `for term in (ev.proposed_value or "").split(",")`), and
+        `_SYN_INSTRUCTION` asks for "ONE comma-separated line per item". A newline-separated answer
+        would be cached and projected as a SINGLE term ("account number\\nacct num\\nacc #") rather
+        than three, with the whole blob as its dedupe key — silently worse than the rejection it
+        replaced, because a rejected item is retried.
+
+    `unit` needs no equivalent: `_UNIT_TOKEN_RE.fullmatch` excludes newlines by construction.
+    """
+    bounded = _accept_bounded(max_len)
+
+    def _accept(raw: str) -> tuple[str | None, str]:
+        value, reason = bounded(raw)
+        if value is None:
+            return None, reason
+        return (None, "multiline") if "\n" in value else (value, "valid")
     return _accept
 
 
@@ -276,24 +472,28 @@ def _accept_domain(max_len: int):
     rejects a prompt/task echo or an internal dotted identifier (``_is_task_echo``). A rejected value
     is invalid -> treated as failure -> NOT cached (M3), same as any other reject. Domains stay
     open-vocabulary: no controlled list — only our own task/namespace identifiers are filtered out."""
-    bounded = _accept_bounded(max_len)
+    # `_accept_single_line`, not `_accept_bounded`: a domain is a grouping-key LABEL and must not
+    # inherit the newline relaxation made for paragraphed definitions. See that helper for why.
+    bounded = _accept_single_line(max_len)
 
     def _accept(raw: str) -> tuple[str | None, str]:
         value, reason = bounded(raw)
         if value is None:
             return None, reason
         if _is_task_echo(value):
-            return None, "invalid_value"
+            return None, "task_echo"
         return value, "valid"
     return _accept
 
 
 def _extract_domain_result(entry: dict) -> str:
-    """Serialize ONE batch result's TWO-LEVEL domain payload — the table default plus the column
-    OVERRIDES — into the single canonical string the batch harness carries per item (the same
-    ``extract`` seam Pass B uses for its structured ``synthesis`` object)."""
+    """Serialize ONE batch result's domain payload — the table default, the column OVERRIDES and
+    (D13.2) the per-column SUB-DOMAINS — into the single canonical string the batch harness carries
+    per item (the same ``extract`` seam Pass B uses for its structured ``synthesis`` object)."""
     return json.dumps({"domain": str(entry.get("domain") or "").strip(),
-                       "column_domains": entry.get("column_domains") or []}, sort_keys=True)
+                       "column_domains": entry.get("column_domains") or [],
+                       "column_sub_domains": entry.get("column_sub_domains") or []},
+                      sort_keys=True)
 
 
 def _accept_domain_result(max_len: int):
@@ -338,28 +538,78 @@ def _accept_domain_result(max_len: int):
                 return None, reason      # unusable label -> the ITEM is a transient miss (KEEP)
             if value != table_domain:
                 overrides[column] = value
-        return json.dumps({"domain": table_domain, "column_domains": overrides},
-                          sort_keys=True), "valid"
+        # D13.2 — the per-column SUB-DOMAIN, a purely ADDITIVE finer axis. Per-field salvage,
+        # deliberately asymmetric to the override handling above: an unusable sub-domain drops
+        # THAT sub-domain only, because dropping it changes nothing a consumer already relies on
+        # (the coarse `domain` still resolves exactly as before). An unusable coarse OVERRIDE, by
+        # contrast, has to reject the item — silently dropping one reads downstream as "the model
+        # WITHDREW this override" and retires the column's prior AI domain.
+        sub_domains: dict[str, str] = {}
+        for item in payload.get("column_sub_domains") or []:
+            if not isinstance(item, dict):
+                continue
+            column = _norm(str(item.get("column") or ""))
+            if not column:
+                continue
+            value, _reason = accept_label(str(item.get("sub_domain") or "").strip())
+            if value is None:
+                continue                 # unusable label -> drop this sub-domain only
+            if value == table_domain or value == overrides.get(column):
+                continue                 # a restated COARSE domain is not a finer axis
+            sub_domains[column] = value
+        return json.dumps({"domain": table_domain, "column_domains": overrides,
+                           "column_sub_domains": sub_domains}, sort_keys=True), "valid"
     return _accept
 
 
-def _parse_domain_result(raw: str) -> tuple[str, dict[str, str]]:
-    """Decode one canonical domain envelope into ``(table_domain, {column: override})``."""
+_DOMAIN_INSTRUCTION = (
+    "For each item give the TABLE's business domain in `domain` — the default context for all of "
+    "its columns — and in `column_domains` list ONLY the columns whose own domain DIFFERS from "
+    "that table domain (omit every column that shares it; an empty list is the normal answer). "
+    "THEN, in `column_sub_domains`, give a FINER sub-domain for any column where one is genuinely "
+    "informative: a short business label NARROWER than the column's domain (e.g. under a "
+    "Compliance domain: 'Correspondent Banking' for a counterparty routing code, 'Sanctions "
+    "Screening' for a screening flag, 'Transaction Posting' for a posting date). Never restate the "
+    "domain as a sub-domain, and omit the column entirely rather than inventing one. Use the "
+    "`column_roster` (each entry's resolved concept and party role) as your evidence. Return "
+    "exactly one result per input ref; treat each table independently.")
+
+
+def _value_of_bundle(bundle: SemanticContextBundleV1, field_name: str):
+    """One resolved/declared value off a bundle — the adapters' `_value_of`, reached without
+    importing the module at enrich-import time (the `graph` -> `enrich` cycle)."""
+    for values in (bundle.resolved_semantics, bundle.source_semantics):
+        for v in values:
+            if v.field_name == field_name and v.value not in (None, ""):
+                return v.value
+    return None
+
+
+def _parse_domain_result(raw: str) -> tuple[str, dict[str, str], dict[str, str]]:
+    """Decode one canonical domain envelope into
+    ``(table_domain, {column: override}, {column: sub_domain})``."""
     try:
         payload = json.loads(raw)
     except ValueError:
-        return raw, {}
+        return raw, {}, {}
     if not isinstance(payload, dict):
-        return raw, {}
+        return raw, {}, {}
     overrides = payload.get("column_domains")
-    return str(payload.get("domain") or ""), overrides if isinstance(overrides, dict) else {}
+    subs = payload.get("column_sub_domains")
+    return (str(payload.get("domain") or ""),
+            overrides if isinstance(overrides, dict) else {},
+            subs if isinstance(subs, dict) else {})
 
 
 # ── E4a T2: the MEASURE ANNOTATION accept gate ────────────────────────────────────────────────────
 # A unit is a short measurement TOKEN, never prose — "AED", "fils", "%", "bps", "days", "shares",
-# "transactions", "USD per share". 32 chars is generous for every real one and far too small for a
+# "transactions", "USD per share". 64 chars is generous for every real one and far too small for a
 # sentence, so a model that starts explaining itself is rejected rather than stored as a unit.
-_MAX_UNIT_LEN = 32
+# ZERO-TRUNCATION RAISE (2026-08-06): 32 -> 64. This one is an ACCEPT gate, so 32 did not shorten a
+# long unit, it DISCARDED the whole proposal — and a compound unit ("basis points per annum on
+# average daily balance") is a legitimate answer that 32 refused. The read-side display bound in
+# `feature_assist._MAX_SUGGESTION_LEN` moves with it and stays the larger of the two.
+_MAX_UNIT_LEN = 64
 # Starts with a letter/digit/% (never punctuation or a list-stringified `['a','b']`) and continues
 # with the characters real units use. Deliberately NOT a closed vocabulary: units are open (every
 # commodity, rate basis and count noun is one), so a closed list would reject legitimate values
@@ -376,10 +626,15 @@ _CURRENCY_CODE_RE = re.compile(r"[A-Za-z]{3}")
 
 def _accept_unit(raw: str) -> tuple[str | None, str]:
     """Accept ONE unit token (bounded, single-line, token-shaped, not a prompt/task echo)."""
-    value = _bounded(raw.strip(), _MAX_UNIT_LEN)
-    if value is None or not _UNIT_TOKEN_RE.fullmatch(value) or _is_task_echo(value):
-        return None, "invalid_value"
-    return value, "valid"
+    stripped = raw.strip()
+    code = _bounded_reject(stripped, _MAX_UNIT_LEN)
+    if code:
+        return None, code
+    if not _UNIT_TOKEN_RE.fullmatch(stripped):
+        return None, "unit_shape"
+    if _is_task_echo(stripped):
+        return None, "task_echo"
+    return stripped, "valid"
 
 
 def _accept_currency(raw: str) -> str | None:
@@ -514,7 +769,7 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
         meta_defn = strip_sample_values(rec.definition)
         if meta_defn:
             # The sanitized business definition is the payload we WANT the classifier to see, so give
-            # it the larger word-bounded window instead of the 200-char default that cut it mid-sentence.
+            # it the larger word-bounded window instead of the `_MAX_META_LEN` default.
             meta["business_definition"] = bounded_definition(meta_defn, _MAX_DEFINITION_LEN)
         for key, val in (("term_name", rec.term_name), ("data_domain", rec.domain),
                          ("bian_path", rec.bian_path), ("fibo_path", rec.fibo_path)):
@@ -533,12 +788,204 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
     return meta
 
 
+# ── joint Task 4: the ONE semantic-context assembly for every Pass-A payload ─────────────────────
+#
+# Pass A runs SERVER-SIDE over the whole upload the caller just authorized: there is no per-reader
+# scope to apply, and a scope-filtered builder would DROP a `pii`-tagged column's own classification
+# (the anchor check raises) — turning a read-scope control into a data-loss control. So the
+# enrichment builder runs with every visibility class granted, exactly like the ingest path that
+# hosts it. Read scope is enforced where a READER asks (dossier / search / context graph), never
+# here. Derived from the role maps rather than re-typed, so a new class cannot silently narrow it.
+_ENRICHMENT_ROLES: tuple[str, ...] = tuple(sorted(
+    set(SENSITIVITY_ROLES.values()) | set(RESTRICTION_ROLES.values())))
+
+#: The table-grain fields the classifier/critic/drafting payloads carry (the previous run's
+#: resolution at the TABLE logical ref). Deliberately the two CLOSED-vocabulary ones: a table's role
+#: and the entity it is about are the context that changes a column-level answer, and both are
+#: platform-derived tokens, never uploader prose.
+_TABLE_CONTEXT_FIELDS: tuple[str, ...] = ("table_role", "primary_entity")
+
+
+def _semantic_context():
+    """`overlay.upload.semantic_context`, imported LAZILY.
+
+    A module-level import cycles: `semantic_context` -> `field_resolution` -> `graph` -> THIS
+    module (for `content_hash`). The same lazy seam `_record_concept_critique_decision` uses."""
+    from featuregen.overlay.upload import semantic_context
+    return semantic_context
+
+
+def _table_semantics(conn, table_refs: Sequence[str]) -> dict[str, tuple]:
+    """The active `table_role`/`primary_entity` evidence for `table_refs`, in ONE query, as
+    `{table_ref: (SemanticValueV1, ...)}`.
+
+    Batched by construction (the 157-scan defect class): one statement for the whole upload, never
+    one per table. Strongest-first within a field so the leading D2 triple is the one a display
+    label would derive from. A missing/failed read yields ``{}`` — the payload then honestly carries
+    no table context rather than a fabricated one."""
+    if not table_refs:
+        return {}
+    sc = _semantic_context()
+    rank = {s.value: i for i, s in enumerate(AssertionStrength)}
+    try:
+        rows = conn.execute(
+            "SELECT logical_ref, field_name, producer, strength, lifecycle, producer_ref, "
+            "evidence_id, proposed_value FROM field_evidence "
+            "WHERE logical_ref = ANY(%s) AND lifecycle = 'active' AND field_name = ANY(%s) "
+            "ORDER BY logical_ref, field_name, created_at, evidence_id",
+            (list(table_refs), list(_TABLE_CONTEXT_FIELDS))).fetchall()
+    except Exception:  # noqa: BLE001 — advisory context: a read failure never aborts enrichment
+        logger.warning("advisory table-context read failed; enriching without it", exc_info=True)
+        return {}
+    grouped: dict[tuple[str, str], list] = {}
+    for ref, field_name, producer, strength, lifecycle, producer_ref, ev_id, value in rows:
+        grouped.setdefault((ref, field_name), []).append(
+            (rank.get(strength, 0), ev_id,
+             sc.EvidenceAuthorityV1(producer=producer, strength=strength, lifecycle=lifecycle,
+                                    producer_ref=producer_ref, evidence_id=ev_id),
+             value))
+    out: dict[str, list] = {}
+    for (ref, field_name), entries in grouped.items():
+        entries.sort(key=lambda e: (-e[0], e[1]))
+        value = entries[0][3]
+        if value in (None, ""):
+            continue
+        out.setdefault(ref, []).append(sc.SemanticValueV1(
+            field_name=field_name, value=str(value),
+            evidence=tuple(e[2] for e in entries), resolution_status="current"))
+    return {ref: tuple(sorted(values, key=lambda v: v.field_name))
+            for ref, values in out.items()}
+
+
+def build_enrichment_context(conn, rows: list[CanonicalRow], glossary: GlossaryUpload | None,
+                             ) -> dict[str, SemanticContextBundleV1]:
+    """Build the run's `{content_hash: SemanticContextBundleV1}` ONCE, for the ingest tail to thread
+    into every Pass-A stage. Public because ingest is the one caller that can amortize it: each
+    stage would otherwise repeat the same batched read and the same pure assembly."""
+    return _bundles_by_hash(conn, rows, glossary)
+
+
+def _bundles_by_hash(conn, rows: list[CanonicalRow], glossary: GlossaryUpload | None,
+                     ) -> dict[str, SemanticContextBundleV1]:
+    """One `SemanticContextBundleV1` per row, built through `bundle_from_upload` — the SINGLE
+    context assembly every Pass-A task's payload projects from (joint Task 4).
+
+    Upload-time by construction: no graph exists yet, so the builder issues no queries; the only DB
+    read is the ONE batched table-context statement above. A per-row build failure is contained —
+    that column falls back to the historical metadata-only payload rather than losing its
+    classification."""
+    if not rows:
+        return {}
+    sc = _semantic_context()
+    schema_of = {}
+    if glossary is not None:
+        for rec in glossary.records:
+            try:
+                _src, schema, table, _col = parse_ref(rec.logical_ref)
+            except ValueError:
+                continue
+            schema_of.setdefault(table, schema)
+    source = rows[0].source
+    table_refs = sorted({normalize_ref(source, schema_of.get(_norm(r.table)), r.table)
+                         for r in rows})
+    table_semantics = _table_semantics(conn, table_refs)
+    cohorts: dict[str, list[CanonicalRow]] = {}
+    for r in rows:
+        cohorts.setdefault(_norm(r.table), []).append(r)
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    out: dict[str, SemanticContextBundleV1] = {}
+    for row in rows:
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        table_ref = normalize_ref(source, schema_of.get(_norm(row.table)), row.table)
+        try:
+            out[content_hash(row)] = sc.bundle_from_upload(
+                row, glossary_record=rec, cohort=cohorts.get(_norm(row.table), ()),
+                roles=_ENRICHMENT_ROLES,
+                table_context=table_semantics.get(table_ref, ()))
+        except Exception:  # noqa: BLE001 — advisory: one column's context never fails the stage
+            logger.warning("advisory semantic-context build failed for %s.%s", row.table,
+                           row.column, exc_info=True)
+    return out
+
+
+def _rec_lookup(glossary: GlossaryUpload | None):
+    """`row -> GlossaryRecord | None` — the curated sidecar for a row, or ``None``. ``None`` is the
+    exact condition the M4 definition guard below keys on."""
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    return lambda row: rec_by_tc.get((_norm(row.table), _norm(row.column)))
+
+
+def _definition_egress_guard(payload: dict, base: dict, *, curated: bool) -> dict:
+    """The ONE seam that decides what `business_definition` a purpose-adapted payload may carry.
+
+    Two invariants the bundle cannot honour on its own, because `bundle_from_upload` carries the
+    RAW declared definition as source semantics (correctly — it is what the file said) while the
+    adapters render `definition` as `business_definition`:
+
+    * **M4 (absolute).** A TECHNICAL upload's uploader-authored free text never egresses. A
+      technical CSV's description column is arbitrary prose nobody sanitized for a prompt.
+      `_concept_metadata` has always enforced this by simply not carrying it; the adapter payload
+      enforces it by REMOVING it. `curated` is "this column has a glossary sidecar" — the same
+      condition `_concept_metadata` keys on.
+    * **Sanitized-and-bounded, or nothing.** A curated definition egresses ONLY in the form
+      `_concept_metadata` built: `strip_sample_values` applied (the live FTR definitions embed raw
+      customer values in prose — "representative values such as 3708484836801" — which the PII
+      backstop misses) and word-bounded to `MAX_DEFINITION_LEN`. The adapter's raw value would be
+      neither: measured on the FTR fixture it reintroduced an 802-char definition that the per-value
+      egress cap then EXCLUDED the whole column for. So the base's value always wins here — the one
+      place where `extra` beats the bundle, and the reason is a data-leak guard, not a preference."""
+    payload.pop("business_definition", None)
+    if curated and base.get("business_definition"):
+        payload["business_definition"] = base["business_definition"]
+    return payload
+
+
+def _classifier_payload(row: CanonicalRow, rec: GlossaryRecord | None,
+                        bundle: SemanticContextBundleV1 | None) -> dict:
+    """The DISPATCH payload for the concept classifier: the `for_concept_enrichment` purpose
+    adapter over this column's bundle, with the upload-only material (`type`, `synonyms`,
+    `source_attributes`) layered underneath.
+
+    IDENTITY IS NOT THIS (D12.5). `_concept_metadata` stays the cache key / evidence `input_hash`
+    material: the sibling roster and the table context enter the PROMPT but never the per-column
+    identity, so a neighbour's reclassification cannot stale and rewrite every sibling's evidence.
+    A bundle that failed to build degrades to exactly the historical metadata-only payload."""
+    base = _concept_metadata(row, rec)
+    if bundle is None:
+        return base
+    return _definition_egress_guard(
+        _semantic_context().for_concept_enrichment(bundle, extra=base), base,
+        curated=rec is not None)
+
+
+def _drafting_payload(bundle: SemanticContextBundleV1 | None, extra: dict, *,
+                      row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
+    """The DISPATCH payload for the prose/annotation tasks (definition / synonyms / unit): the
+    `for_summary` purpose adapter plus the task's own identity keys.
+
+    These tasks receive the CURRENT stronger facts — the source's curated definition, term, domain,
+    process path, the resolved concept and party role, the table's role/entity — precisely so they
+    do not have to invent them. They must not PARAPHRASE a source definition into competing
+    evidence, which is enforced upstream by the target sets (`_definition_targets` only ever fills a
+    BLANK definition), not by hoping the model behaves."""
+    if bundle is None:
+        return extra
+    # The sidecar material (`_concept_metadata`) rides UNDER the task's own identity keys, so these
+    # tasks see the same curated facts the classifier does — sanitized and bounded by the one
+    # builder, never re-derived.
+    base = _concept_metadata(row, rec)
+    return _definition_egress_guard(
+        _semantic_context().for_summary(bundle, extra={**base, **extra}), base,
+        curated=rec is not None)
+
+
 def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str, CanonicalRow],
                             meta_by_hash: dict[str, dict],
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
-                            cache_hit_hashes: frozenset[str] = frozenset()) -> int:
+                            cache_hit_hashes: frozenset[str] = frozenset(),
+                            counts: dict[str, int] | None = None) -> int:
     """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
     ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
     LLM producer must not bypass the machinery every other producer goes through).
@@ -566,18 +1013,35 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
     so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn.
 
     Returns the number of CONTAINED per-item write failures so the caller's stage report (#22) can
-    say ``partial`` — the swallowed except below must never be laundered into an outer success."""
+    say ``partial`` — the swallowed except below must never be laundered into an outer success.
+
+    ``counts`` (Task 9c, optional out-param — the return value is unchanged): the same
+    :data:`EVIDENCE_WRITE_DISPOSITIONS` account ``_write_llm_field_evidence`` keeps, which this
+    writer had no equivalent of at all. Its three designed non-writes below were entirely
+    invisible: a run could classify every column, store evidence for none of them, and report only
+    ``failures == 0``."""
     failures = 0
+
+    def _count(disposition: str, reason: str | None = None) -> None:
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            counts[f"{disposition}_{reason}"] = counts.get(f"{disposition}_{reason}", 0) + 1
+
     for h, concept in resolved.items():
         if concept == UNCLASSIFIED or not is_known_concept(concept):
+            _count("skipped", "not_a_proposal")
             continue   # C3: unclassified / invalid is not a proposal
         row = by_hash[h]
         rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
         if rec is None:
+            _count("skipped", "no_evidence_ref")
             continue   # not a glossary column term — no schema-preserving identity to key on
         if bindings is not None:
             binding = bindings.get(normalize_ref(row.source, None, row.table, row.column))
             if binding is None or not may_attach(binding):
+                _count("skipped", "unattachable_binding")
                 continue   # attachable columns only
         material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
         input_hash = field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
@@ -587,21 +1051,33 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
                 # Stale the LLM's own prior ACTIVE concept rows with a DIFFERENT input (a reclassify),
                 # keeping any row that matches this run's input (unchanged -> reuse).
+                # Keyed on the input AND the VOCABULARY: the classifier's answer depends on both,
+                # so a vocabulary that gained the concept a column needed must be able to dislodge
+                # a label chosen when that concept did not exist. Keying on the column alone made a
+                # re-upload a no-op for every unchanged column — measured 2026-08-09, 209 of cib's
+                # 319 concept rows were still on superseded vocabularies four days after an ingest.
+                vocabulary = _vocab_fingerprint()
                 stale_source_evidence(
                     conn, logical_ref=rec.logical_ref, field_name="concept",
-                    producer=EvidenceProducer.LLM, keep_input_hash=input_hash)
+                    producer=EvidenceProducer.LLM, keep_input_hash=input_hash,
+                    keep_configuration_hash=vocabulary)
                 reused = any(
                     e.producer == EvidenceProducer.LLM.value and e.input_hash == input_hash
+                    and e.producer_configuration_hash == vocabulary
                     for e in read_active_field_evidence(conn, rec.logical_ref, "concept"))
                 if not reused:
                     record_field_evidence(
                         conn, logical_ref=rec.logical_ref, field_name="concept",
                         proposed_value=concept, producer=EvidenceProducer.LLM,
                         strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
-                        producer_item_ref=item_ref, producer_configuration_hash=_vocab_fingerprint(),
+                        producer_item_ref=item_ref, producer_configuration_hash=vocabulary,
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+            # Counted only AFTER the savepoint committed: an increment inside the `with` would
+            # survive a rollback and report a row that does not exist.
+            _count("reused" if reused else "written")
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
             failures += 1
+            _count("failed")
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
     return failures
@@ -621,19 +1097,85 @@ def stale_all_llm_field_evidence(conn, *, logical_ref: str, field_name: str) -> 
                                  producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
 
 
+def _reusable_llm_evidence(conn, *, logical_ref: str, field_name: str, value: object):
+    """The LLM's OWN active evidence row already asserting exactly ``value``, or ``None``.
+
+    VALUE-diff, not input-diff (semantic Task 6 / D12.4): the question a consumer asks is "does the
+    platform still say the same thing?", and it must answer yes for a re-derivation that reached the
+    same answer from a slightly different prompt. Compared on ``proposed_value_hash`` — the store's
+    own order-independent digest — so a jsonb round-trip cannot make an identical value look
+    different.
+
+    Deterministic pick: ``read_active_field_evidence`` is ordered ``(created_at, evidence_id)``, so
+    the OLDEST matching row wins. That is what makes the evidence ID STABLE across reruns — picking
+    the newest would churn the very identity this function exists to preserve."""
+    target = canonical_hash(value)
+    for evidence in read_active_field_evidence(conn, logical_ref, field_name):
+        if (evidence.producer == EvidenceProducer.LLM.value
+                and evidence.proposed_value_hash == target):
+            return evidence
+    return None
+
+
+#: The per-item dispositions :func:`_write_llm_field_evidence` reports through its optional
+#: ``counts`` out-param. Four DIFFERENT things, deliberately not collapsed: a caller that counts
+#: "did not fail" as "wrote" reports rows that do not exist.
+EVIDENCE_WRITE_DISPOSITIONS: tuple[str, ...] = ("written", "reused", "skipped", "failed")
+
+
 def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
                               ref_of: Callable[[str], tuple[str, str, object] | None],
                               source_snapshot_id: str,
                               valid_fn: Callable[[str], bool] | None = None,
                               producer_configuration_hash: str | None = None,
-                              bindings: dict[str, ObjectBinding] | None = None) -> int:
+                              bindings: dict[str, ObjectBinding] | None = None,
+                              counts: dict[str, int] | None = None) -> int:
     """Write one ``llm/proposed`` ``field_evidence`` row per item of ``items`` (E1a); return the
     number of CONTAINED per-item failures so the caller's stage report can say ``partial``.
 
-    SUPERSEDE-AND-REWRITE, unconditionally: prior ACTIVE LLM evidence for the field is staled and a
-    fresh row written. No unchanged-detection and no result cache — that reuse is a DEFERRED
-    optimization (and is why this is a separate, simpler writer than ``_write_concept_evidence``,
-    which keeps its own).
+    VALUE-DIFF SUPERSESSION (semantic Task 6, amending the original unconditional
+    supersede-and-rewrite):
+
+    * a re-derivation landing on the SAME value REUSES the prior active LLM row — same current
+      value AND same ``evidence_id``. Without this, five of the six LLM fields minted a fresh
+      evidence ID on every ingest, so "every consumer returns the same current value and evidence
+      ID" was unachievable and every re-upload manufactured a supersession event that represented
+      no change. The reused row keeps its original ``input_hash``/``source_snapshot_id``: identity
+      belongs to the ASSERTION, not to the prompt that reproduced it, and rewriting them would
+      re-introduce the churn under a different name;
+    * a re-derivation landing on a DIFFERENT value stales the prior row and writes a fresh one,
+      through the SAME producer-scoped mechanics as before
+      (:func:`stale_all_llm_field_evidence` / :func:`stale_source_evidence`);
+    * either way the staling is PRODUCER-SCOPED — source-attested and human evidence is never
+      touched, so an LLM rerun leaves them byte-for-byte, and no system correction can mint a
+      human-rejection event (this writer records no decision events at all).
+
+    A same-value reuse still RETIRES the LLM's other active rows for the field (keeping the reused
+    row's input hash), so a run can never leave two live LLM proposals for one field — the state
+    that makes the resolver NULL a field on conflict. That retirement is load-bearing, not
+    housekeeping: without it a reuse would leave the previously-written row live beside the reused
+    one and the resolver would see a conflict where the model repeated itself.
+
+    THE REUSE TRADE, stated once: the reused row keeps its ORIGINAL ``input_hash`` and
+    ``source_snapshot_id``, so the store does not record that this run re-derived the same value
+    from newer inputs. Re-derivation RECENCY is therefore not observable from the evidence row —
+    accepted deliberately (rewriting those columns is the churn value-diff exists to remove), and a
+    compensating decision-log record naming "re-derived, unchanged, as of snapshot N" is DEFERRED,
+    not designed away.
+
+    TWO REUSE KEYS, two paths, deliberate: this writer reuses on ``proposed_value_hash`` (the
+    question is "does the platform still say the same thing?"), while ``_write_concept_evidence``
+    reuses on ``input_hash`` (its question is "did this column's classification INPUT change?",
+    because a cache HIT there must self-heal a missing row without re-asserting anything). They are
+    not a duplication to fold together: folding the concept writer onto value-diff would make a
+    changed input with an unchanged answer invisible to the self-heal, and folding this writer onto
+    input-diff would re-introduce the per-ingest evidence-ID churn Task 6 removed.
+
+    ``counts`` (optional out-param — the return value is unchanged): when given, receives one
+    :data:`EVIDENCE_WRITE_DISPOSITIONS` increment per item — ``written`` (a NEW row), ``reused``
+    (an existing active row kept, no new row), ``skipped`` (a designed non-write: invalid value,
+    ``ref_of`` returning ``None``, an unattachable binding) or ``failed``. A caller that reports
+    "evidence written" from the ABSENCE of failures counts skips as rows; this is how it stops.
 
     TWO IDENTITIES, never collapsed: ``ref_of(key)`` returns ``(evidence_ref, binding_ref,
     material)`` — attachability is checked against ``bindings[binding_ref]`` (the PUBLIC-flattened
@@ -646,21 +1188,47 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
     value, ``ref_of`` returning ``None``, an unattachable binding) is not a failure and is not
     counted."""
     failures = 0
+
+    def _count(disposition: str, reason: str | None = None) -> None:
+        """Task 9c: the disposition AND, for a skip, WHICH of the three designed non-writes it was.
+        The disposition key is written unchanged so every existing reader is untouched; the reason
+        rides beside it under `skipped_<reason>`, because "126 skipped" and "126 skipped for want
+        of a glossary ref" are different findings and only the second is actionable."""
+        if counts is None:
+            return
+        counts[disposition] = counts.get(disposition, 0) + 1
+        if reason is not None:
+            key = f"{disposition}_{reason}"
+            counts[key] = counts.get(key, 0) + 1
+
     for key, value in items.items():
         try:
             if valid_fn is not None and not valid_fn(value):
-                continue                       # skip — not a proposal, not a failure
+                _count("skipped", "invalid_value")   # skip — not a proposal, not a failure
+                continue
             resolved = ref_of(key)
             if resolved is None:
+                _count("skipped", "no_evidence_ref")
                 continue
             evidence_ref, binding_ref, material = resolved
             if bindings is not None:
                 binding = bindings.get(binding_ref)          # PUBLIC-flattened attachability lookup
                 if binding is None or not may_attach(binding):
-                    continue                   # attachable columns only
+                    _count("skipped", "unattachable_binding")   # attachable columns only
+                    continue
             input_hash = field_input_hash(logical_ref=evidence_ref, field_name=field_name,
                                           material=material)
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
+                reusable = _reusable_llm_evidence(
+                    conn, logical_ref=evidence_ref, field_name=field_name, value=value)
+                if reusable is not None:
+                    # Unchanged: keep THIS row (and its evidence_id) live, retire the LLM's other
+                    # active rows for the field. Producer-scoped — human/source rows untouched.
+                    stale_source_evidence(
+                        conn, logical_ref=evidence_ref, field_name=field_name,
+                        producer=EvidenceProducer.LLM, keep_input_hash=reusable.input_hash)
+                    _count("reused")
+                    continue
                 stale_all_llm_field_evidence(conn, logical_ref=evidence_ref, field_name=field_name)
                 record_field_evidence(
                     conn, logical_ref=evidence_ref, field_name=field_name, proposed_value=value,
@@ -668,8 +1236,10 @@ def _write_llm_field_evidence(conn, *, field_name: str, items: dict[str, str],
                     producer_ref=ENRICHMENT_RUN_ID, producer_item_ref=str(key),
                     producer_configuration_hash=producer_configuration_hash,
                     source_snapshot_id=source_snapshot_id, input_hash=input_hash)
+                _count("written")
         except Exception:  # noqa: BLE001 — advisory: one item's failure never aborts the rest
             failures += 1
+            _count("failed")
             logger.warning("advisory %s field_evidence write failed for item %s", field_name, key,
                            exc_info=True)
     return failures
@@ -701,7 +1271,8 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
                                definitions: dict[str, str], glossary: GlossaryUpload,
                                concepts: dict[str, str] | None,
                                bindings: dict[str, ObjectBinding] | None,
-                               source_snapshot_id: str) -> int:
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's drafted definitions (E1a Task 2) out of the display-only
     ``graph_node.definition`` into governed ``llm/proposed`` ``field_evidence``, so asset-detail can
     honestly show the AI as their author. Returns the CONTAINED per-item failure count, which the
@@ -741,7 +1312,7 @@ def _write_definition_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="definition", items=definitions, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
 
     # The set difference is computed here (never handed a ref written this run — that would silently
     # stale the fresh evidence): KEEP = written this run ∪ still an expected target. The expected set
@@ -759,7 +1330,9 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             summaries: dict[str, str], glossary: GlossaryUpload,
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str,
-                            extras_by_hash: dict[str, dict] | None = None) -> int:
+                            extras_by_hash: dict[str, dict] | None = None,
+                            bundles: dict[str, SemanticContextBundleV1] | None = None,
+                            counts: dict[str, int] | None = None) -> int:
     """Promote drafted summaries into governed ``llm/proposed`` ``field_evidence`` under
     ``ai_summary``. Returns the CONTAINED per-item failure count for the caller's stage report.
 
@@ -772,6 +1345,9 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     by_hash = {content_hash(r): r for r in rows}
     rec_by_tc = _records_by_tc(glossary)
     extras_by_hash = extras_by_hash or {}
+    # The SAME bundles the drafter used (joint Task 4): the evidence material must be byte-for-byte
+    # the drafting input or the input_hash stops meaning "still drafted from this".
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
 
     def ref_of(h: str) -> tuple[str, str, object] | None:
         row = by_hash.get(h)
@@ -787,12 +1363,12 @@ def _write_summary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         # dossier getting richer) leaves the hash unchanged, so a redraft that fails transiently
         # leaves the OLD summary active as though it still described the column.
         return (rec.logical_ref, normalize_ref(row.source, None, row.table, row.column),
-                summary_payload(row, rec, extras_by_hash.get(h)))
+                summary_payload(row, rec, extras_by_hash.get(h), bundles.get(h)))
 
     failures = _write_llm_field_evidence(
         conn, field_name="ai_summary", items=summaries, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        producer_configuration_hash=None, bindings=bindings)
+        producer_configuration_hash=None, bindings=bindings, counts=counts)
     keep = {ref[0] for h in set(summaries) | _summary_targets(rows, glossary)
             if (ref := ref_of(h)) is not None}
     _reconcile_llm_field_evidence(
@@ -835,7 +1411,8 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
                            column_domains: dict[tuple[str, str], str],
                            glossary: GlossaryUpload,
                            bindings: dict[str, ObjectBinding] | None,
-                           source_snapshot_id: str) -> int:
+                           source_snapshot_id: str,
+                           counts: dict[str, int] | None = None) -> int:
     """Promote the LLM's TWO-LEVEL domain classification (E1a T3) into governed ``llm/proposed``
     ``domain`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -898,11 +1475,11 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="domain", items=dict(domains), ref_of=table_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=None)
+        bindings=None, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="domain", items=overrides, ref_of=column_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every still-target table in this upload (written OR transient-missed) ∪ the overrides
     # written this run ∪ every still-target column of a table whose classification MISSED (its
@@ -924,13 +1501,74 @@ def _write_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
     return failures
 
 
+def _write_sub_domain_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                               column_sub_domains: dict[tuple[str, str], str],
+                               glossary: GlossaryUpload,
+                               bindings: dict[str, ObjectBinding] | None,
+                               source_snapshot_id: str,
+                               counts: dict[str, int] | None = None) -> int:
+    """Promote the D13.2 per-column SUB-DOMAINS into governed ``llm/proposed`` ``sub_domain``
+    ``field_evidence``. Returns the CONTAINED per-item failure count for the caller's stage report.
+
+    A COLUMN-level field only: a sub-domain refines ONE column's meaning under its table's coarse
+    domain, so there is no table-grain sibling to write (unlike ``domain``, which is table-first).
+
+    Deliberately NOT gated on the sidecar declaring a domain — the opposite of
+    :func:`_write_domain_evidence`'s "the AI fills a blank" rule, and for the reason that rule
+    exists. That rule protects a CURATED value from a competing AI one resolving to a display
+    CONFLICT that blanks it. ``sub_domain`` is a SEPARATE field with no source producer at all: no
+    file declares one, so there is nothing to contest and nothing that can be blanked. The coarse
+    ``domain`` is untouched either way.
+
+    RECONCILIATION over the whole target universe: every ref in this source still carrying active
+    LLM ``sub_domain`` evidence is retired EXCEPT the refs written this run and the columns of a
+    table whose classification MISSED this run (its sub-domains are unknown, not withdrawn — KEEP
+    stays the safe default). So a column the classifier stops singling out, and one that leaves the
+    upload, are both retired."""
+    rec_by_tc = _records_by_tc(glossary)
+    tables_in_run = {_norm(r.table) for r in rows}
+    classified_tables = {table for (table, _column) in column_sub_domains}
+
+    def ref_of(key: str) -> tuple[str, str, object] | None:
+        table, _sep, column = key.partition(".")
+        rec = rec_by_tc.get((table, column))
+        if rec is None:
+            return None   # not a glossary column term — no schema-preserving identity to key on
+        return (rec.logical_ref, normalize_ref(source, None, table, column),
+                {"table": table, "column": column})
+
+    items = {f"{table}.{column}": value
+             for (table, column), value in column_sub_domains.items()}
+    failures = _write_llm_field_evidence(
+        conn, field_name="sub_domain", items=items, ref_of=ref_of,
+        source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
+        bindings=bindings, counts=counts)
+    missed = tables_in_run - classified_tables
+    keep = {ref[0] for k in items if (ref := ref_of(k)) is not None}
+    keep |= {ref[0] for (table, column) in rec_by_tc
+             if table in missed and (ref := ref_of(f"{table}.{column}")) is not None}
+    _reconcile_llm_field_evidence(
+        conn, field_name="sub_domain",
+        retire_refs=_active_llm_field_refs(conn, source=source, field_name="sub_domain") - keep)
+    return failures
+
+
 def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
                             synonyms: dict[str, str], glossary: GlossaryUpload,
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> int:
+                            source_snapshot_id: str,
+                            counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted synonyms (E1a T4) as FIRST-CLASS ``llm/proposed`` ``semantic_terms``
     ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller MUST propagate
     into its stage report (``partial``/``items_failed``).
+
+    ``counts`` (optional out-param) receives the writer's per-item dispositions
+    (:data:`EVIDENCE_WRITE_DISPOSITIONS`). It is not optional in PRACTICE for the ingest caller, and
+    the reason is `skipped`: ``ref_of`` returns ``None`` for every column WITHOUT a glossary record,
+    so those items are drafted at full LLM cost and stored nowhere. Skips are deliberately NOT
+    failures, so a caller reading only the failure count sees zero and reports a clean ``succeeded``
+    for a run that persisted nothing. Passing ``counts`` is how that stops being invisible — the
+    count was previously not merely unreported but never COMPUTED.
 
     NOT search-only and NOT human-confirmed: an AI synonym may be the ONLY semantic signal that
     selects a column — it needs no corroboration and passes no new gate. What makes that safe is that
@@ -968,7 +1606,7 @@ def _write_synonym_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="semantic_terms", items=synonyms, ref_of=ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = every glossary column still in this upload (written this run OR transient-missed);
     # computed through the SAME `ref_of` the write used, so a fresh row is never handed to retirement.
@@ -984,7 +1622,8 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
                          units: dict[str, str], currencies: dict[str, str],
                          concepts: dict[str, str] | None, glossary: GlossaryUpload,
                          bindings: dict[str, ObjectBinding] | None,
-                         source_snapshot_id: str) -> int:
+                         source_snapshot_id: str,
+                         counts: dict[str, int] | None = None) -> int:
     """Store the LLM's drafted measure annotation (E4a T2) as ``llm/proposed`` ``unit`` /
     ``currency`` ``field_evidence``. Returns the CONTAINED per-item failure count, which the caller
     MUST propagate into its stage report (``partial``/``items_failed``).
@@ -1042,11 +1681,11 @@ def _write_unit_evidence(conn, *, source: str, rows: list[CanonicalRow],
     failures = _write_llm_field_evidence(
         conn, field_name="unit", items=units, ref_of=unit_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
     failures += _write_llm_field_evidence(
         conn, field_name="currency", items=currencies, ref_of=currency_ref_of,
         source_snapshot_id=source_snapshot_id, valid_fn=lambda v: bool(v and v.strip()),
-        bindings=bindings)
+        bindings=bindings, counts=counts)
 
     # KEEP = written this run ∪ still an expected target, computed through the SAME `ref_of` the
     # write used (so a ref written this run is never handed to retirement, and a non-target is never
@@ -1098,9 +1737,47 @@ def _record_concept_critique_decision(conn, *, logical_ref: str, disposition: st
         actor_ref=None, supersedes_event_id=supersedes)
 
 
+#: Task 9c — the label used for "this concept has no identifier namespace" (a non-identifier
+#: concept, an unregistered name, or ``unclassified``). A JSON object key must be a string, and an
+#: explicit label is readable where a missing bucket is ambiguous.
+NO_NAMESPACE = "-"
+
+
+def _namespace_of(concept_name: str | None) -> str:
+    """The join-candidacy axis of a concept name — its identifier NAMESPACE, or ``-``.
+
+    Recorded per run because it is recorded NOWHERE else. ``namespace`` is a pure code-side
+    derivation from the in-code ``CONCEPT_REGISTRY``: no column stores it, so a later registry edit
+    silently rewrites the namespace of every historical verdict and nothing on disk shows that it
+    moved. Two columns are bridge candidates iff their concepts share a namespace, so this is the
+    axis a changed verdict actually moves — and the reason a run producing different features is
+    uninterpretable without it.
+
+    A concept name and a namespace are both controlled-vocabulary CODES from a registry in this
+    repo. Neither is column data, and neither is derived from any."""
+    rec = concept_record(concept_name) if concept_name else None
+    return (rec.namespace or NO_NAMESPACE) if rec is not None else NO_NAMESPACE
+
+
+def namespace_histogram(concepts: dict[str, str]) -> dict[str, int]:
+    """``{namespace: column count}`` over one run's resolved concepts — the join-candidacy shape of
+    the catalog as this run sees it, in counts only. Comparing this run's ``after_critic`` against
+    the previous run's is what separates "the LLM enriched more columns" from "the same columns
+    were re-judged into a different namespace" when a feature set changes."""
+    histogram: dict[str, int] = {}
+    for name in concepts.values():
+        key = _namespace_of(name)
+        histogram[key] = histogram.get(key, 0) + 1
+    return histogram
+
+
 def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, str],
                           by_hash: dict[str, CanonicalRow], meta_by_hash: dict[str, dict],
-                          rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor) -> dict:
+                          rec_by_tc: dict[tuple[str, str], GlossaryRecord], actor,
+                          bundles: dict[str, SemanticContextBundleV1] | None = None,
+                          critic_outcomes: dict[str, dict] | None = None,
+                          call_ledger: CallLedger | None = None,
+                          deadline_s: float | None = None) -> dict:
     """The Pass-A ACCEPTANCE hook (ingestion-richness Task 2 step 5): run the refute-oriented
     concept critic over this run's IDENTIFIER-group assignments and apply its dispositions to
     ``result`` in place. Non-identifier assignments pass through byte-for-byte untouched.
@@ -1125,13 +1802,28 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
     The classifier CACHE is deliberately not touched: it stores the classifier's own answer, and
     the critic's replay store (content-addressed on the same inputs) makes re-criticising a cache
     HIT on the next upload free. Returns the stage-detail report
-    ``{items, accepted, revised, refuted, abstained, conflicts}``."""
+    ``{items, accepted, revised, refuted, abstained, conflicts}``.
+
+    ``critic_outcomes`` (semantic Task 5, optional out-param — the return shape is unchanged):
+    receives ``{logical_ref: {disposition, reason_codes, conflict_codes}}`` for EVERY criticised
+    ref, changed or not. It rides separately from the returned report because the adjudication
+    stage consumes it as one of its deterministic selection inputs — a different consumer with a
+    different lifetime, not a size argument.
+
+    THE SIZE ARGUMENT, RESTATED (Task 9c changed the answer). This docstring used to say a per-ref
+    map must never become a stage detail, because a stage detail is contractually "a SMALL dict of
+    counts". ``report["conflicts"]`` was already a per-ref map when it said so, and Task 9c adds
+    ``report["verdict_changes"]``, so the rule as stated is not the one the code follows. The rule
+    the code actually follows: a stage detail carries counts over EVERY item, and a per-ref map
+    only over the items that CHANGED — bounded by the run's revisions and refutations, not by the
+    catalog's width. ``critic_outcomes`` stays out of the detail because it is the unbounded one."""
     items: dict[str, ConceptCriticItemV1] = {}
     ref_to_hash: dict[str, str] = {}
+    bundles = bundles or {}
     for h, concept_name in result.items():
         registered = concept_record(concept_name)
-        if registered is None or registered.group != "identifier":
-            continue                       # non-identifier fields pass through unchanged
+        if registered is None or registered.group not in CRITIC_GROUPS:
+            continue     # only the high-impact groups are criticised; the rest pass through
         row = by_hash.get(h)
         if row is None:
             continue
@@ -1144,29 +1836,61 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
         evidence_ref = (rec.logical_ref if rec is not None
                         else normalize_ref(row.source, None, row.table, row.column))
         meta = meta_by_hash.get(h, {})
+        bundle = bundles.get(h)
+        # Joint Task 4: the critic sees the SAME purpose-adapted context the classifier saw plus
+        # the deterministic identity axes (`for_critic`), so its refute question is asked against
+        # the evidence that produced the assignment rather than against name/type shape alone.
+        context = (_definition_egress_guard(
+                       _semantic_context().for_critic(bundle, extra=meta), meta,
+                       curated=rec is not None)
+                   if bundle is not None else dict(meta))
         items[evidence_ref] = ConceptCriticItemV1(
             logical_ref=evidence_ref,
             column_name=row.column,
             declared_type=str(meta.get("type") or row.type or "") or None,
             definition=meta.get("business_definition"),
             proposed_concept=concept_name,
+            context=context,
         )
         ref_to_hash[evidence_ref] = h
+    # Task 9c — `verdict_changes` is THE row this run has to leave behind. Task 9b moved the
+    # registry, which moves the critic's replay fingerprint, so this run re-critiques every
+    # identifier column instead of replaying stored verdicts. A REVISED column gets a different
+    # concept and therefore a different NAMESPACE (the join-candidacy axis); a REFUTED one becomes
+    # `unclassified` and loses bridge candidacy entirely. Without the before→after pair per column,
+    # a different set of features coming out of this run is uninterpretable: fresh enrichment and
+    # re-rolled verdicts look exactly the same from the outside.
+    #
+    # CHANGED refs only, and that is complete rather than partial: `accepted` and `abstained` leave
+    # the concept exactly as the classifier produced it, and that value is already durable in
+    # `graph_node.concept` and the column's `concept` `field_evidence`. The counts below say how
+    # many were judged; this map says which ones MOVED, and where from and to. Always present (an
+    # empty map means "nothing moved", an absent key means this code never ran).
     report: dict = {"items": len(items), "accepted": 0, "revised": 0, "refuted": 0,
-                    "abstained": 0, "conflicts": {}}
+                    "abstained": 0, "conflicts": {}, "verdict_changes": {}}
     if not items:
         return report
     # The replay identity of THIS catalog's content: a byte-identical re-upload replays every
     # stored critique for free, while any content change re-asks the affected questions.
     catalog_revision = hashlib.sha256(
         json.dumps(sorted(by_hash)).encode("utf-8")).hexdigest()[:16]
+    # [A.54] The bound. `not_attempted`/`stopped_by` land on the report so the stage can say
+    # `truncated` rather than a laundered `succeeded` over a run that criticised a fraction of
+    # its columns. A skipped item ABSTAINS — the classifier's concept stands, un-refuted.
     outcomes = critique_concept_batch(
-        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor)
+        conn, client, list(items.values()), catalog_revision=catalog_revision, actor=actor,
+        call_ledger=call_ledger, deadline_s=deadline_s, stats=report)
     corrections: list[tuple[str, str]] = []
     for ref, outcome in outcomes.items():
         h = ref_to_hash.get(ref)
         if h is None:
             continue
+        if critic_outcomes is not None:
+            critic_outcomes[ref] = {
+                "disposition": outcome.disposition.value,
+                "reason_codes": list(outcome.reason_codes),
+                "conflict_codes": list(outcome.conflict_codes),
+            }
         if outcome.disposition is ConceptDisposition.ACCEPTED:
             report["accepted"] += 1
             continue
@@ -1183,12 +1907,243 @@ def _apply_concept_critic(conn, client: LLMClient | None, *, result: dict[str, s
                 and outcome.resolved_concept is not None):
             report["revised"] += 1
             corrections.append((h, outcome.resolved_concept))
+            after = outcome.resolved_concept
         else:
             report["refuted"] += 1
             corrections.append((h, UNCLASSIFIED))
+            after = UNCLASSIFIED
+        # Recorded HERE, in the same pass that decides it, and only after the eviction writes above
+        # succeeded — so the map can never claim a change the savepoint did not keep.
+        #
+        # `before` is the concept the critic was ASKED about, which is the already-CANONICALIZED
+        # assignment (`_accept_concept` resolves a legacy alias to its successor before anything
+        # sees it — `counterparty_id` arrives here as `customer_id`). That is the right before: it
+        # is the value that would have been stored had the critic not moved it, so the pair reads
+        # as "what this column would have been" → "what it is".
+        #
+        # `conflict_codes` rides here as well as in `conflicts`, deliberately: a reader who has
+        # found the column that moved should not have to join two maps to learn why it moved.
+        before = items[ref].proposed_concept
+        report["verdict_changes"][ref] = {
+            "disposition": outcome.disposition.value,
+            "from": before, "to": after,
+            "from_namespace": _namespace_of(before), "to_namespace": _namespace_of(after),
+            "reason_codes": list(outcome.reason_codes),
+            "conflict_codes": list(outcome.conflict_codes),
+        }
     for h, corrected in corrections:       # in-memory only after every DB write succeeded
         result[h] = corrected
     return report
+
+
+# ── semantic Task 5: targeted adjudication, applied ─────────────────────────────────────────────
+
+def _adjudication_evidence_ref(row: CanonicalRow, rec: GlossaryRecord | None) -> str:
+    """The evidence identity for one column — the glossary record's SCHEMA-PRESERVING logical ref,
+    else the public-flattened fallback. The SAME rule ``_apply_concept_critic`` uses, so a column's
+    critic verdict and its adjudication key on one identity rather than two."""
+    return (rec.logical_ref if rec is not None
+            else normalize_ref(row.source, None, row.table, row.column))
+
+
+@dataclass(frozen=True, slots=True)
+class AdjudicationRunInputs:
+    """One run's adjudication material, keyed by EVIDENCE ref throughout.
+
+    ``binding_ref_of`` is the second identity ``_write_llm_field_evidence`` refuses to collapse: a
+    binding is keyed by the PUBLIC-FLATTENED ref while evidence keys on the schema-preserving one.
+    Collapsing them silently skips every non-``public``-schema column (the miss reports zero
+    failures), which is exactly how a correction can vanish without a trace."""
+
+    candidates: list
+    context_of: dict[str, dict]
+    ref_to_hash: dict[str, str]
+    binding_ref_of: dict[str, str]
+
+
+def adjudication_candidates(
+    rows: Sequence[CanonicalRow], *, concepts: dict[str, str],
+    glossary: GlossaryUpload | None,
+    critic_outcomes: dict[str, dict] | None = None,
+    bundles: dict[str, SemanticContextBundleV1] | None = None,
+) -> AdjudicationRunInputs:
+    """Build the run's adjudication candidates + their model-facing context + both ref identities.
+
+    PURE over its arguments — no ``conn``. It used to take one and never use it, which is a lie
+    about the function's reach: a reader budgeting queries, or looking for the transaction this
+    runs in, would find neither.
+
+    Every candidate field is a COMPUTED fact of this run: the assigned concept, the deterministic
+    ``shape_conflicts`` for it, the concept critic's verdict where it ran, and the SOURCE-declared
+    ``entity`` the upload itself attested. Nothing here asks a model about a model.
+
+    The context payload is the SAME ``for_critic`` projection the critic saw, through the SAME
+    definition egress guard (the M4 rule: a technical upload's uploader free text never egresses)."""
+    from featuregen.overlay.upload.attest.representation import shape_conflicts
+    from featuregen.overlay.upload.semantic_adjudication import AdjudicationCandidateV1
+
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+    bundles = bundles or {}
+    critic_outcomes = critic_outcomes or {}
+    inputs = AdjudicationRunInputs(candidates=[], context_of={}, ref_to_hash={},
+                                   binding_ref_of={})
+    for row in rows:
+        h = content_hash(row)
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        ref = _adjudication_evidence_ref(row, rec)
+        if ref in inputs.ref_to_hash:
+            continue                      # one candidate per evidence identity
+        meta = _concept_metadata(row, rec)
+        concept_name = concepts.get(h)
+        declared = str(meta.get("type") or row.type or "") or None
+        definition = meta.get("business_definition")
+        verdict = critic_outcomes.get(ref, {})
+        inputs.candidates.append(AdjudicationCandidateV1(
+            logical_ref=ref,
+            column_name=row.column,
+            declared_type=declared,
+            definition=definition,
+            concept=concept_name,
+            shape_conflicts=shape_conflicts(row.column, declared, definition, concept_name),
+            critic_disposition=verdict.get("disposition"),
+            critic_reason_codes=tuple(verdict.get("reason_codes", ())),
+            # The upload's OWN entity declaration (technical CSV column) — source-attested, so a
+            # disagreement with the concept's entity link is a real referral (functional rule 1).
+            source_entity=(row.entity or None),
+        ))
+        bundle = bundles.get(h)
+        if bundle is not None:
+            inputs.context_of[ref] = _definition_egress_guard(
+                _semantic_context().for_critic(bundle, extra=meta), meta, curated=rec is not None)
+        inputs.ref_to_hash[ref] = h
+        inputs.binding_ref_of[ref] = normalize_ref(row.source, None, row.table, row.column)
+    return inputs
+
+
+def adjudicate_semantics(conn, client: LLMClient | None, rows: list[CanonicalRow], *,
+                         concepts: dict[str, str],
+                         glossary: GlossaryUpload | None = None,
+                         bindings: dict[str, ObjectBinding] | None = None,
+                         source_snapshot_id: str | None = None,
+                         actor=None,
+                         critic_outcomes: dict[str, dict] | None = None,
+                         ingestion_run_id: str | None = None,
+                         bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict:
+    """Run targeted adjudication over this run's UNCLEAR columns; return the stage DETAIL dict.
+
+    The applied half of :mod:`semantic_adjudication`. It selects deterministically, adjudicates
+    under the module's explicit call cap, and then applies exactly one kind of change:
+
+    * a ``selected`` outcome corrects the run's ``concepts`` map in place (so ``build_graph``
+      persists the correction, exactly as the critic's revisions do) and writes normal
+      ``llm/proposed`` ``concept`` field evidence through :func:`_write_llm_field_evidence` — the
+      EXISTING proposal path, producer-scoped and (Task 6) value-diff aware, so a re-derivation that
+      lands on the same value reuses the same evidence row;
+    * ``unclassified`` writes NOTHING. It is the honest abstention, and C3's rule holds everywhere:
+      ``unclassified`` is never a proposal. It also does NOT clear a standing concept — the
+      adjudicator failing to name a better word is not evidence the current word is wrong; the
+      critic owns eviction, and doing it here too would make two components fight over one field;
+    * a gap suggestion never touches the registry and is never itself a classification (see
+      :mod:`semantic_gap`); its discovery pointer is written inside ``adjudicate_targets``. It is
+      ORTHOGONAL to the concept verdict: an answer carrying both a gap AND a better concept writes
+      the concept evidence AND records the gap. The display ranking that puts `gap_suggested` at
+      the head of such an item is a LABEL — the write path reads ``corrected_concept``, which is
+      computed from the concept verdict alone.
+
+    DB-first, dict-after (the critic's rule): the evidence write happens before ``concepts`` is
+    mutated, so a rolled-back savepoint leaves the in-memory classification exactly as it was.
+
+    ``ingestion_run_id`` (C5-T5) attributes every dispatch this stage issues to the run and the
+    exact column subject it adjudicates — and, because attribution rides the PRE-DISPATCH audit
+    gate, it is also what makes this stage fail CLOSED (no egress) when the audit store is down.
+
+    Returns ``{targets, considered, selected, unchanged, unclassified, gap_suggested, invalid,
+    not_attempted, evidence_written, evidence_reused, evidence_skipped, evidence_write_failures,
+    gaps}`` — the six outcome counts (D12.3: OUTCOMES in the stage detail, never new stage STATES)
+    plus the independent write counters, so the ranking that picks one headline per item hides
+    nothing. The outcome counts OVERLAP by design (``selected`` and ``gap_suggested`` are both true
+    of one answer that corrects and reports a missing word — see ``outcome_counts``).
+
+    THE WRITE COUNTERS COUNT WHAT HAPPENED, not what did not fail. ``evidence_written`` is NEW
+    rows; ``evidence_reused`` is corrections whose value was already asserted by a live LLM row
+    (Task 6 value-diff — the assertion is current, no row was added); ``evidence_skipped`` is a
+    designed non-write (a technical upload with no ``source_snapshot_id``, an unattachable
+    binding); ``evidence_write_failures`` is contained failures, and only that last one degrades
+    the stage. The earlier arithmetic incremented ``evidence_written`` on every non-failure, so a
+    run with ``bindings={}`` reported one row written and zero rows stored."""
+    from featuregen.overlay.upload.semantic_adjudication import (
+        adjudicate_targets,
+        adjudication_bounds,
+        outcome_counts,
+        select_adjudication_targets,
+    )
+
+    bounds = adjudication_bounds()
+    inputs = adjudication_candidates(
+        rows, concepts=concepts, glossary=glossary, critic_outcomes=critic_outcomes,
+        bundles=bundles)
+    targets = select_adjudication_targets(
+        inputs.candidates, context_of=inputs.context_of, max_targets=bounds.max_targets)
+    detail: dict = {"considered": len(inputs.candidates), "targets": len(targets),
+                    **outcome_counts(()), "evidence_written": 0, "evidence_reused": 0,
+                    "evidence_skipped": 0, "evidence_write_failures": 0, "gaps": 0}
+    if not targets:
+        return detail
+    # The replay identity of the ref set this run adjudicates against, through THE shared canonical
+    # hasher (D1: `materialize_hash`, RFC 8785 JCS) rather than an inline sha256/json.dumps — a
+    # second canonicalization scheme for a replay key is how two components come to disagree about
+    # whether a stored answer may be served.
+    catalog_revision = materialize_hash({"refs": sorted(inputs.ref_to_hash)})[:16]
+    results = adjudicate_targets(conn, client, targets, catalog_revision=catalog_revision,
+                                 actor=actor, bounds=bounds,
+                                 ingestion_run_id=ingestion_run_id)
+    detail.update(outcome_counts(results))
+    detail["gaps"] = sum(
+        1 for r in results if r.adjudication is not None and r.adjudication.ontology_gap is not None)
+
+    corrections: dict[str, str] = {}
+    for result in results:
+        corrected = result.corrected_concept
+        h = inputs.ref_to_hash.get(result.logical_ref)
+        if corrected is None or h is None:
+            continue
+        if source_snapshot_id is None:
+            # A TECHNICAL upload mints no snapshot id (`ingest`: `snapshot_id = mint_id("ing") if
+            # is_glossary else None`), and `field_evidence.source_snapshot_id` is NOT NULL — so the
+            # write is not attempted at all. An honest SKIP, not a silent success: the correction
+            # still reaches `graph_node` through `concepts`, exactly as Pass A's classification
+            # does on that path (see the note at the technical-upload seam in `ingest`).
+            detail["evidence_skipped"] += 1
+        else:
+            # The evidence material is the ADJUDICATION's identity, not the classifier's: this is a
+            # different derivation of the same field, so it must hash differently — otherwise a
+            # correction would look like the classifier's own unchanged answer and (post-Task-6) be
+            # reused rather than superseding it.
+            material = {"adjudication": result.structured_result_id,
+                        "selected_concept": corrected}
+            binding_ref = inputs.binding_ref_of.get(result.logical_ref, result.logical_ref)
+            # Count what the WRITER did, never "it did not fail, so it must have written": a skip
+            # (unattachable binding, an item the writer declined) leaves zero rows behind, and a
+            # reuse leaves the prior row live without adding one.
+            written: dict[str, int] = {}
+            failures = _write_llm_field_evidence(
+                conn, field_name="concept",
+                items={result.logical_ref: corrected},
+                ref_of=lambda ref, _b=binding_ref, _m=material: (ref, _b, _m),
+                source_snapshot_id=source_snapshot_id,
+                valid_fn=is_known_concept,
+                producer_configuration_hash=_vocab_fingerprint(),
+                bindings=bindings, counts=written)
+            detail["evidence_write_failures"] += failures
+            if failures:
+                continue        # a correction whose evidence did not land is not applied in memory
+            detail["evidence_written"] += written.get("written", 0)
+            detail["evidence_reused"] += written.get("reused", 0)
+            detail["evidence_skipped"] += written.get("skipped", 0)
+        corrections[h] = corrected
+    for h, corrected in corrections.items():   # in-memory only after every DB write succeeded
+        concepts[h] = corrected
+    return detail
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
@@ -1196,7 +2151,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     bindings: dict[str, ObjectBinding] | None = None,
                     source_snapshot_id: str | None = None,
                     stats: dict | None = None,
-                    ingestion_run_id: str | None = None) -> dict[str, str]:
+                    ingestion_run_id: str | None = None,
+                    bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """Classify each column into a controlled concept; returns {content_hash: concept} (unchanged).
 
     Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
@@ -1216,7 +2172,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     the distinct ``truncated``) instead of a laundered success. It also receives
     ``concept_critic`` — the acceptance hook's report (``_apply_concept_critic``; ``{"failed":
     True}`` when the contained critic faulted) — which ingest records as the
-    ``enrich_concept_critic`` stage.
+    ``enrich_concept_critic`` stage, plus ``concept_critic_started_at``, that stage's own start
+    instant (the critic runs INSIDE this function, so the concept stage's timer measures the
+    classifier and the critic together and can report neither on its own).
 
     ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
     dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
@@ -1232,7 +2190,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # sidecar included), NOT by ``content_hash``; the RETURNED dict stays keyed by content_hash for
     # downstream (graph/ingest — unchanged). Mirrors ``draft_definitions``'s ``key_of`` seam.
     key_of = {h: concept_cache_key(r, _rec_of(r)) for h, r in by_hash.items()}
-    cached = _cache_get(conn, "enrichment_concept", list(key_of.values()), _CONCEPT_CACHE_VERSION)
+    cached = _cache_get(conn, "enrichment_concept", list(key_of.values()), _concept_cache_version())
     result = {h: cached[key_of[h]] for h in by_hash if key_of[h] in cached}
     hit_hashes = frozenset(result)   # #6: cache HITS this run — their evidence still needs repair
 
@@ -1241,12 +2199,27 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # (a HIT's material must match what a fresh classification would have used, so its input_hash
     # lines up with an already-active row -> reused, not duplicated).
     meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()}
+    # Joint Task 4: the DISPATCH payload is the purpose adapter over this column's bundle. Two
+    # DISTINCT dicts on purpose (D12.5): `meta_by_hash` is IDENTITY (cache key + evidence
+    # input_hash, byte-unchanged), `payload_by_hash` is what the model SEES.
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    payload_by_hash = {h: _classifier_payload(r, _rec_of(r), bundles.get(h))
+                       for h, r in by_hash.items()}
     miss_hashes = [h for h in by_hash if h not in result]
     resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (a MISS only)
 
+    # [A.54] ONE ledger for the WHOLE concept stage. `run_batched` would build its own, which is
+    # correct only while every provider call of the stage is issued by the ladder — and the critic
+    # below issues up to two more PER IDENTIFIER COLUMN from outside it. Sharing the ledger is
+    # exactly what `CallLedger` prescribes, and what stops the critic spending a ceiling it was
+    # never counted against. Built unconditionally so BOTH modes hand the critic the same object.
+    stage_ledger = CallLedger(enrich_config.budget("concept").max_provider_calls)
+    stage_deadline = enrich_config.stage_deadline_s()
     if enrich_config.mode("concept") == "batch":
-        misses = [BatchItem(h, meta_by_hash[h]) for h in miss_hashes]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        misses = [BatchItem(h, payload_by_hash[h]) for h in miss_hashes]
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -1255,22 +2228,22 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor,
-            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
-            report=batch_report,
+            deadline_s=stage_deadline,                     # MF-4 — bound the source-lock hold
+            call_ledger=stage_ledger, report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_concept",
             dispatch_subjects=({h: _column_subject(by_hash[h]) for h in miss_hashes}
                                if ingestion_run_id is not None else None))
         if stats is not None:
             stats["not_attempted"] = batch_report.get("not_attempted", 0)
         for h, concept in resolved.items():
-            _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
+            _cache_put(conn, "enrichment_concept", key_of[h], concept, _concept_cache_version())
             result[h] = concept
     else:
         for h in miss_hashes:                              # single mode
             # Metadata only (names/types + the glossary sidecar for a glossary column) — NEVER the
             # uploader's free-text definition on a technical row (M4 egress risk).
             raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
-                        {**meta_by_hash[h], "vocabulary": _CONCEPT_VOCABULARY}, "concept",
+                        {**payload_by_hash[h], "vocabulary": _CONCEPT_VOCABULARY}, "concept",
                         "Classify this column into the provided controlled concept vocabulary — choose "
                         "the single best-fitting concept name, or 'unclassified' if none fits.", actor,
                         _single_ctx(ingestion_run_id, "enrich_concept", _column_subject(by_hash[h])),
@@ -1286,7 +2259,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             concept, _reason = _accept_concept(raw)
             if concept is None:
                 continue
-            _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
+            _cache_put(conn, "enrichment_concept", key_of[h], concept, _concept_cache_version())
             result[h] = concept
             resolved[h] = concept
 
@@ -1297,21 +2270,65 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     # suggestion. Savepointed + advisory like every enrichment side-effect: a critic fault
     # degrades to un-criticised concepts and an honest ``failed`` stage, never a lost upload.
     critic_report: dict = {"failed": True}
+    critic_outcomes: dict[str, dict] = {}
+    # Task 9c: the join-candidacy shape BEFORE the critic touches anything. Taken here rather than
+    # reconstructed afterwards because `_apply_concept_critic` mutates `result` in place — once it
+    # returns, the pre-critic namespace picture no longer exists anywhere.
+    namespaces_before = namespace_histogram(result)
+    # The critic's OWN clock. It runs inside `enrich_concepts`, so `enrich_concept`'s stage timer
+    # covers the classifier too and cannot say what the critic cost.
+    #
+    # [A.54, fixed 2026-08-09] It is no longer unbounded. The critic now shares this stage's
+    # `stage_ledger` and `stage_deadline`, and an item either bound skipped ABSTAINS with a
+    # `skipped_reason` — the classifier's concept stands un-refuted — while `not_attempted` /
+    # `stopped_by` land on the critic report. The clock below still matters: the deadline is
+    # checked BEFORE each item and cannot interrupt a call already in flight.
+    # Recorded on `stats` BEFORE the try, so a fault still leaves the stage a start time to report.
+    critic_started = datetime.now(UTC)
+    if stats is not None:
+        stats["concept_critic_started_at"] = critic_started
     try:
         with conn.transaction():
             critic_report = _apply_concept_critic(
                 conn, client, result=result, by_hash=by_hash, meta_by_hash=meta_by_hash,
-                rec_by_tc=rec_by_tc, actor=actor)
+                rec_by_tc=rec_by_tc, actor=actor, bundles=bundles,
+                critic_outcomes=critic_outcomes,
+                call_ledger=stage_ledger, deadline_s=stage_deadline)
     except Exception:  # noqa: BLE001 — advisory: the critic never aborts concept enrichment
         logger.warning("advisory concept critic failed", exc_info=True)
+        # The savepoint rolled the critic's writes back, so its per-ref verdicts describe state
+        # that no longer exists. Drop them rather than feeding a phantom refutation into
+        # adjudication selection.
+        critic_outcomes = {}
     if stats is not None:
         stats["concept_critic"] = critic_report
+        stats["concept_critic_outcomes"] = critic_outcomes
+        # Task 9c — the two run-level facts nothing else records.
+        #
+        # `namespaces`: counts per identifier namespace before and after acceptance. The per-column
+        # before→after pairs live on the critic stage (`verdict_changes`); this is the aggregate
+        # the next run can be diffed against, and it covers columns the critic never looked at
+        # (only the identifier GROUPS are criticised) as well as the ones it did.
+        #
+        # `vocab_fingerprint`: WHICH registry generation produced these verdicts. It is already
+        # folded into the classifier cache key and written as `producer_configuration_hash` on
+        # every concept `field_evidence` row, but never as a stage-level fact — so a run whose
+        # evidence writer was gated out (a technical upload) left no record of the vocabulary it
+        # classified under. Recording it here means the answer to "did the concepts move because
+        # the registry moved?" is one query, not an archaeology exercise.
+        stats["namespaces"] = {"before_critic": namespaces_before,
+                               "after_critic": namespace_histogram(result)}
+        stats["vocab_fingerprint"] = _vocab_fingerprint()
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
     # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
     # on the very next upload instead of leaving graph_node.concept populated with no supporting
     # field_evidence forever. `_write_concept_evidence`'s input_hash reuse check makes this a safe
     # no-op when the evidence already exists and is unchanged — no duplicate/stale rows.
+    # Task 9c: the evidence account rides on `stats` whether or not the writer runs. The gate below
+    # is the reason a TECHNICAL upload classifies every column and stores nothing — a divergence
+    # that `resolved`/`expected` cannot show, because both count the DRAFT.
+    ev_counts: dict[str, int] = {} if stats is None else stats.setdefault("evidence_counts", {})
     if glossary is not None and source_snapshot_id is not None:
         # Values come from the corrected ``result`` (never the pre-critic ``resolved``): a REVISED
         # column's evidence must carry the revision, a REFUTED one is ``unclassified`` and writes
@@ -1320,9 +2337,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
         failures = _write_concept_evidence(
             conn, resolved=evidence_targets, by_hash=by_hash, meta_by_hash=meta_by_hash,
             rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id,
-            cache_hit_hashes=hit_hashes)
+            cache_hit_hashes=hit_hashes, counts=ev_counts)
         if stats is not None:
             stats["evidence_write_failures"] = failures
+    elif stats is not None:
+        stats["evidence_writer"] = ("not_run:no_glossary" if glossary is None
+                                    else "not_run:no_source_snapshot")
     return result
 
 
@@ -1386,7 +2406,8 @@ def _summary_cache_key(row_hash: str, metadata: dict) -> str:
 
 
 def summary_payload(row: CanonicalRow, rec: GlossaryRecord | None,
-                    extras: dict | None = None) -> dict:
+                    extras: dict | None = None,
+                    bundle: SemanticContextBundleV1 | None = None) -> dict:
     """The summary drafting payload AND its evidence material — ONE builder (richness Task 3 Step
     6c), so the ``input_hash`` always hashes exactly what was drafted from and the cache key
     auto-redrafts whenever the payload gets richer.
@@ -1410,6 +2431,14 @@ def summary_payload(row: CanonicalRow, rec: GlossaryRecord | None,
             continue
         meta[key] = ([v[:_MAX_META_LEN] for v in val] if isinstance(val, (list, tuple))
                      else str(val)[:_MAX_META_LEN])
+    # Joint Task 4: route the assembled material through the `for_summary` purpose adapter so the
+    # drafter ALSO sees the platform's current stronger facts (the resolved semantic terms, the
+    # table's role and primary entity) rather than the file alone. The adapter's own keys win; the
+    # file/extras material rides underneath, so nothing above is displaced. `bundle=None` (a direct
+    # caller, or a per-column context build that was contained) returns exactly today's payload.
+    if bundle is not None:
+        meta = _definition_egress_guard(
+            _semantic_context().for_summary(bundle, extra=meta), meta, curated=rec is not None)
     return meta
 
 
@@ -1418,7 +2447,8 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     concepts: dict[str, str] | None = None,
                     ingestion_run_id: str | None = None,
                     stats: dict | None = None,
-                    extras_by_hash: dict[str, dict] | None = None) -> dict[str, str]:
+                    extras_by_hash: dict[str, dict] | None = None,
+                    bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """One plain-English summary per column, written from that column's full metadata.
     Returns ``{content_hash: summary}``.
 
@@ -1441,7 +2471,8 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     targets = _summary_targets(rows, glossary)
     by_hash = {h: r for r in rows if (h := content_hash(r)) in targets}
-    meta_by_hash = {h: summary_payload(r, _rec_of(r), extras_by_hash.get(h))
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    meta_by_hash = {h: summary_payload(r, _rec_of(r), extras_by_hash.get(h), bundles.get(h))
                     for h, r in by_hash.items()}
     key_of = {h: _summary_cache_key(h, meta_by_hash[h]) for h in by_hash}
     cached = _cache_get(conn, "enrichment_summary", list(key_of.values()), _SUMMARY_CACHE_VERSION)
@@ -1451,7 +2482,8 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     if not misses:
         return result
     items = [BatchItem(h, meta_by_hash[h]) for h in misses]
-    batch_report: dict = {}
+    # Task 9c: see the note at the other run_batched sites — the report rides on `stats`.
+    batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
     resolved = run_batched(
         conn, client, short="summary", task=_SUMMARY_TASK,
         prompt_id="overlay_summary_batch_v1", schema_id="overlay_summary_batch",
@@ -1462,7 +2494,7 @@ def draft_summaries(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     "if so, say what THIS column specifically is, do not repeat it. Treat each item "
                     "independently; never reuse another item's facts; return exactly one result per "
                     "input ref.",
-        accept=_accept_bounded(400), actor=actor,
+        accept=_accept_bounded(_MAX_SUMMARY_LEN), actor=actor,
         deadline_s=enrich_config.stage_deadline_s(), report=batch_report,
         ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_summary",
         dispatch_subjects=({h: _column_subject(by_hash[h]) for h in misses}
@@ -1479,7 +2511,8 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                       *, concepts: dict[str, str] | None = None,
                       glossary: GlossaryUpload | None = None,
                       ingestion_run_id: str | None = None,
-                      stats: dict | None = None) -> dict[str, str]:
+                      stats: dict | None = None,
+                      bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3). Keyed by (content_hash,
     assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}.
 
@@ -1496,6 +2529,8 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
     concepts = concepts or {}
     targets = _definition_targets(rows, glossary)   # blank, minus the suppressed (R3 + R5-3)
     blank = {h: r for r in rows if (h := content_hash(r)) in targets}
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    rec_of = _rec_lookup(glossary)
     key_of = {h: _def_cache_key(h, concepts.get(h, "")) for h in blank}
     cached = _cache_get(conn, "enrichment_definition", list(key_of.values()), _DEFINITION_CACHE_VERSION)
     result = {h: cached[key_of[h]] for h in blank if key_of[h] in cached}
@@ -1504,18 +2539,36 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
         # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
         misses = [h for h in blank if h not in result]
         misses.sort(key=lambda h: (blank[h].table, h))
-        items = [BatchItem(h, {"table": blank[h].table, "column": blank[h].column,
-                               "type": blank[h].type, **({"concept": concepts[h]} if concepts.get(h) else {})})
+        items = [BatchItem(h, _drafting_payload(bundles.get(h), {
+                     "table": blank[h].table, "column": blank[h].column, "type": blank[h].type,
+                     **({"concept": concepts[h]} if concepts.get(h) else {})},
+                     row=blank[h], rec=rec_of(blank[h])))
                  for h in misses]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="definition", task=_DEF_TASK,
             prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
             shared_metadata={}, items=items, out_key="definition",
-            instruction="Draft a one-line business definition for EACH column. Treat each item "
+            # The instruction USED to say "one-line", which stopped being coherent when
+            # MAX_DEFINITION_LEN reached 32_000 and the accept gate began allowing paragraphs: it
+            # asked for exactly the shape the caps were widened to stop forcing. It now asks for a
+            # complete definition and names the ONE shape still refused (`_is_enumeration`), so the
+            # prompt and the gate agree — a model is never invited to produce output we discard.
+            instruction="Draft a complete business definition for EACH column. Write as much as the "
+                        "column genuinely needs — one sentence for an obvious field, several "
+                        "paragraphs where the meaning, derivation or caveats warrant it. Write "
+                        "flowing PROSE, not a bulleted or numbered list. Treat each item "
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
-                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
+                        "exactly one result per input ref.",
+            # ZERO-TRUNCATION RAISE (2026-08-06): 500 -> MAX_DEFINITION_LEN. The 32_000 raise
+            # widened only the OUTBOUND side (`_MAX_LEN_BY_KEY` is an egress cap); this is the gate
+            # that decided how long a definition the model may WRITE, and at 500 it sat below even
+            # the original 600 — a drafted definition over 500 chars was DISCARDED, not shortened.
+            # Paired with `overlay_definition_batch`'s schema maxLength; pinned equal by test.
+            accept=_accept_bounded(MAX_DEFINITION_LEN), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_definition",
@@ -1533,12 +2586,18 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
             continue
         drafted = _bounded(_call(conn, client, _DEF_TASK, "overlay_definition_v1",
                                  "overlay_definition",
-                                 {"table": row.table, "column": row.column, "type": row.type},
+                                 _drafting_payload(bundles.get(h), {
+                                     "table": row.table, "column": row.column, "type": row.type},
+                                     row=row, rec=rec_of(row)),
                                  "definition",
-                                 "Draft a one-line business definition for this column.",
+                                 # Kept in step with the batch instruction above: prose, any
+                                 # length up to the cap, never a bulleted list.
+                                 "Draft a complete business definition for this column. Write as "
+                                 "much as it genuinely needs, as flowing prose — never a bulleted "
+                                 "or numbered list.",
                                  actor,
                                  _single_ctx(ingestion_run_id, "enrich_definition",
-                                             _column_subject(row))), 500)
+                                             _column_subject(row))), MAX_DEFINITION_LEN)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", key_of[h], drafted, _DEFINITION_CACHE_VERSION)
@@ -1549,7 +2608,10 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
 def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                      actor=None, *, ingestion_run_id: str | None = None,
                      stats: dict | None = None,
-                     column_domains: dict[tuple[str, str], str] | None = None) -> dict[str, str]:
+                     column_domains: dict[tuple[str, str], str] | None = None,
+                     column_sub_domains: dict[tuple[str, str], str] | None = None,
+                     glossary: GlossaryUpload | None = None,
+                     bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """Classify each table's business domain (per-table), returning {table_name: domain} — the table
     DEFAULT, the context every one of its columns inherits.
 
@@ -1574,6 +2636,25 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
     for r in rows:
         by_table.setdefault(r.table, []).append(r.column)
 
+    # Joint Task 4: the classifier sees each table's columns as a ROSTER of the platform's current
+    # stronger facts (name + resolved concept + party role), not a bare name list — the signal a
+    # per-column sub-domain question is answerable from. `columns` stays too: it is the input the
+    # per-table cache key and the evidence material are computed from, and re-keying every table's
+    # domain cache on a sibling concept edit is exactly the identity cascade D12.5 forbids.
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    roster_by_table: dict[str, list[dict]] = {}
+    for r in rows:
+        bundle = bundles.get(content_hash(r))
+        entry: dict = {"column": _norm(r.column)}
+        if bundle is not None:
+            concept = _value_of_bundle(bundle, "concept")
+            party_role = _value_of_bundle(bundle, "party_role")
+            if concept:
+                entry["concept"] = str(concept)[:_MAX_META_LEN]
+            if party_role:
+                entry["party_role"] = str(party_role)[:_MAX_META_LEN]
+        roster_by_table.setdefault(r.table, []).append(entry)
+
     hash_of_table = {t: _table_content_hash(source, t, cols) for t, cols in by_table.items()}
     cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()), _DOMAIN_CACHE_VERSION)
     # {table: canonical two-level envelope} — one shape from BOTH modes and from the cache.
@@ -1581,17 +2662,18 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
     accept_domain = _accept_domain_result(64)
 
     if enrich_config.mode("domain") == "batch":
-        misses = [BatchItem(t, {"table": t, "columns": sorted(cols)})
+        misses = [BatchItem(t, {"table": t, "columns": sorted(cols),
+                                "column_roster": sorted(roster_by_table.get(t, []),
+                                                        key=lambda e: e["column"])})
                   for t, cols in by_table.items() if hash_of_table[t] not in cached]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
-            conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v1",
-            schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
-            instruction="For each item give the TABLE's business domain in `domain` — the default "
-                        "context for all of its columns — and in `column_domains` list ONLY the "
-                        "columns whose own domain DIFFERS from that table domain (omit every column "
-                        "that shares it; an empty list is the normal answer). Return exactly one "
-                        "result per input ref; treat each table independently.",
+            conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v2",
+            schema_id="overlay_domain_batch", prompt_version=2, schema_version=2,
+            shared_metadata={}, items=misses, out_key="domain",
+            instruction=_DOMAIN_INSTRUCTION,
             accept=accept_domain, extract=_extract_domain_result, actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
@@ -1609,11 +2691,14 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
         for table, cols in by_table.items():
             if table in envelopes:
                 continue
-            raw = _call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
-                        {"table": table, "columns": sorted(cols)}, "domain",
+            raw = _call(conn, client, _DOMAIN_TASK, "overlay_domain_v2", "overlay_domain",
+                        {"table": table, "columns": sorted(cols),
+                         "column_roster": sorted(roster_by_table.get(table, []),
+                                                 key=lambda e: e["column"])}, "domain",
                         "Classify this table's business domain.", actor,
                         _single_ctx(ingestion_run_id, "enrich_domain",
-                                    _table_subject(source, table, cols)))
+                                    _table_subject(source, table, cols)),
+                        prompt_version=2, schema_version=2)
             if raw is None:
                 continue   # provider failure / empty -> don't cache (M3)
             envelope, _reason = accept_domain(raw)
@@ -1625,31 +2710,66 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
 
     result: dict[str, str] = {}
     for table, envelope in envelopes.items():
-        table_domain, overrides = _parse_domain_result(envelope)
+        table_domain, overrides, sub_domains = _parse_domain_result(envelope)
         if not table_domain:
             continue
         result[table] = table_domain
         if column_domains is not None:
             for column, value in overrides.items():
                 column_domains[(_norm(table), _norm(column))] = value
+        if column_sub_domains is not None:
+            for column, value in sub_domains.items():
+                column_sub_domains[(_norm(table), _norm(column))] = value
     return result
 
 
-_SYN_INSTRUCTION = ("List the business SYNONYMS and common aliases for EACH column — the other names "
-                    "a business user would search for it by. Return ONE comma-separated line per "
-                    "item, terms only, no explanation. Treat each item independently: use only that "
-                    "item's table/column/type/concept; return exactly one result per input ref.")
+# Synonyms are the ONLY semantic handle an UNCLASSIFIED column has: with no concept it cannot be
+# found by meaning, so its aliases are the entire basis on which anyone can search for it. The prior
+# wording undermined that twice — it asked for no COUNT (the model returned whatever it felt like,
+# typically three or four) and it told the model to "use only that item's table/column/type/concept",
+# which FORBADE the business definition, the single richest source of aliases in the payload.
+#
+# The definition is already IN the item (`_drafting_payload` -> `for_summary`, restored by
+# `_definition_egress_guard` for a curated column): this instruction stops refusing the model
+# permission to read what it is being shown. On a TECHNICAL column the guard withholds it (M4) and
+# the model simply has one fewer source — the instruction names it, it does not require it.
+#
+# "ONE comma-separated LINE" is LOAD-BEARING, not style: the consumer `ingest._project_semantic_terms`
+# splits on COMMAS only, so a newline-separated answer projects as ONE term with the whole blob as
+# its dedupe key. The `_accept_single_line` gate below refuses that shape, and an instruction must
+# never ask for output the gate discards — so asking for MORE terms must never become asking for a
+# term per line.
+# [F10] The character budget is INTERPOLATED from `_MAX_SYNONYMS_LEN`, never typed as a literal.
+# A schema `maxLength` cannot carry this bound to the model: `schema_projection` strips it from the
+# wire (Anthropic's `json_schema` format rejects it) while `validate_output` still checks it on the
+# response — so the instruction is the ONLY channel the bound has, and an over-run fails the whole
+# chunk rather than one item. Asking for "15 to 20 terms" without a length put ~20 x ~50 chars right
+# at the cap. Pinned by `test_the_prompt_and_the_gate_AGREE_about_LENGTH_not_just_shape`.
+_SYN_INSTRUCTION = (
+    "List the business SYNONYMS and common aliases for EACH column — the other names a business "
+    "user would search for it by. Give 15 to 20 terms where the evidence supports them; give fewer "
+    "only when the column is genuinely narrow. Use the item's table, column name, type, concept AND "
+    "its business definition — the definition is usually the richest source of aliases, so read it. "
+    "If the concept is the literal value 'unclassified', ignore it: it is the absence of a "
+    "classification, not a hint. Return ONE comma-separated line per item, terms only, no "
+    f"explanation. HARD LIMIT: the line for each item must be at most {_MAX_SYNONYMS_LEN} "
+    "characters INCLUDING the separators — if the terms you have would exceed it, return fewer "
+    "terms rather than a longer line, keeping the ones a business user is most likely to search "
+    "for. Treat each item independently; return exactly one result per input ref.")
 
 
 def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                    *, concepts: dict[str, str] | None = None,
                    ingestion_run_id: str | None = None,
-                   stats: dict | None = None) -> dict[str, str]:
+                   stats: dict | None = None,
+                   glossary: GlossaryUpload | None = None,
+                   bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """Draft business synonyms for EVERY column; returns {content_hash: "term, term, term"} (E1a T4).
 
     Every column is a target — synonyms are ADDITIVE (they merge with the glossary's own terms), so
-    unlike a definition there is no "only fill a blank" rule to apply. NO CACHE: E1a defers reuse, and
-    the evidence writer supersedes-and-rewrites unconditionally.
+    unlike a definition there is no "only fill a blank" rule to apply. NO PROMPT CACHE: E1a defers
+    call reuse. That is now the only reuse missing — the evidence writer VALUE-DIFFS (Task 6), so a
+    redraft landing on the same terms reuses the same evidence row rather than churning its id.
 
     ``stats`` (optional out-param): in batch mode receives ``not_attempted``, the count the
     budget/deadline cutoff skipped WITHOUT dispatch, so the caller labels a truncated run
@@ -1657,16 +2777,26 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     dispatch to the run + the column subjects drafted (stage ``enrich_synonyms``)."""
     concepts = concepts or {}
     by_hash = {content_hash(r): r for r in rows}
-    accept = _accept_bounded(_MAX_SYNONYMS_LEN)
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    rec_of = _rec_lookup(glossary)
+    # SINGLE LINE, not merely bounded: the consumer splits this on COMMAS
+    # (`ingest._project_semantic_terms`) and `_SYN_INSTRUCTION` asks for one comma-separated line,
+    # so a newline-separated answer would be projected as ONE term instead of several. The 2026-08-06
+    # newline relaxation was for paragraphed DEFINITIONS and must not reach this gate.
+    accept = _accept_single_line(_MAX_SYNONYMS_LEN)
 
     if enrich_config.mode("synonyms") == "batch":
         # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
         refs = sorted(by_hash, key=lambda h: (by_hash[h].table, h))
-        items = [BatchItem(h, {"table": by_hash[h].table, "column": by_hash[h].column,
-                               "type": by_hash[h].type,
-                               **({"concept": concepts[h]} if concepts.get(h) else {})})
+        items = [BatchItem(h, _drafting_payload(bundles.get(h), {
+                     "table": by_hash[h].table, "column": by_hash[h].column,
+                     "type": by_hash[h].type,
+                     **({"concept": concepts[h]} if concepts.get(h) else {})},
+                     row=by_hash[h], rec=rec_of(by_hash[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="synonyms", task=_SYN_TASK,
             prompt_id="overlay_synonyms_batch_v1", schema_id="overlay_synonyms_batch",
@@ -1684,7 +2814,9 @@ def draft_synonyms(conn, rows: list[CanonicalRow], client: LLMClient, actor=None
     result: dict[str, str] = {}
     for h, row in by_hash.items():                    # single mode — the per-item path
         raw = _call(conn, client, _SYN_TASK, "overlay_synonyms_v1", "overlay_synonyms",
-                    {"table": row.table, "column": row.column, "type": row.type}, "synonyms",
+                    _drafting_payload(bundles.get(h), {
+                        "table": row.table, "column": row.column, "type": row.type},
+                        row=row, rec=rec_of(row)), "synonyms",
                     _SYN_INSTRUCTION, actor,
                     _single_ctx(ingestion_run_id, "enrich_synonyms", _column_subject(row)))
         if raw is None:
@@ -1708,7 +2840,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                 *, concepts: dict[str, str] | None = None,
                 currencies: dict[str, str] | None = None,
                 ingestion_run_id: str | None = None,
-                stats: dict | None = None) -> dict[str, str]:
+                stats: dict | None = None,
+                glossary: GlossaryUpload | None = None,
+                bundles: dict[str, SemanticContextBundleV1] | None = None) -> dict[str, str]:
     """Draft the MEASURE ANNOTATION for the columns a unit is meaningful for and the file left blank
     (E4a T2); returns ``{content_hash: unit}``.
 
@@ -1720,8 +2854,9 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
     requirement. A human confirms it (Task 3); the AI only ever drafts the answer.
 
     Targets are ``_unit_targets`` — the ONE definition the writer and ingest's expected count share.
-    NO CACHE (like ``draft_synonyms``): the evidence writer supersedes-and-rewrites unconditionally,
-    and reuse is a deferred optimization.
+    NO PROMPT CACHE (like ``draft_synonyms``): call reuse is a deferred optimization. Evidence
+    reuse is NOT deferred — the writer value-diffs (Task 6), so an unchanged annotation keeps its
+    evidence id.
 
     ``currencies`` (optional out-param; the RETURN shape stays ``{hash: unit}`` so the stage report
     reads exactly like every other Pass A stage) receives ``{content_hash: ISO-4217 code}`` for the
@@ -1735,6 +2870,8 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
     concepts = concepts or {}
     targets = _unit_targets(rows, concepts)
     blank = {h: r for r in rows if (h := content_hash(r)) in targets}
+    bundles = bundles if bundles is not None else _bundles_by_hash(conn, rows, glossary)
+    rec_of = _rec_lookup(glossary)
     result: dict[str, str] = {}
 
     def _record(h: str, envelope: str) -> None:
@@ -1748,11 +2885,15 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
     if enrich_config.mode("unit") == "batch":
         # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
         refs = sorted(blank, key=lambda h: (blank[h].table, h))
-        items = [BatchItem(h, {"table": blank[h].table, "column": blank[h].column,
-                               "type": blank[h].type,
-                               **({"concept": concepts[h]} if concepts.get(h) else {})})
+        items = [BatchItem(h, _drafting_payload(bundles.get(h), {
+                     "table": blank[h].table, "column": blank[h].column,
+                     "type": blank[h].type,
+                     **({"concept": concepts[h]} if concepts.get(h) else {})},
+                     row=blank[h], rec=rec_of(blank[h])))
                  for h in refs]
-        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
+        # Task 9c: the ladder's account lives ON `stats` (not a local), so a run_batched raise
+        # still leaves the caller holding what it managed to record before dying.
+        batch_report: dict = {} if stats is None else stats.setdefault("batch", {})
         resolved = run_batched(
             conn, client, short="unit", task=_UNIT_TASK, prompt_id="overlay_unit_batch_v1",
             schema_id="overlay_unit_batch", shared_metadata={}, items=items, out_key="unit",
@@ -1771,8 +2912,10 @@ def draft_units(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
 
     for h, row in blank.items():                      # single mode — the per-item path
         raw = _call(conn, client, _UNIT_TASK, "overlay_unit_v1", "overlay_unit",
-                    {"table": row.table, "column": row.column, "type": row.type,
-                     **({"concept": concepts[h]} if concepts.get(h) else {})}, "unit",
+                    _drafting_payload(bundles.get(h), {
+                        "table": row.table, "column": row.column, "type": row.type,
+                        **({"concept": concepts[h]} if concepts.get(h) else {})},
+                        row=row, rec=rec_of(row)), "unit",
                     _UNIT_INSTRUCTION, actor,
                     _single_ctx(ingestion_run_id, "enrich_unit", _column_subject(row)))
         if raw is None:

@@ -56,11 +56,13 @@ from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_has
 from featuregen.materialize.ir import (
     FormulaExecutionIRV1,
     bridge_realization_dependencies,
+    crosswalk_execution_pins,
     ir_hash,
 )
 
 __all__ = [
     "GENERATED_LOCK_FILENAME",
+    "REQUIREMENTS_LOCK_FILENAME",
     "CompilationIdentity",
     "RenderedArtifactIdentity",
     "SealedProject",
@@ -76,6 +78,17 @@ __all__ = [
 #: file that carries it. Named once, so the renderer, L0 and the rendered assembly node (§10.2)
 #: cannot disagree about which file to read.
 GENERATED_LOCK_FILENAME = "GENERATED.lock"
+
+#: The artifact's DECLARED runtime environment (§0/§7): the three engine pins
+#: :func:`~featuregen.materialize.render.project._render_requirements` takes from
+#: ``ClusterInventoryV1.engine_versions``. Unlike the manifest above it IS inside
+#: :func:`generated_project_hash`, so what it says is sealed rather than advisory.
+#:
+#: Named here, beside the manifest, for the identical reason: the renderer WRITES it and L0's build
+#: probe READS it back to check the proving interpreter against it (DEFERRED-WORK A.42). A literal
+#: on each side would be two spellings of one filename, and a renamed file would silently turn that
+#: comparison into "the project declares nothing".
+REQUIREMENTS_LOCK_FILENAME = "requirements.lock"
 
 
 def derive_namespace() -> str:
@@ -139,6 +152,14 @@ class CompilationIdentity:
     materialization_contract_hash: str
     group_plan_hash: str
     bridge_realization_dependencies: tuple[tuple[str, str], ...] = ()
+    #: Every pinned CROSSWALK revision this group would execute, one tuple per two-leg traversal:
+    #: ``(execution_revision_id, definition_revision_id, mapping_binding_revision_id,
+    #: mapping_temporal_policy_revision_id, composed_observation_revision_id)`` — empty strings
+    #: where a crosswalk legitimately pins none. The execution revision is content-addressed over
+    #: both leg pins, so the pair of legs is named by the first member and the others are here
+    #: because an auditor reading the generated project must be able to look each one up without
+    #: re-deriving a hash.
+    crosswalk_execution_pins: tuple[tuple[str, str, str, str, str], ...] = ()
 
     def __post_init__(self) -> None:
         formulas = _hashes(self.formula_content_hashes, "formula_content_hashes")
@@ -160,6 +181,16 @@ class CompilationIdentity:
             _required(revision_id, "bridge realization revision")
             _required(snapshot_id, "bridge dependency snapshot")
         object.__setattr__(self, "bridge_realization_dependencies", dependencies)
+        pins = tuple(sorted({tuple(pin) for pin in self.crosswalk_execution_pins}))
+        for pin in pins:
+            if len(pin) != 5:
+                raise ValueError(
+                    f"a crosswalk execution pin names {len(pin)} values and must name 5 "
+                    f"(execution, definition, mapping binding, temporal policy, composed "
+                    f"observation): {pin!r}")
+            _required(pin[0], "crosswalk execution revision")
+            _required(pin[1], "crosswalk definition revision")
+        object.__setattr__(self, "crosswalk_execution_pins", pins)
 
     def identity_payload(self) -> dict[str, Any]:
         """Every field, because every field is identity — no provenance, no run-time value.
@@ -178,6 +209,12 @@ class CompilationIdentity:
         if self.bridge_realization_dependencies:
             payload["bridge_realization_dependencies"] = [
                 list(dependency) for dependency in self.bridge_realization_dependencies
+            ]
+        # Same rule, same reason: a group with no crosswalk adds no key, so its identity bytes are
+        # exactly what they were before crosswalks could be compiled at all.
+        if self.crosswalk_execution_pins:
+            payload["crosswalk_execution_pins"] = [
+                list(pin) for pin in self.crosswalk_execution_pins
             ]
         return payload
 
@@ -250,6 +287,7 @@ def build_compilation_identity(
         materialization_contract_hash=plan.materialization_contract_hash,
         group_plan_hash=group_plan_hash(plan),
         bridge_realization_dependencies=bridge_realization_dependencies(ordered),
+        crosswalk_execution_pins=crosswalk_execution_pins(ordered),
     )
 
 
@@ -412,7 +450,7 @@ def read_lock(document: str) -> RenderedArtifactIdentity:
     compilation = parsed["compilation"]
     required = {"formula_content_hashes", "ir_hashes", "materialization_contract_hash",
                 "group_plan_hash"}
-    optional = {"bridge_realization_dependencies"}
+    optional = {"bridge_realization_dependencies", "crosswalk_execution_pins"}
     if (
         not isinstance(compilation, dict)
         or not required <= set(compilation)
@@ -425,6 +463,10 @@ def read_lock(document: str) -> RenderedArtifactIdentity:
         compilation["bridge_realization_dependencies"] = tuple(
             tuple(dependency)
             for dependency in compilation["bridge_realization_dependencies"]
+        )
+    if "crosswalk_execution_pins" in compilation:
+        compilation["crosswalk_execution_pins"] = tuple(
+            tuple(pin) for pin in compilation["crosswalk_execution_pins"]
         )
     return RenderedArtifactIdentity(
         compilation=CompilationIdentity(**compilation),

@@ -80,8 +80,11 @@ def parse_join_ref(joins_to: str) -> ParsedJoinTarget:
 def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
     """Build the governed `ApprovedJoinRef` a declared join maps to, or None when the row has no join
     or a malformed one (parse_join_ref not ok). Both endpoints are same-source column refs; the single
-    declared column pair is (this column -> target column); cardinality defaults to 'N:1' (a child
-    row referencing a parent — the safe-fan default) when the upload left it blank."""
+    declared column pair is (this column -> target column); a blank uploaded cardinality stays None —
+    UNKNOWN. It used to default to 'N:1' ("the safe-fan default"), but a fabricated cardinality would
+    be admitted, confirmed by two admins, and then trusted absolutely at runtime; "we do not know"
+    must never become "it is safe". `plan_join` refuses an unknown-cardinality hop
+    (`_cardinality_verdict`'s NULL branch) until a human supplies one."""
     parsed = parse_join_ref(row.joins_to)
     if not parsed.ok:
         return None
@@ -90,7 +93,7 @@ def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
         from_ref=CatalogObjectRef(row.source, "column", _SCHEMA, row.table, row.column),
         to_ref=CatalogObjectRef(row.source, "column", _SCHEMA, parsed.to_table, parsed.to_col),
         column_pairs=(ColumnPair(row.column, parsed.to_col),),
-        cardinality=row.cardinality or "N:1")
+        cardinality=row.cardinality or None)
 
 # Weighted tsvector: column name (A) > definition (B) > table/concept/domain/semantics (C). The ONE
 # definition of the search_doc expression (#20) — the build_graph/add_column_row INSERTs and
@@ -107,49 +110,102 @@ _SEARCH_DOC = (
     # A source whose description column is filled by bucket makes the definition slot useless for
     # search — a query for "new to bank" matched nothing, though two columns are exactly that — and
     # the summary is the only text that distinguishes such columns.
-    "setweight(to_tsvector('english', coalesce(%s, '')), 'B')"       # ai_summary
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'B') || "   # ai_summary
+    # TABLE narrative prose (migration 1052). A technical catalog has NO table-definition source at
+    # all (`_write_technical_source_evidence` has no table branch), so `business_context` is the
+    # only prose such a table ever carries — and it lived exclusively in `field_evidence`, where
+    # full-text search cannot reach it. A read-time join does not make text matchable; the text has
+    # to be IN the document. Weighted 'B' beside the definition it stands in for.
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'B')"       # business_context
 )
+
+#: The number of ``%s`` placeholders :data:`_SEARCH_DOC` binds — asserted against
+#: :func:`_search_doc_params`' output at import so a slot added to one and not the other is an
+#: import-time failure, never a silently mis-bound INSERT.
+_SEARCH_DOC_SLOTS = 8
 
 
 def _search_doc_params(kind: str, table: str | None, column: str | None, definition: str | None,
                        concept: str | None, domain: str | None, entity: str | None,
                        semantic_terms: str | None,
-                       ai_summary: str | None = None) -> tuple[str | None, str, str | None, str,
-                                                               str, str, str]:
-    """The six ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
-    domain+entity(C), semantic_terms(C) — derived from a node's field values. Shared by the insert
-    paths AND :func:`rebuild_search_doc` (#20), so an insert-time doc and a rebuilt doc can never
-    disagree on what feeds which weight. A table node's "name" slot is its table name; a column
-    node's concept is indexed HUMANIZED (``monetary_stock`` -> ``monetary stock``) and its entity
-    rides the domain slot. ``semantic_terms`` is the glossary-projected term/synonym/taxonomy text
-    (Task 8) — NULL for technical/generic nodes (the INSERT sites pass None; only the glossary
-    projection populates it, after which the doc is rebuilt)."""
+                       ai_summary: str | None = None,
+                       business_context: str | None = None) -> tuple[str | None, str, str | None,
+                                                                     str, str, str, str, str]:
+    """The eight ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
+    domain+entity(C), semantic_terms(C), ai_summary(B), business_context(B) — derived from a node's
+    field values. Shared by the insert paths AND :func:`rebuild_search_doc` (#20), so an insert-time
+    doc and a rebuilt doc can never disagree on what feeds which weight. A table node's "name" slot
+    is its table name; a column node's concept is indexed HUMANIZED (``monetary_stock`` ->
+    ``monetary stock``) and its entity rides the domain slot. ``semantic_terms`` is the
+    glossary-projected term/synonym/taxonomy text (Task 8) — NULL for technical/generic nodes (the
+    INSERT sites pass None; only the glossary projection populates it, after which the doc is
+    rebuilt).
+
+    TABLE nodes now bind their ``definition`` and ``business_context`` (migration 1052). Both slots
+    were hardcoded ``""`` before, which meant a table's OWN prose — the description a glossary
+    declared for it, and the business context a data owner wrote — was never matchable, so a table
+    could only ever be found by its name. Columns keep an empty ``business_context`` slot: the
+    field is TABLE-grain and the plan is explicit that the same prose must not be copied into every
+    column's record."""
     if kind == "table":
-        return (table, "", table, "", domain or "", semantic_terms or "", "")
+        return (table, definition or "", table, "", domain or "", semantic_terms or "",
+                ai_summary or "", business_context or "")
     return (column, definition or "", table, humanize(concept) if concept else "",
-            (domain or "") + " " + (entity or ""), semantic_terms or "", ai_summary or "")
+            (domain or "") + " " + (entity or ""), semantic_terms or "", ai_summary or "", "")
+
+
+# An explicit RuntimeError, NOT a bare `assert`: `python -O` strips assertions, so the one guard
+# standing between a changed document expression and a silently mis-bound INSERT would vanish in
+# exactly the build a deployment is most likely to run. The check is cheap and runs once at import.
+if not (_SEARCH_DOC.count("%s") == _SEARCH_DOC_SLOTS == len(
+        _search_doc_params("table", "t", None, None, None, None, None, None))):
+    raise RuntimeError(
+        "the search_doc expression and its parameter builder disagree on slot count")
+
+#: The columns :func:`rebuild_search_doc` re-reads, in the order :func:`_search_doc_params` takes
+#: them after ``kind``. Named once so the SELECT and the call site cannot drift apart.
+_SEARCH_DOC_SOURCE_COLUMNS = ("table_name", "column_name", "definition", "concept", "domain",
+                              "entity", "semantic_terms", "ai_summary", "business_context")
 
 
 def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
     """Re-derive a node's ``search_doc`` from its CURRENT flat values (#20). ``build_graph`` writes
     the doc ONCE at insert; any later change to a doc-bearing field (field_resolution's concept/
-    definition/domain display projection, an applied entity suggestion) must call this in the same
-    transaction, or full-text search keeps matching the replaced terms and misses the new ones.
-    Case-insensitive on object_ref so field_resolution's lowercased projection key reaches the same
-    row its UPDATE matched. A ref matching no node is a no-op."""
+    definition/domain/business_context display projection, an applied entity suggestion) must call
+    this in the same transaction, or full-text search keeps matching the replaced terms and misses
+    the new ones. Case-insensitive on object_ref so field_resolution's lowercased projection key
+    reaches the same row its UPDATE matched. A ref matching no node is a no-op."""
     rows = conn.execute(
-        "SELECT object_ref, kind, table_name, column_name, definition, concept, domain, entity, "
-        "semantic_terms, ai_summary "
+        f"SELECT object_ref, kind, {', '.join(_SEARCH_DOC_SOURCE_COLUMNS)} "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
         (catalog_source, object_ref)).fetchall()
-    for (ref, kind, table, column, definition, concept, domain, entity, semantic_terms,
-         ai_summary) in rows:
+    for row in rows:
+        ref, kind = row[0], row[1]
         conn.execute(
             f"UPDATE graph_node SET search_doc = {_SEARCH_DOC} "
             "WHERE catalog_source = %s AND object_ref = %s",
-            (*_search_doc_params(kind, table, column, definition, concept, domain, entity,
-                                 semantic_terms, ai_summary),
-             catalog_source, ref))
+            (*_search_doc_params(kind, *row[2:]), catalog_source, ref))
+
+
+def rebuild_search_docs(conn, catalog_source: str) -> int:
+    """Re-derive EVERY node's ``search_doc`` in one catalog and return the row count.
+
+    The backfill seam for a search-document CHANGE (migration 1052 gave table nodes their
+    definition/business_context slots): rows written by an older build of :data:`_SEARCH_DOC` keep
+    their old document until something touches them, so a catalog uploaded before the change stays
+    unfindable by its table prose forever. This walks the catalog through the ONE expression — the
+    same function the inserts and the per-ref rebuild use, so a backfilled document and a freshly
+    inserted one are identical by construction. Idempotent, and a no-op on an unknown source."""
+    rows = conn.execute(
+        f"SELECT object_ref, kind, {', '.join(_SEARCH_DOC_SOURCE_COLUMNS)} "
+        "FROM graph_node WHERE catalog_source = %s ORDER BY object_ref",
+        (catalog_source,)).fetchall()
+    for row in rows:
+        conn.execute(
+            f"UPDATE graph_node SET search_doc = {_SEARCH_DOC} "
+            "WHERE catalog_source = %s AND object_ref = %s",
+            (*_search_doc_params(row[1], *row[2:]), catalog_source, row[0]))
+    return len(rows)
 
 
 def _table_ref(table: str) -> str:

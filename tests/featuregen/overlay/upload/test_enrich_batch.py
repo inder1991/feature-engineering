@@ -25,7 +25,10 @@ def test_pass_a_defaults_batch_table_synth_single_and_reads_env(monkeypatch):
 def test_max_items_default_and_override(monkeypatch):
     # MF-8a — conservative isolation ceilings (were 40/12/20). The env override still wins.
     assert cfg.max_items("concept") == 20
-    assert cfg.max_items("definition") == 8
+    # `definition` lowered 8 -> 4 (2026-08-06) for a RESPONSE-token reason, not a contamination one:
+    # at `MAX_DEFINITION_LEN` = 32_000 chars a chunk of 8 needs ~64_000 output tokens, exactly the
+    # driver's escalation ceiling. Its siblings keep 8 — their outputs are short.
+    assert cfg.max_items("definition") == 4
     assert cfg.max_items("domain") == 8
     monkeypatch.setenv("OVERLAY_ENRICH_BATCH_CONCEPT_MAX_ITEMS", "16")
     assert cfg.max_items("concept") == 16
@@ -268,6 +271,24 @@ def test_run_batched_does_not_fall_back_egress_excluded_item(db, monkeypatch):
     assert "h2" not in got
 
 
+def test_unregistered_fallback_schema_loses_only_the_fallback_items(db):
+    # The single fallback requests (f"overlay_{task-tail}", version); when THAT pair is
+    # unregistered, _require_schema raises SchemaUnregisteredError AT DISPATCH (no provider call).
+    # The ladder must contain exactly this registration bug: the fallback items end in the same
+    # terminal left-uncached outcome as a budget cutoff, the batch-RESOLVED items survive, and
+    # run_batched never raises.
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "t", "column": "bal2", "type": "numeric"})]
+    task = "overlay.enrich.mystery"   # tail 'mystery' -> fallback schema 'overlay_mystery' (absent)
+    client = FakeLLM(script={task: FakeResponse(output={"results": [
+        {"ref": "h1", "concept": "monetary_stock"}]})})    # batch resolves h1, omits h2
+    got = eb.run_batched(db, client, short="concept", task=task,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock"}   # h2 lost to the broken fallback ONLY — no raise
+
+
 def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
     monkeypatch.setenv("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", "0")   # no fallback allowed
@@ -278,6 +299,62 @@ def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
                          shared_metadata={}, items=items, out_key="concept",
                          instruction="Classify.", accept=_accept_known, actor=None)
     assert got == {}   # unresolved, left uncached (retried next ingest)
+
+
+def test_a_fallback_rejection_is_ACCOUNTED_not_silently_dropped(db, monkeypatch):
+    """[F9] Task 9c's claim is "every rejection is attributable". It held on the BATCH path only.
+
+    `_account(res.outcomes)` has one call site, inside `process`. `_fallback` called
+    `_single_fallback`, kept `value` and dropped `status` — and `_single_fallback` had already
+    collapsed the acceptor's own reason code into a bare FALLBACK_FAILED one frame earlier. So an
+    item the batch missed, retried per-item, and REJECTED appeared in neither `rejects` nor
+    `outcomes`: it simply vanished, indistinguishable from one that was never attempted.
+
+    That is precisely the reading the run's `fallback_calls`-with-unexplained-`unresolved` question
+    needs (reading guide Q3), and it is the path a first live run exercises most."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "c", "type": "text"})]
+    client = FakeLLM()
+    # the batch returns nothing -> h1 falls through to the per-item fallback...
+    client.script(task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                  responses=[FakeResponse(output={"results": []})])
+    # ...which answers with a concept the acceptor refuses.
+    client.script(task=_CTASK, prompt_id="overlay_concept_v1",
+                  responses=[FakeResponse(output={"concept": "not_a_real_concept"})])
+    report: dict = {}
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None, report=report)
+
+    assert got == {}                                  # unchanged: still unresolved
+    assert report.get("rejects", {}).get("invalid_value") == 1, (
+        f"the fallback's rejection never reached the account: {report}")
+    # …under its OWN status, so a per-item refusal stays distinguishable from a batch one. (The
+    # batch's `missing` events are counted separately and are not what this test is about.)
+    assert report.get("outcomes", {}).get(eb.FALLBACK_FAILED) == 1, report
+
+
+def test_a_RESOLVED_fallback_is_not_counted_as_a_rejection(db, monkeypatch):
+    """The inverse, and the mistake the [F9] wiring invites: `_account` skips VALID, but a rescued
+    item carries FALLBACK_VALID. Routing fallbacks through the account without teaching it that
+    second success token would count every rescue as a reject — inverting the signal."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "c", "type": "text"})]
+    client = FakeLLM()
+    client.script(task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                  responses=[FakeResponse(output={"results": []})])
+    client.script(task=_CTASK, prompt_id="overlay_concept_v1",
+                  responses=[FakeResponse(output={"concept": "monetary_stock"})])
+    report: dict = {}
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None, report=report)
+
+    assert got == {"h1": "monetary_stock"}            # the fallback RESCUED it
+    assert eb.FALLBACK_VALID not in report.get("outcomes", {}), report
+    assert "valid" not in report.get("rejects", {}), report
 
 
 def test_enrich_concepts_batch_mode_caches_valid_only(db, monkeypatch):
@@ -341,3 +418,24 @@ def test_definition_cache_key_includes_concept(db):
     from featuregen.overlay.upload.enrich import _def_cache_key
     row = CanonicalRow("deposits", "accounts", "bal", "numeric")
     assert _def_cache_key(content_hash(row), "monetary_stock") != _def_cache_key(content_hash(row), "")
+
+
+def test_the_split_tier_is_intentionally_unreachable_for_definitions():
+    """A failure-mode consequence of `max_items("definition")` 8 -> 4, decided rather than discovered.
+
+    `run_batched`'s adaptive-split tier fires on `len(unresolved) > b.min_split`. With `min_split`
+    at 4 and a definition chunk holding at most 4 items, that condition can never hold: a definition
+    chunk failing past its batch retries goes STRAIGHT to per-item single fallback.
+
+    That is the intended outcome and `min_split` is deliberately not lowered for this stage — the
+    split tier exists to avoid per-ITEM cost on a LARGE chunk (20 concept items to 10+10 to 5+5
+    beats 20 single calls), and at 4 items there is no such saving while single fallback gives
+    strictly better isolation. This test is what fires if `max_items` is ever raised back above
+    `min_split` and the tier silently reactivates, so the rationale gets re-read rather than assumed.
+    """
+    assert cfg.max_items("definition") <= cfg.budget("definition").min_split, (
+        "the split tier is reachable again for definitions — re-read the note on "
+        "`_DEFAULT_MAX_ITEMS` before relying on either behaviour")
+    # The stages that DO still reach it, so this is a real distinction and not a vacuous inequality.
+    assert cfg.max_items("concept") > cfg.budget("concept").min_split
+    assert cfg.max_items("summary") > cfg.budget("summary").min_split

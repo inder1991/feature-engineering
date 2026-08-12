@@ -15,6 +15,7 @@ import os
 from dataclasses import dataclass
 
 from featuregen.intake.llm import (
+    _MAX_REPAIR_FEEDBACK_CHARS,
     DEFAULT_LLM_MODEL,
     PROVIDER_AUTH_ERROR,
     PROVIDER_MAX_TOKENS,
@@ -25,10 +26,29 @@ from featuregen.intake.llm import (
     LLMRequest,
     LLMResult,
 )
-from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
+from featuregen.intake.redaction import (
+    INPUT_KEY_CATALOG,
+    INPUT_KEY_INTENT,
+    INPUT_KEY_REPAIR_ERRORS,
+)
 from featuregen.intake.schema_projection import project_for_anthropic
 
 logger = logging.getLogger(__name__)
+
+
+#: The per-call wall-clock ceiling, in seconds. RAISED 60 -> 300 (2026-08-09) to close the second
+#: half of the drift class that `enrich_config.DEFAULT_MAX_PROVIDER_CALLS` closed: the manifest
+#: shipped 300 while this defaulted to 60, so which clock bound a run depended on whether an env var
+#: happened to be set.
+#:
+#: THE PAIR IS THE UNIT, not this number. `FEATUREGEN_LLM_MAX_TOKENS` and this timeout are coupled —
+#: 4096+60 and 32000+300 are each coherent, and the manifest's own note records that 32000 with
+#: adaptive thinking at effort=high means "a slow call dies at 60s". The dangerous configuration is
+#: a MIXED pair, which is what an environment applying half the manifest gets. Raising this default
+#: makes the unconfigured case fail in the SAFE direction (a slow call gets the time the cluster
+#: gives it) at the cost of a longer worst-case lock hold, which
+#: `test_the_stage_deadline_CANNOT_bound_a_call_already_in_flight` already pins and documents.
+DEFAULT_LLM_TIMEOUT_S = 300.0
 
 
 @dataclass(frozen=True)
@@ -39,9 +59,13 @@ class ClaudeConfig:
     thinking: str = "adaptive"           # adaptive thinking (§9.5); budget_tokens is a 400 on 4.8
     effort: str = "high"
     # MF-4 — per-call wall-clock ceiling (seconds). A hung provider call would otherwise hold the
-    # source advisory lock indefinitely and could fail the whole catalog ingest. Retries stay bounded
-    # (2, unchanged); this bounds each attempt. Default 60s (env FEATUREGEN_LLM_TIMEOUT).
-    timeout: float = 60.0
+    # source advisory lock indefinitely and could fail the whole catalog ingest. This bounds each
+    # PHYSICAL attempt — and because `_SDK_MAX_RETRIES` is 0 it is also the entire wall clock of one
+    # `messages.create`, so the ceiling an operator configures is the ceiling that elapses. The
+    # driver's bounded repair/retry budget (§9.2) is the only retry layer above it.
+    # Default `DEFAULT_LLM_TIMEOUT_S` (env FEATUREGEN_LLM_TIMEOUT), pinned EQUAL to the manifest by
+    # `test_the_CODE_DEFAULT_timeout_is_the_one_the_manifest_ships`.
+    timeout: float = DEFAULT_LLM_TIMEOUT_S
 
     @classmethod
     def from_env(cls) -> ClaudeConfig:
@@ -51,7 +75,7 @@ class ClaudeConfig:
             max_tokens=int(os.environ.get("FEATUREGEN_LLM_MAX_TOKENS", "4096")),
             thinking=os.environ.get("FEATUREGEN_LLM_THINKING", "adaptive"),
             effort=os.environ.get("FEATUREGEN_LLM_EFFORT", "high"),
-            timeout=float(os.environ.get("FEATUREGEN_LLM_TIMEOUT", "60")),
+            timeout=float(os.environ.get("FEATUREGEN_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_S))),
         )
 
 
@@ -94,7 +118,11 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
     user message — byte-for-byte today's rendering (definition/domain batches, single-mode calls, and
     every non-enrichment caller are unaffected). Pure + SDK-free so the split is unit-testable
     without importing the provider SDK. Operates on a COPY of the catalog metadata, so
-    ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched."""
+    ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched.
+
+    A REPAIR re-call additionally appends the driver's value-free validation complaint to the user
+    turn (see the ``INPUT_KEY_REPAIR_ERRORS`` block below); a first attempt carries no such key and
+    renders exactly as before."""
     intent = request.inputs.get(INPUT_KEY_INTENT, "")
     catalog = dict(request.inputs.get(INPUT_KEY_CATALOG, {}) or {})
     cache_keys = [k for k in request.cacheable_metadata_keys if k in catalog]
@@ -109,6 +137,20 @@ def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
         f"Intent (redacted, LLM-safe): {intent}\n"
         f"Catalog metadata (names/types/grain only): {catalog}"
     )
+    # A repair re-call carries the errors that refuted the previous answer. Without this the
+    # repair sends byte-identical bytes and the budget buys nothing. The key is `_`-prefixed so it
+    # stays OUT of `compute_input_hash` — the repair keeps its parent's identity while differing
+    # on the wire, which is exactly the intent. The values are already value-free (`_safe_reason`).
+    # It is the SHARED `INPUT_KEY_REPAIR_ERRORS` constant, never a literal: the writer is in
+    # `llm.drive_structured_call` and a rename on one side alone would silently revert every repair
+    # to a byte-identical re-call.
+    errors = request.inputs.get(INPUT_KEY_REPAIR_ERRORS)
+    if errors:
+        rendered = "; ".join(str(e) for e in errors)[:_MAX_REPAIR_FEEDBACK_CHARS]
+        user_content += (
+            "\n\nYour previous answer did not validate against the required output schema. "
+            f"Correct exactly these problems and return the fixed structure: {rendered}"
+        )
     return system, user_content
 
 
@@ -127,6 +169,20 @@ def _wire_output_config(request: LLMRequest, config: ClaudeConfig) -> dict:
     }
 
 
+def _effective_timeout(request: LLMRequest, config: ClaudeConfig) -> float:
+    """The per-attempt wall clock (MF-4), SCALED by any truncation escalation the driver applied.
+
+    `config.timeout` stays the baseline for every ordinary call — the deployment layer owns that
+    value via FEATUREGEN_LLM_TIMEOUT, and this multiplies it rather than replacing it, so raising
+    the configured value raises the escalated ceilings with it. `request.timeout_scale` is 1.0
+    unless `_escalated` raised `max_tokens`, in which case it carries the SAME ratio: an attempt
+    allowed 4x the output tokens is allowed 4x the time to generate them. Without this the
+    escalated retry is cut off mid-generation and the truncation is merely relabelled as an
+    APITimeoutError -> PROVIDER_NON_RETRYABLE, which now ends the call outright. Pure + SDK-free so
+    a unit test can prove the coupling without importing the SDK."""
+    return config.timeout * request.timeout_scale
+
+
 # JSON-Schema keywords a provider 400 might name. Length/array-size/numeric bounds are stripped by the
 # wire projection; `enum`/`type` round out the recognizable tokens. Order = extraction priority.
 _SCHEMA_KEYWORDS = ("maxLength", "maxItems", "minItems", "minimum", "maximum",
@@ -140,6 +196,48 @@ def _rejected_schema_keyword(message: str) -> str | None:
         if kw in message:
             return kw
     return None
+
+
+#: `max_retries` for the Anthropic client. ZERO, deliberately.
+#:
+#: The SDK default is 2, and it retries `APITimeoutError` internally — its own documentation states
+#: "wall-clock can reach timeout x (max_retries+1)". So the SDK silently does, one layer down, the
+#: exact thing the `APITimeoutError` arm below refuses to do: re-issue a request identically after
+#: it needed longer than the clock it was given. Left at the default, a 300s configured ceiling
+#: costs up to 900s per physical attempt, and the per-attempt bound MF-4 exists to enforce (see
+#: `ClaudeConfig.timeout`) is multiplied by 3 while the source advisory lock is held.
+#:
+#: With this at 0, `drive_structured_call`'s bounded repair/retry budget is the ONE retry authority
+#: (spec §9.2), the elapsed wall time equals `_effective_timeout`, and the warning that arm logs is
+#: honest rather than a third of the truth.
+#:
+#: WHAT THIS GIVES UP. Three classes, not one — the SDK was absorbing more than self-inflicted
+#: rate-limit bursts, and each is listed with where it now lands:
+#:
+#: 1. CONNECTION-LEVEL TIMEOUTS, and this is the sharp edge. The SDK raises `APITimeoutError` from
+#:    ANY `httpx.TimeoutException` — connect, pool and write, not only "this generation needed more
+#:    clock". All of them reach the `APITimeoutError` arm below, which returns
+#:    PROVIDER_NON_RETRYABLE, which `llm.py` treats as terminal. So a sub-second TCP connect blip
+#:    now kills the chunk with no retry at ANY layer. NOT recovered here and NOT recovered by the
+#:    driver's backoff (that arm is never reached): the fix is to stop classifying every
+#:    `APITimeoutError` as a generation overrun, which is a change to the arm's own contract rather
+#:    than to this constant. Tracked as DEFERRED-WORK A.49.
+#: 2. PROVIDER-SIDE CAPACITY — 529 `overloaded_error`, and org-wide or shared-key ITPM/OTPM limits.
+#:    These are independent of OUR concurrency: one sequential caller issuing max_tokens=32000
+#:    requests is exactly the shape that meets an output-token-per-minute ceiling. They map to
+#:    PROVIDER_TRANSIENT and are RECOVERED, by the bounded backoff `llm._TRANSIENT_BACKOFF_BASE_S`
+#:    adds to the driver's own retry arm — at the layer that can see the disposition, and costing
+#:    ≤3s against a 2700s worst-case chain.
+#: 3. A LONG `retry-after`. Bounded backoff does not clear a 30-60s per-minute quota, and the
+#:    PROVIDER_* taxonomy carries no metadata channel to pass the provider's header into the
+#:    decision. Partially given up, deliberately, and tracked as DEFERRED-WORK A.49.
+#:
+#: What is NOT given up is the self-inflicted burst: `run_batched` issues chunks strictly
+#: sequentially from a single-replica backend, so there is no concurrency of ours to rate-limit.
+#: And the SDK's own sleeps were themselves an unbounded addition to the lock hold — a
+#: `retry-after: 60` sleeps outside the `timeout` budget entirely — which the driver's capped
+#: backoff is not.
+_SDK_MAX_RETRIES = 0
 
 
 class ClaudeLLM:
@@ -163,7 +261,7 @@ class ClaudeLLM:
                     "anthropic SDK not installed; failing closed (no FakeLLM fallback, D5)"
                 ) from exc
             try:
-                self._client = anthropic.Anthropic()
+                self._client = anthropic.Anthropic(max_retries=_SDK_MAX_RETRIES)
             except Exception as exc:  # missing creds / config → fail closed
                 raise LLMAdapterUnavailable(f"Claude adapter unavailable: {exc}") from exc
         return self._client
@@ -196,7 +294,9 @@ class ClaudeLLM:
                     "type": request.generation_settings.get("thinking", self._config.thinking)},
                 "output_config": output_config,
                 "messages": [{"role": "user", "content": user_content}],
-                "timeout": self._config.timeout,   # MF-4 — bound each attempt (retries bounded at 2)
+                # MF-4 — bound each attempt (retries bounded at 2), scaled by any truncation
+                # escalation so a retry granted more tokens is granted the time to generate them.
+                "timeout": _effective_timeout(request, self._config),
             }
             if system is not None:                 # vocab-caching: a cached shared-prefix system block
                 create_kwargs["system"] = system   # (omitted entirely when there is no static prefix)
@@ -215,8 +315,34 @@ class ClaudeLLM:
             if status == 429 or status >= 500:
                 return _fail(PROVIDER_TRANSIENT)    # rate-limit / transient 5xx → bounded retry
             return _fail(PROVIDER_NON_RETRYABLE)    # other non-retryable 4xx → fail closed
+        except anthropic.APITimeoutError:
+            # NOT transient, and ordered BEFORE APIConnectionError because it is a SUBCLASS of it —
+            # today this exception reaches that arm by inheritance, never by intent.
+            #
+            # The CASE THIS ARM IS FOR is a generation that needed longer than the ceiling it was
+            # given: deterministic, so re-attempting it identically spends the budget proving it.
+            # Fail closed; the stage reports it and the operator raises FEATUREGEN_LLM_TIMEOUT or
+            # switches this adapter to streaming.
+            #
+            # THE CASE IT ALSO CATCHES, and should not: the SDK raises APITimeoutError from ANY
+            # `httpx.TimeoutException`, so a connect/pool/write timeout — a transient network blip,
+            # not a long generation — takes this same terminal path. That used to be masked because
+            # the SDK retried those internally; `_SDK_MAX_RETRIES = 0` removed the mask without
+            # narrowing this arm, so the blip now kills the chunk with no retry at any layer.
+            # KNOWN AND TRACKED (DEFERRED-WORK A.49) rather than silently narrowed here: splitting
+            # the two needs a discriminator this arm does not currently have, and widening what
+            # counts as retryable is a change to the §9.2 taxonomy's contract, not a comment fix.
+            #
+            # The logged clock is the EFFECTIVE one (an escalated truncation retry runs at a
+            # multiple of the configured value), or the operator reads a ceiling that was never
+            # applied — and with no SDK retry layer beneath it, that effective clock is also the
+            # real elapsed wall time rather than a third of it.
+            logger.warning("anthropic call timed out after %.0fs (task=%s) — non-retryable; "
+                           "raise FEATUREGEN_LLM_TIMEOUT or stream",
+                           _effective_timeout(request, self._config), request.task)
+            return _fail(PROVIDER_NON_RETRYABLE)
         except anthropic.APIConnectionError:
-            return _fail(PROVIDER_TRANSIENT)        # network → bounded retry
+            return _fail(PROVIDER_TRANSIENT)        # network → bounded retry (NOT a timeout: above)
 
         provider_status = _map_stop_reason(resp.stop_reason)
         output, scores = _parse_structured(resp)

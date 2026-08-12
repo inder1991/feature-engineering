@@ -29,11 +29,10 @@ is a refusal rather than a default. The model is never asked for them.
 from __future__ import annotations
 
 import os
-
 from dataclasses import dataclass, field
 
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure, Window
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.intake.llm import (
@@ -54,6 +53,13 @@ from featuregen.intake.redaction import (
     redact_free_text,
 )
 
+# The CLOSED Release-B refusal vocabulary, imported rather than re-spelled: one set, one spelling,
+# one owner (`overlay.upload.source_selection`). That module is deliberately import-light — it
+# defers `semantic_context` to call time — so this stays a cheap import for the analysis package,
+# unlike the `enrich_llm` dependency the helper above exists to avoid.
+from featuregen.overlay.upload.source_selection import SELECTION_REFUSAL_CODES
+
+
 def _generation_settings() -> dict:
     """Provider + model + the pinned knobs, from the SAME env that configures the client.
 
@@ -73,7 +79,14 @@ def _generation_settings() -> dict:
 
 TASK = "analysis.intent"
 PROMPT_ID = "analysis_intent_v1"
+#: The INPUT contract's version, stamped on the immutable llm_call record.
+#:   1 — offered refs + labels only (the shape this module shipped with).
+#:   2 — v1 plus bounded `SemanticContextBundleV1.for_analysis_planning` projections carrying the
+#:       D2 authority axes and the closed missing-context codes (semantic Task 9).
+#: The OUTPUT schema is UNCHANGED at both versions — the version identifies which INPUT egressed,
+#: which is the only thing that makes an audit record unambiguous about what the model was shown.
 PROMPT_VERSION = 1
+PROMPT_VERSION_V2 = 2
 SCHEMA_ID = "analysis_intent"
 SCHEMA_VERSION = 1
 
@@ -83,9 +96,10 @@ MEASURE_OPS: frozenset[str] = frozenset({"count", "count_distinct", "sum", "avg"
 COMPARISONS: frozenset[str] = frozenset({"", "decrease", "increase", "change"})
 CALENDAR_UNITS: frozenset[str] = frozenset({"month", "day"})
 
-#: What the model may say it could not determine. Closed so an abstention is actionable — a free-text
-#: "not sure" cannot be routed to a clarification question.
-UNRESOLVED_CODES: frozenset[str] = frozenset({
+#: What THE MODEL may say it could not determine. Closed so an abstention is actionable — a
+#: free-text "not sure" cannot be routed to a clarification question. This set, and only this set,
+#: is what the wire schema's `unresolved` enum admits and what `validate_intent` accepts back.
+MODEL_UNRESOLVED_CODES: frozenset[str] = frozenset({
     "entity",          # who the question is about
     "measure",         # what is being counted or aggregated
     "windows",         # which periods
@@ -97,6 +111,19 @@ UNRESOLVED_CODES: frozenset[str] = frozenset({
     # something with less standing than the catalog.
     "population",
 })
+
+#: Every abstention that can become a CLARIFICATION — the model's own codes plus the closed
+#: Release-B selection refusals (`overlay.upload.source_selection.SELECTION_REFUSAL_CODES`).
+#:
+#: THE SPLIT IS DELIBERATE, and it is the reason `MODEL_UNRESOLVED_CODES` exists at all. The wire
+#: schema's enum is derived from this vocabulary, so widening one set widens what the model is
+#: invited to assert. Functional rule 1 says the LLM never attests uniqueness, overlap, population
+#: completeness or row-history correctness — so a model must not be able to answer `TEMPORAL_SCD_OVERLAP`
+#: or `SELECTION_BINDING_MISSING`. Those are conditions the SELECTOR observes about the catalog and
+#: the data, never things a language model can know. Keeping the schema enum on the narrow set also
+#: leaves the request body byte-identical, so no prompt/schema version bump and no replay churn
+#: (D10: a schema change is a REAL version bump, never a silent widening).
+UNRESOLVED_CODES: frozenset[str] = MODEL_UNRESOLVED_CODES | SELECTION_REFUSAL_CODES
 
 #: Every wire object is CLOSED (`additionalProperties: false`) and every slot declared. A previous
 #: schema in this codebase left objects open and a model omitted a required-but-unenforced field,
@@ -165,8 +192,10 @@ INTENT_SCHEMA: dict = {
             },
         },
         "comparison": {"type": "string", "enum": sorted(COMPARISONS)},
+        # The MODEL's vocabulary only (see MODEL_UNRESOLVED_CODES): a language model may not assert
+        # a selection/temporal condition it cannot observe.
         "unresolved": {"type": "array", "items": {"type": "string",
-                                                 "enum": sorted(UNRESOLVED_CODES)}},
+                                                 "enum": sorted(MODEL_UNRESOLVED_CODES)}},
     },
 }
 
@@ -195,6 +224,42 @@ class IntentCandidates:
 
 
 @dataclass(frozen=True, slots=True)
+class AnalysisIntentInputV2:
+    """The VERSIONED input contract for intent extraction (semantic Task 9).
+
+    :class:`IntentCandidates` is UNVERSIONED and stays that way — it is the closed offered set and
+    nothing more. This wrapper is what carries a version, so a later shape change is a contract
+    bump with an audit trail rather than a silent widening of what the model was shown.
+
+    **Placement is deliberately unchanged.** Everything here rides in the SAME `catalog_metadata`
+    block the offered refs already ride in, which lands in the USER turn beside the instruction
+    telling the model to choose only from them. Moving metadata into a cacheable `system` block once
+    separated the refs from that instruction and the extraction failed validation until the repair
+    budget ran out — a recorded repair-exhaustion history, not a hypothetical. So: version the
+    contract, add keys, move nothing.
+
+    `context` entries are bounded `for_analysis_planning` projections, each keyed by the SAME `ref`
+    spelling :func:`validate_intent` matches on. They are EXPLANATION: context can never widen what
+    may be named, because validation still turns on `candidates.column_refs` alone."""
+
+    candidates: IntentCandidates
+    context: tuple[dict, ...] = ()
+    #: Closed `MISSING_CONTEXT_CODES` for the offered set as a whole — what this view does NOT
+    #: carry. Read-scoped by construction, so it is never a data-quality verdict.
+    missing_context: tuple[str, ...] = ()
+    contract_version: int = 2
+
+
+def _as_input(candidates: IntentCandidates | AnalysisIntentInputV2) -> AnalysisIntentInputV2:
+    """Accept either contract. An `IntentCandidates` is the v1 input, unchanged and unversioned;
+    the wrapper is what a v2 caller passes. Both are supported on purpose — the analysis route is
+    not the only caller, and forcing every test to wrap would be churn without a property."""
+    if isinstance(candidates, AnalysisIntentInputV2):
+        return candidates
+    return AnalysisIntentInputV2(candidates=candidates, contract_version=1)
+
+
+@dataclass(frozen=True, slots=True)
 class IntentExtraction:
     """A candidate plan plus what the model abstained on.
 
@@ -214,62 +279,123 @@ class IntentExtraction:
 
 
 def validate_intent(output: dict, candidates: IntentCandidates) -> None:
-    """Raise :class:`SchemaValidationError` when the model chose something it was not offered.
+    """Raise :class:`AttestedSchemaValidationError` when the model chose something it was not offered.
 
     Driving this through the repair loop rather than refusing outright is deliberate: the complaint
     names the offending ref, so a second attempt can correct it. What must never happen is a ref
     passing through — it would ground against nothing and read as a catalog gap rather than a model
     error.
+
+    **Two complaints, and they are not the same string.** The MESSAGE stays as informative as it
+    has always been — it interpolates the ref, and it is read by a human looking at a traceback,
+    which no wire and no audit column ever sees. The ATTESTED reason
+    (:class:`AttestedSchemaValidationError`) is the one `intake.llm._safe_reason` sends back to the
+    provider and writes to `llm_call.repair_attempts`, so it is built from THIS FILE'S literals and
+    the closed vocabularies declared at the top of it, and from nothing else.
+
+    Every one of these raises used to reach `_safe_reason` with no jsonschema `__cause__`, so the
+    whole intent flow complained with one generic constant — the repair budget bought a
+    differently-shaped prompt carrying no information. Each site now attests.
+
+    **What is deliberately NOT attested, at every site.**
+
+    * The ref itself (`{ref!r}`, `{op!r}`, `{code!r}`, …). It is model-supplied text on an egress
+      path. "The model already knows it" is a claim about ONE of the four sinks: the reason also
+      lands in audit columns that store verbatim and never re-scan, and a model that was shown a
+      question whose PII the scanner missed can echo it straight back into `entity_ref`. Task 2's
+      `_path_is_schema_declared` suppresses exactly this class of text from the structural pointer;
+      attesting it here would re-admit through the front door what that guard turns away at the
+      back, two commits later, on the same function.
+    * The offered-column `sample`. It is CATALOG text. It already egresses inside
+      `catalog_metadata` — but that is a property of the CALLER, and `validate_intent` is public,
+      so the safety of an egress string would rest on an invariant nothing enforces. It also buys
+      nothing: `_wire_prompt` re-renders the full `catalog_metadata`, including every offered
+      `column_refs` entry, in the repair turn itself. The model is already holding the list.
+
+    What the shape-only reason costs: the model is told which field failed and what that field
+    wants, not which of its refs was wrong. It has one answer in front of it and one named field to
+    fix, which is what the repair loop needed and never had.
     """
     offered = sorted(candidates.column_refs)
     # Bounded: enough to correct the answer, not so many that the complaint becomes another prompt.
     sample = ", ".join(offered[:12]) + ("" if len(offered) <= 12 else ", ...")
 
-    def _require_column(ref: str, what: str) -> None:
+    def _require_column(ref: str, what: str, field: str) -> None:
+        # TWO namings on purpose. `what` is the prose the MESSAGE has always used, read by a human
+        # in a traceback. `field` is the JSON field path the attested reason uses, read by the model
+        # and by whoever queries `llm_call.repair_attempts`. Both are author literals at all four
+        # call sites — which are the only ones there can be, this closure being local to
+        # `validate_intent` — and that locality is the whole reason attesting them is safe.
         if ref and ref not in candidates.column_refs:
             hint = ""
+            attested = f"{field}: not one of the offered column_refs"
             if ref in candidates.table_refs:
                 # The observed failure: the customer TABLE was given where a column identifying the
-                # customer was required. Naming the confusion is what lets one repair fix it.
+                # customer was required. Naming the confusion is what lets one repair fix it — and
+                # the confusion is a SHAPE, so it survives into the attested reason intact.
                 hint = (f" — that is a TABLE. {what} must be a COLUMN, one of the offered "
                         f"column_refs")
-            raise SchemaValidationError(
+                attested = (f"{field}: that is one of the offered table_refs; it must be one of "
+                            f"the offered column_refs")
+            raise AttestedSchemaValidationError(
                 f"{what} {ref!r} is not one of the columns offered for this question{hint}. "
-                f"Choose from: {sample}")
+                f"Choose from: {sample}",
+                llm_safe_reason=attested)
 
-    _require_column(str(output.get("entity_ref", "")), "entity_ref")
+    _require_column(str(output.get("entity_ref", "")), "entity_ref", "entity_ref")
     table = str(output.get("base_table_ref", ""))
     if table and table not in candidates.table_refs:
-        raise SchemaValidationError(
-            f"base_table_ref {table!r} is not one of the tables offered for this question")
+        raise AttestedSchemaValidationError(
+            f"base_table_ref {table!r} is not one of the tables offered for this question",
+            llm_safe_reason="base_table_ref: not one of the offered table_refs")
 
     measure = output.get("measure") or {}
     op = str(measure.get("op", ""))
     if op not in MEASURE_OPS:
-        raise SchemaValidationError(f"measure op {op!r} is not one of {sorted(MEASURE_OPS)}")
+        # MEASURE_OPS is an in-code closed vocabulary that ALREADY egresses — `INTENT_SCHEMA`
+        # carries it verbatim as the `measure.op` enum on every call. Author text, not data.
+        raise AttestedSchemaValidationError(
+            f"measure op {op!r} is not one of {sorted(MEASURE_OPS)}",
+            llm_safe_reason=("measure.op: not one of the operations this contract defines: "
+                             f"{sorted(MEASURE_OPS)}"))
     # count(*) needs no column; every other op aggregates one, and an op with no ref is not a measure.
     measure_ref = str(measure.get("logical_ref", ""))
     if op != "count" and not measure_ref:
-        raise SchemaValidationError(f"measure op {op!r} needs a column to aggregate")
-    _require_column(measure_ref, "measure logical_ref")
+        raise AttestedSchemaValidationError(
+            f"measure op {op!r} needs a column to aggregate",
+            llm_safe_reason=("measure.logical_ref: required for every op except 'count', which "
+                             "counts rows and takes no column"))
+    _require_column(measure_ref, "measure logical_ref", "measure.logical_ref")
 
     for window in output.get("windows") or ():
-        _require_column(str(window.get("anchor_ref", "")), "window anchor_ref")
+        _require_column(str(window.get("anchor_ref", "")), "window anchor_ref",
+                        "windows[].anchor_ref")
         if not str(window.get("label", "")).strip():
-            raise SchemaValidationError(
+            # The only site whose message was already value-free. Attested anyway: the seam is the
+            # TYPE, and one site left generic because its message happened to be safe is a trap for
+            # whoever edits it next.
+            raise AttestedSchemaValidationError(
                 "every window needs a label: partition values are matched to windows by label, and "
-                "position would swap two periods and invert the answer")
+                "position would swap two periods and invert the answer",
+                llm_safe_reason="windows[].label: every window needs a non-empty label")
     for dimension in output.get("dimensions") or ():
-        _require_column(str(dimension.get("logical_ref", "")), "dimension logical_ref")
+        _require_column(str(dimension.get("logical_ref", "")), "dimension logical_ref",
+                        "dimensions[].logical_ref")
 
     comparison = str(output.get("comparison", ""))
     if comparison not in COMPARISONS:
-        raise SchemaValidationError(f"comparison {comparison!r} is not one of {sorted(COMPARISONS)}")
+        raise AttestedSchemaValidationError(
+            f"comparison {comparison!r} is not one of {sorted(COMPARISONS)}",
+            llm_safe_reason=("comparison: not one of the values this contract defines: "
+                             f"{sorted(COMPARISONS)}"))
 
     for code in output.get("unresolved") or ():
-        if code not in UNRESOLVED_CODES:
-            raise SchemaValidationError(
-                f"unresolved code {code!r} is not actionable; use one of {sorted(UNRESOLVED_CODES)}")
+        if code not in MODEL_UNRESOLVED_CODES:
+            raise AttestedSchemaValidationError(
+                f"unresolved code {code!r} is not actionable; use one of "
+                f"{sorted(MODEL_UNRESOLVED_CODES)}",
+                llm_safe_reason=("unresolved[]: not an actionable abstention code; use one of "
+                                 f"{sorted(MODEL_UNRESOLVED_CODES)}"))
 
 
 def _plan_from(output: dict, question: str) -> AnalysisPlanV1:
@@ -307,7 +433,8 @@ def _plan_from(output: dict, question: str) -> AnalysisPlanV1:
     )
 
 
-def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCandidates, *,
+def extract_intent(conn, client: LLMClient, question: str,
+                   candidates: IntentCandidates | AnalysisIntentInputV2, *,
                    actor: IdentityEnvelope, model: str | None = None) -> IntentExtraction:
     """Turn a question into a candidate plan, or fail into clarification.
 
@@ -325,26 +452,37 @@ def extract_intent(conn, client: LLMClient, question: str, candidates: IntentCan
     The plan is NOT grounded here. Grounding is a separate pass over the catalog's governed facts,
     and keeping the two apart is what stops a model's confidence being mistaken for evidence.
     """
+    supplied = _as_input(candidates)
+    candidates = supplied.candidates
     # The question is the intent; the offered catalog objects are metadata. Same split the
     # enrichment path uses, so the reserved-key contract `assert_llm_safe` checks is satisfied.
     redaction = redact_free_text(question)
+    metadata: dict = {
+        "column_refs": sorted(candidates.column_refs),
+        "table_refs": sorted(candidates.table_refs),
+        "labels": dict(sorted(candidates.labels.items())),
+        "instruction":
+            "Choose, from the offered catalog objects only, which ones this question is about. "
+            "Never name a ref that is not offered. Express periods as whole calendar units. If "
+            "the question does not determine something, list it in `unresolved` and leave it "
+            "empty rather than guessing.",
+    }
+    if supplied.contract_version >= 2:
+        # SAME BLOCK, new keys — placement is deliberately untouched (see AnalysisIntentInputV2).
+        metadata["contract_version"] = supplied.contract_version
+        if supplied.context:
+            metadata["semantic_context"] = [dict(entry) for entry in supplied.context]
+        if supplied.missing_context:
+            metadata["missing_context"] = list(supplied.missing_context)
     inputs = build_llm_inputs(
-        redaction,
-        catalog_metadata={
-            "column_refs": sorted(candidates.column_refs),
-            "table_refs": sorted(candidates.table_refs),
-            "labels": dict(sorted(candidates.labels.items())),
-            "instruction":
-                "Choose, from the offered catalog objects only, which ones this question is about. "
-                "Never name a ref that is not offered. Express periods as whole calendar units. If "
-                "the question does not determine something, list it in `unresolved` and leave it "
-                "empty rather than guessing.",
-        },
+        redaction, catalog_metadata=metadata,
         raw_input_classification=(
             "contains_pii" if redaction.redacted_spans else "clean"))
 
     request = LLMRequest(
-        task=TASK, prompt_id=PROMPT_ID, prompt_version=PROMPT_VERSION, inputs=inputs,
+        task=TASK, prompt_id=PROMPT_ID,
+        prompt_version=(PROMPT_VERSION_V2 if supplied.contract_version >= 2 else PROMPT_VERSION),
+        inputs=inputs,
         output_schema_id=SCHEMA_ID, output_schema_version=SCHEMA_VERSION,
         # From the SAME env that configures the client, so the audit record says what the adapter
         # actually applied — and `llm_call.provider` is NOT NULL, so an empty dict cannot be written

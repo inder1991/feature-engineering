@@ -92,8 +92,8 @@ body {
   background: var(--ground);
   color: var(--ink);
   font-family: var(--font-sans);
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -290,11 +290,13 @@ table,
 .shell > main {
   flex: 1;
   min-width: 0;
-  padding: 36px 32px 64px;
+  padding: 20px 28px 48px;
 }
 
 .shell > main > * {
-  max-width: 1120px;
+  width: min(1240px, 100%);
+  max-width: 1240px;
+  margin-inline: auto;
 }
 
 /* ---------------------------------------------------------------- page head */
@@ -1638,15 +1640,459 @@ section > h2:first-child {
 }
 
 /* the canvas */
-.ln-wrap {
-  position: relative;
-  height: 640px;
-  margin-block: 16px;
+/* The graph workspace: three dedicated columns, per the reviewed concept. Nothing is positioned
+   over the canvas any more, so no control can cover a node or an edge label. */
+/* The graph anchor bar. Joined to the workspace below it — one object, one border — exactly as
+   the artifact draws it (radius top-only here, bottom-only there, no border between). */
+.ln-contextbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  min-height: 47px;
+  margin-top: 16px;
+  padding: 8px 12px;
   border: 1px solid var(--line);
-  border-radius: var(--radius-panel);
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;
+  background: var(--surface);
+}
+
+.ln-context-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.ln-context-kind {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  flex: none;
+  place-items: center;
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 800;
+}
+
+.ln-context-name { min-width: 0; }
+
+.ln-context-name strong {
+  display: block;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ln-context-name small {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-faint);
+}
+
+.ln-context-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.ln-wrap {
+  display: grid;
+  grid-template-columns: 205px minmax(540px, 1fr) 328px;
+  height: 680px;
+  margin-block: 0 16px;
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-panel) var(--radius-panel);
   background: var(--surface);
   box-shadow: var(--shadow);
   overflow: hidden;
+}
+
+.ln-tools {
+  overflow: auto;
+  padding: 14px 13px;
+  border-right: 1px solid var(--line);
+  /* A step back from the canvas: the map is the subject, the controls are chrome. */
+  background: var(--surface-2);
+}
+
+.ln-tool-section {
+  margin-top: 18px;
+  padding-top: 15px;
+  border-top: 1px solid var(--line);
+}
+
+.ln-tool-section--first {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.ln-micro {
+  margin: 0 0 8px;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* A layer is a name AND what it means, so the row is three columns: box, swatch, wording. */
+.ln-layer {
+  display: grid;
+  grid-template-columns: 16px 8px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 6px 0;
+}
+
+.ln-layer input {
+  width: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+}
+
+.ln-swatch {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+}
+
+.ln-layer strong {
+  display: block;
+  font-size: 11.5px;
+}
+
+.ln-layer small {
+  display: block;
+  margin-top: 1px;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.ln-legend {
+  display: grid;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.ln-legend-row {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+/* The stroke itself, so the legend shows the line rather than describing it. */
+.ln-line-sample {
+  height: 0;
+  border-top: 2px solid var(--ln-join);
+}
+
+.ln-line-sample--dashed {
+  border-top-style: dashed;
+  border-top-color: var(--warn);
+}
+
+.ln-line-sample--dotted {
+  border-top-style: dotted;
+  border-top-color: var(--line-strong);
+}
+
+.ln-scope-note {
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+/* In a column now, so it drops the floating-panel affordance it needed over the canvas. */
+.ln-tools .ln-layers {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.ln-canvas {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.ln-inspector {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  overflow: auto;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.ln-inspector-empty {
+  padding: 15px;
+}
+
+/* The inspector opens on the anchor, as the artifact does, instead of on a Close button
+   floating above a gap. */
+.ln-selected {
+  padding: 15px 15px 0;
+}
+
+.ln-selected-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ln-selected-name {
+  margin: 8px 0 0;
+  font-family: var(--font-mono);
+  font-size: 17px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.ln-selected-def {
+  margin: 8px 0 12px;
+  color: var(--ink-soft);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.ln-pillrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 13px;
+}
+
+/* Two facts per row, each in its own inset — the artifact's grid. */
+.ln-fact-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+/* One fact should not sit at half width with a hole beside it. */
+.ln-fact-grid > .ln-fact:only-child {
+  grid-column: 1 / -1;
+}
+
+.ln-fact {
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-2);
+}
+
+.ln-fact span {
+  display: block;
+  color: var(--ink-faint);
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ln-fact strong {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+/* What this map IS, over the top-left of the canvas. */
+.ln-map-label {
+  position: absolute;
+  top: 13px;
+  left: 15px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--surface) 94%, transparent);
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.ln-map-label b { color: var(--ink); }
+
+/* The ONE overlay the artifact permits, and only because it cannot take a click:
+   pointer-events:none means it can never intercept a press meant for a node. */
+.ln-canvas-summary {
+  position: absolute;
+  right: 15px;
+  bottom: 13px;
+  left: 15px;
+  max-width: calc(100% - 30px);
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  pointer-events: none;
+}
+
+.ln-canvas-stat {
+  padding: 8px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in oklch, var(--surface) 94%, transparent);
+}
+
+.ln-canvas-stat strong {
+  display: block;
+  font-size: 11px;
+}
+
+.ln-canvas-stat span {
+  color: var(--ink-faint);
+  font-size: 9.5px;
+}
+
+.ln-recommendations {
+  display: grid;
+  gap: 7px;
+  margin-top: 9px;
+}
+
+.ln-recommendation {
+  display: block;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+.ln-recommendation:hover {
+  border-color: var(--proposal);
+}
+
+.ln-recommendation strong {
+  display: block;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ln-recommendation span {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+  overflow-wrap: anywhere;
+}
+
+.ln-recommendation em {
+  display: inline-block;
+  margin-top: 5px;
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.ln-recommendation-note {
+  margin: 7px 0 0;
+  color: var(--ink-faint);
+  font-size: 9.5px;
+}
+
+/* Pinned to the foot of the column by margin-top:auto, as the artifact draws it. */
+.ln-inspector-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: auto;
+  padding: 12px 15px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.ln-inspector-actions .btn {
+  min-height: 34px;
+  height: auto;
+  padding: 7px 10px;
+  white-space: normal;
+  text-align: center;
+  line-height: 1.25;
+}
+
+.ln-inspector-section {
+  margin: 0 15px 15px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+/* One relationship, stated as a capability first and evidence second. */
+.ln-relationship {
+  margin-top: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+
+.ln-relationship strong {
+  display: block;
+  font-size: 11px;
+}
+
+.ln-relationship p {
+  margin: 3px 0 8px;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  /* break-word, not anywhere: a ref should wrap at a boundary, not split "cif_id" into
+     "cif_i" and "d". */
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+/* Three independent axes, never collapsed into one word. */
+.ln-trustline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.ln-trust-na,
+.ln-why {
+  margin: 6px 0 0;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+@media (max-width: 1400px) {
+  .ln-wrap {
+    grid-template-columns: 185px minmax(440px, 1fr) 300px;
+  }
 }
 
 .ln-wrap--placeholder {
@@ -1755,6 +2201,13 @@ section > h2:first-child {
   color: var(--ink-faint);
   font-size: 11px;
   flex: none;
+}
+
+.ln-src-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ln-src {
@@ -1866,9 +2319,34 @@ section > h2:first-child {
   color: var(--chip-ink);
 }
 
+.ln-flag--anchor {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.ln-flag--mapped {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
 .ln-flag--stale {
-  background: var(--warn-solid);
-  color: var(--chip-ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1.5px 0;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 9px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.ln-flag--stale::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn);
 }
 
 .ln-flag--feat {
@@ -1902,8 +2380,11 @@ section > h2:first-child {
   border-color: var(--warn);
 }
 
+/* A PALE head tint, as the artifact draws it — not the full warn-soft fill that made a routine
+   snapshot age read as an alert. Mixed most of the way back to the surface so it reads as a
+   tint, not a state. */
 .ln-card--stale .ln-head {
-  background: var(--warn-soft);
+  background: color-mix(in oklch, var(--warn-soft) 55%, var(--surface));
 }
 
 .ln-card--pending {
@@ -1928,13 +2409,15 @@ section > h2:first-child {
 }
 
 /* the +N expander chip on units with unfetched neighbors */
+/* Inside the card, not hanging 14px off its right edge. A control that overlaps the object it
+   acts on obscures the edge, the port and any label near it. */
 .ln-expander {
   position: absolute;
-  right: -14px;
+  right: 8px;
   top: 50%;
   transform: translateY(-50%);
-  width: 32px;
-  height: 32px;
+  width: 22px;
+  height: 22px;
   min-height: 0;
   padding: 0;
   border-radius: 999px;
@@ -2019,14 +2502,18 @@ section > h2:first-child {
    so both the 10px edge labels and the 9px .ln-kind micro-labels conform without change. */
 .ln-wrap .react-flow__edge-text {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  fill: var(--ink-faint);
+  letter-spacing: 0.04em;
+  fill: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__edge-textbg {
   fill: var(--surface);
+  stroke: var(--line);
+  stroke-width: 1px;
+  rx: 9px;
+  ry: 9px;
 }
 
 .ln-wrap .ln-edge--trace .react-flow__edge-text {
@@ -2061,35 +2548,42 @@ section > h2:first-child {
 }
 
 .ln-swatch {
-  width: 14px;
-  height: 3px;
-  border-radius: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
   display: inline-block;
   flex: none;
 }
 
 /* xyflow built-in controls + minimap, restyled onto the tokens */
 .ln-wrap .react-flow__controls {
-  box-shadow: var(--shadow);
-  border-radius: var(--radius);
+  inset: 13px 15px auto auto;
+  display: flex;
+  width: 28px;
+  height: max-content;
+  flex-direction: column;
   overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
 }
 
+/* Small, as the artifact draws them: a map control must not compete with the map. Written as
+   ONE set of declarations — earlier attempts prepended into this block and the original 32px
+   values, still sitting below them, won every time. */
 .ln-wrap .react-flow__controls-button {
-  width: 32px;
-  height: 32px;
+  width: 28px;
+  height: 26px;
+  padding: 0;
   border: none;
   border-bottom: 1px solid var(--line);
   background: var(--surface);
-  color: var(--ink);
+  color: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__controls-button:hover {
   background: var(--surface-2);
-}
-
-.ln-wrap .react-flow__controls-button svg {
-  fill: var(--ink-soft);
 }
 
 .ln-wrap .react-flow__minimap {
@@ -2102,26 +2596,52 @@ section > h2:first-child {
 
 /* detail drawer (right, inside the canvas) */
 .ln-drawer {
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 300px;
-  padding: 16px;
+  position: static;
+  width: auto;
+  padding: 15px;
   background: var(--surface);
-  border-left: 1px solid var(--line);
-  box-shadow: var(--shadow);
+  border-left: 0;
+  box-shadow: none;
   overflow: auto;
   z-index: 6;
 }
 
+/* The dismiss control sits in the corner and costs no row of its own. */
+.ln-drawer-header {
+  display: flex;
+  justify-content: flex-end;
+  height: 0;
+  margin: 0;
+}
+
+/* Was float:right, which reserves no space in the flow — a long object ref ran underneath the
+   button and collided with it. */
 .ln-drawer-close {
-  float: right;
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  min-height: 0;
+  flex: none;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink-faint);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.ln-drawer-close:hover {
+  color: var(--ink);
 }
 
 .ln-drawer-title {
+  min-width: 0;
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
   margin: 0 0 2px;
   overflow-wrap: anywhere;
@@ -2711,6 +3231,77 @@ section > h2:first-child {
   align-items: start;
 }
 
+/* Graph mode is a different investigation, not another result card. The faceted rail leaves, and
+   the canvas takes the width it was losing to it — the reviewed concept's decision 6. */
+.facet-cols--graph {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+/* Graph mode names itself in the crumb, exactly as the artifact does
+   ("Catalog · Search · Relationship intelligence"). An earlier pass hid the heading and the
+   description outright to reclaim vertical space; that removed the page's identity, which was
+   worse than the space it saved. */
+main:has(.ln-wrap) .page-head-eyebrow::after {
+  content: ' · Relationship intelligence';
+}
+
+/* A2/A3: the workspace is the subject in graph mode, so the page heading and the search row stop
+   competing for the top of the screen. Measured at ~470px of chrome before the canvas began. */
+main:has(.ln-wrap) .page-head {
+  margin-bottom: 10px;
+}
+
+main:has(.ln-wrap) .page-head > h1 {
+  font-size: 20px;
+}
+
+main:has(.ln-wrap) .page-head > p {
+  display: none;
+}
+
+/* B5: a trust axis is a reading, not an alarm. Solid green and solid brown pills read as alerts;
+   the artifact uses small quiet chips and lets the WORDS carry the verdict. */
+.ln-trustline .badge {
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--ink-soft);
+  font-size: 8.5px;
+}
+
+/* The tone classes carry a SOLID fill. Setting only the text colour to the same hue painted
+   the label onto its own background and the badge rendered as a blank coloured bar. Override
+   the fill too, so these are outlined chips with readable text. */
+.ln-trustline .badge.gj-verified {
+  border-color: var(--ok);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.ln-trustline .badge.gj-partial {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.ln-trustline .badge.gj-none {
+  border-color: var(--line);
+  background: var(--surface-2);
+  color: var(--ink-soft);
+}
+
+/* B7: the recipe is a formula, not a description. Clamp it so a long expression cannot dominate
+   the card; the full text is on the suggestions page the card links to. */
+.ln-recommendation span {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 .facet-panel {
   position: sticky;
   top: 20px;
@@ -3263,14 +3854,476 @@ button.stat:hover {
   gap: 12px;
 }
 
+/* ---- the dossier hero: tier 1, the verdict ----
+   Answers "what is this?" before any section is read. The business term leads at a size that wins
+   against everything below it; the physical ref is demoted, not lost. */
+/* The hero and its verdict strip are one object, so they must not be separated by the .adg grid
+   gap — a seam between two halves that share a border reads as a rendering fault. */
+.adg-header {
+  display: block;
+}
+
+/* A crumb-only page head: the screen's own hero states the title, so this is wayfinding, not a
+   heading block. */
+.page-head--crumb {
+  margin-bottom: 10px;
+}
+
+/* The hero and the verdict strip are ONE object: the strip is the hero's readout, so they share a
+   border and meet without a seam. Splitting them (or putting the tabs between them) is what made
+   the page read as a pile of separate slabs. */
+.adg-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 24px;
+  align-items: start;
+  padding: 19px 20px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;
+  background: var(--surface);
+}
+
+.adg-hero-main { min-width: 0; }
+
+.adg-hero-kicker {
+  margin: 0 0 6px;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
 .adg-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 24px;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+}
+
+/* A definition is a sentence. Body prose at a readable measure, never a label/value row, which is
+   how a sentence ends up scanned past. */
+.adg-hero-definition {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 68ch;
+  margin: 11px 0 0;
+  color: var(--ink-soft);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+
+.adg-hero .adg-id-flags {
+  flex-wrap: wrap;
+  margin-top: 13px;
+}
+
+.adg-hero-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+/* The headline is the business term; the fully-qualified ref rides underneath it so the physical
+   identity is never lost, only demoted. */
+.adg-fqn {
+  margin: 3px 0 4px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .adg-id-flags {
   display: inline-flex;
   gap: 6px;
+}
+
+/* ---- tier 1: the four-count strip ----
+   Extends the app-wide .stat rather than importing a private one, so the dossier reads as the same
+   system as every other screen. The qualifier line is the point: a bare `0` is a verdict, `0` with
+   "the parent table still provides context" is a fact. */
+/* One container with hairline dividers, joined to the hero above it — not four floating tiles.
+   Four shadowed cards in a row read as four things to evaluate; one strip reads as one readout. */
+.adg-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(200px, 100%), 1fr));
+  gap: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-panel) var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.adg-stat {
+  display: grid;
+  align-content: start;
+  gap: 1px;
+  padding: 11px 15px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-stat + .adg-stat {
+  border-left: 1px solid var(--line);
+}
+
+.adg-stat-label {
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.adg-stat small {
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+/* ---- tier 2: the reasoning grid ----
+   Two columns on wide screens; cards that carry a full-width payload span both. */
+.adg-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(350px, 0.85fr);
+  align-items: start;
+  gap: 12px;
+  margin-top: 15px;
+}
+
+.adg-card {
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  /* Deliberately not var(--shadow): the border does the separating here, and ten full drop shadows
+     stacked down the page is the difference between "structured" and "busy". */
+  box-shadow: 0 1px 1px oklch(0.25 0.025 225 / 0.03);
+}
+
+.adg-card--full { grid-column: 1 / -1; }
+
+/* A half-width card with no sibling beside it strands dead space; let a lone one take the row. */
+.adg-card:not(.adg-card--full):last-child:nth-child(odd) {
+  grid-column: 1 / -1;
+}
+
+/* The head's second line names which authority governs the card. In a product whose value is
+   knowing who asserted what, that sentence is the feature, not decoration. */
+.adg-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 46px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+/* 16px, not 13. At 13 the card title was the same size as the field label, the field value AND
+   the body copy under it, so the heading-to-body ratio was 1.0 and hierarchy rested entirely on
+   700-vs-600 weight, which is not perceptible. 16/13 is 1.23, just over the 1.25 a scale needs to
+   read as deliberate; the weight drops to 600 because size is now carrying the contrast. */
+.adg-card-head h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* 12px, not 10. This line explains what the card means and it was the smallest text on the page,
+   at 77% of the body copy it introduces. */
+.adg-card-head p {
+  margin: 3px 0 0;
+  max-width: 68ch;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.adg-card-head .adg-count,
+.adg-card-head .btn { flex: none; }
+
+.adg-card-body { padding: 14px; }
+
+/* `.rows` is the app's standalone list panel: it carries its own border, radius, surface, shadow
+   and 16px block margin. Inside a card body that makes a bordered, shadowed box within a bordered,
+   shadowed box — a card inside a card, and the margin fights the body padding. Strip the panel
+   affordance here and keep only the list. */
+.adg-card-body > .rows {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-card-body > .rows > .row {
+  padding-inline: 0;
+}
+
+/* Semantics: two axis columns on wide screens so eight rows read as one block, not a long scroll. */
+.adg-axes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 22px;
+}
+
+/* `.row + .row` draws its divider in DOM order, which in a two-column grid puts a top border on the
+   second cell of the FIRST row and leaves the dividers unaligned across columns. Drive the rule off
+   grid position instead: every axis gets a top border except the first row of each column. */
+.adg-axes > .row + .row {
+  border-top: 0;
+}
+
+.adg-axes > .adg-axis {
+  border-top: 1px solid var(--line);
+}
+
+.adg-axes > .adg-axis:nth-child(-n + 2) {
+  border-top: 0;
+}
+
+/* ---- capability + coverage rows: label, copy, verdict ---- */
+.adg-cap,
+.adg-cov {
+  display: grid;
+  grid-template-columns: minmax(88px, 132px) minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+/* One small-label step at 12/600. These were 11px/650, and 650 is not a shipped IBM Plex weight
+   so it snapped to a neighbour anyway — 600 and 650 were doing one job between them. */
+.adg-cap-role,
+.adg-cov-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.adg-cap-copy,
+.adg-cov-copy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.adg-cap-copy strong,
+.adg-cov-copy strong {
+  display: block;
+  font-size: 11.5px;
+}
+
+.adg-cap-copy small,
+.adg-cov-copy small {
+  display: block;
+  margin-top: 2px;
+  color: var(--ink-faint);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+/* A classification path renders as its own segments, so the hierarchy is legible at a glance
+   instead of being parsed out of punctuation by the reader. */
+.adg-path {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+
+.adg-path em {
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 10.5px;
+  font-style: normal;
+}
+
+.adg-path i {
+  color: var(--ink-faint);
+  font-style: normal;
+}
+
+/* ---- tier 3: the receipts ----
+   Every ref and the response state. This used to be the FIRST section on the page. */
+.adg-tech {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+}
+
+.adg-tech > summary {
+  padding: 12px 15px;
+  cursor: pointer;
+  font-weight: 650;
+  font-size: 12.5px;
+}
+
+.adg-tech-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr));
+  gap: 7px 18px;
+  margin: 0;
+  padding: 0 15px 6px;
+}
+
+.adg-tech-grid > div {
+  display: grid;
+  grid-template-columns: 148px minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.adg-tech-grid dt,
+.adg-tech-grid dd { margin: 0; }
+
+.adg-tech-grid dt {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
+.adg-tech-grid dd {
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.adg-tech > .hint { padding: 4px 15px 14px; }
+
+.adg-recs { margin-top: 14px; }
+
+.adg-recs h3 {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+/* A section heading that carries an action on its right. Defined here because the JSX applies it
+   as the layout contract — without it the title and the action stack vertically. */
+.adg-section-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adg-suggestion-head {
+  align-items: flex-end;
+}
+
+.adg-suggestion-head p { margin: 4px 0 0; }
+
+.adg-suggestion-head a {
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  color: var(--ink-soft);
+  text-decoration: none;
+}
+
+/* Suggestion cards on the asset surface read as a card grid, not the flat `.rows` list — each one
+   carries enough facts that a single column wastes the width. */
+.adg-suggestion-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: start;
+  /* 9px read as "boxes touching boxes" at three columns. */
+  gap: 14px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.adg-suggestion-grid > .sfc {
+  /* FLEX COLUMN, not `grid` + `align-content: start`. The grid form stretched each card to the
+     tallest in its row (`height: 100%`) and then packed the content to the top, so the uses row —
+     which carries a `border-top` — floated in the middle of the card with a void beneath it. A
+     column lets the footer be pushed to the bottom instead (`.sfc-usesrow { margin-top: auto }`),
+     which is what makes ragged content lengths read as one tidy row. */
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 11px;
+  min-width: 0;
+  /* NOT `height: 100%`. Stretching every card to the tallest in its row left the short ones with a
+     large void between their last control and the pinned footer. Natural height gives a ragged
+     bottom edge, which reads as content of different lengths; a void reads as something failing
+     to load. */
+  height: auto;
+  /* 12px was too tight against a 9px grid gap: the fact boxes and the formula block sat almost on
+     the card edge, and adjacent cards nearly touched. See the specificity repair below — this
+     declaration alone does NOT win. */
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  /* An INSET, not a floating card: tinted a step darker than the card it sits in, and no shadow.
+     That is what keeps a panel-inside-a-card from reading as a card-inside-a-card. */
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+
+/* SPECIFICITY REPAIR — measured in the browser, not guessed. The card is an `li.row`, so
+   `.adg-card-body > .rows > .row { padding-inline: 0 }` (0,3,0) beat `.adg-suggestion-grid > .sfc`
+   (0,2,0) and zeroed the HORIZONTAL padding: computed style read `16px 0px`, and every child sat
+   1px from the border. That is why the footer text, the fact boxes and the callouts all touched
+   the card edge while looking like they had been given padding.
+   This selector is (0,4,0) and restores the inset for real. */
+.adg-card-body > .rows.adg-suggestion-grid > .sfc {
+  padding: 16px;
+  /* SUBGRID — the cards share the grid's row tracks, so section N of every card sits on the same
+     line as section N of its neighbours. Each card previously laid itself out independently, so a
+     one-line description in the middle column pulled its fact boxes, formula, callout and footer
+     up relative to the three-line descriptions either side, and nothing lined up at any level.
+     `display: grid` is required: subgrid is ignored on a flex container.
+     The row count is the card's fixed slot sequence — head, taxonomy, lead, facts, status, recipe,
+     safety note, caveats, no-value, foot, uses. Every optional section renders a placeholder so
+     the count never varies; `test_every_suggestion_card_emits_the_same_row_count` pins that, since
+     a card with fewer children silently mis-maps every row after the missing one. */
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 11;
+  row-gap: 11px;
+}
+
+/* An EXPANDED card mounts its detail drawer as a 12th child and spans all three columns, so it can
+   no longer map onto an 11-row band. It drops out of the subgrid and lays itself out. */
+.adg-card-body > .rows.adg-suggestion-grid > .sfc:has(.sfc-detail) {
+  display: flex;
+  flex-direction: column;
+  grid-row: auto;
+}
+
+/* Occupies its row and paints nothing. */
+.sfc-slot { min-height: 0; }
+
+.adg-suggestion-grid .sfc-name { flex-basis: 100%; }
+
+/* An opened card needs the full width for its detail drawer, so it spans the grid. */
+.adg-suggestion-grid:has(.sfc-detail) > .sfc:has(.sfc-detail) {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 1400px) {
+  .adg-suggestion-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .adg-suggestion-grid { grid-template-columns: 1fr; }
 }
 
 .adg-tabs {
@@ -3292,9 +4345,17 @@ button.stat:hover {
 }
 
 .adg-kv dd.mono,
+/* MONOSPACE IS A SIGNAL, NOT A STYLE. This rule made EVERY field value monospace, so an absence
+   message ("nothing known yet"), a business label ("Customer") and a registry identifier
+   (`customer_id`) were typographically identical — and a reader could not tell a placeholder from
+   real data. Mono now means one thing: the string is exact and copyable, so it is opt-in per
+   value (`.mono`) rather than the default for the class. */
 .adg-field-value {
-  font-family: var(--font-mono);
   font-size: 13px;
+}
+
+.adg-field-value.mono {
+  font-family: var(--font-mono);
 }
 
 /* a compact read-only field row (overview summary / containment / audit): label, value, chips */
@@ -4209,6 +5270,7 @@ button.stat:hover {
 
 .adg-plan,
 .adg-rests-on,
+.adg-selection,
 .adg-blocked,
 .adg-clarifications,
 .adg-sql {
@@ -4222,12 +5284,74 @@ button.stat:hover {
 
 .adg-plan h3,
 .adg-rests-on h3,
+.adg-selection h3,
 .adg-blocked h3,
 .adg-clarifications h3,
 .adg-sql h3 {
   margin: 0;
   font-size: 14px;
 }
+
+/* Release B — where the answer comes from. Deliberately styled like the plan panel next to it and
+   NOT like `.adg-error`: an undecided source is a choice somebody has to make, and drawing it in
+   danger colours would tell a user the system broke. */
+.adg-sources,
+.adg-row-rules,
+.adg-selection-warnings {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.adg-source,
+.adg-row-rule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.adg-source-role,
+.adg-row-kind { color: var(--ink-soft); }
+
+.adg-source-ref,
+.adg-row-ref {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.adg-source-basis,
+.adg-source-alternatives,
+.adg-row-predicates {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.adg-source.withheld .adg-source-ref,
+.adg-row-predicates.withheld {
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+.adg-selection-warnings li {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.adg-open {
+  display: grid;
+  gap: 4px;
+  border-left: 3px solid var(--line-strong);
+  padding-left: 12px;
+}
+
+.adg-open p { margin: 0; font-size: 13px; }
+.adg-open-heading { font-weight: 600; }
+.adg-open-detail,
+.adg-open-who { color: var(--ink-soft); }
 
 /* label / value pairs: the label column is fixed so the values line up down the panel */
 .adg-plan-fields {
@@ -4678,3 +5802,1200 @@ button.stat:hover {
   display: grid;
   gap: 4px;
 }
+
+/* ── Data-use policies (D14) — the PII allow-policy panel on the governance review screen ──────
+   Quiet by construction. Every tone here is INK, not alarm: a concept nobody has decided about is
+   an ordinary row, and only a WITHDRAWN approval gets a warn tone — because that one records a
+   decision somebody made, and a reviewer should be able to find it. "Not approved for feature use"
+   must never look like a failure, so it carries no colour at all. */
+.dup-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.dup-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.dup-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.dup-concept {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dup-state {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.dup-state[data-status='active'] {
+  color: var(--ok, var(--ink));
+}
+
+.dup-state[data-status='revoked'] {
+  color: var(--warn, var(--ink));
+}
+
+.dup-desc {
+  margin: 0;
+}
+
+.dup-detail {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.dup-detail dt {
+  font-weight: 600;
+  color: var(--ink-faint);
+}
+
+.dup-detail dd {
+  margin: 0;
+}
+
+.dup-form {
+  display: grid;
+  gap: 6px;
+}
+
+.dup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dup-confirm {
+  margin: 4px 0 0;
+}
+
+.dup-revision {
+  font-size: 12px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The blast-radius statement inside the approve form. It sits at decision time only, so it may
+   carry the warn treatment without turning the resting list into a wall of hazard. */
+.dup-scope {
+  margin: 2px 0 0;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+/* ---------------------------------------------------------------- suggested feature card (v2)
+   Appended for the v2 discovery card shared by SuggestedFeaturesScreen and the AssetDetailScreen
+   column dossier. Composes the existing .rows/.row/.q-item, .badge, .kv, .stats/.stat, .callout,
+   .mono/.hint/.micro-label vocabulary and the token palette; nothing above this line is modified.
+
+   THREE THINGS THIS BLOCK IS RESPONSIBLE FOR.
+
+   1. HONESTY IS TYPOGRAPHIC, NOT CHROMATIC. Every state a reader must act on carries a WORD:
+      the limitation class ("Execution safety" / "Review" / "Missing fact"), the provenance basis
+      ("AI-proposed" / "derived from recipe family"), and the absent value ("not supplied",
+      "unavailable"). Colour is a second channel on top of the word, never the only one — which is
+      also why `.sfc-absent` is italic + faint rather than tinted, and `.sfc-unavailable` is a
+      DASHED chip: "nobody decided this" must not read as an error.
+
+   2. NOTHING MAY OVERFLOW THE PAGE. Catalog display names, catalog wording, object refs and
+      content hashes are all unbounded strings from an upload. Every badge inside a card is allowed
+      to WRAP (the global `.badge` is `white-space: nowrap`, which is right for a status chip and
+      wrong for a 90-character authored label), every flex/grid child that holds one sets
+      `min-width: 0`, and every ref/hash breaks with `overflow-wrap: anywhere`. A card is therefore
+      TALLER under hostile input, never wider.
+
+   3. HIERARCHY. The card has four altitudes: the name + state row, the classification strip, the
+      meaning/mechanics pairs, and the limitations. The drawer is a distinctly inset surface
+      (--surface-2) so "audit material" is visibly a different register from "what this measures".
+
+   KEYBOARD: the only control is one native <button> disclosure per card, so the base
+   :focus-visible ring (2px --accent, 2px offset) is the whole story. Nothing here sets overflow on
+   an ancestor of it, so the ring is never clipped. */
+
+.sfc {
+  /* q-item already stacks; this only tightens the internal rhythm and guards the flex track */
+  gap: 8px;
+  min-width: 0;
+}
+
+.sfc-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+.sfc-name {
+  margin: 0;
+  flex: 1 1 20ch;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  overflow-wrap: anywhere;
+}
+
+/* A long authored label must wrap inside its pill rather than push the row wider than the page. */
+.sfc .badge,
+.sfc-chip .badge {
+  height: auto;
+  min-height: 20px;
+  padding-block: 2px;
+  white-space: normal;
+  text-align: left;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+/* generation source + "suggested, not registered": a quiet fact, not a state */
+.badge.sfc-origin {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink-soft);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+.badge.sfc-cat {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+
+/* the count is prominent because the contract says so; the WORD "limitations" carries it */
+.badge.sfc-limcount {
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 40%, var(--line));
+  color: var(--warn);
+}
+
+/* an execution-safety limitation is the loud one: solid, like .badge.rejected */
+.badge.sfc-limcount--safety {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.sfc-nolim {
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.sfc-limit-note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  max-width: 74ch;
+}
+
+/* ---- classification strip ---- */
+
+.sfc-tax {
+  display: grid;
+  gap: 4px;
+}
+
+.sfc-chiprow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.sfc-chiprow-label {
+  flex: 0 0 auto;
+  min-width: 104px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.sfc-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.sfc-more {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* catalog WORDING, deliberately not a pill: it is text somebody typed, not a controlled label */
+.sfc-term {
+  font-size: 13px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.sfc-term::before {
+  content: '\201C';
+}
+
+.sfc-term::after {
+  content: '\201D';
+}
+
+/* authorship, always beside the value it qualifies */
+.sfc-prov {
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+}
+
+.sfc-prov--proposed {
+  color: var(--proposal);
+}
+
+/* "nobody has decided this" — words + a quiet italic. Never a colour alone, never an alarm. */
+.sfc-absent {
+  font-style: italic;
+  color: var(--ink-faint);
+}
+
+/* ---- meaning + mechanics ---- */
+
+.sfc-meaning,
+.sfc-facts {
+  display: grid;
+  grid-template-columns: fit-content(160px) 1fr;
+  gap: 4px 16px;
+  margin: 0;
+  min-width: 0;
+}
+
+.sfc-fact {
+  display: contents;
+}
+
+.sfc-meaning dt,
+.sfc-facts dt {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding-top: 2px;
+}
+
+.sfc-meaning dd,
+.sfc-facts dd {
+  margin: 0;
+  min-width: 0;
+  font-size: 13.5px;
+  overflow-wrap: anywhere;
+}
+
+/* prose is clamped on the COMPACT card only; the complete value renders in the drawer */
+.sfc-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Decision-critical recommendation facts stay visible on the compact card. Raw evidence and
+   revision identifiers remain in the existing full-detail disclosure. */
+.sfc-inputs {
+  display: grid;
+  grid-template-columns: fit-content(160px) 1fr;
+  gap: 8px 16px;
+  align-items: start;
+}
+
+.sfc-inputs-label {
+  padding-top: 5px;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.sfc-inputs ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sfc-inputs li {
+  display: inline-flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.sfc-inputs li small {
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
+/* Point-in-time and eligibility are leakage-shaped truths: they get a tinted rail so they read as
+   a caution, not as one more fact in the list. */
+.sfc-safety-note {
+  display: grid;
+  grid-template-columns: fit-content(150px) 1fr;
+  gap: 8px 12px;
+  /* A full 1px border, never a thick left stripe: a colored side-stripe is decoration standing in
+     for structure, and it also crowded the text against the card edge. The tint already carries
+     the caution. */
+  padding: 10px 12px;
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--warn-soft);
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.sfc-safety-note strong {
+  color: var(--warn);
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-safety-note--eligibility {
+  border-left-color: var(--danger);
+  background: color-mix(in oklch, var(--danger-soft) 68%, var(--paper));
+}
+
+.sfc-safety-note--eligibility strong { color: var(--danger); }
+
+/* Taxonomy first: what KIND of feature this is, before any of its parameters. */
+/* The arrival context a table-scoped page would otherwise drop. */
+.sfs-from {
+  margin: 0 0 12px;
+  padding: 9px 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--radius);
+  background: var(--accent-soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.sfc-taxonomy {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.sfc-tax {
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: color-mix(in oklch, var(--proposal) 12%, var(--surface));
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-factgrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.sfc-factgrid .sfc-fact {
+  display: block;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.sfc-factgrid .sfc-fact dt {
+  color: var(--ink-faint);
+  font-size: 8px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.sfc-factgrid .sfc-fact dd {
+  margin: 3px 0 0;
+  font-size: 11.5px;
+}
+
+.sfc-sources {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 10.5px;
+}
+
+/* A caveat count, not a defect list. Quiet: it points at the detail, it does not shout. */
+/* The description leads the card, as prose, so it says what the feature IS before listing its
+   parameters. */
+.sfc-lead {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.sfc-novalue {
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* A deliberate ending: which inputs it uses, and nothing to click. */
+.sfc-usesrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  /* Pushed to the bottom of a stretched card, so the rule above it separates the footer from the
+     content rather than hanging in empty space. */
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--proposal);
+  font-family: var(--font-mono);
+  /* 9px uppercase mono with letter-spacing was below the point of legibility, and it is real
+     content (the operand and the input count), not decoration. */
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+/* The formula is a quoted artefact, so it sits in its own inset rather than running as body
+   text against the prose above it. */
+.sfc-recipe {
+  border: 1px solid var(--line);
+  background: var(--surface);
+}
+
+/* Fact VALUES carry the weight; their labels are the quiet part. */
+.sfc-factgrid .sfc-fact dd {
+  font-weight: 650;
+}
+
+/* Cards size to their content. Stretching every card to the tallest left ~400px of dead white
+   under the short ones — the row equalises height and the shortest card pays for it. */
+.sfc-grid,
+.rows:has(> .sfc) {
+  align-items: start;
+}
+
+.sfc-caveats {
+  margin: 0;
+  color: var(--warn);
+  font-size: 11px;
+}
+
+/* The status pair must read as ONE axis at ONE weight. `design not checked` inherits
+   .gj-partial, whose solid warn fill made the not-checked state far louder than the checked
+   one -- the exact inversion this product forbids: a card waiting on a declared fact is honest
+   output, not a failure. Outline both. */
+/* Soft tints, as the artifact draws them — checked reads green, ambiguous reads amber, and
+   NEITHER is a solid fill. The earlier grey-on-grey pair fixed the inversion but threw away
+   the signal with it: a reader could no longer tell the two states apart at a glance. */
+.sfc-status .badge {
+  border: 1px solid var(--ok);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+/* The two DESIGN states must not look alike. `SuggestionCard`'s STATUS_TONE deliberately assigns
+   `gj-none` to DESIGN_CHECKED and `gj-partial` to design-NOT-checked, with the stated intent that
+   "neither state gets the success fill" but that they remain distinguishable. This rule used to
+   list both selectors together and paint them the SAME amber, so a checked design and an unchecked
+   one were identical at a glance — defeating the one signal a reader triaging a grid of cards
+   needs. Checked is quiet; not-checked keeps the amber. Neither is green. */
+.sfc-status .badge.gj-none {
+  border-color: var(--line);
+  background: var(--paper);
+  color: var(--ink-soft);
+}
+
+.sfc-status .badge.gj-partial {
+  border-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+/* The binding chip rides beside them and must read at the same weight. */
+.sfc-status .gj-score {
+  padding: 2px 7px;
+  border: 1px solid var(--warn);
+  border-radius: 999px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+/* Left rail and field only — the artifact's note is the sentence, not a labelled row. */
+.sfc-safety-note {
+  display: block;
+}
+
+/* Long identifiers wrap at a boundary, not mid-token: "cust_smart_cust_pk / g_cd" is not a
+   column anyone can search for. */
+.sfc-lims,
+.sfc-lim-words {
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+
+.sfc-recipe {
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  overflow-wrap: anywhere;
+}
+
+/* ---- limitations: visible without opening anything ---- */
+
+.sfc-lims {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.sfc-lim {
+  display: grid;
+  grid-template-columns: minmax(96px, max-content) 1fr max-content;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  font-size: 12.5px;
+  min-width: 0;
+}
+
+.sfc-lim-class {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sfc-lim-words {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-lim-refs {
+  color: var(--ink-soft);
+}
+
+.sfc-lim-code {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Tones are a SECOND channel: the class word above already says which kind this is. Review and
+   execution safety are deliberately different hues as well as different words, because "nobody
+   has confirmed this link" and "running this could duplicate rows" are not the same fact. */
+.sfc-lim--safety {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 35%, var(--line));
+}
+
+.sfc-lim--safety .sfc-lim-class,
+.sfc-lim--handling .sfc-lim-class {
+  color: var(--danger);
+}
+
+.sfc-lim--handling {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 22%, var(--line));
+}
+
+.sfc-lim--review,
+.sfc-lim--context {
+  background: var(--proposal-soft);
+  border-color: color-mix(in oklch, var(--proposal) 30%, var(--line));
+}
+
+.sfc-lim--review .sfc-lim-class,
+.sfc-lim--context .sfc-lim-class {
+  color: var(--proposal);
+}
+
+.sfc-lim--fact,
+.sfc-lim--design {
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 30%, var(--line));
+}
+
+.sfc-lim--fact .sfc-lim-class,
+.sfc-lim--design .sfc-lim-class {
+  color: var(--warn);
+}
+
+.sfc-lim--other .sfc-lim-class {
+  color: var(--ink-soft);
+}
+
+/* ---- footer + disclosure ---- */
+
+.sfc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.sfc-toggle {
+  margin-left: auto;
+  padding: 0 12px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  border-color: var(--line);
+  background: transparent;
+}
+
+.sfc-toggle:hover {
+  color: var(--ink);
+}
+
+/* ---- the drawer: audit material, visibly a different register ---- */
+
+.sfc-detail {
+  display: grid;
+  gap: 18px;
+  padding: 14px;
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+
+.sfc-sec {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sfc-h {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+.sfc-sec .kv {
+  background: var(--surface);
+}
+
+.sfc-attr {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.sfc-attr-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sfc-attr-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.sfc-attr-value {
+  font-size: 13.5px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  max-width: 74ch;
+}
+
+.sfc-attr-id {
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.sfc-evidence {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.sfc-dataset {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sfc-dataset + .sfc-dataset {
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.sfc-dataset-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+}
+
+/* "no value has been decided" as a chip: dashed, neutral, never an alarm colour */
+.badge.sfc-unavailable {
+  background: transparent;
+  border-style: dashed;
+  border-color: var(--line-strong);
+  color: var(--ink-faint);
+}
+
+.sfc-operands,
+.sfc-rels,
+.sfc-reqs,
+.sfc-omit {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12.5px;
+}
+
+.sfc-reqs,
+.sfc-omit {
+  gap: 4px;
+}
+
+.sfc-operands > li,
+.sfc-rels > li {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  min-width: 0;
+}
+
+.sfc-operand-head,
+.sfc-rel-path {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-operands p,
+.sfc-rels p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.sfc-omit > li {
+  color: var(--ink-soft);
+}
+
+/* ---- narrow layout: the label columns collapse before anything scrolls sideways ---- */
+
+/* The dossier collapses to one column before anything scrolls sideways. */
+@media (max-width: 1080px) {
+  .adg-grid,
+  .adg-axes {
+    grid-template-columns: 1fr;
+  }
+
+  /* One column now, so only the FIRST axis is a top-of-column row. */
+  .adg-axes > .adg-axis:nth-child(2) {
+    border-top: 1px solid var(--line);
+  }
+}
+
+@media (max-width: 720px) {
+  .adg-hero {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .adg-title { font-size: 21px; }
+
+  .adg-card-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .adg-cap,
+  .adg-cov {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  /* The role label rides above its copy rather than squeezing a third column onto a phone. */
+  .adg-cap-role,
+  .adg-cov-label {
+    grid-column: 1 / -1;
+  }
+
+  .adg-tech-grid > div {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .adg-id-head,
+  .adg-section-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .adg-id-flags {
+    justify-content: flex-start;
+  }
+
+  .adg-suggestion-head a {
+    width: 100%;
+    text-align: center;
+  }
+
+  .sfc-inputs,
+  .sfc-safety-note {
+    grid-template-columns: 1fr;
+  }
+
+  .sfc-meaning,
+  .sfc-facts {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+
+  .sfc-fact {
+    display: block;
+  }
+
+  .sfc-fact + .sfc-fact {
+    margin-top: 8px;
+  }
+
+  .sfc-lim {
+    grid-template-columns: 1fr;
+  }
+
+  .sfc-chiprow-label {
+    flex-basis: 100%;
+  }
+
+  .sfc-toggle {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
+.ln-wrap .react-flow__controls-button svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+.ln-wrap .react-flow__controls-button:last-child {
+  border-bottom: 0;
+}
+
+/* ------------------------------------------------------- recipe reviews (BR-23 sign-off) */
+
+/* Master–detail: the queue keeps a fixed readable column, the definition takes the rest.
+   Below 960px the panes stack; the queue is capped so the definition stays reachable. */
+.rr-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 960px) {
+  .rr-layout { grid-template-columns: 1fr; }
+  .rr-queue { max-height: 44vh; }
+}
+
+.rr-queue {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: calc(100vh - 180px);
+  overflow-y: auto;
+  position: sticky;
+  top: 16px;
+}
+
+.rr-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rr-family-head { margin: 4px 0 0; }
+
+.rr-rows {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* A queue row is a button semantically but not visually: undo the global button rule's
+   centering and fixed height (button:where(:not(.nav-item)) sets align-items/justify-content/
+   height, which a display override alone does not clear). */
+.rr-row {
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  font-weight: 400;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  height: auto;
+  gap: 4px;
+}
+
+.rr-row:hover { background: var(--surface-2); }
+
+.rr-row--active {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.rr-row-label { font-weight: 550; }
+
+.rr-row-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.rr-row-id {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* The three honest validity states — none of them renders as failure. */
+.rr-chip {
+  font-size: 11.5px;
+  line-height: 1;
+  padding: 4px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.rr-chip--approved { background: var(--ok-soft); color: var(--ok); }
+.rr-chip--awaiting { background: var(--surface-2); color: var(--ink-soft); }
+.rr-chip--blocked  { background: var(--warn-soft); color: var(--warn); }
+.rr-chip--stale {
+  background: var(--surface-2);
+  color: var(--ink-faint);
+  margin-left: 8px;
+}
+
+.rr-panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.rr-head h2 { margin: 0; }
+.rr-head-id { margin: 4px 0 8px; color: var(--ink-faint); font-size: 13px; }
+.rr-head-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+
+.rr-section > h3 { margin: 0 0 8px; }
+.rr-section > p { margin: 0 0 6px; max-width: 72ch; }
+
+.rr-roles {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rr-role {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.rr-role--approved { border-color: var(--ok-soft); background: var(--ok-soft); }
+.rr-role--blocked  { border-color: var(--warn-soft); background: var(--warn-soft); }
+
+.rr-role-name { font-weight: 550; }
+.rr-role-state { color: var(--ink-soft); font-size: 13px; text-align: right; }
+.rr-role--approved .rr-role-state { color: var(--ok); }
+.rr-role--blocked .rr-role-state { color: var(--warn); }
+
+.rr-current { color: var(--ok); margin: 8px 0 0; }
+
+.rr-kvs {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 8px 16px;
+}
+
+.rr-kv { display: flex; flex-direction: column; gap: 2px; }
+.rr-kv-label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+.rr-kv-value { font-size: 13.5px; }
+
+.rr-operands, .rr-policies, .rr-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rr-operand {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.rr-operand-role { font-size: 12.5px; color: var(--accent); }
+.rr-operand-facts { color: var(--ink-soft); font-size: 13.5px; }
+.rr-policy { font-size: 12.5px; color: var(--ink-soft); }
+
+.rr-decide {
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+}
+
+.rr-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 560px;
+}
+
+.rr-form-actions { display: flex; align-items: center; gap: 12px; }
+.rr-recorded { color: var(--ok); font-size: 13.5px; }
+
+.rr-event {
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rr-event-head { font-size: 13.5px; }
+.rr-event-why { color: var(--ink-soft); font-size: 13px; max-width: 72ch; }
+
+/* ------------------------------------------------- concept confirmations (SE-4b funnel) */
+
+.ccq-group {
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ccq-columns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 4px 16px;
+}
+
+.ccq-column {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.ccq-outcome { color: var(--ok); }

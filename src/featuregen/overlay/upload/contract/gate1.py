@@ -25,11 +25,19 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_to_json,
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
+from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
+from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
+from featuregen.overlay.upload.contract.param_choice import choose_params
+from featuregen.overlay.upload.generation_semantic_context import (
+    build_generation_semantic_context,
+)
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
+from featuregen.overlay.upload.enrich_batch import CallLedger
 from featuregen.overlay.upload.feature_assist import (
     ExternalRequirementPreview,
     FeatureIdea,
     FeatureSet,
+    Rejection,
     RoleBinding,
     SetRecommendation,
     _candidate_columns,
@@ -44,6 +52,13 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     capture_column_snapshot,
     ensure_generation_run,
 )
+from featuregen.overlay.upload.grounding_trace import (
+    GROUNDING_CANDIDATE_SET,
+    READ_SCOPE,
+    SuggestionDependencyClass,
+    build_trace,
+    dependency_pin,
+)
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -55,15 +70,22 @@ from featuregen.overlay.upload.planner.declarations import CompileBudget, build_
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.plan_envelope import (
     PlanEnvelopeV1,
+    plan_dependency_pins,
     plan_envelope_from_result,
+    plan_operand_roles,
+    plan_relationship_dependencies,
 )
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
+from featuregen.overlay.upload.read_scope import allowed_classes, read_scope_rule_content_hash
 from featuregen.overlay.upload.recipe_grounding_context import (
     RecipeGroundingContextV1,
     build_recipe_grounding_context,
 )
-from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
+from featuregen.overlay.upload.taxonomy.applicability import (
+    ApplicabilityResult,
+    ConfirmedScope,
+)
 from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
@@ -74,6 +96,7 @@ from featuregen.overlay.upload.templates import (
 from featuregen.overlay.upload.templates import (
     ground_all_outcomes as _ground_all_default,
 )
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +195,27 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 # whole ALL_TEMPLATES registry (every family), and grounding is the router — a family surfaces ONLY where
 # its distinctive concepts exist in the catalog (a churn-shaped catalog yields exactly the churn lens).
 _MAX_RATIONALE = 200
+# Task 3: the near-label critic's per-build spend ceiling. Verdicts are content-addressed, so a
+# steady-state build replays for free; the ceiling only bites on a cold, unusually wide set — where
+# the overflow candidates abstain honestly rather than dispatch unboundedly.
+_NEAR_LABEL_MAX_CALLS = 24
+
+
+# Pre-live simplification (2026-08-11): Task 4b's hypothesis-chosen parameters run whenever a
+# client is present — the FEATUREGEN_PARAM_CHOICE flag is retired (fail-soft by construction:
+# any dispatch failure falls back to the authored defaults).
+
+
+def _param_alternatives_line(template: Template, bound: dict) -> str:
+    """The card's "also available" line (Task 4b emission policy): each multi-value param with its
+    chosen value marked. "" for a recipe with nothing to choose — the field stays absent."""
+    parts = []
+    for key, allowed in sorted(template.params.items()):
+        if len(allowed) <= 1:
+            continue
+        rendered = "/".join(f"[{v}]" if v == bound.get(key) else str(v) for v in allowed)
+        parts.append(f"{key}: {rendered}")
+    return "; ".join(parts)
 
 
 def _operand_roles(gf: GroundedFeature) -> tuple[tuple[str, str], ...]:
@@ -205,16 +249,51 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
         operand_roles=_operand_roles(gf))
 
 
+@dataclass(frozen=True, slots=True)
+class RejectionRecordV1:
+    """One refused grounded candidate, WITH the template that produced it (Task 2A, freeze 0F-7 P3).
+
+    The V1 wire rejection is a ``{name, reason, code}`` dict and carries no template id, so a
+    consumer that wanted one had to match on the rendered NAME — the re-attribution guesswork
+    per-table grounding removed. This record carries the id the engine already knew, and the typed
+    `Rejection` (with its own decision trace) rather than a lossy projection of it.
+    """
+
+    template_id: str
+    candidate_name: str
+    rejection: Rejection
+
+
+@dataclass(frozen=True, slots=True)
+class TemplateCandidatesResult:
+    """What one grounding pass produced — the SAME eight objects the 8-tuple carried, under their
+    established names, plus the rejection records (Task 2A, freeze 0F-7 P3).
+
+    This replaced a positionally-unpacked 8-tuple, deliberately and BREAKINGLY: a ninth member
+    would have been the fourth silent widening of a shape whose callers all index it positionally,
+    and the trace's whole point is that a later consumer can name what it reads. The surviving
+    candidates' traces ride INSIDE ``ideas`` (``FeatureIdea.grounding_trace``); the refused ones
+    ride on ``rejection_records[].rejection.trace``.
+    """
+
+    ideas: list[FeatureIdea]
+    rejections: list[dict]                          # the V1 wire shape, byte-identical
+    grounded_ids: frozenset[str]
+    rejected_ids: dict[str, tuple[str, ...]]
+    binding_by_id: dict[str, str]
+    incomplete_ids: dict[str, tuple[str, ...]]
+    contexts: dict[str, RecipeGroundingContextV1]
+    keys_by_recipe: dict[str, tuple[str, ...]]
+    rejection_records: tuple[RejectionRecordV1, ...] = ()
+
+
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          table: str | None = None,
                          also_tables: Sequence[str] = (),
-                         ) -> tuple[list[FeatureIdea], list[dict],
-                                    frozenset[str], dict[str, tuple[str, ...]], dict[str, str],
-                                    dict[str, tuple[str, ...]],
-                                    dict[str, RecipeGroundingContextV1],
-                                    dict[str, tuple[str, ...]]]:
+                         params_by_id: dict | None = None,
+                         ) -> TemplateCandidatesResult:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
     ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
@@ -250,6 +329,10 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         narrowing["table"] = table
         if also_tables:
             narrowing["also_tables"] = tuple(also_tables)
+    # Task 4b: hypothesis-chosen parameter overrides, passed ONLY when present for the same
+    # seam-stability reason — the flag-off / abstain call stays argument-for-argument identical.
+    if params_by_id:
+        narrowing["params_by_id"] = params_by_id
     outcomes = _ground_template_outcomes(
         conn, templates, catalog_source=catalog_source, roles=roles, **narrowing)
     grounded = [
@@ -260,7 +343,9 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         if outcome.status is GroundingStatus.BUDGET_TRUNCATED
     }
     if not grounded:
-        return [], [], frozenset(), {}, {}, incomplete_ids, {}, {}
+        return TemplateCandidatesResult(
+            ideas=[], rejections=[], grounded_ids=frozenset(), rejected_ids={}, binding_by_id={},
+            incomplete_ids=incomplete_ids, contexts={}, keys_by_recipe={})
     by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
@@ -274,17 +359,26 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     binding_by_id: dict[str, str] = {}                   # SURVIVING template -> BindingQuality.value
     contexts: dict[str, RecipeGroundingContextV1] = {}
     keys_by_recipe: dict[str, list[str]] = {}
+    rejection_records: list[RejectionRecordV1] = []
     for gf in grounded:
         idea = _idea_from_grounded(gf, by_id[gf.template_id])
         raw = {"name": idea.name, "description": idea.description,
                "derives_from": list(idea.derives_from), "aggregation": idea.aggregation,
                "grain_table": idea.grain_table, "rationale": idea.rationale}
+        # Task 2A: the candidate's own identity, built BEFORE the gauntlet so it can be threaded in
+        # and the trace can be minted AT the decision points rather than stitched on afterwards.
+        # `build_recipe_grounding_context` is pure (template + grounded feature, no DB) and the
+        # object is reused verbatim below, so this moves no work and adds no read — it only makes
+        # the key available to a REFUSED candidate too, which is precisely the case V2 must explain.
+        context = build_recipe_grounding_context(by_id[gf.template_id], gf)
         # The TEMPLATE-DECLARED operand roles ride into the gauntlet alongside `raw` (which is bare
         # refs): they narrow which operands the unit/currency needs-check may ask about. Passed as a
         # kwarg rather than folded into `raw` so the LLM's raw shape — and therefore the LLM path —
         # is untouched.
         validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
-                                        roles=roles, operand_roles=idea.operand_roles)
+                                        roles=roles, operand_roles=idea.operand_roles,
+                                        candidate_key=context.recipe_candidate_key,
+                                        template_id=gf.template_id)
         if rej is None:
             # [F9] keep the VALIDATOR's idea (carries status + requirements), then SERVER-STAMP the H1a
             # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
@@ -294,26 +388,34 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
             # from `raw` (which is bare refs), so without this the template-declared roles would be
             # dropped again one line after being carried. Additive — the validator's status +
             # requirements are untouched.
+            # `replace` preserves `grounding_trace` by construction, so the server stamp cannot
+            # drop the trace the validator just minted.
+            # Task 4b's "also available" line — unconditional since the flag retired (pre-live).
+            alternatives_line = _param_alternatives_line(by_id[gf.template_id], gf.params)
             ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
                                  planner_applicability="not_applicable_single_catalog",
-                                 operand_roles=idea.operand_roles))
+                                 operand_roles=idea.operand_roles,
+                                 param_alternatives=alternatives_line))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
-            context = build_recipe_grounding_context(by_id[gf.template_id], gf)
             contexts[context.recipe_candidate_key] = context
             keys_by_recipe.setdefault(gf.template_id, []).append(context.recipe_candidate_key)
         else:
             rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
             rejected_ids[gf.template_id] = (rej.code,)
-    return (
-        ideas,
-        rejections,
-        frozenset(grounded_ids),
-        rejected_ids,
-        binding_by_id,
-        incomplete_ids,
-        contexts,
-        {recipe_id: tuple(keys) for recipe_id, keys in keys_by_recipe.items()},
+            # The SAME rejection, carrying its template id and its trace — the V1 dict above stays
+            # exactly the three keys the wire has always had.
+            rejection_records.append(RejectionRecordV1(gf.template_id, idea.name, rej))
+    return TemplateCandidatesResult(
+        ideas=ideas,
+        rejections=rejections,
+        grounded_ids=frozenset(grounded_ids),
+        rejected_ids=rejected_ids,
+        binding_by_id=binding_by_id,
+        incomplete_ids=incomplete_ids,
+        contexts=contexts,
+        keys_by_recipe={recipe_id: tuple(keys) for recipe_id, keys in keys_by_recipe.items()},
+        rejection_records=tuple(rejection_records),
     )
 
 
@@ -321,6 +423,38 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
 # Normal release mode always narrows to the supplied applicability. The old applicability flag is read
 # only in the explicit legacy_unscoped emergency mode. The narrowing never widens and never relaxes
 # grounding safety.
+def order_ideas_by_use_case(ideas: list[FeatureIdea],
+                            domains: tuple[str, ...]) -> list[FeatureIdea]:
+    """Task 4's whole ranking step — deterministic set intersection, NO model. Stable descending
+    sort on |template.use_cases ∪ {family} ∩ signed business_domain|: equal-overlap ideas keep
+    today's registry order EXACTLY, so an unmappable hypothesis (no signed domains, or nothing
+    overlaps) provably falls back to today's order. ORDERS, never removes — THE RULE: the
+    hypothesis may remove a recipe only for being unsafe, never for being irrelevant. Shadow
+    counters always fire; the reordered list is returned only under the flag."""
+    domain_set = frozenset(domains)
+    by_id = {t.id: t for t in ALL_TEMPLATES}
+
+    def _overlap(idea: FeatureIdea) -> int:
+        template = by_id.get(idea.recipe_id) if idea.recipe_id else None
+        if template is None:
+            return 0
+        return len((set(template.use_cases) | {template.family}) & domain_set)
+
+    if not domain_set:
+        counters.incr("overlay.use_case_order.unmappable")
+        return ideas
+    ordered = sorted(ideas, key=lambda i: -_overlap(i))   # stable: ties keep registry order
+    if all(_overlap(i) == 0 for i in ideas):
+        counters.incr("overlay.use_case_order.unmappable")
+        return ideas
+    changed = [i.name for i in ordered] != [i.name for i in ideas]
+    counters.incr(f"overlay.use_case_order.{'changed' if changed else 'unchanged'}")
+    # Pre-live simplification (2026-08-11): the ordering APPLIES unconditionally — the
+    # FEATUREGEN_USE_CASE_ORDERING flag is retired. The unmappable fallback above already
+    # guarantees a hypothesis with no signed domains keeps the registry order exactly.
+    return ordered
+
+
 def _intent_scoped_applicability_enabled() -> bool:
     """Release mode always enforces scoped applicability.
 
@@ -386,8 +520,40 @@ def _governed_rejection_reason(result: BindingPlanningResultV1) -> str:
     return result.contract_result_status.value
 
 
+def _governed_plan_trace(plan: BindingPlanV1, *, roles, pairs: tuple[tuple[str, str], ...],
+                         validation_status: str):
+    """The cross-catalog candidate's decision trace (Task 2A).
+
+    The governed planner IS this candidate's decision, so its trace is minted here, from the plan
+    the compiler already produced: the ordered crossings it selected (never re-planned), one pin per
+    crossing carrying the exact realization revision, the contract resolution that admitted it, the
+    read scope the compile ran under and the read set it resolved. No gauntlet rule runs on this
+    path, so ``validation_rule_content_hashes`` is honestly empty — this candidate's authority is
+    the governed contract, not the tri-state gauntlet.
+    """
+    pins = [
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=READ_SCOPE, dependency_key="read-scope",
+            content={"allowed_classes": allowed_classes(roles)}),
+        dependency_pin(
+            dependency_class=SuggestionDependencyClass.HARD_AVAILABILITY,
+            dependency_kind=GROUNDING_CANDIDATE_SET,
+            dependency_key="physical_read_set",
+            content={"resolved_object_refs": [ref for _cs, ref in pairs]}),
+        *plan_dependency_pins(plan),
+    ]
+    return build_trace(
+        candidate_key=plan.physical_plan_id,
+        ordered_operand_roles=plan_operand_roles(plan),
+        ordered_relationship_path=plan_relationship_dependencies(plan),
+        validation_status=validation_status, requirements=(), dependency_pins=pins,
+        validation_rule_content_hashes=(),
+        read_scope_rule_content_hashes=(read_scope_rule_content_hash(),))
+
+
 def _governed_idea_from_result(result: BindingPlanningResultV1, template: Template,
-                               target_entity: str) -> FeatureIdea | None:
+                               target_entity: str, *, roles=()) -> FeatureIdea | None:
     """A SELECTED RESOLVED governed contract plan → a Gate-#1 :class:`FeatureIdea` carrying the exact
     compiled plan envelope (so drafting reconstructs the governed path, never a permissive one) and the
     STRUCTURED provenance (``origin`` / ``path_authority``). None when the run has no resolved contract
@@ -414,7 +580,11 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
         # H1a metadata from the SERVER's envelope — planner_applicability is "applicable_cross_catalog"
         # BECAUSE a governed plan_envelope is present (the path_authority↔planner_applicability mapping).
         generation_source="recipe", recipe_id=envelope.recipe_id,
-        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id)
+        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id,
+        # The governed path's own decision trace — the crossings the compiler SELECTED, retained so
+        # nothing downstream has to re-plan to explain this option (freeze 0F-7 / rule 15).
+        grounding_trace=_governed_plan_trace(plan, roles=roles, pairs=pairs,
+                                             validation_status="DESIGN_CHECKED"))
 
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
@@ -455,7 +625,7 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
             rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
                                "recipe_id": rid})
             continue
-        idea = _governed_idea_from_result(result, tmpl, target_entity)
+        idea = _governed_idea_from_result(result, tmpl, target_entity, roles=roles)
         if idea is not None:
             ideas.append(idea)
         else:
@@ -527,7 +697,8 @@ def _run_actor(intent: Intent) -> dict:
 
 def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
                                  generation_run_id: str | None, roles, catalog_source: str | None,
-                                 is_live: bool) -> tuple[str | None, str | None, str | None]:
+                                 is_live: bool,
+                                 semantic_context=None) -> tuple[str | None, str | None, str | None]:
     """Mint the generation run (if not supplied), build the immutable catalog snapshot (C0-T3) over the
     considered set's candidate refs, and return the ``(generation_run_id, snapshot_id, content_hash)``
     lineage to record on the contract_considered row. Runs ONLY under REPEATABLE READ (returns all-None
@@ -556,12 +727,73 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
         "refs": [list(r) for r in refs],   # already sorted, deduped
         "roles": sorted(str(r) for r in roles),
     })
+    # SE-2: the frozen Layer-A context's identity pin joins the sealed item set — the run can
+    # prove which semantic state it consumed, and the freshness check can detect drift from it.
+    extra_items = ()
+    if semantic_context is not None:
+        from featuregen.overlay.upload.generation_semantic_context import context_snapshot_item
+
+        extra_items = (context_snapshot_item(semantic_context),)
     snapshot = build_metadata_snapshot(
         conn, generation_run_id=run_id, refs=refs, read_scope_hash=read_scope_hash,
         actor=_run_actor(intent),
         flags={"intake_mode": intent.intake_mode, "catalog_source": catalog_source,
-               "is_live": bool(is_live)})
+               "is_live": bool(is_live)},
+        extra_items=extra_items)
     return run_id, snapshot.snapshot_id, snapshot.content_hash
+
+
+def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
+                             grounded_ids: frozenset[str],
+                             rejected_ids: dict[str, tuple[str, ...]],
+                             semantic_context=None,
+                             generation_run_id: str | None = None) -> None:
+    """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
+    the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
+    savepoint: a shadow failure must not poison the user's request transaction (the same rule
+    the shadow planner obeys), and the response is byte-identical either way."""
+    from collections import Counter
+
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+
+    context_hash = semantic_context.context_hash() if semantic_context is not None else ""
+    try:
+        with conn.transaction():                      # savepoint — shadow reads stay isolated
+            candidates = v2_recipe_candidates(
+                conn, catalog_source=catalog_source, roles=roles, scope=scope,
+                context=semantic_context)
+            # SE-10 slice 1: the observations become ROWS (append-only, migration 1062) —
+            # fleet metrics query them; the savepoint still shields the user's request.
+            if semantic_context is not None:
+                from featuregen.overlay.upload.semantic_candidate_store import (
+                    persist_semantic_candidates,
+                )
+
+                persist_semantic_candidates(
+                    conn, generation_run_id=generation_run_id or "unattributed",
+                    context=semantic_context, candidates=candidates)
+        by_state = Counter(candidate.binding_state for candidate in candidates)
+        logger.info(
+            "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
+            "review_current=%d temporal_blocked=%d | legacy grounded=%d rejected=%d "
+            "context=%s",
+            len(candidates), by_state.get("bound", 0), by_state.get("ambiguous", 0),
+            by_state.get("missing", 0), by_state.get("blocked", 0),
+            sum(1 for c in candidates if c.review_current),
+            sum(1 for c in candidates if c.temporal_blocker),
+            len(grounded_ids), len(rejected_ids), context_hash[:16] or "unassembled")
+        # SE-10 slice 2: assembly runs in shadow too — merge + designed order observed on real
+        # catalogs before anything serves it. Pure fold over the candidates already in hand.
+        from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+
+        assembled = assemble_candidates(candidates)
+        merged = sum(len(a.corroborations) for a in assembled.ranked + assembled.actionable)
+        logger.info(
+            "semantic-shadow assembly: ranked=%d actionable=%d merged_twins=%d top=%s",
+            len(assembled.ranked), len(assembled.actionable), merged,
+            ",".join(a.candidate.recipe_id for a in assembled.ranked[:5]) or "-")
+    except Exception:
+        logger.exception("semantic-shadow comparison failed (response unaffected)")
 
 
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
@@ -570,7 +802,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                          applicability: ApplicabilityResult | None = None,
                          is_live: bool = False, target_entity: str | None = None,
                          templates: Sequence[Template] | None = None,
-                         generation_run_id: str | None = None) -> ConsideredSet:
+                         generation_run_id: str | None = None,
+                         scope: ConfirmedScope | None = None,
+                         semantic_mode: str = "legacy") -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -596,12 +830,24 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     recorded on the contract_considered row (see :func:`_persist_considered_snapshot`). On a READ
     COMMITTED connection no snapshot is taken (additive — the lineage columns stay NULL)."""
     persist_intent(conn, intent, target_ref)
+    # The intake build's SIGNED reading, fetched once for its two consumers here: the use-case
+    # ordering reads business_domain (Task 4), the near-label critic reads the window (Task 3).
+    # None on the legacy path / unsigned round — both consumers degrade (today's order; abstain).
+    signed_reading = signed_reading_for(
+        conn, hypothesis=intent.hypothesis, actor_json=_actor_json(intent.actor))
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
     # so a required-but-ignored field (bug_003) now actually shapes generation.
     redacted_goal = redact_free_text(objective, label="prediction goal")
     gen_objective = (f"{intent.redacted_hypothesis}\n\nprediction goal: {redacted_goal}"
                      if redacted_goal else intent.redacted_hypothesis)
+    # SE-2: freeze the Layer-A semantic context BEFORE any model dispatch — the identity every
+    # downstream decision (and the shadow lens) can be tied to. Assembled on this connection
+    # (REPEATABLE READ on the production path), sealed into the metadata snapshot below.
+    semantic_context = None
+    if catalog_source is not None:
+        semantic_context = build_generation_semantic_context(
+            conn, catalog_source=catalog_source, roles=roles)
     report = recommend_feature_sets_report(
         conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, feedback=feedback, now=now)
@@ -618,18 +864,74 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
     # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
     # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
-    if catalog_source is not None:
+    if catalog_source is not None and semantic_mode == "semantic_v1" and scope is not None:
+        # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
+        # (frozen context → capability binder → eligibility fold → assembly → typed gauntlet),
+        # not from legacy template grounding. One engine, one eligibility policy. The LLM lens
+        # and everything downstream (near-label critic, ordering, recommendation) are unchanged
+        # and origin-blind. Observations persist in the SAME transaction — the audit rows and
+        # the response commit together on the serving path.
+        from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+        from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+        from featuregen.overlay.upload.semantic_candidate_store import (
+            persist_semantic_candidates,
+        )
+        from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+        v2_candidates = v2_recipe_candidates(
+            conn, catalog_source=catalog_source, roles=roles, scope=scope,
+            context=semantic_context)
+        if semantic_context is not None:
+            persist_semantic_candidates(
+                conn, generation_run_id=generation_run_id or "unattributed",
+                context=semantic_context, candidates=v2_candidates)
+        projection = project_assembled_set(
+            assemble_candidates(v2_candidates),
+            catalog_source=catalog_source, target_ref=target_ref)
+        grounded_template_ids = projection.grounded_ids
+        rejected_template_ids = projection.rejected_ids
+        binding_quality_by_template = projection.binding_by_id
+        if projection.ideas:
+            alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
+                projection.ideas,
+                signed_reading["business_domain"] if signed_reading else ())))
+        rejections.extend(projection.rejections)
+        logger.info(
+            "semantic-v1 served: ideas=%d rejections=%d grounded=%s",
+            len(projection.ideas), len(projection.rejections),
+            ",".join(sorted(projection.grounded_ids)) or "-")
+    elif catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
-        (template_ideas, template_rejections, grounded_template_ids, rejected_template_ids,
-         binding_quality_by_template, incomplete_template_ids,
-         recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id) = (
-            _template_candidates(
-                conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
-                templates=_templates_to_ground(intent, applicability)))
-        if template_ideas:
-            alternatives.append(FeatureSet(lens="templates", features=template_ideas))
-        rejections.extend(template_rejections)
+        to_ground = _templates_to_ground(intent, applicability)
+        # Task 4b: hypothesis-chosen parameters — a closed selection from the authored tuples,
+        # dispatched ONCE per build for the cache misses only, applied at grounding (BEFORE the
+        # gauntlet and the near-label critic — the walkthrough ordering fix). Abstain / no client
+        # = empty overrides = the historical first-allowed-value defaults. Unconditional since
+        # the flag retired (pre-live, 2026-08-11).
+        param_overrides: dict[str, dict] = {}
+        if client is not None:
+            param_overrides = choose_params(
+                conn, client, templates=to_ground,
+                redacted_hypothesis=intent.redacted_hypothesis,
+                call_ledger=CallLedger(max_provider_calls=1))
+        candidates = _template_candidates(
+            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+            templates=to_ground, params_by_id=param_overrides or None)
+        grounded_template_ids = candidates.grounded_ids
+        rejected_template_ids = candidates.rejected_ids
+        binding_quality_by_template = candidates.binding_by_id
+        incomplete_template_ids = candidates.incomplete_ids
+        recipe_grounding_context_by_candidate_key = candidates.contexts
+        recipe_candidate_keys_by_recipe_id = candidates.keys_by_recipe
+        if candidates.ideas:
+            # Task 4: the template lens is ORDERED by the signed reading's business_domain —
+            # deterministic set intersection, shadow-counted always, applied only under
+            # FEATUREGEN_USE_CASE_ORDERING. Removes nothing by construction.
+            alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
+                candidates.ideas,
+                signed_reading["business_domain"] if signed_reading else ())))
+        rejections.extend(candidates.rejections)
     elif is_live:
         # 3C.2a — the LIVE governed cross-catalog lens (entity-scoped: no single catalog to ground on).
         # FIRST enforce the invariant over the LLM alternatives (a cross-catalog LLM idea has no governed
@@ -650,6 +952,15 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             if governed_ideas:
                 alternatives.append(FeatureSet(lens="templates", features=governed_ideas))
             rejections.extend(governed_rejections)
+    # SE-7 part 2 — the semantic_shadow observation: run the V2 planning lens beside the
+    # template lens and log the divergence. Read-only, fail-soft, response-invisible; the mode
+    # is ROUTE-resolved (the builder never reads env), same discipline as ``is_live``.
+    if semantic_mode == "semantic_shadow" and catalog_source is not None and scope is not None:
+        _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
+                                 grounded_ids=grounded_template_ids,
+                                 rejected_ids=rejected_template_ids,
+                                 semantic_context=semantic_context,
+                                 generation_run_id=generation_run_id)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(
@@ -668,6 +979,24 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             rejections.append({"name": anchor.name, "reason": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
                                "code": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED})
             anchor = None
+    # Task 3 — the near-label critic, FLAG-ONLY and ORIGIN-BLIND: every surviving candidate (anchor
+    # included, template and LLM alike) gets a {no_finding | too_close | abstain} annotation;
+    # nothing is removed (relevance is ORDER, safety is REMOVAL — and this pass is advisory until
+    # the explicit refusal decision). Unconditional since the flag retired (pre-live,
+    # 2026-08-11). The label window is the intake build's SIGNED reading — no signed window
+    # means every verdict abstains at zero model cost.
+    window = signed_reading["target_window_days"] if signed_reading else None
+    ledger = CallLedger(max_provider_calls=_NEAR_LABEL_MAX_CALLS)
+    alternatives = [
+        replace(fs, features=annotate_near_label(
+            conn, client, ideas=fs.features,
+            redacted_hypothesis=intent.redacted_hypothesis,
+            label_window_days=window, call_ledger=ledger))
+        for fs in alternatives]
+    if anchor is not None:
+        anchor = annotate_near_label(
+            conn, client, ideas=[anchor], redacted_hypothesis=intent.redacted_hypothesis,
+            label_window_days=window, call_ledger=ledger)[0]
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
@@ -690,6 +1019,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # row written, and the snapshot + considered set commit atomically in the one feature transaction.
     snap_run_id, snap_id, snap_hash = _persist_considered_snapshot(
         conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
+        semantic_context=semantic_context,
         catalog_source=catalog_source, is_live=is_live)
     cs = _with_option_ids(cs, snap_run_id or f"legacy:{intent.intent_id}")
     revision_id, considered_hash = _persist_considered_revision(
@@ -772,12 +1102,30 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
         d["metadata_input_fingerprint"] = f.metadata_input_fingerprint
     if f.binding_fact_keys:
         d["binding_fact_keys"] = list(f.binding_fact_keys)
+    # D14 (review F2): only-when-non-empty, exactly like `binding_fact_keys` above. This dict is
+    # hashed into `option_id` and `considered_content_hash`, so a candidate that licensed nothing —
+    # every pre-D14 snapshot and the overwhelming majority of candidates — keeps byte-identical
+    # bytes. A candidate that DID need a policy could not have existed before the gate could clear
+    # one, so there are no pre-existing bytes for the non-empty case to break.
+    if f.personal_data_policy_revision_ids:
+        d["personal_data_policy_revision_ids"] = list(f.personal_data_policy_revision_ids)
     if f.planner_applicability != "not_applicable_nonrecipe":
         d["planner_applicability"] = f.planner_applicability
     if f.physical_plan_id is not None:
         d["physical_plan_id"] = f.physical_plan_id
     if f.planner_declaration_id is not None:
         d["planner_declaration_id"] = f.planner_declaration_id
+    # Task 3: only-when-present, same byte-identity strategy as every additive key above. The
+    # verdict is ADVISORY card metadata; it round-trips so the Gate-1 reload shows what the
+    # reviewer saw, and it participates in option identity exactly because it is part of the
+    # reviewed artifact.
+    if f.near_label_verdict is not None:
+        d["near_label_verdict"] = f.near_label_verdict
+        d["near_label_rationale"] = f.near_label_rationale
+    # Task 4b: only-when-present (populated only under FEATUREGEN_PARAM_CHOICE, so flag-off
+    # snapshots keep their historical bytes).
+    if f.param_alternatives:
+        d["param_alternatives"] = f.param_alternatives
     return d
 
 
@@ -1012,9 +1360,14 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         metadata_snapshot_id=d.get("metadata_snapshot_id"),
         metadata_input_fingerprint=d.get("metadata_input_fingerprint"),
         binding_fact_keys=tuple(str(k) for k in d.get("binding_fact_keys", ())),
+        personal_data_policy_revision_ids=tuple(
+            str(r) for r in d.get("personal_data_policy_revision_ids", ())),
         planner_applicability=d.get("planner_applicability", "not_applicable_nonrecipe"),
         physical_plan_id=d.get("physical_plan_id"),
-        planner_declaration_id=d.get("planner_declaration_id"))
+        planner_declaration_id=d.get("planner_declaration_id"),
+        near_label_verdict=d.get("near_label_verdict"),
+        near_label_rationale=d.get("near_label_rationale", ""),
+        param_alternatives=d.get("param_alternatives", ""))
 
 
 def _chosen_feature_from_snapshot(
@@ -1207,6 +1560,42 @@ def _verified_considered_revision_payload(
         "content_hash": snapshot_hash,
     }
     return considered, lineage, revision_id, digest
+
+
+def verified_considered_revision_by_id(conn, considered_revision_id: str) -> dict:
+    """SE-11 step 4 — load ONE immutable considered revision by id, verified the same way the
+    Gate-1 choice path verifies it (envelope re-hash against the stored digest), and return the
+    full stored payload. The caller serves option detail FROM THIS STORED REVISION ONLY — never
+    a wider live catalog read to decorate it."""
+    row = conn.execute(
+        "SELECT considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
+        "metadata_snapshot_content_hash, considered_json, considered_content_hash, "
+        "canonicalization_version "
+        "FROM contract_considered_revision WHERE considered_revision_id = %s",
+        (considered_revision_id,),
+    ).fetchone()
+    if row is None:
+        raise Gate1Error("UNKNOWN_CONSIDERED_REVISION")
+    revision_id, intent_id, run_id, snapshot_id, snapshot_hash, considered, digest, version = row
+    if considered.get("version") != version:
+        raise Gate1Error("considered revision lineage is inconsistent")
+    envelope = {
+        "version": version,
+        "intent_id": intent_id,
+        "generation_run_id": run_id,
+        "metadata_snapshot_id": snapshot_id,
+        "metadata_snapshot_content_hash": snapshot_hash,
+        "considered": considered,
+    }
+    if canonical_hash(envelope) != digest:
+        raise Gate1Error("considered revision content hash mismatch")
+    return {
+        "considered_revision_id": revision_id,
+        "intent_id": intent_id,
+        "generation_run_id": run_id,
+        "considered_content_hash": digest,
+        "considered": considered,
+    }
 
 
 def _verified_considered_revision(

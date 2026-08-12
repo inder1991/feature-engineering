@@ -17,7 +17,7 @@ const lineageGraph = vi.mocked(api.lineageGraph)
 const HIT: api.SearchHit = {
   object_ref: 'public.accounts.balance', table: 'accounts', column: 'balance', kind: 'column',
   data_type: 'numeric', definition: 'end-of-day ledger balance', is_grain: false, is_as_of: false,
-  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null,
+  catalog_source: 'deposits', concept: null, domain: null, sensitivity: null, sensitivity_display: null,
   additivity: 'semi_additive', unit: 'dollars', currency: 'USD', entity: 'Account', score: 1.2,
 }
 
@@ -25,7 +25,10 @@ const HIT: api.SearchHit = {
 const FACETS: Record<string, api.FacetBucket[]> = {
   source: [{ value: 'deposits', count: 3 }, { value: 'cards', count: 1 }],
   domain: [{ value: 'retail', count: 3 }],
+  // The raw source-declared tag ("Declared tag" in the sidebar) and the projected display axis
+  // ("Sensitivity") are separate facets with separate vocabularies — see SEARCH_FACET_KEYS.
   sensitivity: [{ value: '(none)', count: 3 }, { value: 'pii', count: 1 }],
+  sensitivity_display: [{ value: 'restricted', count: 2 }],
   additivity: [{ value: 'semi_additive', count: 3 }, { value: 'additive', count: 1 }],
   entity: [{ value: 'Account', count: 3 }],
   kind: [{ value: 'column', count: 4 }],
@@ -38,7 +41,8 @@ function result(
   facets: Record<string, api.FacetBucket[]> = {},
   total = hits.length,
 ): api.SearchResult {
-  return { hits, facets, total }
+  // Task 6: every search read carries the projection marker; `ready` is the normal value.
+  return { hits, facets, total, projection: { status: 'ready', code: '', detail: '' } }
 }
 
 beforeEach(() => {
@@ -158,7 +162,8 @@ describe('search screen — facet sidebar', () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await screen.findByText('public.accounts.balance')
-    for (const group of ['Source', 'Domain', 'Sensitivity', 'Additivity', 'Entity', 'Kind', 'Flags']) {
+    for (const group of ['Source', 'Domain', 'Sensitivity', 'Declared tag', 'Additivity',
+                         'Entity', 'Kind', 'Flags']) {
       expect(screen.getByText(group)).toBeInTheDocument()
     }
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).not.toBeChecked()
@@ -220,7 +225,7 @@ describe('search screen — facet sidebar', () => {
     )
     render(<SearchScreen />)
     await screen.findByText('public.accounts.balance')
-    expect(screen.getByText('Sensitivity')).toBeInTheDocument()
+    expect(screen.getByText('Declared tag')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '(none) 4' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: 'pii 1' })).not.toBeInTheDocument()
   })
@@ -425,7 +430,7 @@ describe('search screen — impact and graph', () => {
       'public.accounts.balance', 'deposits',
       expect.objectContaining({ direction: 'both', depth: 1 }),
     )
-    expect(await screen.findByText('Layers')).toBeInTheDocument()
+    expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Impact for public.accounts.balance' }),
     ).not.toBeInTheDocument()
@@ -434,7 +439,7 @@ describe('search screen — impact and graph', () => {
     expect(
       await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
     ).toBeInTheDocument()
-    expect(screen.queryByText('Layers')).not.toBeInTheDocument()
+    expect(screen.queryByText('Relationship layers')).not.toBeInTheDocument()
   })
 
   it('Details action navigates to the asset route with the hit\'s source and object_ref', async () => {
@@ -452,13 +457,16 @@ describe('search screen — impact and graph', () => {
 
   it('Suggested features action navigates to the suggested route with the hit\'s table', async () => {
     // P4's ONE entry point: the sheet is otherwise unreachable. Suggestions are per TABLE, so a
-    // column hit opens the table it lives on — the bare table_name the backend keys on.
+    // A column hit opens the table it lives on -- the bare table_name the backend keys on --
+    // AND carries the column it came from. The page stays table-scoped; the column only names
+    // the context, which four identical pages otherwise dropped.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await userEvent.click(
       await screen.findByRole('button', { name: 'Suggested features for accounts' }),
     )
-    expect(window.location.hash).toBe('#/suggested?source=deposits&table=accounts')
+    expect(window.location.hash)
+      .toBe('#/suggested?source=deposits&table=accounts&column=balance')
   })
 
   it('jumps to the graph anchored on the row whose Graph action was clicked', async () => {
@@ -474,7 +482,7 @@ describe('search screen — impact and graph', () => {
       'public.accounts.opened_at', 'deposits',
       expect.objectContaining({ direction: 'both', depth: 1 }),
     )
-    expect(await screen.findByText('Layers')).toBeInTheDocument()
+    expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
   })
 
   // The unfiltered browse lists the TABLE itself as the first hit; its card title looks exactly
@@ -488,9 +496,11 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    const caption = await screen.findByText(/Graph of:/)
-    expect(caption).toHaveTextContent('public.accounts.opened_at')
-    expect(caption).toHaveTextContent('column')
+    // The hint sentence was replaced by the graph's own context bar, which names the anchor with
+    // its kind chip, full ref and wording rather than a parenthetical.
+    const bar = await screen.findByRole('region', { name: /graph anchor/i })
+    expect(bar).toHaveTextContent('public.accounts.opened_at')
+    expect(bar).toHaveTextContent('COL')
   })
 
   it('table hits carry a table badge so they cannot read as columns', async () => {
@@ -515,10 +525,10 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     // Re-search (same result set): the anchor must NOT silently reset to the first hit (the table).
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
   })
 
   it('a re-search falls back to the first hit only when the anchor left the result set', async () => {
@@ -528,9 +538,9 @@ describe('search screen — impact and graph', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.balance')
+    expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.balance')
   })
 })

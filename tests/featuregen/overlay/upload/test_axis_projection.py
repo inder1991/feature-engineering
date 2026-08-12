@@ -223,11 +223,25 @@ def test_party_role_is_never_consumed_by_join_candidacy_or_execution(db):
         "overlay/upload/enrich_llm.py",        # egress allowlist entry (structural token)
         "overlay/upload/asset_detail.py",      # the column dossier (Task 3C read surface)
         "overlay/upload/column_view.py",       # pure dossier assembler
+        # Semantic Task 1's read-model bundle + purpose adapters: party_role rides as ADVISORY
+        # display/context (NeighbourColumnV1, resolved semantics) exactly like the dossier; the
+        # bundle never feeds it to candidacy or execution — pairing invariance stays pinned in
+        # test_bridge_namespace_pairing.
+        "overlay/upload/semantic_context.py",
         # The namespace-pairing handoff's deterministic entity PICK: the role breaks the tie for
         # which entity LABEL rides a disagreeing same-namespace candidate. WHICH pairs derive is
         # decided by namespace alone — test_bridge_namespace_pairing pins that the candidate pair
         # set is party-role-invariant, so the role still explains and never gates candidacy.
         "overlay/upload/bridge_candidates.py",
+        # Semantic Task 7's Context Graph read model: the same ADVISORY display grade as
+        # `asset_detail` / `column_view` above — it renders the role on a neighbour and on the
+        # anchor's resolved semantics, and nothing in it is a predicate.
+        "overlay/upload/context_graph.py",
+        # Semantic Task 8's feature-context v4: `party_role` rides IN THE PROMPT as context, so a
+        # model can tell a counterparty identifier from a customer one. It is not a gate, and
+        # `test_party_role_never_enters_a_feature_gate` below asserts that directly on the
+        # gauntlet's source rather than trusting this comment.
+        "overlay/upload/feature_assist.py",
     }
     offenders = sorted(
         str(p.relative_to(src_root))
@@ -235,6 +249,23 @@ def test_party_role_is_never_consumed_by_join_candidacy_or_execution(db):
         if "party_role" in p.read_text(encoding="utf-8")
         and str(p.relative_to(src_root)) not in allowed)
     assert offenders == [], f"party_role leaked into non-display modules: {offenders}"
+
+
+def test_party_role_never_enters_a_feature_gate():
+    """The module-level allowlist above got two new entries when feature-context v4 put
+    `party_role` into the PROMPT. That widening is only safe if the role stays out of every
+    DECISION, so this asserts it where it matters: the gauntlet's own source.
+
+    A file-level scan cannot make this distinction — it would have to choose between banning the
+    role from a module that legitimately renders it and permitting a predicate hidden inside the
+    same file. Reading the deciding functions directly does."""
+    import inspect
+
+    from featuregen.overlay.upload import feature_assist
+
+    for fn in (feature_assist._vet, feature_assist._validate_idea, feature_assist._column_meta,
+               feature_assist._is_mandatory, feature_assist._needs_numeric):
+        assert "party_role" not in inspect.getsource(fn), fn.__name__
 
 
 # ── idempotent, catalog-scoped ───────────────────────────────────────────────────────────────────

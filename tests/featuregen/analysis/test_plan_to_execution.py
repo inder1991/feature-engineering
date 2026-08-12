@@ -57,6 +57,7 @@ from featuregen.analysis.execution import (
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, GroundedPlan, Measure, Window
 from featuregen.data_agent.analysis import Comparison
 from featuregen.data_agent.learning import GAP_CODES
+from featuregen.overlay.upload.source_selection import SELECTION_POPULATION_UNDECLARED
 
 
 def _plan(**over) -> AnalysisPlanV1:
@@ -269,8 +270,62 @@ def test_a_spine_binding_that_MATCHES_the_declaration_is_accepted():
     assert ir.spine.binding.identity.table == CUSTOMER_TABLE
 
 
-def test_an_UNDECLARED_population_still_works_for_a_caller_that_supplies_its_own_spine():
-    """The check is on the DECLARATION, not a new requirement to declare — a caller assembling
-    ExecutionInputs directly (the executor's own tests, a batch job) is unaffected."""
+def test_an_UNDECLARED_population_still_works_with_the_selection_flag_OFF(monkeypatch):
+    """CHANGE OF INTENT, Release-B Task 8 — this test was
+    `test_an_UNDECLARED_population_still_works_for_a_caller_that_supplies_its_own_spine`, and it
+    pinned the fail-open as intended: "the check is on the DECLARATION, not a new requirement to
+    declare — a caller assembling ExecutionInputs directly is unaffected."
+
+    That was defensible while NOTHING could resolve a population. Refusing would have left the
+    executor's own tests and any batch caller with no way to run at all, so the bridge accepted
+    whatever spine it was handed and the plan's own DoD item ("enforce the declaration again at the
+    plan-to-execution bridge") was simply not true. Release B supplies the resolution — an explicit
+    declaration or a serving policy — so the fallback now has an alternative and the honest
+    behaviour is to refuse.
+
+    The old acceptance survives EXACTLY, as the flag-off half of the matrix: a tree that has not
+    enabled `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` behaves byte-identically to before — and the
+    flag is UNSET here rather than assumed unset, like its siblings below. A matrix test whose
+    half depends on the ambient environment passes for the wrong reason on a developer machine
+    that exported the flag once.
+    """
+    monkeypatch.delenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", raising=False)
+    monkeypatch.delenv("FEATUREGEN_DATASET_PROFILES", raising=False)
     ir = plan_to_execution_ir(_grounded(), _inputs())
     assert ir.spine.binding.identity.table == CUSTOMER_TABLE
+
+
+def test_an_UNDECLARED_population_REFUSES_with_the_selection_flag_ON(monkeypatch):
+    """The population hole, closed. A caller-supplied spine is no longer its own authority."""
+    monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
+    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
+    with pytest.raises(BridgeRefusal) as exc:
+        plan_to_execution_ir(_grounded(), _inputs())
+    assert exc.value.code == SELECTION_POPULATION_UNDECLARED
+
+
+def test_a_DECLARED_population_is_unaffected_by_the_flag(monkeypatch):
+    """The new refusal is about the ABSENCE of a declaration, not a new hoop for one that exists."""
+    monkeypatch.setenv("FEATUREGEN_DATASET_PROFILES", "1")
+    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
+    declared = _plan(population_table_ref="ftr::dpl_eib.customer_master",
+                     population_key_ref="ftr::dpl_eib.customer_master.cif_id")
+    ir = plan_to_execution_ir(_grounded(plan=declared), _inputs())
+    assert ir.spine.binding.identity.table == CUSTOMER_TABLE
+
+
+def test_the_flag_is_fail_closed_on_its_dependency(monkeypatch):
+    """D8: requesting SOURCE_TEMPORAL_SELECTION without DATASET_PROFILES is an INVALID
+    configuration, not a half-enabled path — so the bridge stays on its flag-off behaviour."""
+    monkeypatch.delenv("FEATUREGEN_DATASET_PROFILES", raising=False)
+    monkeypatch.setenv("FEATUREGEN_SOURCE_TEMPORAL_SELECTION", "1")
+    ir = plan_to_execution_ir(_grounded(), _inputs())
+    assert ir.spine.binding.identity.table == CUSTOMER_TABLE
+
+
+def test_the_new_population_refusal_maps_to_the_same_gap_the_selector_uses():
+    """One thing to decide, reached from two directions."""
+    from featuregen.data_agent.learning import REFUSAL_TO_GAP
+
+    assert (BRIDGE_REFUSAL_TO_GAP[SELECTION_POPULATION_UNDECLARED]
+            == REFUSAL_TO_GAP[SELECTION_POPULATION_UNDECLARED])

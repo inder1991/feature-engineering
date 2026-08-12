@@ -23,6 +23,32 @@ data:
   # the call succeeds in ONE shot (no costly retries). NB: setting this above the model's real output
   # ceiling makes the provider 400 the request outright, so this is the safe practical max, not higher.
   FEATUREGEN_LLM_MAX_TOKENS: "32000"
+  # Per-CALL wall-clock ceiling, seconds. The 60s default is mismatched with
+  # FEATUREGEN_LLM_MAX_TOKENS=32000 + adaptive thinking at effort=high: a slow call dies at 60s and,
+  # now that a timeout is classified non-retryable, fails its chunk outright — one billing, no
+  # result, a stage truthfully reported as truncated. 300s covers the heaviest task (feature
+  # generation), not just enrichment.
+  #
+  # WHAT THIS MULTIPLIES OUT TO, because the number alone does not say. `drive_structured_call` may
+  # issue up to FIVE physical calls for one logical call (1 initial + 2 truncation retries + 2
+  # repairs), and a truncation retry scales max_tokens AND this clock by the same ratio. With
+  # FEATUREGEN_LLM_MAX_TOKENS=32000 against the driver's 64000 escalation ceiling that ratio caps at
+  # 2x after a single step, so the provider ceilings sum to 300 + 4x600 = 2700s, plus up to 2s of
+  # bounded transient backoff = 2702s. The Anthropic client is built with max_retries=0
+  # (llm_claude._SDK_MAX_RETRIES) precisely so the SDK does not multiply that by a further 3x, as
+  # its default of 2 would. NOTE THE INVERSION: LOWERING FEATUREGEN_LLM_MAX_TOKENS RAISES the worst
+  # case, because a smaller ceiling escalates further before capping — at the 4096 code default the
+  # ratio reaches 4x and the chain reaches 4500s.
+  # tests/featuregen/intake/test_deployment_llm_bounds.py pins this arithmetic against both files.
+  #
+  # 2702s exceeds OVERLAY_ENRICH_STAGE_DEADLINE_S below, and that is a known, bounded overshoot: the
+  # deadline is checked only BEFORE issuing each new chunk, so it cannot interrupt a call already in
+  # flight, and the source advisory lock is held for the excess. Reaching 2702s needs four
+  # consecutive calls that each run to ~their full ceiling AND return a complete-but-schema-invalid
+  # body, because a single timeout ends the chain outright — so the realistic bad case is one hung
+  # call at 300-600s. Bounding the LOGICAL call needs a deadline inside the driver; that is a code
+  # change, deliberately not a deployment one.
+  FEATUREGEN_LLM_TIMEOUT: "300"
   # Drift-freshness SLA = 30 days. This single-node demo cluster runs NO periodic drift scanner, so
   # the default 60-min SLA makes resolve_fact REVERIFY(drift_stale_pending_scan) as soon as a VERIFIED
   # fact's watermark ages past an hour — which silently drops is_grain/as_of and starves the planner.
@@ -53,6 +79,113 @@ data:
   # per-source lock while it runs, so a slow provider can now block re-uploads of the SAME source
   # for longer — acceptable here, worth revisiting for concurrent ingestion.
   OVERLAY_ENRICH_STAGE_DEADLINE_S: "1800"
+  # Per-stage physical-provider-call ceiling for batched enrichment. Raised from 100 (2026-08-06).
+  # PER STAGE, not per upload: enrich_batch.run_batched builds one CallLedger per invocation.
+  #
+  # This is a RUNAWAY BACKSTOP, not a throughput limiter. Crossing it does not slow enrichment down,
+  # it silently STOPS ENRICHING COLUMNS — enrich_config's chunking note explains why: an over-budget
+  # item still forms its own chunk, so a tight token bound degrades into MORE CALLS, and this
+  # ceiling is the only thing that turns more calls into lost work. The zero-truncation cap raise
+  # made items larger, so that degradation is exactly what it risks.
+  #
+  # Derived (NOT measured — a live before/after ingest was not authorised) from the degenerate
+  # one-item-per-chunk case over the largest catalog this repo exercises:
+  #   237 items x max_batch_attempts(2) + max_single_fallback(8) = 482.  512 clears it.
+  # tests/featuregen/intake/test_deployment_llm_bounds.py recomputes this from the live budget so a
+  # future cap change that outgrows it fails a test instead of truncating a stage.
+  #
+  # COST: 512 per stage is a much larger worst-case bill than 100 was, and this number is no longer
+  # what stops a runaway — OVERLAY_ENRICH_STAGE_DEADLINE_S above is. This remains a COUNT bound, not
+  # a time bound, so raising it does not lengthen how long the stage may hold the source lock.
+  OVERLAY_ENRICH_MAX_PROVIDER_CALLS: "512"
+  # Release-A flags (verified-interfaces D8). FEATUREGEN_FEATURE_CONTEXT is SET ON here;
+  # FEATUREGEN_DATASET_PROFILES below remains OFF and is still gated. Truthy set: 1/true/yes/on.
+  # NOT AN APPROVAL RECORD: applying this ConfigMap IS the Release-A gate decision for the flag
+  # below, and that decision has not been taken. This file states a value, never a sign-off.
+  # Richer feature-generation context (CURRENT DEFAULT: v5). ON: feature generation receives the
+  # full semantic dossier — concept, definition, domain, ai_summary, semantic_terms, party_role,
+  # concept ancestry, identifier namespace, cross-catalog links — plus `semantic_authority`,
+  # the {field: "producer/strength"} map that makes an LLM proposal legible AS a proposal, and
+  # (v5) every proposed feature returns `grounding`, its own account of which offered column it
+  # used. Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION below, NOT this switch — turning this
+  # off drops to the thin v1 menu.
+  FEATUREGEN_FEATURE_CONTEXT: "1"
+  # Task 2 (router plan): tied grounding bindings follow the warmed LLM verdict instead of
+  # alphabetical order. Flipped 2026-08-10 after the shadow phase: 20-verdict disagreement report
+  # reviewed (9 disagreements, all SME-endorsed — aggregating recipes re-bind to fixed-AED amounts,
+  # rail ties to clearing_type). Flag-off restores the historical byte-identical order.
+  FEATUREGEN_TIE_BREAK_BINDING: "1"
+  # THE ROLLBACK LEVER for the flag above. ABSENT BY DEFAULT — absent means v5
+  # (`feature_assist._FEATURE_CONTEXT_SCHEMA_VERSION`), the shared SemanticContextBundleV1 payload
+  # PLUS the `grounding` output contract. Set `FEATUREGEN_FEATURE_CONTEXT_VERSION` here to fall
+  # back WITHOUT dropping to the thin v1 menu, which is what turning FEATUREGEN_FEATURE_CONTEXT off
+  # would do — a functional regression dressed as a safety valve. The ladder, in order of how much
+  # it gives up:
+  #   "4" — the rich v4 payload with NO returned grounding (the model is no longer asked which
+  #         column it used, so a proposal can no longer be checked against the menu it was offered);
+  #   "3" — the shipped v3 payload: smaller prompts, no concept ancestry / identifier namespace /
+  #         party role / authority axes, and no grounding.
+  # Named here, commented, so an incident response edits a value instead of inventing a key: only
+  # "3", "4" and "5" are honoured, and a typo warns and silently keeps the default (v5).
+  # DO NOT set "4" to "stay on the default" — since Task 6c the default is 5, and 4 silently drops
+  # the grounding output contract.
+  # Dataset/catalog semantic profiles: profile API surfaces, upload narrative part, listing
+  # display names — off ⟹ every new surface 404s and existing payloads stay byte-identical.
+  FEATUREGEN_DATASET_PROFILES: "0"
+  # Release-B serving/temporal policy surfaces. DEPENDS ON FEATUREGEN_DATASET_PROFILES and is
+  # FAIL-CLOSED (D8): flipping this to "1" while the line above is "0" leaves the feature DISABLED
+  # (routes still 404) and logs a loud startup warning — the dependency is enforced, not assumed.
+  FEATUREGEN_SOURCE_TEMPORAL_SELECTION: "0"
+  # Release-C generated two-leg crosswalk execution. DEPENDS ON the line above being ENABLED, and
+  # unlike that dependency this one is a TRUE BOOT REFUSAL (D8): flipping this to "1" while the
+  # line above is "0" makes the backend REFUSE TO START with a message naming both flags — it does
+  # not degrade to a warning, because a crosswalk's mapping rows are chosen by the Release-B
+  # temporal policy. Off ⟹ crosswalks stay discoverable and structurally non-executable.
+  FEATUREGEN_CROSSWALK_EXECUTION: "0"
+  # ── Materialization / code-gen (Phase G) — OFF on this cluster ────────────────────────────────
+  # THE KILL SWITCH for the whole materialization lane. A compile runs inside the worker tick on the
+  # worker's one connection, so while it runs the relay, the timers, the projections and every
+  # poller wait for it. `kubectl -n featuregen edit configmap backend-config` + a pod restart is the
+  # supported way to stop materialization WITHOUT stopping the worker; queued jobs stay `ready` and
+  # drain when it comes back on. Truthy: 1/true/yes/on.
+  #
+  # STILL OFF, and the reason is now exactly ONE thing. The image gained a kedro/pyspark interpreter
+  # at /opt/kedro-venv (see deploy/kind/Dockerfile.backend), so three of the four settings below have
+  # genuinely usable values in THIS pod. The fourth, INVENTORY, does not: the only §0 inventory in the
+  # repo is conf/environments/hdfc-local-inventory.yml, which is a TEMPLATE that `load_inventory`
+  # refuses by design (`engine_versions.hive is missing or null`, and `tables: {}`), and it is not
+  # copied into the image at all. Turning the switch on against it would not degrade politely — see
+  # the paragraph below for what it would actually do.
+  FEATUREGEN_MATERIALIZE_ENABLED: "0"
+  # The four settings a deployment that turns the switch ON must also supply. Deliberately left
+  # UNSET rather than pointed at paths this image does not contain: the lane resolves them only when
+  # a job is claimed, names the missing one, and leaves the request queued for the fix — but that
+  # patience is FINITE. A missing setting is treated as retryable, so the job is redelivered on the
+  # queue's ordinary budget (12 attempts) and then DEAD-LETTERED, and because the lane never claimed
+  # the request it writes no lifecycle: the request is left stranded at `requested` with nothing
+  # queued behind it. Past that point re-triggering needs a FRESH idempotency key (the old one names
+  # the stranded request, and the API answers 409), and the stranded row can never be CLOSED at all —
+  # §3.2 ships no `requested → failed` edge, so T13's reconciler reports NO_LEGAL_TERMINAL and
+  # changes nothing (DEFERRED-WORK A.35). An INVENTORY that exists but does not LOAD is the same
+  # failure exactly: `load_inventory` raises before the lane accepts anything. So turn the switch on
+  # and these four together — and only once the inventory is one a compilation can read.
+  #   the directory each sealed project tree is written under (one subdirectory per generation).
+  #   READY: no volume is mounted there, so a demo cluster writes to the pod's EPHEMERAL layer and a
+  #   restart takes every sealed tree with it. `materialize_to` mkdirs its parents and the container
+  #   runs as root, so the path needs no volume to work — it needs one to SURVIVE.
+  # FEATUREGEN_MATERIALIZE_PROJECT_ROOT: "/var/lib/featuregen/materialize"
+  #   the YAML of captured cluster facts every compilation reads (§0's typed input).
+  #   NOT READY — the one blocker. Nothing in this repo or this image satisfies it; a compile needs
+  #   engine versions AND a TableLayout per governed table, and nobody has captured a cluster.
+  # FEATUREGEN_MATERIALIZE_INVENTORY: "/etc/featuregen/cluster-inventory.yaml"
+  #   the interpreter the L0 build proof runs in; unset means no run is ever proven to build.
+  #   READY: the venv is in the image and was proved to import kedro+pyspark and to build a real
+  #   rendered project's pipeline. It proves a project BUILDS; it does not run Spark (no JVM).
+  # FEATUREGEN_MATERIALIZE_L0_PYTHON: "/opt/kedro-venv/bin/python"
+  #   that proof's bound in seconds; required with L0_PYTHON, and the worker's lease derives from it.
+  #   READY at the sandbox/gate precedent of 900 — but note what it buys: the lease becomes 600 + 900
+  #   = 1500s, and for that whole window one compile holds the single-threaded worker tick.
+  # FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS: "900"
 ---
 apiVersion: apps/v1
 kind: Deployment

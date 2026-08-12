@@ -14,8 +14,17 @@ import { type Page, expect, test } from 'playwright/test'
 const SOURCE = 'e2e_asset_experience'
 const TABLE = 'e2e_accounts'
 
+// A SECOND seeded source whose table, columns and definitions are deliberately long. Catalog
+// identifiers are unbounded strings from an upload, and they are what the suggestion card's layout
+// rules exist to survive — see the `.sfc` block in index.css, which allows every badge to wrap,
+// sets `min-width: 0` on every flex/grid track holding one, and breaks refs with
+// `overflow-wrap: anywhere` so a hostile label makes a card TALLER, never wider.
+const WIDE_SOURCE = 'e2e_wide_labels'
+const WIDE_TABLE = 'e2e_counterparty_settlement_exposure_reconciliation_daily_snapshot'
+
 const here = dirname(fileURLToPath(import.meta.url))
 const fixtureCsv = readFileSync(join(here, 'fixtures', 'e2e_accounts.csv'))
+const wideCsv = readFileSync(join(here, 'fixtures', 'e2e_wide_labels.csv'))
 
 // A desktop invariant: the page body must never scroll sideways. Asserted on each screen visited.
 async function expectNoHorizontalOverflow(page: Page, where: string): Promise<void> {
@@ -98,5 +107,63 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
 
     // no horizontal overflow on the widest (relationships / graph) tab either
     await expectNoHorizontalOverflow(page, 'asset detail (relationships)')
+  })
+})
+
+// The suggested-features surface, which the suite above never visits. Its own describe because it
+// seeds a DIFFERENT source: one whose identifiers are long enough to break the card's wrapping
+// rules if they ever regress.
+//
+// NOT a mobile project — the config's desktop-only scope decision stands, and no device emulation
+// is used here. The widths below are ordinary desktop window sizes (a half-screen window is about
+// 700px), chosen to sit either side of the card block's own `max-width: 720px` branch, which
+// collapses the label columns and is otherwise entirely unexercised.
+test.describe('suggested features — desktop, real backend, hostile-length catalog labels', () => {
+  test.beforeAll(async ({ request }) => {
+    const res = await request.post('/uploads', {
+      multipart: {
+        source: WIDE_SOURCE,
+        file: { name: 'e2e_wide_labels.csv', mimeType: 'text/csv', buffer: wideCsv },
+      },
+    })
+    expect(res.ok(), `seed upload failed: HTTP ${res.status()} — ${await res.text()}`).toBeTruthy()
+    const body = await res.json()
+    expect(body.status, JSON.stringify(body)).toBe('ingested')
+  })
+
+  test('long catalog labels never scroll the page sideways, at desktop or narrow', async ({
+    page,
+  }) => {
+    await page.goto(`/#/suggested?source=${WIDE_SOURCE}&table=${WIDE_TABLE}`)
+
+    // NON-VACUITY GUARD. The summary group renders only once the REAL v2 route has answered for a
+    // table this catalog holds, so this fails loudly if the seed did not land, if the deployment
+    // does not serve contract_version=2, or if the read was refused — rather than letting the
+    // overflow assertions below pass against a blank page or an error callout.
+    await expect(page.getByRole('group', { name: /suggestion summary/i })).toBeVisible()
+    // The anchor line always carries the unbounded table ref and catalog source as mono text, so
+    // there is always at least one hostile string on the page for the assertions to bite on.
+    await expect(page.getByText(WIDE_TABLE).first()).toBeVisible()
+    // ...and at least one CARD. The summary group also renders on a page with zero suggestions,
+    // which would leave the `.sfc` block this case exists to guard entirely absent from the DOM —
+    // the assertions below would then pass without ever testing the rules under test.
+    await expect(page.locator('.sfc').first()).toBeVisible()
+
+    await expectNoHorizontalOverflow(page, 'suggested features (default desktop)')
+
+    // 900px: the app's other max-width:900 breakpoints are active, the card block's is not.
+    // 700px: below the card block's own 720px collapse.
+    for (const width of [900, 700]) {
+      await page.setViewportSize({ width, height: 1000 })
+      await expectNoHorizontalOverflow(page, `suggested features (${width}px wide)`)
+    }
+
+    // Open every disclosure: the drawer carries the widest content on the surface — full refs,
+    // content hashes and revision ids — and none of it is on the page until it is expanded.
+    await page.setViewportSize({ width: 700, height: 1000 })
+    for (const toggle of await page.getByRole('button', { name: /show full detail/i }).all()) {
+      await toggle.click()
+    }
+    await expectNoHorizontalOverflow(page, 'suggested features (700px, every drawer open)')
   })
 })

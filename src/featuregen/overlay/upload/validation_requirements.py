@@ -18,10 +18,13 @@ PURE module — no DB, no I/O. The registry is DETERMINISTIC and CLOSED.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from featuregen.canonical import contract_hash_v1
+from featuregen.contracts.contract_versions import register_contract_version
+from featuregen.overlay.upload import feature_assist as _fa
 from featuregen.overlay.upload.feature_assist import REQUIREMENT_CODES, Requirement
 
 DEFAULT_SCHEMA_VERSION = "v1"
@@ -230,6 +233,71 @@ def _validate_params(
             f"requirement {schema.code!r} has an unhashable param value: {exc}"
         ) from exc
     return param_tuple
+
+
+# ── Task 2A (freeze 0F-7 P6): the content identity of each RULE the gauntlet evaluates ──────────
+# A trace records "which rules did this decision actually run", not "which registry version was
+# deployed": a global version moves for every unrelated edit, and a candidate that never ran the
+# temporal check should not go stale because the temporal schema changed. Each rule's identity is
+# its registry schema entry PLUS the module constants that GATE it — the word lists are as
+# load-bearing as the schema (widening `_WINDOW_WORDS` changes which candidates get asked for a
+# point-in-time basis), so they belong in the same identity and nowhere else.
+_RULE_CONTRACT = "validation-requirement-rule"
+_RULE_VERSION = "1"
+register_contract_version(_RULE_CONTRACT, _RULE_VERSION,
+                          owner="featuregen.overlay.upload.validation_requirements")
+
+
+def _gating_constants(code: str) -> dict[str, object]:
+    """The feature_assist constants that decide whether this rule's check RUNS at all."""
+    if code == "TYPE_IS_NUMERIC":
+        return {"numeric_op_words": sorted(_fa._NUMERIC_OP_WORDS)}
+    if code == "ADDITIVITY_SUPPORTS_OPERATION":
+        return {"unsafe_additive_words": sorted(_fa._UNSAFE_ADDITIVE_WORDS)}
+    if code == "TEMPORAL_IS_POPULATED":
+        return {"window_words": sorted(_fa._WINDOW_WORDS),
+                "window_pattern": _fa._WINDOW_RE.pattern}
+    return {}
+
+
+def _rule_payload(schema: ValidationRequirementSchema) -> dict[str, object]:
+    return {
+        "code": schema.code,
+        "schema_version": schema.schema_version,
+        "subject_kind": schema.subject_kind,
+        # Types are identified by NAME: the registry's contract with the external check is "this
+        # param is an int", not "this param is <class 'int'> at 0x...".
+        "params_schema": {name: t.__name__ for name, t in sorted(schema.params_schema.items())},
+        "result_schema": {name: t.__name__ for name, t in sorted(schema.result_schema.items())},
+        "unit": schema.unit,
+        "blocking": schema.blocking,
+        "optional_params": sorted(schema.optional_params),
+        "gating_constants": _gating_constants(schema.code),
+    }
+
+
+def rule_content_hash(code: str) -> str:
+    """The content identity of ONE validation rule. Raises `UnknownRequirement` for an unknown code."""
+    schema = REQUIREMENT_SCHEMA_REGISTRY.get(code)
+    if schema is None:
+        raise UnknownRequirement(f"unknown requirement code {code!r}")
+    return contract_hash_v1(_RULE_CONTRACT, _RULE_VERSION, _rule_payload(schema))
+
+
+def evaluated_rule_content_hashes(codes: Iterable[str]) -> tuple[str, ...]:
+    """The content hashes of exactly the rules a decision EVALUATED — sorted, deduplicated."""
+    return tuple(sorted({rule_content_hash(code) for code in codes}))
+
+
+def rule_codes_for_content_hashes(hashes: Iterable[str]) -> frozenset[str]:
+    """The inverse: which rules do these hashes name (under the CURRENT registry)?
+
+    A hash minted under an older rule definition resolves to nothing, which is the honest answer —
+    the trace was evaluated against a rule this deployment no longer has.
+    """
+    wanted = set(hashes)
+    return frozenset(code for code in REQUIREMENT_SCHEMA_REGISTRY
+                     if rule_content_hash(code) in wanted)
 
 
 def build_requirement(

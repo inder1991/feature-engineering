@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from featuregen.aggregates.ids import mint_id
@@ -37,15 +38,14 @@ from featuregen.overlay.upload.field_resolution import (
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 from featuregen.overlay.upload.templates import _Col, _load_columns
-from featuregen.projections.runner import _checkpoint_seq, _head_seq
 
 # The standard governed+hint field set the snapshot captures — mirrors the fields
 # ``column_authority`` actually MODELS (its ``_VALUE_COLUMN`` keys). NOTE: the field key for the
 # numeric-usable operational type is ``logical_representation`` (whose value is read from the flat
 # ``data_type`` column); ``declared_type`` is the separate raw-declared hint. A caller may pass a
-# custom ``fields`` list; any field NOT in :data:`_KNOWN_FIELDS` is SKIPPED (``read_column_facts``
-# would fall back to a bare ``None``/hint for it — snapshotting that would fabricate an item for a
-# field the adapter does not resolve).
+# custom ``fields`` list; any field NOT in :data:`_KNOWN_FIELDS` RAISES (D6 — ``read_column_facts``
+# would fall back to a bare ``None``/hint for it, and silently dropping it handed the caller a
+# snapshot that quietly lacked a field they asked to pin).
 _DEFAULT_FIELDS: tuple[str, ...] = (
     "additivity",
     "logical_representation",
@@ -68,6 +68,43 @@ _FACT_FIELDS: frozenset[str] = frozenset({"is_grain", "is_as_of"})
 _C1_GOVERNED_FIELDS: frozenset[str] = _DECISION_FIELDS | _FACT_FIELDS
 
 _ISOLATION_LEVEL = "repeatable read"
+
+# ── Task 0.6 Seam 4 (D6): the six snapshot pin KINDS. ``column_field`` is the only kind with a
+# builder/comparator today; the other five are RESERVED vocabulary whose builders arrive with the
+# profile/serving/temporal deliveries. No DB change: ``item_kind`` is an existing text column.
+#
+# STILL RESERVED AFTER RELEASE-B TASK 9, deliberately. Task 9's own rule is "use the six shared
+# snapshot kinds WHEN feature/materialization consumes the same decision". Analysis now consumes
+# all six — it seals them into `AnalysisExecutionIRV2` and revalidates them before every run
+# (`analysis/sealed_plan.py`) — but the FEATURE side does not until the Phase-G wiring merge, and a
+# pin with one producer and no consumer is the inert mechanism this programme keeps rediscovering.
+# The compat-safe hash rule below is already in place, so the builders land additively: no
+# migration, and not one stored snapshot re-hashed.
+ITEM_KIND_COLUMN_FIELD = "column_field"
+ITEM_KINDS: frozenset[str] = frozenset({
+    ITEM_KIND_COLUMN_FIELD, "dataset_profile", "serving_policy", "source_selection",
+    "physical_binding", "temporal_policy", "row_selection",
+    # SE-2: the frozen Layer-A generation context's identity pin (one item per catalog run).
+    "generation_semantic_context",
+})
+
+# Freshness reason (D6): a stored item whose kind has no comparator registered in THIS build — a
+# typed refusal ("this build cannot verify that pin"), never generic drift and never a crash.
+SNAPSHOT_KIND_UNSUPPORTED = "SNAPSHOT_KIND_UNSUPPORTED"
+
+
+def snapshot_item_hash(item_kind: str, material: Mapping[str, object]) -> str:
+    """The hash-compat rule (D6): ``column_field`` keeps the EXACT legacy computation — ``item_kind``
+    EXCLUDED — so every already-stored snapshot's item/content hashes stay valid; every NEW kind
+    hashes ``item_kind`` INTO its material, so two kinds with identical payloads can never collide.
+    Cross-kind collision is thereby impossible without touching a single legacy row."""
+    if item_kind not in ITEM_KINDS:
+        raise ValueError(f"unknown snapshot item kind {item_kind!r}; register it in ITEM_KINDS")
+    if item_kind == ITEM_KIND_COLUMN_FIELD:
+        return canonical_hash(dict(material))
+    if "item_kind" in material:
+        raise ValueError("item material must not carry its own 'item_kind' key")
+    return canonical_hash({**material, "item_kind": item_kind})
 
 # The version constants captured into the snapshot HEADER, and their column mapping:
 #   policy_version   ← FIELD_POLICY_VERSION              (the field-policy the reads obeyed)
@@ -109,53 +146,65 @@ class CatalogProjectionUnavailable(RuntimeError):
         self.detail = detail
 
 
-def _projection_is_degraded(conn: DbConn, name: str) -> bool:
-    """True if ANY aggregate of the named projection carries a poison marker in the generic degraded
-    ledger (``projection_degraded`` — the SAME store ``runner._mark_degraded`` writes). A degraded
-    projection's read model is untrustworthy, so the snapshot must not consume it."""
-    return conn.execute(
-        "SELECT 1 FROM projection_degraded WHERE projection_name = %s LIMIT 1", (name,)
-    ).fetchone() is not None
+def _readiness_probe(conn: DbConn, projections: Sequence[str]) -> dict[str, dict]:
+    """Everything :func:`check_projection_readiness` needs, in ONE round trip.
 
+    The gate's three inputs per projection — does it have a tracked checkpoint, is it poisoned, and
+    how far behind the event head is it — were four separate queries (head, exists, degraded,
+    checkpoint), which is fine for the once-per-feature-run snapshot gate but not for a READ
+    surface that calls the detection-only sibling on every request. Same predicates, same
+    fail-closed semantics, one statement: a LEFT JOIN over the requested names so an UNTRACKED
+    projection comes back as a row with a NULL checkpoint (present but unknown) rather than as a
+    missing row indistinguishable from "not asked about".
 
-def _projection_checkpoint_exists(conn: DbConn, name: str) -> bool:
-    """True if the named projection has a tracked checkpoint row. Fail-CLOSED input to the gate: an
-    ABSENT checkpoint is an unknown/untracked projection, NOT a caught-up one — ``projection_lag``
-    would read a missing row as lag 0 (falsely 'ready') when the head is also 0."""
-    return conn.execute(
-        "SELECT 1 FROM projection_checkpoints WHERE projection_name = %s", (name,)
-    ).fetchone() is not None
+    ``{name: {"checkpoint": int | None, "degraded": bool, "head": int}}``."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT p.name AS name, c.checkpoint_seq AS checkpoint, "
+            "       (SELECT COALESCE(max(global_seq), 0) FROM events) AS head, "
+            "       EXISTS (SELECT 1 FROM projection_degraded d "
+            "               WHERE d.projection_name = p.name) AS degraded "
+            "FROM unnest(%s::text[]) AS p(name) "
+            "LEFT JOIN projection_checkpoints c ON c.projection_name = p.name",
+            (list(projections),))
+        return {r["name"]: r for r in cur.fetchall()}
 
 
 def check_projection_readiness(
     conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
 ) -> dict[str, int]:
-    """Readiness gate for the feature-generation snapshot (C0-T4). Reusing the projection-health
-    primitives in ``projections.runner`` (never re-implementing them), verify EVERY load-bearing
-    projection is READY, and return its ``{projection_name: checkpoint_seq}`` watermarks (the seq
-    the read model is current as-of) for pinning into the snapshot header.
+    """Readiness gate for the feature-generation snapshot (C0-T4). Over the SAME three health
+    predicates ``projections.runner`` models (checkpoint tracked, not poisoned, not behind the
+    event head), verify EVERY load-bearing projection is READY, and return its
+    ``{projection_name: checkpoint_seq}`` watermarks (the seq the read model is current as-of) for
+    pinning into the snapshot header. The predicates are read in ONE statement
+    (:func:`_readiness_probe`) rather than four, because the detection-only sibling
+    :func:`projection_lag_marker` runs this gate on every catalog READ.
 
     Fail CLOSED. Raise :class:`CatalogProjectionUnavailable` (code
     :data:`CATALOG_PROJECTION_UNAVAILABLE`) if ANY load-bearing projection:
-      * has NO tracked checkpoint (unknown/untracked — never treated as caught-up), OR
-      * is DEGRADED/poisoned (a marker in ``projection_degraded``), OR
-      * is LAGGED — its ``_checkpoint_seq`` sits below the event head ``_head_seq`` (= the
-        resolve.py lag-guard posture: a just-committed event the projection has not yet applied
-        would make the read model STALE)."""
-    head = _head_seq(conn)   # the event head: COALESCE(max(global_seq), 0) FROM events
+      * has NO tracked checkpoint — unknown/untracked, never treated as caught-up (``projection_lag``
+        would read a missing row as lag 0, falsely 'ready', when the head is also 0), OR
+      * is DEGRADED/poisoned (a marker in ``projection_degraded``, the same ledger
+        ``runner._mark_degraded`` writes — a degraded read model is untrustworthy), OR
+      * is LAGGED — its checkpoint sits below the event head (= the resolve.py lag-guard posture: a
+        just-committed event the projection has not yet applied would make the read model STALE)."""
+    probe = _readiness_probe(conn, projections)   # ONE round trip for the whole gate
     watermarks: dict[str, int] = {}
     for name in projections:
-        if not _projection_checkpoint_exists(conn, name):
+        row = probe.get(name)
+        head = 0 if row is None else int(row["head"])   # COALESCE(max(global_seq), 0) FROM events
+        if row is None or row["checkpoint"] is None:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
                 f"load-bearing projection {name!r} has no tracked checkpoint (untracked/unknown)",
             )
-        if _projection_is_degraded(conn, name):
+        if row["degraded"]:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
                 f"load-bearing projection {name!r} is DEGRADED (poisoned read model)",
             )
-        checkpoint = _checkpoint_seq(conn, name)
+        checkpoint = int(row["checkpoint"])
         if checkpoint < head:
             raise CatalogProjectionUnavailable(
                 CATALOG_PROJECTION_UNAVAILABLE,
@@ -164,6 +213,52 @@ def check_projection_readiness(
             )
         watermarks[name] = checkpoint
     return watermarks
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionLagV1:
+    """A typed, honest marker that a READ was served while a load-bearing projection was behind.
+
+    Semantic Task 6, scoped deliberately narrow: DETECTION AND DISCLOSURE, not a new refusal. The
+    feature path aborts on lag because it SEALS a snapshot that must be re-executable; a catalog
+    READ has no such contract — refusing to show a column because a projection is three events
+    behind would be a worse answer than showing it with the lag named. What must never happen is
+    the silent version: serving a newer semantic value under an older context hash as though the
+    two agreed.
+
+    ``code`` is the existing :data:`CATALOG_PROJECTION_UNAVAILABLE`; ``detail`` is the gate's own
+    sentence, naming which projection and why. Nothing here is re-derived — the marker is exactly
+    what :func:`check_projection_readiness` already computes."""
+
+    status: str
+    code: str
+    detail: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "code": self.code, "detail": self.detail}
+
+
+#: The marker a READY read carries. Present ALWAYS (never omitted on the happy path): an absent key
+#: is indistinguishable from an older client that never had one, so "we checked and it was fine"
+#: has to be said out loud for "we checked and it was not" to mean anything.
+PROJECTION_READY = ProjectionLagV1(status="ready", code="", detail="")
+
+
+def projection_lag_marker(
+    conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
+) -> ProjectionLagV1:
+    """The DETECTION-ONLY sibling of :func:`check_projection_readiness`: same gate, same verdict,
+    reported instead of raised.
+
+    Reuses the readiness gate verbatim (never re-implements projection health) so a read surface
+    and the feature path can never disagree about whether the catalog is caught up. Returns
+    :data:`PROJECTION_READY` when it is, and a ``lagged`` marker carrying the gate's own code and
+    detail when it is not."""
+    try:
+        check_projection_readiness(conn, projections=projections)
+    except CatalogProjectionUnavailable as exc:
+        return ProjectionLagV1(status="lagged", code=exc.code, detail=exc.detail)
+    return PROJECTION_READY
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,7 +464,8 @@ def _build_item(
         provenance = facts.provenance
     decision_event_id = provenance if field in _DECISION_FIELDS else None
     fact_event_id = provenance if field in _FACT_FIELDS else None
-    item_hash = canonical_hash(
+    item_hash = snapshot_item_hash(
+        ITEM_KIND_COLUMN_FIELD,
         {
             "catalog_source": catalog_source,
             "graph_ref": object_ref,
@@ -378,14 +474,14 @@ def _build_item(
             "authority": authority,
             "provenance": provenance,
             "status": status,
-        }
+        },
     )
     return SnapshotItem(
         catalog_source=catalog_source,
         graph_ref=object_ref,
         logical_ref=logical_ref,
         physical_ref=_physical_ref(conn, catalog_source, logical_ref),
-        item_kind="column_field",
+        item_kind=ITEM_KIND_COLUMN_FIELD,
         field_or_fact_type=field,
         value=value,
         authority=authority,
@@ -397,6 +493,23 @@ def _build_item(
     )
 
 
+# item_kind -> the CURRENT-state item rebuilder ``compare_snapshot_to_current`` dispatches on (D6).
+# Only ``column_field`` has one today; the five reserved kinds gain theirs with their builders — a
+# stored kind absent here is the typed :data:`SNAPSHOT_KIND_UNSUPPORTED` refusal.
+def _compare_generation_context(conn, catalog_source, graph_ref, field):
+    """SE-2's freshness dispatch — imported lazily (the context module imports THIS one for the
+    item shape, so a module-level import here would cycle)."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        compare_generation_context_item,
+    )
+
+    return compare_generation_context_item(conn, catalog_source, graph_ref, field)
+
+
+_KIND_COMPARATORS = {ITEM_KIND_COLUMN_FIELD: _build_item,
+                     "generation_semantic_context": _compare_generation_context}
+
+
 def build_metadata_snapshot(
     conn: DbConn,
     *,
@@ -406,14 +519,21 @@ def build_metadata_snapshot(
     actor: dict | None = None,
     flags: dict | None = None,
     fields: Sequence[str] | None = None,
+    extra_items: Sequence[SnapshotItem] = (),
 ) -> SnapshotContext:
     """Persist an immutable, hashed snapshot of the in-scope catalog state and return a
     :class:`SnapshotContext` (see module docstring).
 
     ``refs`` is a sequence of ``(catalog_source, object_ref)``; ``fields`` defaults to the standard
-    governed+hint set (:data:`_DEFAULT_FIELDS`). A field ``read_column_facts`` does not MODEL is
-    skipped (never fabricated). MUST be given a REPEATABLE READ connection (raises
-    :class:`SnapshotIsolationError` otherwise)."""
+    governed+hint set (:data:`_DEFAULT_FIELDS`). Requesting a field ``read_column_facts`` does not
+    MODEL RAISES ``ValueError`` naming it (D6 — never silently dropped, never fabricated). MUST be
+    given a REPEATABLE READ connection (raises :class:`SnapshotIsolationError` otherwise)."""
+    requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
+    unknown_fields = [f for f in requested if f not in _KNOWN_FIELDS]
+    if unknown_fields:   # pure input validation — refuse BEFORE any read or write
+        raise ValueError(
+            f"unknown snapshot field(s) {unknown_fields!r}: read_column_facts does not model them "
+            f"(known: {sorted(_KNOWN_FIELDS)})")
     isolation_level = _assert_repeatable_read(conn)   # before the first catalog read
     # Readiness gate (C0-T4): a load-bearing projection that is LAGGED or DEGRADED would make the
     # authority adapter read STALE projected truth. Refuse BEFORE writing anything (no run manifest,
@@ -422,8 +542,7 @@ def build_metadata_snapshot(
     projection_watermarks = check_projection_readiness(conn)
     ensure_generation_run(conn, generation_run_id, actor or {}, flags or {})
 
-    requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
-    selected = [f for f in requested if f in _KNOWN_FIELDS]
+    selected = list(requested)
 
     items: list[SnapshotItem] = []
     seen_hashes: set[str] = set()
@@ -434,6 +553,16 @@ def build_metadata_snapshot(
                 continue   # an identical item appears once (mirrors the DB UNIQUE dedup)
             seen_hashes.add(item.item_hash)
             items.append(item)
+    # SE-2: caller-supplied pre-built items (the generation-context identity pin) join the SAME
+    # sealed set — hashed into content_hash below, verified by their registered kind comparator.
+    # Absent extra items, this loop is a no-op: byte-identical to the pre-SE-2 snapshot.
+    for item in extra_items:
+        if item.item_kind not in ITEM_KINDS:
+            raise ValueError(f"unknown extra snapshot item kind {item.item_kind!r}")
+        if item.item_hash in seen_hashes:
+            continue
+        seen_hashes.add(item.item_hash)
+        items.append(item)
 
     content_hash = canonical_hash(
         {
@@ -517,7 +646,7 @@ def compare_snapshot_to_current(conn: DbConn, snapshot_id: str) -> SnapshotFresh
     ):
         return SnapshotFreshness("drifted", "SNAPSHOT_VERSION_DRIFT", None)
     rows = conn.execute(
-        "SELECT catalog_source,graph_ref,field_or_fact_type,item_hash "
+        "SELECT catalog_source,graph_ref,field_or_fact_type,item_kind,item_hash "
         "FROM catalog_metadata_snapshot_item WHERE snapshot_id=%s "
         "ORDER BY catalog_source,graph_ref,field_or_fact_type,item_hash",
         (snapshot_id,),
@@ -525,9 +654,14 @@ def compare_snapshot_to_current(conn: DbConn, snapshot_id: str) -> SnapshotFresh
     if len(rows) != item_count:
         return SnapshotFreshness("unverifiable", "SNAPSHOT_ITEM_COUNT_MISMATCH", None)
     current_hashes: list[str] = []
-    for catalog_source, graph_ref, field, stored_item_hash in rows:
+    for catalog_source, graph_ref, field, item_kind, stored_item_hash in rows:
+        # D6 kind dispatch: a stored kind THIS build has no comparator for is a typed refusal —
+        # "cannot verify that pin" — never reported as drift and never allowed to crash.
+        comparator = _KIND_COMPARATORS.get(item_kind)
+        if comparator is None:
+            return SnapshotFreshness("unverifiable", SNAPSHOT_KIND_UNSUPPORTED, None)
         try:
-            current = _build_item(conn, catalog_source, graph_ref, field)
+            current = comparator(conn, catalog_source, graph_ref, field)
         except Exception:
             return SnapshotFreshness("unverifiable", "CURRENT_CATALOG_READ_FAILED", None)
         current_hashes.append(current.item_hash)

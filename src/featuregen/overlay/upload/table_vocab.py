@@ -25,7 +25,13 @@ TABLE_ROLE_ENUM = ["fact", "dim", "reference", "event_fact", "snapshot_fact", "d
 CANONICAL_TABLE_ROLES = frozenset({"event_fact", "snapshot_fact", "dimension", "reference",
                                    "bridge", "fact"})
 
-_ROLE_ALIASES = {"dim": "dimension"}
+# `crosswalk` is an INPUT alias for the legacy canonical `bridge` (profile plan §6.1 / Task 1):
+# a profile edit may SAY "crosswalk", but the canonical evidence vocabulary stays `bridge` so no
+# stored table_role evidence is re-keyed. Deliberately NOT added to TABLE_ROLE_ENUM above — that
+# list is interpolated into the Pass-B prompt, and extending it would re-version the prompt
+# (review D, Release A). Display mapping back out (`bridge` -> CROSSWALK) is owned by
+# `profile_vocab.data_role_from_table_role`.
+_ROLE_ALIASES = {"dim": "dimension", "crosswalk": "bridge"}
 
 _EVENT_OR_SNAPSHOT = ("event", "snapshot")
 

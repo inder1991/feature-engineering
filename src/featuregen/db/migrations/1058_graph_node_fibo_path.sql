@@ -1,0 +1,28 @@
+-- src/featuregen/db/migrations/1058_graph_node_fibo_path.sql
+-- Readiness wave (verified-interfaces doc D7 reservation 1058, appended in this same commit).
+--
+-- The THIRD taxonomy path from the FTR glossary sidecar, and the last `UNCARRIED_GAPS` entry.
+--
+-- `bian_path` and `process_path` got their display-projection columns in migration 1051; `fibo_path`
+-- did not, and the omission was invisible because all three are captured identically as SOURCE
+-- `field_evidence` by the glossary reader (`ingest._SOURCE_FIELDS`). Evidence without a flat column
+-- can never reach `graph_node`, so the facet mechanism (which requires literal columns), every flat
+-- reader, and `semantic_context`'s anchor query were all blind to it — while the sibling paths beside
+-- it flowed through normally. A field that is captured, stored and then silently unreachable reads
+-- from the outside exactly like a field nobody sent.
+--
+-- Recorded because the branch handover called closing this "one line" — the `_FEATURE_COLUMN_PROSE_KEYS`
+-- egress grade. That was the LAST of six steps: without this column there is nothing for the grade to
+-- carry.
+--
+-- Rebuildable, NEVER authoritative — the same contract as 1051/1052 and every other projected display
+-- column: `build_graph` recreates `graph_node` with this NULL on every upload and `resolve_and_project`
+-- re-derives it from the surviving evidence, so a lost column is a re-projection away and no
+-- operational read may consult it (authority stays in the decision log).
+--
+-- No CHECK constraint, for 1051's stated reason: a FIBO path is the source's own " > "-joined open
+-- hierarchy, so a constraint here would reject legitimate source data. The bounds that DO apply are
+-- enforced in code before persistence (the accept gates in `enrich`, the per-value egress caps in
+-- `enrich_llm`).
+
+ALTER TABLE graph_node ADD COLUMN IF NOT EXISTS fibo_path text NULL;

@@ -69,11 +69,17 @@ STATUS_EVENT_KEYS = {"status", "at", "reason_code"}
 # SearchHit / FacetBucket / SearchResult / SEARCH_FACET_KEYS (api.ts)
 SEARCH_HIT_KEYS = {
     "object_ref", "table", "column", "kind", "data_type", "definition", "is_grain", "is_as_of",
-    "catalog_source", "concept", "domain", "sensitivity", "additivity", "unit", "currency",
-    "entity", "score"}
-SEARCH_RESULT_KEYS = {"hits", "facets", "total"}
+    "catalog_source", "concept", "domain", "sensitivity", "sensitivity_display", "additivity",
+    "unit", "currency", "entity", "score"}
+# `projection` (semantic Task 6): every search read SAYS whether a load-bearing projection was
+# behind when it ran, instead of serving rows as though it knew.
+SEARCH_RESULT_KEYS = {"hits", "facets", "total", "projection"}
 FACET_BUCKET_KEYS = {"value", "count"}
-SEARCH_FACET_KEYS = {"source", "domain", "sensitivity", "additivity", "entity", "kind"}
+# Two sensitivity facets by design: `sensitivity` is the raw source-declared read-scope TAG,
+# `sensitivity_display` the projected restriction LABEL (migration 1042). Different vocabularies
+# ("pii" vs "restricted"), so they are separate facets rather than one repointed column.
+SEARCH_FACET_KEYS = {"source", "domain", "sensitivity", "sensitivity_display", "additivity",
+                     "entity", "kind"}
 
 # QuarantineItem (api.ts)
 QUARANTINE_ITEM_KEYS = {"row_index", "raw", "reason"}

@@ -1,4 +1,10 @@
-"""The fixture CONSTRUCTION CHECK — proof that the three worked features are not forgeries.
+"""The fixture CONSTRUCTION CHECK — proof that the four worked features are not forgeries.
+
+FOUR since DEFERRED-WORK A.36 added the BRIDGED one, and it is parametrized here beside the other
+three deliberately: a hand-authored formula nothing re-derives is exactly the fixture this file
+exists to refuse, and having a cross-catalog grain is no reason to be exempt. It resolves the same
+output policy as ``total_debit_amount_30d`` — the policy comes from the OPERAND's governed facts and
+the operand is identical — which this file re-derives rather than asserts.
 
 A hand-authored ``TypedFormulaV1`` is an assertion about what Child-1 resolves. Spec §13: *"a
 fixture claiming ADDITIVE for a plain SUM is a forgery, since Child-1 resolves NON_ADDITIVE without

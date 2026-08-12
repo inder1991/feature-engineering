@@ -104,6 +104,9 @@ from featuregen.overlay.upload.catalogs import list_visible_catalogs
 from featuregen.overlay.upload.contract.invalidation import bridge_fact_marker
 from featuregen.overlay.upload.governed_grain import load_governed_grains
 from featuregen.overlay.upload.join_governance import list_open_approved_join_proposals
+from featuregen.overlay.upload.semantic_binding_governance import (
+    list_semantic_binding_proposals,
+)
 from featuregen.overlay.upload.table_fact_governance import (
     list_open_table_fact_proposals_governance,
 )
@@ -141,17 +144,46 @@ APPROVED_JOIN = "approved_join"
 
 #: The kinds, in the order the queue presents them. Bridges first: they are the cross-catalog
 #: decisions no per-source screen could show, which is why this surface exists.
-KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time")
+# `entity_assignment` / `currency_binding` joined 2026-08-10: six service-proposed currency
+# bindings sat behind a four-eyes confirm while the ONE screen humans review from never listed
+# the kind — a dual-control over an invisible queue. The routes existed; the merge did not.
+KIND_ORDER = (ENTITY_BRIDGE, APPROVED_JOIN, "grain", "availability_time",
+              "entity_assignment", "currency_binding")
 
 #: Wordings that must NEVER appear anywhere in this payload — not in a value, a key, or a comment.
 #: Every one of them asserts that human review gates use, which is false: review is accountability,
 #: availability is automatic. Pinned by a test that scans the rendered response for each phrase.
+#:
+#: THE SCAN IS LITERAL AND CASE-INSENSITIVE, and the list is what it can see. That is why the last
+#: three are single WORDS rather than sentences: the four originals are whole assertions, and a
+#: surface that grows its own phrasing — "blocked until a reviewer signs off" — matched none of
+#: them and passed silently on every consumer of this list, including the crosswalk payload scan
+#: that shares it. A word is coarser than a sentence and that is the point: there is no honest
+#: sentence in this product containing "blocked", and a false positive costs a rewording.
 FORBIDDEN_PHRASES = (
     "Blocks N features",
     "Approve to enable",
     "Waiting to become usable",
     "Production approval required",
+    #: Catches every inflection a literal scan can reach: "blocked", "blocked by review", "blocked
+    #: until…". Availability is automatic, so nothing here is ever blocked BY anything.
+    "blocked",
+    #: Both spellings of the same claim — that somebody's signature is what makes a thing usable.
+    "sign-off",
+    "awaiting sign-off",
+    #: THE FALSE ZERO, SPELLED OUT. "not tracked yet" is the honest answer when no store records
+    #: dependants; these two assert the opposite — that the absence of a record is an absence of
+    #: dependants — in words, where no digit scan can see them.
+    "no features depend",
+    "nothing depends",
 )
+
+#: WHAT A LITERAL LIST CANNOT HOLD, recorded so nobody assumes the list is the whole rule. The other
+#: family the crosswalk-row review found is "a reviewer verifies it and it BECOMES runnable": three
+#: ordinary words in one sentence, none forbidden alone, and unbounded in how they can be spelled.
+#: Catching it needs an ADJACENCY pattern, which a substring scan cannot express — so it lives as a
+#: regex in the surface that renders sentences (``AssetDetailScreen.context.test.tsx``,
+#: ``FORBIDDEN_ON_A_CROSSWALK_ROW``) rather than being half-added here where it would look covered.
 
 # ── The human axis ───────────────────────────────────────────────────────────────────────────────
 # Keyed by the folded status the sibling listings already display. Each label states the human
@@ -427,6 +459,76 @@ def _usage_for(cat: _Category, state: str, counts: Mapping[str, int] | None,
                  basis=cat.basis)
 
 
+#: WHAT ALREADY DEPENDS ON A CROSSWALK. Release C Task 13, and ALL FIVE are `not_tracked_yet` BY
+#: CONSTRUCTION today — deliberately, and stated rather than hidden.
+#:
+#: Every store that records "something used a relationship" anchors on a bridge `fact_key`: the
+#: shadow assembly store keys `crossings[].bridge_fact_key`, `contract_metadata_dependency` carries
+#: the typed `bridgefact:<key>` marker, and the materialization control plane identifies a
+#: generation by hash alone. NONE of them has a crosswalk anchor, so no probe could license a count
+#: and a 0 here would be a lie in the most expensive direction — it would read as "nothing uses
+#: this", inviting exactly the "approve it and things become usable" story this surface exists to
+#: refuse.
+#:
+#: The machinery is shared with :data:`_CATEGORIES` rather than special-cased so that the day a
+#: crosswalk anchor lands in ANY of these stores, one `count_sql` turns its row into a real number
+#: with no other change — and until then the honest answer is the one that renders.
+_CROSSWALK_CATEGORIES: tuple[_Category, ...] = (
+    _Category(
+        name="planned_candidates", store="multisource_assembly_shadow_operand_obs.crossings[]",
+        basis="an assembled candidate plan whose operand path traversed this crosswalk",
+        by_construction=("the crossings record anchors on a bridge fact_key; a two-leg crosswalk "
+                         "traversal has no fact key and is not recorded there")),
+    _Category(
+        name="generated_artifacts", store="materialization control plane (migration 1034)",
+        basis="a rendered generation whose provenance names this crosswalk",
+        by_construction=("the control plane identifies a generation by group/project HASH only; "
+                         "the rendered project names its crosswalk pins in provenance text, which "
+                         "no table indexes")),
+    _Category(
+        name="published_features",
+        store="feature_current_contract + contract_metadata_dependency.logical_ref",
+        basis="a registered feature whose CURRENT governed contract depends on this crosswalk",
+        by_construction=("`contract_metadata_dependency` carries the typed `bridgefact:<key>` "
+                         "marker and no crosswalk equivalent exists, so a crosswalk dependency is "
+                         "not expressible in that column")),
+    _Category(
+        name="data_agent_analyses", store="none",
+        basis="an analysis whose plan traversed this crosswalk",
+        by_construction=("AnalysisPlan is never persisted and there is no analysis-run store; "
+                         "analysis_learning_event records only DECISIONS owed about a mapping "
+                         "dataset and is blind to a crosswalk that raised no finding")),
+    _Category(
+        name="sandbox_plans", store="none",
+        basis="a sandbox plan compiled through this crosswalk",
+        by_construction=("sandbox planning is compile-time and leaves no durable record keyed on "
+                         "a crosswalk definition")),
+)
+
+
+def crosswalk_usage(
+    conn: DbConn, definition_ids: Sequence[str]
+) -> dict[str, tuple[Usage, ...]]:
+    """``definition_id -> (Usage, …)`` — the SAME tri-state contract bridges use.
+
+    Shared with :func:`bridge_usage` on purpose: two implementations of "what already depends on
+    this" is two chances for one of them to render a 0 it has not earned. Every category resolves
+    through :func:`_usage_for`, so the type itself keeps "unmeasured" unrepresentable as a number.
+
+    A crosswalk's answer is currently ``not_tracked yet`` in all five categories, each carrying the
+    reason. That is a fact about this platform's lineage stores, NOT about the crosswalk, and the
+    ``reason`` string says which store would have to change.
+    """
+    if not definition_ids:
+        return {}
+    keys = list(dict.fromkeys(definition_ids))
+    return {
+        key: tuple(
+            _usage_for(cat, _NOT_TRACKED, None, key) for cat in _CROSSWALK_CATEGORIES)
+        for key in keys
+    }
+
+
 def bridge_usage(conn: DbConn, fact_keys: Sequence[str]) -> dict[str, tuple[Usage, ...]]:
     """``fact_key -> (Usage, …)`` for every category, measured ONCE for the whole batch.
 
@@ -658,6 +760,38 @@ def _table_fact_item(view: Mapping[str, Any], source: str) -> QueueItem:
                 "evidence_parse_status": view.get("evidence_parse_status")})
 
 
+def _semantic_binding_item(view: Mapping[str, Any], source: str,
+                           actor: IdentityEnvelope | None) -> QueueItem:
+    """A pending semantic binding as ONE queue item. `view` is
+    `list_semantic_binding_proposals`' shape (display statuses — `_STATE_LABEL`'s own vocabulary).
+
+    FOUR-EYES IS PROJECTED, NOT JUST ENFORCED: the item contract promises `available_actions` is
+    the server-sanctioned set for THIS caller, and `confirm_fact` 409s the uploading principal on a
+    binding born of their own upload (`source_uploader`, program-audit F2). Advertising confirm to
+    that caller invites a guaranteed 409 — the exact confusion the 2026-08-10 currency review hit —
+    so the uploader's own queue drops `confirm` and keeps `reject`."""
+    subject = view.get("subject") or {}
+    state, code = _state(str(view.get("status") or ""))
+    actions = tuple(view.get("available_actions") or ())
+    uploader = view.get("source_uploader")
+    if actor is not None and uploader and actor.subject == uploader:
+        actions = tuple(a for a in actions if a != "confirm")
+    return QueueItem(
+        kind=str(view.get("binding_kind") or ""),
+        fact_key=str(view["fact_key"]),
+        catalogs=(source,),
+        subject=f"{source}.{subject.get('table') or ''}.{subject.get('column') or ''}",
+        state=state, state_code=code,
+        # A binding is metadata about ONE column — nothing crosses, so the automatic axis is silent.
+        production_eligibility=None, production_eligibility_code="not_applicable",
+        available_actions=actions,
+        detail={"target": view.get("target"), "value": view.get("value"),
+                "entity_id": view.get("entity_id"), "prior_value": view.get("prior_value"),
+                "target_event_id": view.get("target_event_id"),
+                "disposition": view.get("disposition"),
+                "reason_codes": view.get("reason_codes")})
+
+
 # ── The merge ────────────────────────────────────────────────────────────────────────────────────
 
 def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
@@ -792,6 +926,27 @@ def governance_queue(conn: DbConn, *, roles: Iterable[str] = (),
             facts = []
         for view in facts:
             item = _table_fact_item(view, source)
+            key = (item.kind, item.fact_key)
+            if not item.fact_key or key in seen or item.kind not in by_kind:
+                continue
+            seen.add(key)
+            by_kind[item.kind].append(item)
+
+        try:
+            bindings = list_semantic_binding_proposals(
+                conn, source, limit=_FETCH_LIMIT, roles=role_claims)
+            capped = capped or len(bindings) >= _FETCH_LIMIT
+        except Exception:  # noqa: BLE001 — one catalog's listing, not the whole queue
+            counters.incr("overlay.governance_queue.semantic_bindings_unreadable")
+            logger.warning("governance queue: the semantic-binding listing for %s is unreadable",
+                           source, exc_info=True)
+            unreadable.append(Unreadable(
+                "semantic_binding", source, "the semantic-binding listing could not be read"))
+            bindings = []
+        for view in bindings:
+            if view.get("status") == "VERIFIED":
+                continue   # the queue lists PENDING decisions; a VERIFIED binding is not one
+            item = _semantic_binding_item(view, source, actor)
             key = (item.kind, item.fact_key)
             if not item.fact_key or key in seen or item.kind not in by_kind:
                 continue

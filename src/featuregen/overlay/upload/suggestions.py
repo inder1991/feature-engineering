@@ -46,13 +46,107 @@ The catalog-wide question is a DIFFERENT question and still has its own caller: 
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from featuregen.overlay.upload import join_path
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.gate1 import _template_candidates
 from featuregen.overlay.upload.feature_assist import FeatureIdea
-from featuregen.overlay.upload.join_path import clearing_neighbourhood, table_of_ref
+from featuregen.overlay.upload.join_path import (
+    JoinNeighbourhood,
+    clearing_neighbourhood,
+    table_of_ref,
+)
+from featuregen.overlay.upload.read_scope import allowed_classes
 from featuregen.overlay.upload.recipe_grounding_context import RecipeGroundingContextV1
+from featuregen.overlay.upload.suggestion_contract import (
+    FeatureSuggestionPageV2,
+    build_page_v2,
+    recipe_parts,
+    recipe_parts_to_json,
+    render_recipe,
+    unknown_table_page_v2,
+)
+
+# The recipe line is rendered by ONE producer, in `suggestion_contract`, and re-exported here: V1's
+# card and V2's `recipe`/`recipe_parts` must be the same string built the same way, and the module
+# that owns the V2 contract cannot import this one back without a cycle. Existing callers keep
+# importing `render_recipe` from here.
+__all__ = ["render_recipe", "suggest_features_for_table", "suggest_features_page_v2"]
+
+
+class _Anchored(NamedTuple):
+    """One grounding pass for one anchor table, shared by the V1 and V2 surfaces so the two can
+    never ground differently for the same request."""
+
+    table: str
+    neighbourhood: JoinNeighbourhood
+    candidates: object
+    ideas: list[FeatureIdea]
+
+
+def _ground_anchor(conn, catalog_source: str, table: str, roles, max_hops) -> _Anchored | None:
+    """Resolve the table, bound the neighbourhood, ground once, keep the candidates that bind THIS
+    table. ``None`` means this catalog holds no such table for this caller."""
+    known = _resolve_table(conn, catalog_source, table, roles=roles)
+    if known is None:
+        return None
+    # The BOUNDED join NEIGHBOURHOOD, decided by the gauntlet's own rule. Read-scoped: an edge with
+    # an endpoint this caller cannot see is DENIED there, so it never widens anything here — and a
+    # table the cap drops was, by construction, one this caller could already see, so truncation
+    # changes HOW MUCH is grounded against and never WHAT may be.
+    neighbourhood = clearing_neighbourhood(conn, catalog_source, known, roles=roles,
+                                           max_hops=max_hops)
+    # The engine's own result object. Read BY NAME — this screen consumes five of its members
+    # (ideas, rejections, binding_by_id, contexts, keys_by_recipe) and ignores the rest; it never
+    # rebuilds, re-derives or re-attributes any of them, and (rule 15) it never touches the decision
+    # traces the engine minted: they are the gauntlet's answer to a different question, handed
+    # whole to `suggestion_contract`, and reconstructing one here would be a second copy of the
+    # decision.
+    candidates = _template_candidates(conn, catalog_source=catalog_source, roles=roles,
+                                      target_ref=None, now=None,   # no intent, no clock, no LLM
+                                      table=known,                 # ...THIS table's columns...
+                                      also_tables=neighbourhood.neighbours)  # ...+ what it joins to
+    return _Anchored(known, neighbourhood, candidates,
+                     [idea for idea in candidates.ideas if _binds(idea, known)])
+
+
+def _empty_neighbourhood(max_hops: int | None) -> JoinNeighbourhood:
+    """Zeroes are the truth for a table this catalog does not hold: it has no neighbours to have
+    truncated. Reported anyway so the payload's shape never varies — and carried as the real value
+    object, so the V1 adapter re-serializes it through its own producer instead of synthesizing a
+    second zero block that could drift."""
+    return JoinNeighbourhood(
+        tables=(), tables_considered=0, tables_available=0, truncated=False,
+        max_hops=(join_path.MAX_HOPS_DEFAULT if max_hops is None else max_hops),
+        limit_reason=None)
+
+
+def suggest_features_page_v2(conn, *, catalog_source: str, table: str, roles=(),
+                             max_hops: int | None = None,
+                             column_ref: str | None = None) -> FeatureSuggestionPageV2:
+    """This table's suggestions as ``FeatureSuggestionPageV2`` — the SAME read as V1, projected onto
+    the discovery contract instead of the v1 card shape.
+
+    Release A is ``read_mode=on_demand``: there is no projection, so the page reports
+    ``projection=None`` rather than claiming a currentness it never computed, and this call remains
+    strictly read-only.
+
+    The assembly itself lives in ``suggestion_contract``: this function's whole job is to run the
+    engine once and hand the result over with the entity resolution V1 groups by, so the two
+    surfaces can never disagree about which bucket a card belongs to."""
+    anchored = _ground_anchor(conn, catalog_source, table, roles, max_hops)
+    if anchored is None:
+        return unknown_table_page_v2(catalog_source=catalog_source, requested_table=table,
+                                     neighbourhood=_empty_neighbourhood(max_hops), roles=roles)
+    contexts = anchored.candidates.contexts
+    keys_by_recipe = anchored.candidates.keys_by_recipe
+    return build_page_v2(
+        conn, catalog_source=catalog_source, anchor_table_ref=anchored.table,
+        anchored=[(idea, *_entity_of(idea, contexts, keys_by_recipe)) for idea in anchored.ideas],
+        candidates=anchored.candidates, neighbourhood=anchored.neighbourhood, roles=roles,
+        anchor_column_ref=column_ref)
 
 
 def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(),
@@ -67,36 +161,27 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
     ``table_known`` is a FOURTH state, and the load-bearing one for honesty: a table this catalog does
     not hold produces exactly the same zero-suggestion payload as a table whose columns carry no
     concepts, so without it the screen diagnoses a NONEXISTENT table as "your columns don't carry
-    business concepts". Resolved from ``graph_node`` alone, before the engine runs.
+    business concepts". Resolved from ``graph_node`` before the engine runs — under THIS CALLER's
+    read scope: a table none of whose columns are visible to the caller is, for that caller, a table
+    this catalog does not hold (see :func:`_resolve_table`).
 
     ``max_hops`` is the EXPLICIT opt-in for a wider neighbourhood. ``None`` — what every automatic
     page load passes — is the capped default (``join_path.MAX_HOPS_DEFAULT``: one hop). A deliberate
     caller may ask for more; the table cap and the column budget still apply, so expansion changes
     which tables are ELIGIBLE, never how many are admitted."""
-    known = _resolve_table(conn, catalog_source, table)
-    if known is None:
-        # Zeroes are the truth here, not a placeholder: a table this catalog does not hold has no
-        # neighbours to have truncated. Reported anyway so the payload's shape never varies.
+    anchored = _ground_anchor(conn, catalog_source, table, roles, max_hops)
+    if anchored is None:
         return {"catalog_source": catalog_source, "table": table, "table_known": False,
                 "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
                 "groups": [], "rejections": [],
-                "neighbourhood": {"tables_considered": 0, "tables_available": 0, "truncated": False,
-                                  "max_hops": (join_path.MAX_HOPS_DEFAULT if max_hops is None
-                                               else max_hops),
-                                  "limit_reason": None}}
-    table = known                                   # the catalog's own bare name — the engine's key
-    # The BOUNDED join NEIGHBOURHOOD, decided by the gauntlet's own rule. Read-scoped: an edge with an
-    # endpoint this caller cannot see is DENIED there, so it never widens anything here — and a table
-    # the cap drops was, by construction, one this caller could already see, so truncation changes
-    # HOW MUCH is grounded against and never WHAT may be.
-    neighbourhood = clearing_neighbourhood(conn, catalog_source, table, roles=roles,
-                                           max_hops=max_hops)
-    ideas, rejections, _grounded, _rejected, binding_by_id, _incomplete, contexts, keys_by_recipe = (
-        _template_candidates(conn, catalog_source=catalog_source, roles=roles,
-                             target_ref=None, now=None,           # no intent, no clock, no LLM
-                             table=table,                         # ...THIS table's columns...
-                             also_tables=neighbourhood.neighbours))   # ...+ what it can join to
-    mine = [idea for idea in ideas if _binds(idea, table)]
+                "neighbourhood": _empty_neighbourhood(max_hops).as_metadata()}
+    table = anchored.table                          # the catalog's own bare name — the engine's key
+    neighbourhood = anchored.neighbourhood
+    candidates = anchored.candidates
+    binding_by_id = candidates.binding_by_id
+    contexts = candidates.contexts
+    keys_by_recipe = candidates.keys_by_recipe
+    mine = anchored.ideas
     # Keyed on the entity REF alone: keying on (ref, label) lets one column open two groups, which
     # the screen then renders with the same React key.
     groups: dict[str, list[dict]] = {}
@@ -122,7 +207,7 @@ def suggest_features_for_table(conn, *, catalog_source: str, table: str, roles=(
         # own columns, plus whatever a clearing join reaches), so the engine's list is already this
         # screen's and needs no re-attribution — see the module docstring. With no join the
         # neighbourhood is the table itself and the list is exactly the table's, as before.
-        "rejections": rejections,
+        "rejections": candidates.rejections,
         # WHAT WAS LEFT OUT. A page that grounds against a bounded slice of a table's join
         # neighbourhood must say so, or its empty states become false claims ("nothing else is
         # buildable here" when the truth is "we did not look"). These are the screen's numbers.
@@ -147,16 +232,32 @@ def _binds(idea: FeatureIdea, table: str) -> bool:
     return any(table_of_ref(ref) == table for _src, ref in idea.derives_pairs)
 
 
-def _resolve_table(conn, catalog_source: str, table: str) -> str | None:
+def _resolve_table(conn, catalog_source: str, table: str, roles=()) -> str | None:
     """This catalog's own ``graph_node.table_name`` for ``table`` — ``None`` when it holds no such
-    table. The bare name is the engine's key (``FeatureIdea.grain_table``), but a deep link naturally
-    carries the schema-qualified table ``object_ref`` (``public.txns``), which is UNIQUE per catalog
-    (the node's primary key), so accepting it too is unambiguous. A bare match wins the tie."""
+    table FOR THIS CALLER. The bare name is the engine's key (``FeatureIdea.grain_table``), but a
+    deep link naturally carries the schema-qualified table ``object_ref`` (``public.txns``), which is
+    UNIQUE per catalog (the node's primary key), so accepting it too is unambiguous. A bare match
+    wins the tie.
+
+    Existence is a READ-SCOPED fact, derived from at least one caller-VISIBLE column (Task 0C defect
+    2). The table node itself is world-visible, so treating it as proof let a caller whose scope
+    could see NO column of a table still learn the table exists through ``table_known`` — and would
+    then be shown its rejections, neighbourhood metadata and counts. The visibility rule is the
+    grounding set's own (``visible_requires <@ allowed_classes(roles)``, the migration-1032
+    predicate every read-scope call site binds), so "the table exists for you" and "some column of
+    it could ground for you" can never disagree: all-hidden resolves exactly like nonexistent, while
+    one visible column keeps the resolution — and the payload — precisely what it always was. The
+    deep-link spelling still resolves through the table node's own ref, but only NAMES the table;
+    it never proves existence."""
     row = conn.execute(
-        "SELECT table_name FROM graph_node WHERE catalog_source = %s "
-        "AND (table_name = %s OR (kind = 'table' AND object_ref = %s)) "
-        "ORDER BY (table_name = %s) DESC LIMIT 1",
-        (catalog_source, table, table, table)).fetchone()
+        "SELECT c.table_name FROM graph_node c "
+        "WHERE c.catalog_source = %s AND c.kind = 'column' "
+        "AND c.visible_requires <@ %s "
+        "AND (c.table_name = %s OR c.table_name = ("
+        "    SELECT t.table_name FROM graph_node t "
+        "    WHERE t.catalog_source = %s AND t.kind = 'table' AND t.object_ref = %s)) "
+        "ORDER BY (c.table_name = %s) DESC LIMIT 1",
+        (catalog_source, allowed_classes(roles), table, catalog_source, table, table)).fetchone()
     return row[0] if row else None
 
 
@@ -199,56 +300,60 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: st
         "uses": list(dict.fromkeys(ref for _src, ref in idea.derives_pairs)),
         "binding_quality": binding_by_id.get(idea.recipe_id or "", ""),
         "recipe": render_recipe(idea, entity_ref),
-        "recipe_parts": _recipe_parts(idea, entity_ref),
+        "recipe_parts": recipe_parts_to_json(recipe_parts(idea, entity_ref)),
     }
 
+def semantic_parity_block(conn, *, catalog_source: str, table: str, roles=()) -> dict:
+    """SE-13 — the deterministic page's ENGINE verdicts for one opened table.
 
-def render_recipe(idea: FeatureIdea, entity_ref: str) -> str:
-    """The one-line recipe this feature computes, e.g. ``trend_90d(bal_amt) BY cif_id OVER 90d
-    [as_of_dt]``.
+    Runs the SAME lens the hypothesis Workbench serves from — frozen context, capability
+    binder, eligibility fold, assembly — UNSCOPED (this page has no hypothesis, no target, no
+    LLM; applicability narrows nothing here by design), then anchors to the opened table: a
+    candidate appears when any of its bound operands lives on this table. The anchor is
+    retrieval, never a forced measure — the engine bound whatever roles the columns can
+    actually serve. Because both surfaces call one engine over one context, they CANNOT
+    disagree about whether a recipe/column binding is semantically valid — the SE-13
+    acceptance, held by construction and pinned by test."""
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
-    ``operation_kind`` is printed AS BOUND. It is a DOMAIN label (``trend``, ``inflow_outflow``,
-    ``frequency_trend`` — ~152 of them), NOT a SQL verb: there is no label -> verb map here, because
-    inventing one would print ``AVG(...)`` for an operation the system calls ``trend``. Clauses that
-    do not apply are omitted, never emitted empty."""
-    parts = _recipe_parts(idea, entity_ref)
-    measures = ", ".join(parts["measures"])
-    line = f"{parts['operation']}({measures})" if parts["operation"] else measures
-    if parts["grain"]:
-        line += f" BY {parts['grain']}"
-    if parts["window"]:
-        line += f" OVER {parts['window']}"
-    if parts["time"]:
-        line += f" [{parts['time']}]"
-    return line
+    context = build_generation_semantic_context(
+        conn, catalog_source=catalog_source, roles=roles)
+    candidates = v2_recipe_candidates(
+        conn, catalog_source=catalog_source, roles=roles,
+        scope=ConfirmedScope(primary=None, unscoped=True), context=context)
 
+    def _on_table(candidate) -> bool:
+        return any(
+            verdict.selected_ref and verdict.selected_ref.split(".")[-2] == table
+            for verdict in candidate.verdicts if verdict.status == "bound")
 
-def _recipe_parts(idea: FeatureIdea, entity_ref: str) -> dict:
-    """The rendered line's pieces, structured. ``measure_refs`` carries EVERY bound pair — the grain
-    and point-in-time columns included — so both are subtracted here: a card listing the grain column
-    as a measure would claim the feature aggregates its own key. Order is the engine's binding order
-    (deduped), so the same idea always renders the same line.
-
-    ``entity_ref`` is the recipe's OWN bound entity (:func:`_entity_of`) when one resolved. The ``BY``
-    clause must name the column the card's HEADING names: ``idea.grain_ref`` is the table's single
-    ``is_grain`` column, so an account-grained card otherwise read "per account" above a line saying
-    ``BY cif_id``. It is subtracted from the measures for the same reason the grain is — it is the
-    feature's key, not a quantity it aggregates. Empty (no unambiguous source entity) falls back to
-    ``grain_ref``, unchanged."""
-    dropped = {ref for ref in (idea.grain_ref, idea.time_ref) if ref is not None}
-    measures = [ref for ref in dict.fromkeys(idea.measure_refs)
-                if ref not in dropped and ref[1] != entity_ref]
-    grain = entity_ref or (idea.grain_ref[1] if idea.grain_ref else "")
+    anchored = [c for c in candidates if _on_table(c)]
+    assembled = assemble_candidates(anchored)
+    def _entry(item) -> dict:
+        candidate = item.candidate
+        return {
+            "recipe_id": candidate.recipe_id,
+            "binding_state": candidate.binding_state,
+            "readiness": candidate.readiness,
+            "review_current": candidate.review_current,
+            "planning_request_hash": candidate.planning_request_hash,
+            "verdicts": [
+                {"role": v.role, "status": v.status, "selected_ref": v.selected_ref,
+                 "reason_codes": list(v.reason_codes), "resolution": v.resolution}
+                for v in candidate.verdicts],
+            "corroborations": [
+                {"origin": c.origin, "source_definition_id": c.source_definition_id}
+                for c in item.corroborations],
+        }
     return {
-        "operation": idea.operation_kind,
-        "measures": [_column(ref) for _src, ref in measures],
-        "grain": _column(grain) if grain else "",
-        "window": idea.window or "",
-        "time": _column(idea.time_ref[1]) if idea.time_ref else "",
+        "semantic_context_hash": context.context_hash(),
+        "table": table,
+        "ranked": [_entry(a) for a in assembled.ranked],
+        "actionable": [_entry(a) for a in assembled.actionable],
+        "order_basis": assembled.order_basis,
     }
-
-
-def _column(object_ref: str) -> str:
-    """The column name — the ref's last segment. A full ``schema.table.column`` ref is unreadable on
-    a card, and nothing is invented by taking the name the catalog already holds."""
-    return object_ref.rsplit(".", 1)[-1]

@@ -200,6 +200,8 @@ def _identifier_columns(conn, *, roles: Iterable[str]) -> list[_IdCol]:
             catalog_source=catalog_source,
             table_name=table_name,
             column_name=column_name,
+            # The RAW registry entity_link (D12.1-revised): this entity feeds _entity_pick and
+            # therefore fact_key — never the display seam. `customer` is read-time display only.
             entity=grounding.entity_id or c.entity_link,
             namespace=c.namespace,
             type_family=grounding.data_type_family,

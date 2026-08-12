@@ -9,6 +9,7 @@ table with no point-in-time basis.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import NamedTuple
 
@@ -306,7 +307,7 @@ def test_the_rejection_list_is_the_engines_own_per_table_list(overlay_conn, ftr_
     re-attribution guesswork and its "kept because the second pass could not place it" fallback — is
     gone. Pinned directly against the engine so a silent divergence cannot creep back."""
     engine = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(), target_ref=None,
-                                  now=None, table=TABLE)[1]
+                                  now=None, table=TABLE).rejections
     assert engine, "the fixture rejects nothing on this table — the pin would be vacuous"
     out = suggest_features_for_table(overlay_conn, catalog_source=SOURCE, table=TABLE)
     assert out["rejections"] == engine
@@ -342,7 +343,8 @@ def test_rejections_are_this_tables_only(overlay_conn, ftr_catalog):
 def _catalog_wide_ideas(conn) -> list[FeatureIdea]:
     """The FEATURE-GENERATION engine's own pass — ``_template_candidates`` called exactly as
     ``build_considered_set`` calls it, with no table narrowing."""
-    return _template_candidates(conn, catalog_source=SOURCE, roles=(), target_ref=None, now=None)[0]
+    return _template_candidates(conn, catalog_source=SOURCE, roles=(), target_ref=None,
+                                now=None).ideas
 
 
 def _uses(out: dict) -> set[str]:
@@ -406,13 +408,15 @@ def test_the_feature_generation_path_is_still_catalog_wide(overlay_conn, ftr_cat
                                    target_ref=None, now=None)
     explicit = _template_candidates(overlay_conn, catalog_source=SOURCE, roles=(),
                                     target_ref=None, now=None, table=None)
-    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
-        (i.name, i.grain_table, i.recipe_id) for i in explicit[0]]
-    assert default[1:] == explicit[1:]          # rejections + every id/context map the flow consumes
-    grains = {i.grain_table for i in default[0]}
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default.ideas] == [
+        (i.name, i.grain_table, i.recipe_id) for i in explicit.ideas]
+    # every OTHER member of the result — rejections, the id/context maps the flow consumes, and the
+    # rejection records with their traces — compared whole.
+    assert replace(default, ideas=[]) == replace(explicit, ideas=[])
+    grains = {i.grain_table for i in default.ideas}
     assert TABLE in grains and SIBLING_TABLE not in grains
     # one candidate per template — the catalog-wide invariant this change must not touch
-    assert len({i.recipe_id for i in default[0]}) == len(default[0])
+    assert len({i.recipe_id for i in default.ideas}) == len(default.ideas)
 
 
 # ── widening the grounding set across a CLEARING join ────────────────────────────────────────────
@@ -432,14 +436,17 @@ def join_catalog(overlay_conn):
     return _Catalog(source=_JOIN_SOURCE, table=_MEASURE_TABLE)
 
 
-def _join_edge(conn, *, fact_key: str | None, status: str | None) -> None:
+def _join_edge(conn, *, fact_key: str | None, status: str | None,
+               cardinality: str | None = "N:1") -> None:
     """One operational `joins` edge between the two tables. ``fact_key=None`` is a FILE-DECLARED edge;
-    a fact key with ``VERIFIED`` is a governed-verified one — `join_path` treats both as CLEARING."""
+    a fact key with ``VERIFIED`` is a governed-verified one — `join_path` treats both as CLEARING.
+    ``cardinality=None`` is an edge that declared none, which the traversed leg reports as
+    ``unknown`` (never guessed at 1:1) — reachability does not depend on it."""
     conn.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority, "
         "approved_join_fact_key, approved_join_status) "
-        "VALUES (%s, 'joins', %s, %s, 'N:1', 'operational', %s, %s)",
-        (_JOIN_SOURCE, _JOIN_FROM, _JOIN_TO, fact_key, status))
+        "VALUES (%s, 'joins', %s, %s, %s, 'operational', %s, %s)",
+        (_JOIN_SOURCE, _JOIN_FROM, _JOIN_TO, cardinality, fact_key, status))
 
 
 def _screen(conn, table: str = _MEASURE_TABLE, roles=()) -> dict:
@@ -537,6 +544,63 @@ def test_widening_never_binds_a_column_the_caller_could_not_already_see(overlay_
             assert _uses(_screen(overlay_conn, table=table, roles=roles)) <= visible, (roles, table)
 
 
+# ── Task 0C defect 2: table EXISTENCE is a read-scoped fact. `_resolve_table` used to treat the
+# world-visible table node as proof, so a caller whose scope could see NO column of a table still
+# learned the table exists through `table_known` (and would then see its rejections, neighbourhood
+# metadata and counts). Existence now derives from at least one caller-VISIBLE column
+# (`visible_requires`), like every other read on this surface. ──────────────────────────────────
+
+
+def _hide_every_column(conn, table: str) -> None:
+    conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'column' AND table_name = %s",
+        (_JOIN_SOURCE, table))
+
+
+def test_an_all_hidden_table_does_not_exist_for_the_blind_caller(overlay_conn, join_catalog):
+    """The all-hidden fixture. Every column of ``cust_master`` is restricted: to a caller with no
+    reader roles the table must be INDISTINGUISHABLE from one this catalog does not hold — the
+    byte-identical unknown-table payload, so nothing leaks through ``table_known``, rejections,
+    neighbourhood metadata or counts. The restricted fixture is the same probe under
+    ``restricted_reader``: the table exists again, through the same door."""
+    _hide_every_column(overlay_conn, _ENTITY_TABLE)
+    blind = _screen(overlay_conn, table=_ENTITY_TABLE, roles=())
+    assert blind["table_known"] is False
+    unknown = _screen(overlay_conn, table="no_such_table", roles=())
+    assert blind == {**unknown, "table": _ENTITY_TABLE}   # only the echoed request string differs
+    privileged = _screen(overlay_conn, table=_ENTITY_TABLE, roles=("restricted_reader",))
+    assert privileged["table_known"] is True
+    assert privileged["table"] == _ENTITY_TABLE
+
+
+def test_the_schema_qualified_ref_of_an_all_hidden_table_is_also_unknown(overlay_conn,
+                                                                         join_catalog):
+    """The deep-link spelling must not be a side door: probing the table's own ``object_ref``
+    (``public.cust_master``) reveals exactly as little as the bare name — and the unknown payload
+    echoes the caller's requested string verbatim, per the frozen two-case rule (0F-11)."""
+    _hide_every_column(overlay_conn, _ENTITY_TABLE)
+    out = _screen(overlay_conn, table=f"public.{_ENTITY_TABLE}", roles=())
+    assert out["table_known"] is False
+    assert out["table"] == f"public.{_ENTITY_TABLE}"
+
+
+def test_one_visible_column_keeps_the_table_resolving_exactly_as_before(overlay_conn,
+                                                                        join_catalog):
+    """The public/restricted split, and the compatibility half of the fix: hide every column BUT one
+    untagged (public) column, and the no-roles caller still resolves the table — both spellings,
+    same resolved bare name. A caller who can see at least one column sees no behaviour change."""
+    overlay_conn.execute(
+        "UPDATE graph_node SET sensitivity = 'restricted' "
+        "WHERE catalog_source = %s AND kind = 'column' AND table_name = %s "
+        "AND column_name <> 'master_dt'",
+        (_JOIN_SOURCE, _ENTITY_TABLE))
+    bare = _screen(overlay_conn, table=_ENTITY_TABLE, roles=())
+    qualified = _screen(overlay_conn, table=f"public.{_ENTITY_TABLE}", roles=())
+    assert bare["table_known"] is True and bare["table"] == _ENTITY_TABLE
+    assert qualified["table_known"] is True and qualified["table"] == _ENTITY_TABLE
+
+
 def test_the_catalog_wide_path_never_widens(overlay_conn, join_catalog):
     """The SCOPE guarantee for the feature-generation flow: widening is meaningless without an anchor
     table, so the catalog-wide default is inert to it — argument-for-argument the pass it always was."""
@@ -546,9 +610,9 @@ def test_the_catalog_wide_path_never_widens(overlay_conn, join_catalog):
     inert = _template_candidates(overlay_conn, catalog_source=_JOIN_SOURCE, roles=(),
                                  target_ref=None, now=None, table=None,
                                  also_tables=(_MEASURE_TABLE, _ENTITY_TABLE))
-    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
-        (i.name, i.grain_table, i.recipe_id) for i in inert[0]]
-    assert default[1:] == inert[1:]
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default.ideas] == [
+        (i.name, i.grain_table, i.recipe_id) for i in inert.ideas]
+    assert replace(default, ideas=[]) == replace(inert, ideas=[])
 
 
 def test_the_widened_screen_still_writes_nothing(overlay_conn, join_catalog):
@@ -965,9 +1029,9 @@ def test_the_cap_writes_nothing_and_leaves_the_catalog_wide_path_alone(overlay_c
                                    target_ref=None, now=None)
     explicit = _template_candidates(overlay_conn, catalog_source=_HUB_SOURCE, roles=(),
                                     target_ref=None, now=None, table=None)
-    assert [(i.name, i.grain_table, i.recipe_id) for i in default[0]] == [
-        (i.name, i.grain_table, i.recipe_id) for i in explicit[0]]
-    assert default[1:] == explicit[1:]
+    assert [(i.name, i.grain_table, i.recipe_id) for i in default.ideas] == [
+        (i.name, i.grain_table, i.recipe_id) for i in explicit.ideas]
+    assert replace(default, ideas=[]) == replace(explicit, ideas=[])
 
 
 def test_the_unbounded_closure_helper_still_answers_its_own_question(overlay_conn, hub_catalog):

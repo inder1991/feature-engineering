@@ -46,12 +46,19 @@ class CompilationRefusalCode(StrEnum):
     TERMINAL_PAYLOAD_TAMPERED = "TERMINAL_PAYLOAD_TAMPERED"
     NOT_RESOLVED = "NOT_RESOLVED"
     FORMULA_HASH_MISMATCH = "FORMULA_HASH_MISMATCH"
+    # BR-6: the compiler consumes exactly Formula-v1 today. A formula claiming any other schema
+    # version is refused at admission — never silently compiled under v1 semantics. Lifting this
+    # is an ENGINE capability decision (capability_v2.EngineCapabilityV1), not a default.
+    FORMULA_SCHEMA_UNSUPPORTED = "FORMULA_SCHEMA_UNSUPPORTED"
     AXES_MISMATCH = "AXES_MISMATCH"
     INTENT_HASH_MISMATCH = "INTENT_HASH_MISMATCH"
 
     # Read scope and safety classification.
     READ_SCOPE_INSUFFICIENT = "READ_SCOPE_INSUFFICIENT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"
+    #: a physical read names a column the governed catalog does not describe — §11's L1 would
+    #: call it COLUMN_ABSENT, but compile must not emit a read nobody governs.
+    COLUMN_NOT_GOVERNED = "COLUMN_NOT_GOVERNED"
 
     # Physical resolution and join planning (§3).
     AMBIGUOUS_TABLE_NAME = "AMBIGUOUS_TABLE_NAME"
@@ -144,6 +151,15 @@ class ValidationFindingCode(StrEnum):
     PROJECT_DOES_NOT_BUILD = "PROJECT_DOES_NOT_BUILD"
     PROJECT_HASH_MISMATCH = "PROJECT_HASH_MISMATCH"
     PIPELINE_NOT_CONSTRUCTIBLE = "PIPELINE_NOT_CONSTRUCTIBLE"
+    #: The interpreter that proved the build is not the environment the artifact PINS ITSELF to
+    #: (``requirements.lock``, rendered from ``ClusterInventoryV1.engine_versions`` and inside the
+    #: project hash). Added for DEFERRED-WORK A.42: without it the one Phase G failure that fails
+    #: OPEN had no name — L0 imported the project in whatever interpreter it was handed, never
+    #: compared the two, and reported ``PASSED``, so "the build was proven" could be a proof about
+    #: a different environment than the one the artifact declares. It is a FINDING rather than a
+    #: refusal because L0 reports; and it is a finding rather than ``status="error"`` because
+    #: something WAS observed and a report that carries no findings cannot name what.
+    ENGINE_VERSION_MISMATCH = "ENGINE_VERSION_MISMATCH"
 
     # L1 — the physical inputs the run will actually read.
     COLUMN_ABSENT = "COLUMN_ABSENT"

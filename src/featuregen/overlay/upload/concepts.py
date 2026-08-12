@@ -47,6 +47,32 @@ class Concept:
     near_label: bool = False        # True for funnel-tail signals that BORDER the label (forbearance,
     #                                 stage-3 impairment, 90+ DPD, CASS switch, filed SAR) — the 3-part
     #                                 leakage control must FLAG these (softer than leakage_anchor).
+    #: True for THE LABEL THAT STANDS BESIDE A CODE FOR THE SAME THING — a branch NAME beside
+    #: `branch_id`, a status DESCRIPTION beside the status code, a merchant's trading name beside
+    #: `merchant_id`. Every concept that sets it says so in its own description ("(the label beside
+    #: X)"), and each adds the same warning in prose: "never a join key", "the id joins, the name
+    #: does not", "conflates what you GROUP BY with what you DISPLAY". This field is that sentence
+    #: made readable by the feature USE gate. It follows the `leakage_anchor` precedent exactly — a
+    #: behaviour-carrying boolean, not a name pattern.
+    #:
+    #: DELIBERATELY NOT every name. `party_name`, `beneficiary_name` and `postal_address` are NOT
+    #: descriptive, because the registry documents a real computable use for each: a beneficiary
+    #: name is the match input of `external_own_transfer_trend` (§A9), and an address "generalises
+    #: to a region or distance feature". They are personal data, which is a POLICY question with a
+    #: policy answer — not a structural one. Marking them here would tell a reviewer "no approval
+    #: can ever help" about a feature an approval is exactly what unblocks.
+    #:
+    #: AND DELIBERATELY NOT every free-text column. The `text` GROUP was once swept in wholesale;
+    #: the sweep never applied the criterion above to its members, and the result told a reviewer
+    #: that `payment_narrative` — which the registry's own description calls "the single richest
+    #: signal in transaction data … it drives categorisation, merchant identification and AML
+    #: screening" — could never be built from, and sent them to "use the CODE column beside it"
+    #: when a narration has no code beside it and no approval could have helped. Every `text`
+    #: concept is now adjudicated on its OWN description (§3.9), and none of them sets this field:
+    #: they are PII-laden computable text, which is the policy class. The rule holds again in both
+    #: directions — every concept that sets `descriptive` says so in its own description, and every
+    #: concept whose description says so sets it.
+    descriptive: bool = False
     description: str = ""
 
 
@@ -145,23 +171,29 @@ _ALL: tuple[Concept, ...] = (
             description="A person or organisation NAME. Names display and group; they are "
                         "never identifiers and never join keys."),
     Concept("module_id", "categorical",
+            is_a="category_code",
             description="A source-system module/product code (which subsystem produced the row). "
                         "System-scoped categorical; not a business category and not a key."),
 
     # ── §3.3 Temporal (point-in-time critical) ────────────────────────────────────────────────────
     Concept("as_of_date", "temporal", pit_role="as_of",
+            is_a="valid_time",
             description="Decision reference date — the point features are computed as-of."),
     Concept("effective_date", "temporal", pit_role="effective",
+            is_a="valid_time",
             description="State start date — when a value/state became effective."),
     Concept("origination_date", "temporal", pit_role="event",
+            is_a="event_timestamp",
             description="When a loan/account/facility was originated (an occurrence)."),
     Concept("maturity_date", "temporal", pit_role="maturity",
             description="Contractual maturity/expiry date."),
-    Concept("trade_date", "temporal", pit_role="event", description="Date a trade was struck."),
+    Concept("trade_date", "temporal", pit_role="event", is_a="event_timestamp",
+            description="Date a trade was struck."),
     Concept("value_date", "temporal", pit_role="effective",
+            is_a="effective_date",
             description="Date value/funds become economically effective (FX/payments)."),
     Concept("settlement_date", "temporal", pit_role="event",
-            description="Date a trade/payment settles (an occurrence)."),
+            is_a="event_timestamp", description="Date a trade/payment settles (an occurrence)."),
     Concept("event_timestamp", "temporal", pit_role="event",
             description="Timestamp an event occurred (dated at occurrence)."),
     Concept("duration_tenure", "temporal", additivity="non_additive",
@@ -201,14 +233,18 @@ _ALL: tuple[Concept, ...] = (
     Concept("beta", "quantity_risk", additivity="non_additive",
             description="Deposit beta (a ratio). Non-additive."),
     Concept("pd", "quantity_risk", additivity="non_additive",
+            is_a="score_probability",
             description="Basel probability of default (generalises pd_ttc/pd_pit). Non-additive. "
                         "LEAKAGE-RISK when a model output — flag before use as a feature."),
 
     # ── §3.5 Categorical & coded ──────────────────────────────────────────────────────────────────
     Concept("category_code", "categorical", description="Generic coded category."),
-    Concept("product_type", "categorical", description="Product classification."),
-    Concept("account_type", "categorical", description="Account classification (current/savings/loan/…)."),
-    Concept("transaction_type", "categorical", description="Transaction classification."),
+    Concept("product_type", "categorical", is_a="category_code",
+            description="Product classification."),
+    Concept("account_type", "categorical", is_a="category_code",
+            description="Account classification (current/savings/loan/…)."),
+    Concept("transaction_type", "categorical", is_a="category_code",
+            description="Transaction classification."),
     Concept("direct_debit", "categorical",
             description="Direct-debit mandate + its lifecycle events (setup / amend / cancel). Distinct "
                         "from a one-off transaction — cancellation is a Stage-4 churn signal "
@@ -217,19 +253,25 @@ _ALL: tuple[Concept, ...] = (
             description="Standing-order mandate + events (setup / redirect / cancel). Redirection to an "
                         "external bank is a primacy-loss signal (§A9)."),
     Concept("debit_credit_indicator", "categorical",
+            is_a="category_code",
             description="Flow DIRECTION on a transaction (debit vs credit / dr-cr / sign). Required by "
                         "every cash-flow feature (inflow_outflow_ratio §A4) — distinct from boolean_flag."),
     Concept("beneficiary_bank", "categorical",
             description="The payee's destination bank / sort-code / scheme, with an internal-vs-EXTERNAL "
                         "flag. Powers the own-money-to-a-competitor primacy signal (§A9)."),
-    Concept("channel", "categorical", description="Origination/servicing channel (mobile/web/branch/call-center)."),
+    Concept("channel", "categorical", is_a="category_code",
+            description="Origination/servicing channel (mobile/web/branch/call-center)."),
     Concept("country_code", "categorical", sensitivity="proxy",
+            is_a="category_code",
             description="ISO country code. When it encodes nationality/residence it is a national-"
                         "origin PROXY (ECOA/fair-lending) — proxy-flagged; use-case-gate for credit."),
-    Concept("industry_code", "categorical", description="Industry classification (NAICS/SIC)."),
-    Concept("mcc", "categorical", description="Merchant category code."),
-    Concept("instrument_type", "categorical", description="Instrument classification."),
+    Concept("industry_code", "categorical", is_a="category_code",
+            description="Industry classification (NAICS/SIC)."),
+    Concept("mcc", "categorical", is_a="category_code", description="Merchant category code."),
+    Concept("instrument_type", "categorical", is_a="category_code",
+            description="Instrument classification."),
     Concept("lifecycle_state", "categorical",
+            is_a="category_code",
             description="Lifecycle state / status (origination→active→delinquent→default→restructured→"
                         "closed/written-off). Features condition on it; transitions are often the target."),
 
@@ -240,19 +282,20 @@ _ALL: tuple[Concept, ...] = (
 
     # ── §3.7 Flags (boolean) — some are targets (leakage anchors) ─────────────────────────────────
     Concept("boolean_flag", "flag", description="Generic boolean flag."),
-    Concept("delinquency_flag", "flag", leakage_anchor=True,
+    Concept("delinquency_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Delinquency indicator. LEAKAGE ANCHOR — is the target for delinquency models."),
-    Concept("default_flag", "flag", leakage_anchor=True,
+    Concept("default_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Default indicator. LEAKAGE ANCHOR — is the target for PD/default models."),
-    Concept("fraud_flag", "flag", leakage_anchor=True,
+    Concept("fraud_flag", "flag", is_a="boolean_flag", leakage_anchor=True,
             description="Fraud indicator. LEAKAGE ANCHOR — is the target for fraud models."),
-    Concept("restructured_flag", "flag", near_label=True,
+    Concept("restructured_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Restructure / forbearance indicator. NEAR-LABEL: forbearance ≈ the default "
                         "label (§B2 Stage-4) — the 3-part leakage control must flag it."),
-    Concept("sanctions_hit_flag", "flag", sensitivity="pii", near_label=True,
+    Concept("sanctions_hit_flag", "flag", sensitivity="pii", is_a="boolean_flag", near_label=True,
             description="Sanctions-screening hit — sensitive (read-scoped, AML-lawful-basis; not fair-"
                         "lending-blocked). NEAR-LABEL: a filed hit ≈ the sanctions-model target."),
     Concept("pep_flag", "flag", sensitivity="pii",
+            is_a="boolean_flag",
             description="Politically-exposed-person indicator — GDPR-sensitive (political); read-scoped "
                         "and AML-lawful-basis. Tagged pii (usable for AML), NOT special_category-blocked."),
 
@@ -270,16 +313,40 @@ _ALL: tuple[Concept, ...] = (
     Concept("kyc_document", "sensitive", sensitivity="pii",
             description="KYC identity document — carries PII; read-scoped."),
     Concept("beneficiary_name", "sensitive", sensitivity="pii", entity_link="beneficiary",
+            is_a="party_name",
             description="Payee name on a transfer — PII, read-scoped. Name-matched against the customer "
                         "name to DERIVE the own-account flag downstream (§A9 external_own_transfer_trend; "
                         "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
 
     # ── §3.9 Text & documents ─────────────────────────────────────────────────────────────────────
+    # THE USE-GATE ADJUDICATION FOR THE WHOLE `text` GROUP, recorded once here because the members
+    # live in three sections (§3.9, §3.19 record_author, §3.20 payment_narrative + kyc_narrative).
+    # `descriptive` means ONE thing — the label that stands beside a CODE for the same thing — and
+    # not one of these six is that. A narration has no code column beside it, so the structural
+    # refusal ("use the CODE column beside it") names a column that does not exist, and the
+    # structural family says "no approval can ever help" about text the registry itself documents a
+    # computable use for. Each is therefore adjudicated on its own description:
+    #
+    #   payment_narrative  POLICY  — "drives categorisation, merchant identification and AML
+    #                                 screening"; the richest computable text in the catalog, and
+    #                                 pii because it carries names and account numbers.
+    #   free_text          POLICY  — memo / complaint text: complaint-driven features are ordinary
+    #                                 conduct and churn signals; pii because it may carry PII.
+    #   kyc_narrative      POLICY  — high-risk rationale prose; an AML/CDD input under a policy.
+    #   unstructured_doc   POLICY  — document bodies; pii, possibly special-category CONTENT, but
+    #                                 the content is not a declared special-category ATTRIBUTE.
+    #   record_author      POLICY  — a named member of staff; "rarely a legitimate feature" is a
+    #                                 judgement about usefulness, not a structural impossibility.
+    #   document_reference NEITHER — a pointer with no declared sensitivity and no label-beside-a-
+    #                                 code semantics. Counting documents per customer is an ordinary
+    #                                 feature, so the gate leaves it alone entirely — the same
+    #                                 "absence is not an assertion" rule the whole gate is built on.
     Concept("free_text", "text", sensitivity="pii",
             description="Memo, notes, complaint text. Tagged pii: may carry PII — read-scoped + screen "
                         "on egress (a deterministic gate, not just a prose warning)."),
     Concept("document_reference", "text", description="Reference/pointer to a stored document."),
     Concept("unstructured_doc", "text", sensitivity="pii",
+            is_a="free_text",
             description="Loan/KYC document body. Tagged pii: may carry PII/special-category content — "
                         "read-scoped + screen on egress."),
 
@@ -290,7 +357,8 @@ _ALL: tuple[Concept, ...] = (
                         "built from it or from its defining source columns."),
 
     # ── §3.11 Behavioural / digital ───────────────────────────────────────────────────────────────
-    Concept("event_type", "behavioural", description="Digital event classification."),
+    Concept("event_type", "behavioural", is_a="category_code",
+            description="Digital event classification."),
     Concept("session", "behavioural", description="Session grouping of digital activity."),
     Concept("clickstream", "behavioural", description="Sequence of page/app interactions."),
     Concept("channel_usage", "behavioural", description="Usage intensity by channel."),
@@ -317,6 +385,7 @@ _ALL: tuple[Concept, ...] = (
                         "features require both valid_time ≤ as_of AND system_time ≤ as_of — the second "
                         "drops values restated later that you didn't know at prediction time."),
     Concept("booking_date", "temporal", pit_role="system_time",
+            is_a="system_time",
             description="Date an entry was booked to the ledger (a knowledge/system-time date)."),
     Concept("business_day_convention", "temporal",
             description="Rule for adjusting dates to business days (following/modified-following/…)."),
@@ -327,17 +396,21 @@ _ALL: tuple[Concept, ...] = (
     Concept("currency_code", "currency",
             description="The monetary UNIT. CANNOT mix currencies in a sum — convert to a base "
                         "currency via a point-in-time fx_rate first; mixing USD+EUR is a wrong number."),
-    Concept("base_currency", "currency", description="Reporting/base currency all amounts convert to."),
-    Concept("local_currency", "currency", description="Native/local currency of the amount."),
+    Concept("base_currency", "currency", is_a="currency_code",
+            description="Reporting/base currency all amounts convert to."),
+    Concept("local_currency", "currency", is_a="currency_code",
+            description="Native/local currency of the amount."),
     Concept("fx_conversion_rate", "currency", additivity="non_additive",
             description="Point-in-time FX rate used to convert local→base. Non-additive."),
     Concept("cross_rate", "currency", additivity="non_additive",
+            is_a="fx_conversion_rate",
             description="Currency cross-rate (via a common base). Non-additive."),
 
     # ── §3.15 Data eligibility (P0 compliance) ────────────────────────────────────────────────────
     Concept("data_purpose", "eligibility", description="Declared purpose the data may be used for."),
     Concept("consent_status", "eligibility", description="Whether consent covers the intended use."),
-    Concept("retention_class", "eligibility", description="Retention policy class / max retention window."),
+    Concept("retention_class", "eligibility", is_a="category_code",
+            description="Retention policy class / max retention window."),
     Concept("data_residency", "eligibility", description="Jurisdiction the data must reside in."),
 
     # ── §3.16 Regulatory capital & accounting (the spine) ─────────────────────────────────────────
@@ -357,14 +430,17 @@ _ALL: tuple[Concept, ...] = (
     Concept("downturn_lgd", "regulatory_capital", additivity="non_additive", is_a="lgd",
             description="Downturn loss given default. Non-additive."),
     Concept("fair_value", "accounting", additivity="semi_additive",
+            is_a="monetary_stock",
             description="Fair-value carrying amount (a valuation stock). Semi-additive (latest over time)."),
     Concept("amortised_cost", "accounting", additivity="semi_additive",
+            is_a="monetary_stock",
             description="Amortised-cost carrying amount (a balance). Semi-additive (latest over time)."),
-    Concept("impairment_stage", "accounting", near_label=True,
+    Concept("impairment_stage", "accounting", is_a="category_code", near_label=True,
             description="IFRS9 stage 1/2/3 (ordinal). Not aggregatable — condition on it. NEAR-LABEL: "
                         "stage 3 (credit-impaired) ≈ the default label — the 3-part leakage control "
                         "must flag it."),
     Concept("accrual", "accounting", additivity="additive",
+            is_a="monetary_flow",
             description="Accrued interest/amount over a period (flow-like). Additive over the period."),
     Concept("provision_amount", "accounting", additivity="semi_additive", is_a="monetary_stock",
             description="Loan-loss provision — a provision STOCK. Semi-additive: sum across exposures, "
@@ -384,8 +460,10 @@ _ALL: tuple[Concept, ...] = (
     Concept("esg_score", "esg", additivity="non_additive", description="ESG rating/score. Non-additive."),
     Concept("carbon_intensity", "esg", additivity="non_additive",
             description="Emissions per unit of activity/revenue. Non-additive (a ratio)."),
-    Concept("green_flag", "esg", description="Green/sustainable-finance eligibility flag."),
-    Concept("sharia_compliant_flag", "esg", description="Sharia-compliance flag (Islamic banking)."),
+    Concept("green_flag", "esg", is_a="boolean_flag",
+            description="Green/sustainable-finance eligibility flag."),
+    Concept("sharia_compliant_flag", "esg", is_a="boolean_flag",
+            description="Sharia-compliance flag (Islamic banking)."),
 
     # ══════════════════════════════════════════════════════════════════════════════════════════
     # Phase-2 additive expansion — closes the SME gap-review's missing-concept findings (§B) plus
@@ -401,6 +479,7 @@ _ALL: tuple[Concept, ...] = (
                         "master limit): semi-additive at most (latest over time); never naively sum "
                         "nested limits — double-counts. Contrast a drawn balance (§E limit-vs-balance)."),
     Concept("limit_type", "categorical",
+            is_a="category_code",
             description="Kind of limit (facility / counterparty / country / sector / settlement / "
                         "single-name). Disambiguates a limit's scope."),
     Concept("covenant", "quantity_risk", additivity="non_additive", near_label=True,
@@ -408,9 +487,11 @@ _ALL: tuple[Concept, ...] = (
                         "NEAR-LABEL: a breach borders the default/forbearance label — the leakage control "
                         "must flag headroom/breach features."),
     Concept("collateral_type", "categorical",
+            is_a="category_code",
             description="Kind of collateral (cash / real-estate / securities / receivables / guarantee). "
                         "Drives haircut + advance_rate."),
     Concept("lien_seniority", "categorical",
+            is_a="category_code",
             description="Priority of the security interest (first / second lien, senior / subordinated) "
                         "— ordinal; drives recovery/LGD. Loan-level (contrast tranche)."),
     Concept("netting_set_id", "identifier", namespace="netting_set", entity_link="netting_set",
@@ -450,6 +531,7 @@ _ALL: tuple[Concept, ...] = (
             description="Option-implied volatility (a market observable / surface point). Non-additive "
                         "across strikes/expiries."),
     Concept("position_direction", "categorical",
+            is_a="category_code",
             description="Market position DIRECTION (long / short / buy / sell). Required for netting and "
                         "signed exposure — distinct from boolean_flag (cf. debit_credit_indicator)."),
     Concept("expected_exposure", "quantity_risk", additivity="semi_additive", is_a="monetary_stock",
@@ -490,13 +572,15 @@ _ALL: tuple[Concept, ...] = (
     Concept("trade_line", "categorical",
             description="A credit-bureau tradeline — one account's history (limit/balance/status) on the "
                         "file. External / FCRA-regulated reference data."),
-    Concept("sicr_flag", "flag", near_label=True,
+    Concept("sicr_flag", "flag", is_a="boolean_flag", near_label=True,
             description="IFRS9 Significant-Increase-in-Credit-Risk trigger (Stage 1→2). NEAR-LABEL: the "
                         "staging trigger borders the default label — flag."),
-    Concept("delinquency_bucket", "quantity_risk", additivity="non_additive", near_label=True,
+    Concept("delinquency_bucket", "quantity_risk", additivity="non_additive", is_a="category_code",
+            near_label=True,
             description="Ordinal delinquency bucket (current / 1-29 / 30-59 / 60-89 / 90+ DPD). "
                         "Non-additive. NEAR-LABEL: the 90+ bucket is a default backstop — flag."),
     Concept("exposure_class", "categorical",
+            is_a="category_code",
             description="Basel exposure class / regulatory segment (sovereign / bank / corporate / "
                         "retail / equity). Drives the risk_weight; the standardised/IRB segment."),
     Concept("customer_risk_rating", "quantity_risk", additivity="non_additive",
@@ -511,13 +595,13 @@ _ALL: tuple[Concept, ...] = (
     Concept("effective_maturity", "temporal", additivity="non_additive", is_a="tenor",
             description="Basel effective maturity (M), floored/capped 1–5y — a regulatory duration. "
                         "Non-additive."),
-    Concept("npe_flag", "flag", near_label=True,
+    Concept("npe_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Non-performing-exposure flag (EBA NPE: 90+ DPD / unlikely-to-pay). NEAR-LABEL: "
                         "NPE overlaps the default definition — flag (a distinct-but-adjacent target)."),
-    Concept("watchlist_hit_flag", "flag", near_label=True,
+    Concept("watchlist_hit_flag", "flag", is_a="boolean_flag", near_label=True,
             description="Internal credit watchlist / early-warning hit. NEAR-LABEL: watchlisting borders "
                         "the default/forbearance funnel — flag."),
-    Concept("adverse_media_flag", "flag", sensitivity="pii", near_label=True,
+    Concept("adverse_media_flag", "flag", sensitivity="pii", is_a="boolean_flag", near_label=True,
             description="Negative-news (adverse-media) screening hit — AML, read-scoped (may carry "
                         "special-category/criminal data). NEAR-LABEL: borders the financial-crime label."),
     Concept("collateral_value", "monetary", additivity="semi_additive", is_a="monetary_stock",
@@ -527,6 +611,7 @@ _ALL: tuple[Concept, ...] = (
             description="Beneficial/parent ownership stake (%) — the consolidation weight on a group "
                         "edge. Non-additive (a proportion)."),
     Concept("model_tier", "categorical",
+            is_a="category_code",
             description="Model-risk materiality tier (SR 11-7 / model governance). Governance metadata — "
                         "gates validation rigour; not aggregatable."),
 
@@ -556,6 +641,7 @@ _ALL: tuple[Concept, ...] = (
             description="Net asset value per unit — a PRICE. Non-additive. (Fund-level total NAV is a "
                         "stock — see monetary_stock.)"),
     Concept("settlement_status", "categorical",
+            is_a="category_code",
             description="Settlement lifecycle status (pending / settled / failed / partial). Distinct "
                         "from settlement_date; a fail is the settlement_fail outcome."),
     Concept("settlement_cycle", "temporal",
@@ -565,11 +651,13 @@ _ALL: tuple[Concept, ...] = (
             description="Corporate-action event (dividend / split / merger / rights). Entitlement is "
                         "fixed at record_date, priced at ex_date, paid at pay_date."),
     Concept("record_date", "temporal", pit_role="effective",
+            is_a="effective_date",
             description="Corporate-action record date — entitlement is FIXED (effective) as-of this date."),
     Concept("ex_date", "temporal", pit_role="as_of",
             description="Ex-dividend/ex-entitlement date — entitlement is read AS-OF here (the price "
                         "drops by the entitlement on this date)."),
     Concept("pay_date", "temporal", pit_role="event",
+            is_a="event_timestamp",
             description="Corporate-action payment date — the cash/stock pays (an occurrence)."),
     Concept("securities_loan", "monetary", additivity="semi_additive", is_a="monetary_stock",
             description="Securities lending/borrowing (SFT) position — a STOCK. Semi-additive: sum "
@@ -596,6 +684,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("tracking_error", "quantity_risk", additivity="non_additive",
             description="Std-dev of active return vs benchmark (active risk). Non-additive."),
     Concept("expense_ratio", "monetary", additivity="non_additive",
+            is_a="monetary_rate",
             description="Fund expense ratio (TER / OCF) — annual cost as a % of assets. Non-additive "
                         "(a ratio)."),
 
@@ -632,6 +721,7 @@ _ALL: tuple[Concept, ...] = (
                         "Additive within one firm; NOT summable across a portfolio (cross-entity "
                         "double-count). See emissions_data_quality."),
     Concept("financed_emissions", "esg", additivity="additive",
+            is_a="scope_3_emissions",
             description="PCAF financed emissions — emissions ATTRIBUTED to loans/investments. Additive "
                         "across the book (attribution avoids double-count); heavily ESTIMATED."),
     Concept("taxonomy_alignment", "esg", additivity="non_additive",
@@ -651,13 +741,16 @@ _ALL: tuple[Concept, ...] = (
 
     # ── Specialist · payments (gap-review §B) ────────────────────────────────────────────────────
     Concept("payment_rail", "categorical",
+            is_a="category_code",
             description="Payment rail (FPS / BACS / CHAPS / SEPA / ACH / Fedwire / RTGS / card). Drives "
                         "speed, cost and settlement finality."),
     Concept("scheme", "categorical",
+            is_a="category_code",
             description="Card/payment SCHEME (Visa / Mastercard / Amex). Distinct from the rail."),
     Concept("interchange", "monetary", additivity="additive", is_a="monetary_flow",
             description="Interchange fee (issuer revenue on a card transaction). A flow — additive."),
     Concept("merchant_discount_rate", "monetary", additivity="non_additive",
+            is_a="monetary_rate",
             description="Merchant discount rate (MDR) — the acquiring fee % charged to a merchant. "
                         "Non-additive (a rate)."),
     Concept("corridor", "categorical", sensitivity="proxy",
@@ -667,9 +760,11 @@ _ALL: tuple[Concept, ...] = (
             description="The irrevocability point of a payment. PIT-critical: real-time (APP-scam) "
                         "scoring must DECIDE BEFORE finality — a batch trailing-window model cannot."),
     Concept("nostro_vostro", "categorical",
+            is_a="category_code",
             description="Correspondent-account type (nostro = our account abroad / vostro = their "
                         "account here). Reconciliation + liquidity grain."),
     Concept("iso20022_purpose_code", "categorical",
+            is_a="category_code",
             description="ISO 20022 payment purpose code (SALA / SUPP / …) — structured payment context "
                         "for AML/analytics."),
 
@@ -678,16 +773,19 @@ _ALL: tuple[Concept, ...] = (
             description="Reference / master data (slowly-changing) vs transactional facts — different "
                         "PIT semantics: join AS-OF and watch restatement (system_time), don't event-date it."),
     Concept("model_output", "flag",
+            is_a="boolean_flag",
             description="Provenance marker: this column is a MODEL OUTPUT (score/PD/ESG derived), not "
                         "observed. Leakage-risk when its target overlaps the feature target; also a "
                         "model-monitoring input."),
     Concept("data_quality_flag", "flag",
+            is_a="category_code",
             description="Data-quality marker (missing / imputed / stale / reconciliation-break). Gate "
                         "features on it; not a target."),
     Concept("source_system", "categorical",
             description="Provenance: the originating system-of-record. Lineage / reconciliation / "
                         "join disambiguation."),
     Concept("segment", "categorical",
+            is_a="category_code",
             description="Customer/portfolio segment (mass / affluent / HNW; value/behaviour tiers). "
                         "Audit for proxy leakage if derived from protected attributes."),
     Concept("peer_group", "categorical",
@@ -700,6 +798,7 @@ _ALL: tuple[Concept, ...] = (
             description="The non-monetary UNIT (shares / oz / MWh / tonnes / bbl) — the unit-mixing "
                         "guard for quantity_units. Mixing units in a sum is a wrong number (cf. currency_code)."),
     Concept("vulnerability_flag", "sensitive", sensitivity="special_category",
+            is_a="boolean_flag",
             description="FCA Consumer-Duty vulnerable-customer indicator — highly sensitive (may derive "
                         "from health/capacity): read-scoped + eligibility-gated. MUST support fair "
                         "treatment, never disadvantage."),
@@ -712,6 +811,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("desk_id", "identifier", namespace="desk", entity_link="desk",
             description="Links to the trading desk entity — a markets grain."),
     Concept("bureau_provenance", "flag",
+            is_a="boolean_flag",
             description="Provenance marker: EXTERNAL bureau/third-party data — FCRA-regulated and heavily "
                         "lagged/restated (use system_time to avoid restated-data leakage)."),
     Concept("collateral_id", "identifier", namespace="collateral", entity_link="collateral",
@@ -755,12 +855,14 @@ _ALL: tuple[Concept, ...] = (
     Concept("anacredit_attribute", "categorical",
             description="An ECB AnaCredit granular loan-level reporting attribute. Reference data."),
     Concept("finrep_corep_line", "categorical",
+            is_a="regulatory_report_line",
             description="An EBA FINREP (financial) / COREP (own-funds) template line. Reporting lineage."),
     Concept("mifir_transaction_report", "categorical",
             description="A MiFIR/MiFID II transaction-report field/record (RTS 22, T+1). Reporting event."),
     Concept("emir_report", "categorical",
             description="An EMIR derivative trade-repository report record. Reporting event."),
     Concept("fatca_crs_classification", "categorical", sensitivity="proxy",
+            is_a="category_code",
             description="FATCA/CRS reportable-person / tax-residency classification. Tax residency is a "
                         "national-origin PROXY — use-case-gate for credit."),
 
@@ -771,6 +873,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("tpp_id", "identifier", namespace="tpp", entity_link="tpp",
             description="Links to the third-party provider (AISP/PISP) entity."),
     Concept("aisp_pisp_flag", "categorical",
+            is_a="category_code",
             description="Open-Banking access role (AIS account-information vs PIS payment-initiation). "
                         "PSD2 classification."),
     Concept("api_call_event", "behavioural",
@@ -785,21 +888,25 @@ _ALL: tuple[Concept, ...] = (
             description="On-chain wallet address — pseudonymous but linkable (clustering/chain-analysis), "
                         "so treat as personal data; read-scoped. FATF travel-rule relevant."),
     Concept("stablecoin", "crypto",
+            is_a="digital_asset",
             description="A fiat-referenced stablecoin (peg + reserve risk). Distinct from cbdc."),
     Concept("on_chain_txn", "crypto",
             description="An on-chain transaction/event — irreversible on block-confirmation finality; "
                         "AML chain-analysis input."),
     Concept("cbdc", "crypto",
+            is_a="digital_asset",
             description="Central-bank digital currency (retail/wholesale) — programmable central-bank "
                         "money; distinct from private crypto/stablecoin."),
 
     # ── Still-missing area · securitization & structured finance ─────────────────────────────────
     Concept("tranche", "categorical",
+            is_a="category_code",
             description="A securitization tranche (senior / mezzanine / equity) with attach/detach "
                         "points — ordinal loss priority. Structure-level (contrast lien_seniority)."),
     Concept("spv_id", "identifier", namespace="spv", entity_link="spv",
             description="Links to the bankruptcy-remote SPV/issuer entity (securitization)."),
     Concept("waterfall_position", "categorical",
+            is_a="category_code",
             description="Position in the cashflow waterfall (payment priority) — ordinal."),
     Concept("credit_enhancement", "monetary", additivity="semi_additive", is_a="monetary_stock",
             description="Credit enhancement absorbing losses (over-collateralisation / reserve fund / "
@@ -812,8 +919,10 @@ _ALL: tuple[Concept, ...] = (
             description="Annuity conversion factor (pot→income) — actuarial (mortality + rates). "
                         "Non-additive."),
     Concept("vesting", "categorical",
+            is_a="category_code",
             description="Vesting status/schedule — when benefits become owned. Gates entitlement."),
     Concept("decumulation", "categorical",
+            is_a="category_code",
             description="Retirement decumulation (drawdown) phase, vs accumulation — sequencing/longevity "
                         "risk differs."),
 
@@ -827,6 +936,7 @@ _ALL: tuple[Concept, ...] = (
     Concept("risk_control_id", "identifier", namespace="risk_control", entity_link="risk_control",
             description="Links to a risk/control entity (RCSA) — the op-risk taxonomy grain."),
     Concept("near_miss_flag", "flag",
+            is_a="boolean_flag",
             description="Operational near-miss (control failure, no/immaterial loss) — an early-warning "
                         "signal, not a loss."),
 
@@ -838,6 +948,7 @@ _ALL: tuple[Concept, ...] = (
             description="Links to a cost-basis tax lot (acquisition date + basis) — the CGT realisation "
                         "grain (FIFO/LIFO/spec-id)."),
     Concept("taxable_flag", "flag",
+            is_a="boolean_flag",
             description="Taxability indicator (taxable vs exempt / tax-advantaged, e.g. ISA/401k). "
                         "Gates net return."),
 
@@ -846,6 +957,7 @@ _ALL: tuple[Concept, ...] = (
             description="Non-traditional underwriting data (rent / utility / telco / psychometric) — "
                         "external + PROXY-RISK for protected attributes; use-case-gate for credit."),
     Concept("thin_file_flag", "flag",
+            is_a="boolean_flag",
             description="Thin-file / credit-invisible indicator — reject-inference + inclusion relevant. "
                         "Not a target."),
     Concept("cashflow_underwriting_signal", "quantity_risk", additivity="non_additive",
@@ -860,6 +972,7 @@ _ALL: tuple[Concept, ...] = (
             description="Wholesale/market funding balance (vs sticky retail deposits) — a funding STOCK; "
                         "liquidity/run-off risk. Semi-additive: latest over time."),
     Concept("resolution_group", "categorical",
+            is_a="category_code",
             description="Resolution group / strategy classification (single vs multiple point of entry, "
                         "ring-fencing). Distinct from a customer group."),
 
@@ -871,13 +984,16 @@ _ALL: tuple[Concept, ...] = (
             description="Customer redress/compensation paid (remediation, e.g. PPI). A flow — additive; "
                         "a conduct cost."),
     Concept("root_cause_code", "categorical",
+            is_a="category_code",
             description="Root-cause taxonomy code for a complaint/incident — thematic conduct analytics."),
 
     # ── Still-missing area · correspondent banking & SWIFT ───────────────────────────────────────
     Concept("swift_message_type", "categorical",
+            is_a="category_code",
             description="SWIFT message type (MT103 customer / MT202 bank-to-bank / ISO 20022 MX). "
                         "Payment classification."),
     Concept("nested_correspondent_flag", "flag",
+            is_a="boolean_flag",
             description="Nested/downstream-correspondent indicator (a bank clearing for another bank's "
                         "clients) — elevated AML risk (visibility gap; FATF/Wolfsberg)."),
 
@@ -886,6 +1002,7 @@ _ALL: tuple[Concept, ...] = (
             description="Nature/biodiversity impact-or-dependency (TNFD / SBTN) — ESTIMATED, nascent "
                         "data. Non-additive."),
     Concept("deforestation_flag", "esg",
+            is_a="boolean_flag",
             description="Deforestation-linked supply-chain flag (EUDR due-diligence). Not a target."),
 
     # ── Legacy aliases — the original 11 vocabulary strings retained so live enriched columns and
@@ -914,40 +1031,47 @@ _ALL: tuple[Concept, ...] = (
     # concept below is grounded in a column present in a loaded catalog, never invented from a
     # taxonomy. NONE is additive: these are states, flags and identifiers, not measures to sum.
     Concept("new_to_bank_flag", "flag",
+            is_a="boolean_flag",
             description="Whether the party is within the bank's new-to-bank (NTB) window. Usually "
                         "arrives as a PAIR at different offsets (current vs 9 months prior); the pair "
                         "is what yields tenure movement and first-year cohort behaviour, so the "
                         "offset belongs in the column's own definition, not in this concept."),
     Concept("customer_relationship_status", "categorical",
+            is_a="category_code",
             description="Lifecycle state of the bank's relationship with the party — active, dormant, "
                         "closed, special handling. The relationship's own state, distinct from any "
                         "single source system's record status (see source_system_status)."),
     Concept("source_system_status", "categorical",
+            is_a="category_code",
             description="A party's record status WITHIN one originating system (Finacle, Calypso, "
                         "FinOne, Advent, VisionPlus). Operational plumbing, not a business state: it "
                         "says whether that system holds the party, never how the bank regards them."),
     Concept("staff_indicator", "flag", sensitivity="pii",
+            is_a="boolean_flag",
             description="Whether the party is an employee of the bank. A POPULATION control as much "
                         "as a feature — staff accounts carry preferential pricing and insider "
                         "controls, so they are routinely excluded from behavioural models. Personal "
                         "employment data about an identifiable person, hence the pii floor."),
     Concept("legal_entity_type", "categorical",
+            is_a="category_code",
             description="What KIND of party this is — individual, sole proprietor, corporate, joint, "
                         "trust. Constitution / legal structure. Drives which features are even "
                         "meaningful, since an individual and a corporate share few attributes."),
     Concept("residency_status", "categorical",
+            is_a="category_code",
             description="The party's residency for regulatory and tax purposes — resident, "
                         "non-resident, free-zone. A jurisdictional eligibility fact, not a location."),
-    Concept("restriction_status", "flag", near_label=True,
+    Concept("restriction_status", "flag", is_a="boolean_flag", near_label=True,
             description="Whether the party is under a servicing restriction — suspended, negated, "
                         "blacklisted, watch-listed. near_label: these are AML/fraud CONSEQUENCES, so "
                         "a financial-crime model trained on them reads its own answer back. Not a "
                         "hard leakage anchor — they are legitimate as controls and as filters."),
-    Concept("restriction_reason", "categorical", near_label=True,
+    Concept("restriction_reason", "categorical", is_a="category_code", near_label=True,
             description="WHY a party is restricted — the suspension / negation / blacklist reason "
                         "code or note. Borders an outcome for the same reason restriction_status "
                         "does, and is more specific, so it leaks more readily."),
     Concept("nominee_indicator", "flag",
+            is_a="boolean_flag",
             description="Whether the party holds in a nominee capacity — the named party is not the "
                         "beneficial owner. Material to AML beneficial-ownership treatment and to "
                         "whether party-level behaviour can be attributed to a real person."),
@@ -955,10 +1079,12 @@ _ALL: tuple[Concept, ...] = (
             description="Identifier of the corporate GROUP a party belongs to (parent group / "
                         "conglomerate). The join key for group-level exposure and concentration."),
     Concept("parent_customer_id", "identifier", namespace="cif", entity_link="customer",
+            is_a="customer_id",
             description="Reference to another PARTY that is this one's parent — a self-referencing "
                         "hierarchy. Shares the `customer` entity link with customer_id deliberately: "
                         "a different entity would make the hierarchy unbridgeable across catalogs."),
     Concept("record_deleted_flag", "flag",
+            is_a="boolean_flag",
             description="Soft-delete marker on the record. A POPULATION filter, never a predictor — "
                         "a model that treats it as an ordinary feature trains on rows the bank "
                         "considers deleted, and must exclude them instead."),
@@ -974,6 +1100,7 @@ _ALL: tuple[Concept, ...] = (
     # 20022 party role into one word loses the handling difference — a phone can be tokenised, an
     # address generalised to a region feature, a party role is a structural field of the message.
     Concept("payment_narrative", "text", sensitivity="pii",
+            is_a="free_text",
             description="Free-text remittance information on a payment (narration, "
                         "sender-to-receiver info, inter-bank information). The single richest signal "
                         "in transaction data — it drives categorisation, merchant identification and "
@@ -1006,6 +1133,7 @@ _ALL: tuple[Concept, ...] = (
                         "business entity. Deliberately NOT an identifier: a hash column that "
                         "bridged would pair with every other hash column in every catalog."),
     Concept("statement_visibility_flag", "flag",
+            is_a="boolean_flag",
             description="Whether a transaction is shown on, or suppressed from, the customer "
                         "statement. Presentation rather than economics — a suppressed entry still "
                         "moved money, so it must not be mistaken for a reversal or exclusion."),
@@ -1021,37 +1149,199 @@ _ALL: tuple[Concept, ...] = (
     # Every concept here is `categorical` with NO entity_link — the two conditions the bridge
     # derivation requires — so a label can never be proposed as a join key. The paired identifier is
     # untouched and still links catalogs; only the name stops pretending to.
-    Concept("branch_name", "categorical",
+    Concept("branch_name", "categorical", is_a="code_label", descriptive=True,
             description="Human-readable name of a branch (the label beside branch_id). Groups and "
                         "displays; never a join key — two catalogs' branch names are text that may "
                         "coincide, not a shared identifier."),
-    Concept("relationship_manager_name", "categorical", sensitivity="pii",
+    Concept("relationship_manager_name", "categorical", sensitivity="pii", is_a="code_label",
+            descriptive=True,
             description="Name of the relationship manager (the label beside "
                         "relationship_manager_id). An identifiable employee, so it carries a pii "
                         "floor for the same reason record_author does."),
-    Concept("merchant_name", "categorical",
+    Concept("merchant_name", "categorical", is_a="code_label", descriptive=True,
             description="Trading name of a merchant (the label beside merchant_id). Notoriously "
                         "inconsistent across acquirers — the id joins, the name does not."),
-    Concept("account_name", "categorical",
+    Concept("account_name", "categorical", is_a="code_label", descriptive=True,
             description="Display name or title of an account (the label beside account_id). Often "
                         "carries the holder's name, so treat as free text rather than a key."),
-    Concept("instrument_name", "categorical",
+    Concept("instrument_name", "categorical", is_a="code_label", descriptive=True,
             description="Readable name of a financial instrument (the label beside instrument_id). "
                         "The ISIN/CUSIP identifies it; the name only describes it."),
-    Concept("counterparty_name", "categorical",
+    Concept("counterparty_name", "categorical", is_a="code_label", descriptive=True,
             description="Name of the counterparty to a transaction (the label beside "
                         "counterparty_id). Distinct from beneficiary_name, which names the party a "
                         "payment is FOR rather than the party it is WITH."),
-    Concept("code_label", "categorical",
+    Concept("code_label", "categorical", descriptive=True,
             description="The readable description of a coded value — a sector description beside a "
                         "sector code, a reason description beside a reason code. Landing these on "
                         "the CODE's own concept conflates what you GROUP BY with what you DISPLAY, "
                         "and doubles every code into two apparently-equal columns."),
 
     Concept("kyc_narrative", "text", sensitivity="pii",
+            is_a="free_text",
             description="Free-prose KYC commentary — nature of business, corporate background, "
                         "high-risk rationale. Uploader-authored text about an identifiable party, so "
                         "it carries a pii floor and is read-scoped rather than freely searchable."),
+
+    # ── §3.20 BR-10 canonical banking event / lifecycle vocabulary ────────────────────────────────
+    # Grounded in the recipe audit's 15 missing-concept admissions and the BR-10 plan list: the
+    # concepts recipes had to APOLOGIZE for ("no dedicated chargeback concept", "no promise_to_pay
+    # concept", "no product_holding concept", ...) now exist as governed vocabulary. Descriptions
+    # state the NEGATIVE deliberately (the bank_bic precedent): the sentences that separate an
+    # authorization feed from a posting ledger from a settlement feed are exactly the sentences
+    # the classifier needs, and the refusal tests pin them. None of these names touches
+    # `_LEGACY_ALIASES` (the BR-plan hard rule) — `counterparty_id` stays retired; counterparty-ness
+    # is a PARTY ROLE, never a revived identifier.
+    #
+    # Payment/card event lifecycle — authorization, posting, clearing, settlement are FOUR stages:
+    Concept("original_transaction_id", "identifier", namespace="core_serial",
+            entity_link="transaction",
+            description="The transaction a correcting event points BACK to — the lineage key a "
+                        "reversal, return, refund or chargeback row carries beside its own "
+                        "transaction_id. Same core_serial namespace (it holds transaction ids); "
+                        "never the row's own id."),
+    Concept("beneficiary_id", "identifier", namespace="payee_registry", entity_link="beneficiary",
+            description="The registered PAYEE record id — the bank's own registry of saved "
+                        "beneficiaries a customer pays. Not beneficiary_bank (the destination "
+                        "bank/BIC), not a CIF (a counterparty who is our customer is customer_id), "
+                        "and not beneficiary_name (the label). Grains payee-level features."),
+    Concept("original_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The instructed / original transaction amount before FX conversion, "
+                        "partial capture or fees — pairs with the posted amount (monetary_flow) "
+                        "and the conversion evidence (fx_conversion_rate)."),
+    Concept("authorization_status", "categorical", is_a="category_code",
+            description="Card/payment authorization OUTCOME (approved / declined / partial / "
+                        "expired) decided at AUTH time. An authorization is a promise, not a "
+                        "posting: never booking_status (core-ledger posting state) and never "
+                        "settlement_status — an approved auth may never settle."),
+    Concept("authorization_timestamp", "temporal", pit_role="event",
+            description="When the authorization decision happened. Marks an AUTHORIZATION feed — "
+                        "a dataset carrying this is not a core-ledger posting table and not a "
+                        "settlement feed; the three are never interchangeable transaction tables."),
+    Concept("booking_status", "categorical", is_a="category_code",
+            description="Posting state on the CORE LEDGER (posted / pending / failed / memo). "
+                        "booking_date says WHEN it posted; this says WHETHER. Not "
+                        "authorization_status (pre-posting) and not settlement_status "
+                        "(interbank finality)."),
+    Concept("clearing_status", "categorical", is_a="category_code",
+            description="Interbank CLEARING state of a payment (submitted / cleared / rejected) — "
+                        "the exchange stage between posting and settlement. Not booking_status and "
+                        "not settlement_status (finality of funds)."),
+    Concept("clearing_timestamp", "temporal", pit_role="event",
+            description="When the payment cleared the interbank exchange. Marks a clearing feed — "
+                        "distinct from booking_date (ledger) and settlement_date (finality)."),
+    Concept("reversal_indicator", "flag", is_a="boolean_flag",
+            description="This row REVERSES or corrects an earlier posting — pairs with "
+                        "original_transaction_id for lineage. An economic undo: distinct from "
+                        "statement_visibility_flag (presentation) and from a return "
+                        "(payment_return_status, the scheme bouncing a payment)."),
+    Concept("payment_return_status", "categorical", is_a="category_code",
+            description="Scheme RETURN / rejection state of a payment (the R-transaction: "
+                        "returned, rejected, recalled). The scheme bounced the payment — distinct "
+                        "from a card dispute (chargeback_status) and from an internal correction "
+                        "(reversal_indicator)."),
+    Concept("return_reason_code", "categorical", is_a="category_code",
+            description="The scheme's coded reason for a payment return (SEPA R-codes, NACHA "
+                        "return codes: closed account, insufficient funds, revoked mandate). Not "
+                        "dispute_reason_code (card chargeback reasons)."),
+    Concept("chargeback_status", "categorical", is_a="category_code",
+            description="Card DISPUTE / chargeback lifecycle state (raised / represented / "
+                        "arbitration / won / lost / written off). The cardholder disputes a "
+                        "settled transaction — scheme-scoped, weeks-long, distinct from a payment "
+                        "return and from a merchant refund (a new credit, not a dispute)."),
+    Concept("dispute_reason_code", "categorical", is_a="category_code",
+            description="The scheme's coded chargeback/dispute reason (fraud, goods not received, "
+                        "duplicate processing). Not return_reason_code (payment R-codes)."),
+
+    # Account / holding / facility state:
+    Concept("account_status", "categorical", is_a="lifecycle_state",
+            description="The ACCOUNT's own lifecycle state (open / active / dormant / blocked / "
+                        "closed). The dormancy-and-reactivation and attrition signals condition on "
+                        "it; generic lifecycle_state stays for non-account lifecycles."),
+    Concept("product_holding", "categorical",
+            description="The customer×product HOLDING fact — that this customer holds this "
+                        "product. product_type says WHICH product; valid_time carries from/to; "
+                        "this says THAT it is held. The product-breadth and cross-hold recipes' "
+                        "anchor."),
+    Concept("notice_period", "temporal", additivity="non_additive", is_a="duration_tenure",
+            description="Contractual NOTICE term of a notice deposit or withdrawal restriction — "
+                        "how long before access, not how long until maturity (tenor) and not the "
+                        "product's age (duration_tenure generally)."),
+    Concept("available_limit", "monetary", additivity="semi_additive", is_a="limit",
+            description="Undrawn HEADROOM under a limit (approved limit minus drawn). Falls as "
+                        "drawings rise — pairs with drawn_principal; never sum with the limit it "
+                        "is carved from."),
+    Concept("drawn_principal", "monetary", additivity="semi_additive", is_a="monetary_stock",
+            description="Drawn principal OUTSTANDING on a facility/card/loan — the balance side "
+                        "of the limit-vs-balance contrast (§E). A stock: latest over time, "
+                        "additive across facilities."),
+
+    # Installments, collections promises and contact effectiveness:
+    Concept("due_date", "temporal", pit_role="maturity",
+            description="Contractual DUE date of an installment, minimum payment or invoice — "
+                        "knowable at the cutoff from the schedule (a contractual-future anchor "
+                        "like maturity_date). Not the date paid (event_timestamp)."),
+    Concept("minimum_due_amount", "monetary", additivity="additive", is_a="scheduled_amount",
+            description="The revolving MINIMUM due for the cycle (cards / revolving credit) — a "
+                        "floor under the full scheduled_amount; paying it is not paying the "
+                        "installment."),
+    Concept("payment_allocation", "categorical", is_a="category_code",
+            description="The governed ORDER a payment applies in (fees → interest → principal, or "
+                        "jurisdiction-specific). Decides what a partial payment paid — an "
+                        "arrears computation without it is guessing."),
+    Concept("promise_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The amount PROMISED in a collections promise-to-pay — a commitment, not "
+                        "the contractual installment (scheduled_amount) and not the payment "
+                        "itself."),
+    Concept("promise_due_date", "temporal", pit_role="maturity",
+            description="When the promise-to-pay falls due — contractual-future, knowable when "
+                        "the promise is taken. Not the installment's due_date."),
+    Concept("promise_outcome", "categorical", is_a="category_code",
+            description="Whether the promise was KEPT / broken / partially kept — the collections "
+                        "behaviour signal promise_to_pay_adherence measures. An outcome of a "
+                        "commitment, not a delinquency label."),
+    Concept("contact_attempt_event", "behavioural",
+            description="An outbound collections/servicing CONTACT ATTEMPT (call, SMS, letter) — "
+                        "an event to count and time. Never the money spent chasing "
+                        "(cost_to_collect): an attempt row is activity, not expense."),
+    Concept("contact_outcome", "categorical", is_a="category_code",
+            description="What the contact attempt reached (answered / no answer / wrong party / "
+                        "promise taken). Pairs with contact_attempt_event."),
+    Concept("right_party_contact_flag", "flag", is_a="boolean_flag",
+            description="The reached party WAS the debtor — the collections-effectiveness signal "
+                        "(RPC rate). A quality of contact_outcome, never derivable from cost."),
+
+    # Instruments, operations and adjacent lifecycles:
+    Concept("matching_status", "categorical", is_a="category_code",
+            description="Pre-settlement trade MATCHING state (matched / unmatched / mismatched) — "
+                        "the confirmation stage BEFORE settlement. Not settlement_status: a "
+                        "matched trade can still fail to settle."),
+    Concept("instruction_execution_outcome", "categorical", is_a="category_code",
+            description="The RESULT of executing a scheduled instruction (standing order / direct "
+                        "debit run: executed / failed / insufficient funds / retried). "
+                        "Instruction-level; the interbank bounce that may follow is "
+                        "payment_return_status."),
+    Concept("lc_guarantee_event", "categorical", is_a="event_type",
+            description="Trade-finance instrument LIFECYCLE event kind (LC/guarantee issue / "
+                        "amendment / utilization / expiry / rollover). The utilization converts "
+                        "contingent_exposure toward drawn exposure."),
+    Concept("claim_status", "categorical", is_a="category_code",
+            description="Insurance claim lifecycle state (open / reopened / closed / declined). "
+                        "Not the reserve (claim_reserve) and not the paid amount."),
+    Concept("claim_paid_amount", "monetary", additivity="additive", is_a="monetary_flow",
+            description="Amount PAID OUT on a claim — the flow beside the claim_reserve stock; "
+                        "severity = paid + reserve movement."),
+    Concept("invoice_status", "categorical", is_a="category_code",
+            description="Invoice lifecycle state (issued / approved / due / paid / disputed / "
+                        "credit-noted) — the receivables-finance anchor beside invoice_id; "
+                        "due_date carries when it falls due."),
+    Concept("policy_loan_balance", "monetary", additivity="semi_additive", is_a="monetary_stock",
+            description="Loan drawn AGAINST an insurance policy's surrender value — the pre-lapse "
+                        "signal policy_loan_utilisation sizes against surrender_value. A stock."),
+    Concept("customer_income", "monetary", additivity="additive", is_a="monetary_flow",
+            description="The CUSTOMER's declared or salary-credit-derived income — the "
+                        "affordability and needs-analysis input. Never the bank's own "
+                        "interest_income; a salary credit row is evidence FOR it."),
 )
 
 # Public registry: name -> full Concept record.
@@ -1061,23 +1351,43 @@ CONCEPT_REGISTRY: dict[str, Concept] = {c.name: c for c in _ALL}
 CONCEPTS: frozenset[str] = frozenset(CONCEPT_REGISTRY)
 
 
-def _validate_registry() -> None:
+def _validate_registry(records: tuple[Concept, ...] = _ALL) -> None:
     """Fail fast at import if the registry drifts: no duplicate names, every ``is_a`` resolves to a
-    real concept, and the flat ``CONCEPTS`` set mirrors the registry keys."""
-    seen: set[str] = set()
-    for c in _ALL:
-        if c.name in seen:
+    real concept, the ``is_a`` graph is ACYCLIC, and the flat ``CONCEPTS`` set mirrors the registry
+    keys. ``records`` defaults to the live registry; tests validate synthetic tuples."""
+    by_name: dict[str, Concept] = {}
+    for c in records:
+        if c.name in by_name:
             raise ValueError(f"duplicate concept name {c.name!r}")
-        seen.add(c.name)
-        if c.is_a is not None and c.is_a not in seen and c.is_a not in {x.name for x in _ALL}:
-            raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
+        by_name[c.name] = c
         # Three-axis model: namespace <=> identifier. An identifier without a value space cannot
         # participate in join candidacy; a namespace on a non-identifier is a modelling bug.
         if c.group == "identifier" and not c.namespace:
             raise ValueError(f"identifier concept {c.name!r} declares no namespace")
         if c.group != "identifier" and c.namespace is not None:
             raise ValueError(f"non-identifier concept {c.name!r} declares namespace {c.namespace!r}")
-    if CONCEPTS != frozenset(CONCEPT_REGISTRY) or len(_ALL) != len(CONCEPT_REGISTRY):
+        # `descriptive` and `identifier` are contradictory claims about the SAME column: one says
+        # "this is prose that displays", the other "this is a value space you may join on". A
+        # concept asserting both would make the USE gate refuse a legitimate join key.
+        if c.descriptive and c.group == "identifier":
+            raise ValueError(f"concept {c.name!r} is both descriptive and an identifier")
+    for c in records:
+        if c.is_a is not None and c.is_a not in by_name:
+            raise ValueError(f"concept {c.name!r} has unresolved is_a {c.is_a!r}")
+    # Every is_a chain must terminate: the old check added each name to `seen` BEFORE testing it,
+    # so a self-loop (is_a = own name) and mutual loops validated — and a chain-walking consumer
+    # (concept_path, taxonomy derivation) would spin forever.
+    for c in records:
+        chain = [c.name]
+        cur = c.is_a
+        while cur is not None:
+            if cur in chain:
+                raise ValueError(
+                    f"concept {c.name!r} has an is_a cycle: {' -> '.join([*chain, cur])}")
+            chain.append(cur)
+            cur = by_name[cur].is_a
+    if records is _ALL and (
+            CONCEPTS != frozenset(CONCEPT_REGISTRY) or len(_ALL) != len(CONCEPT_REGISTRY)):
         raise ValueError("CONCEPTS must mirror CONCEPT_REGISTRY keys (no dropped duplicates)")
 
 
@@ -1097,18 +1407,301 @@ def concept(name: str) -> Concept | None:
     return CONCEPT_REGISTRY.get(name)
 
 
-# The 5 legacy aliases are retained so already-enriched data + the pre-B1b classifier are never orphaned,
-# but they are NOT classification targets — the classifier should choose the richer §3 concept instead.
+# ── the USE-class predicates (Bar-4 feature use gate) ────────────────────────────────────────────
+#
+# WHAT THESE ARE FOR, and what they deliberately are NOT. `sensitivity` has always answered "who may
+# SEE this column" (read_scope). It never answered "may a feature be BUILT from it", and the
+# Release-A evaluation measured the consequence: a visible PII column, a visible protected
+# characteristic, a visible currency-blind amount and a visible free-text label all landed as
+# DESIGN_CHECKED with zero requirements. The predicates below are the registry half of the USE
+# answer — the behaviour each concept already declares, read as a question about USE.
+#
+# They are REGISTRY predicates over a concept NAME, never over a column name: `sol_desc` is refused
+# because its concept is `branch_name` and `branch_name.descriptive` is True, not because the string
+# ends in "_desc". A column with no concept answers False everywhere and is untouched.
+
+#: THERE IS NO GROUP SWEEP, and the absence is the fix. `DESCRIPTIVE_GROUPS = {"text"}` used to
+#: pull six concepts into the structural class without ever asking them the question `descriptive`
+#: asks — see the §3.9 adjudication block for the per-concept answers. A group is a taxonomy
+#: bucket; `descriptive` is a claim about a specific column's semantics, and only a concept can
+#: make that claim about itself.
+
+#: The sensitivity classes a POLICY can never license as a model input. ECOA/fair-lending
+#: (`protected_attribute`) and GDPR Article 9 (`special_category`) do not have an "allow" switch —
+#: refusing these is a statement about the column, not about a missing setting.
+PROTECTED_SENSITIVITIES: frozenset[str] = frozenset({"protected_attribute", "special_category"})
+
+#: The sensitivity class a lawful-basis policy COULD license (AML use of a pep_flag is the standing
+#: example). No such policy surface exists yet, so today this refuses — with wording that names the
+#: missing policy rather than the column.
+PERSONAL_DATA_SENSITIVITY = "pii"
+
+#: The concept group whose values are denominated in a currency, and the group that carries the
+#: denomination itself.
+MONETARY_GROUP = "monetary"
+CURRENCY_GROUP = "currency"
+
+
+def is_descriptive(name: str | None) -> bool:
+    """Is this concept THE LABEL THAT STANDS BESIDE A CODE for the same thing — a branch name beside
+    `branch_id`, a status description beside the status code?
+
+    Reads the `descriptive` FIELD and nothing else: one concept, one self-declaration. Unknown /
+    absent concepts answer False (absence is not an assertion). A concept that says only "this is
+    free prose" is NOT this — prose can be computed over, and the answer to PII-laden text is a
+    policy, which :func:`is_personal_data` routes to.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.descriptive
+
+
+def is_protected_characteristic(name: str | None) -> bool:
+    """Is this concept a protected characteristic or a GDPR special category?
+
+    WHAT THIS CAN ACTUALLY SEE, stated so no caller over-reads it. The registry holds exactly THREE
+    concepts in these sensitivity classes — the umbrellas `protected_attribute` and
+    `special_category`, plus `vulnerability_flag` — and NO per-attribute concept:
+    `protected_attribute` enumerates "age, gender, race, ethnicity, marital status, national origin,
+    religion" INSIDE its own description, so there is no `gender` or `ethnicity` concept for a column
+    to land on. This therefore answers True only when ENRICHMENT chose one of those three. A
+    `gender_cd` column left unclassified, or landed on some ordinary categorical, is invisible here,
+    and the USE gate built on this predicate will not refuse it. That is a limit of the VOCABULARY,
+    not of the gate — the fix is per-attribute concepts in the registry, and until they exist this
+    is a floor rather than a guarantee.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.sensitivity in PROTECTED_SENSITIVITIES
+
+
+def is_personal_data(name: str | None) -> bool:
+    """Is this concept personal data (the registry's `pii` sensitivity class)?"""
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.sensitivity == PERSONAL_DATA_SENSITIVITY
+
+
+def carries_currency(name: str | None) -> bool:
+    """Is a value of this concept denominated in a currency (every `monetary` group member)?"""
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.group == MONETARY_GROUP
+
+
+def is_currency_denomination(name: str | None) -> bool:
+    """Does this concept NAME a denomination — the currency dimension that sits beside an amount?
+
+    The `currency` group holds two different things: the CODES that say what an amount is
+    denominated in (`currency_code`, `base_currency`, `local_currency`) and the conversion RATES
+    that move between them (`fx_conversion_rate`, `cross_rate`). Only the codes answer "in what
+    currency is this number", so only the codes count here. The discriminator is a registry field
+    and not a name list: a rate IS a number and therefore declares its additivity, while a code
+    declares none — so a currency concept added later is classified by what it declares about
+    itself rather than by anyone remembering to extend a set.
+    """
+    record = CONCEPT_REGISTRY.get(name or "")
+    return record is not None and record.group == CURRENCY_GROUP and record.additivity == "n/a"
+
+
+def denomination_concepts() -> frozenset[str]:
+    """Every concept name that denotes a currency dimension — bound into the sibling-column query
+    so the "the currency column is right there on the same table" check is a registry lookup."""
+    return frozenset(c.name for c in _ALL if is_currency_denomination(c.name))
+
+
+def concept_path(name: str | None) -> tuple[str, ...]:
+    """The selected concept followed by every ``is_a`` ancestor (semantic plan Task 1).
+
+    ``unclassified`` is a SENTINEL, never a registry member — it (like ``None`` and any unknown
+    name) returns the EMPTY tuple; the semantic-context bundle carries the closed
+    ``concept_unclassified`` missing-context code beside it, so "no hierarchy" is honest output
+    rather than a lookup error. Registry validation (:func:`_validate_registry`) makes an ``is_a``
+    cycle impossible at import, but this READER still refuses a corrupt registry (a mutated entry
+    at runtime) rather than spinning forever: a revisited name raises ``ValueError``."""
+    if not name or name == UNCLASSIFIED:
+        return ()
+    record = CONCEPT_REGISTRY.get(name)
+    if record is None:
+        return ()
+    path: list[str] = [name]
+    cur = record.is_a
+    while cur is not None:
+        if cur in path:
+            raise ValueError(
+                f"concept registry is corrupt: is_a cycle {' -> '.join([*path, cur])}")
+        parent = CONCEPT_REGISTRY.get(cur)
+        if parent is None:
+            raise ValueError(
+                f"concept registry is corrupt: {path[-1]!r} names unknown parent {cur!r}")
+        path.append(cur)
+        cur = parent.is_a
+    return tuple(path)
+
+
+# The legacy aliases are retained so already-enriched data + the pre-B1b classifier are never
+# orphaned, but they are NOT classification targets — the classifier should choose the richer §3
+# concept instead. `counterparty_id` joined the set under semantic Task 2 (D12.1): `counterparty`
+# is a PARTY ROLE (the third axis, `party_vocab`), not an entity — the identifier is a CIF that
+# links the CUSTOMER entity. The registry member itself is preserved byte-stable (its
+# `entity_link` feeds governed bridge fact keys), and only NEW classification stops targeting it.
 _LEGACY_ALIASES: frozenset[str] = frozenset({
     "monetary_amount", "account_identifier", "customer_identifier", "timestamp", "rate_or_ratio",
+    "counterparty_id",
 })
+
+# The canonicalization half of the ONE alias seam: a legacy alias with an unambiguous successor
+# maps to it; aliases whose successor is ambiguous (monetary_amount, rate_or_ratio, ...) have no
+# entry and stay themselves. Keys must be `_LEGACY_ALIASES` members; targets must be non-alias
+# registry members (validated below) — a parallel alias mechanism is forbidden.
+_CANONICAL_ALIAS_TARGETS: dict[str, str] = {
+    "counterparty_id": "customer_id",
+}
+
+
+def _derive_entity_alias_targets() -> dict[str, str]:
+    """The ENTITY half of the ONE alias seam, DERIVED from :data:`_CANONICAL_ALIAS_TARGETS`.
+
+    `counterparty_id -> customer_id` already says everything needed: the entity an aliased
+    identifier links (`counterparty`) is the entity its canonical successor links (`customer`).
+    Restating that as a second hardcoded entity map would be a parallel alias mechanism — the exact
+    thing `_validate_alias_seam` exists to forbid — and could only ever drift from the concept
+    table it duplicates. Pairs whose two concepts link the SAME entity (or link none) contribute
+    nothing and are omitted, so the map stays empty until an alias actually moves an entity."""
+    targets: dict[str, str] = {}
+    for alias, target in _CANONICAL_ALIAS_TARGETS.items():
+        alias_concept = CONCEPT_REGISTRY.get(alias)
+        target_concept = CONCEPT_REGISTRY.get(target)
+        if alias_concept is None or target_concept is None:
+            continue
+        source_entity, canonical = alias_concept.entity_link, target_concept.entity_link
+        if source_entity and canonical and source_entity != canonical:
+            targets[source_entity] = canonical
+    return targets
+
+
+_ENTITY_ALIAS_TARGETS: dict[str, str] = _derive_entity_alias_targets()
+
+
+def _validate_alias_seam() -> None:
+    for alias, target in _CANONICAL_ALIAS_TARGETS.items():
+        if alias not in _LEGACY_ALIASES or alias not in CONCEPT_REGISTRY:
+            raise ValueError(f"canonical alias source {alias!r} must be a legacy-alias registry member")
+        if target not in CONCEPT_REGISTRY or target in _LEGACY_ALIASES:
+            raise ValueError(f"canonical alias target {target!r} must be a non-alias registry member")
+    # One hop only: a canonical entity that is itself an alias source would make
+    # `canonical_entity` order-dependent (A->B and B->C canonicalize differently depending on which
+    # is applied), which is not a canonical form at all.
+    for source_entity, canonical in _ENTITY_ALIAS_TARGETS.items():
+        if canonical in _ENTITY_ALIAS_TARGETS:
+            raise ValueError(
+                f"entity alias {source_entity!r} -> {canonical!r} chains: the target is itself "
+                "an alias source")
+
+
+_validate_alias_seam()
+
+
+def is_classifier_producible(name: str) -> bool:
+    """True when a NEW classification can produce this name today: a registry member that is NOT a
+    retired legacy alias. The recipe registry validates every ``Need`` against THIS (router plan
+    Task 1) rather than bare registry membership — a need for a retired alias passed the old check
+    and then silently never ground again, because no column could ever be classified to it."""
+    return name in CONCEPT_REGISTRY and name not in _LEGACY_ALIASES
+
+
+def canonical_concept_name(name: str) -> str:
+    """The canonical registry name for a NEW selection attempt (semantic Task 2).
+
+    A legacy alias with an unambiguous successor canonicalizes (`counterparty_id` ->
+    `customer_id`); every other name — including aliases with no single successor — is returned
+    unchanged. STORED values are never rewritten through this seam: historical `counterparty_id`
+    evidence, decisions and bridge fact keys stay byte-stable (D12.1 fact-key preservation)."""
+    return _CANONICAL_ALIAS_TARGETS.get(name, name)
+
+
+def display_entity(concept_name: str | None, entity: str | None) -> str | None:
+    """The READ-TIME display entity for a column, through the alias seam (D12.1-revised).
+
+    When `concept_name` is an aliased concept and the stored/derived `entity` is that alias's own
+    `entity_link` (or absent), the DISPLAY entity is the canonical concept's `entity_link` —
+    `counterparty_id` therefore displays `customer` (a counterparty is our customer seen through a
+    party ROLE). An explicitly different stored entity is a decision, never an alias artifact, and
+    passes through untouched.
+
+    READ SURFACES ONLY (`entity_map._endpoint_view`, semantic-bundle display values, asset-detail
+    renders). NOTHING stored or derivation-feeding may route through this function — not
+    `graph_node.entity`, not axis-projection fills, not grounding's `concept_entity`: that value
+    flows into `advisory_entity_id` -> `_entity_pick` -> `fact_key`, and seaming it would re-key
+    governed bridge facts (a REJECTED decoy would resurrect under a fresh key; a VERIFIED link
+    would duplicate). The registry member's persisted `entity_link` stays the byte-stable key
+    input everywhere."""
+    if not concept_name:
+        return entity
+    canonical = canonical_concept_name(concept_name)
+    if canonical == concept_name:
+        return entity
+    alias = CONCEPT_REGISTRY.get(concept_name)
+    target = CONCEPT_REGISTRY.get(canonical)
+    if alias is None or target is None or target.entity_link is None:
+        return entity
+    if entity is None or entity == alias.entity_link:
+        return target.entity_link
+    return entity
+
+
+def canonical_entity(entity: str | None) -> str | None:
+    """The canonical form of ONE entity name, through the derived entity alias seam — the operand
+    normalizer :func:`display_entity` is not.
+
+    `display_entity` answers "what entity should this COLUMN display?", and it can only normalize
+    when the column's own concept is the alias. Comparing a SOURCE-declared entity against a
+    concept's `entity_link` is a different question with two independent operands: D12.1-revised
+    leaves them on opposite sides of the alias (stored/declared entities keep saying `counterparty`
+    because bridge fact keys are byte-stable, while a new classification canonicalizes to
+    `customer_id`, whose link is `customer`). Both operands must be reduced to the same canonical
+    form or the seam reports the alias itself as a disagreement.
+
+    COMPARISON AND DISPLAY ONLY, exactly like `display_entity`: nothing stored or
+    derivation-feeding may route through this function — not `graph_node.entity`, not axis
+    projection, not grounding's `concept_entity` — because that value reaches `advisory_entity_id`
+    -> `_entity_pick` -> `fact_key`, and re-keying governed bridge facts is how a REJECTED decoy
+    resurrects under a fresh key. Returns ``None`` for a blank entity (absent is not a name)."""
+    if not entity:
+        return None
+    return _ENTITY_ALIAS_TARGETS.get(entity, entity)
 
 
 def classification_vocabulary() -> tuple[dict, ...]:
-    """The vocabulary the enrichment classifier chooses from — each concept's ``name``, ``group`` and a
-    short ``hint`` (first clause of its description), EXCLUDING the legacy aliases. Passed to the LLM
-    (B1b) so it classifies into the full structured vocabulary rather than a hardcoded subset; an
-    unrecognised answer still falls back to ``unclassified`` at the caller."""
-    return tuple(
-        {"name": c.name, "group": c.group, "hint": c.description.split(".")[0].strip()[:120]}
-        for c in _ALL if c.name not in _LEGACY_ALIASES)
+    """The vocabulary the enrichment classifier chooses from — each concept's ``name``, ``group`` and
+    its ``hint`` (the WHOLE description), EXCLUDING the legacy aliases. Passed to the LLM (B1b) so it
+    classifies into the full structured vocabulary rather than a hardcoded subset; an unrecognised
+    answer still falls back to ``unclassified`` at the caller.
+
+    ``hint`` used to be ``description.split(".")[0][:120]`` — the FIRST SENTENCE. That silently
+    discarded the half of every description this file writes ON PURPOSE for the classifier (see the
+    "Descriptions state the NEGATIVE deliberately" note above the identifier block): ``bank_bic``
+    sent "SWIFT BIC of a BANK (8/11 alphanumeric)" and cut "never the counterparty person/company —
+    a counterparty's CIF is counterparty_id", and ``clearing_member_code`` cut "not a BIC and not a
+    counterparty". Those are precisely the sentences that separate the concepts seven live FTR
+    columns were misclassified across. Sending the whole description costs ~16k characters across
+    318 entries on a payload that rides ``shared_metadata`` ONCE per batch, not per item.
+
+    Still bounded: a registry description is authored text, and an unbounded registry field must not
+    become an unbounded prompt. 320 clears the current longest (306) with headroom.
+
+    THE ABSTAIN ENTRY is offered last and is not a registry concept — it is the answer that means
+    "none of these fits". Without it a closed answer set can only report a vocabulary GAP as a
+    confident wrong label: on 2026-07-21 the classifier had to name a concept for a column defined
+    as "Correspondent Intermediary Bank BIC" ten days before ``bank_bic`` existed, and the nearest
+    neighbour it returned went on to propose eight bridges from a bank's SWIFT code to a customer
+    number. ``_accept_concept`` has always treated ``unclassified`` as VALID; it was simply
+    unreachable without violating the response contract. Offering it makes the honest answer a legal
+    move, so a gap surfaces as a gap."""
+    return (
+        *(
+            {"name": c.name, "group": c.group, "hint": c.description.strip()[:320]}
+            for c in _ALL if c.name not in _LEGACY_ALIASES
+        ),
+        {"name": UNCLASSIFIED, "group": "none",
+         "hint": "NONE of the concepts above fits. Prefer a genuine match wherever one exists — "
+                 "this is not a way to avoid deciding. Choose it only when no concept applies, in "
+                 "preference to a near-neighbour: a wrong concept silently sets join eligibility, "
+                 "visibility and aggregation safety."},
+    )

@@ -7,12 +7,23 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from featuregen.overlay.upload.grounding_trace import (
+    CROSS_CATALOG_CONTRACT,
+    CROSS_CATALOG_PATH_SEGMENT,
+    GroundingDependencyPinV1,
+    SuggestionDependencyClass,
+    SuggestionRelationshipDependencyV1,
+    dependency_pin,
+    relationship_leg,
+)
 from featuregen.overlay.upload.planner.contracts import (
     PLAN_CONTRACT_VERSION,
+    BindingPathSegmentV1,
     BindingPlanningResultV1,
     BindingPlanV1,
     CatalogStateStampV1,
     ReplayFreshness,
+    SegmentKind,
 )
 from featuregen.overlay.upload.planner.fingerprint import _VERSIONS
 from featuregen.overlay.upload.planner.replay import (
@@ -121,6 +132,126 @@ def plan_envelope_from_result(result: BindingPlanningResultV1) -> PlanEnvelopeV1
             if segment.bridge_realization_revision is not None
         ),
     )
+
+
+# ── Task 2A: the cross-catalog half of the grounding trace (freeze 0F-7) ────────────────────────
+# The same-catalog gauntlet retains the ordered join path `classify_join_path` selected. Its
+# cross-catalog counterpart is the compiled plan's ordered path segments, and the same rule applies:
+# the trace RECORDS the crossing the planner already chose — it never re-plans, and no consumer may.
+#
+#: Which frozen relationship kind (D3 vocabulary) each plan segment realizes. `direct_catalog` is
+#: absent on purpose: it says "this ingredient lives in this catalog" and crosses nothing, so it is
+#: not a traversal and gets no leg.
+_SEGMENT_RELATIONSHIP_KIND: dict[SegmentKind, str] = {
+    SegmentKind.governed_bridge: "crosswalk",          # a governed cross-catalog identifier bridge
+    SegmentKind.intra_catalog_realization: "direct_equality",   # a physical key equality, one catalog
+    SegmentKind.semantic_rollup: "semantic_only",      # an entity roll-up, asserted semantically
+}
+#: A crossing whose immutable realization revision is attached was compiled for production; one
+#: carrying only endpoints and a bridge fact is a discovery/sandbox path (contracts.py Task 9).
+_SAFETY_WITH_REALIZATION = "clearing"
+_SAFETY_WITHOUT_REALIZATION = "unverified"
+
+
+def _segment_endpoints(segment: BindingPathSegmentV1) -> tuple[tuple[str, str], tuple[str, str]]:
+    """The crossing's addressed endpoints, in the direction of travel. A segment that carries no
+    explicit bridge endpoints falls back to its own catalog + entity names — which is what such a
+    segment actually asserts, rather than a column pair it never named."""
+    from_ref = (segment.bridge_from_catalog_source or segment.catalog_source,
+                segment.bridge_from_object_ref or segment.from_entity or "")
+    to_ref = (segment.bridge_to_catalog_source or segment.catalog_source,
+              segment.bridge_to_object_ref or segment.to_entity or "")
+    return from_ref, to_ref
+
+
+def plan_relationship_dependencies(plan: BindingPlanV1
+                                   ) -> tuple[SuggestionRelationshipDependencyV1, ...]:
+    """The compiled plan's ordered directional realizations (freeze 0F-7).
+
+    ``relationship_ref`` is the SEMANTIC hop the segment realizes (``relationship_id``, else the
+    governed bridge fact that stands for it) — direction-free, because one relationship exposes many
+    directional realizations. The direction, the cardinality AS CROSSED and the realization's own
+    identity live in ``from_ref``/``to_ref``/``realization_content_hash``. The exact
+    ``realization_revision_id`` is NOT here: it is a currentness pointer and rides on the dependency
+    pin (:func:`plan_dependency_pins`), so replaying the identical crossing under a new revision
+    does not fork the candidate's identity.
+    """
+    legs: list[SuggestionRelationshipDependencyV1] = []
+    for segment in plan.path_segments:
+        kind = _SEGMENT_RELATIONSHIP_KIND.get(segment.segment_kind)
+        if kind is None:
+            continue
+        from_ref, to_ref = _segment_endpoints(segment)
+        revision = segment.bridge_realization_revision
+        legs.append(relationship_leg(
+            relationship_ref=(segment.relationship_id or segment.bridge_fact_key
+                              or segment.realization_ref or ""),
+            relationship_kind=kind,
+            from_ref=from_ref, to_ref=to_ref,
+            realization_content={
+                "segment_kind": segment.segment_kind.value,
+                "catalog_source": segment.catalog_source,
+                "from_entity": segment.from_entity, "to_entity": segment.to_entity,
+                "from_ref": [from_ref[0], from_ref[1]], "to_ref": [to_ref[0], to_ref[1]],
+                "cardinality": segment.cardinality, "direction": segment.direction,
+                "bridge_fact_key": segment.bridge_fact_key,
+                "realization_ref": segment.realization_ref,
+                "realization_id": None if revision is None else revision.realization_id,
+                "relationship_version": segment.relationship_version,
+            },
+            cardinality=segment.cardinality or "unknown",
+            safety_status=(_SAFETY_WITH_REALIZATION if revision is not None
+                           else _SAFETY_WITHOUT_REALIZATION),
+            review_status=("governed_bridge" if segment.bridge_fact_key else "unlinked")))
+    return tuple(legs)
+
+
+def plan_dependency_pins(plan: BindingPlanV1) -> tuple[GroundingDependencyPinV1, ...]:
+    """One pin per traversed segment plus the plan's contract resolution.
+
+    A segment pin's ``current_revision_id`` is the exact ``realization_revision_id`` the compile
+    consumed — the provenance a later reader compares against the current realization to decide
+    whether this candidate is still true. The CONTENT hashed beside it is the crossing's logical
+    shape, so the two questions ("is it the same crossing?" and "is it the same revision?") stay
+    separable, which is the whole point of the split.
+    """
+    pins: list[GroundingDependencyPinV1] = []
+    for index, segment in enumerate(plan.path_segments):
+        if segment.segment_kind not in _SEGMENT_RELATIONSHIP_KIND:
+            continue
+        from_ref, to_ref = _segment_endpoints(segment)
+        revision = segment.bridge_realization_revision
+        pins.append(dependency_pin(
+            dependency_class=SuggestionDependencyClass.VALIDATION,
+            dependency_kind=CROSS_CATALOG_PATH_SEGMENT,
+            dependency_key=f"{plan.physical_plan_id}::segment::{index}",
+            content={"segment_kind": segment.segment_kind.value,
+                     "from_ref": [from_ref[0], from_ref[1]],
+                     "to_ref": [to_ref[0], to_ref[1]],
+                     "cardinality": segment.cardinality, "direction": segment.direction,
+                     "bridge_fact_key": segment.bridge_fact_key,
+                     "relationship_id": segment.relationship_id,
+                     "relationship_version": segment.relationship_version},
+            current_revision_id=None if revision is None else revision.realization_revision_id))
+    pins.append(dependency_pin(
+        dependency_class=SuggestionDependencyClass.VALIDATION,
+        dependency_kind=CROSS_CATALOG_CONTRACT,
+        dependency_key=plan.contract_id or plan.physical_plan_id,
+        content={"contract_resolution_status": str(plan.contract_resolution_status),
+                 "path_resolution_status": str(plan.path_resolution_status),
+                 "resolution_status": str(plan.resolution_status),
+                 "safety": str(plan.safety),
+                 "reason_codes": sorted(str(code) for code in plan.contract_reason_codes)},
+        current_revision_id=plan.contract_id))
+    return tuple(pins)
+
+
+def plan_operand_roles(plan: BindingPlanV1) -> tuple[tuple[str, str, str], ...]:
+    """``(catalog_source, object_ref, need_role)`` per bound ingredient, in the plan's own binding
+    order — the cross-catalog counterpart of the template-declared operand roles the gauntlet
+    records."""
+    return tuple((b.bound_catalog_source, b.bound_object_ref, b.need_role)
+                 for b in plan.ingredient_bindings)
 
 
 def recheck_plan_freshness(conn, envelope: PlanEnvelopeV1,

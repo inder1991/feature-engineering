@@ -60,6 +60,7 @@ from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
 from featuregen.materialize.identity import (
     GENERATED_LOCK_FILENAME,
+    REQUIREMENTS_LOCK_FILENAME,
     CompilationIdentity,
     SealedProject,
     build_compilation_identity,
@@ -272,6 +273,12 @@ def _fold(value: str) -> str:
     return value.strip().lower()
 
 
+def _comment(text: str) -> str:
+    """A catalog comment stays ON its comment line: a linebreak inside an interpolated value would
+    end the comment early and turn the remainder into YAML nobody wrote."""
+    return str(text).replace("\r", " ").replace("\n", " ")
+
+
 # ── the datasets ─────────────────────────────────────────────────────────────────────────────────
 
 
@@ -336,7 +343,12 @@ def project_datasets(
     for ir in sorted(authorized.irs, key=lambda compiled: compiled.feature_name):
         column = _column_of(plan, ir.feature_name)
         staging[column] = f"feature_staging_{column}"
-        manifests[column] = f"feature_staging_manifest_{column}"
+        # `feature_manifest__` (and `feature_group__` below), NOT `feature_staging_manifest_`:
+        # a feature legitimately named `manifest_<x>` stages as `feature_staging_manifest_<x>`,
+        # which is exactly the name the old prefix gave feature `<x>`'s manifest. The
+        # double-underscore families cannot collide with any `feature_staging_<hive_identifier>`
+        # name — they differ from it at the character after `feature_`.
+        manifests[column] = f"feature_manifest__{column}"
         for expression in sorted(ir.expressions, key=lambda e: e.expr_path):
             projections[(column, expression.expr_path)] = (
                 f"intermediate_{column}__{slug(expression.expr_path)}")
@@ -357,7 +369,9 @@ def project_datasets(
         # §9's gates run AFTER assembly and BEFORE publication, so the assembled group needs a
         # declared home: an undeclared output is an in-memory dataset, and a gate that failed over
         # one would leave nothing an operator could inspect to see what it judged.
-        assembled="feature_staging_assembled",
+        # `feature_group__`, not `feature_staging_`: a feature named `assembled` stages as
+        # `feature_staging_assembled`, which is the name this dataset used to claim.
+        assembled="feature_group__assembled",
         published=published_dataset_name(plan))
 
     declared = [
@@ -422,7 +436,7 @@ def _hive_entry(name: str, layer: DatasetLayer, *, database: str, table: str,
     at all. Task 16 replaces this entry with the mechanism its probe attested.
     """
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: spark.SparkHiveDataset",
         f"  database: {_quote(database)}",
         f"  table: {_quote(table)}",
@@ -441,7 +455,7 @@ def _parquet_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -
     and a re-run would land on top of the previous run's evidence.
     """
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: spark.SparkDataset",
         f"  filepath: {_quote('${runtime_params:staging_root}/' + path)}",
         '  file_format: "parquet"',
@@ -455,7 +469,7 @@ def _parquet_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -
 
 def _json_entry(name: str, layer: DatasetLayer, *, path: str, comment: str) -> _CatalogEntry:
     return _CatalogEntry(name=name, layer=layer, body=(
-        f"  # {comment}",
+        f"  # {_comment(comment)}",
         "  type: json.JSONDataset",
         f"  filepath: {_quote('${runtime_params:staging_root}/' + path)}",
         "  metadata:",
@@ -496,7 +510,9 @@ def _catalog_entries(
     """
     entries: list[_CatalogEntry] = []
     for physical, name in sorted(datasets.raw.items()):
-        schema, table = physical.split(".", 1)
+        # The LAST dot separates schema from table: a dotted schema is real (a catalog-qualified
+        # namespace like `edp.raw`), a dotted table is not.
+        schema, table = physical.rsplit(".", 1)
         entries.append(_hive_entry(
             name, DatasetLayer.RAW, database=schema, table=table,
             comment=f"governed source, read-only: {physical}"))
@@ -529,7 +545,9 @@ def _catalog_entries(
         comment="the assembled group — §9's gates run on THIS, and only a group that passes"
                 " every one of them reaches the publication target"))
     if selection is None:
-        database, table = published_target.split(".", 1)
+        # The LAST dot separates schema from table; the sandbox namespace may itself be
+        # catalog-qualified, and the group name (a hive identifier) never carries a dot.
+        database, table = published_target.rsplit(".", 1)
         entries.append(_hive_entry(
             datasets.published, DatasetLayer.FEATURE, database=database, table=table,
             comment=f"the publication target, derived from the sandbox binding: {published_target}"))
@@ -772,7 +790,8 @@ def _render_hooks(package: str, required_parameters: tuple[str, ...]) -> str:
         "    @hook_impl\n"
         "    def before_pipeline_run(self, run_params: dict[str, Any], pipeline: Any,\n"
         "                            catalog: Any) -> None:\n"
-        '        supplied = set((run_params or {}).get("runtime_params") or {})\n'
+        '        params = run_params or {}\n'
+        '        supplied = set(params.get("runtime_params") or params.get("extra_params") or {})\n'
         "        expected = set(self.REQUIRED_RUN_PARAMETERS)\n"
         "        missing = sorted(expected - supplied)\n"
         "        unexpected = sorted(supplied - expected)\n"
@@ -939,7 +958,13 @@ def _render_spark(package: str) -> str:
         "# decided HOW an overwrite behaves would be a policy for an operation this project may not\n"
         "# perform.\n"
         f"spark.app.name: {_quote(package)}\n"
-        'spark.sql.session.timeZone: "UTC"\n')
+        'spark.sql.session.timeZone: "UTC"\n'
+        "#\n"
+        "# ANSI mode changes what the emitted gates observe: the OVERFLOW_VIOLATION gate\n"
+        "# reads a NULL from an out-of-range cast (legacy semantics); under ANSI the cast\n"
+        "# raises a raw SparkArithmeticException outside the closed gate vocabulary. The\n"
+        "# governed semantics therefore must not depend on a cluster default.\n"
+        'spark.sql.ansi.enabled: "false"\n')
 
 
 def _render_pyproject(package: str, *, engine_versions: EngineVersions) -> str:
@@ -993,6 +1018,68 @@ def _render_requirements(engine_versions: EngineVersions) -> str:
         f"pyspark=={engine_versions.pyspark}\n")
 
 
+def _render_crosswalk_pins(compilation: CompilationIdentity) -> str:
+    """The human-auditable crosswalk pins, or NOTHING when the group compiled none.
+
+    **Why the README needs its own block when identity already covers it.** Every pin here is
+    already inside ``ir_hash`` (through each step's ``identity_payload``) and inside
+    ``COMPILATION_IDENTITY``, so identity coverage is not what this adds. What it adds is that an
+    auditor holding the generated project can LOOK EACH ONE UP without re-deriving a hash: which
+    definition was joined, which execution revision's safety verdict admitted it, which mapping
+    table binding was measured, which temporal policy decided the mapping rows, and which composed
+    observation states the fan-out. A crosswalk's mapping table is the one relation on the path that
+    no formula names, so it is exactly the one whose provenance nobody can reconstruct from the
+    feature definition.
+
+    The per-leg values (``leg_plan_hash``, ``leg_read_set_hash``, ``leg_measurement_ids``,
+    ``mapping_row_selection_hash``) are deliberately NOT here: they are inside ``ir_hash`` via
+    ``identity_payload``, they are per-leg rather than per-traversal, and a README that listed every
+    leaf hash would bury the five values a human actually chases. The leg REALIZATIONS are here,
+    because a run revalidates them (``authorize_execution_realizations``) and an operator reading a
+    revalidation failure needs to find them somewhere other than a hash.
+
+    Emitted only when the group carries a crosswalk — same rule the identity payload keeps, and for
+    the same reason: a single-catalog project's bytes stay exactly what they were.
+    """
+    if not compilation.crosswalk_execution_pins:
+        return ""
+    rows = "\n".join(
+        f"| `{execution}` | `{definition}` | `{mapping_binding}` | "
+        f"{f'`{policy}`' if policy else '(none)'} | "
+        f"{f'`{observation}`' if observation else '(none)'} |"
+        for execution, definition, mapping_binding, policy, observation
+        in compilation.crosswalk_execution_pins)
+    block = (
+        "\n"
+        "## Governed crosswalk pins\n"
+        "\n"
+        "One row per two-leg mapping-table traversal. The traversal's fan-out verdict is the\n"
+        "COMPOSED one — measured over the joined shape, never multiplied out of the two legs — and\n"
+        "the composed observation named here is what states it.\n"
+        "\n"
+        "| Execution | Definition | Mapping binding | Mapping temporal policy | Composed"
+        " observation |\n"
+        "| --- | --- | --- | --- | --- |\n"
+        f"{rows}\n")
+    if compilation.bridge_realization_dependencies:
+        realizations = "\n".join(
+            f"| `{revision_id}` | `{snapshot_id}` |"
+            for revision_id, snapshot_id in compilation.bridge_realization_dependencies)
+        block += (
+            "\n"
+            "### Directional realizations revalidated before every run\n"
+            "\n"
+            "This artifact's FULL set, not the crosswalk's alone: a cross-catalog crosswalk leg\n"
+            "and a direct entity bridge both resolve through a governed bridge realization and\n"
+            "both land here. Run preparation refuses if any current pointer moved after\n"
+            "compilation (§11.1) rather than substituting a newer revision nobody rendered.\n"
+            "\n"
+            "| Realization revision | Dependency snapshot |\n"
+            "| --- | --- |\n"
+            f"{realizations}\n")
+    return block
+
+
 def _render_readme(
     plan: FeatureGroupPlanV1,
     compilation: CompilationIdentity,
@@ -1009,6 +1096,7 @@ def _render_readme(
     sources = "\n".join(f"| `{physical}` | `{name}` |"
                         for physical, name in sorted(datasets.raw.items()))
     parameters = "\n".join(f"- `{name}`" for name in required_parameters)
+    crosswalks = _render_crosswalk_pins(compilation)
     return (
         f"# `{published_target}`\n"
         "\n"
@@ -1076,6 +1164,7 @@ def _render_readme(
         "\n"
         "Plus the three system columns §10.2 adds once at assembly: `__generation_id`,\n"
         "`__generated_project_hash`, `__sandbox_execution_hash`.\n"
+        f"{crosswalks}"
         "\n"
         "## Identity\n"
         "\n"
@@ -1221,7 +1310,7 @@ def render_project(
 
     files = {
         "pyproject.toml": _render_pyproject(package, engine_versions=engine_versions),
-        "requirements.lock": _render_requirements(engine_versions),
+        REQUIREMENTS_LOCK_FILENAME: _render_requirements(engine_versions),
         "README.md": _render_readme(
             plan, compilation, datasets, package=package, environment_id=environment_id,
             engine_versions=engine_versions, published_target=published_target,

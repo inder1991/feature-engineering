@@ -182,6 +182,7 @@ def stale_source_evidence(
     field_name: str,
     producer: EvidenceProducer | str,
     keep_input_hash: str,
+    keep_configuration_hash: str | None = None,
 ) -> int:
     """Stale a producer's drifted ACTIVE rows for a field on re-ingest; return the rows staled.
 
@@ -189,14 +190,42 @@ def stale_source_evidence(
     rows for ``(logical_ref, field_name)`` whose ``input_hash`` differs from ``keep_input_hash``
     (the current upload's input). A source re-upload therefore stales ONLY its own superseded
     proposals and NEVER human- or taxonomy-produced evidence. An unchanged input
-    (``input_hash == keep_input_hash``) is left ACTIVE — snapshot reuse keys on the hash."""
+    (``input_hash == keep_input_hash``) is left ACTIVE — snapshot reuse keys on the hash.
+
+    ``keep_configuration_hash`` extends "unchanged" to the PRODUCER'S CONFIGURATION, for producers
+    whose answer depends on more than the column. A classifier's answer depends on two things: the
+    column, and the closed VOCABULARY it must choose from — so keying on the input alone made a
+    vocabulary change unable to dislodge a label chosen when the right concept did not yet exist.
+    Measured 2026-08-09: 209 of cib's 319 concept rows sat on superseded vocabularies four days
+    AFTER a re-ingest (ftr: 124 of 124), because the columns had not changed and the rows were
+    reused. The fingerprint was already being RECORDED in ``producer_configuration_hash`` by every
+    write and was never read.
+
+    OMITTED (``None``) keeps the historical input-only rule EXACTLY, which is why it is not the
+    default: the source re-upload, type-attestation and table-synth callers configure no vocabulary
+    and store NULL here, and must not begin staling rows over a column they never configured."""
+    if keep_configuration_hash is None:
+        cur = conn.execute(
+            """
+            UPDATE field_evidence SET lifecycle = 'stale'
+            WHERE logical_ref = %s AND field_name = %s AND producer = %s
+              AND lifecycle = 'active' AND input_hash <> %s
+            """,
+            (logical_ref, field_name, EvidenceProducer(producer).value, keep_input_hash),
+        )
+        return cur.rowcount
+    # A row survives only when BOTH the column AND the configuration are unchanged. `IS DISTINCT
+    # FROM` (not `<>`) so a legacy NULL configuration — every row written before this was recorded
+    # — counts as different and is re-derived, rather than surviving on a NULL comparison.
     cur = conn.execute(
         """
         UPDATE field_evidence SET lifecycle = 'stale'
         WHERE logical_ref = %s AND field_name = %s AND producer = %s
-          AND lifecycle = 'active' AND input_hash <> %s
+          AND lifecycle = 'active'
+          AND (input_hash <> %s OR producer_configuration_hash IS DISTINCT FROM %s)
         """,
-        (logical_ref, field_name, EvidenceProducer(producer).value, keep_input_hash),
+        (logical_ref, field_name, EvidenceProducer(producer).value, keep_input_hash,
+         keep_configuration_hash),
     )
     return cur.rowcount
 

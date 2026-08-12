@@ -27,6 +27,23 @@ that read-modify-write is a race: two appenders would both read the same maximum
 silently overwrite the other's place in the order. Supplied ``seq`` turns that race into a
 ``UniqueViolation`` the caller must handle.
 
+*One carve-out, added by Phase G §3.6:* :func:`record_compiled_artifact` DERIVES the two hashes it
+stores, from the very payloads it stores, and accepts neither from a caller. That is the same rule
+seen from the other side rather than an exception to it — everything supplied above is a fact about
+the world (when a thing happened, where it sits in an order) that this module could only invent,
+while a hash is a pure function of a body this module is already holding. A hash a caller could
+supply is a hash that could describe some other object, and on an append-only table nothing could
+ever correct it.
+
+**The one record here that carries a BODY, and why it still holds no data.** Phase G §3.6 added
+``materialization_compiled_artifact`` (migration ``1054``): the group plan and the materialization
+contract, stored as the very canonical payloads their hashes were derived from. It is the same kind
+of record as everything else here — append-only evidence about a compilation — and it carries no
+feature data either: a packing list names columns, types and refs, and a contract names keys,
+classes and policies. What it adds is *readability*: before it, a generation's three hashes named
+bodies nothing had kept, so no human could audit what a run intended to read and §3.3's reconciler
+had no compile-side evidence to reconcile against.
+
 **What this module does NOT own.** ``pipeline_validation_report`` and
 ``publication_capability_attestation`` are created by the same migration — the plan puts all six
 tables in one place — but their ingestion paths belong to the tasks that own the records:
@@ -36,15 +53,22 @@ probe result. Writing them from here would mean inventing both shapes a task lat
 from __future__ import annotations
 
 import datetime as _datetime
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from enum import StrEnum
+from typing import Any
+
+from psycopg.types.json import Jsonb
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.binding import GroupContractBinding, GroupPlanRevision
+from featuregen.materialize.canonical import materialize_hash
+from featuregen.materialize.contract import MaterializationContractV1
+from featuregen.materialize.group_plan import FeatureGroupPlanV1
 
 __all__ = [
     "TERMINAL_RUN_EVENT_KINDS",
+    "CompiledArtifactV1",
     "MaterializationGeneration",
     "MaterializationRunEvent",
     "RunEventKind",
@@ -53,10 +77,12 @@ __all__ = [
     "append_run_event",
     "fold_run_status",
     "published_generation_ids",
+    "read_compiled_artifact",
     "read_group_binding",
     "read_plan_revisions",
     "read_run_events",
     "read_run_manifest",
+    "record_compiled_artifact",
     "record_generation",
     "record_group_binding",
     "record_plan_revision",
@@ -324,6 +350,60 @@ class RunManifestV1:
 RUN_MANIFEST_FIELDS: tuple[str, ...] = tuple(field.name for field in fields(RunManifestV1))
 
 
+@dataclass(frozen=True, slots=True)
+class CompiledArtifactV1:
+    """Phase G §3.6 — the BODIES a generation's hashes name, so a compile is auditable afterwards.
+
+    Until migration ``1054`` a compile left only hashes: a human holding a ``group_plan_hash`` could
+    not answer *which features, which columns, which spine?* without re-deriving the whole
+    compilation, and §3.3's reconciler — which resolves a mid-chain failure by reading evidence —
+    had no compile-side evidence to read.
+
+    **The bodies are the canonical payloads, and the record proves it.** ``group_plan`` and
+    ``materialization_contract`` are exactly the mappings
+    :func:`~featuregen.materialize.canonical.materialize_hash` consumed, never a second rendering of
+    the same objects: the package has ONE canonicalization scheme by invariant (§14), and a second
+    serialization is a second identity. ``__post_init__`` re-derives both digests, so a body and a
+    hash that describe different objects cannot become a record at all — on the way in *or* on the
+    way back out of the database. The table's triggers stop a rewrite through ordinary DML; this is
+    what stops a row that reached it by any other means from being read back as evidence.
+
+    ``recorded_at`` is not a field here, matching :class:`MaterializationGeneration`: when the row
+    was *stored* is the database's bookkeeping, not part of what was compiled.
+    """
+
+    generation_id: str
+    group_plan: Mapping[str, Any]
+    group_plan_hash: str
+    materialization_contract: Mapping[str, Any]
+    contract_hash: str
+
+    def __post_init__(self) -> None:
+        _text(self.generation_id, field="compiled artifact generation_id",
+              why="the artifact describes ONE compilation, and one that names no generation "
+                  "describes nothing")
+        for body, digest in (("group_plan", "group_plan_hash"),
+                             ("materialization_contract", "contract_hash")):
+            value = getattr(self, body)
+            if not isinstance(value, Mapping):
+                raise ValueError(
+                    f"compiled artifact {body} is {type(value).__name__}: it is the identity "
+                    f"payload the one hasher consumes, which is a mapping — a fragment or a scalar "
+                    f"would re-derive to a digest nothing in the plane holds")
+            # Copied, so the record is compared by value and cannot be mutated behind the digest
+            # that was checked against it. Frozen guards rebinding, not the contents of a mapping.
+            object.__setattr__(self, body, dict(value))
+            _text(getattr(self, digest), field=f"compiled artifact {digest}",
+                  why="the body is stored beside its hash precisely so the two can be compared, "
+                      "and a blank digest compares nothing to nothing and passes")
+            derived = materialize_hash(getattr(self, body))
+            if derived != getattr(self, digest):
+                raise ValueError(
+                    f"compiled artifact {digest} is {getattr(self, digest)!r} and its {body} "
+                    f"re-derives to {derived!r}: the body and the hash must describe the SAME "
+                    f"object, or the record is evidence about a compilation nobody performed")
+
+
 # ── the fold ─────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -388,9 +468,21 @@ def append_run_event(conn: DbConn, event: MaterializationRunEvent) -> None:
     """Append one run event.
 
     The event's place in the run (``seq``) is the caller's, not this function's: computing
-    ``max(seq) + 1`` here would be a read-modify-write two appenders could both win. A duplicate
-    ``(run_id, seq)`` — or a second terminal event for the run — surfaces as the database's
-    ``UniqueViolation``, which is a refusal the caller must handle rather than a silent reordering.
+    ``max(seq) + 1`` here would be a read-modify-write two appenders could both win. The database
+    guarantees three things this function deliberately does not police:
+
+    * a duplicate ``(run_id, seq)`` is refused by the primary key (``UniqueViolation``);
+    * a second terminal event for the run is refused by the one-terminal partial unique index
+      (``UniqueViolation``);
+    * any event after a terminal one, and any ``seq`` that does not extend the run's max, is
+      refused by migration 1044's ``materialization_run_event_ordered`` BEFORE INSERT trigger
+      (``RaiseException``) — either write would brick ``run_status()`` forever on a table whose
+      append-only triggers leave no repair path.
+
+    Within one session the ordering trigger fires first, so those refusals surface as its
+    ``RaiseException``; the two unique constraints remain the arbiters of the concurrent race the
+    trigger's reads cannot see. Every one is a refusal the caller must handle rather than a silent
+    reordering.
     """
     conn.execute(
         "INSERT INTO materialization_run_event (run_id, seq, generation_id, event_kind, "
@@ -482,6 +574,85 @@ def record_plan_revision(conn: DbConn, revision: GroupPlanRevision) -> None:
         "VALUES (%s, %s, %s, %s)",
         (revision.binding_id, revision.generation_id, revision.group_plan_hash,
          revision.created_at))
+
+
+def record_compiled_artifact(
+    conn: DbConn,
+    *,
+    generation_id: str,
+    group_plan: FeatureGroupPlanV1,
+    contract: MaterializationContractV1,
+) -> None:
+    """Store §3.6's compile-side bodies for ``generation_id`` — ONCE; a second is a
+    ``UniqueViolation``.
+
+    **The bodies are the objects' own canonical payloads, and the hashes are re-derived from the
+    very mappings that are stored** — not from a second ``identity_payload()`` call, and never from
+    a caller. ``materialize_hash`` is the package's one hasher (§14): a second serialization here
+    would be a second identity, and a body that hashed to a value the plane does not hold would be
+    evidence about nothing. There is deliberately no parameter through which a caller could supply
+    either digest, because on an append-only table nothing could correct one afterwards.
+
+    **The row is read BACK inside the caller's transaction and checked.** ``jsonb`` is a normalizing
+    type — it is not the bytes handed to it — so "the body we meant to store" and "the body a reader
+    will get" are two different objects, and only the second one is evidence. Re-deriving it here
+    means a normalization that perturbed the payload aborts the compile that produced it, rather
+    than surfacing months later in a reconciler holding a row nothing can repair or delete.
+
+    **The two arguments must belong together, and that is checked.** ``build_group_plan`` guarantees
+    the plan carries *its own group's* contract hash; nothing guarantees that the ``contract`` passed
+    here is that group's contract. Without the check, a mismatched pair would store two bodies that
+    each re-derive to the digest beside them — internally consistent, describing two different
+    compilations — and the stored ``contract_hash`` would disagree with the
+    ``materialization_contract_hash`` the plane holds for this generation. It is a ``ValueError``,
+    not a §14 code: a call assembled wrongly is not a governed verdict about a feature.
+
+    This function does NOT open a transaction: it is called from inside ``compile/chain.py``'s
+    commit block, whose whole point is that the generation row, the §10.1 records, this artifact,
+    the terminal event and the tree land together or not at all.
+    """
+    plan_payload = group_plan.identity_payload()
+    contract_payload = contract.identity_payload()
+    contract_digest = materialize_hash(contract_payload)
+    if contract_digest != group_plan.materialization_contract_hash:
+        raise ValueError(
+            f"the compiled artifact for generation {generation_id!r} was given a contract hashing "
+            f"to {contract_digest!r} and a plan whose materialization_contract_hash is "
+            f"{group_plan.materialization_contract_hash!r}: the plan is the packing list for the "
+            f"group THIS contract governs, and storing the pair would record two different "
+            f"compilations as one — on a table where nothing can be corrected afterwards")
+    row = conn.execute(
+        "INSERT INTO materialization_compiled_artifact (generation_id, group_plan, "
+        "group_plan_hash, materialization_contract, contract_hash) VALUES (%s, %s, %s, %s, %s) "
+        "RETURNING generation_id, group_plan, group_plan_hash, materialization_contract, "
+        "contract_hash",
+        (generation_id, Jsonb(plan_payload), materialize_hash(plan_payload),
+         Jsonb(contract_payload), contract_digest)).fetchone()
+    if row is None:
+        # Unreachable: an `INSERT … RETURNING` with no `ON CONFLICT` either returns the row it
+        # inserted or raises. It is a narrow rather than an `assert` (which `python -O` strips,
+        # turning the line below into a confusing TypeError) so the check can never be skipped
+        # silently — an unverifiable write must not be treated as a recorded one.
+        raise RuntimeError(
+            f"the compiled artifact for generation {generation_id!r} returned no row from its own "
+            f"INSERT, so what was stored cannot be checked against what was hashed")
+    # Constructing the record IS the check: `CompiledArtifactV1` re-derives both digests from the
+    # bodies the database returned, and raises if either pair describes two different objects.
+    CompiledArtifactV1(*row)
+
+
+def read_compiled_artifact(conn: DbConn, *, generation_id: str) -> CompiledArtifactV1 | None:
+    """The bodies ``generation_id`` compiled, or ``None`` when no compile recorded them.
+
+    ``None`` also covers every generation written before migration ``1054`` existed: they have
+    hashes and no bodies, which is exactly the gap this table closes going forward and cannot close
+    backwards.
+    """
+    row = conn.execute(
+        "SELECT generation_id, group_plan, group_plan_hash, materialization_contract, "
+        "contract_hash FROM materialization_compiled_artifact WHERE generation_id = %s",
+        (generation_id,)).fetchone()
+    return None if row is None else CompiledArtifactV1(*row)
 
 
 def read_plan_revisions(conn: DbConn, binding_id: str) -> tuple[GroupPlanRevision, ...]:

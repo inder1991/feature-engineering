@@ -15,8 +15,10 @@ constant in the same file as the chain would close that loop, and the failure wo
 module inside this package (``compile.chain``), which may import ``identity`` freely, and this file
 stays free of imports. A test pins exactly that, as it does for ``render``.
 
-Nothing else lives here yet: §2's orchestrator is not built, and inventing a shell for it would be
-a second place the chain is described.
+Nothing else lives in THIS FILE, and the two modules beside it are why the rule above matters:
+:mod:`~featuregen.materialize.compile.chain` (Phase G T3) runs §2's chain from a durable request to
+a sealed project, and :mod:`~featuregen.materialize.compile.wiring` (T4) assembles the Kedro node
+sequence that chain renders. Both import ``identity``; neither is imported from here.
 """
 from __future__ import annotations
 
@@ -40,4 +42,11 @@ __all__ = ["COMPILER_VERSION"]
 #: (``PHYSICAL_TYPE_POLICY_VERSION``, ``CLASSIFICATION_POLICY_VERSION``, ``RETENTION_POLICY_VERSION``,
 #: ``CANONICALIZATION_VERSION``): those version individual policies, and a compiler can change what
 #: it decides without any of them moving.
-COMPILER_VERSION = "1"
+#:
+#: **"2"** (codegen-review remediation branch): the chain decides differently for unchanged
+#: governed inputs — new refusals (``COLUMN_NOT_GOVERNED`` for a read the catalog does not govern,
+#: ``PARTITION_MAPPING_NOT_DECLARED`` for an unresolvable partition mapping, ``half_even`` ratios
+#: and non-UTC ``DATE`` clocks now refuse), the ``grain_keys`` field folded into the IR, and a
+#: changed contract derivation. Formulas that compiled under "1" can refuse under "2", so an
+#: execution hashed under "1" describes decisions this compiler no longer makes.
+COMPILER_VERSION = "2"

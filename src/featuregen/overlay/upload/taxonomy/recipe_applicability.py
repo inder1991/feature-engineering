@@ -1,6 +1,6 @@
 """Per-recipe applicability — the governed use-case a recipe scopes on, *derived* (not stamped).
 
-Every one of the 153 legacy recipes still carries only its flat ``Template.use_cases`` tag bag; this
+Every legacy recipe in the frozen registry still carries only its flat ``Template.use_cases`` tag bag; this
 module turns that bag into a governed :class:`ApplicabilitySpec` — a single selectable-leaf ``primary``
 objective plus the ordered ``secondary`` objectives and the routed non-use_case dimension fields
 (``product_context`` / ``typology`` / ``journey_stage`` / ``business_outcome``). Behaviour-neutral:

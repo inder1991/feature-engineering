@@ -7,7 +7,12 @@ from typing import Any
 
 from psycopg.rows import dict_row
 
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    PROJECTION_READY,
+    ProjectionLagV1,
+    projection_lag_marker,
+)
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, visible_table_pairs
 
 # Facet name -> graph_node column. AND across facet groups, OR (= ANY) within one group.
 # These are the ONLY facetable columns; read-scope (sensitivity gate) and freshness stay HARD
@@ -16,10 +21,53 @@ _COLUMN_FACETS: dict[str, str] = {
     "source": "catalog_source",
     "domain": "domain",
     "sensitivity": "sensitivity",
+    # The projected DISPLAY axis (migration 1042), a SEPARATE facet from the enforcement tag above
+    # — never a repoint of it. The two speak different vocabularies ('pii' vs
+    # 'restricted'/'confidential'), and `sensitivity` is an input to the generated
+    # `visible_requires`, so swapping the column under the existing name would silently retire the
+    # role-gated `pii` bucket. Read scope applies here exactly as it does to every other facet: the
+    # base predicates gate the facet counts too, so a label can never name a row the caller cannot
+    # already see.
+    "sensitivity_display": "sensitivity_display",
     "additivity": "additivity",
     "entity": "entity",
     "kind": "kind",
 }
+
+# Release-A profile facets (profile Task 5 + D13.1/D13.2), added ONLY while
+# `FEATUREGEN_DATASET_PROFILES` is on — with the flag off, `search()` returns the exact facet map
+# it always did, so the flag-off payload is byte-identical (profile Task 6's own rule).
+#
+# Every one is a LITERAL `graph_node` column, because that is the only thing this mechanism can
+# read (review D: "a derived data role facet is inexpressible"). `data_role` is the migration-1052
+# projection of the canonical `table_role`; `authority_role`/`temporal_storage_model` are the 1047
+# table-node projections; `bian_path`/`process_path`/`sub_domain` are the 1051 column-node axes.
+#
+# TABLE-grain facets bucket every COLUMN row under `(none)`, which is honest rather than noisy:
+# selecting `data_role=crosswalk` returns the crosswalk TABLES, which is the question being asked.
+# Read scope is IDENTICAL to every other facet — the base predicates (including the derived
+# table-visibility rule) are applied to the facet counts too, so a hidden table's profile can never
+# be counted into a bucket.
+_PROFILE_FACETS: dict[str, str] = {
+    "data_role": "data_role",
+    "authority_role": "authority_role",
+    "temporal_storage_model": "temporal_storage_model",
+    "bian_path": "bian_path",
+    "process_path": "process_path",
+    "sub_domain": "sub_domain",
+}
+
+
+def column_facets() -> dict[str, str]:
+    """The active facet map. The ONE definition — the route builds its filter dict from it, so a
+    facet cannot exist in the query layer and be un-passable from HTTP (or the reverse)."""
+    from featuregen.overlay.upload.profile_vocab import dataset_profiles_enabled
+
+    if dataset_profiles_enabled():
+        return {**_COLUMN_FACETS, **_PROFILE_FACETS}
+    return dict(_COLUMN_FACETS)
+
+
 # Boolean-flag facets: presence of the filter means "only rows where the flag is true".
 _FLAG_FACETS: dict[str, str] = {
     "grain": "is_grain",
@@ -48,7 +96,7 @@ def _select_hit(match: str) -> str:
     return f"""
     n.object_ref, n.table_name, n.column_name, n.kind, n.data_type, n.definition,
     n.is_grain, n.is_as_of, n.catalog_source, n.concept, n.domain, n.sensitivity,
-    n.additivity, n.unit, n.currency, n.entity,
+    n.sensitivity_display, n.additivity, n.unit, n.currency, n.entity,
     ts_rank_cd(n.search_doc, {_TSQUERY[match]})
       + (CASE WHEN n.is_grain THEN 0.5 ELSE 0 END)
       + (CASE WHEN n.is_as_of THEN 0.3 ELSE 0 END) AS score
@@ -70,7 +118,8 @@ class SearchHit:
     catalog_source: str
     concept: str | None
     domain: str | None
-    sensitivity: str | None
+    sensitivity: str | None              # the raw read-scope TAG (what the file declared)
+    sensitivity_display: str | None      # the projected display LABEL (1042) — never enforcement
     additivity: str | None
     unit: str | None
     currency: str | None
@@ -89,6 +138,15 @@ class SearchResult:
     hits: list[SearchHit]              # limit-capped, score-ordered (all facets applied)
     facets: dict[str, list[FacetBucket]]
     total: int                         # count of ALL matching rows (may exceed len(hits))
+    # Semantic Task 6: whether a load-bearing projection was BEHIND when these rows were read.
+    # Search reads `graph_node`'s projected display columns, so a lagged projection means the hits
+    # may not yet reflect the newest resolved semantics. DISCLOSED, never refused — an empty result
+    # set would be a worse (and less honest) answer than the rows plus the marker. Defaulted so
+    # every existing constructor stays valid; `PROJECTION_READY` is the normal value, always
+    # present, because an omitted key cannot distinguish "checked and fine" from "never checked".
+    # Computed for any page that returns HITS; a page returning none keeps the default, because the
+    # marker describes the rows served and there are none (see the call site).
+    projection: ProjectionLagV1 = PROJECTION_READY
 
 
 def _hit(r: dict[str, Any]) -> SearchHit:
@@ -97,6 +155,7 @@ def _hit(r: dict[str, Any]) -> SearchHit:
         kind=r["kind"], data_type=r["data_type"], definition=r["definition"],
         is_grain=r["is_grain"], is_as_of=r["is_as_of"], catalog_source=r["catalog_source"],
         concept=r["concept"], domain=r["domain"], sensitivity=r["sensitivity"],
+        sensitivity_display=r["sensitivity_display"],
         additivity=r["additivity"], unit=r["unit"], currency=r["currency"], entity=r["entity"],
         score=float(r["score"]))
 
@@ -116,13 +175,25 @@ def _build_predicates(
         # that node is fresh for the SLA window after its resolution and never re-blessed by a
         # later scan of the OTHER rows (round-3 #5). NULL attested_at = watermark, as before.
         "COALESCE(n.attested_at, w.last_completed_at) >= %(cutoff)s",
-        "COALESCE(n.visible_requires, '{}') <@ %(allowed)s",   # read-scope hard filter
+        # Read-scope hard filter. A COLUMN row carries its own requirement; a TABLE row's scope is
+        # DERIVED (D11): visible iff the caller can see AT LEAST ONE of its columns — the same rule
+        # the asset-detail and field-correction anchor loads apply via read_scope's shared anchor
+        # predicate — because build_graph never writes sensitivity on table nodes
+        # (visible_requires = {}), which made every table name/text world-matchable: an existence
+        # oracle over fully-restricted tables. The anchors keep the single-row EXISTS probe; here
+        # the visible-table SET is hoisted ONCE per search() call (read_scope.visible_table_pairs)
+        # because every query of the ~10-query fan-out shares these base_preds — the correlated
+        # EXISTS re-planned a full-catalog hashed subplan in EACH of them. Identical semantics;
+        # empty arrays (nothing visible) hide every table row without a SQL edge.
+        "(CASE WHEN n.kind = 'table' THEN (n.catalog_source, n.table_name) IN "
+        "(SELECT * FROM unnest(%(vt_sources)s::text[], %(vt_tables)s::text[])) "
+        "ELSE COALESCE(n.visible_requires, '{}') <@ %(allowed)s END)",
     ]
     if query:
         base_preds.append(f"n.search_doc @@ {_TSQUERY[match]}")
 
     facet_preds: dict[str, str] = {}
-    for name, col in _COLUMN_FACETS.items():
+    for name, col in column_facets().items():
         selected = list(filters.get(name, ()))
         if not selected:
             continue
@@ -182,6 +253,8 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
     }
     if match not in _TSQUERY:
         raise ValueError(f"unknown match mode {match!r}; use {sorted(_TSQUERY)}")
+    # The derived table scope, computed ONCE for the whole fan-out (see the predicate comment).
+    params["vt_sources"], params["vt_tables"] = visible_table_pairs(conn, params["allowed"])
     base_preds, facet_preds = _build_predicates(query, filters, params, match=match)
     where_all = _where(base_preds, facet_preds)
 
@@ -201,7 +274,7 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
         total = int(row["c"]) if row else 0
 
         facets: dict[str, list[FacetBucket]] = {}
-        for name, col in _COLUMN_FACETS.items():
+        for name, col in column_facets().items():
             # GROUP BY the facet column over the set filtered by everything EXCEPT this facet.
             # read-scope stays in base_preds, so a forbidden sensitivity value never appears here.
             cur.execute(
@@ -216,4 +289,12 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
             row = cur.fetchone()
             facets[name] = [FacetBucket(value="true", count=int(row["c"]) if row else 0)]
 
-    return SearchResult(hits=hits, facets=facets, total=total)
+    # Task 6 disclosure — ONE readiness check per search call (the gate itself is one statement,
+    # `_readiness_probe`), and only when this page actually SERVES rows. The marker qualifies the
+    # rows returned: "these may not yet reflect the newest resolved semantics". A page that returns
+    # no rows has nothing to qualify, so it keeps the default and pays nothing — search is the
+    # highest-frequency read on the platform and an empty facet-filtered page is its most common
+    # answer. A non-empty page always carries a FRESHLY computed marker; the default is never a
+    # substitute for a check that was skipped over served rows.
+    projection = projection_lag_marker(conn) if hits else PROJECTION_READY
+    return SearchResult(hits=hits, facets=facets, total=total, projection=projection)

@@ -11,7 +11,7 @@ import logging
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
@@ -52,6 +52,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     recorded_gate1_choice_revision,
     recorded_gate1_draft_choice,
     select_and_record_gate1_choice,
+    verified_considered_revision_by_id,
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
@@ -69,6 +70,13 @@ from featuregen.overlay.upload.contract.intake import (
     IntentValidationError,
     redact_free_text,
     submit_intent,
+)
+from featuregen.overlay.upload.contract.intake_ticket import (
+    _use_case_vocabulary,
+    extract_intake_ticket,
+    is_readable_column,
+    record_target_reading,
+    target_reading,
 )
 from featuregen.overlay.upload.contract.live_activation import (
     CROSS_CATALOG_GROUNDING_NOT_ENABLED,
@@ -95,6 +103,7 @@ from featuregen.overlay.upload.contract.scope_records import (
 )
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
+    compare_snapshot_to_current,
     ensure_generation_run,
 )
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
@@ -105,6 +114,7 @@ from featuregen.overlay.upload.recipe_formula_shadow import (
     declare_expected_run,
     recipe_formula_shadow_enabled,
 )
+from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -223,6 +233,12 @@ class ConsideredSetIn(BaseModel):
     recognition_id: str | None = None     # the recognition attempt this scope confirms (lineage)
     confirmed_scope: ConfirmedScopeIn | None = None
     supersedes_scope_id: str | None = None   # broaden lineage: the scope this run's scope supersedes
+    # SE-11: the EXPLICIT response-contract opt-in. 1 (the default) = today's response, byte-
+    # identical — an old client never infers a version from optional fields. 2 = the semantic
+    # candidate contract: top-level contract_version + the resolved semantic-planning mode
+    # (the step-7 diagnostic), with the per-card semantic fields the v2 card serializer already
+    # carries. Never an env flag — the CLIENT asks per request.
+    contract_version: Literal[1, 2] = 1
 
 
 class DraftReqIn(BaseModel):
@@ -240,6 +256,29 @@ class RecognitionIn(BaseModel):
     supersedes_scope_id: str | None = None
 
 
+class IntakeIn(BaseModel):
+    """The mandatory read (intake build, router-quality plan 2026-08-10): one hypothesis in, one
+    ticket out — a DRAFT reading for the confirm screen, never a decision."""
+    hypothesis: str = Field(min_length=1)
+    catalog_source: str | None = None
+
+
+class IntakeTargetIn(BaseModel):
+    """The human's answer to the confirm screen. ``confirmed`` = "Yes, that's my target" (agreed
+    with the draft), ``corrected`` = "Change it" (the click IS the extractor's ground truth — the
+    two are one provenance and two telemetry counters), ``exploring`` = an explicit no-target
+    declaration. The server validates the signed ref against the READ-SCOPED catalog — never
+    against the ticket — so a correction to any real, visible column is one click."""
+    intent_id: str
+    decision: str = Field(pattern="^(confirmed|corrected|exploring)$")
+    target_ref: str | None = None
+    target_window_days: int | None = Field(default=None, ge=1)
+    target_type: str | None = Field(default=None,
+                                    pattern="^(binary_classification|regression|multiclass)$")
+    business_domain: list[str] = []
+    catalog_source: str | None = None
+
+
 # ---- routes -------------------------------------------------------------------------------------
 @router.get("/contract/scope-mode", dependencies=[Depends(require_feature_read)])
 def scope_mode() -> dict:
@@ -250,6 +289,53 @@ def scope_mode() -> dict:
         "confirmation_required": status.confirmation_required,
         "configuration_valid": status.configuration_valid,
     }
+
+
+@router.get("/contract/considered-revisions/{considered_revision_id}/options/{option_id}",
+            dependencies=[Depends(require_feature_read)])
+def considered_option_detail(considered_revision_id: str, option_id: str,
+                             conn: _FeatureGenConn) -> dict:
+    """SE-11 step 4 — the audit drawer: full eligibility and plan evidence for ONE option,
+    served from the IMMUTABLE stored revision (hash-verified, the same verification the Gate-1
+    choice path runs) plus this run's semantic observations. Never a live-catalog read to
+    decorate it — what the human saw is what this returns."""
+    try:
+        revision = verified_considered_revision_by_id(conn, considered_revision_id)
+    except Gate1Error as e:
+        if str(e) == "UNKNOWN_CONSIDERED_REVISION":
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    option = revision["considered"].get("options_by_id", {}).get(option_id)
+    if option is None:
+        raise HTTPException(status_code=404, detail="UNKNOWN_CONSIDERED_OPTION")
+    detail = {
+        "considered_revision_id": revision["considered_revision_id"],
+        "considered_content_hash": revision["considered_content_hash"],
+        "generation_run_id": revision["generation_run_id"],
+        "option_id": option_id,
+        "option": option,
+    }
+    # The semantic evidence for a recipe-sourced option: this generation run's persisted
+    # observation for that definition — verdicts, per-shortlist eligibility, policy hashes,
+    # and the frozen context hash. Bounded to the newest row; absent means the run predates
+    # the observation store or the option is not recipe-sourced — honest absence, no backfill.
+    identity = option.get("canonical_candidate_identity") or {}
+    recipe_id = (identity.get("feature") or {}).get("recipe_id")
+    if recipe_id:
+        row = conn.execute(
+            "SELECT context_hash, planning_request_hash, binding_state, verdicts, "
+            "eligibility, policy_hashes "
+            "FROM semantic_candidate_observation "
+            "WHERE generation_run_id = %s AND source_definition_id = %s "
+            "ORDER BY recorded_at DESC LIMIT 1",
+            (revision["generation_run_id"], recipe_id)).fetchone()
+        if row is not None:
+            detail["semantic_evidence"] = {
+                "context_hash": row[0], "planning_request_hash": row[1],
+                "binding_state": row[2], "verdicts": row[3],
+                "eligibility": row[4], "policy_hashes": row[5],
+            }
+    return detail
 
 
 def _considered_set_response(conn, intent, cs) -> dict:
@@ -305,10 +391,11 @@ _TEMPLATES_BY_ID = {t.id: t for t in ALL_TEMPLATES}
 
 
 def _intent_ranking_enabled() -> bool:
-    """Deterministic ranking is OFF by default — the scoped considered-set omits ``ranking`` /
-    ``ranking_version`` entirely (Phase-1B/Task-7 byte-identical) unless a deployment opts in with
-    ``FEATUREGEN_INTENT_RANKING=1``."""
-    return os.environ.get("FEATUREGEN_INTENT_RANKING", "0") == "1"
+    """Deterministic ranking is ALWAYS ON — the FEATUREGEN_INTENT_RANKING opt-in retired with
+    the pre-live simplification (2026-08-11): a built, tested, deterministic ordering that
+    nobody could see behind a dark flag is exactly the class of switch the steer removes. The
+    helper remains (three call sites stamp it into provenance) but no longer reads env."""
+    return True
 
 
 def _live_cross_catalog_flag_on() -> bool:
@@ -629,6 +716,17 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
+    # SE-7 part 4: the mode is resolved ONCE here (the builder never reads env). Under
+    # semantic_v1 the DISPOSITION universe is the V2 registry — the universe that was actually
+    # planned — while the legacy object still feeds the legacy machinery (shadow planner,
+    # scoped-grounding narrowing) untouched. In legacy/shadow the two are the same object.
+    semantic_mode = RecipeRolloutConfig.from_env().semantic_planning
+    if semantic_mode == "semantic_v1":
+        from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
+
+        disposition_applicability = v2_applicability_as_result(scope)
+    else:
+        disposition_applicability = applicability
     now = datetime.now(UTC)
     # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
     # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
@@ -644,23 +742,39 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             roles=identity.role_claims, target_ref=run_target_ref, objective=run_prediction_goal,
             feedback=run_feedback, now=now, applicability=applicability,
             is_live=is_live, target_entity=scope.target_entity,
-            generation_run_id=generation_run_id)
+            generation_run_id=generation_run_id,
+            # SE-7 part 2: the semantic-planning mode, resolved HERE from the rollout config
+            # (the builder never reads env — same discipline as is_live) with the confirmed
+            # scope the V2 lens classifies against. In `legacy` (the frozen default) the
+            # builder ignores both — byte-identical.
+            scope=scope,
+            semantic_mode=semantic_mode)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
         raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
             status_code=409,
             detail="a concurrent request updated this intent; re-fetch and retry") from e
-    # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
+    # 7. The per-stage disposition lens over the MODE'S applicability universe + this run's
+    #    grounding outcome (the ids the builder actually returned live in the same universe).
     dispositions = evaluate_dispositions(
-        applicability, cs.grounded_template_ids, cs.rejected_template_ids,
+        disposition_applicability, cs.grounded_template_ids, cs.rejected_template_ids,
         evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now,
         incomplete=cs.incomplete_template_ids)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
     response = {**_considered_set_response(conn, intent, cs),
                 "generation_run_id": generation_run_id, "scope_id": scope_id,
                 "dispositions": [_disposition_json(d) for d in dispositions],
-                "in_scope_count": len(applicability.eligible_ids)}
+                "in_scope_count": len(disposition_applicability.eligible_ids)}
+    # SE-11: the v2 contract is an EXPLICIT opt-in and the v1 response never carries the new
+    # keys — no newer semantic field silently leaks into the frozen old contract (pinned).
+    if body.contract_version == 2:
+        response["contract_version"] = 2
+        response["semantic_planning_mode"] = semantic_mode
+        # Step 3's audit-drawer provenance: the immutable revision this response was minted
+        # from — the address of GET /contract/considered-revisions/{id}/options/{option_id}.
+        response["considered_revision_id"] = cs.considered_revision_id
+        response["considered_content_hash"] = cs.considered_content_hash
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
@@ -782,6 +896,12 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
     an absent scope. Only the explicit legacy_unscoped emergency mode retains the old one-shot path."""
     if body.confirmed_scope is not None:
         return _scoped_considered_set(body, conn, identity, client)
+    if body.contract_version == 2:
+        # SE-11: the semantic candidate contract needs the scoped pipeline (mode resolution,
+        # dispositions, the semantic engine). The emergency unscoped path stays frozen at v1.
+        raise HTTPException(
+            status_code=422,
+            detail="contract_version 2 requires a confirmed_scope")
     if confirmation_required():
         raise HTTPException(
             status_code=409,
@@ -910,6 +1030,116 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
             "warnings": list(result.warnings)}
 
 
+def _intent_row(conn, intent_id: str):
+    return conn.execute(
+        "SELECT actor, target_provenance, target_ref FROM contract_intent WHERE intent_id = %s",
+        (intent_id,)).fetchone()
+
+
+@router.post("/contract/intake", dependencies=[Depends(require_feature_generate)])
+def intake(body: IntakeIn, conn: _Conn, identity: _Identity, client: _OptionalLLM) -> dict:
+    """The mandatory read: persist the intent (per-actor idempotent, the recognitions discipline),
+    extract the ticket (ONE cached governed call — replay is free), and return the DRAFT reading
+    for the confirm screen. A literally-typed name is recorded server-side as ``user_typed``
+    immediately (shows-doesn't-gate: human-origin by construction, no click required) — but NEVER
+    over a reading a human already signed. Degrades, never blocks: with no LLM configured the
+    pinned target still lands and everything else honestly abstains."""
+    try:
+        intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
+    except IntentValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    prior = conn.execute(
+        "SELECT intent_id FROM contract_intent WHERE hypothesis = %s AND intake_mode = %s "
+        "AND actor = %s::jsonb ORDER BY created_at ASC LIMIT 1",
+        (intent.hypothesis, intent.intake_mode, _actor_json(intent.actor))).fetchone()
+    if prior is not None:
+        intent = replace(intent, intent_id=prior[0])
+    persist_intent(conn, intent)
+
+    ticket, reason = extract_intake_ticket(
+        conn, client, hypothesis=body.hypothesis, catalog_source=body.catalog_source,
+        roles=identity.role_claims, actor=identity)
+    counters.incr(f"overlay.intake.{reason}")
+
+    row = _intent_row(conn, intent.intent_id)
+    # The pin is the USER's own typed name — record it without a click. A NEW pin may overwrite a
+    # PRIOR pin (both are code-derived from the user's own current text; refusing left the stored
+    # target on a column the catalog no longer resolves to while the screen showed the new one —
+    # review fix 2026-08-10). A HUMAN-signed reading (human_confirmed / exploring) is never
+    # clobbered: re-running intake on a decided intent stays a read.
+    if (ticket.pinned and ticket.target_column
+            and (row is None or row[1] in (None, "user_typed"))
+            and (row is None or row[2] != ticket.target_column or row[1] is None)):
+        record_target_reading(conn, intent_id=intent.intent_id, provenance="user_typed",
+                              target_ref=ticket.target_column, confirmed_by=identity.subject)
+        counters.incr("overlay.intake.pinned")
+
+    def _column_detail(ref: str | None) -> dict | None:
+        if not ref:
+            return None
+        detail = conn.execute(
+            "SELECT catalog_source, concept, ai_summary FROM graph_node "
+            "WHERE kind = 'column' AND object_ref = %s "
+            "AND (%s::text IS NULL OR catalog_source = %s) LIMIT 1",
+            (ref, body.catalog_source, body.catalog_source)).fetchone()
+        if detail is None:
+            return None
+        return {"ref": ref, "catalog_source": detail[0], "concept": detail[1] or "",
+                "ai_summary": detail[2] or ""}
+
+    return {"intent_id": intent.intent_id, "reason": reason,
+            "ticket": {"target_column": ticket.target_column,
+                       "target_window_days": ticket.target_window_days,
+                       "target_type": ticket.target_type,
+                       "business_domain": list(ticket.business_domain),
+                       "confidence": ticket.confidence, "pinned": ticket.pinned,
+                       "contradiction": ticket.contradiction,
+                       "runners_up": list(ticket.runners_up)},
+            "target_detail": _column_detail(ticket.target_column),
+            # the Change-it menu, ranked, with the same one-liner material as the main line
+            "runner_up_details": [d for r in ticket.runners_up
+                                  if (d := _column_detail(r)) is not None]}
+
+
+@router.post("/contract/intake/target", dependencies=[Depends(require_feature_generate)])
+def intake_target(body: IntakeTargetIn, conn: _Conn, identity: _Identity) -> dict:
+    """Record the HUMAN's answer — the point where provenance flips to a person. Author-only: the
+    reading governs the author's own leakage gate, so another principal cannot sign it. The signed
+    ref is validated against the read-scoped catalog (never the ticket — the human may correct to
+    any column they can see); the domain tokens are validated against the closed use-case
+    vocabulary STRICTLY (a human decision is recorded verbatim or refused, never silently edited).
+    The existing server-side leakage path (``intent_target_ref``) reads the same row, so the veto
+    downstream runs on the signed value with no further wiring."""
+    row = _intent_row(conn, body.intent_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such intent")
+    if row[0] != identity.subject:
+        raise HTTPException(status_code=403,
+                            detail="only the intent's author can sign its target reading")
+    if body.decision in ("confirmed", "corrected"):
+        if not body.target_ref:
+            raise HTTPException(status_code=422,
+                                detail=f"decision '{body.decision}' requires target_ref")
+        if not is_readable_column(conn, body.target_ref, roles=identity.role_claims,
+                                  catalog_source=body.catalog_source):
+            raise HTTPException(status_code=422,
+                                detail="target_ref is not a readable column in this catalog")
+    vocabulary = set(_use_case_vocabulary())
+    off_vocab = [d for d in body.business_domain if d not in vocabulary]
+    if off_vocab:
+        raise HTTPException(
+            status_code=422,
+            detail=f"business_domain outside the use-case vocabulary: {sorted(off_vocab)}")
+    provenance = "exploring" if body.decision == "exploring" else "human_confirmed"
+    record_target_reading(
+        conn, intent_id=body.intent_id, provenance=provenance, target_ref=body.target_ref,
+        target_window_days=body.target_window_days, target_type=body.target_type,
+        business_domain=tuple(body.business_domain), confirmed_by=identity.subject)
+    counters.incr(f"overlay.intake.target_{body.decision}")
+    return {"intent_id": body.intent_id, **(target_reading(conn, body.intent_id) or {}),
+            "business_domain": sorted(body.business_domain)}
+
+
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
 def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
@@ -948,6 +1178,25 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     if choice is None:
         raise HTTPException(status_code=422,
                             detail="chosen option is not in the recorded considered set for this intent")
+    # SE-11 step 6: the option's sealed metadata snapshot (which carries the frozen semantic
+    # context pin) is re-verified at the moment of choice — catalog drift since generation is a
+    # typed 409 asking for regeneration, never a silent draft over a world that no longer
+    # exists. "Unverifiable" is logged, not refused: compatibility snapshots (pre-C0 lineage,
+    # kinds this build cannot re-derive) must not brick drafting — absence of proof is not
+    # proof of drift.
+    lineage_snapshot_id = (choice.snapshot_lineage or {}).get("snapshot_id")
+    if lineage_snapshot_id:
+        freshness = compare_snapshot_to_current(conn, lineage_snapshot_id)
+        if freshness.status == "drifted":
+            raise HTTPException(status_code=409, detail={
+                "code": "SEMANTIC_SNAPSHOT_STALE",
+                "message": "the catalog drifted since this considered set was generated; "
+                           "regenerate from the current considered set",
+                "reason": freshness.reason,
+            })
+        if freshness.status == "unverifiable":
+            logger.warning("considered snapshot %s unverifiable at draft time: %s",
+                           lineage_snapshot_id, freshness.reason)
     feature = choice.feature
     target = _target_for_generation(
         conn, intent_id=body.intent_id, snapshot_lineage=choice.snapshot_lineage)
@@ -1077,10 +1326,18 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # DESIGN_CHECKED. They are taken ONLY from the server-reconstructed chosen candidate (restored from
     # the revision's private grounding context) — `DraftIn` has no such field, so a client can never
     # declare a role and suppress a unit check.
+    # D14 (review F2): `personal_data_policy_revision_ids` joins the same server-authoritative
+    # overwrite for the same reason — `DraftIn` has no such field, so a client can never DECLARE a
+    # licence it was not granted. What lands on the contract is not even this value: the confirm-time
+    # MCV below re-consults the gate against the LIVE policy store and `confirm_contract` persists
+    # THAT answer, so a revocation (or a re-approval, which mints a different revision id) between
+    # Gate #1 and confirm is recorded rather than papered over. This carries Gate #1's reading only
+    # so the pre-MCV draft is honest about what it was drafted under.
     draft = replace(draft, grain_table=chosen.grain_table,
                     derives_from=list(chosen.derives_from),
                     as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog),
-                    operand_roles=chosen.operand_roles)
+                    operand_roles=chosen.operand_roles,
+                    personal_data_policy_revision_ids=chosen.personal_data_policy_revision_ids)
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The

@@ -95,28 +95,22 @@ def _govern_additivity(db, logical_ref, value):
         supersedes_event_id=None)
 
 
-def test_feature_context_enabled_reads_env(monkeypatch):
-    # RF-C3: the ONE public flag helper. Default OFF; truthy set is {1, true, yes, on},
-    # case-insensitive and whitespace-tolerant; everything else is OFF.
-    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
-    assert feature_context_enabled() is False
-    for raw in ("1", "true", "yes", "on", " TRUE ", "Yes", "ON"):
-        monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", raw)
+def test_feature_context_is_always_on_and_env_is_inert(monkeypatch):
+    # Pre-live simplification (2026-08-11): the FEATUREGEN_FEATURE_CONTEXT gate retired — the
+    # rich context is the platform's core capability. RF-C3 still holds: this remains the ONE
+    # public helper, and no env value can turn it off.
+    for raw in (None, "", "0", "false", "off", "1", "true"):
+        if raw is None:
+            monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+        else:
+            monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", raw)
         assert feature_context_enabled() is True, raw
-    for raw in ("", "0", "false", "no", "off", "enabled", "2"):
-        monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", raw)
-        assert feature_context_enabled() is False, raw
 
 
 def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
     _bank_graph(db)
     # Govern amount.additivity via the decision log (display value stays the flat column).
     _govern_additivity(db, logical_ref_of(db, "bank", "public.transactions.amount"), "additive")
-
-    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
-    assert feature_context_enabled() is False
-    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
-    assert feature_context_enabled() is True
 
     cols = _candidate_columns(db, "bank", roles=())
     menu = _enriched_menu(db, cols)
@@ -146,7 +140,11 @@ def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
     assert txn_date["is_as_of"] == {"value": "true", "authority": "governed"}
 
 
-def test_enriched_menu_shows_hint_not_governed_for_a_drifted_value(db):
+def test_enriched_menu_shows_hint_not_governed_for_a_drifted_value(db, monkeypatch):
+    # This is a V3-READER property (the C1 hash-verified read): pin the version explicitly —
+    # the retired on/off gate used to leave this path selected implicitly; the version ladder
+    # (still real: FEATUREGEN_FEATURE_CONTEXT_VERSION) is now the only selector.
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT_VERSION", "3")
     # C1: the menu's GOVERNED-clearing facts come from read_operational_value, so "governed" shows
     # ONLY for a hash-verified resolved read. Approve additivity = non_additive, then DRIFT the flat
     # value to "additive": the OLD permissive read_column_facts still tags it governed, but C1
@@ -162,27 +160,24 @@ def test_enriched_menu_shows_hint_not_governed_for_a_drifted_value(db):
     assert amount["additivity"] == {"value": None, "authority": "hint"}   # C1 refuses the drift
 
 
-def test_flag_off_menu_content_is_byte_identical_thin_projection(db, monkeypatch):
-    # With the flag OFF (unset or an explicit falsy value) the menu CONTENT is exactly the thin
-    # 5-key projection — no wrappers, no enrichment keys — even though the widened candidate rows
-    # carry the new fields. (The route-level serializer split lands in 3a-iv.)
+def test_the_menu_is_enriched_regardless_of_env(db, monkeypatch):
+    # Pre-live simplification (2026-08-11): the thin serving path is unreachable — with the
+    # retired env unset or explicitly falsy, the ENRICHED menu serves. (`_menu` survives only
+    # as a pure projection helper; nothing selects it by flag anymore.)
     _bank_graph(db)
     for off in (None, "0"):
         if off is None:
             monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
         else:
             monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", off)
-        assert feature_context_enabled() is False
-        menu = _menu(_candidate_columns(db, "bank", roles=()))
+        menu = _enriched_menu(db, _candidate_columns(db, "bank", roles=()))
         assert sorted(m["object_ref"] for m in menu) == [
             "public.accounts.account_id", "public.transactions.amount",
             "public.transactions.txn_date"]
-        for m in menu:
-            assert set(m.keys()) == {"object_ref", "table", "column", "concept", "domain"}
-            assert all(not isinstance(v, dict) for v in m.values())
         amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
-        assert amount == {"object_ref": "public.transactions.amount", "table": "transactions",
-                          "column": "amount", "concept": None, "domain": None}
+        # Enriched shape, not the thin 5-key projection: fact fields ride {value, authority}.
+        assert "additivity" in amount
+        assert set(amount["additivity"].keys()) == {"value", "authority"}
 
 
 def test_table_context_from_authorized_rows_requires_fact_event_id(db):
@@ -204,11 +199,23 @@ def test_table_context_from_authorized_rows_requires_fact_event_id(db):
     ctx = {b["table"]: b for b in fa._table_context(cols)}
     assert ctx["accounts"]["table_definition"] == "Accounts master"
     assert ctx["accounts"]["primary_entity"] == "Account"
-    # Only the fact-event-linked grain column is confirmed; the file-declared one is excluded.
+    # Task 8 RE-READ THIS TEST rather than relaxing it, and it still holds — for a sharper reason.
+    # `accounts` carries a CONFIRMED grain (account_id, fact-event-linked) alongside a merely
+    # file-declared one (region), and a confirmation is never widened by a declaration: the union
+    # would assert a grain nobody attested. So the confirmed set still wins, unchanged, and the
+    # block says so.
+    #
+    # TASK 8b UPDATES THE TOKEN, DELIBERATELY, AND THIS TEST IS WHY THE FALLBACK IS THE WEAK ONE.
+    # The fact-event ids here are hand-written strings against no event stream at all, and no
+    # `authority=` is passed, so the resolver has nothing to read. `source_declared` is the honest
+    # answer: the platform cannot show an endorsement for this grain, and claiming one it cannot
+    # evidence is the precise defect Task 8's review raised.
     assert ctx["accounts"]["grain_columns"] == ["account_id"]
+    assert ctx["accounts"]["grain_status"] == "source_declared"
     assert "as_of_column" not in ctx["accounts"]
     assert ctx["transactions"]["as_of_column"] == "txn_date"
-    assert "grain_columns" not in ctx["transactions"]
+    assert ctx["transactions"]["as_of_status"] == "source_declared"
+    assert "grain_columns" not in ctx["transactions"]      # no is_grain column at all — no key
 
 
 def test_table_context_skips_read_scope_excluded_table(db):

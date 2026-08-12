@@ -65,6 +65,7 @@ from featuregen.materialize.ir import (
     authorize_compilation,
     compile_ir,
     ir_hash,
+    physical_read_set,
 )
 from featuregen.materialize.spine import (
     CurrentSnapshot,
@@ -72,6 +73,7 @@ from featuregen.materialize.spine import (
     PopulationSemantics,
     SpineSourceDeclarationV1,
 )
+from featuregen.overlay.upload.bridge_realization import ExecutionTier
 
 _SRC = "hdfc"
 _ROLES = ("feature_engineer",)
@@ -204,6 +206,31 @@ def _tag(db, table, column, sensitivity):
         (sensitivity, _SRC, f"public.{table}.{column}"))
 
 
+def _floor(db, table, column, restriction):
+    """Set the GOVERNED floor (`graph_node.effective_restriction`) — axis two — leaving the tag
+    NULL. That pairing is the shipped FTR shape (migration 1032's header: a business glossary
+    attests no sensitivity, so all 126 columns carry `sensitivity = NULL` while the concept cascade
+    ruled 28 of them restricted/confidential). Migration 1032's GENERATED `visible_requires` column
+    derives from BOTH axes, so seeding the floor alone is enough to populate it."""
+    db.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = %s",
+        (restriction, _SRC, f"public.{table}.{column}"))
+
+
+def _table_floor(db, table, restriction):
+    """The governed floor on the TABLE row itself — the same writer `field_resolution` uses.
+
+    `field_resolution.apply_sensitivity_floor` UPDATEs `graph_node.effective_restriction` keyed on
+    `lower(object_ref)`, and a table ref is a valid logical ref, so this is a reachable catalog
+    state and not a hand-forged one. The raw tag stays NULL, which is the shipped shape:
+    `build_graph` never writes sensitivity on a table node.
+    """
+    db.execute(
+        "UPDATE graph_node SET effective_restriction = %s WHERE catalog_source = %s "
+        "AND object_ref = %s AND kind = 'table'", (restriction, _SRC, f"public.{table}"))
+
+
 def seed_catalog(db):
     """`transactions` (the fact table), the two-hop path to `customers`, and the spine's facts.
 
@@ -314,9 +341,9 @@ def _admitted(name, *, formula=None, run_id="run-0001") -> AdmittedFeature:
 
 
 def _compile(db, name="total_debit_amount_30d", *, formula=None, roles=_ROLES,
-             spine_decl=DECLARATION, inventory=INVENTORY, run_id="run-0001"):
+             spine_decl=DECLARATION, inventory=INVENTORY, run_id="run-0001", **kwargs):
     return compile_ir(db, _admitted(name, formula=formula, run_id=run_id),
-                      roles=roles, spine_decl=spine_decl, inventory=inventory)
+                      roles=roles, spine_decl=spine_decl, inventory=inventory, **kwargs)
 
 
 def _ok(value):
@@ -563,6 +590,14 @@ def test_the_union_covers_a_spine_column_that_is_NEITHER_a_key_nor_the_availabil
         snapshot_policy=LatestAvailableAsOf(
             effective_time_ref=f"{CUSTOMERS}.effective_from", availability_ref=CUSTOMERS_ASOF,
             deterministic_tie_break_refs=(f"{CUSTOMERS}.version_seq",)))
+    # Task 13: `LatestAvailableAsOf` now holds its effective-time column to the same governed
+    # `is_as_of` standard as availability. Flag + link on the COLUMN node only — deliberately not
+    # `_govern_availability`, whose per-table `overlay_fact_state` upsert would overwrite the
+    # `availability_time` fact that names `load_ts`.
+    catalog.execute(
+        "UPDATE graph_node SET is_as_of = true, availability_fact_event_id = 'ovf_evt_asof_eff' "
+        "WHERE catalog_source = %s AND table_name = 'customers' AND kind = 'column' "
+        "AND column_name = 'effective_from'", (_SRC,))
     ir = _ok(_compile(catalog, PUBLIC_FEATURE, spine_decl=declaration))
     assert f"{CUSTOMERS}.effective_from" in ir.spine.read_set
     assert f"{CUSTOMERS}.effective_from" not in ir.spine.ordered_key_refs
@@ -590,15 +625,115 @@ def test_a_read_scope_tag_in_ANOTHER_CATALOG_does_not_deny_this_group(catalog):
 
 
 def test_the_union_covers_the_spine_SOURCE_TABLE_node(catalog):
-    """The table node carries its own read-scope tag, and the population's table is a read."""
+    """The population's TABLE is a read, and its scope is DERIVED from its columns (D11).
+
+    THE PRODUCTION SHAPE, deliberately. The earlier version of this test set
+    ``graph_node.sensitivity`` on the TABLE row and asserted the refusal — which passed, and proved
+    nothing that could ever happen: ``build_graph`` never writes sensitivity on a table node, so on
+    every real catalog a table row's ``visible_requires`` is ``'{}'`` and the table half of Gate 2
+    passed for everybody, always. Here the restriction is put where a catalog actually carries it —
+    on the COLUMNS — and the spine source is hidden because the caller can see none of them, which
+    is ``read_scope.anchor_visibility_predicate``'s rule and the one five other surfaces use.
+    """
     ir = _ok(_compile(catalog, PUBLIC_FEATURE))
-    catalog.execute(
-        "UPDATE graph_node SET sensitivity = 'restricted' WHERE catalog_source = %s "
-        "AND object_ref = %s AND kind = 'table'", (_SRC, "public.customers"))
+    assert CUSTOMERS in physical_read_set((ir,), ir.spine)
+    for column in ("cif_id", "load_ts", "status_cd", "effective_from", "version_seq"):
+        _floor(catalog, "customers", column, "restricted")
     refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
     assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
     assert CUSTOMERS in refused.detail
     assert ReadElementKind.SPINE_SOURCE.value in refused.detail
+
+
+def test_one_visible_column_is_enough_to_see_the_spine_source_table(catalog):
+    """The other half of D11's derived rule, so the test above cannot pass by hiding everything.
+
+    A caller who can see AT LEAST ONE of the table's columns sees the table anchor. The columns
+    they cannot see still refuse on their own account — which is why this asserts the TABLE ref is
+    absent from the refusal rather than asserting the group is authorized.
+    """
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _floor(catalog, "customers", "cif_id", "restricted")
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert CUSTOMERS_CIF in refused.detail
+    assert ReadElementKind.SPINE_SOURCE.value not in refused.detail
+
+
+# ── the TABLE-level governed floor, which the derived rule alone discards ─────────────────────────
+#
+# D11's shared predicate SUBSTITUTES the derived answer for the table row's own `visible_requires`,
+# so with every column visible a table's own governed floor decided nothing. On a display surface
+# that is defensible; at Gate 2 it is a grant to SCAN, and `restricted` is caught NOWHERE else —
+# §5.2's contract-time classification refuses only a `prohibited` input. These three tests pin the
+# conjunctive rule Gate 2 binds instead: the floor refuses, and the floor's own reader role clears
+# it. Against the substitutive predicate the first two AUTHORIZE.
+
+
+@pytest.mark.parametrize("floor", ["restricted", "prohibited"])
+def test_a_governed_floor_on_the_spine_TABLE_refuses_even_when_every_column_is_visible(
+        catalog, floor):
+    """The table row's OWN requirement, which nothing else in the read set repeats.
+
+    Every column of `customers` stays world-visible here, so D11's derived half is satisfied and
+    the substitutive predicate authorizes. What must not be discarded is the floor governance set
+    on the TABLE — the one statement about the relation as a whole.
+    """
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    assert CUSTOMERS in physical_read_set((ir,), ir.spine)
+    _table_floor(catalog, "customers", floor)
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert f"{CUSTOMERS} ({ReadElementKind.SPINE_SOURCE.value})" in refused.detail
+
+
+def test_the_restricted_readers_role_clears_a_restricted_TABLE_floor(catalog):
+    """The GRANT path — otherwise the refusal above could be "table floors always refuse"."""
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _table_floor(catalog, "customers", "restricted")
+    assert isinstance(
+        authorize_compilation(catalog, (ir,), ir.spine,
+                              roles=(*_ROLES, "restricted_reader")), AuthorizedCompilation)
+
+
+def test_a_PROHIBITED_table_floor_is_ungrantable_at_this_gate(catalog):
+    """`prohibited` is in no role map, so no role a caller can hold unlocks it (migration 1032)."""
+    ir = _ok(_compile(catalog, PUBLIC_FEATURE))
+    _table_floor(catalog, "customers", "prohibited")
+    for roles in ((*_ROLES, "restricted_reader"), (*_ROLES, "confidential_reader", "pii_reader")):
+        refused = authorize_compilation(catalog, (ir,), ir.spine, roles=roles)
+        assert isinstance(refused, MaterializationRefused), roles
+        assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+
+
+def test_gate_2_binds_a_CONJUNCTIVE_anchor_and_leaves_the_shared_D11_predicate_alone():
+    """The scoping of the fix, pinned as SQL: five other surfaces still bind the shared rule.
+
+    Making `anchor_visibility_predicate` conjunctive would change field corrections, asset detail,
+    crosswalk discovery, the crosswalk store and source selection in one move — a
+    controlling-doc-level decision about D11, recorded in `docs/DEFERRED-WORK.md` rather than taken
+    here. So the two predicates must genuinely be two.
+    """
+    from featuregen.overlay.upload.read_scope import (
+        anchor_visibility_predicate,
+        materialization_anchor_visibility_predicate,
+    )
+
+    def table_branch(predicate: str) -> str:
+        return predicate.split("THEN", 1)[1].split("ELSE", 1)[0]
+
+    shared, gate = anchor_visibility_predicate("gn"), materialization_anchor_visibility_predicate(
+        "gn")
+    assert shared != gate
+    # SUBSTITUTIVE: the shared table branch never mentions the table row's own requirement.
+    assert "gn.visible_requires" not in table_branch(shared)
+    # CONJUNCTIVE: Gate 2's does, AND keeps the derived EXISTS probe.
+    assert "gn.visible_requires" in table_branch(gate)
+    assert "EXISTS(" in table_branch(gate)
+    # The bind count is the shape of each predicate, and the call sites depend on it.
+    assert (shared.count("%s"), gate.count("%s")) == (2, 3)
 
 
 def test_the_union_covers_every_JOIN_STEP_ENDPOINT(catalog):
@@ -682,22 +817,62 @@ def test_a_role_that_grants_the_TAG_authorizes_the_group(catalog):
         AuthorizedCompilation)
 
 
-def test_the_two_sensitivity_axes_are_NOT_conflated(catalog):
-    """`graph_node.sensitivity` is the read-scope tag; `effective_restriction` is the ordered
-    restriction level (interfaces §2). Gate 2 is the READ-SCOPE gate, so a `prohibited` restriction
-    with no read-scope tag does not belong to it — §5.2 refuses that with `PROHIBITED_INPUT` during
-    classification. Conflating them here would make the restriction axis unreachable and give the
-    wrong code."""
-    catalog.execute(
-        "UPDATE graph_node SET effective_restriction = 'prohibited' WHERE catalog_source = %s "
-        "AND object_ref = %s", (_SRC, "public.transactions.txn_amt"))
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_a_governed_floor_on_an_UNTAGGED_column_refuses_without_its_reader_role(
+        catalog, floor, granting_role):
+    """`sensitivity = NULL` + a governed floor is the shipped FTR shape (migration 1032's header:
+    28/126 columns, including an Emirates ID number, carried a floor and NO file tag). Gate 2 reads
+    `visible_requires`, which folds BOTH axes, so the governed floor gates compilation exactly like
+    a tag — before this, such a column compiled for a caller with no reader role at all."""
+    _floor(catalog, "transactions", "txn_amt", floor)
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=())
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+    assert TXN_AMT in refused.detail
+
+
+@pytest.mark.parametrize(("floor", "granting_role"),
+                         [("restricted", "restricted_reader"),
+                          ("confidential", "confidential_reader")])
+def test_the_floors_own_reader_role_clears_the_governed_floor(catalog, floor, granting_role):
+    _floor(catalog, "transactions", "txn_amt", floor)
     ir = _ok(_compile(catalog, DENIED_FEATURE))
     assert isinstance(
-        authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES), AuthorizedCompilation)
+        authorize_compilation(catalog, (ir,), ir.spine, roles=(granting_role,)),
+        AuthorizedCompilation)
 
+
+def test_a_PROHIBITED_floor_is_ungrantable_at_Gate_2(catalog):
+    """`prohibited` always wins in `visible_requires` (migration 1032) and no role maps to it, so
+    no read scope — not even every reader role at once — can compile over it. Before 1032 Gate 2
+    read only the raw tag and AUTHORIZED this group, leaving §5.2 to refuse it later with
+    `PROHIBITED_INPUT`; that classification refusal still exists (it re-reads the catalog at
+    contract time), but the read-scope gate now fails closed first."""
+    _floor(catalog, "transactions", "txn_amt", "prohibited")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    every_reader = ("pii_reader", "restricted_reader", "confidential_reader")
+    refused = authorize_compilation(catalog, (ir,), ir.spine, roles=(*_ROLES, *every_reader))
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
+
+
+def test_a_TAGGED_column_keeps_its_own_gate_when_a_floor_is_also_present(catalog):
+    """The two axes are folded by PRECEDENCE, never required jointly (migration 1032): where a file
+    tag exists it keeps its own gate, so `pii_reader` — who can see this column today — does not
+    lose access when the governed floor independently resolves `restricted`, and the floor's role
+    alone does not unlock the tag."""
     _tag(catalog, "transactions", "txn_amt", "pii")
+    _floor(catalog, "transactions", "txn_amt", "restricted")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
     assert isinstance(
-        authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES), MaterializationRefused)
+        authorize_compilation(catalog, (ir,), ir.spine, roles=("pii_reader",)),
+        AuthorizedCompilation)
+    assert isinstance(
+        authorize_compilation(catalog, (ir,), ir.spine, roles=("restricted_reader",)),
+        MaterializationRefused)
 
 
 @pytest.mark.parametrize(("tag", "granting_role"),
@@ -720,6 +895,78 @@ def test_each_read_scope_TAG_needs_its_OWN_granting_role(catalog, tag, granting_
     assert isinstance(
         authorize_compilation(catalog, (ir,), ir.spine, roles=(*_ROLES, granting_role)),
         AuthorizedCompilation)
+
+
+# ══ §1.3 — existence: compile must not emit a read nobody governs ════════════════════════════════
+
+
+_EVERY_READER_ROLE = (*_ROLES, "pii_reader", "restricted_reader", "confidential_reader")
+
+
+def _with_ref_renamed(ir: FormulaExecutionIRV1, old: str, new: str) -> FormulaExecutionIRV1:
+    """The same IR with one read-set ref RENAMED — the shape of a hallucinated column.
+
+    A typo'd operand keeps every other property of the read (its roles, its table) and changes only
+    which column the catalog is asked about, which is exactly what an LLM-authored formula naming a
+    plausible-but-absent column produces.
+    """
+    expressions = tuple(
+        dataclasses.replace(
+            expr,
+            physical_read_set=tuple(
+                dataclasses.replace(ref, logical_ref=new) if ref.logical_ref == old else ref
+                for ref in expr.physical_read_set))
+        for expr in ir.expressions)
+    doctored = dataclasses.replace(ir, expressions=expressions)
+    assert _refs_of(doctored) != _refs_of(ir)
+    return doctored
+
+
+def test_a_ref_the_catalog_does_not_govern_refuses_precisely(catalog):
+    # No graph_node row used to mean "authorized, L1 will catch it" — but L1 is not on any
+    # production path. A hallucinated column must die at compile, named as what it is (Task 12,
+    # report §3.3), not as a role problem and not on the cluster. EVERY reader role is supplied
+    # so the refusal cannot be about scope.
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo")
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_EVERY_READER_ROLE)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+    assert "public.transactions.txn_amt_typo" in refused.detail
+
+
+def test_the_refusal_names_EVERY_ungoverned_ref_not_just_the_first(catalog):
+    """One round trip, one verdict, the COMPLETE list — an operator fixing a refused group must not
+    discover the second typo only after fixing the first."""
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(
+        _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo"),
+        TXN_DR_CR, f"{TXN}.dr_cr_flag_typo")
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+    assert "public.transactions.txn_amt_typo" in refused.detail
+    assert "public.transactions.dr_cr_flag_typo" in refused.detail
+    assert "2 of" in refused.detail
+
+
+def test_existence_is_decided_BEFORE_read_scope(catalog):
+    """When one group carries both an undescribed ref and a hidden one, `COLUMN_NOT_GOVERNED` wins
+    (Task 12): no grantable role can make an undescribed column readable, so refusing on scope
+    first would send an operator to request a privilege that cannot help."""
+    _tag(catalog, "transactions", "dr_cr_flag", "pii")
+    ir = _ok(_compile(catalog, DENIED_FEATURE))
+    doctored = _with_ref_renamed(ir, TXN_AMT, f"{TXN}.txn_amt_typo")
+
+    refused = authorize_compilation(catalog, (doctored,), ir.spine, roles=_ROLES)
+    assert isinstance(refused, MaterializationRefused)
+    assert refused.code is CompilationRefusalCode.COLUMN_NOT_GOVERNED
+
+    # The control: with the typo alone repaired, the SAME group refuses on scope — the ordering
+    # above was a precedence between two live verdicts, not scope being unreachable.
+    scoped = authorize_compilation(catalog, (ir,), ir.spine, roles=_ROLES)
+    assert isinstance(scoped, MaterializationRefused)
+    assert scoped.code is CompilationRefusalCode.READ_SCOPE_INSUFFICIENT
 
 
 # ══ §1.3 — calls the caller assembled wrongly ════════════════════════════════════════════════════
@@ -876,6 +1123,20 @@ def test_ir_hash_excludes_run_time_values(catalog):
 def test_the_same_feature_compiles_to_the_same_hash_twice(catalog):
     assert ir_hash(_ok(_compile(catalog, RATIO_FEATURE))) == \
            ir_hash(_ok(_compile(catalog, RATIO_FEATURE)))
+
+
+def test_grain_key_CASING_does_not_fork_the_formula_level_ir_hash(catalog):
+    """`formula_content_hash` folds ref case and Task 19 folded the per-EXPRESSION payloads — but
+    `grain_keys` enters THIS module's `identity_payload` directly, so a raw spelling here was the
+    last place one governed formula could still compile to two `ir_hash`es. Folded at the same
+    boundary (`compile_ir`), with `_fold` — the fold the sibling grain-entity check already uses."""
+    formula = fixtures.authored_formula(PUBLIC_FEATURE)
+    lower = dataclasses.replace(formula, grain=Grain(entity="customer", keys=(TXN_CIF,)))
+    upper = dataclasses.replace(formula, grain=Grain(entity="customer", keys=(TXN_CIF.upper(),)))
+    one = _ok(_compile(catalog, PUBLIC_FEATURE, formula=lower))
+    two = _ok(_compile(catalog, PUBLIC_FEATURE, formula=upper))
+    assert two.grain_keys == one.grain_keys == (TXN_CIF,)
+    assert ir_hash(two) == ir_hash(one)
 
 
 def test_two_different_features_hash_differently(catalog):
@@ -1059,3 +1320,45 @@ def test_an_expression_ir_is_reused_verbatim_never_rebuilt(catalog):
     assert isinstance(expr, ExpressionExecutionIR)
     assert RefRole.SOURCE_TABLE in next(
         r.roles for r in expr.physical_read_set if r.logical_ref == TXN)
+
+
+# ══ P2 — the realization APPLICABILITY tier is passed through, never asserted ═════════════════════
+#
+# `ExecutionTier` (`overlay/upload/bridge_realization.py:81`) scopes whether a directional bridge
+# realization is approved for SANDBOX or PRODUCTION data. It is NOT a run execution tier: plan §3.4
+# decided Phase G introduces none, because the sandbox namespace is baked into
+# `sandbox_execution_hash` and a production namespace would fork execution identity. Nothing here
+# names a namespace, a run tier or an execution hash — only which realizations this module can SEE.
+#
+# Before this fix `compile_ir` asserted PRODUCTION by omission: it called
+# `executable_bridge_realizations`, which pins the tier internally, so a SANDBOX-scoped realization
+# was invisible to compilation with no parameter anywhere to change it. What the tier does to the
+# READ is proved against the real store in `tests/featuregen/overlay/upload/test_bridge_store.py`,
+# where the fixture that can put a backed realization on disk lives; what is proved here is that
+# `compile_ir` asks for the tier it was given, and still asks for PRODUCTION when it was given none.
+
+
+def test_compile_ir_defaults_to_the_PRODUCTION_tier_and_forwards_what_it_is_GIVEN(
+        catalog, monkeypatch) -> None:
+    """The read set is empty either way for this same-catalog group — what is asserted is which
+    tier was ASKED for, which is the whole of the bug."""
+    asked: list[ExecutionTier] = []
+
+    def _spy(conn, *, environment_id, execution_tier):
+        asked.append(execution_tier)
+        return ()
+
+    monkeypatch.setattr(ir_module, "_executable_realizations_for_tier", _spy)
+    _ok(_compile(catalog, PUBLIC_FEATURE))
+    _ok(_compile(catalog, PUBLIC_FEATURE, execution_tier=ExecutionTier.SANDBOX))
+    assert asked == [ExecutionTier.PRODUCTION, ExecutionTier.SANDBOX]
+
+
+def test_an_INJECTED_realization_set_still_bypasses_the_reader_entirely(catalog, monkeypatch):
+    """The tier is a parameter of the READ, not a second filter over what a caller injected —
+    `bridge_realizations=` remains the deterministic-unit-test seam it always was."""
+    def _never(conn, *, environment_id, execution_tier):
+        raise AssertionError("the typed reader must not be consulted for an injected set")
+
+    monkeypatch.setattr(ir_module, "_executable_realizations_for_tier", _never)
+    _ok(_compile(catalog, PUBLIC_FEATURE, bridge_realizations=()))

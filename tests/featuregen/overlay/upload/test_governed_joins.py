@@ -14,16 +14,25 @@ Two layers under test:
 """
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
+
+from tests.featuregen.overlay.upload.passc.conftest import (  # noqa: F401 — pytest fixtures
+    _confirm_join,
+    human_admin_1,
+    human_admin_2,
+)
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.catalog import _clear_catalog_adapter
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import fact_key
+from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.graph import governed_join_proposal, parse_join_ref
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.runtime.observability import counters
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 
@@ -104,10 +113,15 @@ def test_declared_join_builds_approved_join_ref():
     assert ref.from_ref.object_kind == "column" and ref.from_ref.column == "account_id"
 
 
-def test_governed_proposal_defaults_cardinality_to_n1():
+def test_a_blank_uploaded_cardinality_stays_unknown():
+    # Codegen-review remediation Task 5: this test used to pin the fabricated "N:1" default
+    # (test_governed_proposal_defaults_cardinality_to_n1). A fabricated N:1 would be admitted,
+    # confirmed by two admins, and trusted at runtime. Unknown must stay unknown so plan_join
+    # refuses until someone decides.
     ref = governed_join_proposal(CanonicalRow("deposits", "transactions", "account_id", "integer",
-                                              joins_to="accounts.id"))
-    assert ref is not None and ref.cardinality == "N:1"
+                                              joins_to="accounts.id", cardinality=""))
+    assert ref is not None
+    assert ref.cardinality is None
 
 
 def test_governed_proposal_none_for_absent_or_malformed_join():
@@ -140,6 +154,130 @@ def test_flag_on_with_adapter_marks_display_only_and_proposes(db, monkeypatch, c
     ref = governed_join_proposal(_join_rows()[0])
     events = load_fact(db, fact_key(ref, "approved_join"))
     assert any(e.type == "OVERLAY_FACT_PROPOSED" for e in events)   # governed proposal exists
+
+
+def test_flag_on_blank_cardinality_still_proposes_with_cardinality_none(db, monkeypatch, catalog):
+    # Codegen-review remediation Task 5: a blank uploaded cardinality no longer fabricates "N:1" —
+    # the declared join must STILL be proposed (the approved_join schema admits null) with
+    # cardinality None, so two admins can verify the join while plan_join refuses the hop as
+    # cardinality-unknown until a human supplies one.
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                    # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=_NOW)
+    assert res.status == "ingested"
+    ref = governed_join_proposal(rows[0])
+    assert ref is not None and ref.cardinality is None
+    events = load_fact(db, fact_key(ref, "approved_join"))
+    proposed = [e for e in events if e.type == "OVERLAY_FACT_PROPOSED"]
+    assert proposed, "the blank-cardinality join must still be proposed, not schema-denied"
+    stored = proposed[-1].payload["proposed_value"]["cardinality"]
+    assert stored is None
+    # M5: pin the REFUSAL in the same test that pins the proposal — the value this fact serves is
+    # exactly what plan_join's traversal gate sees, and None must land in the UNKNOWN branch
+    # (materialize.joins refuses an UNKNOWN-cardinality hop until a human supplies one).
+    from featuregen.materialize.joins import _cardinality_verdict, _CardinalityVerdict
+    assert _cardinality_verdict(stored) is _CardinalityVerdict.UNKNOWN
+
+
+def test_verified_pair_accepts_no_rival_draft_from_a_blank_cardinality_reupload(
+        db, monkeypatch, human_admin_1, human_admin_2):  # noqa: F811 — imported pytest fixtures
+    # Task 5 codegen-review remediation (F2): fact_key digests cardinality, so a blank re-upload
+    # of a pair already VERIFIED as N:1 hashes to a DIFFERENT fact_key — without the propose-time
+    # pair dedupe it would mint a rival DRAFT for the same unordered column pair (two VERIFIED
+    # refs on one pair is a state project_confirmed_joins treats as impossible). The VERIFIED
+    # fact STANDS (authority-persists); the new proposal is refused.
+    # Real clock (no now=): resolve_fact's 24h drift-freshness guard, as in test_join_drift.
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    res = ingest_upload(db, "deposits", _join_rows(), actor=_actor())   # declares N:1
+    assert res.status == "ingested"
+    ref_n1 = governed_join_proposal(_join_rows()[0])
+    _confirm_join(db, ref_n1, admin1=human_admin_1, admin2=human_admin_2)
+    key_n1 = fact_key(ref_n1, "approved_join")
+    assert fold_overlay_state(load_fact(db, key_n1)).status == "VERIFIED"
+
+    blank_rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                   # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    res = ingest_upload(db, "deposits", blank_rows, actor=_actor())
+    assert res.status == "ingested"                                     # advisory: never aborts
+    ref_none = governed_join_proposal(blank_rows[0])
+    assert ref_none is not None and ref_none.cardinality is None
+    key_none = fact_key(ref_none, "approved_join")
+    assert key_none != key_n1                                           # the rival identity
+    assert load_fact(db, key_none) == []                                # NO rival DRAFT minted
+    # The human-confirmed claim on the pair STANDS. It folds STALE — the re-upload's blanked
+    # cardinality cell is a catalog change that PRE-EXISTING freshness governance marks for
+    # re-confirmation (and the end-of-ingest projection demotes the edge while it waits; that
+    # demotion is the STALE lifecycle, not this guard). The human decision is never erased.
+    stream = load_fact(db, key_n1)
+    assert any(e.type == "OVERLAY_FACT_CONFIRMED" for e in stream)      # the decision persists
+    assert fold_overlay_state(stream).status == "STALE"                 # awaiting re-confirm
+    edge = db.execute(
+        "SELECT authority, approved_join_fact_key FROM graph_edge WHERE catalog_source = %s "
+        "AND kind = 'joins' AND from_ref = %s AND to_ref = %s",
+        ("deposits", "public.transactions.acct_id", "public.accounts.account_id")).fetchone()
+    assert edge == ("display_only", None)   # demoted pending re-confirm — no rival ever ran
+
+
+def test_a_dropped_cardinality_correction_is_VISIBLE_not_a_silent_log_line(
+        db, monkeypatch, caplog, human_admin_1, human_admin_2):  # noqa: F811 — imported fixtures
+    """Final-review I3: the pair-guard above is correct to refuse the rival proposal, but the
+    changed/blanked cardinality was an OPERATOR'S correction attempt, and dropping it at
+    logger.info left no trace a human would meet. The drop must be visible three ways: a WARNING
+    log line, the `skipped_verified_rival` counter, and `IngestResult` itself (count + the
+    human-readable warnings). `governed_join_divergence` deliberately does NOT carry it: its
+    `kind` CHECK admits only retargeted/dropped (a new kind needs a migration), and its
+    re-affirmation branch DELETES any same-pair row in this very ingest — a row written there
+    would be erased before anyone saw it."""
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    res = ingest_upload(db, "deposits", _join_rows(), actor=_actor())   # declares N:1
+    assert res.status == "ingested"
+    assert res.governed_join_corrections_dropped == 0                  # nothing dropped yet
+    assert res.governed_join_correction_warnings == ()
+    # SPARSE at the serialization seam: an ordinary upload's outward payload carries NEITHER
+    # field, which is what keeps POST /uploads' body byte-identical to the pre-I3 contract
+    # (test_upload_response_body_byte_identical_with_stage_reports pins the bytes).
+    assert "governed_join_corrections_dropped" not in res.response_payload()
+    assert "governed_join_correction_warnings" not in res.response_payload()
+    ref_n1 = governed_join_proposal(_join_rows()[0])
+    _confirm_join(db, ref_n1, admin1=human_admin_1, admin2=human_admin_2)
+
+    blank_rows = [
+        CanonicalRow("deposits", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id"),                  # cardinality omitted
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+    ]
+    before = counters.snapshot()["counters"].get(
+        "overlay.governed_joins.skipped_verified_rival", 0)
+    with caplog.at_level(logging.WARNING, logger="featuregen.overlay.upload.ingest"):
+        res = ingest_upload(db, "deposits", blank_rows, actor=_actor())
+    assert res.status == "ingested"                                    # advisory: never aborts
+    # 1. the result: the operator's client can render the account without reading server logs.
+    assert res.governed_join_corrections_dropped == 1
+    (warning,) = res.governed_join_correction_warnings
+    assert "transactions.acct_id" in warning and "accounts.account_id" in warning
+    assert "join governance" in warning                                # the correction route
+    # ...and the sparse serialization EMITS both fields exactly when a drop happened — the
+    # other half of the omission the no-drop upload above pins.
+    payload = res.response_payload()
+    assert payload["governed_join_corrections_dropped"] == 1
+    assert payload["governed_join_correction_warnings"] == (warning,)
+    # 2. the counter.
+    assert counters.snapshot()["counters"][
+        "overlay.governed_joins.skipped_verified_rival"] == before + 1
+    # 3. the log, at WARNING — not the info level the drop used to hide at.
+    assert any(record.levelno == logging.WARNING
+               and "governed-join correction dropped" in record.getMessage()
+               for record in caplog.records)
 
 
 def test_flag_on_ingest_reensures_adapter_and_proposes(db, monkeypatch):

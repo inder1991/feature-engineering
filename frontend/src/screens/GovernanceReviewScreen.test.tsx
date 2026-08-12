@@ -19,7 +19,10 @@ vi.mock('../api', async importOriginal => {
     rejectJoin: vi.fn(),
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
+    confirmSemanticBinding: vi.fn(),
+    rejectSemanticBinding: vi.fn(),
     reviewBridgeRealization: vi.fn(),
+    getDataUsePolicies: vi.fn(),
   }
 })
 const getGovernanceQueue = vi.mocked(api.getGovernanceQueue)
@@ -29,6 +32,9 @@ const bulkRejectEntityBridges = vi.mocked(api.bulkRejectEntityBridges)
 const reviewBridgeRealization = vi.mocked(api.reviewBridgeRealization)
 const confirmJoin = vi.mocked(api.confirmJoin)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
+const confirmSemanticBinding = vi.mocked(api.confirmSemanticBinding)
+const rejectSemanticBinding = vi.mocked(api.rejectSemanticBinding)
+const getDataUsePolicies = vi.mocked(api.getDataUsePolicies)
 
 // ── fixtures ─────────────────────────────────────────────────────────────────────────────────────
 // Shaped exactly as overlay/upload/governance_queue.py emits them, including the two INDEPENDENT
@@ -269,6 +275,8 @@ beforeEach(() => {
     approvals: [],
   })
   confirmTableFact.mockReset()
+  confirmSemanticBinding.mockReset()
+  rejectSemanticBinding.mockReset()
   confirmTableFact.mockResolvedValue({
     governance_status: 'VERIFIED', operational_projection: 'projected',
   })
@@ -514,6 +522,23 @@ describe('governance review — the basis of the claim being endorsed', () => {
     expect(caution).toHaveTextContent(/nothing read the physical schema/i)
     // Beside the statement being agreed to, not somewhere else on the page.
     expect(cells.getByRole('checkbox').closest('.gq-panel')).toContainElement(caution)
+  })
+
+  it('states an unstated cardinality honestly in the join agreement, never as fact', async () => {
+    // Task 5 codegen-review remediation (M3): a blank uploaded cardinality is proposed as null
+    // now, and this sentence is the agreement the confirmation records. The old fallback
+    // ("at the stated cardinality") asserted a cardinality that does not exist.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [join({ detail: { ...join().detail, cardinality: null } })],
+      items_visible_to_you_by_kind: { entity_bridge: 0, approved_join: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const cells = within(await screen.findByTestId(`row-${join().fact_key}`))
+    await userEvent.click(cells.getByRole('button', { name: /^confirm/i }))
+    const label = cells.getByRole('checkbox').closest('label')!
+    expect(label).toHaveTextContent(/at an unstated cardinality/i)
+    expect(label).toHaveTextContent(/stays unusable until one is supplied/i)
+    expect(label).not.toHaveTextContent(/the stated cardinality/i)
   })
 
   it('reports an attested basis differently, and a missing one as missing', async () => {
@@ -1196,5 +1221,137 @@ describe('governance review — state travels as an attribute, never as colour a
     const confirm = withheld.getByRole('button', { name: /^confirm/i })
     expect(confirm).toBeDisabled()
     expect(confirm).toHaveAttribute('aria-describedby', withheld.getByTestId('gq-action-why').id)
+  })
+})
+
+// ── the destination the feature flow's refusal names (D14) ──────────────────────────────────────
+
+it('carries the data-use policy panel the feature refusal points at', async () => {
+  // `feature_assist._use_gate` refuses a personal-data operand with "... must declare one (purpose)
+  // under Governance -> Data-use policies ...". This is the assertion that the pointer LANDS: the
+  // heading a reader is sent to has to exist on the screen the refusal names, and it has to be
+  // the DECIDING screen rather than the read-only dashboard.
+  getGovernanceQueue.mockResolvedValue(FULL)
+  getDataUsePolicies.mockResolvedValue({
+    concepts: [{
+      concept_name: 'pep_flag', description: 'Politically exposed person marker.', group: 'flag',
+      status: 'none', pointer_version: 0, purpose: null, revision_id: null, approved_by: null,
+      approved_at: null, declared_by: null, updated_at: null,
+    }],
+    purpose_bounds: { min: 8, max: 300 },
+  })
+  render(<GovernanceReviewScreen />)
+
+  const panel = await screen.findByTestId('data-use-policies')
+  expect(within(panel).getByRole('heading', { name: 'Data-use policies' })).toBeInTheDocument()
+  expect(within(panel).getByTestId('dup-pep_flag')).toBeInTheDocument()
+})
+
+// ── semantic bindings in the queue (the 2026-08-10 currency-review gap) ─────────────────────────
+// Six service-proposed currency bindings sat behind a four-eyes confirm while this screen — the one
+// place humans review — never listed the kind. These tests pin the kind end to end: section,
+// headline in the reviewer's language, its OWN confirm command and reject vocabulary.
+
+function currencyBinding(over: Partial<api.GovernanceQueueItem> = {}): api.GovernanceQueueItem {
+  return {
+    kind: 'currency_binding',
+    fact_key: 'fact:currency:tran_amt',
+    catalogs: ['ftr'],
+    subject: 'ftr.comp_financial_tran_repos_dly.tran_amt',
+    state: 'Unreviewed — available for use',
+    state_code: 'unreviewed_available',
+    production_eligibility: null,
+    production_eligibility_code: 'not_applicable',
+    available_actions: ['confirm', 'reject'],
+    detail: {
+      target: { schema: 'public', table: 'comp_financial_tran_repos_dly', column: 'tran_crncy' },
+      value: { currency_column: { column: 'tran_crncy' } },
+      entity_id: null, prior_value: null, target_event_id: 'ev-ccy-1',
+      disposition: 'strong', reason_codes: [],
+    },
+    already_depended_on_by: [],
+    ...over,
+  }
+}
+
+describe('semantic bindings in the queue', () => {
+  it('renders a per-row currency binding in the reviewer\'s language', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    expect(row.getByText(/tran_amt is in the currency named by tran_crncy/i)).toBeInTheDocument()
+    expect(screen.getByTestId('kind-currency_binding')).toBeInTheDocument()
+  })
+
+  it('confirm goes to the SEMANTIC-BINDING command with the binding agreement', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    confirmSemanticBinding.mockResolvedValue(
+      { governance_status: 'VERIFIED', operational_projection: 'projected' })
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    await userEvent.click(row.getByRole('button', { name: /^confirm/i }))
+    const label = row.getByRole('checkbox').closest('label')!
+    expect(label).toHaveTextContent(/currency varies per row and is named by tran_crncy/i)
+    await userEvent.click(row.getByRole('checkbox'))
+    await userEvent.click(row.getByRole('button', { name: /record my confirmation/i }))
+    await waitFor(() => expect(confirmSemanticBinding)
+      .toHaveBeenCalledWith('fact:currency:tran_amt', {}))
+    expect(confirmTableFact).not.toHaveBeenCalled()
+    expect(confirmJoin).not.toHaveBeenCalled()
+  })
+
+  it('reject offers the semantic-binding vocabulary, and dispatches to its own command', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding()],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    rejectSemanticBinding.mockResolvedValue({ governance_status: 'REJECTED', category: 'wrong_currency_column' })
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    await userEvent.click(row.getByRole('button', { name: /^reject/i }))
+    // categories render as pressed-state chips (CategoryChips), not radios
+    await userEvent.click(row.getByRole('button', { name: /^wrong currency column$/i }))
+    await userEvent.click(row.getByRole('button', { name: /record my rejection/i }))
+    await waitFor(() => expect(rejectSemanticBinding).toHaveBeenCalledWith(
+      'fact:currency:tran_amt', { category: 'wrong_currency_column' }))
+  })
+
+  it('an uploader whose confirm the server would 409 gets a DISABLED confirm, not a live one', async () => {
+    // The queue projects four-eyes into available_actions (backend: the uploading principal's
+    // confirm is dropped). The screen's existing pattern for an unsanctioned action is a
+    // disabled button — never a live button that invites a guaranteed 409.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding({ available_actions: ['reject'] })],
+      items_visible_to_you_by_kind: { currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
+    expect(row.getByRole('button', { name: /^confirm/i })).toBeDisabled()
+    expect(row.getByRole('button', { name: /^reject/i })).toBeEnabled()
+  })
+
+  it('an unknown kind gets a reload instruction, never somebody else\'s command', async () => {
+    // VERSION SKEW (live, 2026-08-10): a pre-deploy bundle met the new currency_binding kind and
+    // dispatched its confirm to the TABLE-FACT route, which 404ed. The dispatch is now closed over
+    // the kinds this build knows; anything else errors with "reload".
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [currencyBinding({ kind: 'kind_from_the_future', fact_key: 'fact:future:1' })],
+      items_visible_to_you_by_kind: { kind_from_the_future: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const row = within(await screen.findByTestId('row-fact:future:1'))
+    await userEvent.click(row.getByRole('button', { name: /^confirm/i }))
+    await userEvent.click(row.getByRole('checkbox'))
+    await userEvent.click(row.getByRole('button', { name: /record my confirmation/i }))
+    expect(await row.findByRole('alert')).toHaveTextContent(/older than this decision kind/i)
+    expect(confirmTableFact).not.toHaveBeenCalled()
+    expect(confirmJoin).not.toHaveBeenCalled()
+    expect(confirmSemanticBinding).not.toHaveBeenCalled()
   })
 })

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
@@ -68,6 +68,23 @@ class LeakageIn(BaseModel):
     target_ref: str
 
 
+def _compatibility_only_guard() -> None:
+    """SE-11 step 5 — the bypass audit's verdict on the direct feature routes: they skip typed
+    intent, confirmed scope, dispositions, and the semantic engine, so they are COMPATIBILITY-
+    ONLY. In enforced semantic mode no public endpoint may remain a bypass around eligibility —
+    the refusal is typed and points at the governed pipeline. In legacy/shadow they serve
+    unchanged, marked, so no client discovers the retirement by surprise at cutover."""
+    from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
+
+    if RecipeRolloutConfig.from_env().semantic_planning == "semantic_v1":
+        raise HTTPException(status_code=409, detail={
+            "code": "SEMANTIC_ENFORCED_USE_CONTRACT_PIPELINE",
+            "message": "direct feature routes are compatibility-only; use "
+                       "POST /contract/considered-set (typed intent + confirmed scope + "
+                       "semantic eligibility)",
+        })
+
+
 @router.post("/features/recommend", dependencies=[Depends(require_feature_generate)])
 def recommend(
     body: RecommendIn,
@@ -80,6 +97,7 @@ def recommend(
     # target_ref/entity) so those gates are ON — omitting them would silently downgrade safety
     # (review root-cause A). `actor=identity` so every llm_call this round records is attributed
     # to the HUMAN who asked, not the fallback service enrichment identity.
+    _compatibility_only_guard()
     report = recommend_features_report(conn, body.objective, client,
                                        catalog_source=body.catalog_source,
                                        roles=identity.role_claims,
@@ -90,7 +108,8 @@ def recommend(
     feature_context = feature_context_enabled()
     return {"proposals": [serialize_feature_idea(i, feature_context=feature_context)
                           for i in report.ideas],
-            "rejections": report.rejections}
+            "rejections": report.rejections,
+            "compatibility_only": True}
 
 
 @router.post("/features/refine", dependencies=[Depends(require_feature_generate)])
@@ -103,6 +122,7 @@ def refine(
     """One human-directed revision of one candidate. Both outcomes are 200: a gauntlet rejection of
     the revision is data the reviewer acts on, not a server error. The revision stays a proposal;
     registration remains the separate explicit POST /features confirm."""
+    _compatibility_only_guard()
     revised, rejection = refine_idea(conn, body.candidate.model_dump(), body.instruction, client,
                                      catalog_source=body.catalog_source,
                                      roles=identity.role_claims, entity=body.entity,
@@ -110,9 +130,11 @@ def refine(
                                      objective=body.objective, actor=identity)
     feature_context = feature_context_enabled()
     if revised is not None:
-        return {"revised": serialize_feature_idea(revised, feature_context=feature_context)}
+        return {"revised": serialize_feature_idea(revised, feature_context=feature_context),
+                "compatibility_only": True}
     rej = rejection or {}
-    return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))}}
+    return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))},
+            "compatibility_only": True}
 
 
 @router.post("/features/recommend-sets", dependencies=[Depends(require_feature_generate)])
@@ -125,6 +147,7 @@ def recommend_sets(
     """One validated set per applicable strategy lens, plus the ADVISORY set recommendation (a
     fit/coverage judgment, honestly caveated — never a performance claim) and the aggregated
     gauntlet rejections. Same safety posture as /features/recommend: server clock always on."""
+    _compatibility_only_guard()
     report = recommend_feature_sets_report(conn, body.objective, client,
                                            catalog_source=body.catalog_source,
                                            roles=identity.role_claims,
@@ -140,7 +163,8 @@ def recommend_sets(
     # and we do not spend an LLM call to say so.
     recommendation = (recommend_set(conn, report.sets, body.objective, client, actor=identity)
                       if any(s.features for s in report.sets) else None)
-    return {"sets": sets, "recommendation": recommendation, "rejections": report.rejections}
+    return {"sets": sets, "recommendation": recommendation, "rejections": report.rejections,
+            "compatibility_only": True}
 
 
 @router.post("/features/recipe", dependencies=[Depends(require_feature_generate)])
@@ -150,6 +174,7 @@ def recipe(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> Recipe:
+    _compatibility_only_guard()
     return feature_recipe(conn, body.query, client,
                           catalog_source=body.catalog_source, roles=identity.role_claims,
                           actor=identity)

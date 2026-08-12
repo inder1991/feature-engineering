@@ -42,6 +42,15 @@ is derived from the formula's own policies (§8 rule 4) and never from the SQL t
   is a NULL on a NON-empty window. §6 lists only the two sources below; this third one is added
   deliberately, because declaring a column non-null that a propagating null can fill is the
   direction of that decision that produces a broken write rather than a refusal;
+* ``NullInput.IGNORE`` on ANY NON-COUNT expression (Task 20) — Spark's aggregates skip nulls, so a
+  NON-empty window whose every operand value is NULL aggregates to NULL, and the renderer
+  deliberately does not coalesce it: an all-null group is not an empty window, so the
+  ``empty_window`` fill must not touch it (the rendered §8 rule 4 comments say exactly this), and
+  a substituted zero would answer a policy question the formula never declared. The COUNT family
+  is exempt because every count answers that same group with 0, never NULL. Task 7's rendered
+  aggregate-overflow gate reads the same split from the other side — a NULL sum beside an operand
+  count ABOVE zero is OVERFLOW and aborts; beside a count of ZERO it is this policy's own answer,
+  and the type must admit it;
 * ``ZeroDenominator.NULL`` on a ratio.
 
 Everything else is non-null — including the ``ERROR`` members of those two enums, which abort the
@@ -50,7 +59,12 @@ run instead of producing a value, so a column that exists at all was written wit
 **Two obligations this module RESOLVES but cannot itself enforce**, carried on :class:`PhysicalType`
 so the renderer receives them rather than re-deriving them:
 
-* ``RoundingMode`` — §6 requires it be implemented explicitly, never left to an engine default;
+* ``RoundingMode`` — §6 requires it be implemented explicitly, never left to an engine default.
+  For a RATIO, ``HALF_EVEN`` therefore REFUSES: Spark's decimal division rounds HALF_UP at the
+  result scale before any explicit rounding call in generated code runs, so the emitted call
+  re-rounds an already-rounded value and the declared mode is recorded but never applied
+  (DEFERRED-WORK A.28). Non-ratio bodies keep both modes — post-aggregate rounding of a
+  narrower-scale value has no engine pre-rounding to fight;
 * ``OverflowBehavior.ERROR`` — Spark's default on decimal overflow is to return NULL, so honouring
   ERROR is deliberate configuration plus an explicit check in generated code (§9's
   ``OVERFLOW_VIOLATION`` gate is the last line, not the first). ``SATURATE`` is a deferred NFR and
@@ -108,7 +122,22 @@ __all__ = [
 #: ``DECIMAL`` under version 1 can refuse under version 2 — a float denominator was invisible to the
 #: word, and an ungoverned operand type was accepted — so the two versions are not interchangeable
 #: and a contract keyed on the old one describes a column decided by a rule that no longer applies.
-PHYSICAL_TYPE_POLICY_VERSION = 2
+#:
+#: **3** (codegen-review Task 8): a RATIO declaring ``HALF_EVEN`` rounding now REFUSES — Spark's
+#: decimal division rounds HALF_UP at the result scale before any explicit rounding call runs, so
+#: the declared mode was recorded but never applied. A ratio + half_even formula that resolved
+#: under version 2 refuses under version 3, and the version-2 column it described carries a
+#: rounding claim the engine did not honour — the same accept→refuse non-interchangeability that
+#: separated 1 from 2 (DEFERRED-WORK A.28).
+#:
+#: **4** (codegen-review Task 20): a NON-COUNT aggregate under ``null_input=IGNORE`` is now
+#: NULLABLE — Spark answers a non-empty, all-NULL window with NULL, the renderer deliberately does
+#: not coalesce it, and the COUNT family (which answers the same group with 0) keeps its version-3
+#: answer. Unlike 1→2 and 2→3 this is accept→ACCEPT-DIFFERENTLY: the same formula resolves under
+#: both versions with different nullability, so a version-3 plan typing a SUM+ignore column NOT
+#: NULL describes a constraint its own data can violate — §9's rendered ``WRONG_NULLABILITY`` gate
+#: would abort a correctly-authored feature the first time a group's operands were all NULL.
+PHYSICAL_TYPE_POLICY_VERSION = 4
 
 #: The maximum precision a Hive/Spark ``DECIMAL`` can hold. A policy above it is not representable.
 _MAX_DECIMAL_PRECISION = 38
@@ -314,11 +343,20 @@ def _check_operand_types(
 def _is_nullable(
     body: FormulaBody, expressions: tuple[tuple[str, AggregateExpression], ...]
 ) -> bool:
-    """Whether the published column can hold a NULL, from the formula's own policies (§8 rule 4)."""
+    """Whether the published column can hold a NULL, from the formula's own policies (§8 rule 4).
+
+    Four sources (module docstring): a NULL empty window, a propagating null input, an IGNORED
+    null input on a non-COUNT aggregate — a NON-empty, all-NULL window aggregates to NULL and the
+    renderer deliberately does not coalesce it (Task 20) — and a NULL zero-denominator policy.
+    Counts are exempt from the third source only: every COUNT answers an all-null group with 0.
+    """
     for _path, expr in expressions:
         if expr.window.empty_window is EmptyWindowResult.NULL:
             return True
         if expr.window.null_input is NullInput.PROPAGATE:
+            return True
+        if (expr.window.null_input is NullInput.IGNORE
+                and expr.aggregation not in _COUNT_FUNCTIONS):
             return True
     return isinstance(body, RatioBody) and body.zero_denominator is ZeroDenominator.NULL
 
@@ -370,8 +408,9 @@ def resolve_physical_type(
     Returns:
         The resolved :class:`PhysicalType`, or a :class:`MaterializationRefused` carrying
         ``PHYSICAL_TYPE_UNSUPPORTED`` — an arithmetic operand that is not a governed exact numeric,
-        a decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, or an overflow
-        behaviour this slice does not implement.
+        a decimal policy outside what a Hive/Spark ``DECIMAL`` can represent, an overflow
+        behaviour this slice does not implement, or ``HALF_EVEN`` rounding on a ratio, which the
+        engine's own division pre-rounds out of existence.
 
     Raises:
         ValueError: ``operand_types`` does not describe exactly this formula's expressions. A call
@@ -404,6 +443,20 @@ def resolve_physical_type(
     sql_type = _decimal_type(formula.decimal)
     if isinstance(sql_type, MaterializationRefused):
         return sql_type
+    if isinstance(body, RatioBody) and formula.decimal.rounding is RoundingMode.HALF_EVEN:
+        # Spark's decimal `Divide` wraps its result in `CheckOverflow`, which rounds HALF_UP at
+        # the division result scale (clamped to MINIMUM_ADJUSTED_SCALE=6) BEFORE any explicit
+        # rounding call in the generated code runs — at the published scale the emitted `bround`
+        # re-rounds an already-rounded value and is a no-op (verified empirically: 1/2000000 →
+        # 0.000001, not the HALF_EVEN 0.000000). §6 requires the mode to be implemented
+        # explicitly, and generated code alone cannot: the ties are gone before it runs. A
+        # declaration the engine silently ignores refuses instead of being recorded as applied.
+        # Non-ratio bodies keep both modes — post-aggregate rounding of a narrower-scale value
+        # has no engine pre-rounding to fight. DEFERRED-WORK A.28 holds the lifting conditions.
+        return _refuse(
+            "the formula declares half_even rounding on a ratio, which generated code cannot "
+            "honour: Spark decimal division rounds HALF_UP at the result scale before any "
+            "explicit rounding call; declare half_up, or wait for engine-side support")
     return PhysicalType(
         sql_type=sql_type,
         nullable=nullable,

@@ -199,3 +199,31 @@ def test_catalog_drift_stales_a_verified_bridge(db):
     # … and the bridge projection reflects it: the edge is demoted on the next project.
     assert project_verified_bridge(db, ref, now=_NOW) == "pending"
     assert active_bridges(db) == ()
+
+
+def test_confirming_a_bridge_leaves_the_overlay_projection_caught_up(db):
+    """FROM THE LIVE CLUSTER (2026-08-09): a bridge confirm appended OVERLAY_FACT_CONFIRMED and left
+    the overlay checkpoint one event behind FOREVER, which fail-closed EVERY load-bearing catalog
+    read (`/suggestions` 500ed with CATALOG_PROJECTION_UNAVAILABLE: checkpoint 53 < head 54).
+
+    `confirm_fact` branches by fact type, and three of the four branches drain-then-project:
+    `project_verified_join`, `project_verified_semantic_binding` and the table-fact surface all take
+    the checkpoint lock and drain to head. The `entity_bridge` branch called
+    `project_verified_bridge`, which wrote its OWN `entity_bridge_edge` row and never touched the
+    checkpoint — so this one confirm surface silently wedged the global read model.
+
+    The module's premise ("no drain needed — the fold is the authoritative status") is right about
+    THIS projection and wrong about its side effect: folding is enough to decide the bridge's own
+    edge, but the confirm still appends an event, and something has to advance the checkpoint every
+    OTHER reader gates on.
+
+    Nothing here asserts the bridge edge — its own tests cover that. This asserts the side effect
+    that was missing, which is why it is phrased as lag rather than as a row.
+    """
+    from featuregen.projections.runner import projection_lag
+
+    ref = _propose_confirm(db)
+    assert fold_overlay_state(load_fact(db, fact_key(ref, "entity_bridge"))).status == "VERIFIED"
+    assert projection_lag(db, "overlay") == 0, (
+        "a bridge confirm must leave the overlay projection at head; a lagged checkpoint "
+        "fail-closes every governed catalog read until an unrelated ingest happens to drain it")

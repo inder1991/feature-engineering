@@ -25,8 +25,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -70,6 +71,42 @@ def compute_physical_request_hash(request: LLMRequest) -> str:
     encoded = json.dumps(
         material, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _physical_generation_settings(
+    generation_settings: Mapping[str, Any],
+    repair_attempts: object,
+    attempt_no: object,
+) -> dict:
+    """The generation_settings the Nth PHYSICAL attempt actually carried.
+
+    The logical ``llm_call`` row stores the STARTING settings — deliberately, because they are the
+    idempotency key (``find_llm_call`` compares them, so an escalated copy would fork dedup
+    identity). A truncation retry is nonetheless dispatched at a RAISED ``max_tokens``, so
+    rebuilding an attempt from the logical row alone describes a request that was never sent.
+
+    The driver already audits each escalation on that same row: ``repair_attempts`` holds ONE entry
+    per physical re-call, and a truncation retry's entry carries the ``max_tokens`` it was raised
+    to. Replaying that ledger up to ``attempt_no`` reconstructs the real physical request without a
+    schema change and WITHOUT weakening the hash — ``generation_settings`` stays in the material in
+    full, so a ceiling that disagrees with the recorded ledger still fails reconciliation. An
+    escalation that was never audited cannot pass by virtue of being an escalation.
+
+    Physical attempt N is preceded by exactly N-1 ledger entries (the driver appends one, then
+    calls), so the prefix ``[:N-1]`` is the escalation history that attempt saw. Repair entries
+    carry no ``max_tokens`` and are skipped while still consuming their position."""
+    settings = dict(generation_settings)
+    # An unusable attempt_no rebuilds the BASELINE rather than inventing a ceiling: the hash check
+    # then fails honestly on a real mismatch instead of being talked into a value nobody recorded.
+    if not isinstance(attempt_no, int) or not isinstance(repair_attempts, list):
+        return settings
+    preceding = attempt_no - 1
+    if preceding <= 0:
+        return settings
+    for entry in repair_attempts[:preceding]:
+        if isinstance(entry, dict) and entry.get("max_tokens"):
+            settings["max_tokens"] = entry["max_tokens"]
+    return settings
 
 
 def _content_hash(value) -> str:
@@ -311,7 +348,7 @@ def formula_dispatch_reconciliation_failure(
     dispatches = conn.execute(
         "SELECT dispatch_ref,task,input_hash,redacted_input,provider,model,prompt_version,"
         "schema_version,physical_request_hash,call_role,canonical_turn_input_hash,"
-        "provider_contract_hash,prompt_content_hash,schema_content_hash "
+        "provider_contract_hash,prompt_content_hash,schema_content_hash,attempt_no "
         "FROM llm_dispatch WHERE authoring_run_id=%s ORDER BY dispatch_ref",
         (authoring_run_id,),
     ).fetchall()
@@ -334,10 +371,12 @@ def formula_dispatch_reconciliation_failure(
             provider_contract_hash,
             prompt_content_hash,
             schema_content_hash,
+            attempt_no,
         ) = dispatch
         links = conn.execute(
             "SELECT c.llm_call_ref,c.task,c.provider,c.model,c.prompt_id,c.prompt_version,"
-            "c.output_schema_id,c.output_schema_version,c.generation_settings,c.input_hash "
+            "c.output_schema_id,c.output_schema_version,c.generation_settings,c.input_hash,"
+            "c.repair_attempts "
             "FROM llm_call_dispatch l JOIN llm_call c USING (llm_call_ref) "
             "WHERE l.dispatch_ref=%s",
             (dispatch_ref,),
@@ -355,6 +394,7 @@ def formula_dispatch_reconciliation_failure(
             call_schema_version,
             generation_settings,
             call_input_hash,
+            repair_attempts,
         ) = links[0]
         schema = registry.schema_for(schema_id, call_schema_version)
         if (
@@ -363,15 +403,19 @@ def formula_dispatch_reconciliation_failure(
             or not isinstance(generation_settings, dict)
         ):
             return "REQUEST_SHAPE_UNVERIFIABLE"
+        # What this ATTEMPT physically carried: the logical row holds the starting settings, and a
+        # truncation retry was dispatched at a raised ceiling recorded in repair_attempts.
+        physical_settings = _physical_generation_settings(
+            generation_settings, repair_attempts, attempt_no)
         computed_prompt_hash = _content_hash(
             redacted_input.get("instruction")
         )
         computed_schema_hash = _content_hash(schema)
         computed_contract_hash = _content_hash({
             "call_role": call_role or task,
-            "provider": generation_settings.get("provider"),
-            "model": generation_settings.get("model"),
-            "generation_settings": generation_settings,
+            "provider": physical_settings.get("provider"),
+            "model": physical_settings.get("model"),
+            "generation_settings": physical_settings,
             "prompt_id": prompt_id,
             "prompt_version": call_prompt_version,
             "prompt_content_hash": computed_prompt_hash,
@@ -386,7 +430,7 @@ def formula_dispatch_reconciliation_failure(
             inputs=redacted_input,
             output_schema_id=schema_id,
             output_schema_version=schema_version,
-            generation_settings=generation_settings,
+            generation_settings=physical_settings,
             output_schema=schema,
         )
         outcomes = conn.execute(

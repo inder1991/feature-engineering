@@ -1,0 +1,49 @@
+{
+  "canonical_json": "{\"allocation_policy_ref\":\"\",\"body\":{\"expr\":{\"aggregation\":\"first_known\",\"aggregation_argument\":null,\"authority_refs\":null,\"filter\":null,\"operand\":\"authored::public.balances.eod_bal\",\"second_operand\":null,\"source_relation\":{\"table_ref\":\"authored::public.balances\"},\"window\":{\"basis\":\"trailing\",\"empty_window\":\"null\",\"end_inclusive\":\"exclusive\",\"event_time_ref\":\"authored::public.balances.as_of_dt\",\"length\":90,\"null_input\":\"ignore\",\"offset_periods\":0,\"start_inclusive\":\"inclusive\",\"timezone\":\"Asia/Dubai\",\"unit\":\"day\"}},\"final_operation\":\"identity\"},\"canonicalization_version\":1,\"decimal\":{\"overflow\":\"error\",\"precision\":38,\"rounding\":\"half_even\",\"scale\":6},\"expected_output\":null,\"formula_schema_version\":2,\"grain\":{\"entity\":\"account\",\"keys\":[\"authored::public.balances.acct_id\"]},\"operation_grammar_version\":1,\"parameters\":[]}",
+  "case_id": "first_known_balance_in_window",
+  "expected": "ok",
+  "expected_proposal_hash": "7541d61937cd72840b5fb96ff10eb34db224b125444abfeb0fcb2f4027ead695",
+  "note": "the first value shown inside the window \u2014 balance-at-window-open for drawdown/delta shapes [re-keyed in increment 4: offset_periods + second_operand joined the canonical form] [re-keyed in increment 8: authority_refs + allocation_policy_ref joined the canonical form]",
+  "operation": "first_known",
+  "proposal": {
+    "body": {
+      "expr": {
+        "aggregation": "first_known",
+        "filter": null,
+        "operand": "authored::public.balances.eod_bal",
+        "source_relation": {
+          "table_ref": "authored::public.balances"
+        },
+        "window": {
+          "basis": "trailing",
+          "empty_window": "null",
+          "end_inclusive": "exclusive",
+          "event_time_ref": "authored::public.balances.as_of_dt",
+          "length": 90,
+          "null_input": "ignore",
+          "start_inclusive": "inclusive",
+          "timezone": "Asia/Dubai",
+          "unit": "day"
+        }
+      },
+      "final_operation": "identity"
+    },
+    "canonicalization_version": 1,
+    "decimal": {
+      "overflow": "error",
+      "precision": 38,
+      "rounding": "half_even",
+      "scale": 6
+    },
+    "expected_output": null,
+    "formula_schema_version": 2,
+    "grain": {
+      "entity": "account",
+      "keys": [
+        "authored::public.balances.acct_id"
+      ]
+    },
+    "operation_grammar_version": 1,
+    "parameters": []
+  }
+}

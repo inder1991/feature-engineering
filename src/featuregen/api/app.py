@@ -23,6 +23,7 @@ from featuregen.api.routes import (
     catalogs,
     contract,
     data_sources,
+    dataset_policies,
     entity,
     entity_map,
     features,
@@ -35,9 +36,15 @@ from featuregen.api.routes import (
     integrations,
     learning,
     lineage,
+    pii_policies,
+    concept_confirmations,
+    profiles,
     quarantine,
     readiness,
+    recipe_funnel,
+    recipe_review,
     search,
+    selection_telemetry,
     semantics,
     suggestions,
     uploads,
@@ -51,7 +58,16 @@ from featuregen.overlay.config import overlay_config_from_env, register_overlay_
 from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.upload.contract.live_activation import startup_artifact_check
 from featuregen.overlay.upload.contract.scope_mode import scope_mode_status
+from featuregen.overlay.upload.crosswalk_flag import (
+    CROSSWALK_EXECUTION_FLAG,
+    crosswalk_execution_status,
+    require_valid_crosswalk_configuration,
+)
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
+from featuregen.overlay.upload.source_selection import (
+    SOURCE_TEMPORAL_SELECTION_FLAG,
+    source_temporal_selection_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +102,55 @@ def _startup_migration_check(app: FastAPI) -> None:
         logger.warning("could not check pending migrations at startup", exc_info=True)
 
 
+def _startup_flag_dependency_check(app: FastAPI) -> None:
+    """D8 / plan §5.16: `FEATUREGEN_SOURCE_TEMPORAL_SELECTION` DEPENDS ON
+    `FEATUREGEN_DATASET_PROFILES`, and an invalid combination fails configuration validation
+    instead of running a half-enabled path.
+
+    Two halves, both needed. The reader itself fails CLOSED — with the dependency unmet the feature
+    reports disabled and every Release-B route 404s — so no surface can accidentally opt out by
+    forgetting to check. This function is the other half: it makes the mistake LOUD at boot and
+    records it on `app.state`, because a silently-ignored flag is how an operator concludes the
+    feature is broken rather than misconfigured. It never blocks startup: the running configuration
+    is a valid one (the feature is simply off), so refusing to boot would turn a misconfiguration
+    into an outage.
+    """
+    status = source_temporal_selection_status()
+    app.state.source_temporal_selection_valid = status.configuration_valid
+    app.state.source_temporal_selection_enabled = status.enabled
+    if not status.configuration_valid:
+        logger.warning(
+            "INVALID FLAG COMBINATION: %s=%r requests source/temporal selection, but "
+            "FEATUREGEN_DATASET_PROFILES is off. The dependency is required (verified-interfaces "
+            "D8), so source/temporal selection stays DISABLED and its routes 404. Set "
+            "FEATUREGEN_DATASET_PROFILES=1 to enable it, or unset %s.",
+            SOURCE_TEMPORAL_SELECTION_FLAG, status.configured_value,
+            SOURCE_TEMPORAL_SELECTION_FLAG)
+
+
+def _startup_crosswalk_flag_refusal(app: FastAPI) -> None:
+    """D8's Release-C row: `FEATUREGEN_CROSSWALK_EXECUTION` REFUSES TO BOOT on an unmet dependency.
+
+    Deliberately NOT the function above. That one records and warns because Release B's flag-off
+    state is a valid running configuration; this one raises, because a deployment that asked for
+    generated crosswalk execution while source/temporal selection is disabled would run a two-leg
+    traversal whose mapping-row rule nobody resolved. The verified-interfaces D8 note (2026-08-03)
+    is explicit that Release C must not inherit the log-only precedent, so the two checks sit side
+    by side with different verdicts rather than one being reused for both.
+
+    The state is still recorded on `app.state` for the legal combinations, so `/health` and the
+    Release-C surfaces read one posture rather than each re-deriving it.
+    """
+    require_valid_crosswalk_configuration()
+    status = crosswalk_execution_status()
+    app.state.crosswalk_execution_enabled = status.enabled
+    if status.enabled:
+        logger.warning(
+            "%s is ON: governed two-leg mapping-table crosswalks may be compiled and rendered. "
+            "Discovery is unaffected by this flag; EXECUTION is what it gates.",
+            CROSSWALK_EXECUTION_FLAG)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The same process bootstrap the worker and the test suite use: event schemas (idempotent)
@@ -96,6 +161,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
     _startup_migration_check(app)
+    _startup_flag_dependency_check(app)
+    # RAISES on the one illegal combination — see the function's own docstring for why this is a
+    # refusal where the line above is a warning. It runs BEFORE the diagnostic checks below so a
+    # refused configuration never reaches anything that touches a cluster or an artifact.
+    _startup_crosswalk_flag_refusal(app)
     # H3c — the lightweight 3C.2 signed-gate posture signal at boot (log-only, never blocks startup): a
     # loud warning when the live cross-catalog flag is ON but the signed artifact is absent/stale/invalid,
     # so a mis-provisioned gate is visible early. The per-request admission check still enforces fail-closed.
@@ -143,9 +213,21 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(ingestion_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
+    app.include_router(recipe_funnel.router)
+    app.include_router(recipe_review.router)
+    app.include_router(concept_confirmations.router)
+    app.include_router(selection_telemetry.router)
     # `GET /catalogs` — the pick-list for every `{source}`-keyed surface below (read-scoped).
     app.include_router(catalogs.router)
     app.include_router(assets.router)
+    # Release-A table-asset profiles (flag-gated 404 while FEATUREGEN_DATASET_PROFILES is off).
+    # Distinct `/catalog/asset-profiles` prefix — the assets greedy `{object_ref:path}` route
+    # would swallow a nested literal (see profiles.py module docstring).
+    app.include_router(profiles.router)
+    # Release-B serving/temporal policies (flag-gated 404 while
+    # FEATUREGEN_SOURCE_TEMPORAL_SELECTION is off OR its DATASET_PROFILES dependency is unmet).
+    app.include_router(dataset_policies.router)
+    app.include_router(pii_policies.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
     app.include_router(readiness.router)
@@ -167,6 +249,18 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(analysis.router)
     # `/data-sources/...` — which engine each catalog lives on, and the routes to reach it.
     app.include_router(data_sources.router)
+    # Phase G §3.1 — `POST /materialization-runs` (enqueue, never compile) + its status read.
+    # Registered UNCONDITIONALLY and gated per-request by FEATUREGEN_MATERIALIZE_ENABLED, which is
+    # read on every call: a router included behind a boot-time flag read would capture the switch at
+    # import and make flipping it a code path nobody could exercise. Flag off, both paths answer
+    # Starlette's own 404 and touch no connection.
+    #
+    # Imported HERE rather than added to the module-level `from featuregen.api.routes import (...)`
+    # block: that block is being edited by a concurrent session, and this task is additive-only in
+    # this file. `create_app` already uses local imports for the same reason elsewhere.
+    from featuregen.api.routes import materialization_runs
+
+    app.include_router(materialization_runs.router)
 
     @app.get("/health")
     def health() -> dict:

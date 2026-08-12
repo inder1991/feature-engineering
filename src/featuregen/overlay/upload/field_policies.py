@@ -46,6 +46,7 @@ _OPERATIONAL_DISQUALIFIERS: tuple[Disqualifier, ...] = (
 _LLM_PROPOSED = HasEvidence(EvidenceProducer.LLM, AssertionStrength.PROPOSED)
 _SOURCE_PROPOSED = HasEvidence(EvidenceProducer.SOURCE, AssertionStrength.PROPOSED)
 _SOURCE_ATTESTED = HasEvidence(EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+_HUMAN_PROPOSED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.PROPOSED)
 _HUMAN_CONFIRMED = HasEvidence(EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED)
 _PARSER_SUPPORTED = HasEvidence(EvidenceProducer.PARSER, AssertionStrength.SUPPORTED)
 _TAXONOMY_PROPOSED = HasEvidence(EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
@@ -199,6 +200,45 @@ _MEASURE_ANNOTATION = FieldPolicy(
 )
 
 
+# ── Release-A profile fields (profile plan Task 1, interface doc D12.7) ───────────────────────────
+
+# business_context — the NEW advisory table-narrative field: the business meaning of a table in the
+# uploader's / curator's words. RECOMMENDATION ceiling (advisory forever: the ceiling, not the
+# operational rule, is the guarantee). Display admits llm/source/human-proposed AND human-proposed
+# (the no-"blocked" rule: a pending proposal is usable, labeled — never failure-styled) and it is
+# the ONE field the single-actor `set_advisory` command may write (field_correction's hard
+# allowlist). For a TECHNICAL catalog this is the only table prose there is — technical ingestion
+# writes no source-attested table narrative — so hiding a proposal here would blank the product.
+_BUSINESS_CONTEXT = _recommendation(
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_PROPOSED,
+                        _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+    human_editable=True,
+)
+
+# authority_role / temporal_storage_model — the NEW OPERATIONAL profile classifications (D12.7).
+#
+# * DISPLAY is lenient: an LLM or uploader (HUMAN/PROPOSED via the profile PUT) proposal is shown
+#   for exploration — visible, labeled, usable in sandbox ranking later — never hidden.
+# * LOAD-BEARING is strict and NEVER from the LLM: only source-attested or human-confirmed
+#   evidence clears the operational rule THIS release (the plan's explicit bar; no producer emits
+#   PROFILER field evidence for these fields today). The deferred Hive/ODS deterministic-
+#   classification slice re-proposes a profiler/attested leaf through policy review when it lands.
+# * human_editable=True wires the EXISTING four-eyes flow (D12.7): propose_override writes
+#   HUMAN/PROPOSED (displayed, not load-bearing); confirm_override by a DISTINCT subject writes
+#   HUMAN/CONFIRMED (load-bearing). `set_advisory` is hard-excluded (field_correction allowlist).
+_OPERATIONAL_PROFILE_CLASSIFICATION = FieldPolicy(
+    influence_max=InfluenceTier.OPERATIONAL,
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_PROPOSED,
+                        _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
+    resolution_mode=ResolutionMode.GENERIC_FIELD,
+    conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
+    human_editable=True,
+)
+
+
 # The registry: object-field name -> its policy. Keyed by the field_name written to field_evidence.
 _POLICIES: dict[str, FieldPolicy] = {
     "concept": _CONCEPT,
@@ -225,11 +265,33 @@ _POLICIES: dict[str, FieldPolicy] = {
     # Source-authority fields (Delivery B item 8) — technical-CSV / glossary declared values.
     "business_term": _GLOSSARY_TERM,        # advisory scalar — generically human-editable
     "term_type": _GLOSSARY_TERM,            # advisory scalar — generically human-editable
+    # D13.1 — the source's own FINE-GRAINED taxonomy axes. Both already land as SOURCE evidence
+    # (`ingest._SOURCE_FIELDS`, ATTESTED under FTR_GLOSSARY_PROFILE); without a policy they were
+    # unresolvable, so they could never reach a decision, a flat column or a facet. Same advisory
+    # shape as every other curated glossary scalar: shown, human-correctable, never load-bearing.
+    "bian_path": _GLOSSARY_TERM,
+    "process_path": _GLOSSARY_TERM,
+    # The THIRD path from the same sidecar (migration 1058). It was captured as SOURCE evidence
+    # exactly like the two above and then had no policy and no column, so it resolved nowhere —
+    # invisible precisely BECAUSE its siblings worked.
+    "fibo_path": _GLOSSARY_TERM,
+    # D13.2 — the LLM-proposed FINER classification axis beside the coarse source `domain`. The
+    # SAME `_MEANING` policy `domain` carries, deliberately: recommendation tier (never load-
+    # bearing however strong the evidence), lenient display so an `llm/proposed` value is visible
+    # and labeled rather than hidden, and human_editable so the existing four-eyes propose/confirm
+    # flow can correct it. It never overwrites `domain` — they are two separate fields.
+    "sub_domain": _MEANING,
     "declared_type": _DECLARED_TYPE_HINT,   # glossary-declared SQL type: a HINT, never authority
     "data_type": _DATA_TYPE,
     "unit": _MEASURE_ANNOTATION,
     "currency": _MEASURE_ANNOTATION,
     "entity": _ENTITY_ADVISORY,             # operational path = VERIFIED entity_assignment (Del. E)
+    # Release-A profile fields (TABLE-level; profile plan Task 1). business_context is advisory
+    # forever (RECOMMENDATION ceiling + the set_advisory allowlist); the two classifications are
+    # OPERATIONAL with the strict source/human/deterministic bar documented above.
+    "business_context": _BUSINESS_CONTEXT,
+    "authority_role": _OPERATIONAL_PROFILE_CLASSIFICATION,
+    "temporal_storage_model": _OPERATIONAL_PROFILE_CLASSIFICATION,
 }
 
 

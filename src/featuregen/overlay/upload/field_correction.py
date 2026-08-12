@@ -40,6 +40,7 @@ from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import Command
 from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.overlay.evidence import AssertionStrength, EvidenceLifecycle, EvidenceProducer
+from featuregen.overlay.field_authority import InfluenceTier, evaluate
 from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
     read_field_decisions,
@@ -75,16 +76,70 @@ from featuregen.overlay.upload.ingest import (
     ingest_source_lock_key,
 )
 from featuregen.overlay.upload.object_ref import parse_ref
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.profile_vocab import (
+    normalize_authority_role,
+    normalize_temporal_storage_model,
+)
+from featuregen.overlay.upload.read_scope import allowed_sensitivities, anchor_visibility_predicate
 from featuregen.security.audit import record_denial
 
 ACTIONS: frozenset[str] = frozenset(
-    {"confirm_existing", "propose_override", "confirm_override", "reject"}
+    {"confirm_existing", "propose_override", "confirm_override", "reject", "set_advisory"}
 )
 
+# ── set_advisory (profile Task 1, interface doc D12.7) ────────────────────────────────────────────
+# The HARD allowlist for the single-actor advisory write: `set_advisory` appends HUMAN/CONFIRMED
+# and projects immediately WITHOUT a second reviewer, so it may cover ONLY a field whose value can
+# never be load-bearing from that write AND that never had (nor deserves) the four-eyes flow.
+# Exactly one field qualifies: `business_context` (RECOMMENDATION ceiling — the confirm changes
+# display, never authority). Every OTHER field — including every pre-existing human_editable
+# scalar (definition / concept / domain / …) — keeps propose_override -> confirm_override with
+# DISTINCT subjects. Extending this constant is guarded by `_assert_set_advisory_allowlist`
+# (import-time + tested): adding `definition`/`concept` (or any operational field) raises.
+SET_ADVISORY_FIELDS: frozenset[str] = frozenset({"business_context"})
+
+# Fields that must NEVER become single-actor writable: every field registered BEFORE the profile
+# program (each already carries four-eyes via the generic command or a dedicated one) plus the two
+# OPERATIONAL profile classifications (their confirm path IS four-eyes, D12.7). A hard, explicit
+# list — not derived — so a future registry addition cannot silently widen set_advisory.
+_SET_ADVISORY_BARRED: frozenset[str] = frozenset({
+    "concept", "definition", "ai_summary", "domain", "feature_role", "logical_representation",
+    "semantic_type", "sensitivity", "additivity", "temporal_role", "leakage_anchor", "table_role",
+    "primary_entity", "event_or_snapshot", "business_term", "term_type", "declared_type",
+    "data_type", "unit", "currency", "entity", "authority_role", "temporal_storage_model",
+})
+
+
+def _assert_set_advisory_allowlist(fields: frozenset[str] = SET_ADVISORY_FIELDS) -> None:
+    """Fail LOUDLY if the set_advisory allowlist ever names a field that four-eyes protects (or
+    should): barred fields, unregistered fields, non-RECOMMENDATION fields, and non-human_editable
+    fields all raise. Runs at import time over the live constant; the test suite additionally
+    proves that adding ``definition``/``concept`` to a candidate list raises."""
+    for f in sorted(fields):
+        if f in _SET_ADVISORY_BARRED:
+            raise ValueError(
+                f"set_advisory may never cover {f!r}: it is four-eyes-protected (propose/confirm "
+                "with distinct subjects); the single-actor advisory write is business_context only")
+        policy = policy_for(f)
+        if policy is None:
+            raise ValueError(f"set_advisory names an unregistered field {f!r}")
+        if policy.influence_max is not InfluenceTier.RECOMMENDATION:
+            raise ValueError(
+                f"set_advisory may never cover {f!r}: only a RECOMMENDATION-ceiling field (whose "
+                "value can never be load-bearing) may be single-actor confirmed")
+        if not policy.human_editable:
+            raise ValueError(f"set_advisory field {f!r} must be human_editable")
+
+
+_assert_set_advisory_allowlist()
+
 # [5] the PROJECTING actions — each re-projects (or clears) the field's governed display column, which
-# H2c hashes as contract-dependency state. ``propose_override`` is the sole non-projecting action (it
-# only surfaces a pending proposal), so it never invalidates a dependent contract.
+# H2c hashes as contract-dependency state. ``propose_override`` stays OUTSIDE this set deliberately:
+# for most fields it only surfaces a pending proposal (no projection at all), and for the three
+# proposal-DISPLAYING profile fields ([F3] — business_context / authority_role /
+# temporal_storage_model) the display it refreshes lives on TABLE nodes, which no ``column_field``
+# metadata snapshot hashes — so no dependent-contract state can change and no invalidation applies
+# (the Release-B ``dataset_profile`` snapshot kind revisits this when table-level pins exist).
 _PROJECTING_ACTIONS: frozenset[str] = frozenset({"confirm_existing", "confirm_override", "reject"})
 
 # [F11] the correctable fields whose INGESTION-STAGE counterpart the D2 semantic-binding shortlist
@@ -95,16 +150,46 @@ _PROJECTING_ACTIONS: frozenset[str] = frozenset({"confirm_existing", "confirm_ov
 # so the correction command itself must retire the current set.
 _SHORTLIST_INPUT_FIELDS: frozenset[str] = frozenset({"concept", "business_term", "term_type"})
 
-# Per-field value bound (chars); ``definition`` gets a longer prose ceiling, everything else a short
-# scalar bound. A value outside the bound (or empty/whitespace-only) is REFUSED before any write.
-_MAX_LEN: dict[str, int] = {"definition": 4000}
+# Per-field value bound (chars); ``definition``/``business_context`` get a longer prose ceiling,
+# everything else a short scalar bound. A value outside the bound (or empty/whitespace-only) is
+# REFUSED before any write.
+_MAX_LEN: dict[str, int] = {"definition": 4000, "business_context": 4000}
 _DEFAULT_MAX_LEN = 512
 
 # Fields whose value is drawn from a CLOSED, known vocabulary — a correction must land a real registry
 # term, not free text (M-8). ``definition`` / ``domain`` / ``business_term`` stay genuinely free-text.
-_KNOWN_VOCAB_VALIDATORS = {"concept": is_known_concept}
+# The two profile classifications accept only their EXACT canonical members (already-lowercased; the
+# profile PUT surface normalizes input before it reaches here) so case-variant duplicates can never
+# enter the evidence stream.
+_KNOWN_VOCAB_VALIDATORS = {
+    "concept": is_known_concept,
+    "authority_role": lambda v: normalize_authority_role(v) == v,
+    "temporal_storage_model": lambda v: normalize_temporal_storage_model(v) == v,
+}
 
 _HUMAN = EvidenceProducer.HUMAN.value
+
+# ── [F10] HUMAN evidence key discipline — ONE owner ───────────────────────────────────────────────
+# EVERY HUMAN `field_evidence` row is written by this module: the generic correction command
+# (`_append_human_evidence`, keyed by the CALLER'S `idempotency_key`) and the narrow
+# `propose_profile_field` seam the asset-profile PUT calls. The command's replay probe (step 5)
+# assumed it owned the whole HUMAN key space; the PUT broke that by stamping
+# `producer_item_ref="asset-profile-put:{field}"` — a string a user could plausibly send as their
+# own idempotency_key, which then 409'd as "reused with different parameters" for a command they
+# never issued (and, since every PUT reused it, stacked rows under one key).
+#
+# The two spaces are now disjoint by construction, twice over:
+#   * `source_snapshot_id` NAMESPACE — command rows are "human-correction:{key}", surface rows are
+#     "asset-profile-put:{subject}". The replay probe matches on its own namespace, so a surface row
+#     can never be read as a command replay whatever a user sends.
+#   * `producer_item_ref` DERIVATION — a surface key embeds the field AND the value hash, so it is
+#     unique per (producer_ref, field, value) and is never the bare "surface:field" string.
+_PROFILE_PUT_NS = "asset-profile-put"
+
+
+def _command_snapshot_id(idempotency_key: str) -> str:
+    """The `source_snapshot_id` namespace of a row written by the CORRECTION COMMAND."""
+    return f"human-correction:{idempotency_key}"
 
 
 class FieldCorrectionError(Exception):
@@ -170,6 +255,8 @@ def _callable_actions(
     never confirm their OWN proposal)."""
     active = read_active_field_evidence(conn, logical_ref, field)
     actions = ["propose_override", "reject"]
+    if field in SET_ADVISORY_FIELDS:
+        actions.append("set_advisory")   # allowlisted advisory field: single-actor write available
     if any(not _proposed_by_actor(e, actor) for e in active):
         actions.append("confirm_existing")
     if any(_human_proposal(e) and e.producer_ref != actor.subject for e in active):
@@ -224,7 +311,7 @@ def _append_human_evidence(
         conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
         producer=EvidenceProducer.HUMAN, strength=strength, lifecycle=lifecycle,
         producer_ref=actor.subject, producer_item_ref=idempotency_key,
-        source_snapshot_id=f"human-correction:{idempotency_key}", input_hash=input_hash,
+        source_snapshot_id=_command_snapshot_id(idempotency_key), input_hash=input_hash,
         evidence_spans=list(spans), note=note)
 
 
@@ -256,17 +343,19 @@ def apply_field_correction(
                  "command")
 
     # 2. Resolve the schema-preserving logical_ref + confirm the asset exists AND is VISIBLE to this
-    #    caller (I-1 read-scope). The anchor is loaded under the actor's sensitivity scope (mirroring
-    #    asset_detail._load_anchor); a hidden column (e.g. pii) the caller can't read is
+    #    caller (I-1 read-scope). The anchor is loaded under the actor's sensitivity scope (the SAME
+    #    shared predicate as asset_detail._load_anchor and search — D11: a TABLE anchor's scope is
+    #    DERIVED from its columns, since table nodes carry visible_requires = {}); a hidden asset
+    #    (e.g. a pii column, or a table whose EVERY column is hidden) the caller can't read is
     #    INDISTINGUISHABLE from a missing one — the SAME 404, raised BEFORE the idempotency probe / CAS
     #    read / any write — so a platform-admin WITHOUT pii_reader gets no existence oracle and no blind
-    #    write path on a column that GET 404s for the same caller.
+    #    write path on an asset that GET 404s for the same caller.
     norm_source = source.strip().lower()
     allowed = allowed_sensitivities(actor.role_claims)
     anchor = conn.execute(
-        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s) "
-        "AND visible_requires <@ %s",
-        (norm_source, object_ref, allowed)).fetchone()
+        "SELECT 1 FROM graph_node gn WHERE gn.catalog_source = %s AND gn.object_ref = lower(%s) "
+        f"AND {anchor_visibility_predicate()}",
+        (norm_source, object_ref, allowed, allowed)).fetchone()
     if anchor is None:
         raise FieldCorrectionError(404, "asset not found")
     logical_ref = logical_ref_of(conn, norm_source, object_ref.lower())
@@ -288,12 +377,17 @@ def apply_field_correction(
                   "subject": actor.subject, "idempotency_key": idempotency_key})
 
     # 5. Idempotency — BEFORE the CAS, so a replay carrying the (now-stale) original CAS view still
-    #    replays success rather than 409ing. HUMAN field_evidence is written ONLY by this command, so
-    #    (producer=human, producer_item_ref=idempotency_key) is a clean key.
+    #    replays success rather than 409ing. [F10] The probe is scoped to rows THIS COMMAND wrote:
+    #    (producer=human, producer_item_ref=idempotency_key) alone was only a clean key while the
+    #    command owned every HUMAN row, which the asset-profile PUT surface ended. Matching the
+    #    command's own `source_snapshot_id` namespace as well (every command row goes through
+    #    `_append_human_evidence`) makes the probe exact: a surface row can never be mistaken for a
+    #    replay, so a user whose idempotency_key happens to look like a surface key is never 409'd.
     prior = conn.execute(
         "SELECT input_hash FROM field_evidence WHERE logical_ref = %s AND field_name = %s "
-        "AND producer = %s AND producer_item_ref = %s",
-        (logical_ref, field, _HUMAN, idempotency_key)).fetchall()
+        "AND producer = %s AND producer_item_ref = %s AND source_snapshot_id = %s",
+        (logical_ref, field, _HUMAN, idempotency_key,
+         _command_snapshot_id(idempotency_key))).fetchall()
     if prior:
         if all(row[0] != input_hash for row in prior):
             raise FieldCorrectionError(409, "idempotency_key reused with different parameters")
@@ -310,14 +404,17 @@ def apply_field_correction(
     # 7. Action-specific validation (bounds / selection / four-eyes) BEFORE any write, then effect. The
     #    reviewer ``note`` (M-9) is persisted on the appended human-action evidence row by each helper.
     if action == "propose_override":
-        projected = _propose_override(conn, logical_ref, field, replacement_value, actor,
-                                      idempotency_key, input_hash, note)
+        projected = _propose_override(conn, norm_source, logical_ref, field, replacement_value,
+                                      actor, idempotency_key, input_hash, note)
     elif action == "confirm_override":
         projected = _confirm_override(conn, norm_source, logical_ref, field, replacement_value,
                                       actor, idempotency_key, input_hash, note)
     elif action == "confirm_existing":
         projected = _confirm_existing(conn, norm_source, logical_ref, field, selected_evidence_ids,
                                       actor, idempotency_key, input_hash, note)
+    elif action == "set_advisory":
+        projected = _set_advisory(conn, norm_source, logical_ref, field, replacement_value, actor,
+                                  idempotency_key, input_hash, note)
     else:  # reject
         projected = _reject(conn, norm_source, logical_ref, field, selected_evidence_ids, actor,
                             idempotency_key, input_hash, note)
@@ -395,7 +492,8 @@ def _success_body(
 ) -> dict:
     latest, set_hash, policy_version = _current_cas(conn, logical_ref, field)
     outcome = {"confirm_existing": "confirmed", "confirm_override": "confirmed",
-               "propose_override": "proposed", "reject": "rejected"}[action]
+               "propose_override": "proposed", "reject": "rejected",
+               "set_advisory": "confirmed"}[action]
     return {"accepted": True, "body": {
         "field": field, "action": action,
         "outcome": "replayed" if replayed else outcome, "replayed": replayed,
@@ -407,19 +505,148 @@ def _success_body(
     }}
 
 
-def _propose_override(
-    conn: DbConn, logical_ref: str, field: str, replacement_value: str | None,
+def _set_advisory(
+    conn: DbConn, source: str, logical_ref: str, field: str, replacement_value: str | None,
     actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool:
-    """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review; do NOT project (a
-    later ``confirm_override`` by a DIFFERENT subject projects). HUMAN/PROPOSED is absent from every
-    display/operational rule, so this proposal is neither shown nor load-bearing until confirmed."""
+    """Single-actor ADVISORY write (profile Task 1, D12.7): append a bounded HUMAN/CONFIRMED row
+    and re-resolve/project immediately — for the :data:`SET_ADVISORY_FIELDS` allowlist ONLY
+    (``business_context``; anything else 403s here, whatever its ``human_editable`` flag says).
+
+    Why no four-eyes: the allowlisted field is RECOMMENDATION-ceilinged, so this confirm changes
+    what is DISPLAYED and nothing operational — the influence ceiling (enforced in the resolver,
+    re-asserted by ``_assert_set_advisory_allowlist``) is the guarantee, not reviewer count. It is
+    deliberately NOT in ``_PROJECTING_ACTIONS``: ``business_context`` has no ``graph_node`` display
+    column (decision-only), so no H2c-hashed contract-dependency state changes and no contract
+    invalidation applies. Four-eyes for every other field is untouched."""
+    if field not in SET_ADVISORY_FIELDS:
+        raise FieldCorrectionError(
+            403, f"field {field!r} is not set_advisory-eligible; use propose_override/"
+                 "confirm_override (four-eyes) or the field's dedicated command")
     _check_bounds(field, replacement_value)
+    _append_human_evidence(
+        conn, logical_ref=logical_ref, field=field, value=replacement_value,
+        strength=AssertionStrength.CONFIRMED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
+        idempotency_key=idempotency_key, input_hash=input_hash, spans=[], note=note)
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
+    return True
+
+
+def _supersede_own_prior_proposal(
+    conn: DbConn, *, logical_ref: str, field: str, subject: str, keep_value_hash: str
+) -> int:
+    """[F1] A subject RE-PROPOSING a different value for the same field retires their OWN prior
+    ACTIVE ``HUMAN/PROPOSED`` row(s) to the ``superseded`` lifecycle — the substrate's sanctioned
+    per-row lifecycle flip (the same scoped-UPDATE mechanic :func:`_reject` /
+    ``stale_source_evidence`` use; ``EvidenceLifecycle.SUPERSEDED`` is the existing "a newer record
+    replaces it" member, no new lifecycle). Without this, a typo correction ties with itself at the
+    top strength and the resolver maps the tie to a cleared display.
+
+    Scoped HARD to the proposer's OWN rows: a DIFFERENT subject's proposal is a legitimate
+    competing proposal and is never touched. Rows carrying the SAME value hash are kept ACTIVE
+    (an idempotent same-value replay reuses them). Returns the rows superseded."""
+    cur = conn.execute(
+        "UPDATE field_evidence SET lifecycle = 'superseded' "
+        "WHERE logical_ref = %s AND field_name = %s AND producer = %s AND strength = %s "
+        "AND producer_ref = %s AND lifecycle = 'active' AND proposed_value_hash <> %s",
+        (logical_ref, field, _HUMAN, AssertionStrength.PROPOSED.value, subject,
+         keep_value_hash))
+    return cur.rowcount
+
+
+def propose_profile_field(
+    conn: DbConn, *, logical_ref: str, field: str, value: str, actor: IdentityEnvelope,
+    note: str | None = None,
+) -> bool:
+    """[F10] The ONE seam a NON-command surface (the asset-profile PUT) writes HUMAN
+    ``field_evidence`` through, so this module stays the single owner of HUMAN evidence and of both
+    idempotency key spaces (see the ``_PROFILE_PUT_NS`` note). Appends a bounded, ordinary
+    ``HUMAN/PROPOSED`` row — displayable, labeled, never load-bearing; promotion stays with the
+    four-eyes ``confirm_override``. Returns whether the ACTIVE evidence set CHANGED, so the caller
+    re-projects exactly the fields that moved. Does NOT project and does NOT lock: the caller owns
+    the transaction, the source+ref locks, and the batched :func:`resolve_and_project`.
+
+    Key discipline, in this order:
+
+    1. [F1] retire the author's OWN prior ACTIVE proposal for the field (a self-correction replaces
+       their pending value; a DIFFERENT subject's proposal is a legitimate competitor, untouched);
+    2. the row's key is ``asset-profile-put:{field}:{value_hash}`` under ``producer_ref=subject``,
+       i.e. unique per (subject, field, value) — repeat PUTs cannot stack under one key;
+    3. that key already ACTIVE -> nothing to write (an idempotent replay, exactly like the command's
+       replay: no second row, and the replayed ``note`` is not persisted);
+    4. that key present but ``superseded`` -> the author is re-asserting a value THEY retired, so
+       revive that exact row rather than stack a duplicate under its key. Scoped hard to
+       ``superseded`` (this module's own supersession): a ``rejected`` row is a governance decision
+       and is NEVER revived — re-proposing a rejected value appends fresh, which is honest, and is
+       the one case where a key can carry two rows.
+    """
+    _check_bounds(field, value)
+    value_hash = canonical_hash(value)
+    changed = bool(_supersede_own_prior_proposal(
+        conn, logical_ref=logical_ref, field=field, subject=actor.subject,
+        keep_value_hash=value_hash))
+    key = f"{_PROFILE_PUT_NS}:{field}:{value_hash}"
+    prior = conn.execute(
+        "SELECT evidence_id, lifecycle FROM field_evidence WHERE logical_ref = %s "
+        "AND field_name = %s AND producer = %s AND producer_ref = %s AND producer_item_ref = %s",
+        (logical_ref, field, _HUMAN, actor.subject, key)).fetchall()
+    if any(row[1] == EvidenceLifecycle.ACTIVE.value for row in prior):
+        return changed
+    revivable = [row[0] for row in prior if row[1] == EvidenceLifecycle.SUPERSEDED.value]
+    if revivable:
+        conn.execute("UPDATE field_evidence SET lifecycle = 'active' WHERE evidence_id = ANY(%s)",
+                     (revivable,))
+        return True
+    record_field_evidence(
+        conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
+        producer=EvidenceProducer.HUMAN, strength=AssertionStrength.PROPOSED,
+        lifecycle=EvidenceLifecycle.ACTIVE, producer_ref=actor.subject, producer_item_ref=key,
+        source_snapshot_id=f"{_PROFILE_PUT_NS}:{actor.subject}",
+        input_hash=field_input_hash(logical_ref=logical_ref, field_name=field,
+                                    material={"value": value, "subject": actor.subject}),
+        note=note)
+    return True
+
+
+#: [F3] The singleton (producer, strength) pair a bare human proposal contributes — evaluated
+#: against a field's display_rule to decide whether a pending proposal is DISPLAYABLE.
+_HUMAN_PROPOSED_PAIR = frozenset({(EvidenceProducer.HUMAN, AssertionStrength.PROPOSED)})
+
+
+def _propose_override(
+    conn: DbConn, source: str, logical_ref: str, field: str, replacement_value: str | None,
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
+) -> bool:
+    """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review. A later
+    ``confirm_override`` by a DIFFERENT subject is what makes it load-bearing.
+
+    [F3] Projection parity with the asset-profile PUT: for most fields HUMAN/PROPOSED is absent
+    from every display/operational rule, so a bare proposal is neither shown nor load-bearing and
+    this helper does NOT project. The three profile fields (``business_context`` /
+    ``authority_role`` / ``temporal_storage_model``) DO render proposals (their display_rule
+    admits human/proposed — the no-"blocked" rule), and the PUT path re-projects them — so this
+    path must too, or identical evidence leaves different graph state and the strict
+    ``profile_reconcile`` report flags every pending four-eyes proposal as drift. The gate is the
+    registered policy itself (does the display_rule pass on a lone human/proposed pair?), never a
+    hardcoded field list. Returns whether it projected.
+
+    [F1] Re-proposing supersedes the SAME subject's prior ACTIVE proposal for this field first
+    (same transaction) — identical behavior to the asset-profile PUT path, so the two propose
+    surfaces can never diverge on self-correction."""
+    _check_bounds(field, replacement_value)
+    _supersede_own_prior_proposal(
+        conn, logical_ref=logical_ref, field=field, subject=actor.subject,
+        keep_value_hash=canonical_hash(replacement_value))
     _append_human_evidence(
         conn, logical_ref=logical_ref, field=field, value=replacement_value,
         strength=AssertionStrength.PROPOSED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
         idempotency_key=idempotency_key, input_hash=input_hash, spans=[], note=note)
-    return False  # not projected — the pending proposal IS the review item
+    policy = policy_for(field)
+    assert policy is not None   # apply_field_correction validated the field before dispatch
+    if not evaluate(policy.display_rule, _HUMAN_PROPOSED_PAIR):
+        return False  # not displayable — the pending proposal IS the review item, nothing to show
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
+    return True
 
 
 def _confirm_override(

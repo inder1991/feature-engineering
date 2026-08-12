@@ -5,6 +5,7 @@
 #   ./deploy/kind/deploy.sh            # build + deploy everything (backend, frontend, postgres)
 #   ./deploy/kind/deploy.sh backend    # rebuild + redeploy ONLY the backend (fast iteration)
 #   ./deploy/kind/deploy.sh frontend   # rebuild + redeploy ONLY the frontend
+#   ./deploy/kind/deploy.sh worker     # restart ONLY the durable-runtime worker
 #
 # The LLM key (never committed) is sourced, in order, from:
 #   1. $ANTHROPIC_API_KEY in your environment, or
@@ -22,7 +23,7 @@ CLUSTER="${KIND_CLUSTER:-featuregen}"
 NS="${KIND_NAMESPACE:-featuregen}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
-TARGET="${1:-all}"   # all | backend | frontend
+TARGET="${1:-all}"   # all | backend | frontend | worker
 
 log() { printf '\n==> %s\n' "$*"; }
 want() { [ "$TARGET" = "all" ] || [ "$TARGET" = "$1" ]; }
@@ -70,14 +71,30 @@ restart_wait() {  # $1 = deploy name
 }
 want backend  && restart_wait backend
 want frontend && restart_wait frontend
+# The worker runs the BACKEND image, so a backend rebuild leaves it stale exactly as it would the
+# backend itself — but SILENTLY, since it serves no traffic to notice with. It is therefore
+# restarted on a `backend` target as well as its own: that is when its code actually moved.
+{ want backend || want worker; } && restart_wait worker
 
 # ── 6. verify the running image actually serves the code (not just "pod is up") ─────────────────────
 log "verify"
 kubectl -n "$NS" get pods -o wide
-kubectl -n "$NS" port-forward svc/backend 8000:8000 >/dev/null 2>&1 & PF=$!
-sleep 3
-HEALTH="$(curl -s -m 5 localhost:8000/health || true)"
-ROUTES="$(curl -s -m 5 localhost:8000/openapi.json | grep -c '/catalog/assets' || echo 0)"
+# A FREE local port, not 8000: a port-forward left over from an interactive session already owns
+# 8000 on most dev machines, and this one would then bind nothing while curl silently answered from
+# the STALE forward — reporting the freshly-deployed image as broken.
+kubectl -n "$NS" port-forward svc/backend 18000:8000 >/dev/null 2>&1 & PF=$!
+# Poll rather than `sleep 3`: the forward races the rollout's endpoint flip, and a fixed sleep turns
+# a slow-but-healthy start into a hard failure with a misleading "image is stale" message.
+HEALTH=""
+for _ in $(seq 1 15); do
+  HEALTH="$(curl -s -m 5 localhost:18000/health || true)"
+  [ -n "$HEALTH" ] && break
+  sleep 1
+done
+# `grep -c` PRINTS 0 and EXITS 1 when it matches nothing, so `|| echo 0` appended a SECOND line and
+# `[ "0\n0" -gt 0 ]` died with "integer expression expected" — which `set -e` then turned into the
+# stale-image error above, on a deploy that was in fact fine. `|| true` keeps grep's own count.
+ROUTES="$(curl -s -m 5 localhost:18000/openapi.json | grep -c '/catalog/assets' || true)"
 kill "$PF" 2>/dev/null || true
 echo "backend /health: ${HEALTH:-<none>}"
 if [ "${ROUTES:-0}" -gt 0 ]; then

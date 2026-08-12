@@ -64,13 +64,17 @@ def test_successful_upload_records_all_stages_in_order(db):
         "enrich_concept", "enrich_concept_critic",
         "enrich_definition", "enrich_domain", "enrich_synonyms",
         "enrich_unit",
+        "semantic_adjudication",
         "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        "table_display_reprojection",
         "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "entity_bridges", "join_projection",
         "semantic_binding_projection", "join_drift",
         "stamp_reconcile",
-        "axis_projection", "enrich_summary",
+        "axis_projection",
+        # Task 2b: every genuine grounding tie adjudicated once, graph final.
+        "tie_break_warming", "enrich_summary",
         "quarantine"]
     assert _states(rec) == {
         "validation": "succeeded", "brake": "succeeded", "fact_assertion": "succeeded",
@@ -83,9 +87,12 @@ def test_successful_upload_records_all_stages_in_order(db):
         # absent from the skip loop — so the report implied a stage that never existed.
         "enrich_summary": "skipped_no_client", "enrich_domain": "skipped_no_client",
         "enrich_synonyms": "skipped_no_client", "enrich_unit": "skipped_no_client",
+        # semantic Task 5: adjudication is an LLM stage end to end, so no client = honestly skipped.
+        "semantic_adjudication": "skipped_no_client",
         "graph_persistence": "succeeded",
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
+        "table_display_reprojection": "succeeded",             # tail re-projection (Seam 5a)
         "entity_bridges": "disabled",                          # OVERLAY_ENTITY_BRIDGES off
         "semantic_binding_candidates": "disabled",             # OVERLAY_SEMANTIC_BINDING_* off
         "semantic_binding_proposals": "disabled",
@@ -94,6 +101,7 @@ def test_successful_upload_records_all_stages_in_order(db):
         "join_drift": "disabled",
         "stamp_reconcile": "succeeded",
         "axis_projection": "succeeded",
+        "tie_break_warming": "skipped_no_client",   # Task 2b: no client in this fixture — honest skip
         "quarantine": "succeeded"}
     assert _report(rec, "fact_assertion").detail == {"asserted": 2}   # grain + availability_time
     assert _report(rec, "drift").detail == {"changed_objects": 0}
@@ -110,8 +118,9 @@ def test_stages_that_ran_carry_started_at(db):
                         stage_recorder=rec)
     assert res.status == "ingested"
     ran = {"validation", "brake", "fact_assertion", "drift", "graph_persistence",
-           "projection_drain", "table_fact_projection", "join_projection",
-           "semantic_binding_projection", "stamp_reconcile", "axis_projection", "quarantine"}
+           "table_display_reprojection", "projection_drain", "table_fact_projection",
+           "join_projection", "semantic_binding_projection", "stamp_reconcile",
+           "axis_projection", "quarantine"}
     for r in rec.reports:
         if r.stage in ran:
             assert r.started_at is not None, r.stage
@@ -131,7 +140,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 28
+    assert len(rec.reports) == 31
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -179,7 +188,23 @@ def test_partial_enrichment_records_partial_not_succeeded(db, monkeypatch):
     assert res.status == "ingested"
     concept = _report(rec, "enrich_concept")
     assert concept.state == "partial"                        # NOT succeeded — 1 of 2 items failed
-    assert concept.detail == {"resolved": 1, "expected": 2, "unresolved": 1}
+    assert concept.reason_code == "items_failed"
+    # Task 9c attached the run's diagnostic account to the stage detail. Still pinned EXACTLY (a
+    # subset assertion would let a wrong key through unnoticed) — only the vocabulary fingerprint
+    # is pinned by shape, because it is a hash of the live concept registry.
+    detail = dict(concept.detail)
+    fingerprint = detail.pop("vocab_fingerprint", None)
+    assert isinstance(fingerprint, str) and fingerprint      # WHICH registry generation judged this
+    assert detail == {
+        "resolved": 1, "expected": 2, "unresolved": 1,
+        # The evidence writer never ran at all: a technical upload has no glossary, so there is no
+        # schema-preserving ref to key `field_evidence` on. Previously invisible — the stage
+        # reported a clean count of drafted values and said nothing about storing none of them.
+        "evidence": {"writer": "not_run:no_glossary"},
+        # The join-candidacy axis, before and after acceptance. `monetary_stock` is not an
+        # identifier concept, so it carries no namespace and lands in the `-` bucket.
+        "namespaces": {"before_critic": {"-": 1}, "after_critic": {"-": 1}},
+    }
     assert _report(rec, "enrich_definition").state == "succeeded"
     assert _report(rec, "enrich_domain").state == "succeeded"
 
@@ -273,8 +298,12 @@ _ALL_INGEST_STAGES = [
     "enrich_concept", "enrich_concept_critic",
     "enrich_definition", "enrich_domain", "enrich_synonyms",
     "enrich_unit",
+    # semantic Task 5 — targeted adjudication, between the Pass-A stages it reasons over and the
+    # graph persistence that must carry its corrections.
+    "semantic_adjudication",
     "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+    "table_display_reprojection",
     "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
     "table_fact_projection", "entity_bridges", "join_projection",
     "semantic_binding_projection", "join_drift",

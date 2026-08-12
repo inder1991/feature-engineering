@@ -1,0 +1,1454 @@
+{
+ "manifest": "legacy-use-case-audit-manifest",
+ "version": "1",
+ "note": "Reviewed migration evidence for the 107 legacy Template.use_cases tags. Crosswalk columns come from the reviewed LEGACY_TAG_CROSSWALK; the proposed_canonical_use_case column stays the explicit UNRESOLVED marker until a later human/LLM pass passes the canonical registry validator. No legacy string is ever silently converted into a canonical use-case ID.",
+ "rows": [
+  {
+   "legacy_tag": "account_takeover",
+   "template_ids": [
+    "cross_channel_rail_anomaly",
+    "device_sharing_velocity",
+    "geo_velocity_impossible",
+    "new_device_flag",
+    "txn_velocity_spike"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "fraud.account_takeover",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "affordability",
+   "template_ids": [
+    "dscr_covenant_headroom",
+    "payment_ratio",
+    "salary_signal"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.underwriting.affordability",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "alm",
+   "template_ids": [
+    "contractual_deposit_maturity_profile",
+    "deposit_beta",
+    "early_withdrawal_break",
+    "hot_money_share",
+    "hqla_eligibility_contribution",
+    "islamic_deposit_beta",
+    "lagged_net_interest_flow",
+    "lcr_outflow_weight",
+    "maturity_ladder_runoff",
+    "nmd_stickiness",
+    "nsfr_asf_contribution",
+    "rate_sensitive_concentration",
+    "repricing_gap_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "treasury_alm",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "aml",
+   "template_ids": [
+    "amount_just_under_limit",
+    "cash_intensity_ratio",
+    "cross_border_burst",
+    "crypto_offramp_exposure",
+    "dormant_reactivation",
+    "fan_in_fan_out",
+    "high_risk_corridor_exposure",
+    "nested_correspondent_flow",
+    "prior_alert_recidivism",
+    "rapid_movement_passthrough",
+    "round_amount_ratio",
+    "screening_exposure",
+    "structuring_smurfing"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "app_scam",
+   "template_ids": [
+    "first_time_payee_high_value"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "fraud.app_scam",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "asset_management",
+   "template_ids": [
+    "aum_stability",
+    "expense_ratio_competitiveness",
+    "mandate_breach_proximity",
+    "net_fund_flow_trend",
+    "performance_vs_benchmark",
+    "redemption_liquidity_coverage",
+    "share_class_flow_mix",
+    "tracking_error_breach_proximity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "aum_stability",
+   "template_ids": [
+    "aum_stability"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.redemption.aum_stability",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "authorised_push_payment",
+   "template_ids": [
+    "first_time_payee_high_value"
+   ],
+   "crosswalk_dimension": "typology",
+   "crosswalk_target": "app_scam",
+   "crosswalk_status": "merged",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "bancassurance",
+   "template_ids": [
+    "bancassurance_cross_hold",
+    "sum_assured_adequacy"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.bancassurance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "basis_risk",
+   "template_ids": [
+    "benchmark_basis_dislocation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "markets.market_risk.basis_risk",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "campaign_analytics",
+   "template_ids": [
+    "campaign_response_recency"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.campaign",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "card_fraud",
+   "template_ids": [
+    "amount_zscore_spike",
+    "card_testing_velocity",
+    "merchant_risk_anomaly",
+    "txn_velocity_spike"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "fraud.card_fraud",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cash_management",
+   "template_ids": [
+    "pooling_structure_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "treasury_alm.cash_management",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cashflow",
+   "template_ids": [
+    "inflow_outflow_ratio"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.relationship_attrition.churn",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cashflow_risk",
+   "template_ids": [
+    "balance_volatility"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.relationship_attrition.churn",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "claims",
+   "template_ids": [
+    "claims_fraud_typology",
+    "claims_frequency_severity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.claims",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "claims_fraud",
+   "template_ids": [
+    "claims_fraud_typology"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.claims.claims_fraud",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "climate_risk",
+   "template_ids": [
+    "carbon_intensity_trajectory",
+    "emissions_data_quality_reliance",
+    "emissions_trend_by_scope",
+    "financed_emissions_attribution",
+    "physical_hazard_exposure",
+    "scope3_value_chain_exposure",
+    "taxonomy_alignment_share",
+    "transition_alignment_gap"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "esg.climate",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "clv",
+   "template_ids": [
+    "clv_revenue_trajectory",
+    "household_relationship_value",
+    "next_best_product_propensity",
+    "relationship_deepening_breadth",
+    "rfm_composite",
+    "share_of_wallet_growth"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.clv",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "collections",
+   "template_ids": [
+    "cost_to_collect_ratio",
+    "cure_reage_dynamics",
+    "days_in_collection",
+    "days_past_due_max",
+    "delinquency_bucket_dynamics",
+    "dormancy_days",
+    "hardship_forbearance_in_collection",
+    "missed_partial_payment_count",
+    "payment_plan_adherence",
+    "promise_to_pay_adherence",
+    "return_payment_rate",
+    "right_party_contact_intensity",
+    "roll_forward_severity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.collections",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "concentration_risk",
+   "template_ids": [
+    "book_desk_concentration",
+    "group_exposure_aggregation",
+    "guarantor_reliance",
+    "rate_sensitive_concentration",
+    "sukuk_concentration",
+    "syndication_concentration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "portfolio_risk.concentration",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "contactability",
+   "template_ids": [
+    "right_party_contact_intensity"
+   ],
+   "crosswalk_dimension": "metadata",
+   "crosswalk_target": "customer_state",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "corporate_actions",
+   "template_ids": [
+    "corporate_action_complexity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services.custody.corporate_actions",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "correspondent_banking",
+   "template_ids": [
+    "nested_correspondent_flow"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft.correspondent",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cost_efficiency",
+   "template_ids": [
+    "cost_to_collect_ratio"
+   ],
+   "crosswalk_dimension": "business_outcome",
+   "crosswalk_target": "cost_efficiency",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "counterparty_risk",
+   "template_ids": [
+    "counterparty_deterioration_ewi",
+    "counterparty_exposure_trend",
+    "margin_call_intensity",
+    "notional_netting_exposure",
+    "reinsurance_recoverable_concentration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "counterparty_risk",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "credit_mitigation",
+   "template_ids": [
+    "guarantor_reliance"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.monitoring.credit_mitigation",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "credit_risk",
+   "template_ids": [
+    "bureau_inquiry_velocity",
+    "bureau_score_delta",
+    "counterparty_deterioration_ewi",
+    "credit_utilisation",
+    "days_past_due_max",
+    "delinquency_bucket_dynamics",
+    "dscr_covenant_headroom",
+    "ecl_provision_trend",
+    "exposure_trend",
+    "forbearance_in_window",
+    "loan_to_value",
+    "min_payment_only_streak",
+    "missed_partial_payment_count",
+    "murabaha_installment_behaviour",
+    "new_trade_line_count",
+    "payment_ratio",
+    "sicr_onset",
+    "stage_migration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "credit_seasoning",
+   "template_ids": [
+    "tenure_days"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.underwriting.seasoning",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cross_border",
+   "template_ids": [
+    "corridor_cross_border_share"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "payments.cross_border",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "cross_sell",
+   "template_ids": [
+    "bancassurance_cross_hold",
+    "campaign_response_recency",
+    "channel_adoption_depth",
+    "clv_revenue_trajectory",
+    "household_relationship_value",
+    "next_best_product_propensity",
+    "product_breadth",
+    "product_gap_whitespace",
+    "relationship_deepening_breadth",
+    "rfm_composite",
+    "segment_relative_penetration",
+    "share_of_wallet_growth",
+    "tenure_upsell_readiness",
+    "txn_frequency_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.cross_sell",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "crypto",
+   "template_ids": [
+    "crypto_offramp_exposure"
+   ],
+   "crosswalk_dimension": "product_context",
+   "crosswalk_target": "crypto_assets",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "custody",
+   "template_ids": [
+    "corporate_action_complexity",
+    "custody_holding_dynamics",
+    "fail_ageing_buckets",
+    "matching_break_rate",
+    "nav_strike_timeliness",
+    "pre_settlement_aging",
+    "sec_lending_utilisation",
+    "settlement_fail_rate"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services.custody",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "data_quality",
+   "template_ids": [
+    "emissions_data_quality_reliance"
+   ],
+   "crosswalk_dimension": "measure",
+   "crosswalk_target": "data_quality",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "deposit_attrition",
+   "template_ids": [
+    "balance_trend",
+    "external_own_transfer_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.relationship_attrition.deposit_attrition",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "deposit_stability",
+   "template_ids": [
+    "contractual_deposit_maturity_profile",
+    "deposit_beta",
+    "early_withdrawal_break",
+    "hot_money_share",
+    "islamic_deposit_beta",
+    "maturity_ladder_runoff",
+    "nmd_stickiness",
+    "rate_sensitive_concentration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "treasury_alm.deposit_stability",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "distribution",
+   "template_ids": [
+    "share_class_flow_mix"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "early_warning",
+   "template_ids": [
+    "balance_trend",
+    "bureau_inquiry_velocity",
+    "bureau_score_delta",
+    "counterparty_deterioration_ewi",
+    "covenant_headroom_breach",
+    "credit_utilisation",
+    "cross_product_stress_count",
+    "days_past_due_max",
+    "dscr_covenant_headroom",
+    "exposure_trend",
+    "forbearance_in_window",
+    "min_payment_only_streak",
+    "missed_partial_payment_count",
+    "new_trade_line_count",
+    "payment_ratio",
+    "roll_forward_severity",
+    "stage_migration",
+    "trade_cycle_working_capital"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.early_warning",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "engagement",
+   "template_ids": [
+    "channel_adoption_depth",
+    "dormancy_days",
+    "txn_frequency_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.engagement",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "esg_scoring",
+   "template_ids": [
+    "carbon_intensity_trajectory",
+    "emissions_data_quality_reliance",
+    "emissions_trend_by_scope",
+    "financed_emissions_attribution",
+    "physical_hazard_exposure",
+    "scope3_value_chain_exposure",
+    "sll_kpi_achievement",
+    "taxonomy_alignment_share",
+    "transition_alignment_gap"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "esg.scoring",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "exposure_management",
+   "template_ids": [
+    "notional_netting_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "counterparty_risk.exposure_monitoring",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "financial_crime",
+   "template_ids": [
+    "amount_just_under_limit",
+    "amount_zscore_spike",
+    "card_testing_velocity",
+    "cash_intensity_ratio",
+    "claims_fraud_typology",
+    "cross_border_burst",
+    "cross_channel_rail_anomaly",
+    "crypto_offramp_exposure",
+    "device_sharing_velocity",
+    "dormant_reactivation",
+    "fan_in_fan_out",
+    "first_time_payee_high_value",
+    "geo_velocity_impossible",
+    "high_risk_corridor_exposure",
+    "merchant_risk_anomaly",
+    "nested_correspondent_flow",
+    "new_device_flag",
+    "prior_alert_recidivism",
+    "rapid_movement_passthrough",
+    "round_amount_ratio",
+    "screening_exposure",
+    "structuring_smurfing",
+    "txn_velocity_spike"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "financial_crime",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "fraud",
+   "template_ids": [
+    "amount_just_under_limit",
+    "amount_zscore_spike",
+    "card_testing_velocity",
+    "chargeback_dispute_rate",
+    "cross_border_burst",
+    "cross_channel_rail_anomaly",
+    "device_sharing_velocity",
+    "first_time_payee_high_value",
+    "geo_velocity_impossible",
+    "merchant_mcc_diversity",
+    "merchant_risk_anomaly",
+    "new_device_flag",
+    "txn_velocity_spike"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "fraud",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "frtb",
+   "template_ids": [
+    "position_var_risk"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "frtb",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "ftp",
+   "template_ids": [
+    "deposit_beta",
+    "lagged_net_interest_flow",
+    "nmd_stickiness"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "ftp",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "fund_administration",
+   "template_ids": [
+    "nav_strike_timeliness"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services.fund_administration",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "fund_flows",
+   "template_ids": [
+    "net_fund_flow_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.redemption.fund_flows",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "fund_liquidity",
+   "template_ids": [
+    "redemption_liquidity_coverage"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.redemption.fund_liquidity",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "fund_performance",
+   "template_ids": [
+    "performance_vs_benchmark"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.performance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "hardship",
+   "template_ids": [
+    "days_below_threshold",
+    "hardship_forbearance_in_collection",
+    "policy_loan_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.collections.hardship",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "ifrs9_staging",
+   "template_ids": [
+    "delinquency_bucket_dynamics",
+    "ecl_provision_trend",
+    "forbearance_in_window",
+    "loan_to_value",
+    "sicr_onset",
+    "stage_migration"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "ifrs9",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "insurance",
+   "template_ids": [
+    "bancassurance_cross_hold",
+    "claims_fraud_typology",
+    "claims_frequency_severity",
+    "missed_premium_streak",
+    "mortality_morbidity_loading",
+    "policy_loan_utilisation",
+    "premium_payment_irregularity",
+    "reinsurance_recoverable_concentration",
+    "sum_assured_adequacy",
+    "surrender_value_trajectory"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "interchange_optimisation",
+   "template_ids": [
+    "interchange_revenue",
+    "merchant_discount_economics"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "payments.merchant.interchange",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "irrbb",
+   "template_ids": [
+    "greek_sensitivity_exposure",
+    "repricing_gap_exposure"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "irrbb",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "islamic_banking",
+   "template_ids": [
+    "islamic_deposit_beta",
+    "murabaha_installment_behaviour",
+    "profit_rate_exposure",
+    "profit_sharing_split_behaviour",
+    "prohibited_activity_exposure_share",
+    "purification_ratio",
+    "sukuk_concentration",
+    "takaful_contribution_behaviour"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "islamic.banking",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "kyc",
+   "template_ids": [
+    "screening_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft.kyc",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "lapse_risk",
+   "template_ids": [
+    "missed_premium_streak",
+    "policy_loan_utilisation",
+    "premium_payment_irregularity",
+    "surrender_value_trajectory",
+    "takaful_contribution_behaviour"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.lapse",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "lcr",
+   "template_ids": [
+    "hqla_eligibility_contribution",
+    "lcr_outflow_weight"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "lcr",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "lgd",
+   "template_ids": [
+    "recovery_rate",
+    "write_off_severity"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "lgd",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "limit_management",
+   "template_ids": [
+    "credit_utilisation",
+    "exposure_trend",
+    "facility_utilisation_headroom",
+    "group_exposure_aggregation",
+    "lc_guarantee_rollover",
+    "loan_to_value",
+    "obligor_facility_count",
+    "syndication_concentration",
+    "trading_limit_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.monitoring.limit_management",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "liquidity_risk",
+   "template_ids": [
+    "contractual_deposit_maturity_profile",
+    "deposit_beta",
+    "early_withdrawal_break",
+    "hot_money_share",
+    "hqla_eligibility_contribution",
+    "lcr_outflow_weight",
+    "maturity_ladder_runoff",
+    "nsfr_asf_contribution",
+    "pooling_structure_utilisation",
+    "rate_sensitive_concentration",
+    "repricing_gap_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "treasury_alm.liquidity",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "mandate_compliance",
+   "template_ids": [
+    "mandate_breach_proximity",
+    "tracking_error_breach_proximity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.mandate_compliance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "margin",
+   "template_ids": [
+    "margin_call_intensity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "counterparty_risk.margin_call_risk",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "market_risk",
+   "template_ids": [
+    "benchmark_basis_dislocation",
+    "book_desk_concentration",
+    "counterparty_exposure_trend",
+    "greek_sensitivity_exposure",
+    "margin_call_intensity",
+    "notional_netting_exposure",
+    "position_var_risk",
+    "trading_limit_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "markets.market_risk",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "merchant_analytics",
+   "template_ids": [
+    "authorisation_decline_rate",
+    "chargeback_dispute_rate",
+    "corridor_cross_border_share",
+    "interchange_revenue",
+    "merchant_discount_economics",
+    "merchant_mcc_diversity",
+    "purpose_code_diversity",
+    "rail_scheme_diversity",
+    "rail_volume_value"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "payments.merchant",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "next_best_action",
+   "template_ids": [
+    "campaign_response_recency",
+    "channel_adoption_depth",
+    "next_best_product_propensity",
+    "product_gap_whitespace",
+    "segment_relative_penetration",
+    "tenure_upsell_readiness"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.cross_sell.next_best_action",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "nsfr",
+   "template_ids": [
+    "nsfr_asf_contribution"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "nsfr",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "overdraft_propensity",
+   "template_ids": [
+    "days_below_threshold"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.overdraft_propensity",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "payments",
+   "template_ids": [
+    "authorisation_decline_rate",
+    "chargeback_dispute_rate",
+    "corridor_cross_border_share",
+    "interchange_revenue",
+    "merchant_discount_economics",
+    "purpose_code_diversity",
+    "rail_scheme_diversity",
+    "rail_volume_value",
+    "return_payment_rate",
+    "settlement_lag"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "payments",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "payments_ops",
+   "template_ids": [
+    "authorisation_decline_rate",
+    "rail_volume_value",
+    "return_payment_rate",
+    "settlement_lag"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "payments.operations",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "persistency",
+   "template_ids": [
+    "missed_premium_streak",
+    "premium_payment_irregularity",
+    "surrender_value_trajectory"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.lapse.persistency",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "physical_risk",
+   "template_ids": [
+    "physical_hazard_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "esg.climate.physical",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "portfolio_risk",
+   "template_ids": [
+    "mandate_breach_proximity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "portfolio_risk",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "pricing",
+   "template_ids": [
+    "claims_frequency_severity",
+    "clv_revenue_trajectory",
+    "expense_ratio_competitiveness",
+    "mortality_morbidity_loading",
+    "profit_rate_exposure",
+    "tenure_days",
+    "tenure_upsell_readiness"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "pricing",
+   "crosswalk_status": "deprecated",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "primacy_loss",
+   "template_ids": [
+    "external_own_transfer_trend",
+    "salary_signal"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.relationship_attrition.primacy_loss",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "receivables_finance",
+   "template_ids": [
+    "invoice_finance_dynamics"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "corporate_trade.receivables_finance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "recoveries",
+   "template_ids": [
+    "cost_to_collect_ratio",
+    "cure_reage_dynamics",
+    "days_in_collection",
+    "hardship_forbearance_in_collection",
+    "payment_plan_adherence",
+    "promise_to_pay_adherence",
+    "recovery_rate",
+    "right_party_contact_intensity",
+    "roll_forward_severity",
+    "write_off_severity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.collections.recoveries",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "redemption_risk",
+   "template_ids": [
+    "aum_stability",
+    "expense_ratio_competitiveness",
+    "net_fund_flow_trend",
+    "performance_vs_benchmark",
+    "redemption_liquidity_coverage",
+    "share_class_flow_mix"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "asset_management.redemption",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "reinsurance",
+   "template_ids": [
+    "reinsurance_recoverable_concentration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.reinsurance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "retail_churn",
+   "template_ids": [
+    "balance_trend",
+    "balance_volatility",
+    "days_below_threshold",
+    "dd_cancellation_rate",
+    "dormancy_days",
+    "external_own_transfer_trend",
+    "inflow_outflow_ratio",
+    "product_breadth",
+    "rfm_composite",
+    "salary_signal",
+    "tenure_days",
+    "txn_frequency_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.relationship_attrition.churn",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "sanctions",
+   "template_ids": [
+    "high_risk_corridor_exposure",
+    "screening_exposure"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft.sanctions",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "screening",
+   "template_ids": [
+    "prohibited_activity_exposure_share"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft.screening",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "securities_lending",
+   "template_ids": [
+    "sec_lending_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services.securities_lending",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "securities_services",
+   "template_ids": [
+    "corporate_action_complexity",
+    "custody_holding_dynamics",
+    "fail_ageing_buckets",
+    "matching_break_rate",
+    "nav_strike_timeliness",
+    "pre_settlement_aging",
+    "sec_lending_utilisation",
+    "settlement_fail_rate"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "segmentation",
+   "template_ids": [
+    "purpose_code_diversity",
+    "rail_scheme_diversity",
+    "rfm_composite"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.segmentation",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "self_cure",
+   "template_ids": [
+    "cure_reage_dynamics",
+    "payment_plan_adherence",
+    "promise_to_pay_adherence"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.collections.self_cure",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "settlement_risk",
+   "template_ids": [
+    "fail_ageing_buckets",
+    "matching_break_rate",
+    "pre_settlement_aging",
+    "settlement_fail_rate"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "securities_services.custody.settlement_failure_risk",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "share_of_wallet",
+   "template_ids": [
+    "bancassurance_cross_hold",
+    "household_relationship_value",
+    "product_breadth",
+    "relationship_deepening_breadth",
+    "share_of_wallet_growth"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.cross_sell.share_of_wallet",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "sharia_compliance",
+   "template_ids": [
+    "islamic_deposit_beta",
+    "murabaha_installment_behaviour",
+    "profit_rate_exposure",
+    "profit_sharing_split_behaviour",
+    "prohibited_activity_exposure_share",
+    "purification_ratio",
+    "sukuk_concentration",
+    "takaful_contribution_behaviour"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "islamic.sharia_compliance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "sme_credit",
+   "template_ids": [
+    "balance_volatility",
+    "inflow_outflow_ratio"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.underwriting.sme",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "structuring",
+   "template_ids": [
+    "amount_just_under_limit",
+    "structuring_smurfing"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "aml_cft.structuring",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "supply_chain_finance",
+   "template_ids": [
+    "lc_guarantee_rollover",
+    "supply_chain_finance_dynamics"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "corporate_trade.supply_chain_finance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "surrender",
+   "template_ids": [
+    "surrender_value_trajectory"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "insurance.lapse.surrender",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "sustainable_finance",
+   "template_ids": [
+    "sll_kpi_achievement"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "esg.scoring",
+   "crosswalk_status": "merged",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "synthetic_id",
+   "template_ids": [
+    "device_sharing_velocity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "fraud.synthetic_id",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "tracking_error",
+   "template_ids": [
+    "tracking_error_breach_proximity"
+   ],
+   "crosswalk_dimension": "measure",
+   "crosswalk_target": "tracking_error",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "trade_finance",
+   "template_ids": [
+    "covenant_headroom_breach",
+    "cross_product_stress_count",
+    "facility_utilisation_headroom",
+    "group_exposure_aggregation",
+    "guarantor_reliance",
+    "invoice_finance_dynamics",
+    "lc_guarantee_rollover",
+    "obligor_facility_count",
+    "supply_chain_finance_dynamics",
+    "syndication_concentration",
+    "trade_cycle_working_capital"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "corporate_trade.trade_finance",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "trading_risk",
+   "template_ids": [
+    "benchmark_basis_dislocation",
+    "greek_sensitivity_exposure",
+    "position_var_risk",
+    "trading_limit_utilisation"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "markets.market_risk",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "transaction_monitoring",
+   "template_ids": [
+    "amount_just_under_limit",
+    "amount_zscore_spike",
+    "card_testing_velocity",
+    "cash_intensity_ratio",
+    "cross_border_burst",
+    "cross_channel_rail_anomaly",
+    "crypto_offramp_exposure",
+    "device_sharing_velocity",
+    "dormant_reactivation",
+    "fan_in_fan_out",
+    "first_time_payee_high_value",
+    "geo_velocity_impossible",
+    "high_risk_corridor_exposure",
+    "merchant_risk_anomaly",
+    "nested_correspondent_flow",
+    "new_device_flag",
+    "prior_alert_recidivism",
+    "rapid_movement_passthrough",
+    "round_amount_ratio",
+    "screening_exposure",
+    "structuring_smurfing",
+    "txn_velocity_spike"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "financial_crime",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "transition_risk",
+   "template_ids": [
+    "carbon_intensity_trajectory",
+    "emissions_trend_by_scope",
+    "financed_emissions_attribution",
+    "scope3_value_chain_exposure",
+    "sll_kpi_achievement",
+    "taxonomy_alignment_share",
+    "transition_alignment_gap"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "esg.climate.transition",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "unbundling",
+   "template_ids": [
+    "dd_cancellation_rate"
+   ],
+   "crosswalk_dimension": "journey_stage",
+   "crosswalk_target": "unbundling",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "underwriting",
+   "template_ids": [
+    "mortality_morbidity_loading",
+    "sum_assured_adequacy"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.underwriting",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "wealth_outflow",
+   "template_ids": [
+    "external_own_transfer_trend"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "wealth.asset_outflow",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "whitespace",
+   "template_ids": [
+    "product_gap_whitespace",
+    "segment_relative_penetration"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "customer.cross_sell.whitespace",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "working_capital",
+   "template_ids": [
+    "covenant_headroom_breach",
+    "cross_product_stress_count",
+    "facility_utilisation_headroom",
+    "invoice_finance_dynamics",
+    "pooling_structure_utilisation",
+    "supply_chain_finance_dynamics",
+    "trade_cycle_working_capital"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "corporate_trade.working_capital",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "workout",
+   "template_ids": [
+    "recovery_rate",
+    "write_off_severity"
+   ],
+   "crosswalk_dimension": "use_case",
+   "crosswalk_target": "credit.collections.workout",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  },
+  {
+   "legacy_tag": "xva",
+   "template_ids": [
+    "counterparty_exposure_trend"
+   ],
+   "crosswalk_dimension": "modelling_context",
+   "crosswalk_target": "xva",
+   "crosswalk_status": "mapped",
+   "proposed_canonical_use_case": "UNRESOLVED"
+  }
+ ]
+}

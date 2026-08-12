@@ -253,6 +253,11 @@ def _build_view(conn: DbConn, key: str, want_source: str,
         "ingestion_run_id": provenance.get("ingestion_run_id"),
         "attempt_no": provenance.get("attempt_no"),
         "reviewer_note": _latest_reviewer_note(stream),
+        # SOURCE-provenance four-eyes input (program-audit F2): the uploading human recorded on the
+        # SERVICE proposal. Exposed so queue surfaces can PROJECT the uploader bar into
+        # `available_actions` instead of advertising a confirm the execute path will 409 — the
+        # exact confusion the 2026-08-10 currency review hit.
+        "source_uploader": payload0.get("source_uploader"),
         "available_actions": list(
             _ACTIONS_VERIFIED if status == "VERIFIED" else _ACTIONS_PENDING),
     }

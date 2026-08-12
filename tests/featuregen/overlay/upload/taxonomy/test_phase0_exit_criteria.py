@@ -95,20 +95,21 @@ def test_g3_use_case_targets_left_the_dimension_vocabularies():
 
 
 def test_remapped_recipes_land_on_precise_leaves_not_closest_fit():
-    # Taxonomy patch: the three precise leaves each carry their recipe as PRIMARY, and the vacated
-    # closest-fit leaf no longer lists that recipe (the old mapping is an audit record only, not coverage).
+    # Taxonomy patch, carried through the BR-17 cutover: the precise leaves carry the V2
+    # replacements as PRIMARY (the claims family's atoms, the loading spec's recipe, custody
+    # holdings), and the vacated closest-fit leaves list none of them.
     by_leaf = coverage_report()["by_leaf"]
-    assert "claims_frequency_severity" in by_leaf["insurance.actuarial.claims_cost_modelling"]
-    assert "claims_frequency_severity" not in by_leaf["insurance.claims.claims_fraud"]
+    assert "claim_count" in by_leaf["insurance.actuarial.claims_cost_modelling"]
+    assert "claim_count" not in by_leaf["insurance.claims.claims_fraud"]
     assert ("mortality_morbidity_loading"
             in by_leaf["insurance.underwriting.mortality_morbidity_risk_assessment"])
     assert "mortality_morbidity_loading" not in by_leaf["insurance.reinsurance"]
     assert "custody_holding_dynamics" in by_leaf["securities_services.custody.holdings_dynamics"]
-    # The renamed settlement leaf carries the 4 settlement recipes; the old id is gone from coverage.
+    # The renamed settlement leaf carries the settlement recipes; the old id is gone from coverage.
     assert "securities_services.custody.settlement" not in by_leaf
     fail = by_leaf["securities_services.custody.settlement_failure_risk"]
     for rid in ("matching_break_rate", "pre_settlement_aging",
-                "settlement_fail_rate", "fail_ageing_buckets"):
+                "settlement_fail_rate", "settlement_fail_count"):
         assert rid in fail, rid
 
 
@@ -141,8 +142,14 @@ def test_release_objectives_have_explicit_primary_recipe_coverage():
         assert report["coverage_quality_tier_by_leaf"][leaf] == "MINIMUM_ANCHOR"
 
 
-def test_every_active_leaf_has_effective_discovery_coverage():
+def test_every_active_leaf_is_covered_or_scheduled():
+    """BR-17 superseded the Phase-0 "no active leaf uncovered" pin: coverage now reads the
+    ACTIVE V2 registry, whose honest gaps are SCHEDULED debt — every zero-effective leaf must
+    hold a backlog row naming its owning expansion pack, and the report's key mirrors hold."""
+    from featuregen.overlay.upload.taxonomy.coverage_cli import load_coverage_targets
+
     report = coverage_report()
-    assert report["active_zero_effective"] == []
+    backlog = {row["leaf"] for row in load_coverage_targets()["backlog"]}
+    assert set(report["active_zero_effective"]) <= backlog
     assert report["primary_by_leaf"] == report["by_leaf"]
     assert report["supporting_by_leaf"] == report["secondary_by_leaf"]
