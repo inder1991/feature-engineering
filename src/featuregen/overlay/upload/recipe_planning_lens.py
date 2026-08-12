@@ -273,8 +273,51 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
     return tuple(candidates)
 
 
+def llm_intent_candidates(conn, client, *, context, scope_leaves,
+                          redacted_hypothesis: str, actor=None):
+    """SE-6 wire-up — LLM intents through the SAME engine as recipes: one audited structured
+    call proposes ABSTRACT intents (concepts, operand classes, temporal contracts — never
+    physical refs), each adapts to the neutral planning request, and the SHARED capability
+    binder decides WHICH columns serve. Returns (candidates, rejections): candidates in the
+    same V2RecipeCandidateV1 carrier the recipe lens emits, so assembly merges recipe/LLM
+    twins by semantic signature and the projection serves both origin-blind. Deterministic
+    intents project as conceptual_pattern ("formula pending") — the structural readiness
+    ceiling; no temporal PIT text is claimed (nothing was compiled from an authored recipe)."""
+    from featuregen.overlay.upload.feature_intent_generation import generate_feature_intents
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_feature_intent,
+        planning_request_hash,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    result = generate_feature_intents(
+        conn, client, context=context, scope_leaves=scope_leaves,
+        redacted_hypothesis=redacted_hypothesis, actor=actor)
+    candidates = []
+    rejections = [dict(r) for r in result.rejections]
+    for intent in result.intents:
+        request = planning_request_from_feature_intent(intent)
+        verdicts, eligibility = bind_planning_request(conn, request, context)
+        candidates.append(V2RecipeCandidateV1(
+            recipe_id=request.source_definition_id,
+            relationship="primary",
+            planning_request=request,
+            planning_request_hash=planning_request_hash(request),
+            recipe_revision_hash=request.source_content_hash,
+            verdicts=verdicts,
+            binding_state=fold_binding_state(verdicts, request),
+            readiness="CONCEPTUAL_ONLY",
+            temporal_pit_text="",
+            temporal_blocker="",
+            review_current=False,
+            review_missing_roles=(),
+            eligibility=eligibility,
+            dataset_story=fold_dataset_story(request, verdicts, context)))
+    return tuple(candidates), rejections
+
+
 __all__ = [
     "BINDING_STATES", "DatasetStoryV1", "V2ApplicabilityResult", "V2RecipeCandidateV1",
-    "fold_binding_state", "fold_dataset_story", "v2_applicability",
+    "fold_binding_state", "fold_dataset_story", "llm_intent_candidates", "v2_applicability",
     "v2_applicability_as_result", "v2_recipe_candidates",
 ]

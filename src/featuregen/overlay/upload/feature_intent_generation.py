@@ -20,7 +20,10 @@ from dataclasses import dataclass
 from featuregen.overlay.upload.feature_intent import FeatureIntentV1, parse_feature_intent
 from featuregen.overlay.upload.feature_planning_contracts import PlanningContractError
 from featuregen.overlay.upload.generation_semantic_context import GenerationSemanticContextV1
-from featuregen.overlay.upload.recipe_contract_v2 import RESULT_CLASS_ADDITIVITY
+from featuregen.overlay.upload.recipe_contract_v2 import (
+    RESULT_CLASS_ADDITIVITY,
+    RecipeContractError,
+)
 
 FEATURE_INTENT_TASK = "overlay.feature.intents"
 FEATURE_INTENT_PROMPT_ID = "feature_intents"
@@ -129,7 +132,11 @@ def generate_feature_intents(conn, client, *, context: GenerationSemanticContext
         doc = {**item, "generation_provenance": dict(provenance)}   # OURS, always — overwrite
         try:
             intent = parse_feature_intent(doc)
-        except PlanningContractError as error:   # FeatureIntentError AND the nested operand/
+        # FeatureIntentError + nested operand/output/temporal validation share the
+        # PlanningContractError base; the typed spec constructors (OutputSpecV2 et al) raise
+        # RecipeContractError. BOTH are per-item facts about ONE proposed intent — a malformed
+        # unit_kind must reject that item, never kill the batch.
+        except (PlanningContractError, RecipeContractError) as error:
                                                  # output validators' refusals — one shared base
 
             rejections.append({"index": index, "code": INTENT_REJECTED_PARSE,

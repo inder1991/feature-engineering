@@ -881,13 +881,39 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         v2_candidates = v2_recipe_candidates(
             conn, catalog_source=catalog_source, roles=roles, scope=scope,
             context=semantic_context)
+        # SE-6 wire-up: the LLM proposes ABSTRACT intents (one audited structured call over the
+        # physically-blind capability inventory) and the SAME binder decides which columns
+        # serve. Recipe and intent candidates assemble TOGETHER — the semantic signature merges
+        # twins, so an LLM intent that re-derives an authored recipe becomes corroboration on
+        # the recipe's card, never a duplicate. Fail-soft: an intent-generation failure serves
+        # the recipe lens alone (logged), because the engine's recipes never depend on a model.
+        intent_rejections: list = []
+        all_candidates = list(v2_candidates)
+        if client is not None and semantic_context is not None:
+            try:
+                from featuregen.overlay.upload.recipe_planning_lens import (
+                    llm_intent_candidates,
+                )
+
+                intent_cands, intent_rejections = llm_intent_candidates(
+                    conn, client, context=semantic_context,
+                    scope_leaves=(scope.primary, *scope.secondary) if scope.primary
+                                 else (),
+                    redacted_hypothesis=intent.redacted_hypothesis)
+                all_candidates.extend(intent_cands)
+            except Exception:
+                logger.exception("semantic-v1 intent generation failed "
+                                 "(recipe lens serves alone)")
         if semantic_context is not None:
             persist_semantic_candidates(
                 conn, generation_run_id=generation_run_id or "unattributed",
-                context=semantic_context, candidates=v2_candidates)
+                context=semantic_context, candidates=all_candidates)
         projection = project_assembled_set(
-            assemble_candidates(v2_candidates),
+            assemble_candidates(all_candidates),
             catalog_source=catalog_source, target_ref=target_ref)
+        rejections.extend({"name": r.get("detail", "intent"), "reason": r.get("detail", ""),
+                           "code": r.get("code", "INTENT_REJECTED")}
+                          for r in intent_rejections)
         grounded_template_ids = projection.grounded_ids
         rejected_template_ids = projection.rejected_ids
         binding_quality_by_template = projection.binding_by_id

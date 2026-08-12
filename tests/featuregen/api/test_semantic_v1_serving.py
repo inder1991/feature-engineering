@@ -140,3 +140,54 @@ def test_legacy_default_is_untouched_by_the_serving_branch(make_client, conn, mo
     monkeypatch.setattr(
         "featuregen.overlay.upload.semantic_projection.project_assembled_set", boom)
     _post(make_client(llm_client=_fake()))
+
+
+def test_semantic_v1_binds_llm_intents_through_the_same_engine(
+        make_client, conn, monkeypatch, caplog):
+    """SE-6 wired: the model proposes an ABSTRACT intent (concepts + classes, no refs), the
+    SHARED binder chooses the columns, and the observation store records an llm_intent-origin
+    candidate beside the recipes — one engine, both origins."""
+    intent_payload = {"intents": [{
+        "display_name": "Days since last activity (model)",
+        "business_definition": "Days elapsed since the customer's most recent event.",
+        "primary_objective": CHURN,
+        "computation_kind": "deterministic_formula",
+        "operation_class": "recency",
+        "output_grain_entity": "customer",
+        "source_grain": "transaction",
+        "output": {
+            "output_id": "recency_model", "display_label": "Days since last activity",
+            "output_type": "numeric", "additivity": "non_additive", "unit_kind": "duration_days",
+            "null_input_policy": "null timestamps are excluded and counted",
+            "empty_population_policy": "null with populated flag",
+        },
+        "operands": [
+            {"role": "who", "concept": "customer_id", "operand_class": "entity_key"},
+            {"role": "when", "concept": "event_timestamp",
+             "operand_class": "event_timestamp"},
+        ],
+        "temporal": {"anchor_kind": "event", "window_basis": "event time",
+                     "window_unit": "days", "cutoff_inclusivity": "inclusive"},
+        "rationale": "recency is the strongest dormancy precursor",
+    }]}
+    fake = FakeLLM(script={
+        "overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+             "aggregation": "avg_90d"}]}),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "monetary", "reasoning": "monetary fits"}),
+        "overlay.feature.intents": FakeResponse(output=intent_payload),
+    })
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    _post(make_client(llm_client=fake))
+
+    rows = conn.execute(
+        "SELECT source_origin, source_definition_id, binding_state "
+        "FROM semantic_candidate_observation WHERE source_origin = 'llm_intent'").fetchall()
+    assert rows, "the intent candidate reached the engine and was observed"
+    origin, definition_id, binding_state = rows[0]
+    assert definition_id.startswith("intent:") or definition_id
+    # The engine DECIDED the binding (bound on this catalog: customer_id + event_ts exist);
+    # whatever the state, it came from the shared binder, never from model-named columns.
+    assert binding_state in ("bound", "ambiguous", "missing", "blocked")

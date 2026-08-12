@@ -111,13 +111,14 @@ data:
   # off drops to the thin v1 menu.
   FEATUREGEN_FEATURE_CONTEXT: "1"
   # SE-7/SE-14 (semantic-eligibility program): the ONE rollout control — a closed three-value
-  # MODE, not a boolean. semantic_shadow = the user response is UNCHANGED; beside the legacy
-  # lens the semantic engine runs on every considered-set request (frozen context -> capability
-  # binder -> eligibility fold -> assembly), logs divergence, and persists per-candidate
-  # verdicts as append-only semantic_candidate_observation rows (migration 1062). Failures are
-  # savepoint-swallowed. Set 2026-08-12 to accumulate the MEASURED evidence semantic_planning_gate
-  # requires before the semantic_v1 cutover; the cutover DELETES the legacy path and this mode.
-  FEATUREGEN_SEMANTIC_PLANNING: "semantic_shadow"
+  # MODE, not a boolean. CUT OVER 2026-08-13 (user steer: pre-live, bring the functionality UP):
+  # semantic_v1 SERVES — the recipe lens comes from the semantic engine (frozen context ->
+  # capability binder -> eligibility fold -> assembly -> typed gauntlet), legacy template
+  # grounding does not run, dispositions describe the V2 universe, observations persist in the
+  # request transaction, and the direct /features/* generation routes refuse with a typed 409.
+  # One-env-var rollback (semantic_shadow / legacy) while live behavior stabilizes; the mode and
+  # the legacy path are DELETED once it holds.
+  FEATUREGEN_SEMANTIC_PLANNING: "semantic_v1"
   # Task 2 (router plan): tied grounding bindings follow the warmed LLM verdict instead of
   # alphabetical order. Flipped 2026-08-10 after the shadow phase: 20-verdict disagreement report
   # reviewed (9 disagreements, all SME-endorsed — aggregating recipes re-bind to fixed-AED amounts,

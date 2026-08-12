@@ -135,3 +135,20 @@ def test_no_validated_output_is_an_honest_unavailable_never_a_crash(db):
     result, _ = _run(db, {"wrong_shape": True})               # schema-invalid: repair exhausts
     assert result.intents == ()
     assert result.rejections[0]["code"] == INTENT_GENERATION_UNAVAILABLE
+
+
+def test_a_malformed_output_spec_rejects_the_item_never_the_batch(db):
+    """SE-6 wire-up regression: the typed spec constructors raise RecipeContractError (not the
+    PlanningContractError base) — a bad unit_kind on ONE proposed intent must become that
+    item's INTENT_REJECTED_PARSE rejection while a valid sibling still parses."""
+    bad = _wire_intent(output={
+        "output_id": "bad_unit", "display_label": "Bad unit", "output_type": "numeric",
+        "additivity": "additive", "unit_kind": "duration",     # not a closed UNIT_KINDS value
+        "null_input_policy": "nulls excluded and counted",
+        "empty_population_policy": "zero with populated flag",
+    })
+    result, _ = _run(db, {"intents": [bad, _wire_intent()]})
+    assert len(result.intents) == 1                            # the valid sibling survived
+    assert len(result.rejections) == 1
+    assert result.rejections[0]["code"] == "INTENT_REJECTED_PARSE"
+    assert "unit_kind" in result.rejections[0]["detail"]
