@@ -864,7 +864,43 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
     # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
     # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
-    if catalog_source is not None:
+    if catalog_source is not None and semantic_mode == "semantic_v1" and scope is not None:
+        # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
+        # (frozen context → capability binder → eligibility fold → assembly → typed gauntlet),
+        # not from legacy template grounding. One engine, one eligibility policy. The LLM lens
+        # and everything downstream (near-label critic, ordering, recommendation) are unchanged
+        # and origin-blind. Observations persist in the SAME transaction — the audit rows and
+        # the response commit together on the serving path.
+        from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+        from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+        from featuregen.overlay.upload.semantic_candidate_store import (
+            persist_semantic_candidates,
+        )
+        from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+        v2_candidates = v2_recipe_candidates(
+            conn, catalog_source=catalog_source, roles=roles, scope=scope,
+            context=semantic_context)
+        if semantic_context is not None:
+            persist_semantic_candidates(
+                conn, generation_run_id=generation_run_id or "unattributed",
+                context=semantic_context, candidates=v2_candidates)
+        projection = project_assembled_set(
+            assemble_candidates(v2_candidates),
+            catalog_source=catalog_source, target_ref=target_ref)
+        grounded_template_ids = projection.grounded_ids
+        rejected_template_ids = projection.rejected_ids
+        binding_quality_by_template = projection.binding_by_id
+        if projection.ideas:
+            alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
+                projection.ideas,
+                signed_reading["business_domain"] if signed_reading else ())))
+        rejections.extend(projection.rejections)
+        logger.info(
+            "semantic-v1 served: ideas=%d rejections=%d grounded=%s",
+            len(projection.ideas), len(projection.rejections),
+            ",".join(sorted(projection.grounded_ids)) or "-")
+    elif catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
         to_ground = _templates_to_ground(intent, applicability)
