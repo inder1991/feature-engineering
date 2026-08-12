@@ -782,6 +782,16 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
             sum(1 for c in candidates if c.review_current),
             sum(1 for c in candidates if c.temporal_blocker),
             len(grounded_ids), len(rejected_ids), context_hash[:16] or "unassembled")
+        # SE-10 slice 2: assembly runs in shadow too — merge + designed order observed on real
+        # catalogs before anything serves it. Pure fold over the candidates already in hand.
+        from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+
+        assembled = assemble_candidates(candidates)
+        merged = sum(len(a.corroborations) for a in assembled.ranked + assembled.actionable)
+        logger.info(
+            "semantic-shadow assembly: ranked=%d actionable=%d merged_twins=%d top=%s",
+            len(assembled.ranked), len(assembled.actionable), merged,
+            ",".join(a.candidate.recipe_id for a in assembled.ranked[:5]) or "-")
     except Exception:
         logger.exception("semantic-shadow comparison failed (response unaffected)")
 
