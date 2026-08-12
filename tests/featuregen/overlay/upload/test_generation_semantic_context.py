@@ -57,8 +57,9 @@ def test_read_scope_shapes_both_content_and_identity(db):
     assert narrow.context_hash() != wide.context_hash()
 
 
-def test_layer_a_is_exactly_two_queries_regardless_of_width(db):
-    """The rebased SE-2 budget gate: O(fact families), never O(columns)."""
+def test_layer_a_is_exactly_three_queries_regardless_of_width(db):
+    """The rebased SE-2 budget gate: O(fact families), never O(columns). Three families now:
+    columns, the watermark, and the table-level dataset axis (deeper SE-8)."""
     _seed(db)
     calls: list[str] = []
     original = db.execute
@@ -72,7 +73,7 @@ def test_layer_a_is_exactly_two_queries_regardless_of_width(db):
         build_generation_semantic_context(db, catalog_source=SOURCE)
     finally:
         db.execute = original
-    assert len(calls) == 2, calls
+    assert len(calls) == 3, calls
 
 
 # ── SE-2 part 2: the durable seal + kind-dispatched freshness ──────────────────────────────────

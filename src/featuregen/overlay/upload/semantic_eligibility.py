@@ -84,6 +84,9 @@ _RESOLUTIONS: dict[str, str] = {
                              "realization), then regenerate",
     R.CURRENCY_POLICY_MISSING: "declare the currency (fixed code or per-row column) — money "
                                "is refused until it is known",
+    R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW: "this table is declared a SNAPSHOT — it cannot "
+                                            "anchor an event window; bind an event source, or "
+                                            "correct the table's classification",
 }
 
 
@@ -143,6 +146,17 @@ def evaluate_operand(operand: RequiredOperandV1,
     if allowed_families and capability.type_family not in ("unknown", "other") \
             and capability.type_family not in allowed_families:
         codes.append(R.TYPE_INCOMPATIBLE)
+        blocked = True
+
+    # 2b. The dataset axis (deeper SE-8): a table DECLARED (or better) to be a snapshot
+    #     cannot anchor an event window — the plan's own rule, with the matrix deciding what
+    #     counts as declared-or-better. A merely-proposed "snapshot" blocks NOTHING (it may not
+    #     clear an event-source requirement either — the runtime history check owns that case).
+    if (operand.operand_class == "event_timestamp"
+            and capability.table_event_or_snapshot == "snapshot"
+            and AUTHORITY_MATRIX.get(capability.table_event_or_snapshot_authority,
+                                     {}).get("suggestion_at_declared", False)):
+        codes.append(R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW)
         blocked = True
 
     # 3. Economic role: binds ONLY over governed evidence matching it (the binder's own law,

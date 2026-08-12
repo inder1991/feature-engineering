@@ -6,9 +6,9 @@ deterministically, without an LLM, with the honest status: a DIFFERENT MEANING i
 ``not_applicable`` (no action fixes it), a KNOWN contradiction is ``blocked``, and an
 unproven-but-plausible binding stays ``provisional`` with the named action.
 
-Two confusions in the plan's list need the SE-8 dataset axes (event-vs-snapshot TABLE shape;
-current-vs-lifecycle history) and are covered here only in their column-level half — the
-docstrings say so, because a test that silently covers less than its name is how gaps hide.
+The event-vs-snapshot TABLE half is covered since deeper SE-8 (the dataset axis rides the
+capability). The current-vs-lifecycle HISTORY axis stays a runtime question by design — the
+typed gauntlet's EVENT_HISTORY_VERIFICATION names it; no metadata fold can prove depth.
 """
 from __future__ import annotations
 
@@ -32,6 +32,7 @@ def cap(**over) -> ColumnCapabilityV1:
         additivity=None, additivity_authority="absent",
         currency=None, currency_authority="absent",
         economic_role=None, economic_role_authority="absent",
+        table_event_or_snapshot=None, table_event_or_snapshot_authority="absent",
         missing_context=("dataset_profile_absent", "relationship_state_absent",
                          "use_policy_absent"),
         retrieval_text="")
@@ -128,14 +129,58 @@ def test_authorization_status_never_serves_a_settlement_operand():
 
 def test_an_as_of_date_never_anchors_an_event_window():
     """The column half of "a snapshot cannot support an event window": an as-of date's concept
-    is not an event timestamp. (The TABLE half — an event-classified column on a
-    current-only snapshot — needs SE-8's dataset axes and is deliberately not claimed here.)"""
+    is not an event timestamp. (The TABLE half is claimed just below — the dataset axis.)"""
     verdict = evaluate_operand(
         op(role="event_ts", concept="event_timestamp", operand_class="event_timestamp"),
         cap(object_ref="public.customers.business_dt", concept="as_of_date",
             declared_type="date", type_family="temporal", is_as_of=True,
             possible_operand_classes=("as_of_timestamp", "event_timestamp")))
     assert verdict.status == "not_applicable"
+
+
+# ── snapshot date as event anchor: the TABLE half (deeper SE-8's dataset axis) ─────────────────
+
+def test_an_event_column_on_a_declared_snapshot_table_never_anchors_an_event_window():
+    """The plan's own sentence, now enforceable: a genuine event-timestamp COLUMN sitting on a
+    table DECLARED to be a current-only snapshot cannot anchor an event window — the rows are
+    overwritten, so the history the window needs does not exist."""
+    verdict = evaluate_operand(
+        op(role="event_ts", concept="event_timestamp", operand_class="event_timestamp"),
+        cap(object_ref="public.positions.last_txn_ts", concept="event_timestamp",
+            declared_type="timestamp", type_family="temporal",
+            possible_operand_classes=("event_timestamp",),
+            table_event_or_snapshot="snapshot",
+            table_event_or_snapshot_authority="source/declared"))
+    assert verdict.status == "blocked"
+    assert R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW in verdict.reason_codes
+    assert "SNAPSHOT" in verdict.resolution
+
+
+def test_a_merely_proposed_snapshot_classification_blocks_nothing():
+    """Staged-floor symmetry on the table axis: an llm/proposed (or display-only) "snapshot"
+    never blocks — and never clears. The runtime half stays with the typed gauntlet's
+    EVENT_HISTORY_VERIFICATION, which rides EVERY bound event anchor regardless."""
+    for unproven in ("llm/proposed", "graph_hint"):
+        verdict = evaluate_operand(
+            op(role="event_ts", concept="event_timestamp", operand_class="event_timestamp"),
+            cap(object_ref="public.positions.last_txn_ts", concept="event_timestamp",
+                declared_type="timestamp", type_family="temporal",
+                possible_operand_classes=("event_timestamp",),
+                table_event_or_snapshot="snapshot",
+                table_event_or_snapshot_authority=unproven))
+        assert verdict.status == "eligible", unproven
+        assert R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW not in verdict.reason_codes
+
+
+def test_a_declared_event_table_changes_nothing_for_event_anchors():
+    verdict = evaluate_operand(
+        op(role="event_ts", concept="event_timestamp", operand_class="event_timestamp"),
+        cap(object_ref="public.transactions.txn_ts", concept="event_timestamp",
+            declared_type="timestamp", type_family="temporal",
+            possible_operand_classes=("event_timestamp",),
+            table_event_or_snapshot="event",
+            table_event_or_snapshot_authority="source/declared"))
+    assert verdict.status == "eligible"
 
 
 # ── one bureau date is not bureau-event velocity (§3's cust_num neighborhood) ───────────────────

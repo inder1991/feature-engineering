@@ -17,6 +17,7 @@ from featuregen.overlay.upload.generation_semantic_context import (
     build_generation_semantic_context,
 )
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.object_ref import normalize_ref
 
 SOURCE = "capbank"
 
@@ -108,6 +109,36 @@ def test_an_unmapped_concept_refuses_with_a_marker_never_a_guess(db):
         pytest.skip("classifier did not accept the probe concept")
     assert cap.possible_operand_classes == ()
     assert "concept_not_in_operand_class_map" in cap.missing_context
+
+
+def test_the_table_dataset_axis_rides_the_capability_with_its_own_authority(db):
+    """Deeper SE-8 end to end: the TABLE's event_or_snapshot classification reaches every
+    capability on that table from the frozen context, and its authority comes from the TABLE's
+    own evidence pins — a display-only value stays graph_hint, which downstream blocks nothing
+    and clears nothing."""
+    _seed(db)
+    db.execute(
+        "UPDATE graph_node SET event_or_snapshot = 'snapshot' "
+        "WHERE kind = 'table' AND catalog_source = %s AND table_name = 'transactions'",
+        (SOURCE,))
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    caps = compile_capabilities(db, context, [
+        "public.transactions.amount", "public.customers.cust_no"])
+    amount = caps["public.transactions.amount"]
+    assert amount.table_event_or_snapshot == "snapshot"
+    assert amount.table_event_or_snapshot_authority == "graph_hint"
+    assert caps["public.customers.cust_no"].table_event_or_snapshot is None
+
+    table_ref = normalize_ref(SOURCE, None, "transactions", None)
+    record_field_evidence(
+        db, logical_ref=table_ref, field_name="event_or_snapshot",
+        proposed_value="snapshot", producer="source", strength="attested",
+        producer_ref="svc:catalog-connector", source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=table_ref, field_name="event_or_snapshot",
+                                    material="snapshot"))
+    repinned = compile_capabilities(db, context, ["public.transactions.amount"])
+    assert repinned["public.transactions.amount"].table_event_or_snapshot_authority \
+        == "source/attested"                                  # NOW it can block an event window
 
 
 def test_the_compiler_is_one_query_and_cannot_widen_the_frozen_universe(db):

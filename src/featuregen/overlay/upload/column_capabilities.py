@@ -37,7 +37,8 @@ from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.recipe_operand_policy import _type_family
 
 #: The evidence fields whose authority pins ride the capability (one batched read).
-_PINNED_FIELDS = ("concept", "entity", "additivity", "currency", "economic_role")
+_PINNED_FIELDS = ("concept", "entity", "additivity", "currency", "economic_role",
+                  "event_or_snapshot")
 
 #: The honest absences of this compiler version — axes SE-8 compiles later.
 _ABSENT_AXES = ("dataset_profile_absent", "relationship_state_absent", "use_policy_absent")
@@ -78,6 +79,12 @@ class ColumnCapabilityV1:
     # eligibility fold enforces economic-role operands over THIS, never concept compatibility.
     economic_role: str | None
     economic_role_authority: str
+    # dataset axis (deeper SE-8): the TABLE's event_or_snapshot classification with its own
+    # evidence authority — a declared/confirmed "snapshot" refuses event anchors in the fold;
+    # a merely-proposed one clears nothing AND blocks nothing (the runtime history check owns
+    # that case); None = the axis is honestly absent.
+    table_event_or_snapshot: str | None
+    table_event_or_snapshot_authority: str
     # honesty
     missing_context: tuple[str, ...]
     # retrieval-only prose — NEVER a capability input
@@ -105,6 +112,9 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
     logical_by_ref = {
         ref: normalize_ref(context.catalog_source, col.schema_name, col.table, col.column)
         for ref, col in members}
+    table_logical_by_name = {
+        col.table: normalize_ref(context.catalog_source, col.schema_name, col.table, None)
+        for _ref, col in members}
     pins: dict[tuple[str, str], str] = {}
     economic_roles: dict[str, tuple[str, str]] = {}      # logical_ref -> (value, authority)
     if members:
@@ -113,7 +123,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             "FROM field_evidence "
             "WHERE lifecycle = 'active' AND field_name = ANY(%s) AND logical_ref = ANY(%s) "
             "ORDER BY created_at, evidence_id",
-            (list(_PINNED_FIELDS), list(logical_by_ref.values()))).fetchall()
+            (list(_PINNED_FIELDS),
+             list(logical_by_ref.values()) + list(table_logical_by_name.values()))).fetchall()
         for logical_ref, field_name, producer, strength, proposed_value in rows:
             pins[(logical_ref, field_name)] = f"{producer}/{strength}"   # newest active wins
             if field_name == "economic_role" and producer == "human" and strength == "confirmed":
@@ -162,6 +173,10 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             currency_authority=_authority(pins, logical_ref, "currency", col.currency),
             economic_role=economic_roles.get(logical_ref, (None, "absent"))[0],
             economic_role_authority=economic_roles.get(logical_ref, (None, "absent"))[1],
+            table_event_or_snapshot=context.table_facts.get(col.table),
+            table_event_or_snapshot_authority=_authority(
+                pins, table_logical_by_name[col.table], "event_or_snapshot",
+                context.table_facts.get(col.table)),
             missing_context=tuple(missing),
             retrieval_text=" ".join(filter(None, (
                 col.definition, col.ai_summary, col.semantic_terms))))

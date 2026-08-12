@@ -35,8 +35,9 @@ from featuregen.overlay.upload.taxonomy.versions import CONCEPT_REGISTRY_VERSION
 
 GENERATION_CONTEXT_CONTRACT = "generation-semantic-context"
 # v2: ColumnIndexV1 gained schema_name (Layer B keys field_evidence by schema-preserving
-# logical_ref). Pre-live: stored v1 pins verify as drifted against v2 rebuilds — honestly.
-GENERATION_CONTEXT_VERSION = "2"
+# logical_ref). v3: the context gained table_facts (the event_or_snapshot dataset axis).
+# Pre-live: stored older pins verify as drifted against newer rebuilds — honestly.
+GENERATION_CONTEXT_VERSION = "3"
 _OWNER = "featuregen.overlay.upload.generation_semantic_context"
 
 register_contract_version(GENERATION_CONTEXT_CONTRACT, GENERATION_CONTEXT_VERSION, owner=_OWNER)
@@ -75,6 +76,9 @@ class GenerationSemanticContextV1:
     field_policy_version: str
     columns: tuple[ColumnIndexV1, ...]
     concept_index: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: table_name -> the event_or_snapshot DISPLAY value ("event" | "snapshot" | None) — the
+    #: dataset axis Layer B pins authority onto. Absence is a fact, never an inferred default.
+    table_facts: dict[str, str] = field(default_factory=dict)
 
     def context_hash(self) -> str:
         """The run's context identity — field-exhaustive, so ANY visible difference (a column,
@@ -102,6 +106,10 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
     watermark_row = conn.execute(
         "SELECT last_completed_at FROM overlay_drift_watermark WHERE catalog_source = %s",
         (catalog_source,)).fetchone()
+    table_rows = conn.execute(
+        "SELECT table_name, event_or_snapshot FROM graph_node "
+        "WHERE kind = 'table' AND catalog_source = %s AND visible_requires <@ %s",
+        (catalog_source, scope)).fetchall()
 
     columns = tuple(
         ColumnIndexV1(object_ref=r[0], schema_name=r[1], table=r[2], column=r[3],
@@ -121,7 +129,8 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
         concept_registry_version=CONCEPT_REGISTRY_VERSION,
         field_policy_version=FIELD_POLICY_VERSION,
         columns=columns,
-        concept_index={k: tuple(v) for k, v in concept_index.items()})
+        concept_index={k: tuple(v) for k, v in concept_index.items()},
+        table_facts={name: value for name, value in table_rows if value})
 
 
 __all__ = ["ColumnIndexV1", "GENERATION_CONTEXT_ITEM_KIND", "GenerationSemanticContextV1",

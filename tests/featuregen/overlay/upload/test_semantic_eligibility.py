@@ -27,6 +27,7 @@ def capability(**over) -> ColumnCapabilityV1:
         additivity="additive", additivity_authority="graph_hint",
         currency="USD", currency_authority="graph_hint",
         economic_role=None, economic_role_authority="absent",
+        table_event_or_snapshot=None, table_event_or_snapshot_authority="absent",
         missing_context=("dataset_profile_absent", "relationship_state_absent",
                          "use_policy_absent"),
         retrieval_text="signed transaction amount")
