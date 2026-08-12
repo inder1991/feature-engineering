@@ -84,6 +84,61 @@ def v2_applicability(scope: ConfirmedScope) -> V2ApplicabilityResult:
     return V2ApplicabilityResult(by_recipe=by_recipe, eligible_ids=eligible)
 
 
+@dataclass(frozen=True, slots=True)
+class DatasetStoryV1:
+    """SE-8 steps 2+3 — the candidate's FEATURE-LEVEL dataset decision, folded once over every
+    bound operand (never one column at a time):
+
+    * ``population_ref`` — the table whose rows define WHO this feature computes over. It is
+      EXPLICIT or it is absent: the population is the table of the bound entity-key operand
+      whose grain flag was DECLARED in the upload (a governed fact) — never inferred from a
+      table's name or its primary entity (step 3's rule, verbatim).
+    * ``dataset_tables`` — every table a bound operand touches; ``cross_dataset`` says the
+      candidate spans more than one, which makes the RELATIONSHIP a feature-level need.
+    * ``codes`` — the named setup work: POPULATION_DATASET_UNDECLARED when no declared-grain
+      entity key anchors the population; RELATIONSHIP_REQUIRED when the candidate crosses
+      datasets (until relationship facts prove the hop, the honest state is setup work)."""
+
+    population_ref: str | None
+    population_basis: str                # "declared_grain" | "undeclared"
+    dataset_tables: tuple[str, ...]
+    cross_dataset: bool
+    codes: tuple[str, ...]
+
+
+def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
+    """The pure fold: bound refs + the frozen context's declared facts, nothing else."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+
+    by_ref = {c.object_ref: c for c in context.columns} if context is not None else {}
+    operands_by_role = {op.role: op for op in request.operands}
+    tables: list[str] = []
+    population: str | None = None
+    for verdict in verdicts:
+        if verdict.status != "bound" or not verdict.selected_ref:
+            continue
+        column = by_ref.get(verdict.selected_ref)
+        if column is None:
+            continue
+        if column.table not in tables:
+            tables.append(column.table)
+        operand = operands_by_role.get(verdict.role)
+        if (operand is not None and operand.operand_class == "entity_key"
+                and column.is_grain and population is None):
+            population = column.table
+    codes: list[str] = []
+    if population is None:
+        codes.append(R.POPULATION_DATASET_UNDECLARED)
+    if len(tables) > 1:
+        codes.append(R.RELATIONSHIP_REQUIRED)
+    return DatasetStoryV1(
+        population_ref=population,
+        population_basis="declared_grain" if population else "undeclared",
+        dataset_tables=tuple(tables),
+        cross_dataset=len(tables) > 1,
+        codes=tuple(codes))
+
+
 def v2_applicability_as_result(scope: ConfirmedScope):
     """The V2 classification in the LEGACY ``ApplicabilityResult`` carrier — so under
     ``semantic_v1`` the disposition lens folds the universe that was actually planned (the V2
@@ -142,6 +197,9 @@ class V2RecipeCandidateV1:
     # The full per-candidate eligibility audit from the shared binder — the losing-shortlist
     # evidence SE-10 persists: {(role, object_ref): OperandEligibilityVerdictV1}.
     eligibility: dict = None  # type: ignore[assignment]
+    # SE-8 steps 2+3: the feature-level dataset decision (population + cross-dataset need),
+    # folded from the frozen context's DECLARED facts. None only on legacy fixtures.
+    dataset_story: "DatasetStoryV1 | None" = None
 
 
 def _review_validity(conn, definition: RecipeDefinitionV2,
@@ -210,11 +268,13 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             temporal_blocker=temporal_blocker,
             review_current=current,
             review_missing_roles=missing_roles,
-            eligibility=eligibility))
+            eligibility=eligibility,
+            dataset_story=fold_dataset_story(request, verdicts, context)))
     return tuple(candidates)
 
 
 __all__ = [
-    "BINDING_STATES", "V2ApplicabilityResult", "V2RecipeCandidateV1",
-    "fold_binding_state", "v2_applicability", "v2_recipe_candidates",
+    "BINDING_STATES", "DatasetStoryV1", "V2ApplicabilityResult", "V2RecipeCandidateV1",
+    "fold_binding_state", "fold_dataset_story", "v2_applicability",
+    "v2_applicability_as_result", "v2_recipe_candidates",
 ]

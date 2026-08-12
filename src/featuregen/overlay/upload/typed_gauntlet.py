@@ -109,6 +109,27 @@ def validate_candidate(candidate, *, target_ref: str | None = None) -> TypedVali
             family=R.reason_family(R.TEMPORAL_POLICY_UNRESOLVED),
             object_ref="", detail=candidate.temporal_blocker))
 
+    # SE-8 steps 2+3: the FEATURE-LEVEL dataset decision rides the candidate, not any single
+    # operand. An undeclared population and an unproven cross-dataset hop are named setup work —
+    # candidate-level requirements with the story's own facts in the detail.
+    story = getattr(candidate, "dataset_story", None)
+    if story is not None:
+        if R.POPULATION_DATASET_UNDECLARED in story.codes:
+            requirements.append(TypedRequirementV1(
+                code=R.POPULATION_DATASET_UNDECLARED,
+                family=R.reason_family(R.POPULATION_DATASET_UNDECLARED),
+                object_ref="",
+                detail="no DECLARED-grain entity key anchors the population — confirm the "
+                       "grain of the table that defines who this feature computes over"))
+        if R.RELATIONSHIP_REQUIRED in story.codes:
+            requirements.append(TypedRequirementV1(
+                code=R.RELATIONSHIP_REQUIRED,
+                family=R.reason_family(R.RELATIONSHIP_REQUIRED),
+                object_ref="",
+                detail="bound operands span "
+                       f"{', '.join(story.dataset_tables)} — govern the relationship "
+                       "(verify the join) before this computes as ONE feature"))
+
     if refusals:
         status = "refused"
     elif requirements:

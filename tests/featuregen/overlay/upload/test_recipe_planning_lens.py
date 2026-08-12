@@ -257,3 +257,104 @@ def test_the_lens_never_reloads_graph_node_with_a_prebuilt_context(db):
     assert len(candidates) >= 7                               # the whole eligible scope bound
     assert not [q for q in calls if "FROM graph_node" in q], \
         "the frozen context is the only column source — no per-recipe reload"
+
+
+# ── SE-8 steps 2+3: the feature-level dataset story ─────────────────────────────────────────────
+
+def test_the_dataset_story_names_an_explicit_population_from_the_declared_grain(db):
+    """The population is the table whose DECLARED grain column the entity key bound — a governed
+    upload fact, never a table-name or primary-entity inference (step 3's rule, verbatim)."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE,
+        scope=ConfirmedScope(primary=EXEMPLAR.primary_objective))
+    bound = next(c for c in candidates
+                 if c.recipe_id == EXEMPLAR.recipe_id and c.binding_state == "bound")
+    story = bound.dataset_story
+    assert story is not None
+    assert story.population_ref == "transactions"             # acct_ref is DECLARED is_grain
+    assert story.population_basis == "declared_grain"
+    assert story.dataset_tables == ("transactions",)
+    assert story.cross_dataset is False
+    assert R.POPULATION_DATASET_UNDECLARED not in story.codes
+
+
+def test_an_undeclared_grain_makes_the_population_named_setup_work(db):
+    """Same catalog, grain flag withheld: the entity key still BINDS (meaning matched), but the
+    population is honestly UNDECLARED — named setup work on the candidate, never an inference."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.typed_gauntlet import validate_candidate
+
+    rows = [
+        (CanonicalRow(SOURCE, "transactions", "acct_ref", "integer",
+                      entity="Account", definition="the posting account"), "account_id"),
+        (CanonicalRow(SOURCE, "transactions", "amount", "numeric", additivity="additive",
+                      currency="USD", definition="signed transaction amount"), "monetary_flow"),
+        (CanonicalRow(SOURCE, "transactions", "dc_flag", "text",
+                      definition="debit/credit indicator"), "debit_credit_indicator"),
+        (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp",
+                      definition="when the transaction was booked"), "event_timestamp"),
+    ]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE,
+        scope=ConfirmedScope(primary=EXEMPLAR.primary_objective))
+    candidate = next(c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id)
+    story = candidate.dataset_story
+    assert story is not None
+    assert story.population_ref is None
+    assert R.POPULATION_DATASET_UNDECLARED in story.codes
+    if candidate.binding_state == "bound" and not candidate.temporal_blocker:
+        validation = validate_candidate(candidate)
+        assert validation.status == "needs_external_validation"
+        population = next(r for r in validation.requirements
+                          if r.code == R.POPULATION_DATASET_UNDECLARED)
+        assert population.family == "needs_setup"
+        assert "grain" in population.detail
+
+
+def test_crossing_datasets_is_a_feature_level_relationship_need():
+    """Step 2: dataset needs are ONE decision over the whole candidate. Two bound operands on
+    two tables make the relationship the candidate's own named setup work — not a per-column
+    afterthought — until governed facts prove the hop."""
+    from types import SimpleNamespace
+
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        RequiredOperandV1,
+        planning_request_from_user_definition,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
+    from featuregen.overlay.upload.recipe_planning_lens import fold_dataset_story
+
+    exemplar = v2_recipe_by_id("customer_activity_recency")
+    request = planning_request_from_user_definition(
+        definition_id="user:cross_probe", primary_objective=exemplar.primary_objective,
+        output=exemplar.output,
+        operands=(RequiredOperandV1(role="who", concept="customer_id",
+                                    operand_class="entity_key"),
+                  RequiredOperandV1(role="when", concept="event_timestamp",
+                                    operand_class="event_timestamp")),
+        source_grain="transaction", output_grain="customer",
+        temporal=exemplar.temporal, content_hash="crosshash")
+    verdicts = (
+        OperandBindingVerdictV1(role="who", status="bound",
+                                selected_ref="public.customers.cust_id"),
+        OperandBindingVerdictV1(role="when", status="bound",
+                                selected_ref="public.events.event_ts"),
+    )
+    context = SimpleNamespace(columns=(
+        SimpleNamespace(object_ref="public.customers.cust_id", table="customers",
+                        is_grain=True),
+        SimpleNamespace(object_ref="public.events.event_ts", table="events",
+                        is_grain=False),
+    ))
+    story = fold_dataset_story(request, verdicts, context)
+    assert story.population_ref == "customers"
+    assert story.cross_dataset is True
+    assert story.dataset_tables == ("customers", "events")
+    assert R.RELATIONSHIP_REQUIRED in story.codes
+    assert R.POPULATION_DATASET_UNDECLARED not in story.codes
