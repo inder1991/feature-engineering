@@ -3,8 +3,8 @@ immutable `llm_call` record — 2 when FEATUREGEN_FEATURE_CONTEXT is on, 1 when 
 from __future__ import annotations
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
-from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload import feature_assist
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.feature_assist import feature_context_enabled, recommend_features
 from featuregen.overlay.upload.graph import build_graph
 
@@ -106,8 +106,8 @@ def test_a_recommendation_SURVIVES_with_the_flag_on(db, monkeypatch):
 def test_every_feature_schema_resolves_at_the_stamped_version(db):
     """The general form: whatever version the request stamps must be registered, for every schema
     the feature path can emit — not just the one the happy-path test happens to exercise."""
-    from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
     from featuregen.documents.registry import DocumentSchemaRegistry
+    from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
 
     register_enrichment_schemas(db)
     reg = DocumentSchemaRegistry(db)

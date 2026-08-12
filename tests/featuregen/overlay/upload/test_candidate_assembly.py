@@ -4,6 +4,7 @@ from __future__ import annotations
 import random
 from dataclasses import replace
 
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.candidate_assembly import (
     ASSEMBLY_VERSION,
     assemble_candidates,
@@ -16,7 +17,6 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
 from featuregen.overlay.upload.recipe_planning_lens import V2RecipeCandidateV1
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
-from featuregen.overlay.upload import semantic_eligibility_reasons as R
 
 EXEMPLAR = v2_recipe_by_id("customer_activity_recency")
 

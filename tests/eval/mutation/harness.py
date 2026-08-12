@@ -41,6 +41,7 @@ from tests.eval.mutation.plugin import ENV_VAR
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _COUNT = re.compile(r"(\d+) (passed|failed|error|errors|xfailed|xpassed|skipped|deselected)")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass(frozen=True)
@@ -55,9 +56,16 @@ class RunResult:
 
     @property
     def failed_node_ids(self) -> tuple[str, ...]:
-        """The node ids pytest reported as FAILED/ERROR, from its own summary lines."""
+        """The node ids pytest reported as FAILED/ERROR, from its own summary lines.
+
+        ANSI-stripped first: under a color-forcing terminal env the child colorizes its summary
+        even when captured, so the lines arrive as ``\x1b[31mFAILED …`` and a color-naive
+        prefix match silently reports NO failures — which this harness then misreads as "the
+        mutation killed nothing named". That exact defect made 26 mutations report as
+        uncaught in one environment while passing in another (A0 triage, 2026-08-13)."""
+        plain = _ANSI.sub("", self.output)
         return tuple(line.split(" ", 1)[1].split(" - ", 1)[0].strip()
-                     for line in self.output.splitlines()
+                     for line in plain.splitlines()
                      if line.startswith(("FAILED ", "ERROR ")))
 
     @property
@@ -98,12 +106,17 @@ def run_victims(victims: tuple[str, ...], *, dsn: str, mutation_id: str | None =
         env.pop(ENV_VAR, None)
         plugin_args = []
 
+    # Color-proof the child BOTH ways: force no markup (a color-forcing parent terminal env
+    # otherwise colorizes the captured summary) and the parser above strips ANSI regardless.
+    env["NO_COLOR"] = "1"
+    for var in ("FORCE_COLOR", "PY_COLORS", "CLICOLOR_FORCE"):
+        env.pop(var, None)
     proc = subprocess.run(
         # `-m ""` clears the `-m 'not eval'` in addopts: some victims (the release bars) ARE
         # eval-marked, and a deselected victim exits 0, which the harness would have to read as
         # "the mutation survived nothing".
         [_python(), "-m", "pytest", "-q", "-p", "no:randomly", "--timeout=120", "-m", "",
-         *plugin_args, *victims],
+         "--color=no", *plugin_args, *victims],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout_s, check=False)
     out = proc.stdout + proc.stderr
     counts = {kind: int(n) for n, kind in _COUNT.findall(out)}

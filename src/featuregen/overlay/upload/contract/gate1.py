@@ -28,9 +28,6 @@ from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
 from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
 from featuregen.overlay.upload.contract.param_choice import choose_params
-from featuregen.overlay.upload.generation_semantic_context import (
-    build_generation_semantic_context,
-)
 from featuregen.overlay.upload.contract.scope_mode import confirmation_required
 from featuregen.overlay.upload.enrich_batch import CallLedger
 from featuregen.overlay.upload.feature_assist import (
@@ -51,6 +48,9 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
     build_metadata_snapshot,
     capture_column_snapshot,
     ensure_generation_run,
+)
+from featuregen.overlay.upload.generation_semantic_context import (
+    build_generation_semantic_context,
 )
 from featuregen.overlay.upload.grounding_trace import (
     GROUNDING_CANDIDATE_SET,

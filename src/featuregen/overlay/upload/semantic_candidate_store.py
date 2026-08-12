@@ -19,12 +19,13 @@ from featuregen.idgen import mint_id
 def persist_semantic_candidates(conn, *, generation_run_id: str, context,
                                 candidates) -> int:
     """Append one observation per candidate; returns the row count written."""
+    from psycopg.types.json import Jsonb
+
     from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
     from featuregen.overlay.upload.semantic_eligibility import (
         SEMANTIC_AUTHORITY_POLICY_VERSION,
         authority_matrix_hash,
     )
-    from psycopg.types.json import Jsonb
 
     context_hash = context.context_hash()
     policy_hashes = {
@@ -98,4 +99,3 @@ def semantic_shadow_metrics(conn) -> dict:
         "snapshot_as_event_preventions": snapshot_preventions,
         "temporal_blocked_candidates": temporal_blocked,
     }
-

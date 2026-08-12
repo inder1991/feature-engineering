@@ -31,7 +31,6 @@ Discipline (architecture review + owner decisions, 2026-08-10):
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import replace
 
 from featuregen.overlay.field_evidence import canonical_hash

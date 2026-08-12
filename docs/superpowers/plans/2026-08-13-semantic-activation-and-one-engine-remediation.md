@@ -1,0 +1,796 @@
+# Semantic Activation & One-Engine Remediation
+
+**Date:** 2026-08-13
+**Grounded in:** `docs/architecture/2026-08-12-semantic-eligibility-feature-generation-final-review.md`
+(the external final review) **and its line-by-line validation against commit `333eaa3c`**
+(27/29 findings confirmed with exact anchors; REL-04 confirmed *worse* — 28 eval failures, not 2;
+REL-06's "30 ruff errors" not reproducible — 1 ruff error + 2 EOF-whitespace issues under project config).
+**Parent program:** `docs/superpowers/plans/2026-08-11-semantic-eligibility-feature-generation-workflow.md`
+— this plan is its Tranche-3 completion, re-scoped by the validated review and two user steers.
+**Standing steers applied:** pre-live / no unnecessary flags (2026-08-11) · "focus on bringing the
+functionality UP and running" (2026-08-13) — direct cutover, delete the legacy path, no rollout theater.
+**Execution discipline:** full backend suite green gates every push; frontend suite green gates
+frontend pushes; acceptance row appended to the matching task section of THIS file per landed task;
+push `HEAD:feature/asset-detail-reapply HEAD:main`; memory updated per milestone.
+
+---
+
+## 0. The problem, in one paragraph
+
+The semantic engine (context → capabilities → eligibility → binder → assembly → gauntlet) is built,
+tested, and serves the recipe lens under `semantic_v1` — but the review proved, and validation
+confirmed, that it is **advisory where it must be authoritative**: the legacy physical-column LLM
+generator still runs and serves beside it (GEN-01), its intents are misattributed as recipes
+(GEN-05), the physical planner is never called (PLAN-01), and **nothing** — not review validity
+(PLAN-02), not `confirmation_required` (PLAN-03), not readiness (PLAN-04), not the direct
+`POST /features` route (PLAN-05) — is enforced at any activation point. A candidate whose own
+verdict says "a human must confirm this binding" can be selected, drafted, confirmed, and
+registered today. Pre-live, nobody is harmed — but every end-to-end test run through the current
+UI produces misleading results, which blocks credible SME UAT.
+
+## 0.1 The bar this plan must clear: end-to-end-ready, defined
+
+**After this plan, one person must be able to walk the WHOLE workflow in the UI** — and every
+blocker they hit must have a working clearing surface that unblocks them without an engineer:
+
+1. submit hypothesis + target + confirmed scope → engine candidates (recipes with variants, LLM
+   intents, user-definition anchor) with plans, honest chips, and `allowed_actions`;
+2. hit `PROPOSED_METADATA_ONLY` → deep-link to the **concept-confirmation funnel** (exists,
+   live: 42 groups) → confirm → regenerate → the binding clears;
+3. hit `RECIPE_REVIEW_NOT_CURRENT` → the **recipe-review screen records an approval**
+   (`POST /recipes/{id}/reviews` — verified present) → regenerate → clears;
+4. select → draft → confirm → a **governed contract carrying honest readiness**
+   (`FORMULA_BLOCKED` is a state on the contract, never a lie and never a wall);
+5. refine a candidate and give whole-round feedback without a 409;
+6. the Suggested Features page shows the same engine's verdicts for the same bindings.
+
+**Explicitly OUT of E2E scope (honest, visible, blocked):** materialization/execution — it
+stays refused (`FORMULA_NOT_REVIEWED` / `EXECUTION_AUTHORITY_*`) until the Formula-V2
+authoring program (separately chartered; today 2 v1 blueprints + 1 v2 fixture = 3 recipes
+could ever pass). The E2E test proves the refusal is typed and the UI says why — that IS the
+honest end of the pre-live workflow. **The completion claim this plan may make when done:
+"contract-authoring workflow ready for UAT; materialization visibly unavailable" — never
+"the complete generation-to-execution workflow is production-ready."**
+
+| blocker code | clearing surface | verified |
+|---|---|---|
+| PROPOSED_METADATA_ONLY | concept-confirmation funnel (SE-4b, live) | ✅ deployed, 19+23 groups |
+| RECIPE_REVIEW_NOT_CURRENT | `POST /recipes/{id}/reviews` + review screen | ✅ route exists (201) |
+| PHYSICAL_PLAN_MISSING | B7 wires the planner; refusals actionable | task B7 |
+| CURRENCY_POLICY_MISSING / setup codes | asset field-decision screen (existing) | ✅ exists |
+| CONCEPTUAL_PATTERN_NOT_AUTHORABLE | save-idea path (by design — no formula, no contract) | task A2 |
+| FORMULA_NOT_REVIEWED (materialize only) | out of scope — typed refusal + UI copy | task A1 |
+
+## 1. Design decisions (stated once, so no task re-litigates them)
+
+**D-1. One server-side activation policy, zero new flags — in TWO layers.** A pure fold
+`activation_decision(frozen_facts, current_state, action, actor)` in a new
+`src/featuregen/overlay/upload/activation_policy.py`, called from EVERY route that turns a
+candidate into something durable. The two layers are both load-bearing (validated finding 1 —
+`govern.py`'s confirm already REBUILDS + revalidates plan freshness at the governing write):
+
+- **`FrozenOptionDecisionV1`** — exactly what the user saw, immutable, never recomputed and
+  never silently rebound;
+- **`CurrentActivationStateV1`** — a SMALL re-read at draft/confirm time: current review
+  validity at the frozen revision, current PII policy revisions vs the frozen licensing pins,
+  current formula-expectation revision + `formula_schema_supported`, snapshot freshness.
+  Divergence between frozen pins and current authoritative revisions is a typed
+  `STALE_*` blocker (regenerate) — never a substitution. `snapshot_freshness` must be
+  `current`; `unverifiable` FAILS CLOSED for the semantic workflow (it is new — no
+  compatibility debt exists to excuse it).
+
+Actions form a closed five-step ladder (validated finding 6 — conflating authoring with
+materialization deadlocks the path that MAKES a feature ready): `save_idea` →
+`create_contract` → `author_formula` → `request_materialization` → `execute_materialization`.
+The policy returns `{allowed, blockers}`; every blocker carries a closed code and the named
+next step. No env lever guards it — it is law from the commit it lands in.
+
+**D-2. Blocked ≠ hidden.** A blocked action never hides the candidate. The wire carries
+`allowed_actions` + `blocked_actions{action: [codes]}` per option (the review's §7 shape) and the
+UI renders the server's answer — the client re-implements no policy.
+
+**D-3. "Register" becomes "Save idea".** `POST /features` remains (it is the only durable
+save-my-work path) but every feature it writes is stamped `lifecycle_state='idea'`
+(migration **1064**) and the governed paths never read ideas as governed. Creating a governed
+feature happens ONLY through the immutable considered option + `activation_decision`.
+
+**D-4. The one-engine rule is absolute under the serving mode.** Under `semantic_v1` the
+free-form physical-column generator does not run at all — not as a lens, not as an anchor
+donor. The user-definition anchor routes through an audited definition→intent extraction, the
+`planning_request_from_user_definition` adapter, and the shared binder like everything else
+(B1 owns the extraction seam — the adapter requires typed operands, verified). After Phase B is verified live, the cutover commit
+**deletes** the legacy generation branch, `recommend_feature_sets_report`'s Gate-1 call site,
+the `legacy`/`semantic_shadow` modes, and the mode field itself — rollback is the previous
+image, per the review's pre-live doctrine and the standing steer.
+
+**D-5. Origin honesty is a closed-vocabulary change.** `generation_source` gains `llm_intent`
+(server-assigned, like the existing three). The projection maps origin → generation_source
+1:1 and never writes `recipe_id` for a non-recipe candidate.
+
+**D-6. Parameter variants are enumerated, not guessed.** Every authored parameterization of an
+applicable recipe becomes its OWN planning request (bounded: the registry authors ≤936 variants
+total). Binding is pure over one batched capability read, so variant count costs folds, not
+queries. A deterministic hypothesis-token pass (exact window-token match against allowed
+values) picks the *primary* variant per recipe; all variants carry their values on the card and
+in the option hash. No LLM parameter call in this program (the retired `choose_params` path is
+not resurrected).
+
+**D-7. Authority pins come from the governed resolver.** Capability compilation consumes
+`field_resolution.resolve_and_project`-style resolution (value + producer + strength +
+evidence id + conflict, one indivisible decision) instead of last-active-row-wins. A
+value/evidence mismatch is a `SEMANTIC_CONFLICT`, which clears nothing.
+
+**D-8. Migrations.** 1063 = `semantic_option_decision` (minimal record in Task A1b, enriched
+by D1 — append-only, same guard idiom as 1060/1062). 1064 = `feature.lifecycle_state`
+(backfill: has-current-contract → `governed`, else `idea` — never blanket-default). Both
+backend-first on deploy. 1065 reserved for the sign-convention evidence backfill if step C3
+needs one (write it down now; never "next available").
+
+**D-9. What stays deferred (with the review's blessing):** SE-8 steps 4–5 profile-gated source
+selection (dataset profiles are measured-absent on every live catalog), predictive backtesting,
+production rollback drills, multi-family canary orchestration, bundle-size work (REL-07).
+Deferral is honest only while the UI marks the capability unavailable — D-2 guarantees that.
+
+## 2. Phase A — activation honesty *(closes PLAN-02, PLAN-03, PLAN-04, PLAN-05, UI-03; part of GEN-05)*
+
+> Objective: no browser or direct API call can turn an incomplete option into a governed or
+> executable feature. This phase is first because every test anyone runs before it lands
+> produces misleading results.
+
+### Task A0 — hygiene and red-gate honesty (½ day)
+
+*Files:* `typed_gauntlet.py` (import order — the 1 real ruff error),
+`semantic_candidate_store.py:101` + `tests/featuregen/api/test_semantic_shadow.py:165`
+(EOF whitespace), `tests/eval/mutation/test_must_die.py`.
+
+1. Fix the three hygiene findings.
+2. Rebaseline the release-suite count gate deliberately (277 → current collected 364, with a
+   commit message naming every suite that grew and why).
+3. Retire or repoint the `feature_gen_reads_the_thin_menu` mutation target (its victim test was
+   deliberately deleted in flag-retirement wave B — the mutation now tests nothing).
+4. Triage the 26 remaining must-die failures: classify each as (a) stale target, (b) genuine
+   uncaught mutation = real coverage gap → file as a task in this plan, or (c) harness/env
+   defect. **Do not delete a mutation that is catching a real gap.**
+
+*Acceptance:* `pytest -m eval` green or every remaining red named in this file with an owner
+task; `ruff check` clean on program files; `git diff --check` clean.
+
+### Task A1 — the activation policy fold (1 day)
+
+*Create:* `src/featuregen/overlay/upload/activation_policy.py` + `test_activation_policy.py`.
+
+The pure fold. Inputs — an `OptionActivationFactsV1` assembled by the caller from the stored
+option (never live catalog reads):
+
+- `binding_state` (bound/ambiguous/missing/blocked)
+- `confirmation_required_roles` (from the option's role bindings)
+- `review_current` + `recipe_revision_hash` (BR-23 fold at generation, from the candidate)
+- `readiness` (authored recipe readiness; intents = CONCEPTUAL_ONLY)
+- `computation_kind` (deterministic_formula / governed_model_output / conceptual_pattern)
+- `has_reviewed_formula_expectation` (v1 ∪ v2 registries via `has_reviewed_expectation`)
+- `plan_envelope_present`
+- `validation_status` + outstanding requirement codes (typed gauntlet)
+- `snapshot_freshness` (current/drifted/unverifiable — compare result, computed by caller)
+- `generation_source`
+
+Rules (each one closed-code blocked, never silent):
+
+| action | requires |
+|---|---|
+| `save_idea` | always allowed (an idea is an idea) |
+| `create_contract` | bound · zero confirmation_required · review_current at revision (recipe-origin) · computation_kind ≠ conceptual_pattern · plan envelope present · snapshot not drifted. **Deliberately NOT required: a reviewed formula** — parent-plan SE-12 rule 3: a semantically bound deterministic candidate may be contracted while formula readiness is blocked; the contract CARRIES that readiness and cannot execute. (Requiring it would cap E2E at the 3 recipes with reviewed expectations — a dead end, not governance.) |
+| `author_formula` | create_contract requirements (a contract exists to author against) — deliberately NOT gated on readiness: authoring is how readiness IMPROVES |
+| `request_materialization` / `execute_materialization` | create_contract requirements · **current effective readiness exactly `MATERIALIZATION_READY`** (validated finding 5 — "a reviewed expectation exists" is NOT executable readiness) · `formula_schema_supported` (admission consumes exactly Formula-v1 today — `materialize/admission.py` `_verify_schema_version`, verified) · validation_status == DESIGN_CHECKED or every requirement closed · execution-authority floor met (matrix from C2; until C2 lands, UNCONDITIONALLY blocked `EXECUTION_AUTHORITY_UNEVALUATED`). Enforced at the AUTHORITATIVE boundary: the materialization queue route + worker (`api/routes/materialization_runs.py`) AND analysis-execute — never the UI alone |
+
+Blocker codes (closed, added to `semantic_eligibility_reasons` families): reuse existing codes
+where they exist (`PROPOSED_METADATA_ONLY`, `TEMPORAL_POLICY_UNRESOLVED`…) and add
+`RECIPE_REVIEW_NOT_CURRENT`, `FORMULA_NOT_REVIEWED`, `CONCEPTUAL_PATTERN_NOT_AUTHORABLE`,
+`PHYSICAL_PLAN_MISSING`, `EXECUTION_AUTHORITY_UNEVALUATED`, `SNAPSHOT_STALE_REGENERATE`.
+
+*Acceptance:* table-driven tests — every rule row has a positive and a negative case; an
+unknown action raises; the fold is pure (no conn parameter exists in its signature).
+
+### Task A1b — the minimal option-decision record, BEFORE any enforcement (1 day)
+
+*Create:* migration **1063** (`semantic_option_decision`, append-only, 1060/1062 guard idiom) +
+its store module; *modify:* `gate1.py` (persist per served option, request transaction).
+
+Validated finding 3: A2 cannot build activation facts from `FeatureIdea` — it carries no
+review validity, no readiness, no computation identity (verified). So the MINIMAL decision
+record lands FIRST: per served option — planning request hash + variant values, binding state,
+confirmation-required roles, review fold at generation (current + revision hash), readiness,
+computation kind, validation status + requirement codes, dataset story, observation id, and
+the frozen pins the CurrentActivationState will compare against (policy revisions, formula
+expectation revision, snapshot id). Phase D's Task D1 ENRICHES this record (full verdicts,
+losing shortlist, plan envelope, decision manifest) — it does not create it.
+
+*Acceptance:* every served option has exactly one decision row in the same transaction as the
+revision; A2's facts assembler reads ONLY this row + the revision (test stubs FeatureIdea-only
+paths to explode).
+
+### Task A2 — wire the policy into every durable route (1–2 days)
+
+*Modify:* `api/routes/features.py`, `api/routes/contract.py` (draft + confirm),
+`overlay/upload/contract/gate1.py` (facts assembly helper), migration **1064**.
+
+1. Migration 1064: `ALTER TABLE feature ADD COLUMN lifecycle_state text NOT NULL
+   CHECK (lifecycle_state IN ('idea','governed'))` — **no blanket default** (validated
+   finding 2): the migration backfills rows that HAVE a current contract
+   (`feature_current_contract` pointer) as `governed` and the rest as `idea`, so history stays
+   honest in both directions.
+2. `register_feature(conn, spec, *, lifecycle_state)` — the parameter is MANDATORY (no
+   default; every caller states its intent). `POST /features` passes `'idea'`; the confirm
+   path passes `'governed'`. Response carries `{"lifecycle_state", "governed"}`. UI copy
+   changes from "Register" to "Save idea" (frontend half rides in Task A4).
+2b. **Every feature READ surface filters or labels** (validated finding 2 — all verified
+   unfiltered): registry `list_features`, consumer `register_consumer` (an idea CANNOT be
+   registered as a model consumer — hard refusal + test), `features_for_consumer`, lineage /
+   drift-impact queries, feature-detail. Ideas are visible where humans browse, labeled;
+   invisible where models consume.
+3. `/contract/draft`: assemble `OptionActivationFactsV1` from the verified revision option
+   (+ the stored `semantic_option_decision` once D1 lands; until then from the option's
+   FeatureIdea fields — binding/confirmation/validation are already on the wire there) and call
+   `activation_decision(facts, "create_contract", actor)`. Blocked → typed 409 with the
+   blocker list. The existing SEMANTIC_SNAPSHOT_STALE check folds INTO the policy (one law,
+   not two).
+4. `/contract/confirm` re-checks (draft-then-confirm race safety, same fold) — and the
+   feature row the confirm path registers is stamped `lifecycle_state='governed'` (verified:
+   confirm mints `feature_id` via `register_feature` — the ONLY writer allowed to stamp
+   governed, and only after the fold passed).
+5. Formula authoring entry points call `author_formula` (allowed once a contract exists —
+   authoring must never be blocked by the readiness it exists to improve); the materialization
+   queue route + worker and analysis-execute call `request_materialization` /
+   `execute_materialization` and stay blocked (`EXECUTION_AUTHORITY_UNEVALUATED` until C2,
+   readiness + schema gates always) — write those tests now.
+
+*Acceptance:* negative-path API tests — a provisional-binding option 409s at draft with
+`PROPOSED_METADATA_ONLY` named; an unreviewed recipe 409s with `RECIPE_REVIEW_NOT_CURRENT`; a
+conceptual intent 409s with `CONCEPTUAL_PATTERN_NOT_AUTHORABLE`; `POST /features` writes
+`lifecycle_state='idea'`; **no route path exists that writes a governed artifact without
+passing the fold** (grep-pinned by a meta-test asserting every caller of `register_feature`,
+`gate1_choice`, contract-confirm calls `activation_decision` first); an idea cannot be
+registered as a model consumer; a review revoked AFTER generation blocks confirm with the
+typed `STALE_REVIEW` blocker (the CurrentActivationState comparison, tested end to end).
+
+### Task A3 — allowed_actions + the three-section considered set (1 day)
+
+Validated finding 8: today the projection converts actionable candidates AND gauntlet refusals
+into bare `{name, reason, code}` rejections (`semantic_projection.py:139/159`) — they get no
+option id, so "blocked ≠ hidden" fails and a blocked candidate cannot even be saved as an
+idea. The v2 contract gains three sections:
+
+- `recommended_options` — bound, gauntlet-passed (today's served set);
+- `actionable_options` — blocked/ambiguous/provisional candidates WITH option ids and decision
+  rows: `save_idea` allowed, `create_contract` blocked with their named resolutions;
+- `rejected_outputs` — malformed or unsafe model output only (parse rejections, leakage
+  refusals): no option id, never selectable, still visible.
+
+
+*Modify:* `contract.py` (v2 response + option detail), `semantic_projection.py` (facts ride the
+idea), `feature_serialize.py`.
+
+Each v2-contract option and each option-detail response carries
+`allowed_actions: [...]` + `blocked_actions: {action: [{code, next_step}]}` computed by the
+SAME fold at read time (cheap: pure over stored facts). v1 responses unchanged (no leak — the
+existing no-leak pin extends to the new keys).
+
+*Acceptance:* v2 response test asserts the shape; v1 no-leak pin extended; the fold called at
+read time and at write time is the same function (import-identity test).
+
+### Task A4 — Workbench renders the server's answer (1 day)
+
+*Modify:* `frontend/src/api.ts`, `WorkbenchScreen.tsx`, tests.
+
+1. `contractConsideredSet` sends `contract_version: 2` (UI-01 — the semantic contract becomes
+   Workbench's only contract; the v1 switch is deleted from api.ts, not kept as an option).
+2. `canSelect` and "Take this set" become `allowed_actions`-driven: `create_contract` absent →
+   the select checkbox is disabled with the first blocker's `next_step` as the title;
+   "Save idea" is offered instead (it is always allowed).
+3. The Register button relabels to "Save idea" with the non-governed state visible on the row.
+4. Batch selection filters to actionable members and SAYS how many it skipped and why.
+
+*Acceptance:* screen tests — a `blocked_actions.create_contract` card cannot be selected and
+names the blocker; a clean card can; "Save idea" works for both; every existing test updated to
+the v2 contract shape deliberately (they are byte-pins doing their job).
+
+## 3. Phase B — one engine, one plan *(closes GEN-01…GEN-05, PLAN-01, PLAN-13, PLAN-14)*
+
+> Objective: every displayed candidate came through one request → binder → planner →
+> validation path. No legacy candidate mixes in.
+
+### Task B1 — the free-form generator stops serving under semantic_v1 (1 day)
+
+*Modify:* `gate1.py`.
+
+1. Under `semantic_v1`: skip `recommend_feature_sets_report` entirely (no dispatch, no lens).
+   `alternatives` starts empty; the engine's projection is the only candidate source.
+2. The definition-mode anchor — **a verified plan defect fixed here**: the user-definition
+   adapter takes ALREADY-TYPED operands (`planning_request_from_user_definition(*, operands:
+   tuple[RequiredOperandV1, ...] …)` — verified), and a prose definition has none. The anchor
+   path therefore needs ONE audited definition→intent extraction call (the `feature_intents`
+   schema seeded with the user's redacted definition and instructed to extract, not invent —
+   same physically-blind inventory, same per-item validation), then the shared binder binds it.
+   `generation_source="user_defined"` is server-assigned on the served anchor; physical refs
+   the user typed demote to `binding_hint_refs` (the adapter's existing rule). The free-form
+   `recommend_features` call is not made under the mode.
+3. The near-label critic, use-case ordering, and recommendation stay — origin-blind, over
+   projected ideas (they already are).
+4. legacy/shadow modes byte-identical (existing pins prove it).
+
+5. **Entity-only / cross-catalog scope** (verified: the semantic branch requires
+   `catalog_source is not None`, so an entity-scoped request would lose ALL generation once
+   free-form is off): until a frozen multi-catalog context is chartered, the mode REFUSES the
+   entity-only scope with a typed 422 naming the limitation — an honest refusal, never a
+   silent empty page. E4 re-verifies this before deleting the legacy branch.
+
+*Acceptance:* under semantic_v1 with a FakeLLM whose free-form tasks EXPLODE
+(`overlay.feature.recommend*` scripted to raise), the request succeeds and serves engine
+candidates only; provider-call count per request measured in-test and asserted to include
+exactly one intent call + critic/recommendation calls, zero free-form generation calls.
+
+### Task B2 — unscoped intents get the full vocabulary (½ day)
+
+*Modify:* `gate1.py:900`, `feature_intent_generation.py`, tests.
+
+`scope_leaves = (scope.primary, *scope.secondary)` when primary is set, **else the complete
+`selectable_leaves()` set** (the broaden case is a wider vocabulary, not an empty one).
+`semantic_capability_inventory` truncation counting already bounds prompt size.
+
+*Acceptance:* API test — `unscoped=true` request returns ≥1 validated intent; the
+out-of-scope rejection still fires for an objective outside the full leaf set.
+
+### Task B3 — provenance and actor truth (½ day)
+
+*Modify:* `feature_intent_generation.py` (provenance dict), `gate1.py` +
+`recipe_planning_lens.llm_intent_candidates` (thread the identity envelope),
+`api/routes/contract.py` (pass `identity` into the builder — it already has it).
+
+1. `confirmed_scope_hash` = the confirmed scope's own content hash (canonical hash over
+   primary/secondary/expansion — compute where the scope persists); `semantic_context_hash`
+   becomes its own provenance key.
+2. The authenticated `IdentityEnvelope` threads through to `drive_audited_structured_call` so
+   the intent call is attributed to the human who asked.
+
+*Acceptance:* provenance test pins both hashes distinct; the recorded llm_call's `created_by`
+carries the requesting actor, not the service identity.
+
+### Task B4 — origin-honest projection (1 day)
+
+*Modify:* `semantic_projection.py`, `feature_planning_contracts.py` (additive
+`display_definition: str = ""` on the request; intent adapter fills it from
+`intent.business_definition`, recipe adapter from `definition.business_definition`),
+`feature_assist.py` (`generation_source` closed set + `llm_intent`), serializers, UI label map.
+
+1. `generation_source = {"recipe_v2": "recipe", "llm_intent": "llm_intent",
+   "user_definition": "user_defined"}[origin]`; `recipe_id` set ONLY for recipe origin.
+2. Description = `display_definition` (the intent's real business definition survives);
+   rationale = the intent's authored rationale, labeled "Model's rationale" in the UI (never
+   "Evidence") per SE-12 rule 7.
+3. Option-detail joins observations by origin-appropriate id (no recipe lookup for intents —
+   the `v2_recipe_by_id` try/except fallback becomes an explicit origin branch).
+4. Lens naming stops lying: the engine's one assembled lens serves as `"engine"` (or per-origin
+   lens names) — never `"templates"` for a set that contains intents. Response-shape pins
+   updated deliberately.
+
+*Acceptance:* projection tests — an intent-origin candidate serves with
+`generation_source="llm_intent"`, no `recipe_id`, its real definition; a recipe candidate
+unchanged; the Workbench origin chip renders the new value.
+
+### Task B5 — parameter variants (1–1½ days)
+
+*Modify:* `recipe_planning_lens.py`, `candidate_assembly.py` (no change expected — parameters
+are already signature identity), tests.
+
+1. `v2_recipe_candidates` enumerates each applicable recipe's authored variants
+   (`itertools.product` over `parameter.allowed_values`, bounded by the registry's own
+   authoring); each variant = its own request via the existing `parameter_values` argument.
+2. Deterministic hypothesis-token pass: window-bearing tokens in the redacted hypothesis
+   ("90 day", "quarterly"…) matched against allowed values pick the PRIMARY variant; unmatched
+   recipes lead with the authored-first value. Primary-variant ordering rides the existing
+   composite key (a new `variant_primary` boolean before the signature tiebreak).
+3. Cards state their variant (`param_alternatives` already renders; ensure populated on the
+   semantic path).
+4. **Bounded display, complete choosability:** the ranked LIST shows the primary variant per
+   recipe (alternates collapsed under it, D3 renders the expander); ALL variants exist in
+   `options_by_id` with their own option ids, so any variant is Gate-1 choosable. Omitted-from-
+   display counts are stated (the suggestions page's precedent), never silent.
+5. Whole-round `feedback` threads into the intent-generation prompt (today only the hypothesis
+   does — verified), so the feedback loop actually steers the abstract proposals.
+
+*Acceptance:* a hypothesis naming "90 day" serves the 90-day variant first with the 30/180
+variants as distinct, selectable, correctly-hashed options; total capability queries UNCHANGED
+(one batched read — proven by the B6 pin).
+
+### Task B6 — kill the N+1 (1 day)
+
+*Modify:* `recipe_planning_lens.py`, `recipe_operand_policy.py` (split
+`bind_planning_request` into shortlist assembly + a pure bind-over-capabilities core),
+`recipe_review_validity.py` (batch reader), tests.
+
+1. Collect shortlists across ALL candidates (recipes × variants + intents) → ONE
+   `compile_capabilities` call per generation run.
+2. Review events for all recipe ids in ONE query.
+3. Total-query pin test: a full unscoped run over a 317-recipe registry executes ≤ N queries
+   where N is a small named constant (context 3 + capabilities 1 + reviews 1 + persistence),
+   asserted the same way the existing zero-graph_node-reload test works.
+
+*Acceptance:* the pin test; byte-identical verdicts vs the per-recipe path on a fixture catalog
+(golden comparison in-test before the old path is deleted).
+
+### Task B7 — the planner joins serving (1½–2 days)
+
+*Modify:* `recipe_planning_lens.py` (bound candidates → `plan_planning_request`),
+`semantic_projection.py` (plan envelope + aggregation/grain onto the idea),
+`planner/requests.py` (only if translation gaps surface), tests.
+
+0. **Verify-first (SE-8 step 10 is unverified):** confirm `plan_bindings` mints a real
+   `PlanEnvelopeV1` for SINGLE-catalog plans — the governed planner was built cross-catalog-
+   first and the "only cross-catalog ideas get a real envelope" rule may still hold. If it
+   holds, extending envelope minting to single-catalog IS this task's first step; A1's
+   `plan_envelope_present` gate stays blocked until then (fail closed, by design).
+1. **The planner VALIDATES the frozen bindings — it never chooses columns** (validated
+   finding 4: `plan_planning_request` → `plan_bindings` runs its own `ground_template` +
+   `discover_ingredient_candidates` re-discovery, so the naive wiring could show the user
+   column A and govern column B). New entry point `plan_frozen_bindings(conn, request,
+   role_bindings, …)`: source selection, join path, cardinality, PIT, and grain are computed
+   OVER the exact bound refs; candidate discovery is bypassed. The plan's physical read set is
+   asserted to contain exactly the displayed role bindings — any mismatch returns
+   `BINDING_PLAN_DIVERGENCE` (new closed code), never a substituted column.
+2. Planner refusals are named actionable codes (`SOURCE_SELECTION_AMBIGUOUS`,
+   `JOIN_PATH_DENIED`, `DIRECTIONAL_CARDINALITY_UNPROVEN`…) — the candidate moves to the
+   actionable section, never served as governable (A1's `plan_envelope_present` gate consumes
+   this).
+3. The projection fills `plan_envelope`, `aggregation`, `grain_table`, `grain_ref`, `time_ref`,
+   `window` from the plan — the compatibility fields the review found null.
+
+*Acceptance:* a bound single-table candidate serves WITH a plan envelope and real
+aggregation/grain; a cross-dataset candidate without a verified join lands actionable with the
+named code; `create_contract` on a plan-less option is 409 PHYSICAL_PLAN_MISSING (A-phase test
+flips from expected-blocked-always to conditionally-allowed).
+
+### Task B9 — refine becomes an intent revision (1 day)
+
+*Modify:* `gate1.py` / a small `refine` seam beside `llm_intent_candidates`,
+`api/routes/assist.py` (or a scoped route), `frontend/src/api.ts`, tests.
+
+**Verified dependency:** Workbench calls `refineCandidate` → `POST /features/refine`
+(`WorkbenchScreen.tsx:1400`, `api.ts:1921`) — which A-phase/`semantic_v1` answers with a typed
+409. Without this task the refine loop is DEAD in E2E (bar item 5).
+
+1. Under the mode, refine takes the candidate's stored planning request + the human
+   instruction → ONE audited intent-revision call (revise the MEANING: concepts, classes,
+   temporal, params — never columns) → parse per-item → shared binder → gauntlet → the revised
+   candidate returns with full verdicts, exactly like generation.
+2. A refine that survives mints a fresh generation run + superseding revision (the governed
+   flow's own rule — SE-10 step 9), so the revised option is choosable with real identity.
+3. Gauntlet-rejected revisions stay 200-with-rejection (the existing contract both outcomes
+   arrive as data — pinned by the current tests).
+4. The compatibility-only 409 for `/features/refine` is REPLACED by this path under the mode
+   (the other three direct routes keep their 409s until E4 deletes them).
+
+*Acceptance:* Workbench refine round-trips under semantic_v1 — instruction in, engine-bound
+revision out with verdicts and a fresh option id; a column-naming instruction ("use cust_num")
+does not smuggle a binding (hint at most); the legacy modes byte-identical.
+
+### Task B8 — readiness probe before spend (½ day)
+
+*Modify:* `api/routes/contract.py` (scoped route step 4–5), `gate1.py`.
+
+`check_projection_readiness` runs at run-mint time, BEFORE any model dispatch; a lagged
+projection 503s having spent zero provider calls.
+
+*Acceptance:* test with a lagged projection asserts 503 and `FakeLLM` recorded zero calls.
+
+## 4. Phase C — the metadata actually governs *(closes PLAN-06…PLAN-12, GEN-06)*
+
+### Task C1 — resolver-backed capability pins (1–1½ days)
+
+*Modify:* `column_capabilities.py`, tests.
+
+Compile pins from the governed field-resolution DECISION — through a new **read-only batched
+current-resolution API** (verified: `resolve_and_project` WRITES — it records decisions and
+projects into `graph_node`; generation must never mutate the catalog it reads). The pinned
+decision is `(value, producer, strength, evidence_id, conflict_state)` — indivisible, and
+`conflict_state` is **the resolver's own verdict**, not any-mismatch (a newer weak LLM
+proposal disagreeing with a human-confirmed value is a losing proposal, not a semantic
+conflict — validated correction). Weaker-later evidence can no longer displace stronger.
+
+*Acceptance:* the review's exact failure sequence as a test — display concept A, later active
+proposal B: capability carries A with A's OWN authority and a conflict marker; B's strength
+never rides A. Existing capability tests updated deliberately.
+
+### Task C2 — the four authority matrices (1 day)
+
+*Modify:* `semantic_eligibility.py`, `activation_policy.py`, tests.
+
+`AUTHORITY_MATRIX` grows `retrieval / suggestion_at_declared / authoring / execution_at_governed`
+columns (data, content-hashed — the policy hash moves). Eligibility keeps consuming the
+suggestion column; `activation_decision` consumes authoring (create_contract) and execution
+(materialize) — replacing A1's unconditional `EXECUTION_AUTHORITY_UNEVALUATED` block with the
+real floor check against every bound operand's measured authority.
+
+*Acceptance:* matrix tests per column; materialize allowed only when every operand clears
+`execution_at_governed` (which today means human/confirmed or source/attested — a test proves
+llm/proposed NEVER clears it); the A2 materialize tests flip from unconditional-block to
+floor-driven.
+
+### Task C3 — enforce or refuse every authored constraint (2–3 days, the long tail)
+
+*Modify:* `semantic_eligibility.py`, `recipe_operand_policy.py`, `typed_gauntlet.py`,
+`semantic_eligibility_reasons.py`, migration **1065** only if sign evidence needs a store.
+
+For each transported-but-unconsumed field, ONE of: enforced check, or named
+`UNSUPPORTED_*` blocker. Verified inventory and dispositions:
+
+| field | disposition |
+|---|---|
+| `allowed_source_grains` | enforce: candidate's population/dataset story grain ∈ allowed set, else `SOURCE_GRAIN_MISMATCH` |
+| `join_role` / `temporal_role` | enforced by B7's planner translation (verify; else UNSUPPORTED) |
+| `unit_expectation` | enforce against unit facts where present; absent facts → needs_setup |
+| `currency_expectation` + conversion | already floors on missing currency; add per-row-column vs fixed-code check |
+| `status_policy_ref` | UNSUPPORTED blocker until a status-policy resolver exists (named, visible) |
+| `relationship_requirement` + cardinality | enforced by B7 planner facts, else blocked |
+| **sign** | the authored expectation is an EXPECTATION, never authority. Same-column opposing legs require GOVERNED sign representation — EITHER a `sign_convention` evidence row on the amount column (signed-amount convention) OR a governed pairing with a bound direction column (`debit_credit_indicator` role — the representation real banking schemas use, validated correction); otherwise blocked. Fixes the confirmed `recipe_operand_policy.py:276` defect |
+| output null/empty/zero-denominator policies | gauntlet checks presence when the operation makes them load-bearing (ratio ⟹ zero-denominator, etc.) |
+| additivity vs operation | gauntlet: `sum` over non_additive/semi_additive without an as-of dimension = blocked |
+
+Plus the **meta-test**: every behavior-bearing field on `OperandSpecV2`/`OutputSpecV2` must
+appear in a registered-consumer map (enforced or named-unsupported) or the test fails — the
+review's "no field without a consumer" ratchet.
+
+*Acceptance:* per-field positive + negative tests; the meta-test; the banking battery gains the
+sign-leg, additivity-abuse, and grain-mismatch cases.
+
+### Task C4 — personal-data purpose policy in the engine path (1 day)
+
+*Modify:* `column_capabilities.py` (consume the D14 `pii_policy` resolver the legacy gauntlet
+already uses), `activation_policy.py`, `semantic_projection.py`
+(`personal_data_policy_revision_ids` onto served ideas — the carrier exists).
+
+Capability gains `personal_data: {required, licensed, policy_revision_ids}`; an unlicensed
+personal-data operand is `PERSONAL_DATA_POLICY_REQUIRED` (code exists); activation refuses
+`create_contract` while unlicensed; licensing revision ids persist on the served idea exactly
+as the legacy path persists them.
+
+*Acceptance:* read-allowed-use-denied column refuses activation with the named code (the
+review's §10 case); licensed case carries revision ids end to end.
+
+### Task C5 — DESIGN_CHECKED means every family evaluated (1 day)
+
+*Modify:* `typed_gauntlet.py`, tests.
+
+A closed `_POLICY_FAMILIES` registry (leakage, identifier, temporal, dataset, unit/currency,
+additivity, sign, status, relationship, personal-data, formula-output). Each family reports a
+TRI-STATE (validated correction — a recipe with no monetary operand has no currency family to
+evaluate): `evaluated` / `not_applicable` (with the reason derived from the request's own
+shape) / `missing` (could not evaluate — capability axis absent). `design_checked` requires
+every family `evaluated` or `not_applicable`; any `missing` emits `NEEDS_SETUP`/`UNSUPPORTED`.
+Success-by-omission becomes structurally impossible without blocking features the family
+genuinely does not concern.
+
+*Acceptance:* removing any family's evaluation flips a previously-design-checked fixture to
+needs_external_validation (parameterized over all families).
+
+### Task C6 — authority-ranked shortlists, honest truncation, consumed hints (1 day)
+
+*Modify:* `recipe_operand_policy.py`, `semantic_candidate_store.py` (truncation onto the
+observation row), tests.
+
+1. Rank before truncating: authority tier (confirmed > attested > declared > proposed >
+   hint) → exact-concept-before-alternative → governed economic role → user
+   `binding_hint_refs` match → stable ref order. THEN cut at 16.
+2. `truncated` returns on the verdict/eligibility audit and persists.
+3. A REQUIRED operand whose shortlist truncated without an eligible winner fails closed as
+   `REQUIRED_OPERAND_AMBIGUOUS` (+truncated marker), never "missing" from an incomplete search.
+4. `binding_hint_refs` become a ranking signal (user-only, already validated as such) — never
+   an override of eligibility.
+
+*Acceptance:* a human-confirmed column at index 20 of 25 same-concept columns WINS; the
+truncation flag survives to the observation row; the hint promotes an eligible ref and cannot
+promote a blocked one.
+
+### Task C7 — semantic closure for retrieval (1 day)
+
+*Modify:* `generation_semantic_context.py` (versioned closure map: concept → self + ancestors +
+namespace-mates from the registry, content-hashed into the context), `recipe_operand_policy.py`
+(shortlist assembly consults the closure; eligibility still decides exactly), tests.
+
+*Acceptance:* an operand asking `monetary_flow` retrieves a column enriched with a REGISTERED
+descendant concept and eligibility still refuses a mismatched meaning; closure changes move the
+context hash.
+
+### Task C8 — prose physical-reference detector (½ day)
+
+*Modify:* `feature_intent.py`, tests.
+
+Bounded SERVER-SIDE scan of intent display/definition/rationale strings against the frozen
+semantic context's table/column token set — validated correction: the model-facing inventory
+is deliberately physically blind (concepts + counts only), so scanning "against the inventory"
+would match nothing; the scan runs after the model responds, against `context.columns`
+tokens. A match rejects the item (`INTENT_REJECTED_PARSE`, "model prose names physical
+objects").
+
+*Acceptance:* an intent whose rationale says "use bo_cib_customer.cust_num" is rejected
+per-item; clean prose passes.
+
+## 5. Phase D — the candidate seen is the candidate governed *(closes LIFE-01…03, PLAN-15, UI-02/04/05/06)*
+
+### Task D1 — enrich `SemanticOptionDecisionV1` to the full evidence record (1 day; A1b created it)
+
+*Create:* migration 1063 (`semantic_option_decision`, append-only, guard triggers), a store
+module; *modify:* `gate1.py` (persist per served option in the request transaction),
+`contract.py` (option detail reads it by primary key).
+
+The record: full planning request + variant values, all verdicts + full eligibility audit +
+losing shortlist + truncation, readiness, review fold at generation, validation result, dataset
+story, plan envelope, `decision_manifest` (content hashes of every consumed capability,
+evidence decision, policy revision, closure map, planner artifact — PLAN-15's seal),
+observation id, and the option id it serves. Option detail joins by **decision id carried in
+the option record** — LIFE-03's wrong-row risk is structurally gone.
+
+*Acceptance:* drafting reads the stored decision without recomputation (test stubs live
+metadata to explode); detail returns exactly the selected candidate's evidence for merged
+twins and variants; hash verification test (tamper → typed 409).
+
+### Task D2 — executable identity vs display identity (½ day)
+
+*Modify:* `candidate_assembly.py`, `gate1.py` option-id mint.
+
+**The candidate seen is the candidate governed — so the DISPLAY signature carries the
+canonical formula/mechanism identity too** (validated finding 7: hiding different formulas
+behind one card with different secret option ids breaks the program's core promise). Merge
+ONLY candidates with identical executable semantics; different formulas are separate,
+visibly-distinct selectable variants; corroborations mean "the same computation from another
+origin", never "a different computation". The OPTION ID additionally hashes the plan envelope
++ decision-manifest hash (physical identity on top of executable identity).
+
+*Acceptance:* two candidates differing only in formula expectation render as TWO cards; a
+recipe/intent pair with identical executable semantics still merges; drift in any manifest
+hash mints a new id.
+
+### Task D3 — Workbench audit drawer + card sections (1½ days)
+
+*Modify:* `WorkbenchScreen.tsx`, `api.ts` (detail client), tests.
+
+1. Option detail fetched on demand (UI-02) into a drawer: frozen roles + authorities, losing
+   shortlist, dataset story, plan/PIT summary, policy hashes, revision identity.
+1b. The list groups by each candidate's TYPED operation class ("Ratios & utilization",
+   "Recency & activity", "Flows & sums" — from the closed `RESULT_CLASS_ADDITIVITY`
+   vocabulary), restoring the browsing experience the legacy lenses gave, with headings that
+   are facts about the feature rather than names of the prompt that produced it.
+2. Card gains the review's §UI-04 sections: "what it computes" (operation, window/variant,
+   unit, additivity, grain), "can it be built" (plan summary or first blocker), readiness +
+   review chips as separate axes (never one green badge).
+3. Deep link from a `PROPOSED_METADATA_ONLY` blocker to the asset field-decision screen focused
+   on the field; returning regenerates a fresh run (UI-06 / rule 10 — the card never
+   self-approves its own metadata).
+
+*Acceptance:* screen tests per section; the deep link carries the exact field; a post-confirm
+regenerate mints a new revision (route already does — test the UI flow).
+
+### Task D4 — Suggested Features on the shared carrier (1–1½ days)
+
+*Modify:* `suggestions.py`, `suggestion_contract.py`, `SuggestedFeaturesScreen.tsx`,
+`SuggestionCard.tsx`.
+
+Contract v4's hits are REPLACED by the engine's assembled candidates rendered through the same
+option carrier Workbench uses (UI-05 — one card model, one eligibility result; the legacy
+per-table template pass retires from v4; v1–v3 remain frozen until the E4 cutover deletes
+them). The page anchors/filters the shared results by the opened table.
+
+*Acceptance:* the parity test hardens from "binding states agree" to "the CARDS are the same
+carrier"; v3 byte-freeze pins still hold.
+
+## 6. Phase E — proof, then the knife *(closes REL-04/05, REL-01/02 pragmatically, GEN-01's tail)*
+
+### Task E0 — the end-to-end walkthrough gate (1 day) — **this plan's own acceptance test**
+
+*Create:* `tests/featuregen/api/test_e2e_walkthrough.py` (API-level, FakeLLM-scripted) + the
+UAT runbook section in `docs/architecture/`.
+
+The bar in §0.1, as ONE test that walks the whole workflow and clears every blocker through
+its real surface:
+
+1. seed a cib-shaped catalog (proposed-only concepts, no reviews) → considered set →
+   assert the target candidate is served with `create_contract` BLOCKED, codes
+   `PROPOSED_METADATA_ONLY` + `RECIPE_REVIEW_NOT_CURRENT` (+ `PHYSICAL_PLAN_MISSING` until B7);
+2. confirm the concept through the REAL funnel route; record a review through the REAL
+   `POST /recipes/{id}/reviews`; regenerate;
+3. assert `create_contract` now ALLOWED → draft → confirm → feature registered with
+   `lifecycle_state='governed'` and the contract carrying `FORMULA_BLOCKED` readiness honestly;
+4. assert `materialize` refused with the typed code;
+5. save-idea path works for a conceptual LLM intent;
+6. refine round-trips (B9);
+7. the suggestions v4 page agrees on the same binding.
+
+The UAT runbook documents the same walk as human clicks (screens, buttons, expected chips) for
+the SME session.
+
+*Acceptance:* the test is green and RUNS IN THE DEFAULT SUITE (not eval-marked) — from the day
+it lands, any regression that breaks the end-to-end path breaks the build.
+
+### Task E1 — banking acceptance corpus (2 days)
+
+*Create:* `tests/eval/gold/test_banking_acceptance.py` + fixtures.
+
+The review's §10 table, all 14 cases, as named versioned fixtures run END TO END through the
+serving path (route in, wire out) — not unit folds. Each case asserts the exact refusal
+code/action/served variant the table names.
+
+*Acceptance:* all 14 green; each case's docstring cites its review row.
+
+### Task E2 — Workbench journey + budgets (1½ days)
+
+*Create:* Playwright hypothesis → considered set → blocked-select → save-idea →
+confirm-metadata → regenerate → select → draft → confirm journey; keyboard/focus assertions on
+selection, blockers, drawer. *Create:* perf pin — total SQL + provider calls + p95 latency on a
+CIB/FTR-sized fixture catalog (SE-0's measured 237-column shape), asserted as budgets.
+
+*Acceptance:* journey green against a real backend (the existing Playwright harness's postgres
+requirement fixed or documented); budget test red-lines named numbers.
+
+### Task E3 — finite divergence run (½ day operator + tooling)
+
+*Create:* a one-shot comparison script (not a mode): replay N recorded hypotheses through
+legacy and semantic paths in a dev environment, persist per-candidate pairs, emit the
+explained/unexplained table. Operator (user) reviews; unexplained divergences become tasks or
+accepted notes IN THIS FILE.
+
+*Acceptance:* the adjudication table committed to `docs/architecture/`; zero unexplained rows.
+
+### Task E4 — the cutover commit (1 day)
+
+*Modify/delete:* `gate1.py` legacy branch, `recommend_feature_sets_report` Gate-1 call site,
+`recipe_rollout.semantic_planning` mode + parser, `semantic_shadow` machinery that exists only
+for comparison, SE-0's `ALL_TEMPLATES` gate1 pin (updated IN THIS COMMIT per its own rule),
+suggestion v1–v3 if E3 confirmed no consumer, the 20-backend.yaml mode line (deleted, not
+flipped), and the direct `/features/*` compatibility-only guard (routes now always refuse —
+or delete the generation routes outright).
+
+One commit, one review, suite green, deployed with explicit user approval. Rollback = previous
+image.
+
+**Verify-first:** before deleting any reader/parser (suggestion v1–v3 serializers, legacy
+considered-set reconstruction), prove no persisted record still needs it — query the dev
+store for rows in the old shapes; a one-time migration or an explicit reset (user-approved)
+precedes the deletion, never follows it.
+
+*Acceptance:* `FEATUREGEN_SEMANTIC_PLANNING` appears nowhere in `src/`; the frozen-config test
+updated; every suite green; the deployed cluster serves the engine with the env var absent;
+no orphaned persisted record references a deleted parser.
+
+## 7. Sequencing and dependencies
+
+```
+A0 ──► A1 ──► A2 ──► A3 ──► A4
+              │
+B1 ◄──────────┘ (A2's negative tests make B1's serving change safe to verify)
+B2, B3, B4 — independent, parallel after B1
+B6 ──► B5 (batching lands FIRST — variant expansion must never create a 936-candidate N+1)
+B6 ──► B7 (the planner consumes the batched capability universe)
+B8 — independent; B9 after B4 (refine revises honest-origin intents)
+C1 ──► C2 ──► (A2 materialize flips floor-driven)
+C3, C4, C5, C6, C7, C8 — parallel after C1
+D1 ──► D2 ──► D3; D4 after D1
+E0 needs A complete (incl. A1b) + B1/B2/B7/B9 (create_contract cannot go green without the
+plan envelope B7 mints; C1 strengthens the authority pins but the funnel-confirm walk clears
+without it); E1 needs B+C complete; E2 needs D3;
+E3 needs B complete; E4 LAST, after E0–E3 green
+```
+
+Estimated effort: A ≈ 4 days · B ≈ 7½ · C ≈ 8 · D ≈ 5 · E ≈ 6 — ~30 focused days; phases A and B
+alone (≈11½ days) close every Critical finding, and **A + B + E0 (≈12½ days) is the minimum
+end-to-end-testable milestone** — the walkthrough gate green means an SME can run the workflow.
+
+## 8. Standing rules for execution
+
+- Full backend suite green gates every push; frontend suite for frontend changes; the
+  eval marker (`pytest -m eval`) joins the gate from A0 onward.
+- Acceptance row appended under the task in THIS file per landed slice, with commit hash.
+- Migrations 1063/1064 (and 1065 if used) deploy backend-first, with explicit user approval
+  per the standing deploy rule; the E4 cutover deploy likewise.
+- No new env flags anywhere in this program (D-1); the only mode that exists is deleted by E4.
+- LLM-spend actions (E3's replay, live verification runs) are operator actions — explicit user
+  go each time.
+- The plan file `2026-08-11-semantic-eligibility-feature-generation-workflow.md` receives one
+  closing annotation pointing here; its unfinished acceptance rows are superseded by this file.

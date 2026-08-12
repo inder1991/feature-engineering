@@ -8,7 +8,6 @@ user's request succeeds identically. `legacy` (the frozen default) never touches
 from __future__ import annotations
 
 import pytest
-
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -117,7 +116,6 @@ def test_a_shadow_failure_is_swallowed_and_the_response_is_unchanged(
 def test_shadow_observations_become_append_only_rows(make_client, conn, monkeypatch):
     """SE-10 slice 1: the shadow's per-candidate truth persists as rows — queryable fleet
     metrics under the frozen context's hash — and the store refuses rewrites."""
-    import pytest
 
     _bank(conn)
     monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
@@ -162,4 +160,3 @@ def test_shadow_metrics_fold_the_recorded_observations(make_client, conn, monkey
     assert sum(metrics["candidates_by_binding_state"].values()) == metrics["observations"]
     assert set(metrics["candidates_by_origin"]) == {"recipe_v2"}
     assert metrics["identifier_as_measure_preventions"] >= 0   # counted from verdict codes
-

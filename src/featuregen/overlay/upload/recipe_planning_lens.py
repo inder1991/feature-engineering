@@ -199,7 +199,7 @@ class V2RecipeCandidateV1:
     eligibility: dict = None  # type: ignore[assignment]
     # SE-8 steps 2+3: the feature-level dataset decision (population + cross-dataset need),
     # folded from the frozen context's DECLARED facts. None only on legacy fixtures.
-    dataset_story: "DatasetStoryV1 | None" = None
+    dataset_story: DatasetStoryV1 | None = None
 
 
 def _review_validity(conn, definition: RecipeDefinitionV2,

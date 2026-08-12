@@ -1,12 +1,10 @@
 """SE-4 — the eligibility fold: every known bad binding class refuses, honestly and actionably."""
 from __future__ import annotations
 
-from dataclasses import replace
-
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.column_capabilities import ColumnCapabilityV1
 from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
 from featuregen.overlay.upload.feature_planning_contracts import RequiredOperandV1
-from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.semantic_eligibility import (
     AUTHORITY_MATRIX,
     authority_matrix_hash,

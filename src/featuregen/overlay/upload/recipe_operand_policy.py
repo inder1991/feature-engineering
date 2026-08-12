@@ -426,8 +426,11 @@ def _consult_request_tie_break(conn, request, operand, tied_cols):
     """The SAME verdict store, keyed on the planning request's source definition — for a
     recipe-origin request this is byte-identical to the V2 key (same recipe id, same business
     definition), so adjudications warmed for the live surface resolve here too."""
-    from featuregen.overlay.upload.tie_break import TieBreakCandidate, find_tie_break_verdict
-    from featuregen.overlay.upload.tie_break import tie_break_input_hash
+    from featuregen.overlay.upload.tie_break import (
+        TieBreakCandidate,
+        find_tie_break_verdict,
+        tie_break_input_hash,
+    )
 
     tied = tuple(
         TieBreakCandidate(ref=c.object_ref, definition=c.definition or "",

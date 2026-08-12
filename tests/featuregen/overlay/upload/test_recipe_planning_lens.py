@@ -146,15 +146,15 @@ def _confirm_concept(db, object_ref: str, concept: str) -> None:
 def test_a_confirmed_concept_beats_a_proposed_twin_without_a_tie(db):
     """THE authority payoff: two columns carry the measure concept; one is human-confirmed.
     The old lexical binder saw an unadjudicatable tie — the eligibility tiers resolve it."""
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
     from featuregen.overlay.upload.generation_semantic_context import (
         build_generation_semantic_context,
     )
     from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
-    from featuregen.overlay.upload.feature_planning_contracts import (
-        planning_request_from_recipe,
-    )
 
-    rows = _base_rows_with_twin(db)
+    _base_rows_with_twin(db)
     context = build_generation_semantic_context(db, catalog_source=SOURCE)
     request = planning_request_from_recipe(EXEMPLAR)
     verdicts, eligibility = bind_planning_request(db, request, context)
@@ -194,16 +194,16 @@ def _base_rows_with_twin(db):
 
 
 def test_two_equal_proposals_still_fail_closed_as_ambiguous(db):
-    from featuregen.overlay.upload.generation_semantic_context import (
-        build_generation_semantic_context,
-    )
-    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.enrich import content_hash
     from featuregen.overlay.upload.feature_planning_contracts import (
         planning_request_from_recipe,
     )
-    from featuregen.overlay.upload.canonical import CanonicalRow
-    from featuregen.overlay.upload.enrich import content_hash
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
     from featuregen.overlay.upload.graph import build_graph
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
 
     rows = [
         (CanonicalRow(SOURCE, "transactions", "acct_ref", "integer", is_grain=True,

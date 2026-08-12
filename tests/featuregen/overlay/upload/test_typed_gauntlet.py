@@ -1,6 +1,7 @@
 """SE-9 — the typed gauntlet: the tri-state from ACTUAL unmet conditions, typed per role."""
 from __future__ import annotations
 
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.feature_planning_contracts import (
     RequiredOperandV1,
     planning_request_from_user_definition,
@@ -9,7 +10,6 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
 from featuregen.overlay.upload.recipe_planning_lens import V2RecipeCandidateV1
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
-from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.typed_gauntlet import (
     TYPED_GAUNTLET_VERSION,
     validate_candidate,

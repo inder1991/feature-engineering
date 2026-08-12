@@ -29,6 +29,7 @@ from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
+
 def _set_hash(triples) -> str:
     """`field_resolution._evidence_set_hash`'s formula over (producer, strength,
     proposed_value_hash) triples — order-independent. Kept formula-identical by a pin test

@@ -1,6 +1,7 @@
 """SE-7 — the enforced projection: semantic verdicts become Gate-1 carriers, honestly."""
 from __future__ import annotations
 
+from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.candidate_assembly import assemble_candidates
 from featuregen.overlay.upload.feature_planning_contracts import (
     RequiredOperandV1,
@@ -9,10 +10,9 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
 from featuregen.overlay.upload.recipe_planning_lens import V2RecipeCandidateV1
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
-from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.semantic_eligibility import (
-    OperandEligibilityVerdictV1,
     SEMANTIC_AUTHORITY_POLICY_VERSION,
+    OperandEligibilityVerdictV1,
     authority_matrix_hash,
 )
 from featuregen.overlay.upload.semantic_projection import project_assembled_set

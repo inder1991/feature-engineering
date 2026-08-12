@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import pytest
 
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.column_authority import logical_ref_of
-from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload.column_capabilities import compile_capabilities
 from featuregen.overlay.upload.concept_operand_classes import (
     OPERAND_CLASS_MAP_VERSION,

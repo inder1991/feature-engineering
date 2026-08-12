@@ -112,13 +112,6 @@ def _m_disable_stale_value_retirement() -> None:
     enrich.stale_all_llm_field_evidence = lambda conn, **_kw: 0
 
 
-def _m_feature_gen_reads_the_thin_menu() -> None:
-    """Feature generation serves the v1 thin menu even with the context flag ON."""
-    from featuregen.overlay.upload import feature_assist as fa
-
-    fa.feature_context_enabled = lambda: False
-
-
 def _m_drop_per_kind_truncation_reporting() -> None:
     """The context section stops reporting WHICH kinds it omitted, keeping only the boolean."""
     from featuregen.overlay.upload import lineage
@@ -657,18 +650,11 @@ REGISTRY: tuple[Mutation, ...] = (
         apply=_m_disable_stale_value_retirement,
         expect_failure_contains="assert len(current) == 1",
     ),
-    Mutation(
-        mutation_id="feature_gen_reads_the_thin_menu",
-        kind=MUST_DIE,
-        invariant="with the flag on, feature generation gets v4, not the v1 thin menu",
-        target="feature_assist:feature_context_enabled",
-        victims=(
-            f"{_V4}::test_flag_on_defaults_to_v4",
-            f"{_V4}::test_v4_carries_the_shared_bundle_keys",
-        ),
-        apply=_m_feature_gen_reads_the_thin_menu,
-        expect_failure_contains="where 1 = _feature_schema_version()",
-    ),
+    # RETIRED 2026-08-13 (A0 triage): "feature_gen_reads_the_thin_menu". Its victims
+    # (test_flag_on_defaults_to_v4 et al) were deliberately deleted in flag-retirement wave B —
+    # FEATUREGEN_FEATURE_CONTEXT is gone, feature_context_enabled() returns constant True with
+    # its own reintroduction pin test, and the thin menu is unreachable by construction. The
+    # invariant this mutation guarded is now enforced structurally, not behaviorally.
     Mutation(
         mutation_id="drop_per_kind_truncation_reporting",
         kind=MUST_DIE,

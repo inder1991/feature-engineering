@@ -19,7 +19,6 @@ from featuregen.overlay.upload.enrich_llm import (
 )
 from featuregen.overlay.upload.stage_report import CANONICAL_STAGES
 
-
 # ── the three reporting/display wires ────────────────────────────────────────────────────────────
 
 def test_the_anchor_query_actually_selects_the_value():

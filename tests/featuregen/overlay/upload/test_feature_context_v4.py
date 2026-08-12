@@ -867,7 +867,6 @@ def test_a_bic_never_becomes_a_numeric_measure(db, v4):
 
 def test_a_mixed_currency_aggregation_is_refused(db, v4):
     from featuregen.overlay.upload.feature_assist import recommend_features_report
-
     from featuregen.overlay.upload.graph import add_column_row
 
     _bank_graph(db)

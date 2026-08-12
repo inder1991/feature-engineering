@@ -79,7 +79,10 @@ def test_the_registry_covers_every_invariant_the_plans_named() -> None:
         "entity_reenters_the_blocking_key",
         "accept_off_registry_concept",
         "disable_stale_value_retirement",
-        "feature_gen_reads_the_thin_menu",
+        # "feature_gen_reads_the_thin_menu" RETIRED 2026-08-13 (A0): its victims were
+        # deliberately deleted in flag-retirement wave B; the invariant (rich context is
+        # unconditional) is enforced structurally — feature_context_enabled() returns constant
+        # True with its own reintroduction pin test. See mutations.py for the full note.
         "drop_per_kind_truncation_reporting",
         "review_status_implies_executable",
         "collapse_data_and_authority_role",
@@ -162,7 +165,14 @@ RELEASE_GATE_SUITES: tuple[str, ...] = (
 #: Measured on this branch, 2026-08-03. The Task-0 record put the same seventeen at 238; the
 #: Release-A integration added 31. A DROP here is a deleted guard and must be explained, not
 #: rebaselined silently.
-RELEASE_GATE_BASELINE = 277  # rebaselined 2026-08-05 (Release C Task 13): +4 crosswalk adapter
+RELEASE_GATE_BASELINE = 364  # rebaselined 2026-08-13 (remediation A0): +87 across the named
+# suites, accumulated by three programs that grew them WITHOUT rebaselining as they landed —
+# banking-recipe R2/R3 waves and router-quality (test_feature_assist.py, test_enrich_llm.py,
+# test_feature_menu_enrichment.py additions through 2026-08-11) and the semantic-eligibility
+# program's touches to the same files (2026-08-12). Each program's suites were green at its own
+# gates; only THIS literal went stale. A DROP from 364 is a deleted guard and must be explained.
+# Previous: 277 (2026-08-05), 273 (2026-08-03), 238 (Task-0 baseline).
+_OLD_BASELINE_277 = 277  # kept for the paper trail: rebaselined 2026-08-05 (+4 crosswalk adapter
 # tests in test_joins.py — `plan_crosswalk_join` lives in that module and had NO test there at all
 # (its coverage was entirely in test_crosswalk_ir.py, which drives it THROUGH the IR). The four go
 # at the adapter directly and are the victims for three of Task 13's eight required mutations:
