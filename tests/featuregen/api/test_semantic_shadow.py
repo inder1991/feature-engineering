@@ -112,3 +112,31 @@ def test_a_shadow_failure_is_swallowed_and_the_response_is_unchanged(
 
     assert _comparable(body) == _comparable(baseline)
     assert any("semantic-shadow comparison failed" in r.message for r in caplog.records)
+
+
+def test_shadow_observations_become_append_only_rows(make_client, conn, monkeypatch):
+    """SE-10 slice 1: the shadow's per-candidate truth persists as rows — queryable fleet
+    metrics under the frozen context's hash — and the store refuses rewrites."""
+    import pytest
+
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
+    _post(make_client(llm_client=_fake()))
+
+    rows = conn.execute(
+        "SELECT source_definition_id, source_origin, binding_state, context_hash, "
+        "       generation_run_id, eligibility "
+        "FROM semantic_candidate_observation ORDER BY recorded_at").fetchall()
+    assert rows, "the shadow run persisted observations"
+    definition_ids = {r[0] for r in rows}
+    assert all(r[1] == "recipe_v2" for r in rows)
+    assert all(r[2] in ("bound", "ambiguous", "missing", "blocked") for r in rows)
+    assert len({r[3] for r in rows}) == 1                     # one frozen context per run
+    assert all(r[4] != "unattributed" for r in rows), "the scoped route's run id is attributed"
+    assert definition_ids                                     # real registry ids
+    # Append-only: an observation is what the run saw; rewriting it is a DB error.
+    import psycopg
+
+    with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        with conn.transaction():
+            conn.execute("UPDATE semantic_candidate_observation SET binding_state = 'bound'")

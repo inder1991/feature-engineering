@@ -746,7 +746,8 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
 def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
                              grounded_ids: frozenset[str],
                              rejected_ids: dict[str, tuple[str, ...]],
-                             semantic_context=None) -> None:
+                             semantic_context=None,
+                             generation_run_id: str | None = None) -> None:
     """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
     the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
     savepoint: a shadow failure must not poison the user's request transaction (the same rule
@@ -761,6 +762,16 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
             candidates = v2_recipe_candidates(
                 conn, catalog_source=catalog_source, roles=roles, scope=scope,
                 context=semantic_context)
+            # SE-10 slice 1: the observations become ROWS (append-only, migration 1062) —
+            # fleet metrics query them; the savepoint still shields the user's request.
+            if semantic_context is not None:
+                from featuregen.overlay.upload.semantic_candidate_store import (
+                    persist_semantic_candidates,
+                )
+
+                persist_semantic_candidates(
+                    conn, generation_run_id=generation_run_id or "unattributed",
+                    context=semantic_context, candidates=candidates)
         by_state = Counter(candidate.binding_state for candidate in candidates)
         logger.info(
             "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
@@ -902,7 +913,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
                                  grounded_ids=grounded_template_ids,
                                  rejected_ids=rejected_template_ids,
-                                 semantic_context=semantic_context)
+                                 semantic_context=semantic_context,
+                                 generation_run_id=generation_run_id)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(

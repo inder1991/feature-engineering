@@ -122,6 +122,9 @@ class V2RecipeCandidateV1:
     temporal_blocker: str = ""           # the named reason compilation refused; "" when compiled
     review_current: bool = False
     review_missing_roles: tuple[str, ...] = ()
+    # The full per-candidate eligibility audit from the shared binder — the losing-shortlist
+    # evidence SE-10 persists: {(role, object_ref): OperandEligibilityVerdictV1}.
+    eligibility: dict = None  # type: ignore[assignment]
 
 
 def _review_validity(conn, definition: RecipeDefinitionV2,
@@ -173,7 +176,7 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
     candidates: list[V2RecipeCandidateV1] = []
     for recipe in ordered:
         request = planning_request_from_recipe(recipe)
-        verdicts, _eligibility = bind_planning_request(conn, request, context)
+        verdicts, eligibility = bind_planning_request(conn, request, context)
         revision_hash = canonical_recipe_v2_hash(recipe)
         pit_text, temporal_blocker = _compile_temporal(recipe)
         current, missing_roles = _review_validity(conn, recipe, revision_hash)
@@ -189,7 +192,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             temporal_pit_text=pit_text,
             temporal_blocker=temporal_blocker,
             review_current=current,
-            review_missing_roles=missing_roles))
+            review_missing_roles=missing_roles,
+            eligibility=eligibility))
     return tuple(candidates)
 
 
