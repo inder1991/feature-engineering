@@ -302,3 +302,58 @@ def _suggestion(idea: FeatureIdea, binding_by_id: dict[str, str], entity_ref: st
         "recipe": render_recipe(idea, entity_ref),
         "recipe_parts": recipe_parts_to_json(recipe_parts(idea, entity_ref)),
     }
+
+def semantic_parity_block(conn, *, catalog_source: str, table: str, roles=()) -> dict:
+    """SE-13 — the deterministic page's ENGINE verdicts for one opened table.
+
+    Runs the SAME lens the hypothesis Workbench serves from — frozen context, capability
+    binder, eligibility fold, assembly — UNSCOPED (this page has no hypothesis, no target, no
+    LLM; applicability narrows nothing here by design), then anchors to the opened table: a
+    candidate appears when any of its bound operands lives on this table. The anchor is
+    retrieval, never a forced measure — the engine bound whatever roles the columns can
+    actually serve. Because both surfaces call one engine over one context, they CANNOT
+    disagree about whether a recipe/column binding is semantically valid — the SE-13
+    acceptance, held by construction and pinned by test."""
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
+
+    context = build_generation_semantic_context(
+        conn, catalog_source=catalog_source, roles=roles)
+    candidates = v2_recipe_candidates(
+        conn, catalog_source=catalog_source, roles=roles,
+        scope=ConfirmedScope(primary=None, unscoped=True), context=context)
+
+    def _on_table(candidate) -> bool:
+        return any(
+            verdict.selected_ref and verdict.selected_ref.split(".")[-2] == table
+            for verdict in candidate.verdicts if verdict.status == "bound")
+
+    anchored = [c for c in candidates if _on_table(c)]
+    assembled = assemble_candidates(anchored)
+    def _entry(item) -> dict:
+        candidate = item.candidate
+        return {
+            "recipe_id": candidate.recipe_id,
+            "binding_state": candidate.binding_state,
+            "readiness": candidate.readiness,
+            "review_current": candidate.review_current,
+            "planning_request_hash": candidate.planning_request_hash,
+            "verdicts": [
+                {"role": v.role, "status": v.status, "selected_ref": v.selected_ref,
+                 "reason_codes": list(v.reason_codes), "resolution": v.resolution}
+                for v in candidate.verdicts],
+            "corroborations": [
+                {"origin": c.origin, "source_definition_id": c.source_definition_id}
+                for c in item.corroborations],
+        }
+    return {
+        "semantic_context_hash": context.context_hash(),
+        "table": table,
+        "ranked": [_entry(a) for a in assembled.ranked],
+        "actionable": [_entry(a) for a in assembled.actionable],
+        "order_basis": assembled.order_basis,
+    }

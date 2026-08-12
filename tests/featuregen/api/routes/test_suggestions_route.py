@@ -293,6 +293,58 @@ def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  
     assert v3 == v2
 
 
+def test_v4_is_the_v3_page_plus_the_engines_verdicts(client, ftr_catalog):  # noqa: F811
+    """SE-13. Contract v4 must be asked for deliberately, and what it adds is exactly one thing:
+    the `semantic` block — the SAME engine the hypothesis Workbench serves from, run unscoped
+    over the same frozen context and anchored to this table. The v3 payload underneath is
+    UNCHANGED, proven by deleting the addition and comparing equal."""
+    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
+    v4 = client.get(f"{PATH}?contract_version=4", headers=_h()).json()
+    assert v4["contract_version"] == 4
+    assert set(v4) - set(v3) == {"semantic"}
+
+    semantic = v4.pop("semantic")
+    v4["contract_version"] = 3
+    assert v4 == v3                                           # v3 is byte-frozen under v4
+    assert semantic["semantic_context_hash"]
+    assert semantic["table"] == TABLE
+    assert "review_validity" in semantic["order_basis"] or semantic["order_basis"]
+    for entry in semantic["ranked"] + semantic["actionable"]:
+        assert entry["recipe_id"]
+        assert entry["binding_state"] in ("bound", "ambiguous", "missing", "blocked")
+        assert entry["planning_request_hash"]
+        for verdict in entry["verdicts"]:
+            assert verdict["status"] in ("bound", "ambiguous", "unresolved", "blocked")
+    # Every RANKED entry is bound and anchored: at least one bound operand lives on this table.
+    for entry in semantic["ranked"]:
+        assert entry["binding_state"] == "bound"
+        assert any(v["selected_ref"] and v["selected_ref"].split(".")[-2] == TABLE
+                   for v in entry["verdicts"] if v["status"] == "bound")
+
+
+def test_the_page_and_the_workbench_agree_on_binding_validity(
+        client, conn, ftr_catalog):  # noqa: F811
+    """The SE-13 acceptance, pinned: the deterministic page and the hypothesis Workbench run ONE
+    engine over ONE frozen context, so the same recipe cannot be 'bindable here' and 'blocked
+    there'. Compared against the lens called directly with the same roles."""
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
+
+    semantic = client.get(f"{PATH}?contract_version=4", headers=_h()).json()["semantic"]
+    direct = {c.recipe_id: c.binding_state for c in v2_recipe_candidates(
+        conn, catalog_source=SOURCE, roles=("feature_engineer",),
+        scope=ConfirmedScope(primary=None, unscoped=True))}
+    entries = semantic["ranked"] + semantic["actionable"]
+    assert entries, "the anchored engine produced entries for this table"
+    for entry in entries:
+        assert direct[entry["recipe_id"]] == entry["binding_state"], entry["recipe_id"]
+
+
+def test_v3_carries_no_semantic_key_ever(client, ftr_catalog):  # noqa: F811
+    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
+    assert "semantic" not in v3
+
+
 def test_v2_carries_no_execution_key_ever(client, ftr_catalog):  # noqa: F811
     """The frozen side of BR-8: v1 and v2 clients see not one new byte. The v1 default already has
     its own byte-stability test above; this pins the v2 page."""
@@ -318,7 +370,7 @@ def test_an_unknown_table_stays_a_200_payload_state_in_v2(client, ftr_catalog): 
     assert r.json()["hits"] == [] and collection["neighbourhood"]["max_hops"] == 1
 
 
-@pytest.mark.parametrize("version", [0, 4, 99, -1])
+@pytest.mark.parametrize("version", [0, 5, 99, -1])
 def test_an_unsupported_integer_version_is_a_typed_422(client, version):
     """The typed error contract (0F-12). The bound is deliberately NOT on the query parameter: a
     FastAPI `le=2` would reject the request before the handler ran, so this machine-readable code

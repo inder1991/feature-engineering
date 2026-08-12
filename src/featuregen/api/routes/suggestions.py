@@ -95,7 +95,7 @@ SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 #: The contract versions this deployment serves. v1 stays the DEFAULT for the whole of Release A:
 #: the frontend must ask for v2 deliberately — and v3 (the BR-8 execution-truthfulness page) is
 #: explicit during its whole rollout too, until the BR-24 gates pass.
-SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (1, 2, 3)
+SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (1, 2, 3, 4)
 
 #: Closed machine-readable error codes emitted by HANDLER-level checks, where the body shape is
 #: actually controllable. Framework validation errors are deliberately not in this vocabulary.
@@ -531,7 +531,7 @@ def table_suggestions(
     # opaque 500. Mapped to the same retryable 503 `contract.py` already uses — the mapping
     # `_governed_read`'s docstring promises — so the caller learns this is temporary and retryable.
     try:
-        if contract_version in (2, 3):
+        if contract_version in (2, 3, 4):
             page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
                                             roles=identity.role_claims, max_hops=max_hops)
             collection = page.collection
@@ -540,7 +540,20 @@ def table_suggestions(
                 contract_version, catalog_source, table, time.monotonic() - started,
                 collection.table_known, len(page.hits), max_hops,
                 dict(collection.omitted_counts))
-            return page_to_json(page) if contract_version == 2 else page_to_json_v3(page)
+            if contract_version == 2:
+                return page_to_json(page)
+            body = page_to_json_v3(page)
+            if contract_version == 4:
+                # SE-13: v4 = v3 + the ENGINE's verdicts for this table — the same lens the
+                # hypothesis Workbench serves from, over the same frozen context, so the two
+                # surfaces cannot disagree about a binding's validity. v3 stays byte-frozen.
+                from featuregen.overlay.upload.suggestions import semantic_parity_block
+
+                body["contract_version"] = 4
+                body["semantic"] = semantic_parity_block(
+                    conn, catalog_source=catalog_source, table=table,
+                    roles=identity.role_claims)
+            return body
         out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
                                          roles=identity.role_claims, max_hops=max_hops)
     except CatalogProjectionUnavailable as e:
