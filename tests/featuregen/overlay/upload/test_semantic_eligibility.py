@@ -321,3 +321,44 @@ def test_unlicensed_personal_data_is_a_policy_question_with_an_owner():
                                licensed)
     assert R.PERSONAL_DATA_POLICY_REQUIRED not in verdict.reason_codes
     assert verdict.personal_data_policy_revision_ids == ("pup_abc123",)
+
+
+# ── C9: history depth — optional, and only a KNOWN contradiction bites ─────────────────────────
+
+def test_a_declared_depth_blocks_only_the_window_that_exceeds_it():
+    """C9's surgical law: the 180-day variant blocks on a 90-day-deep source; the 30-day
+    variant of the SAME operand stays eligible. Absence (no declared depth) changes NOTHING."""
+    anchor = operand(concept="event_timestamp", operand_class="event_timestamp",
+                     role="event_ts")
+    deep_enough = capability(concept="event_timestamp", type_family="temporal",
+                             declared_type="timestamp", currency=None,
+                             possible_operand_classes=("event_timestamp",),
+                             table_history_depth_days=90,
+                             table_history_depth_authority="source/declared")
+    verdict = evaluate_operand(anchor, deep_enough, temporal_anchor="event", window_days=180)
+    assert verdict.status == "blocked"
+    assert R.HISTORY_DEPTH_INSUFFICIENT in verdict.reason_codes
+    assert "shorter variant" in verdict.resolution
+
+    verdict = evaluate_operand(anchor, deep_enough, temporal_anchor="event", window_days=30)
+    assert R.HISTORY_DEPTH_INSUFFICIENT not in verdict.reason_codes
+
+    undeclared = capability(concept="event_timestamp", type_family="temporal",
+                            declared_type="timestamp", currency=None,
+                            possible_operand_classes=("event_timestamp",))
+    verdict = evaluate_operand(anchor, undeclared, temporal_anchor="event", window_days=180)
+    assert R.HISTORY_DEPTH_INSUFFICIENT not in verdict.reason_codes, \
+        "absence is always fine — the fact is optional by design"
+
+
+def test_a_proposed_depth_never_blocks():
+    """Only declared-or-better bites; an llm/proposed depth declares nothing enforceable."""
+    anchor = operand(concept="event_timestamp", operand_class="event_timestamp",
+                     role="event_ts")
+    proposed = capability(concept="event_timestamp", type_family="temporal",
+                          declared_type="timestamp", currency=None,
+                          possible_operand_classes=("event_timestamp",),
+                          table_history_depth_days=30,
+                          table_history_depth_authority="llm/proposed")
+    verdict = evaluate_operand(anchor, proposed, temporal_anchor="event", window_days=180)
+    assert R.HISTORY_DEPTH_INSUFFICIENT not in verdict.reason_codes

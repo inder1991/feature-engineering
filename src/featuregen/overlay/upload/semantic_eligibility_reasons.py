@@ -72,6 +72,7 @@ EXECUTION_AUTHORITY_UNMET = "EXECUTION_AUTHORITY_UNMET"
 SNAPSHOT_STALE_REGENERATE = "SNAPSHOT_STALE_REGENERATE"
 OUTPUT_POLICY_INCOMPLETE = "OUTPUT_POLICY_INCOMPLETE"      # C3: a load-bearing output policy unauthored
 POLICY_FAMILY_UNVERIFIABLE = "POLICY_FAMILY_UNVERIFIABLE"  # C5: a family's facts axis is absent
+HISTORY_DEPTH_INSUFFICIENT = "HISTORY_DEPTH_INSUFFICIENT"  # C9: window exceeds DECLARED depth
 ACTIVATION_STATE_DRIFTED = "ACTIVATION_STATE_DRIFTED"
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
@@ -122,6 +123,7 @@ REASON_FAMILIES: dict[str, str] = {
     ACTIVATION_STATE_DRIFTED: "needs_setup",
     OUTPUT_POLICY_INCOMPLETE: "needs_setup",
     POLICY_FAMILY_UNVERIFIABLE: "needs_setup",
+    HISTORY_DEPTH_INSUFFICIENT: "structurally_unsuitable",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —

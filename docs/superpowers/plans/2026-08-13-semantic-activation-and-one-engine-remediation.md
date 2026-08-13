@@ -945,6 +945,25 @@ the computed requirements beside declared values; an optional confirm writes the
 and a previously-blocked variant clears on regenerate. NOT in the E0 mandatory walkthrough —
 it appears only as an optional branch.
 
+> **ACCEPTED (2026-08-13).** `history_depth_days` = an OPTIONAL table-level fact riding the
+> capability's EXISTING pin read (zero new queries — `_PINNED_FIELDS` + a `_TABLE_ADVISORY`
+> policy entry, the SE-8p2 template exactly). The law is surgical and one-directional: the
+> variant's own window (threaded from `parameter_values` through the binder) blocks with
+> HISTORY_DEPTH_INSUFFICIENT only when it EXCEEDS a depth declared at declared-or-better —
+> proposed never blocks, absence changes NOTHING (proven byte-identical: both windows bind
+> with nothing declared), and the resolution names the shorter-variant sibling. Slice 2:
+> `GET /governance/history-requirements` (per event table: the registry's max window axis
+> beside declared depth + authority; "not stated" is a fact with `sufficient: null`, never a
+> to-do) + `POST` (one optional click → human/confirmed evidence row, append-only; 404 on an
+> unknown table, confirmer-gated). The correction path is proven: a human confirming 400d
+> outranks the source's 90d and the blocked 180-day variant clears on the next bind.
+> VOCABULARY NOTE: the plan's "source/declared at upload" is `source/attested` in the
+> evidence vocabulary (no "declared" strength exists); the upload-manifest entry point
+> remains open — the governance POST covers entry point (b), and (a) lands with the upload
+> seam when that manifest gains optional fields. RATCHET CATCH: the feature-context coverage
+> guard flagged the new field on the first gate — registered DELIBERATELY_OMITTED with the
+> reason (a machine floor check, never prompt material; the model never needs to see it).
+
 ### Task C8 — prose physical-reference detector (½ day)
 
 *Modify:* `feature_intent.py`, tests.

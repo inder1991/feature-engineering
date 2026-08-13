@@ -125,6 +125,10 @@ _RESOLUTIONS: dict[str, str] = {
     R.STATUS_POLICY_UNRESOLVED: "this recipe reads a governed status policy no resolver serves "
                                 "yet — declare the source's status meanings, or accept the "
                                 "unfiltered read at your own review",
+    R.HISTORY_DEPTH_INSUFFICIENT: "this variant's window looks back further than the source "
+                                  "declares it keeps — reduce the window (a shorter variant "
+                                  "of the same recipe may already serve), or extend the "
+                                  "source's declared history",
     R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW: "this table is declared a SNAPSHOT — it cannot "
                                             "anchor an event window; bind an event source, or "
                                             "correct the table's classification",
@@ -195,7 +199,8 @@ def _absent_axes(operand: RequiredOperandV1, capability: ColumnCapabilityV1,
 
 def evaluate_operand(operand: RequiredOperandV1,
                      capability: ColumnCapabilityV1, *,
-                     output=None, temporal_anchor: str = "") -> OperandEligibilityVerdictV1:
+                     output=None, temporal_anchor: str = "",
+                     window_days: int | None = None) -> OperandEligibilityVerdictV1:
     """``output``/``temporal_anchor`` (C3, optional): the REQUEST-level context the
     additivity law needs — what operation consumes this measure, anchored how. Omitted by
     single-operand callers; the binder passes them so the check runs on every real fold."""
@@ -244,6 +249,19 @@ def evaluate_operand(operand: RequiredOperandV1,
             and AUTHORITY_MATRIX.get(capability.table_event_or_snapshot_authority,
                                      {}).get("suggestion_at_declared", False)):
         codes.append(R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW)
+        blocked = True
+
+    # 2f. History depth (C9) — OPTIONAL by design: absence changes NOTHING (the runtime
+    #     EVENT_HISTORY_VERIFICATION data check stays the named homework); only a KNOWN
+    #     contradiction bites — a DECLARED depth (declared-or-better authority) the variant's
+    #     window EXCEEDS. Surgical with B5's variants: the 180-day variant blocks, the
+    #     30-day sibling of the same recipe stays eligible.
+    if (operand.operand_class == "event_timestamp" and window_days
+            and capability.table_history_depth_days is not None
+            and AUTHORITY_MATRIX.get(capability.table_history_depth_authority,
+                                     {}).get("suggestion_at_declared", False)
+            and int(window_days) > capability.table_history_depth_days):
+        codes.append(R.HISTORY_DEPTH_INSUFFICIENT)
         blocked = True
 
     # 2c. Source-grain shape (C3): the operand's allowed source grains name row shapes; the

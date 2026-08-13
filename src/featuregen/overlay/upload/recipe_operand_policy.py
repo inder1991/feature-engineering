@@ -443,6 +443,11 @@ def bind_with_capabilities(conn, request, context, capabilities):
 
     hint_refs = frozenset(
         ref for op in request.operands for ref in getattr(op, "binding_hint_refs", ()))
+    # C9: the variant's own window (days) — the per-variant fact the history-depth law needs.
+    try:
+        window_days = int(dict(request.parameter_values).get("window") or 0) or None
+    except (TypeError, ValueError):
+        window_days = None
 
     for operand in request.operands:
         # C6 — rank BEFORE truncating, with the evidence in hand: authority tier →
@@ -469,7 +474,8 @@ def bind_with_capabilities(conn, request, context, capabilities):
                 continue
             verdict = evaluate_operand(
                 operand, capability, output=request.output,
-                temporal_anchor=request.temporal.anchor_kind)
+                temporal_anchor=request.temporal.anchor_kind,
+                window_days=window_days)
             eligibility[(operand.role, ref)] = verdict
             if verdict.status in tiers:
                 tiers[verdict.status].append(ref)

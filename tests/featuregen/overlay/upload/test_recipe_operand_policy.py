@@ -494,3 +494,88 @@ def test_closure_changes_move_the_context_hash(db):
     after = build_generation_semantic_context(db, catalog_source=SOURCE)
     assert "monetary_flow" in after.concept_closure["interest_income"]
     assert after.context_hash() != before.context_hash()
+
+
+# ── C9: the declared history depth through the REAL binder — surgical per variant ──────────────
+
+def _declare_history_depth(db, table: str, days: int, *, producer="source",
+                           strength="attested") -> None:
+    """The upload-manifest declaration lands as source/attested — the evidence vocabulary's
+    structurally-vouched tier (the plan's "source/declared" in matrix terms)."""
+    from featuregen.overlay.upload.object_ref import normalize_ref
+
+    logical = normalize_ref(SOURCE, "public", table, None)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="history_depth_days", proposed_value=str(days),
+        producer=producer, strength=strength, producer_ref=f"{producer}:test",
+        source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="history_depth_days",
+                                    material=str(days)))
+
+
+def test_a_window_exceeding_the_declared_depth_blocks_that_variant_only(db):
+    """C9 both directions: with 90 days declared, the 180-day request blocks by name and the
+    30-day request binds — and with NOTHING declared, both stay byte-identical to today."""
+    from dataclasses import replace as _replace
+
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    _catalog(db)
+
+    def _bind(window):
+        context = build_generation_semantic_context(db, catalog_source=SOURCE)
+        request = planning_request_from_recipe(PROBE_RECIPE)
+        request = _replace(request, parameter_values=(("window", window),))
+        return bind_planning_request(db, request, context)
+
+    # Nothing declared: both windows bind exactly as today.
+    for window in (30, 180):
+        verdicts, _ = _bind(window)
+        event = next(v for v in verdicts if v.role == "event_ts")
+        assert event.status == "bound", (window, event.reason_codes)
+
+    _declare_history_depth(db, "transactions", 90)
+    verdicts, _ = _bind(180)
+    event = next(v for v in verdicts if v.role == "event_ts")
+    assert event.status == "blocked"
+    assert "HISTORY_DEPTH_INSUFFICIENT" in event.reason_codes
+
+    verdicts, _ = _bind(30)
+    event = next(v for v in verdicts if v.role == "event_ts")
+    assert event.status == "bound", "the shorter variant of the SAME recipe stays eligible"
+
+
+def test_a_stronger_correction_clears_a_previously_blocked_variant(db):
+    """C9: corrections are append-only NEW rows, never overwrites — a human confirming the
+    real depth (400d) outranks the source's 90d declaration, and the 180-day variant that
+    was blocked clears on the next bind."""
+    from dataclasses import replace as _replace
+
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    _catalog(db)
+    _declare_history_depth(db, "transactions", 90)
+
+    def _bind_180():
+        context = build_generation_semantic_context(db, catalog_source=SOURCE)
+        request = _replace(planning_request_from_recipe(PROBE_RECIPE),
+                           parameter_values=(("window", 180),))
+        verdicts, _ = bind_planning_request(db, request, context)
+        return next(v for v in verdicts if v.role == "event_ts")
+
+    assert _bind_180().status == "blocked"
+    _declare_history_depth(db, "transactions", 400, producer="human", strength="confirmed")
+    assert _bind_180().status == "bound", \
+        "the stronger append-only correction wins through the resolver pin"

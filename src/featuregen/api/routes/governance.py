@@ -37,9 +37,14 @@ from typing import Annotated, Any, Literal
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from featuregen.api.deps import get_conn, get_identity, require_confirmer
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    require_catalog_read,
+    require_confirmer,
+)
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.bridge_realization_commands import review_bridge_realization
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
@@ -216,6 +221,96 @@ def list_joins(source: str, conn: _Conn,
     divergences = list_governed_join_divergences(conn, source.strip().lower())
     return {"source": source.strip().lower(), "proposals": proposals,
             "divergences": divergences, "next_cursor": None}
+
+@router.get("/governance/history-requirements",
+            dependencies=[Depends(require_catalog_read)])
+def history_requirements(source: str, conn: _Conn, identity: _Identity) -> dict:
+    """C9 — the OPTIONAL per-catalog history panel: "how far back does this data go?"
+
+    Business phrasing, computed, never a gate: per EVENT table, the MAXIMUM window any
+    applicable recipe variant could look back (from the registry's authored window axes),
+    beside whatever depth is DECLARED (and by whom). Ignoring this panel costs nothing —
+    answering is one optional click that writes an evidence row; declaring MORE information
+    only ever makes the engine smarter (a declared depth refuses only the windows that
+    exceed it — shorter variants of the same recipes keep serving)."""
+    from featuregen.overlay.upload.field_resolution import current_resolution_pins
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.read_scope import allowed_sensitivities
+    from featuregen.overlay.upload.recipe_planning_lens import _variant_axes
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+
+    scope = allowed_sensitivities(identity.role_claims)
+    tables = conn.execute(
+        "SELECT DISTINCT table_name FROM graph_node "
+        "WHERE kind = 'table' AND catalog_source = %s AND visible_requires <@ %s "
+        "AND event_or_snapshot = 'event' ORDER BY table_name",
+        (source, list(scope))).fetchall()
+    event_tables = [r[0] for r in tables]
+    max_window = 0
+    for recipe in V2_RECIPES:
+        for axis in _variant_axes(recipe):
+            if axis.name == "window" and axis.allowed_values:
+                max_window = max(max_window, max(axis.allowed_values))
+    logical_by_table = {t: normalize_ref(source, "public", t, None) for t in event_tables}
+    pins = current_resolution_pins(
+        conn, logical_refs=list(logical_by_table.values()),
+        fields=("history_depth_days",))
+    entries = []
+    for table in event_tables:
+        pin = pins.get((logical_by_table[table], "history_depth_days"))
+        declared = None
+        declared_by = None
+        if pin is not None and pin.value:
+            try:
+                declared = int(str(pin.value).strip('"'))
+                declared_by = f"{pin.producer}/{pin.strength}"
+            except (TypeError, ValueError):
+                pass
+        entries.append({
+            "table": table,
+            "features_look_back_days": max_window,
+            "declared_depth_days": declared,
+            "declared_by": declared_by,
+            "sufficient": (None if declared is None else declared >= max_window),
+        })
+    return {"catalog_source": source, "tables": entries}
+
+
+class HistoryDepthIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str
+    table: str
+    depth_days: int = Field(gt=0, le=36500)
+
+
+@router.post("/governance/history-requirements",
+             dependencies=[Depends(require_confirmer)])
+def declare_history_depth(body: HistoryDepthIn, conn: _Conn, identity: _Identity) -> dict:
+    """C9 — the one optional click: a human states how deep the source's history goes.
+
+    Lands as human/confirmed evidence on the TABLE's logical ref — append-only (a correction
+    is a new, stronger row, never an overwrite); an unknown table is a 404, never a silent
+    accept. Declaring is always optional: nothing anywhere requires this row to exist."""
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.object_ref import normalize_ref
+
+    row = conn.execute(
+        "SELECT 1 FROM graph_node WHERE kind = 'table' AND catalog_source = %s "
+        "AND table_name = %s LIMIT 1", (body.source, body.table)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"unknown table {body.table!r} in {body.source!r}")
+    logical = normalize_ref(body.source, "public", body.table, None)
+    record_field_evidence(
+        conn, logical_ref=logical, field_name="history_depth_days",
+        proposed_value=str(body.depth_days), producer="human", strength="confirmed",
+        producer_ref=identity.subject, source_snapshot_id="human-declaration",
+        input_hash=field_input_hash(logical_ref=logical, field_name="history_depth_days",
+                                    material=f"{body.depth_days}:{identity.subject}"))
+    return {"declared": True, "table": body.table, "depth_days": body.depth_days}
+
+
 
 
 @router.post("/governance/joins/{fact_key}/confirm", dependencies=[Depends(require_confirmer)])

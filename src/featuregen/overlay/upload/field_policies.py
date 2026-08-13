@@ -262,6 +262,9 @@ _POLICIES: dict[str, FieldPolicy] = {
     "table_role": _TABLE_ADVISORY,
     "primary_entity": _TABLE_ADVISORY,
     "event_or_snapshot": _TABLE_ADVISORY,   # advisory: informs modelling, never load-bearing
+    "history_depth_days": _TABLE_ADVISORY,  # C9: OPTIONAL declared history depth (days) —
+    #                                         absence is always fine; a declared value only
+    #                                         ever REFUSES a window that exceeds it
     # Source-authority fields (Delivery B item 8) — technical-CSV / glossary declared values.
     "business_term": _GLOSSARY_TERM,        # advisory scalar — generically human-editable
     "term_type": _GLOSSARY_TERM,            # advisory scalar — generically human-editable

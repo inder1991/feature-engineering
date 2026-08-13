@@ -38,7 +38,7 @@ from featuregen.overlay.upload.recipe_operand_policy import _type_family
 
 #: The evidence fields whose authority pins ride the capability (one batched read).
 _PINNED_FIELDS = ("concept", "entity", "additivity", "currency", "economic_role",
-                  "event_or_snapshot", "sign_convention")
+                  "event_or_snapshot", "sign_convention", "history_depth_days")
 
 #: The honest absences of this compiler version — axes SE-8 compiles later.
 _ABSENT_AXES = ("dataset_profile_absent", "relationship_state_absent", "use_policy_absent")
@@ -102,6 +102,11 @@ class ColumnCapabilityV1:
     personal_data_required: bool = False
     personal_data_licensed: bool = False
     personal_data_policy_revision_ids: tuple[str, ...] = ()
+    # C9: the table's OPTIONAL declared history depth in days, with the authority that
+    # declared it. None = never declared — always fine (the fact is optional by design);
+    # a declared value only ever refuses a window that EXCEEDS it, at declared-or-better.
+    table_history_depth_days: int | None = None
+    table_history_depth_authority: str = "absent"
 
 
 def _authority(pins: dict[tuple[str, str], str], logical_ref: str, field: str,
@@ -132,6 +137,7 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
     conflicts: dict[str, list[str]] = {}                 # logical_ref -> conflicted fields
     economic_roles: dict[str, tuple[str, str]] = {}      # logical_ref -> (value, authority)
     sign_cleared: set[str] = set()                       # logical refs w/ authoring-grade sign
+    history_depth: dict[str, tuple[int, str]] = {}       # table logical -> (days, authority)
     if members:
         # C1: the pin is the RESOLVER'S current verdict (read-only, batched) — the value the
         # governed resolution stands behind, with the authority that EARNED it. The pre-C1
@@ -158,6 +164,12 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             if (field_name == "sign_convention" and pin.value
                     and clears(f"{pin.producer}/{pin.strength}", "authoring")):
                 sign_cleared.add(logical_ref)
+            if field_name == "history_depth_days" and pin.value:
+                try:
+                    history_depth[logical_ref] = (int(str(pin.value).strip('"')),
+                                                  f"{pin.producer}/{pin.strength}")
+                except (TypeError, ValueError):
+                    pass                      # a malformed depth declares nothing
 
     from featuregen.overlay.upload.concepts import concept as registered_concept
     from featuregen.overlay.upload.concepts import is_personal_data
@@ -226,7 +238,11 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             personal_data_licensed=col.concept in licensed_by_concept,
             personal_data_policy_revision_ids=(
                 (licensed_by_concept[col.concept],)
-                if col.concept in licensed_by_concept else ()))
+                if col.concept in licensed_by_concept else ()),
+            table_history_depth_days=history_depth.get(
+                table_logical_by_name[col.table], (None, "absent"))[0],
+            table_history_depth_authority=history_depth.get(
+                table_logical_by_name[col.table], (None, "absent"))[1])
     return capabilities
 
 

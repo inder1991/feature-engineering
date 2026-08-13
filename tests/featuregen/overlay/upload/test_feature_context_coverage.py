@@ -89,6 +89,12 @@ from featuregen.overlay.upload.semantic_context import (
 #: `feature_assist._table_context` / `_profile_advisories` — which is why "not in the column payload"
 #: is not the same claim as "never reaches the model".
 DELIBERATELY_OMITTED: dict[str, str] = {
+    "history_depth_days": (
+        "TABLE grain, C9. An OPTIONAL declared history depth consumed by the semantic "
+        "engine's binding law (capability pin -> HISTORY_DEPTH_INSUFFICIENT when a variant's "
+        "window exceeds it) and the governance history panel — a machine floor check, not "
+        "prompt material. The model never needs to see it: windows the source cannot serve "
+        "are refused deterministically before any card exists."),
     "primary_entity": (
         "TABLE grain. Carried by `feature_assist._table_context` as `primary_entity` on the table "
         "block; repeating it on every column of the table would be the same fact N times."),
