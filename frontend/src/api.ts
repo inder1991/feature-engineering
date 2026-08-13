@@ -294,7 +294,10 @@ export interface FeatureIdea {
   // Opaque, revision-scoped identity on /contract/considered-set responses. It distinguishes variants
   // that share a display name and is the only scoped drafting token; other feature APIs may omit it.
   option_id?: string
-  generation_source?: 'recipe' | 'llm_freeform' | 'user_defined' | string
+  generation_source?: 'recipe' | 'llm_freeform' | 'user_defined' | 'llm_intent' | string
+  // B4: the origin-neutral definition identity (recipe id, intent id, or user-definition id).
+  // recipe_id is set ONLY for recipe origin — an intent id never wears a recipe badge.
+  source_definition_id?: string
   recipe_id?: string
   candidate_status?: string
   planner_applicability?: string

@@ -429,6 +429,7 @@ function generationSourceLabel(idea: FeatureIdea): string {
     return idea.recipe_id ? `Recipe · ${idea.recipe_id}` : 'Recipe'
   }
   if (idea.generation_source === 'user_defined') return 'User-defined'
+  if (idea.generation_source === 'llm_intent') return 'Model intent'
   return 'Free-form'
 }
 
@@ -2551,7 +2552,11 @@ export function WorkbenchScreen() {
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
                     {c.kind === 'generated' && c.idea.rationale && (
-                      <p style={{ color: 'var(--ink-soft)' }}>Why: {c.idea.rationale}</p>
+                      <p style={{ color: 'var(--ink-soft)' }}>
+                        {c.idea.generation_source === 'llm_intent'
+                          ? "Model's rationale: " : 'Why: '}
+                        {c.idea.rationale}
+                      </p>
                     )}
                     {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close'
                       && c.idea.near_label_rationale && (

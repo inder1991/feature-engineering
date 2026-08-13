@@ -77,8 +77,11 @@ def test_a_served_idea_carries_recipe_provenance_and_typed_requirements():
     result = _project([_candidate()])
     assert not result.rejections
     idea = result.ideas[0]
-    assert idea.generation_source == "recipe"
-    assert idea.recipe_id == "recipe:proj_probe"
+    # B4: origin is a FACT — this fixture's request has origin user_definition, so the card
+    # says user_defined and carries NO recipe badge; the origin-neutral id is what survives.
+    assert idea.generation_source == "user_defined"
+    assert idea.recipe_id is None
+    assert idea.source_definition_id == "recipe:proj_probe"
     assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
     by_code = {req.code: req for req in idea.requirements}
     grain = by_code["GRAIN_IS_UNIQUE"]                        # identifier uniqueness IS this check
@@ -152,5 +155,5 @@ def test_actionable_candidates_become_visible_options_never_rejections():
     assert not result.rejections                              # and not HIDDEN either
     (option,) = result.actionable_ideas
     assert option.candidate_status == "blocked"               # the honest state, on the card
-    assert option.recipe_id == "recipe:proj_probe"
+    assert option.source_definition_id == "recipe:proj_probe"
     assert R.ECONOMIC_ROLE_UNPROVEN in result.rejected_ids["recipe:proj_probe"]

@@ -109,10 +109,18 @@ def _served_idea(assembled, validation, *, catalog_source: str,
 
     candidate = assembled.candidate
     request = candidate.planning_request
-    try:
-        description = v2_recipe_by_id(candidate.recipe_id).business_definition
-    except Exception:                     # a non-recipe primary (LLM intent fronting alone)
-        description = request.conceptual_reason
+    # B4 (GEN-05 closed): origin is a FACT, translated 1:1 — an intent id never wears a
+    # recipe badge, and the candidate's OWN business definition survives to the card.
+    generation_source = {"recipe_v2": "recipe", "llm_intent": "llm_intent",
+                         "user_definition": "user_defined"}.get(request.origin,
+                                                               request.origin)
+    description = candidate.display_definition
+    if not description and request.origin == "recipe_v2":
+        try:
+            description = v2_recipe_by_id(candidate.recipe_id).business_definition
+        except Exception:
+            description = request.conceptual_reason
+    description = description or request.conceptual_reason
     bound_refs = [v.selected_ref for v in candidate.verdicts
                   if v.status == "bound" and v.selected_ref]
     return FeatureIdea(
@@ -126,9 +134,10 @@ def _served_idea(assembled, validation, *, catalog_source: str,
         validation_status=("DESIGN_CHECKED" if validation.status == "design_checked"
                            else "NEEDS_EXTERNAL_VALIDATION"),
         requirements=_requirements(validation, catalog_source),
-        generation_source="recipe",
+        generation_source=generation_source,
         candidate_status=candidate_status,
-        recipe_id=candidate.recipe_id,
+        recipe_id=(candidate.recipe_id if request.origin == "recipe_v2" else None),
+        source_definition_id=candidate.recipe_id,
         input_role_bindings=_role_bindings(candidate, catalog_source),
         operand_roles=tuple(sorted(
             (v.selected_ref, v.role) for v in candidate.verdicts

@@ -321,7 +321,8 @@ def considered_option_detail(considered_revision_id: str, option_id: str,
     # and the frozen context hash. Bounded to the newest row; absent means the run predates
     # the observation store or the option is not recipe-sourced — honest absence, no backfill.
     identity = option.get("canonical_candidate_identity") or {}
-    recipe_id = (identity.get("feature") or {}).get("recipe_id")
+    feature_body = identity.get("feature") or {}
+    recipe_id = feature_body.get("source_definition_id") or feature_body.get("recipe_id")
     if recipe_id:
         row = conn.execute(
             "SELECT context_hash, planning_request_hash, binding_state, verdicts, "
@@ -800,7 +801,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         recommended, actionable = [], []
         for feature_set in response["alternatives"]:
             for entry in feature_set["features"]:
-                rid = entry.get("recipe_id")
+                rid = entry.get("source_definition_id") or entry.get("recipe_id")
                 facts = cs.semantic_decision_facts_by_definition_id.get(rid) if rid else None
                 if facts is None or not entry.get("option_id"):
                     continue

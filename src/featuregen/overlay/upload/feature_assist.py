@@ -1681,6 +1681,10 @@ class FeatureIdea:
     #        onto path_authority ("single_or_llm" / "governed_cross_catalog") without repurposing it.
     generation_source: str = "llm_freeform"
     recipe_id: str | None = None
+    # B4 (GEN-05): the ORIGIN-NEUTRAL definition identity — set for every engine-served idea
+    # (recipe id, intent id, or user-definition id). `recipe_id` is set ONLY for recipe
+    # origin; an intent id must never wear a recipe badge.
+    source_definition_id: str = ""
     candidate_status: str = ""
     input_role_bindings: tuple[RoleBinding, ...] = ()
     external_requirement_previews: tuple[ExternalRequirementPreview, ...] = ()

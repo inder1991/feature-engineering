@@ -196,7 +196,8 @@ def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, 
     sections = body["recommended_options"] + body["actionable_options"]
     assert sections, "the engine served at least one sectioned option"
     for entry in sections:
-        assert entry["option_id"] and entry["recipe_id"]
+        assert entry["option_id"] and entry["recipe_id"]      # sections key stays recipe_id
+        # (the section builder falls back to source_definition_id server-side)
         assert "save_idea" in entry["allowed_actions"]          # an idea is an idea, always
         assert "create_contract" in entry["blocked_actions"]    # nothing authorable yet here
         blockers = entry["blocked_actions"]["create_contract"]

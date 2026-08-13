@@ -227,7 +227,7 @@ def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeyp
     assert rows, "the served intent option froze a decision row"
     served_engine_options = {
         f["option_id"] for s_ in body["alternatives"] for f in s_["features"]
-        if f.get("recipe_id")}
+        if f.get("source_definition_id")}
     assert {r[0] for r in rows} == served_engine_options       # the EXACT keys the human sees
 
     # A3 widened this: ACTIONABLE recipe options freeze decision rows too, so pick the
@@ -266,7 +266,7 @@ def test_draft_of_a_semantic_option_is_blocked_by_the_activation_policy(
     body = _post(client)
 
     option = next(f for s_ in body["alternatives"] for f in s_["features"]
-                  if f.get("recipe_id"))
+                  if f.get("source_definition_id"))
     res = client.post("/contract/draft", json={
         "intent_id": body["intent_id"],
         "chosen_option_id": option["name"],
@@ -297,7 +297,7 @@ def test_confirm_re_checks_activation_even_when_a_choice_was_recorded(
     client = make_client(llm_client=_fake_with_intents())
     body = _post(client)
     option = next(f for s_ in body["alternatives"] for f in s_["features"]
-                  if f.get("recipe_id"))
+                  if f.get("source_definition_id"))
 
     # Draft: blocked by the fold — but the choice row is recorded first (by design: the
     # choice audit trail exists even for refused activations).
@@ -341,8 +341,11 @@ def test_the_free_form_generator_never_runs_under_semantic_v1(make_client, conn,
     body = _post(make_client(llm_client=fake))
     served = [f for s_ in body["alternatives"] for f in s_["features"]]
     assert served, "the engine alone serves the considered set"
-    assert all(f.get("recipe_id") for f in served)             # every card is engine-origin
-    assert {s_["lens"] for s_ in body["alternatives"]} <= {"templates", "actionable"}
+    assert all(f.get("source_definition_id") for f in served)  # every card is engine-origin
+    # B4: an intent card never wears a recipe badge, and the lens name stopped lying.
+    assert all(f.get("recipe_id") is None or f["generation_source"] == "recipe"
+               for f in served)
+    assert {s_["lens"] for s_ in body["alternatives"]} <= {"engine", "actionable"}
 
 
 def test_entity_only_scope_is_refused_typed_under_semantic_v1(make_client, conn, monkeypatch):

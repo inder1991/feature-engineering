@@ -54,6 +54,8 @@ def serialize_feature_idea_v2(idea: FeatureIdea) -> dict:
         out["generation_source"] = idea.generation_source
     if idea.recipe_id is not None:
         out["recipe_id"] = idea.recipe_id
+    if idea.source_definition_id:
+        out["source_definition_id"] = idea.source_definition_id
     if idea.candidate_status:
         out["candidate_status"] = idea.candidate_status
     if idea.input_role_bindings:

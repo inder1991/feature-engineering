@@ -993,11 +993,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         context_hash_value = (semantic_context.context_hash()
                               if semantic_context is not None else "")
         semantic_decision_facts = {
-            idea.recipe_id: decision_facts_for_candidate(
-                candidates_by_id[idea.recipe_id], idea,
-                observation_ids.get(idea.recipe_id), context_hash_value)
+            idea.source_definition_id: decision_facts_for_candidate(
+                candidates_by_id[idea.source_definition_id], idea,
+                observation_ids.get(idea.source_definition_id), context_hash_value)
             for idea in (*projection.ideas, *projection.actionable_ideas)
-            if idea.recipe_id and idea.recipe_id in candidates_by_id
+            if idea.source_definition_id and idea.source_definition_id in candidates_by_id
         }
         rejections.extend({"name": r.get("detail", "intent"), "reason": r.get("detail", ""),
                            "code": r.get("code", "INTENT_REJECTED")}
@@ -1006,7 +1006,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         rejected_template_ids = projection.rejected_ids
         binding_quality_by_template = projection.binding_by_id
         if projection.ideas:
-            alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
+            # B4: the lens name stops lying — this set holds recipes AND intents, all from
+            # the ONE engine; "templates" was the legacy grounding pass's name.
+            alternatives.append(FeatureSet(lens="engine", features=order_ideas_by_use_case(
                 projection.ideas,
                 signed_reading["business_domain"] if signed_reading else ())))
         # A3: actionable candidates are VISIBLE OPTIONS in their own lens — they mint option
@@ -1222,6 +1224,8 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
         d["generation_source"] = f.generation_source
     if f.recipe_id is not None:
         d["recipe_id"] = f.recipe_id
+    if f.source_definition_id:
+        d["source_definition_id"] = f.source_definition_id
     if f.candidate_status:
         d["candidate_status"] = f.candidate_status
     if f.input_role_bindings:
@@ -1445,7 +1449,8 @@ def _persist_considered_revision(
         facts_by_option: dict[str, dict] = {}
         for option_id, entry in considered.get("options_by_id", {}).items():
             feature = (entry.get("canonical_candidate_identity") or {}).get("feature") or {}
-            facts = cs.semantic_decision_facts_by_definition_id.get(feature.get("recipe_id"))
+            facts = cs.semantic_decision_facts_by_definition_id.get(
+                feature.get("source_definition_id") or feature.get("recipe_id"))
             if facts is not None:
                 facts_by_option[option_id] = facts
         persist_option_decisions(
@@ -1501,6 +1506,7 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         # is restored here so a recipe-sourced idea keeps its registry id across the Gate-1 round-trip.
         generation_source=d.get("generation_source", "llm_freeform"),
         recipe_id=d.get("recipe_id"),
+        source_definition_id=str(d.get("source_definition_id", "")),
         candidate_status=d.get("candidate_status", ""),
         input_role_bindings=tuple(RoleBinding.from_json(b) for b in d.get("input_role_bindings", ())),
         external_requirement_previews=tuple(

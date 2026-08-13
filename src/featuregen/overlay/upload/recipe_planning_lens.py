@@ -200,6 +200,10 @@ class V2RecipeCandidateV1:
     # SE-8 steps 2+3: the feature-level dataset decision (population + cross-dataset need),
     # folded from the frozen context's DECLARED facts. None only on legacy fixtures.
     dataset_story: DatasetStoryV1 | None = None
+    # B4: the candidate's own business definition for the card — recipes carry the authored
+    # business_definition, intents carry the model's. DISPLAY ONLY: deliberately not on the
+    # planning request, whose hash is field-exhaustive (prose must never be identity).
+    display_definition: str = ""
 
 
 def _review_validity(conn, definition: RecipeDefinitionV2,
@@ -269,7 +273,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             review_current=current,
             review_missing_roles=missing_roles,
             eligibility=eligibility,
-            dataset_story=fold_dataset_story(request, verdicts, context)))
+            dataset_story=fold_dataset_story(request, verdicts, context),
+            display_definition=recipe.business_definition))
     return tuple(candidates)
 
 
@@ -314,7 +319,8 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             review_current=False,
             review_missing_roles=(),
             eligibility=eligibility,
-            dataset_story=fold_dataset_story(request, verdicts, context)))
+            dataset_story=fold_dataset_story(request, verdicts, context),
+            display_definition=intent.business_definition))
     return tuple(candidates), rejections
 
 
