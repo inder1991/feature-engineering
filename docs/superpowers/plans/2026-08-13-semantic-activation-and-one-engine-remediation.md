@@ -751,6 +751,19 @@ review's "no field without a consumer" ratchet.
 *Acceptance:* per-field positive + negative tests; the meta-test; the banking battery gains the
 sign-leg, additivity-abuse, and grain-mismatch cases.
 
+> **SIGN SLICE ACCEPTED (2026-08-13).** The confirmed defect is dead: the authored
+> `sign_direction_expectation` no longer licenses anything (the pre-C3 test asserting it as a
+> feature was flipped deliberately). ONE law in both binders (`_resolve_opposing_legs`):
+> opposing legs on one physical column are licensed by (a) a BOUND direction operand
+> (`debit_credit_indicator`) in the same request — PROBE_RECIPE's own shape — or (b) a
+> governed `sign_convention` fact at AUTHORING authority on every shared column, read through
+> C1's pins + C2's matrix (human/confirmed licenses; llm/proposed does not — both tested).
+> The capability compiles `sign_convention_cleared` in the SAME batched read (pin still 3 —
+> the request binder stays pure; the first draft's per-request read showed up as 27 queries
+> and was rehomed). The block's resolution names both real fixes. DISCOVERY: recipes whose
+> opposing legs previously bound via authored strings now block honestly until the catalog
+> carries a representation.
+
 ### Task C4 — personal-data purpose policy in the engine path (1 day)
 
 *Modify:* `column_capabilities.py` (consume the D14 `pii_policy` resolver the legacy gauntlet

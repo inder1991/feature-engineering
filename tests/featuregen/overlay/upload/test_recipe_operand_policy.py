@@ -175,26 +175,86 @@ def test_a_wrong_confirmed_role_still_blocks(db):
         "the rejection names what the column IS, not just what it is not"
 
 
-def test_opposing_legs_refuse_one_physical_column_without_a_sign_authority(db):
-    _catalog(db)
-    legs = (
+def _flow_legs(sign_expectation: str = "", *, with_direction: bool = False):
+    """Two opposing monetary legs in one distinct group. PROBE_RECIPE's own direction operand
+    (debit_credit_indicator) is EXCLUDED by default — it is itself a licensing representation
+    (leg one of the C3 sign law), so isolating the sign_convention path requires its absence."""
+    direction = (PROBE_RECIPE.operands[2],) if with_direction else ()
+    return (
         replace(PROBE_RECIPE.operands[1], role="inflow", distinct_binding_group="flow_legs",
-                sign_direction_expectation=""),
+                sign_direction_expectation=sign_expectation),
         replace(PROBE_RECIPE.operands[1], role="outflow", distinct_binding_group="flow_legs",
-                sign_direction_expectation=""),
-        *PROBE_RECIPE.operands[2:], PROBE_RECIPE.operands[0])
-    definition = replace(PROBE_RECIPE, operands=legs)
-    verdicts = bind_v2_operands(db, definition, catalog_source=SOURCE, roles=("data_owner",))
+                sign_direction_expectation=sign_expectation),
+        *direction, PROBE_RECIPE.operands[3], PROBE_RECIPE.operands[0])
+
+
+def _sign_convention_evidence(db, object_ref: str, *, producer: str, strength: str) -> None:
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.column_authority import logical_ref_of
+
+    logical = logical_ref_of(db, SOURCE, object_ref)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="sign_convention",
+        proposed_value="signed_amount", producer=producer, strength=strength,
+        producer_ref=f"{producer}:test", source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="sign_convention",
+                                    material="signed_amount"))
+
+
+def test_opposing_legs_refuse_one_physical_column_without_a_sign_representation(db):
+    """C3 (validated correction): the AUTHORED sign_direction_expectation is an EXPECTATION,
+    never authority — authoring a string on the recipe cannot license one column to carry
+    both directions. Only the catalog's OWN governed sign representation can."""
+    _catalog(db)
+    verdicts = bind_v2_operands(db, replace(PROBE_RECIPE, operands=_flow_legs()),
+                                catalog_source=SOURCE, roles=("data_owner",))
     flow_legs = [v for v in verdicts if v.role in ("inflow", "outflow")]
     assert all(v.status == "blocked" for v in flow_legs)
     assert all(v.reason_codes == (DISTINCT_BINDING_VIOLATED,) for v in flow_legs)
 
-    signed = tuple(replace(op, sign_direction_expectation="policy:dc-sign-convention")
-                   if op.role in ("inflow", "outflow") else op for op in legs)
+    # The pre-C3 defect: an authored expectation string used to LICENSE the bind. It must not.
+    signed = _flow_legs(sign_expectation="policy:dc-sign-convention")
     verdicts = bind_v2_operands(db, replace(PROBE_RECIPE, operands=signed),
                                 catalog_source=SOURCE, roles=("data_owner",))
+    flow_legs = [v for v in verdicts if v.role in ("inflow", "outflow")]
+    assert all(v.status == "blocked" for v in flow_legs), \
+        "an authored expectation is not evidence — the catalog must carry the representation"
+    assert "sign_convention" in flow_legs[0].resolution
+    assert "debit_credit_indicator" in flow_legs[0].resolution
+
+
+def test_a_confirmed_sign_convention_on_the_shared_column_licenses_the_legs(db):
+    _catalog(db)
+    _sign_convention_evidence(db, "public.transactions.amount",
+                              producer="human", strength="confirmed")
+    verdicts = bind_v2_operands(db, replace(PROBE_RECIPE, operands=_flow_legs()),
+                                catalog_source=SOURCE, roles=("data_owner",))
     assert all(v.status == "bound" for v in verdicts if v.role in ("inflow", "outflow")), \
-        "a governed sign authority is exactly what licenses one column to carry both directions"
+        "a GOVERNED signed-amount convention is exactly what licenses both directions"
+
+
+def test_a_proposed_sign_convention_is_not_authority(db):
+    _catalog(db)
+    _sign_convention_evidence(db, "public.transactions.amount",
+                              producer="llm", strength="proposed")
+    verdicts = bind_v2_operands(db, replace(PROBE_RECIPE, operands=_flow_legs()),
+                                catalog_source=SOURCE, roles=("data_owner",))
+    assert all(v.status == "blocked" for v in verdicts
+               if v.role in ("inflow", "outflow")), \
+        "a proposal retrieves; it never clears the authoring floor"
+
+
+def test_a_bound_direction_operand_licenses_the_legs(db):
+    """The OTHER governed representation real banking schemas use: positive magnitudes plus a
+    debit/credit indicator column — bound in the SAME recipe, no sign fact needed. This is
+    PROBE_RECIPE's own shape (its direction operand binds the catalog's dc_flag)."""
+    _catalog(db)
+    verdicts = bind_v2_operands(
+        db, replace(PROBE_RECIPE, operands=_flow_legs(with_direction=True)),
+        catalog_source=SOURCE, roles=("data_owner",))
+    by_role = {v.role: v for v in verdicts}
+    assert by_role["direction"].status == "bound"
+    assert by_role["inflow"].status == "bound" and by_role["outflow"].status == "bound"
 
 
 def test_a_concept_mismatch_never_binds_at_all(db):

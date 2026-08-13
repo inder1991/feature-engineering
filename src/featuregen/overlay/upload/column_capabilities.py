@@ -38,7 +38,7 @@ from featuregen.overlay.upload.recipe_operand_policy import _type_family
 
 #: The evidence fields whose authority pins ride the capability (one batched read).
 _PINNED_FIELDS = ("concept", "entity", "additivity", "currency", "economic_role",
-                  "event_or_snapshot")
+                  "event_or_snapshot", "sign_convention")
 
 #: The honest absences of this compiler version — axes SE-8 compiles later.
 _ABSENT_AXES = ("dataset_profile_absent", "relationship_state_absent", "use_policy_absent")
@@ -93,6 +93,9 @@ class ColumnCapabilityV1:
     # values disagree) — the resolver's own verdict, never any-mismatch. A losing weaker
     # proposal is NOT a conflict and never appears here.
     authority_conflicts: tuple[str, ...] = ()
+    # C3: a governed signed-amount convention at AUTHORING authority rides this column —
+    # one of the two representations that license opposing legs on one physical column.
+    sign_convention_cleared: bool = False
 
 
 def _authority(pins: dict[tuple[str, str], str], logical_ref: str, field: str,
@@ -122,6 +125,7 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
     pins: dict[tuple[str, str], str] = {}
     conflicts: dict[str, list[str]] = {}                 # logical_ref -> conflicted fields
     economic_roles: dict[str, tuple[str, str]] = {}      # logical_ref -> (value, authority)
+    sign_cleared: set[str] = set()                       # logical refs w/ authoring-grade sign
     if members:
         # C1: the pin is the RESOLVER'S current verdict (read-only, batched) — the value the
         # governed resolution stands behind, with the authority that EARNED it. The pre-C1
@@ -134,6 +138,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             logical_refs=(list(logical_by_ref.values())
                           + list(table_logical_by_name.values())),
             fields=_PINNED_FIELDS)
+        from featuregen.overlay.upload.semantic_eligibility import clears
+
         for (logical_ref, field_name), pin in resolution_pins.items():
             if pin.producer:
                 pins[(logical_ref, field_name)] = f"{pin.producer}/{pin.strength}"
@@ -143,6 +149,9 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
                     and pin.strength == "confirmed"):
                 economic_roles[logical_ref] = (str(pin.value).strip('"'),
                                                "human/confirmed")
+            if (field_name == "sign_convention" and pin.value
+                    and clears(f"{pin.producer}/{pin.strength}", "authoring")):
+                sign_cleared.add(logical_ref)
 
     from featuregen.overlay.upload.concepts import concept as registered_concept
 
@@ -193,7 +202,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             missing_context=tuple(missing),
             retrieval_text=" ".join(filter(None, (
                 col.definition, col.ai_summary, col.semantic_terms))),
-            authority_conflicts=tuple(sorted(conflicts.get(logical_ref, ()))))
+            authority_conflicts=tuple(sorted(conflicts.get(logical_ref, ()))),
+            sign_convention_cleared=logical_ref in sign_cleared)
     return capabilities
 
 

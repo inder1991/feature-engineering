@@ -181,6 +181,83 @@ def _consult_v2_tie_break(conn, definition, operand, tied_cols):
     return (verdict, key) if verdict is not None else (None, key)
 
 
+#: Concepts that ARE a direction representation — a bound operand carrying one licenses a
+#: single magnitude column to serve opposing legs (amounts + indicator, the shape real
+#: banking schemas use).
+_DIRECTION_CONCEPTS = frozenset({"debit_credit_indicator"})
+
+_SIGN_BLOCK_RESOLUTION = (
+    "opposing legs bound one physical column with no governed sign REPRESENTATION — bind "
+    "distinct columns, confirm a sign_convention fact on the shared column (signed-amount "
+    "convention), or bind a direction column (debit_credit_indicator) in this recipe. The "
+    "recipe's authored sign expectation is an EXPECTATION to validate against, never the "
+    "authority that licenses the bind.")
+
+
+def _direction_operand_bound(operands, verdicts) -> bool:
+    """Did THIS request bind a direction-representation operand? (C3 sign law, leg one.)"""
+    bound_roles = {v.role for v in verdicts if v.status == "bound"}
+    return any(op.concept in _DIRECTION_CONCEPTS and op.role in bound_roles
+               for op in operands)
+
+
+def _sign_convention_cleared_by_ref(conn, catalog_source: str, refs) -> dict:
+    """Leg two of the C3 sign law, BATCHED per binding run (the B6 load-once rule): which of
+    ``refs`` carry a governed ``sign_convention`` fact whose CURRENT resolved authority
+    clears the AUTHORING floor (C1's read-only pins + C2's matrix — the same laws everything
+    else answers to). An authored string on the recipe is not evidence; an LLM proposal is
+    not authority."""
+    from featuregen.overlay.upload.field_resolution import current_resolution_pins
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.semantic_eligibility import clears
+
+    logical_by_ref = {}
+    for ref in dict.fromkeys(refs):
+        parts = ref.split(".")
+        if len(parts) >= 3:
+            logical_by_ref[ref] = normalize_ref(catalog_source, parts[-3], parts[-2],
+                                                parts[-1])
+    if not logical_by_ref:
+        return {}
+    pins = current_resolution_pins(
+        conn, logical_refs=list(logical_by_ref.values()), fields=("sign_convention",))
+    cleared = {}
+    for ref, logical in logical_by_ref.items():
+        pin = pins.get((logical, "sign_convention"))
+        cleared[ref] = bool(pin is not None and pin.value and clears(
+            f"{pin.producer}/{pin.strength}", "authoring"))
+    return cleared
+
+
+def _resolve_opposing_legs(operands, verdicts, bound_by_group, final,
+                           *, cleared_lookup) -> None:
+    """The shared opposing-legs law over EVERY group at once. ``cleared_lookup(ref)`` answers
+    leg two (a governed sign_convention at authoring authority on the shared column) — the
+    capability binder answers it PURELY from the pre-compiled capability; the legacy binder
+    reads it batched per run (reached only when real collisions exist, never per candidate)."""
+    colliding = {}
+    for group, members in bound_by_group.items():
+        refs = [b.selected_ref for _sign, b in members if b.selected_ref]
+        if len(refs) != len(set(refs)):
+            colliding[group] = (members, refs)
+    if not colliding:
+        return
+    if _direction_operand_bound(operands, verdicts):
+        return
+    for members, refs in colliding.values():
+        if not all(cleared_lookup(ref) for ref in refs):
+            _block_opposing_legs(final, members)
+
+
+def _block_opposing_legs(final, members) -> None:
+    for _sign, member in members:
+        index = final.index(member)
+        final[index] = OperandBindingVerdictV1(
+            role=member.role, status="blocked", tied_refs=member.tied_refs,
+            reason_codes=(DISTINCT_BINDING_VIOLATED,),
+            resolution=_SIGN_BLOCK_RESOLUTION)
+
+
 def bind_v2_operands(conn, definition, *, catalog_source: str,
                      roles=()) -> tuple[OperandBindingVerdictV1, ...]:
     """Bind every operand of one V2 definition against one catalog, fail-closed. Uses the SAME
@@ -267,23 +344,16 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
             bound_by_group.setdefault(operand.distinct_binding_group, []).append(
                 (operand.sign_direction_expectation, binding))
 
-    # Opposing legs: two members of one distinct group on ONE physical column is incompatible —
-    # unless a governed sign authority explains how one column carries both directions.
+    # Opposing legs: two members of one distinct group on ONE physical column is incompatible
+    # unless the CATALOG carries a governed sign representation (C3 — the authored
+    # sign_direction_expectation is an expectation, never the licensing authority).
     final: list[OperandBindingVerdictV1] = list(verdicts)
-    for _group, members in bound_by_group.items():
-        refs = [b.selected_ref for _sign, b in members if b.selected_ref]
-        if len(refs) != len(set(refs)):
-            has_sign_authority = all(sign.strip() for sign, _b in members)
-            if not has_sign_authority:
-                for _sign, member in members:
-                    index = final.index(member)
-                    final[index] = OperandBindingVerdictV1(
-                        role=member.role, status="blocked",
-                        tied_refs=member.tied_refs,
-                        reason_codes=(DISTINCT_BINDING_VIOLATED,),
-                        resolution=("opposing legs bound one physical column with no governed "
-                                    "sign authority — bind distinct columns, or attach the sign "
-                                    "policy that separates the directions"))
+    if bound_by_group:
+        shared = [b.selected_ref for members in bound_by_group.values()
+                  for _sign, b in members if b.selected_ref]
+        cleared = _sign_convention_cleared_by_ref(conn, catalog_source, shared)
+        _resolve_opposing_legs(definition.operands, verdicts, bound_by_group, final,
+                               cleared_lookup=lambda ref: cleared.get(ref, False))
     return tuple(final)
 
 
@@ -419,18 +489,11 @@ def bind_with_capabilities(conn, request, context, capabilities):
 
     # Opposing legs: identical law to the live-column binder (one rule, two engines is a bug).
     final: list[OperandBindingVerdictV1] = list(verdicts)
-    for _group, members in bound_by_group.items():
-        refs = [b.selected_ref for _sign, b in members if b.selected_ref]
-        if len(refs) != len(set(refs)):
-            if not all(sign.strip() for sign, _b in members):
-                for _sign, member in members:
-                    position = final.index(member)
-                    final[position] = OperandBindingVerdictV1(
-                        role=member.role, status="blocked", tied_refs=member.tied_refs,
-                        reason_codes=(DISTINCT_BINDING_VIOLATED,),
-                        resolution=("opposing legs bound one physical column with no governed "
-                                    "sign authority — bind distinct columns, or attach the "
-                                    "sign policy that separates the directions"))
+    _resolve_opposing_legs(
+        request.operands, verdicts, bound_by_group, final,
+        cleared_lookup=lambda ref: bool(
+            (capability := capabilities.get(ref)) is not None
+            and capability.sign_convention_cleared))
     return tuple(final), eligibility
 
 
