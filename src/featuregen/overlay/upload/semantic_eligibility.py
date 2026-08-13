@@ -150,6 +150,9 @@ class OperandEligibilityVerdictV1:
     # C4: the ACTIVE policy revisions that license this column's personal data (empty when
     # none needed or none granted) — provenance the served idea carries forward.
     personal_data_policy_revision_ids: tuple[str, ...] = ()
+    # C5: capability axes this evaluation NEEDED and could not read (the fact is absent, not
+    # failing) — the tri-state family fold's "missing" input. Never a refusal by itself.
+    facts_absent: tuple[str, ...] = ()
 
 
 def _primary(codes: list[str]) -> str | None:
@@ -167,6 +170,27 @@ def _grain_axis(grain: str) -> str | None:
     if grain == "transaction" or grain.endswith("_event"):
         return "event"
     return None
+
+
+def _absent_axes(operand: RequiredOperandV1, capability: ColumnCapabilityV1,
+                 output) -> tuple[str, ...]:
+    """C5: which capability axes THIS evaluation needed and could not read. Absence never
+    refuses on its own — it makes the family unverifiable, which blocks DESIGN_CHECKED."""
+    absent = []
+    if operand.unit_expectation and not capability.currency:
+        # The only unit fact the catalog carries today is a currency (a monetary-unit fact);
+        # without one, no unit expectation is verifiable.
+        absent.append("unit")
+    if output is not None and operand.operand_class == "measure":
+        agg = f"{output.aggregation_over_entity} {output.aggregation_over_time}".lower()
+        if "sum" in agg and not capability.additivity:
+            absent.append("additivity")
+    if operand.allowed_source_grains:
+        axes = {_grain_axis(g) for g in operand.allowed_source_grains}
+        if (None not in axes and len(axes) == 1
+                and capability.table_event_or_snapshot not in ("event", "snapshot")):
+            absent.append("table_shape")
+    return tuple(absent)
 
 
 def evaluate_operand(operand: RequiredOperandV1,
@@ -289,16 +313,17 @@ def evaluate_operand(operand: RequiredOperandV1,
         status = "provisional"
     else:
         status = "eligible"
-    return _verdict(operand, capability, status, codes)
+    return _verdict(operand, capability, status, codes, output=output)
 
 
 def _verdict(operand: RequiredOperandV1, capability: ColumnCapabilityV1,
-             status: str, codes: list[str]) -> OperandEligibilityVerdictV1:
+             status: str, codes: list[str], output=None) -> OperandEligibilityVerdictV1:
     primary = _primary(codes)
     checks = tuple(code for code in codes
                    if R.reason_family(code) in ("needs_setup", "needs_data_check"))
     return OperandEligibilityVerdictV1(
         personal_data_policy_revision_ids=capability.personal_data_policy_revision_ids,
+        facts_absent=_absent_axes(operand, capability, output),
         operand_role=operand.role,
         object_ref=capability.object_ref,
         status=status,

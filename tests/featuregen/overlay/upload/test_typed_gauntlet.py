@@ -26,7 +26,15 @@ def _request(operands):
         temporal=EXEMPLAR.temporal, content_hash="probehash")
 
 
-def _candidate(operands, verdicts, *, binding_state="bound", temporal_blocker=""):
+def _story(tables=("customers",)):
+    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
+
+    return DatasetStoryV1(population_ref=tables[0], population_basis="declared_grain",
+                          dataset_tables=tuple(tables), cross_dataset=False, codes=())
+
+
+def _candidate(operands, verdicts, *, binding_state="bound", temporal_blocker="",
+               dataset_story="default"):
     request = _request(operands)
     return V2RecipeCandidateV1(
         recipe_id="user:gauntlet_probe", relationship="primary",
@@ -34,7 +42,8 @@ def _candidate(operands, verdicts, *, binding_state="bound", temporal_blocker=""
         recipe_revision_hash="rev", verdicts=tuple(verdicts),
         binding_state=binding_state, readiness="CONCEPTUAL_ONLY",
         temporal_pit_text="" if temporal_blocker else "pit", temporal_blocker=temporal_blocker,
-        review_current=False, review_missing_roles=(), eligibility={})
+        review_current=False, review_missing_roles=(), eligibility={},
+        dataset_story=_story() if dataset_story == "default" else dataset_story)
 
 
 OPERANDS = (
@@ -164,3 +173,40 @@ def test_a_ratio_shaped_output_without_its_zero_denominator_policy_is_named_setu
         review_current=False, review_missing_roles=(), eligibility={})
     codes2 = {r.code for r in validate_candidate(candidate2).requirements}
     assert R.OUTPUT_POLICY_INCOMPLETE not in codes2
+
+
+# ── C5: DESIGN_CHECKED means every family answered ─────────────────────────────────────────────
+
+def test_the_family_report_is_tri_state_and_missing_blocks_design_checked():
+    """A family whose facts axis is ABSENT reports missing — and design_checked is
+    unreachable until it can actually be evaluated. A family the request's own shape never
+    invokes is not_applicable WITH its reason, never a silent pass."""
+    from featuregen.overlay.upload.typed_gauntlet import POLICY_FAMILIES
+
+    validation = validate_candidate(_candidate(OPERANDS, BOUND))
+    by_family = {f.family: f for f in validation.families}
+    assert set(by_family) == set(POLICY_FAMILIES)
+    assert by_family["leakage"].state == "evaluated"
+    assert by_family["dataset"].state == "evaluated"
+    assert by_family["unit_currency"].state == "not_applicable"
+    assert "no unit" in by_family["unit_currency"].reason
+    assert by_family["sign"].state == "not_applicable"
+
+    # A missing axis: the candidate has no dataset story at all.
+    validation = validate_candidate(_candidate(OPERANDS, BOUND, dataset_story=None))
+    by_family = {f.family: f for f in validation.families}
+    assert by_family["dataset"].state == "missing"
+    assert validation.status == "needs_external_validation"
+    assert any(r.code == R.POLICY_FAMILY_UNVERIFIABLE and "dataset" in r.detail
+               for r in validation.requirements)
+
+
+def test_a_status_policy_family_is_missing_until_a_resolver_exists():
+    gated = (RequiredOperandV1(role="status", concept="segment", operand_class="dimension",
+                               status_policy_ref="eligible_status:probe"),)
+    bound = (OperandBindingVerdictV1(role="status", status="bound",
+                                     selected_ref="public.customers.segment"),)
+    validation = validate_candidate(_candidate(gated, bound))
+    by_family = {f.family: f for f in validation.families}
+    assert by_family["status"].state == "missing"
+    assert "resolver" in by_family["status"].reason

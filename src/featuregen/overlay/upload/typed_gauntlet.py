@@ -45,6 +45,25 @@ class TypedRequirementV1:
     schema_version: str = TYPED_GAUNTLET_VERSION
 
 
+#: C5 — the closed policy-family registry: DESIGN_CHECKED means every one of these was
+#: EVALUATED or is NOT APPLICABLE to this request's own shape. "missing" (the facts axis is
+#: absent, so the family could not be evaluated) blocks design_checked with named setup work.
+POLICY_FAMILIES = ("leakage", "identifier", "temporal", "dataset", "unit_currency",
+                   "additivity", "sign", "status", "relationship", "personal_data",
+                   "formula_output")
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyReportV1:
+    """One family's tri-state: evaluated | not_applicable | missing, with the reason derived
+    from the REQUEST'S OWN SHAPE (a recipe with no monetary operand has no currency family
+    to evaluate — that is not_applicable, never a silent pass)."""
+
+    family: str
+    state: str                            # evaluated | not_applicable | missing
+    reason: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class TypedValidationV1:
     status: str                           # refused | not_bindable | needs_external_validation | design_checked
@@ -52,6 +71,7 @@ class TypedValidationV1:
     requirements: tuple[TypedRequirementV1, ...]
     gauntlet_version: str
     policy_content_hash: str
+    families: tuple[FamilyReportV1, ...] = ()
 
 
 def validate_candidate(candidate, *, target_ref: str | None = None) -> TypedValidationV1:
@@ -147,6 +167,18 @@ def validate_candidate(candidate, *, target_ref: str | None = None) -> TypedVali
                        f"{', '.join(story.dataset_tables)} — govern the relationship "
                        "(verify the join) before this computes as ONE feature"))
 
+    # C5 — the family fold: every family answers evaluated / not_applicable / missing from
+    # the request's own shape + what the eligibility fold could actually read.
+    families = _family_reports(candidate, operands_by_role)
+    for report in families:
+        if report.state == "missing":
+            requirements.append(TypedRequirementV1(
+                code=R.POLICY_FAMILY_UNVERIFIABLE,
+                family=R.reason_family(R.POLICY_FAMILY_UNVERIFIABLE),
+                object_ref="",
+                detail=f"the {report.family} family could not be evaluated — "
+                       f"{report.reason}"))
+
     if refusals:
         status = "refused"
     elif requirements:
@@ -154,8 +186,69 @@ def validate_candidate(candidate, *, target_ref: str | None = None) -> TypedVali
     else:
         status = "design_checked"
     return TypedValidationV1(status, tuple(refusals), tuple(requirements),
-                             TYPED_GAUNTLET_VERSION, policy_hash)
+                             TYPED_GAUNTLET_VERSION, policy_hash, families)
 
 
-__all__ = ["TYPED_GAUNTLET_VERSION", "TypedRequirementV1", "TypedValidationV1",
-           "validate_candidate"]
+def _family_reports(candidate, operands_by_role) -> tuple[FamilyReportV1, ...]:
+    """The tri-state per closed family. Applicability derives from the REQUEST's own shape;
+    "missing" comes from the eligibility fold's recorded absent axes — never guessed here."""
+    operands = tuple(operands_by_role.values())
+    request = candidate.planning_request
+    eligibility = candidate.eligibility or {}
+    bound = [(v, eligibility.get((v.role, v.selected_ref)))
+             for v in candidate.verdicts if v.status == "bound" and v.selected_ref]
+    absent: set[str] = {axis for _v, e in bound if e is not None
+                        for axis in getattr(e, "facts_absent", ())}
+
+    def _report(family, applicable, missing_when, na_reason, missing_reason):
+        if not applicable:
+            return FamilyReportV1(family, "not_applicable", na_reason)
+        if missing_when:
+            return FamilyReportV1(family, "missing", missing_reason)
+        return FamilyReportV1(family, "evaluated")
+
+    output = request.output
+    agg_text = f"{output.aggregation_over_entity} {output.aggregation_over_time}".lower()
+    summing = any(op.operand_class == "measure" for op in operands) and "sum" in agg_text
+    has_unit = any(op.unit_expectation or op.currency_expectation for op in operands)
+    ratio_like = (output.unit_kind in ("rate", "ratio", "share", "percentage")
+                  or "ratio" in agg_text or "share" in agg_text)
+    story = getattr(candidate, "dataset_story", None)
+    pii = any(e is not None and (e.personal_data_policy_revision_ids
+                                 or R.PERSONAL_DATA_POLICY_REQUIRED in e.reason_codes)
+              for _v, e in bound)
+
+    return (
+        _report("leakage", True, False, "", ""),          # the safety law runs on every bind
+        _report("identifier",
+                any(op.operand_class == "entity_key" for op in operands),
+                False, "no entity-key operand", ""),
+        _report("temporal", True, False, "", ""),         # compiled, or the blocker is named
+        _report("dataset", True, story is None, "",
+                "no dataset story folded for this candidate"),
+        _report("unit_currency", has_unit, "unit" in absent,
+                "no unit or currency expectation authored",
+                "a unit expectation is authored and the column carries no unit/currency fact"),
+        _report("additivity", summing, "additivity" in absent,
+                "no summing operation over a measure",
+                "the operation sums a measure whose additivity is undeclared"),
+        _report("sign",
+                any(op.distinct_binding_group for op in operands),
+                False, "no opposing-leg groups authored", ""),
+        _report("status",
+                any(op.status_policy_ref for op in operands),
+                any(op.status_policy_ref for op in operands),
+                "no status policy referenced",
+                "no status-policy resolver serves the referenced policy yet"),
+        _report("relationship",
+                any(op.relationship_requirement for op in operands)
+                or bool(story is not None and story.cross_dataset),
+                False, "single-source, no relationship requirement", ""),
+        _report("personal_data", pii, False, "no personal data bound", ""),
+        _report("formula_output", ratio_like, False,
+                "no ratio-shaped output", ""),
+    )
+
+
+__all__ = ["POLICY_FAMILIES", "FamilyReportV1", "TYPED_GAUNTLET_VERSION",
+           "TypedRequirementV1", "TypedValidationV1", "validate_candidate"]

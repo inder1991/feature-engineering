@@ -819,6 +819,18 @@ TRI-STATE (validated correction — a recipe with no monetary operand has no cur
 evaluate): `evaluated` / `not_applicable` (with the reason derived from the request's own
 shape) / `missing` (could not evaluate — capability axis absent). `design_checked` requires
 every family `evaluated` or `not_applicable`; any `missing` emits `NEEDS_SETUP`/`UNSUPPORTED`.
+
+> **ACCEPTED (2026-08-13).** `POLICY_FAMILIES` (the 11, closed) + `FamilyReportV1` tri-state
+> on `TypedValidationV1.families` (additive). Applicability derives from the REQUEST's own
+> shape (no unit expectation → unit_currency not_applicable WITH the reason; no opposing-leg
+> groups → sign n/a); "missing" comes from the eligibility fold's recorded `facts_absent`
+> axes (new additive carrier on the verdict — unit/additivity/table_shape absence recorded
+> where the check would have run) plus candidate-level absences (no dataset story; a status
+> policy with no resolver). Every missing family emits POLICY_FAMILY_UNVERIFIABLE with the
+> family named — design_checked now MEANS every family answered. Tests: the registry is
+> complete per validation; missing blocks design_checked (story-less candidate); status
+> family missing until a resolver exists; the pre-C5 design-checked test now seeds a real
+> story (the honest flip).
 Success-by-omission becomes structurally impossible without blocking features the family
 genuinely does not concern.
 
