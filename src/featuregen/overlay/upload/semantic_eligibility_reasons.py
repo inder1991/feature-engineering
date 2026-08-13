@@ -70,6 +70,7 @@ EXTERNAL_VALIDATION_OUTSTANDING = "EXTERNAL_VALIDATION_OUTSTANDING"
 EXECUTION_AUTHORITY_UNEVALUATED = "EXECUTION_AUTHORITY_UNEVALUATED"
 EXECUTION_AUTHORITY_UNMET = "EXECUTION_AUTHORITY_UNMET"
 SNAPSHOT_STALE_REGENERATE = "SNAPSHOT_STALE_REGENERATE"
+OUTPUT_POLICY_INCOMPLETE = "OUTPUT_POLICY_INCOMPLETE"      # C3: a load-bearing output policy unauthored
 ACTIVATION_STATE_DRIFTED = "ACTIVATION_STATE_DRIFTED"
 
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
@@ -118,6 +119,7 @@ REASON_FAMILIES: dict[str, str] = {
     EXECUTION_AUTHORITY_UNMET: "undecided",
     SNAPSHOT_STALE_REGENERATE: "needs_setup",
     ACTIVATION_STATE_DRIFTED: "needs_setup",
+    OUTPUT_POLICY_INCOMPLETE: "needs_setup",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —

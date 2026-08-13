@@ -193,3 +193,44 @@ def test_a_single_snapshot_date_offered_as_a_measure_is_structurally_refused():
             possible_operand_classes=("measure",)))
     assert verdict.status == "blocked"                        # right meaning, impossible shape
     assert R.TYPE_INCOMPATIBLE in verdict.reason_codes
+
+
+# ── C3: the balance-sums-like-a-flow confusion — a stock summed across time ────────────────────
+
+def test_summing_a_balance_across_time_is_the_classic_stock_flow_confusion():
+    """The audit's additivity-abuse class: 'total balance over 90 days' sums a semi-additive
+    STOCK across time — a number that means nothing. Blocked from the declared additivity,
+    by name; the same balance under an as-of anchor (point-in-time state) is fine."""
+    class _SumOutput:
+        aggregation_over_entity = "sum over accounts"
+        aggregation_over_time = "sum over the trailing window"
+        unit_kind = "monetary"
+        zero_denominator_policy = "n/a"
+
+    balance = cap(concept="monetary_stock", additivity="semi_additive", currency="USD")
+    summed = op(concept="monetary_stock", unit_expectation="monetary")
+    verdict = evaluate_operand(summed, balance, output=_SumOutput(), temporal_anchor="event")
+    assert verdict.status == "blocked"
+    assert R.ADDITIVITY_INCOMPATIBLE in verdict.reason_codes
+
+    verdict = evaluate_operand(summed, balance, output=_SumOutput(), temporal_anchor="as_of")
+    assert R.ADDITIVITY_INCOMPATIBLE not in verdict.reason_codes
+
+
+# ── C3: the snapshot-fed-transaction-recipe confusion — the wrong row shape ────────────────────
+
+def test_a_transaction_recipe_cannot_read_a_declared_snapshot_table():
+    """The audit's grain-mismatch class: a transaction-shaped operand (event rows) served
+    from a table DECLARED to be a point-in-time snapshot — refused from the declared fact;
+    a merely-proposed table shape blocks nothing (the SE-8p2 at-declared+ posture)."""
+    event_only = op(allowed_source_grains=("transaction",))
+    declared_snapshot = cap(table_event_or_snapshot="snapshot",
+                            table_event_or_snapshot_authority="source/declared")
+    verdict = evaluate_operand(event_only, declared_snapshot)
+    assert verdict.status == "blocked"
+    assert R.SOURCE_GRAIN_MISMATCH in verdict.reason_codes
+
+    proposed_snapshot = cap(table_event_or_snapshot="snapshot",
+                            table_event_or_snapshot_authority="llm/proposed")
+    assert R.SOURCE_GRAIN_MISMATCH not in evaluate_operand(
+        event_only, proposed_snapshot).reason_codes

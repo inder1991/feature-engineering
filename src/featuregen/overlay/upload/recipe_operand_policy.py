@@ -426,7 +426,9 @@ def bind_with_capabilities(conn, request, context, capabilities):
             capability = capabilities.get(ref)
             if capability is None:
                 continue
-            verdict = evaluate_operand(operand, capability)
+            verdict = evaluate_operand(
+                operand, capability, output=request.output,
+                temporal_anchor=request.temporal.anchor_kind)
             eligibility[(operand.role, ref)] = verdict
             if verdict.status in tiers:
                 tiers[verdict.status].append(ref)

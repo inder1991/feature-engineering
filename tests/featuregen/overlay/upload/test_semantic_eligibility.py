@@ -223,3 +223,75 @@ def test_growing_the_matrix_moved_the_policy_hash_by_design():
         __import__("featuregen.overlay.upload.semantic_eligibility",
                    fromlist=["AUTHORITY_MATRIX"]).AUTHORITY_MATRIX["human/confirmed"]))
     assert authority_matrix_hash()  # stable + computable; content-addressed by construction
+
+
+# ── C3: the authored-but-unconsumed constraints now enforce or refuse, by name ─────────────────
+
+class _Output:
+    """The request-level output context the additivity law consumes — duck-shaped."""
+
+    def __init__(self, *, entity_agg="sum over accounts", time_agg="sum over windows",
+                 unit_kind="monetary", zero_denominator_policy=""):
+        self.aggregation_over_entity = entity_agg
+        self.aggregation_over_time = time_agg
+        self.unit_kind = unit_kind
+        self.zero_denominator_policy = zero_denominator_policy
+
+
+def test_source_grain_enforces_the_axis_the_catalog_can_prove():
+    """C3: an operand allowing only snapshot-shaped grains cannot bind a table DECLARED to be
+    event-shaped — and a merely-proposed table fact blocks nothing (the SE-8p2 posture)."""
+    snap_only = operand(allowed_source_grains=("account_day_snapshot", "deposit_snapshot"))
+    declared_event = capability(table_event_or_snapshot="event",
+                                table_event_or_snapshot_authority="source/declared")
+    verdict = evaluate_operand(snap_only, declared_event)
+    assert verdict.status == "blocked"
+    assert R.SOURCE_GRAIN_MISMATCH in verdict.reason_codes
+
+    proposed_event = capability(table_event_or_snapshot="event",
+                                table_event_or_snapshot_authority="llm/proposed")
+    assert evaluate_operand(snap_only, proposed_event).status == "eligible"
+
+    # A shape the catalog has no fact for (interval/report/...) skips enforcement honestly.
+    unverifiable = operand(allowed_source_grains=("product_holding_interval",))
+    assert evaluate_operand(unverifiable, declared_event).status == "eligible"
+
+
+def test_a_currency_bearing_column_cannot_serve_a_non_monetary_unit():
+    counting = operand(unit_expectation="count")
+    verdict = evaluate_operand(counting, capability(currency="USD"))
+    assert verdict.status == "blocked"
+    assert R.UNIT_INCOMPATIBLE in verdict.reason_codes
+
+    assert evaluate_operand(operand(unit_expectation="monetary"),
+                            capability(currency="USD")).status == "eligible"
+    assert evaluate_operand(counting, capability(currency=None)).status == "eligible"
+
+
+def test_an_unresolved_status_policy_is_named_setup_work_never_silent():
+    gated = operand(status_policy_ref="eligible_status:foundation-posted-events")
+    verdict = evaluate_operand(gated, capability())
+    assert verdict.status == "provisional"          # visible and actionable — never blocked
+    assert R.STATUS_POLICY_UNRESOLVED in verdict.reason_codes
+    assert "status" in verdict.resolution
+
+
+def test_summing_what_cannot_be_summed_is_blocked_by_declared_additivity():
+    """C3: sum over non_additive never; sum over semi_additive only under an as-of anchor
+    (a stock sums across entities at a point in time, never across time)."""
+    summed = operand()
+    ratio_col = capability(additivity="non_additive", currency=None)
+    verdict = evaluate_operand(summed, ratio_col, output=_Output(), temporal_anchor="event")
+    assert verdict.status == "blocked"
+    assert R.ADDITIVITY_INCOMPATIBLE in verdict.reason_codes
+
+    stock_col = capability(additivity="semi_additive")
+    verdict = evaluate_operand(summed, stock_col, output=_Output(), temporal_anchor="event")
+    assert R.ADDITIVITY_INCOMPATIBLE in verdict.reason_codes
+    verdict = evaluate_operand(summed, stock_col, output=_Output(), temporal_anchor="as_of")
+    assert R.ADDITIVITY_INCOMPATIBLE not in verdict.reason_codes
+
+    # An averaging operation is untouched — the law is about SUM.
+    averaged = _Output(entity_agg="average over accounts", time_agg="mean over window")
+    verdict = evaluate_operand(summed, ratio_col, output=averaged, temporal_anchor="event")
+    assert R.ADDITIVITY_INCOMPATIBLE not in verdict.reason_codes

@@ -764,6 +764,24 @@ sign-leg, additivity-abuse, and grain-mismatch cases.
 > opposing legs previously bound via authored strings now block honestly until the catalog
 > carries a representation.
 
+> **C3 COMPLETE (2026-08-13) — the long tail wired.** Every inventoried field enforces or
+> refuses by name: `SOURCE_GRAIN_MISMATCH` (the event/snapshot AXIS at declared+ — the
+> SE-8p2 posture; finer row-kinds have no catalog fact, named honestly),
+> `UNIT_INCOMPATIBLE` (a currency-bearing column serving a non-monetary expectation; the
+> absent-facts half reports through C5), `STATUS_POLICY_UNRESOLVED` (52+ operands' governed
+> status reads ride every candidate as named setup work — provisional, never blocked, never
+> silent), `ADDITIVITY_INCOMPATIBLE` (the stock/flow law: sum over non_additive never; over
+> semi_additive only under an as-of anchor — output+anchor threaded through the binder's
+> eligibility call), `OUTPUT_POLICY_INCOMPLETE` (a ratio-shaped output without its authored
+> zero-denominator policy is a named gauntlet requirement). THE META-TEST lands
+> (`test_recipe_field_consumers.py`): every `OperandSpecV2`/`OutputSpecV2` field must carry
+> a registered disposition (enforced/partial/expectation/display) — a new field fails the
+> build until its consumer or honest non-consumer is registered. Battery gains the
+> stock-flow additivity-abuse and snapshot-fed-transaction grain-mismatch cases (sign-leg
+> cases live in the operand-policy suite). Honest scope notes: `join_role` = partial
+> (cross-catalog planner only; single-source plans have no join by construction);
+> sign/output prose fields = expectation-class, consumed at the formula-authoring seam.
+
 ### Task C4 — personal-data purpose policy in the engine path (1 day)
 
 *Modify:* `column_capabilities.py` (consume the D14 `pii_policy` resolver the legacy gauntlet

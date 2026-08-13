@@ -31,6 +31,7 @@ TYPED_GAUNTLET_VERSION = "typed-gauntlet@1"
 _REQUIREMENT_CODES = frozenset({
     R.PROPOSED_METADATA_ONLY, R.SEMANTIC_AUTHORITY_INSUFFICIENT,
     R.CURRENCY_POLICY_MISSING, R.RELATIONSHIP_REQUIRED,
+    R.STATUS_POLICY_UNRESOLVED,                     # C3: named setup work, never silent
 })
 
 
@@ -102,6 +103,21 @@ def validate_candidate(candidate, *, target_ref: str | None = None) -> TypedVali
                 requirements.append(TypedRequirementV1(
                     code=code, family=R.reason_family(code),
                     object_ref=verdict.selected_ref, detail=verdict.resolution))
+
+    # C3: a load-bearing output policy the author never wrote — a ratio-shaped output
+    # divides, so its zero-denominator behavior is part of the DESIGN, not a runtime nicety.
+    output = candidate.planning_request.output
+    agg_text = (f"{output.aggregation_over_entity} "
+                f"{output.aggregation_over_time}").lower()
+    ratio_like = (output.unit_kind in ("rate", "ratio", "share", "percentage")
+                  or "ratio" in agg_text or "share" in agg_text)
+    if ratio_like and not output.zero_denominator_policy.strip():
+        requirements.append(TypedRequirementV1(
+            code=R.OUTPUT_POLICY_INCOMPLETE,
+            family=R.reason_family(R.OUTPUT_POLICY_INCOMPLETE),
+            object_ref="",
+            detail="a ratio-shaped output divides, and its authored contract does not say "
+                   "what a zero denominator returns — author the zero_denominator_policy"))
 
     if candidate.temporal_blocker:
         requirements.append(TypedRequirementV1(

@@ -124,3 +124,43 @@ def test_design_checked_is_reachable_and_still_not_proof_of_usefulness():
     validation = validate_candidate(_candidate(operands, verdicts))
     assert validation.status == "design_checked"
     assert validation.requirements == ()
+
+
+def test_a_ratio_shaped_output_without_its_zero_denominator_policy_is_named_setup(monkeypatch):
+    """C3: a ratio DIVIDES — what a zero denominator returns is part of the authored design,
+    and its absence is a named requirement, never a silent gap."""
+    from dataclasses import replace
+
+    bare_ratio = replace(EXEMPLAR.output, unit_kind="rate", zero_denominator_policy="")
+    request = planning_request_from_user_definition(
+        definition_id="user:ratio_probe", primary_objective=EXEMPLAR.primary_objective,
+        output=bare_ratio, operands=OPERANDS,
+        source_grain="transaction", output_grain="customer",
+        temporal=EXEMPLAR.temporal, content_hash="ratiohash")
+    from featuregen.overlay.upload.feature_planning_contracts import planning_request_hash
+    candidate = V2RecipeCandidateV1(
+        recipe_id="user:ratio_probe", relationship="primary",
+        planning_request=request, planning_request_hash=planning_request_hash(request),
+        recipe_revision_hash="rev", verdicts=BOUND,
+        binding_state="bound", readiness="CONCEPTUAL_ONLY",
+        temporal_pit_text="pit", temporal_blocker="",
+        review_current=False, review_missing_roles=(), eligibility={})
+    validation = validate_candidate(candidate)
+    codes = {r.code for r in validation.requirements}
+    assert R.OUTPUT_POLICY_INCOMPLETE in codes
+
+    authored = replace(bare_ratio, zero_denominator_policy="a zero denominator returns null")
+    request2 = planning_request_from_user_definition(
+        definition_id="user:ratio_probe2", primary_objective=EXEMPLAR.primary_objective,
+        output=authored, operands=OPERANDS,
+        source_grain="transaction", output_grain="customer",
+        temporal=EXEMPLAR.temporal, content_hash="ratiohash2")
+    candidate2 = V2RecipeCandidateV1(
+        recipe_id="user:ratio_probe2", relationship="primary",
+        planning_request=request2, planning_request_hash=planning_request_hash(request2),
+        recipe_revision_hash="rev", verdicts=BOUND,
+        binding_state="bound", readiness="CONCEPTUAL_ONLY",
+        temporal_pit_text="pit", temporal_blocker="",
+        review_current=False, review_missing_roles=(), eligibility={})
+    codes2 = {r.code for r in validate_candidate(candidate2).requirements}
+    assert R.OUTPUT_POLICY_INCOMPLETE not in codes2

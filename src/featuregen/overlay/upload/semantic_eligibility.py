@@ -111,6 +111,17 @@ _RESOLUTIONS: dict[str, str] = {
                              "realization), then regenerate",
     R.CURRENCY_POLICY_MISSING: "declare the currency (fixed code or per-row column) — money "
                                "is refused until it is known",
+    R.SOURCE_GRAIN_MISMATCH: "this operand requires a differently-shaped source (event rows "
+                             "vs point-in-time snapshots) — bind a column from a table of the "
+                             "declared shape the recipe expects",
+    R.UNIT_INCOMPATIBLE: "this column carries a currency (a monetary quantity) but the operand "
+                         "expects a non-monetary unit — bind a column of the right unit",
+    R.ADDITIVITY_INCOMPATIBLE: "this operation SUMS a value whose declared additivity cannot "
+                               "be summed this way (a stock/ratio is not a flow) — change the "
+                               "operation or bind an additive measure",
+    R.STATUS_POLICY_UNRESOLVED: "this recipe reads a governed status policy no resolver serves "
+                                "yet — declare the source's status meanings, or accept the "
+                                "unfiltered read at your own review",
     R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW: "this table is declared a SNAPSHOT — it cannot "
                                             "anchor an event window; bind an event source, or "
                                             "correct the table's classification",
@@ -142,8 +153,22 @@ def _primary(codes: list[str]) -> str | None:
     return codes[0] if codes else None
 
 
+def _grain_axis(grain: str) -> str | None:
+    """The coarse row-shape axis of an authored source-grain name — the half the catalog can
+    verify. ``None`` = a shape (interval/report/pull/...) no catalog fact can check yet."""
+    if "snapshot" in grain:
+        return "snapshot"
+    if grain == "transaction" or grain.endswith("_event"):
+        return "event"
+    return None
+
+
 def evaluate_operand(operand: RequiredOperandV1,
-                     capability: ColumnCapabilityV1) -> OperandEligibilityVerdictV1:
+                     capability: ColumnCapabilityV1, *,
+                     output=None, temporal_anchor: str = "") -> OperandEligibilityVerdictV1:
+    """``output``/``temporal_anchor`` (C3, optional): the REQUEST-level context the
+    additivity law needs — what operation consumes this measure, anchored how. Omitted by
+    single-operand callers; the binder passes them so the check runs on every real fold."""
     codes: list[str] = []
     blocked = False
 
@@ -186,6 +211,44 @@ def evaluate_operand(operand: RequiredOperandV1,
         codes.append(R.SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW)
         blocked = True
 
+    # 2c. Source-grain shape (C3): the operand's allowed source grains name row shapes; the
+    #     catalog can prove the COARSE half — the event/snapshot axis — at declared-or-better
+    #     (the same at-declared+ posture as 2b). Grains outside the two recognizable shapes
+    #     skip enforcement honestly (no catalog fact can check them yet).
+    if operand.allowed_source_grains:
+        axes = {_grain_axis(g) for g in operand.allowed_source_grains}
+        if None not in axes and len(axes) == 1:
+            required_axis = next(iter(axes))
+            if (capability.table_event_or_snapshot in ("event", "snapshot")
+                    and capability.table_event_or_snapshot != required_axis
+                    and AUTHORITY_MATRIX.get(capability.table_event_or_snapshot_authority,
+                                             {}).get("suggestion_at_declared", False)):
+                codes.append(R.SOURCE_GRAIN_MISMATCH)
+                blocked = True
+
+    # 2e. Additivity vs operation (C3): SUMMING a value whose declared additivity says it
+    #     cannot be summed that way — a stock (semi_additive) sums across entities at a
+    #     point in time but never across time without an as-of anchor; a non-additive value
+    #     (rate/ratio/score) never sums at all. Absent additivity blocks nothing.
+    if output is not None and operand.operand_class == "measure" and capability.additivity:
+        agg_text = f"{output.aggregation_over_entity} {output.aggregation_over_time}".lower()
+        if "sum" in agg_text:
+            if capability.additivity == "non_additive":
+                codes.append(R.ADDITIVITY_INCOMPATIBLE)
+                blocked = True
+            elif (capability.additivity == "semi_additive"
+                    and temporal_anchor == "event"):
+                codes.append(R.ADDITIVITY_INCOMPATIBLE)
+                blocked = True
+
+    # 2d. Unit contradiction (C3): a currency-bearing column IS a monetary quantity — an
+    #     operand expecting a non-monetary unit (count/rate/score) cannot be served by it.
+    #     (The absent-facts half of unit verification reports through C5's family tri-state.)
+    if (operand.unit_expectation and operand.unit_expectation != "monetary"
+            and capability.currency):
+        codes.append(R.UNIT_INCOMPATIBLE)
+        blocked = True
+
     # 3. Economic role: binds ONLY over governed evidence matching it (the binder's own law,
     #    folded here so the two paths cannot diverge).
     if operand.economic_role and capability.economic_role != operand.economic_role:
@@ -205,6 +268,10 @@ def evaluate_operand(operand: RequiredOperandV1,
     if operand.relationship_requirement \
             and "relationship_state_absent" in capability.missing_context:
         codes.append(R.RELATIONSHIP_REQUIRED)
+    # C3: the recipe reads a governed status policy and no resolver serves it yet — named,
+    # visible setup work riding every candidate that depends on it (never a silent skip).
+    if operand.status_policy_ref:
+        codes.append(R.STATUS_POLICY_UNRESOLVED)
 
     if blocked:
         status = "blocked"
