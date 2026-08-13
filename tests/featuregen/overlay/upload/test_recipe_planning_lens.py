@@ -394,11 +394,12 @@ def test_a_full_unscoped_run_is_two_queries_with_a_prebuilt_context(db):
             context=context)
     finally:
         db.execute = original
-    # B5: one candidate per authored VARIANT (~940) — and the query count is STILL 2:
+    # B5: one candidate per authored VARIANT (~940) — and the query count is STILL a
+    # constant 3 (capability evidence + C1's revalidation read + review_events_all):
     # variant expansion multiplies folds, never reads (the whole point of B6-before-B5).
     assert len(candidates) > len(V2_RECIPES)
     assert len({c.recipe_id for c in candidates}) == len(V2_RECIPES)
-    assert len(calls) == 2, calls
+    assert len(calls) == 3, calls
 
 
 def test_the_batched_fold_is_byte_identical_to_the_per_request_path(db):

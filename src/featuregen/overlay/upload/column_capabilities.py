@@ -89,6 +89,10 @@ class ColumnCapabilityV1:
     missing_context: tuple[str, ...]
     # retrieval-only prose — NEVER a capability input
     retrieval_text: str
+    # C1: fields whose CURRENT resolver verdict is "conflict" (equal-strength operational
+    # values disagree) — the resolver's own verdict, never any-mismatch. A losing weaker
+    # proposal is NOT a conflict and never appears here.
+    authority_conflicts: tuple[str, ...] = ()
 
 
 def _authority(pins: dict[tuple[str, str], str], logical_ref: str, field: str,
@@ -116,20 +120,29 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
         col.table: normalize_ref(context.catalog_source, col.schema_name, col.table, None)
         for _ref, col in members}
     pins: dict[tuple[str, str], str] = {}
+    conflicts: dict[str, list[str]] = {}                 # logical_ref -> conflicted fields
     economic_roles: dict[str, tuple[str, str]] = {}      # logical_ref -> (value, authority)
     if members:
-        rows = conn.execute(
-            "SELECT logical_ref, field_name, producer, strength, proposed_value "
-            "FROM field_evidence "
-            "WHERE lifecycle = 'active' AND field_name = ANY(%s) AND logical_ref = ANY(%s) "
-            "ORDER BY created_at, evidence_id",
-            (list(_PINNED_FIELDS),
-             list(logical_by_ref.values()) + list(table_logical_by_name.values()))).fetchall()
-        for logical_ref, field_name, producer, strength, proposed_value in rows:
-            pins[(logical_ref, field_name)] = f"{producer}/{strength}"   # newest active wins
-            if field_name == "economic_role" and producer == "human" and strength == "confirmed":
-                economic_roles[logical_ref] = (str(proposed_value).strip('"'),
-                                               f"{producer}/{strength}")
+        # C1: the pin is the RESOLVER'S current verdict (read-only, batched) — the value the
+        # governed resolution stands behind, with the authority that EARNED it. The pre-C1
+        # read pinned the NEWEST active evidence row, so a later weak proposal displaced a
+        # human-confirmed value's authority; that cannot happen through the resolver.
+        from featuregen.overlay.upload.field_resolution import current_resolution_pins
+
+        resolution_pins = current_resolution_pins(
+            conn,
+            logical_refs=(list(logical_by_ref.values())
+                          + list(table_logical_by_name.values())),
+            fields=_PINNED_FIELDS)
+        for (logical_ref, field_name), pin in resolution_pins.items():
+            if pin.producer:
+                pins[(logical_ref, field_name)] = f"{pin.producer}/{pin.strength}"
+            if pin.conflict_state == "conflict":
+                conflicts.setdefault(logical_ref, []).append(field_name)
+            if (field_name == "economic_role" and pin.producer == "human"
+                    and pin.strength == "confirmed"):
+                economic_roles[logical_ref] = (str(pin.value).strip('"'),
+                                               "human/confirmed")
 
     from featuregen.overlay.upload.concepts import concept as registered_concept
 
@@ -179,7 +192,8 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
                 context.table_facts.get(col.table)),
             missing_context=tuple(missing),
             retrieval_text=" ".join(filter(None, (
-                col.definition, col.ai_summary, col.semantic_terms))))
+                col.definition, col.ai_summary, col.semantic_terms))),
+            authority_conflicts=tuple(sorted(conflicts.get(logical_ref, ()))))
     return capabilities
 
 

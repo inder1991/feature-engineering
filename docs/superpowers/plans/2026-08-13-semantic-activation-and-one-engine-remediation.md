@@ -676,6 +676,24 @@ conflict — validated correction). Weaker-later evidence can no longer displace
 proposal B: capability carries A with A's OWN authority and a conflict marker; B's strength
 never rides A. Existing capability tests updated deliberately.
 
+> **ACCEPTED (2026-08-13).** `current_resolution_pins` (field_resolution.py) — READ-ONLY
+> batched re-run of the ONE resolver law (`resolve_field_authority`, the same fold the write
+> path records decisions with) over active evidence: two constant queries (evidence +
+> pending-revalidations) regardless of fan-out; never writes. The pin is indivisible
+> `(value, producer, strength, evidence_id, conflict_state, load_bearing)`; the winner's
+> authority is attributed to the STRONGEST active view carrying the resolved value.
+> `compile_capabilities` consumes it — the `:129` "newest active wins" read is gone; a
+> policy-less field (economic_role) pins strongest-wins with `conflict_state="no_policy"`.
+> Capability gains `authority_conflicts` — populated ONLY by the resolver's own verdicts
+> (operational strategy "conflict" OR the display selection's equal-strength tie, carried as
+> new additive `FieldResolution.display_conflict` — concept is a RECOMMENDATION-tier field
+> that short-circuits before the operational check, so its contested state was invisible).
+> Acceptance tests: the exact A-then-B sequence pins A + human/confirmed with NO marker (a
+> losing proposal is not a conflict); two disagreeing human-confirmed values ARE the marker;
+> a lone llm proposal keeps llm/proposed so the floors ride. Deliberate pin updates:
+> capability compile = 2 constant queries; the lens = 3 (was "exactly 2"; C1 adds the
+> revalidation read — still O(1)).
+
 ### Task C2 — the four authority matrices (1 day)
 
 *Modify:* `semantic_eligibility.py`, `activation_policy.py`, tests.

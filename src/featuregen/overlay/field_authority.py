@@ -202,6 +202,11 @@ class FieldResolution:
     display_value: str | None
     load_bearing_value: str | None
     unresolved_reason: str | None
+    # C1: the display selection's OWN tie verdict — True when equal-top-strength values
+    # disagree so the lenient pick showed nothing. Distinct from ``unresolved_reason ==
+    # "conflict"`` (the operational strategy's verdict): display-tier fields short-circuit
+    # before that check, and their contested state would otherwise be invisible.
+    display_conflict: bool = False
 
 
 class _Conflict:
@@ -287,23 +292,25 @@ def resolve_field_authority(
         if evaluate(policy.display_rule, active_pairs)
         else None
     )
-    # Display is lenient: a conflicting lenient pick shows nothing rather than the sentinel.
-    display = None if isinstance(display_sel, _Conflict) else display_sel
+    # Display is lenient: a conflicting lenient pick shows nothing rather than the sentinel —
+    # but the tie itself is carried as ``display_conflict`` (C1), never silently dropped.
+    tied = isinstance(display_sel, _Conflict)
+    display = None if tied else display_sel
 
     if policy.resolution_mode is ResolutionMode.SPECIALIZED_FACT:
-        return FieldResolution(display, None, "specialized_fact")
+        return FieldResolution(display, None, "specialized_fact", tied)
 
     if policy.influence_max is not InfluenceTier.OPERATIONAL:
-        return FieldResolution(display, None, "influence_not_operational")
+        return FieldResolution(display, None, "influence_not_operational", tied)
 
     fired = active_disqualifiers & set(policy.disqualifiers)
     if fired:
-        return FieldResolution(display, None, f"disqualified:{sorted(fired)[0]}")
+        return FieldResolution(display, None, f"disqualified:{sorted(fired)[0]}", tied)
 
     if policy.operational_rule is None or not evaluate(policy.operational_rule, active_pairs):
-        return FieldResolution(display, None, "authority_insufficient")
+        return FieldResolution(display, None, "authority_insufficient", tied)
 
     lb = _select(evidence, policy.conflict_strategy, policy.severity_order)
     if isinstance(lb, _Conflict):
-        return FieldResolution(display, None, "conflict")
-    return FieldResolution(display, lb, None)
+        return FieldResolution(display, None, "conflict", tied)
+    return FieldResolution(display, lb, None, tied)

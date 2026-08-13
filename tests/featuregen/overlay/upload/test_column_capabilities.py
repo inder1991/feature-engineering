@@ -158,6 +158,65 @@ def test_the_compiler_is_one_query_and_cannot_widen_the_frozen_universe(db):
             "public.transactions.booked_ts", "public.not_in.universe"])
     finally:
         db.execute = original
-    assert len(calls) == 1, calls                             # Layer B: one batched read
+    # Layer B: a CONSTANT number of batched reads regardless of fan-out — the active
+    # evidence + (C1) the pending-revalidation set the resolver's verdict depends on.
+    assert len(calls) == 2, calls
     assert "public.not_in.universe" not in caps               # the context IS visibility
     assert len(caps) == 3
+
+
+# ── C1: the pin is the RESOLVER'S verdict — weaker-later never displaces stronger ──────────────
+
+def _evidence(db, object_ref: str, concept: str, *, producer: str, strength: str,
+              material_salt: str = "") -> None:
+    logical = logical_ref_of(db, SOURCE, object_ref)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="concept", proposed_value=concept,
+        producer=producer, strength=strength, producer_ref=f"{producer}:test",
+        source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="concept",
+                                    material=concept + material_salt))
+
+
+def test_a_later_weak_proposal_never_rides_a_confirmed_values_back(db):
+    """The review's exact failure sequence (C1): the display concept is human-confirmed A;
+    a LATER active llm proposal B disagrees. The capability must carry A with A's OWN
+    authority — pre-C1 the newest-active-wins read pinned B's llm/proposed onto A. And B is
+    a LOSING proposal, not a semantic conflict: no conflict marker."""
+    _seed(db)
+    ref = "public.customers.cust_no"
+    _evidence(db, ref, "customer_id", producer="human", strength="confirmed")
+    _evidence(db, ref, "party_identifier", producer="llm", strength="proposed")
+
+    caps = compile_capabilities(
+        db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
+    cap = caps[ref]
+    assert cap.concept_authority == "human/confirmed", cap.concept_authority
+    assert cap.authority_conflicts == (), cap.authority_conflicts
+
+
+def test_equal_strength_disagreement_is_the_resolvers_conflict_verdict(db):
+    """Two human-confirmed values that disagree ARE a semantic conflict — the resolver's own
+    verdict, surfaced as the capability's conflict marker."""
+    _seed(db)
+    ref = "public.customers.cust_no"
+    _evidence(db, ref, "customer_id", producer="human", strength="confirmed")
+    _evidence(db, ref, "party_identifier", producer="human", strength="confirmed",
+              material_salt=":second-reviewer")
+
+    caps = compile_capabilities(
+        db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
+    assert "concept" in caps[ref].authority_conflicts
+
+
+def test_a_lone_proposal_still_pins_proposed_so_the_floors_ride(db):
+    """An unconfirmed llm proposal keeps its honest llm/proposed authority — the suggestion
+    floors (PROPOSED_METADATA_ONLY downstream) depend on this staying visible."""
+    _seed(db)
+    ref = "public.customers.cust_no"
+    _propose_concept(db, ref, "customer_id")
+
+    caps = compile_capabilities(
+        db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
+    assert caps[ref].concept_authority == "llm/proposed"
+    assert caps[ref].authority_conflicts == ()

@@ -37,6 +37,7 @@ Phase-3 structural-fusion concern.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from featuregen.contracts import DbConn
@@ -555,3 +556,121 @@ def stale_and_clear_field(
         display_value=None,
         decision_id=decision_id,
     )
+
+
+# ── Remediation C1 — the READ-ONLY current-resolution pin ────────────────────────────────────
+
+
+@dataclass(frozen=True, slots=True)
+class ResolutionPinV1:
+    """The indivisible pin generation consumes (remediation C1): the value the governed
+    resolver stands behind RIGHT NOW, with the authority that EARNED it.
+
+    ``conflict_state`` is the RESOLVER'S OWN verdict ("resolved", or its named unresolved
+    reason such as "authority_insufficient" / "conflict") — never any-mismatch: a newer weak
+    proposal disagreeing with a human-confirmed value is a losing proposal, not a semantic
+    conflict. ``producer``/``strength`` belong to the WINNING evidence (empty when no value
+    won), so a weaker-later row can never ride a stronger value's back."""
+
+    value: str | None
+    producer: str
+    strength: str
+    evidence_id: str
+    conflict_state: str          # "resolved" | resolver's unresolved reason | "no_policy"
+    load_bearing: bool
+
+
+def _strength_rank(strength: str) -> int:
+    return {"proposed": 0, "supported": 1, "attested": 2, "confirmed": 3}.get(strength, -1)
+
+
+def _winning_view(views, value: str | None):
+    """The strongest active view carrying ``value`` — the evidence the pin attributes. The
+    producer tiebreak (human first) only orders EQUAL-strength rows backing the SAME value."""
+    if value is None:
+        return None
+    carriers = [v for v in views if v.value == value]
+    if not carriers:
+        return None
+    return max(carriers, key=lambda v: (_strength_rank(v.strength.value),
+                                        v.producer.value == "human", v.evidence_id))
+
+
+def current_resolution_pins(
+    conn: DbConn, *, logical_refs: Sequence[str], fields: Sequence[str],
+) -> dict[tuple[str, str], ResolutionPinV1]:
+    """READ-ONLY batched current resolutions for ``logical_refs × fields`` (remediation C1).
+
+    Re-runs the ONE resolver law (:func:`resolve_field_authority` — the same fold
+    :func:`resolve_and_project` records decisions with) over the active evidence, WITHOUT
+    writing anything: generation must never mutate the catalog it reads. Two queries total
+    regardless of fan-out (active evidence + pending revalidations — the load-once rule).
+
+    A field with active evidence but no :func:`policy_for` policy (e.g. ``economic_role``)
+    pins its STRONGEST active view with ``conflict_state="no_policy"`` — strongest-wins, so
+    the pre-C1 defect (newest active row displacing a stronger earlier one) cannot recur
+    even where no resolver policy exists. Keys with no active evidence are absent."""
+    import json as _json
+
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.field_authority import FieldEvidenceView
+    from featuregen.overlay.upload.field_revalidation import Disqualifier
+
+    refs = list(dict.fromkeys(logical_refs))
+    wanted_fields = list(dict.fromkeys(fields))
+    if not refs or not wanted_fields:
+        return {}
+
+    views_by_key: dict[tuple[str, str], list] = {}
+    rows = conn.execute(
+        "SELECT logical_ref, field_name, producer, strength, proposed_value, evidence_id "
+        "FROM field_evidence "
+        "WHERE lifecycle = 'active' AND field_name = ANY(%s) AND logical_ref = ANY(%s) "
+        "ORDER BY created_at, evidence_id",
+        (wanted_fields, refs)).fetchall()
+    for logical_ref, field_name, producer, strength, proposed_value, evidence_id in rows:
+        value = (proposed_value if isinstance(proposed_value, str)
+                 else _json.dumps(proposed_value, sort_keys=True, separators=(",", ":")))
+        views_by_key.setdefault((logical_ref, field_name), []).append(FieldEvidenceView(
+            producer=EvidenceProducer(producer), strength=AssertionStrength(strength),
+            value=value, evidence_id=evidence_id))
+
+    pending = {
+        (r[0], r[1]) for r in conn.execute(
+            "SELECT logical_ref, field_name FROM field_revalidation "
+            "WHERE status = 'pending' AND field_name = ANY(%s) AND logical_ref = ANY(%s)",
+            (wanted_fields, refs)).fetchall()}
+
+    pins: dict[tuple[str, str], ResolutionPinV1] = {}
+    for key, views in views_by_key.items():
+        policy = policy_for(key[1])
+        if policy is None:
+            best = max(views, key=lambda v: (_strength_rank(v.strength.value),
+                                             v.producer.value == "human", v.evidence_id))
+            pins[key] = ResolutionPinV1(
+                value=best.value, producer=best.producer.value,
+                strength=best.strength.value, evidence_id=best.evidence_id,
+                conflict_state="no_policy", load_bearing=False)
+            continue
+        disqualifiers = (frozenset({Disqualifier.CONFIRMATION_PENDING_REVALIDATION})
+                         if key in pending else frozenset())
+        resolution = resolve_field_authority(views, policy, disqualifiers)
+        value = (resolution.load_bearing_value
+                 if resolution.load_bearing_value is not None
+                 else resolution.display_value)
+        winner = _winning_view(views, value)
+        # "conflict" when EITHER selection law says so: the operational strategy's verdict,
+        # or the display selection's own equal-strength tie (display-tier fields never reach
+        # the operational check, and their contested state must not be invisible).
+        if resolution.unresolved_reason == "conflict" or resolution.display_conflict:
+            conflict_state = "conflict"
+        else:
+            conflict_state = resolution.unresolved_reason or "resolved"
+        pins[key] = ResolutionPinV1(
+            value=value,
+            producer=winner.producer.value if winner else "",
+            strength=winner.strength.value if winner else "",
+            evidence_id=winner.evidence_id if winner else "",
+            conflict_state=conflict_state,
+            load_bearing=resolution.load_bearing_value is not None)
+    return pins
