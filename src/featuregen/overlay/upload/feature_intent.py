@@ -22,8 +22,9 @@ so any change — a role, a window, a stage list — is a different intent.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from featuregen.canonical import contract_hash_v1
 from featuregen.contracts.contract_versions import register_contract_version
@@ -144,6 +145,41 @@ class FeatureIntentV1:
             _require(bool(self.model_feature_ref.strip()),
                      "a governed model output must reference a registered model-feature spec "
                      "the server offered — the model may not invent one")
+
+
+def prose_physical_references(texts, columns) -> tuple[str, ...]:
+    """C8 — the bounded server-side scan: which PHYSICAL catalog names does model prose use?
+
+    The model-facing inventory is deliberately physically blind (concepts + counts only), so
+    a physical name in prose is a hallucination or leakage from elsewhere — either way the
+    item is untrustworthy. Runs AFTER the model responds, against the frozen context's
+    ``columns`` (never a live read).
+
+    Bounded deliberately: only PHYSICAL-LOOKING tokens count — a candidate token must contain
+    an underscore or a dot (``cust_num``, ``bo_cib_customer.cust_num``) AND match a context
+    table/column name or a qualified form of one. A plain-English table name ("accounts")
+    never fires on ordinary prose — the naming convention is the signal, and this stays a
+    parse-honesty check, not a language filter."""
+    import re
+
+    physical: set[str] = set()
+    for col in columns:
+        for token in (col.column, col.table,
+                      f"{col.table}.{col.column}",
+                      f"{col.schema_name}.{col.table}.{col.column}"):
+            if token and ("_" in token or "." in token):
+                physical.add(token.lower())
+    if not physical:
+        return ()
+    found: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for token in re.findall(r"[A-Za-z0-9_.]+", text):
+            candidate = token.lower().strip(".")
+            if ("_" in candidate or "." in candidate) and candidate in physical:
+                found.append(candidate)
+    return tuple(dict.fromkeys(found))
 
 
 def feature_intent_id(intent: FeatureIntentV1) -> str:

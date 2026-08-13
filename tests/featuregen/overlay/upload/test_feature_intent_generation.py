@@ -155,3 +155,38 @@ def test_a_malformed_output_spec_rejects_the_item_never_the_batch(db):
     assert len(result.rejections) == 1
     assert result.rejections[0]["code"] == "INTENT_REJECTED_PARSE"
     assert "unit_kind" in result.rejections[0]["detail"]
+
+
+# ── C8: model prose naming physical objects is a per-item parse failure ────────────────────────
+
+def test_prose_naming_a_physical_column_is_rejected_per_item(db):
+    """C8's acceptance: a rationale saying "use transactions.acct_ref" names a physical
+    object the physically-blind inventory never showed — that ITEM rejects; a clean sibling
+    in the same batch survives."""
+    dirty = _wire_intent(rationale="use transactions.acct_ref for the account leg")
+    clean = _wire_intent(display_name="Clean twin")
+    result, _ = _run(db, {"intents": [dirty, clean]})
+    assert len(result.intents) == 1
+    assert result.intents[0].display_name == "Clean twin"
+    assert any(r["code"] == INTENT_REJECTED_PARSE
+               and "physical objects" in r["detail"]
+               and "transactions.acct_ref" in r["detail"]
+               for r in result.rejections)
+
+
+def test_a_bare_physical_column_name_in_the_definition_is_caught_too(db):
+    dirty = _wire_intent(
+        business_definition="Signed net of acct_ref grouped inflows over the window.")
+    result, _ = _run(db, {"intents": [dirty]})
+    assert result.intents == ()
+    assert any("acct_ref" in r["detail"] for r in result.rejections)
+
+
+def test_plain_english_prose_never_false_positives(db):
+    """The boundedness half: table names that are ordinary words ("transactions") never fire
+    on ordinary prose — only physical-looking tokens (underscore/dot) are candidates."""
+    clean = _wire_intent(
+        business_definition="Net of transactions in and out of the account over the window.",
+        rationale="account activity and transactions volume precede dormancy")
+    result, _ = _run(db, {"intents": [clean]})
+    assert len(result.intents) == 1, result.rejections

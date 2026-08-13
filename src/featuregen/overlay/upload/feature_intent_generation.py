@@ -146,6 +146,18 @@ def generate_feature_intents(conn, client, *, context: GenerationSemanticContext
             rejections.append({"index": index, "code": INTENT_REJECTED_PARSE,
                                "detail": str(error)})
             continue
+        # C8: model prose naming PHYSICAL catalog objects is a per-item parse failure — the
+        # inventory it saw was physically blind, so the name is invented or leaked.
+        from featuregen.overlay.upload.feature_intent import prose_physical_references
+
+        physical = prose_physical_references(
+            (intent.display_name, intent.business_definition, intent.rationale,
+             intent.conceptual_reason), context.columns)
+        if physical:
+            rejections.append({"index": index, "code": INTENT_REJECTED_PARSE,
+                               "detail": "model prose names physical objects: "
+                                         + ", ".join(physical)})
+            continue
         if intent.primary_objective not in scope or any(
                 objective not in scope for objective in intent.supporting_objectives):
             rejections.append({"index": index, "code": INTENT_OBJECTIVE_OUT_OF_SCOPE,

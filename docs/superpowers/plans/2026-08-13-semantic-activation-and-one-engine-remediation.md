@@ -959,6 +959,16 @@ objects").
 *Acceptance:* an intent whose rationale says "use bo_cib_customer.cust_num" is rejected
 per-item; clean prose passes.
 
+> **ACCEPTED (2026-08-13).** `prose_physical_references` (feature_intent.py) — the bounded
+> server-side scan over display/definition/rationale/conceptual_reason against the frozen
+> `context.columns` token set (column names, table names, qualified forms), AFTER the model
+> responds (the inventory is physically blind by design — the validated correction). Bounded
+> deliberately: only physical-LOOKING tokens (underscore or dot) are candidates, so a table
+> named "transactions" never fires on ordinary English prose — the naming convention is the
+> signal. A match rejects THAT item (INTENT_REJECTED_PARSE, "model prose names physical
+> objects: …") and clean siblings in the same batch survive. Tests: the qualified-ref case,
+> a bare column name in the definition, and the plain-English false-positive guard.
+
 ## 5. Phase D — the candidate seen is the candidate governed *(closes LIFE-01…03, PLAN-15, UI-02/04/05/06)*
 
 ### Task D1 — enrich `SemanticOptionDecisionV1` to the full evidence record (1 day; A1b created it)
