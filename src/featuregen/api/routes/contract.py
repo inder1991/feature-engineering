@@ -31,6 +31,7 @@ from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.intake.redaction import REDACTION_VERSION
+from featuregen.overlay.upload.activation_policy import activation_decision
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import (
     ContractDraft,
@@ -40,7 +41,6 @@ from featuregen.overlay.upload.contract.author import (
     _envelope_join_path,
     draft_contract,
 )
-from featuregen.overlay.upload.activation_policy import activation_decision
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
     UnknownConsideredOption,
@@ -210,6 +210,10 @@ class ConfirmedScopeIn(BaseModel):
     secondary: list[str] = []
     expansion: str = ScopeExpansion.EXACT.value
     unscoped: bool = False
+    # B10: the confirmed unit of analysis + spine (from the yes/no on the derived proposal;
+    # a "no" picks from the catalog's realistic list — the UI never free-texts these).
+    uoa_entity: str | None = None
+    spine_ref: str | None = None
     use_case_origins: dict[str, str] | None = Field(default=None, deprecated=True)
     confirmation_source: str | None = Field(default=None, deprecated=True)
     # ── Phase-2B (Task B3): the two human-confirmed intent DIMENSIONS. Both SOFT — they never narrow
@@ -291,6 +295,37 @@ def scope_mode() -> dict:
         "confirmation_required": status.confirmation_required,
         "configuration_valid": status.configuration_valid,
     }
+
+
+@router.get("/contract/uoa-proposal", dependencies=[Depends(require_feature_read)])
+def uoa_proposal(catalog_source: str, conn: _FeatureGenConn,
+                 target_ref: str | None = None,
+                 recognized_entity: str | None = None) -> dict:
+    """B10 — the derived unit-of-analysis proposal the scope screen confirms with ONE click.
+
+    Derived from FACTS, never guessed: the target column's table + that table's DECLARED
+    grain column's entity. The alternatives are the catalog's REALISTIC list only — entities
+    that actually have a keyed spine table (a closed list; the UI never free-texts a UOA).
+    A recognizer entity that disagrees with the derivation is surfaced as a contradiction —
+    stated, never silently resolved."""
+    rows = conn.execute(
+        "SELECT table_name, object_ref, entity FROM graph_node "
+        "WHERE kind = 'column' AND catalog_source = %s AND is_grain AND entity IS NOT NULL "
+        "ORDER BY table_name, object_ref", (catalog_source,)).fetchall()
+    alternatives = [{"entity": r[2], "spine_table": r[0], "spine_ref": r[1]} for r in rows]
+    proposed = None
+    if target_ref:
+        target_table = target_ref.split(".")[-2] if target_ref.count(".") >= 2 else None
+        proposed = next((a for a in alternatives if a["spine_table"] == target_table), None)
+    if proposed is None and len(alternatives) == 1:
+        proposed = alternatives[0]
+    contradiction = None
+    if (proposed and recognized_entity
+            and recognized_entity.lower() != str(proposed["entity"]).lower()):
+        contradiction = (f"the recognizer suggested {recognized_entity!r} but the target's "
+                         f"table is keyed per {proposed['entity']!r} — you decide")
+    return {"proposed": proposed, "alternatives": alternatives,
+            "contradiction": contradiction}
 
 
 @router.get("/contract/considered-revisions/{considered_revision_id}/options/{option_id}",
@@ -543,7 +578,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                 )
         scope = ConfirmedScope(
             primary=None, secondary=(), unscoped=True,
-            modelling_contexts=clean_contexts, target_entity=clean_entity)
+            modelling_contexts=clean_contexts, target_entity=clean_entity,
+            uoa_entity=cscope.uoa_entity, spine_ref=cscope.spine_ref)
     else:
         # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
         # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
@@ -569,7 +605,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                 primary=cscope.primary, secondary=tuple(cscope.secondary),
                 expansion=ScopeExpansion(cscope.expansion), unscoped=False,
                 modelling_contexts=clean_contexts,
-                target_entity=clean_entity)
+                target_entity=clean_entity,
+                uoa_entity=cscope.uoa_entity, spine_ref=cscope.spine_ref)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
     # 2. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
@@ -829,11 +866,14 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     plan_envelope_present=facts["plan_envelope_present"],
                     validation_status=facts["validation_status"],
                     outstanding_requirement_codes=tuple(
-                        facts["outstanding_requirement_codes"]))
+                        facts["outstanding_requirement_codes"]),
+                    plan_refusal_codes=tuple(
+                        (facts.get("dataset_story") or {}).get("plan_refusals", ())))
                 current = CurrentActivationStateV1(
                     review_current=facts["review_current"],
                     policy_revisions_current=True,
                     snapshot_freshness="current",
+                    uoa_current=True,
                     effective_readiness=facts["readiness"])
                 decisions = decide_all_actions(frozen, current)
                 section_entry = {
@@ -846,7 +886,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                         a: [{"code": b.code, "next_step": b.next_step} for b in d.blockers]
                         for a, d in decisions.items() if not d.allowed},
                 }
-                (recommended if facts["binding_state"] == "bound"
+                # B10: bound-but-planless (UOA mismatch, cross-dataset…) is ACTIONABLE — a
+                # candidate that cannot create_contract never sits in the recommended list.
+                (recommended if (facts["binding_state"] == "bound"
+                                 and facts["plan_envelope_present"])
                  else actionable).append(section_entry)
         response["recommended_options"] = recommended
         response["actionable_options"] = actionable
@@ -1279,7 +1322,8 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
             option_id=choice.option_id)
     if frozen is not None:
         current = assemble_current_activation_state(
-            conn, frozen=frozen, snapshot_id=lineage_snapshot_id)
+            conn, frozen=frozen, snapshot_id=lineage_snapshot_id,
+            intent_id=body.intent_id)
         decision = activation_decision(frozen, current, "create_contract",
                                        actor=identity.subject)
         if not decision.allowed:
@@ -1418,7 +1462,8 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
         if frozen is not None:
             current = assemble_current_activation_state(
                 conn, frozen=frozen,
-                snapshot_id=(recorded_choice.snapshot_lineage or {}).get("snapshot_id"))
+                snapshot_id=(recorded_choice.snapshot_lineage or {}).get("snapshot_id"),
+                intent_id=body.intent_id)
             decision = activation_decision(frozen, current, "create_contract",
                                            actor=identity.subject)
             if not decision.allowed:

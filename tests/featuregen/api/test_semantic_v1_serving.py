@@ -449,3 +449,121 @@ def test_a_lagged_projection_refuses_before_any_provider_spend(
         "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
     }, headers=AUTH)
     assert res.status_code == 503, res.text
+
+
+def test_the_uoa_proposal_derives_from_the_targets_table_grain(make_client, conn):
+    """B10: the proposal is a FACT — churned lives on accounts, accounts is keyed per
+    Customer via customer_id → 'you are predicting per CUSTOMER'. Alternatives are the
+    catalog's realistic list; a disagreeing recognizer entity is a stated contradiction."""
+    _bank(conn)
+    client = make_client(llm_client=_fake())
+    res = client.get(
+        "/contract/uoa-proposal?catalog_source=bank&target_ref=public.accounts.churned",
+        headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["proposed"] == {"entity": "Customer", "spine_table": "accounts",
+                                "spine_ref": "public.accounts.customer_id"}
+    assert body["proposed"] in body["alternatives"]
+    assert body["contradiction"] is None
+
+    res = client.get(
+        "/contract/uoa-proposal?catalog_source=bank&target_ref=public.accounts.churned"
+        "&recognized_entity=Facility", headers=AUTH)
+    assert "you decide" in res.json()["contradiction"]
+
+
+def test_a_confirmed_uoa_mismatch_is_actionable_with_the_rollup_resolution(
+        make_client, conn, monkeypatch):
+    """B10 end to end: the intent computes per CUSTOMER; the human confirmed the UOA as
+    ACCOUNT — the candidate lands in the ACTIONABLE section (never recommended), its decision
+    row freezes the refusal, and drafting it names UOA_MISMATCH with the roll-up next step."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "target_ref": TARGET, "contract_version": 2,
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact",
+                            "uoa_entity": "account",
+                            "spine_ref": "public.accounts.customer_id"},
+    }, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    actionable_ids = {e["option_id"] for e in body["actionable_options"]}
+    recommended_ids = {e["option_id"] for e in body["recommended_options"]}
+    intent_cards = [f for s_ in body["alternatives"] for f in s_["features"]
+                    if f.get("generation_source") == "llm_intent"]
+    assert intent_cards, "the intent served as a visible option"
+    card = intent_cards[0]
+    assert card["option_id"] in actionable_ids
+    assert card["option_id"] not in recommended_ids
+    assert card["candidate_status"] == "uoa_mismatch"
+
+    entry = next(e for e in body["actionable_options"] if e["option_id"] == card["option_id"])
+    blockers = {b["code"]: b["next_step"] for b in entry["blocked_actions"]["create_contract"]}
+    assert "UOA_MISMATCH" in blockers
+    assert "roll it up" in blockers["UOA_MISMATCH"]
+
+    res = client.post("/contract/draft", json={
+        "intent_id": body["intent_id"], "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"],
+    }, headers=AUTH)
+    assert res.status_code == 409
+    codes = {b["code"] for b in res.json()["detail"]["blockers"]}
+    assert "UOA_MISMATCH" in codes
+
+
+def test_a_matching_uoa_changes_nothing(make_client, conn, monkeypatch):
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact",
+                            "uoa_entity": "customer",
+                            "spine_ref": "public.accounts.customer_id"},
+    }, headers=AUTH)
+    assert res.status_code == 200, res.text
+    rows = conn.execute(
+        "SELECT dataset_story->'plan_refusals' FROM semantic_option_decision "
+        "WHERE generation_source = 'llm_intent'").fetchall()
+    assert rows and all("UOA_MISMATCH" not in (r[0] or []) for r in rows)
+
+
+def test_a_uoa_changed_after_serving_blocks_the_old_draft_as_drift(
+        make_client, conn, monkeypatch):
+    """B10 item 4: generate under UOA=customer, then re-confirm the SAME intent under
+    UOA=account (a new run, a new frozen decision). Drafting an option served under the OLD
+    UOA blocks with the regenerate blocker — the card answers a stale question."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    first = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "target_ref": TARGET, "contract_version": 2,
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact",
+                            "uoa_entity": "customer",
+                            "spine_ref": "public.accounts.customer_id"},
+    }, headers=AUTH)
+    assert first.status_code == 200, first.text
+    body = first.json()
+    card = next(f for s_ in body["alternatives"] for f in s_["features"]
+                if f.get("generation_source") == "llm_intent")
+
+    second = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "target_ref": TARGET, "contract_version": 2, "intent_id": body["intent_id"],
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact",
+                            "uoa_entity": "account",
+                            "spine_ref": "public.accounts.customer_id"},
+    }, headers=AUTH)
+    assert second.status_code == 200, second.text
+
+    res = client.post("/contract/draft", json={
+        "intent_id": body["intent_id"], "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"],
+    }, headers=AUTH)
+    assert res.status_code == 409, res.text
+    blocker_codes = {b["code"] for b in res.json()["detail"]["blockers"]}
+    assert "ACTIVATION_STATE_DRIFTED" in blocker_codes

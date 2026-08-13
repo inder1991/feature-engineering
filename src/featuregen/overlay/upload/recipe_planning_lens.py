@@ -38,7 +38,6 @@ from featuregen.overlay.upload.feature_planning_contracts import (
 from featuregen.overlay.upload.recipe_contract_v2 import RecipeDefinitionV2
 from featuregen.overlay.upload.recipe_operand_policy import (
     OperandBindingVerdictV1,
-    bind_planning_request,
 )
 from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
@@ -209,7 +208,8 @@ def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
 
 
 def fold_frozen_binding_plan(request, verdicts, story, pit_text: str,
-                             temporal_blocker: str, catalog_source: str):
+                             temporal_blocker: str, catalog_source: str,
+                             uoa_entity: str | None = None):
     """B7 (PLAN-01 closed for the single-source class) — the plan is a VALIDATION over the
     exact frozen bindings, never a second binder:
 
@@ -236,6 +236,14 @@ def fold_frozen_binding_plan(request, verdicts, story, pit_text: str,
         return None, (R.TEMPORAL_POLICY_UNRESOLVED,)
     if story.population_ref is None:
         return None, (R.POPULATION_DATASET_UNDECLARED,)
+    # B10: the plan computes AT the confirmed unit of analysis or not at all — a candidate
+    # whose output grain differs is honest setup work ("roll it up via a matching-grain
+    # recipe, or change the confirmed UOA"), never a silently-served mismatch.
+    # Case-insensitive: the UOA is human vocabulary — the catalog declares "Customer", the
+    # planning grain says "customer"; a capitalization is never a different unit of analysis.
+    if (uoa_entity and request.output_grain
+            and request.output_grain.strip().casefold() != uoa_entity.strip().casefold()):
+        return None, (R.UOA_MISMATCH,)
     # Defensive divergence check: every bound ref's table must be one the dataset story saw.
     read_set = tuple(sorted(bound.values()))
     tables = set(story.dataset_tables)
@@ -430,7 +438,7 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             dataset_story=(story := fold_dataset_story(request, verdicts, context)),
             binding_plan=(plan_and_refusals := fold_frozen_binding_plan(
                 request, verdicts, story, pit_text, temporal_blocker,
-                catalog_source))[0],
+                catalog_source, uoa_entity=getattr(scope, "uoa_entity", None)))[0],
             plan_refusals=plan_and_refusals[1],
             display_definition=recipe.business_definition,
             variant_key=_variant_key(recipe.recipe_id, variant),
@@ -441,7 +449,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
 
 def llm_intent_candidates(conn, client, *, context, scope_leaves,
                           redacted_hypothesis: str, actor=None,
-                          confirmed_scope_hash: str = ""):
+                          confirmed_scope_hash: str = "",
+                          uoa_entity: str | None = None):
     """SE-6 wire-up — LLM intents through the SAME engine as recipes: one audited structured
     call proposes ABSTRACT intents (concepts, operand classes, temporal contracts — never
     physical refs), each adapts to the neutral planning request, and the SHARED capability
@@ -455,7 +464,6 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
         planning_request_from_feature_intent,
         planning_request_hash,
     )
-    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
 
     result = generate_feature_intents(
         conn, client, context=context, scope_leaves=scope_leaves,
@@ -494,7 +502,8 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             eligibility=eligibility,
             dataset_story=(istory := fold_dataset_story(request, verdicts, context)),
             binding_plan=(iplan := fold_frozen_binding_plan(
-                request, verdicts, istory, "", "", context.catalog_source))[0],
+                request, verdicts, istory, "", "", context.catalog_source,
+                uoa_entity=uoa_entity))[0],
             plan_refusals=iplan[1],
             display_definition=intent.business_definition,
             variant_key=request.source_definition_id))

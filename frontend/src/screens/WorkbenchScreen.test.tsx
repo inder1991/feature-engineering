@@ -20,6 +20,7 @@ vi.mock('../api', async importOriginal => {
     leakageCheck: vi.fn(),
     registerFeature: vi.fn(),
     featureFreshness: vi.fn(),
+    contractUoaProposal: vi.fn(),
   }
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
@@ -31,6 +32,7 @@ const contractDraft = vi.mocked(api.contractDraft)
 const contractConfirm = vi.mocked(api.contractConfirm)
 const refineCandidate = vi.mocked(api.refineCandidate)
 const featureRecipe = vi.mocked(api.featureRecipe)
+const contractUoaProposal = vi.mocked(api.contractUoaProposal)
 const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
 
@@ -50,6 +52,9 @@ beforeEach(() => {
   featureRecipe.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
+  contractUoaProposal.mockReset()
+  // B10 default: no proposal — the UOA block stays absent unless a test scripts one.
+  contractUoaProposal.mockResolvedValue({ proposed: null, alternatives: [], contradiction: null })
   // Most pre-Delivery-0 tests pin the emergency compatibility UI. Delivery-0 tests explicitly
   // unstub this value to exercise the release-safe confirmation default.
   vi.unstubAllEnvs()
@@ -2015,6 +2020,76 @@ describe('Gate #1 scope confirmation', () => {
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
       expect.objectContaining({
         confirmedScope: expect.objectContaining({ primary: 'churn', secondary: [] }),
+      }))
+  })
+
+  const UOA_PROPOSAL = {
+    proposed: { entity: 'Customer', spine_table: 'accounts',
+                spine_ref: 'public.accounts.customer_id' },
+    alternatives: [
+      { entity: 'Customer', spine_table: 'accounts',
+        spine_ref: 'public.accounts.customer_id' },
+      { entity: 'Account', spine_table: 'positions', spine_ref: 'public.positions.acct_ref' },
+    ],
+    contradiction: null,
+  }
+
+  async function generateFlagOnWithSource() {
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'bank')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  it('B10: the derived UOA proposal confirms with one click and rides the confirmed scope', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    contractUoaProposal.mockResolvedValue(UOA_PROPOSAL)
+    await generateFlagOnWithSource()
+    expect(await screen.findByText(/You're predicting per/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Yes' }))
+    expect(screen.getByText(/Predicting per/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({
+          uoaEntity: 'Customer', spineRef: 'public.accounts.customer_id',
+        }),
+      }))
+  })
+
+  it('B10: a "no" answer offers ONLY the catalog\'s realistic alternatives (closed list)', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    contractUoaProposal.mockResolvedValue(UOA_PROPOSAL)
+    await generateFlagOnWithSource()
+    await screen.findByText(/You're predicting per/)
+    await userEvent.click(screen.getByRole('button', { name: /no — pick another/i }))
+    // No free-text input appears — only the spine-backed entities are offered.
+    await userEvent.click(screen.getByRole('button', { name: /Account — positions/ }))
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({
+          uoaEntity: 'Account', spineRef: 'public.positions.acct_ref',
+        }),
+      }))
+  })
+
+  it('B10: skipping the UOA is free — the scope carries null and generation proceeds', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    contractUoaProposal.mockResolvedValue(UOA_PROPOSAL)
+    await generateFlagOnWithSource()
+    await screen.findByText(/You're predicting per/)
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ uoaEntity: null, spineRef: null }),
       }))
   })
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from psycopg.types.json import Jsonb
 
-from featuregen.overlay.upload.activation_policy import FrozenOptionFactsV1
 from featuregen.idgen import mint_id
+from featuregen.overlay.upload.activation_policy import FrozenOptionFactsV1
 
 #: origin (planning contract) -> server-assigned generation_source. The DECISION row is honest
 #: about origin even while the wire projection still labels intents as recipes (GEN-05 — fixed
@@ -23,7 +23,8 @@ _GENERATION_SOURCE_BY_ORIGIN = {
 
 
 def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
-                                 context_hash: str) -> dict:
+                                 context_hash: str, *, uoa_entity: str | None = None,
+                                 spine_ref: str | None = None) -> dict:
     """Assemble ONE candidate's frozen facts at serving time (gate1's semantic branch), where
     the candidate, its projection (`idea`), and its observation id are all in hand."""
     from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
@@ -53,13 +54,20 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         # declared population, compiled temporal). The plan itself rides the story jsonb until
         # D1 enriches the record with its own column.
         "plan_envelope_present": candidate.binding_plan is not None,
-        "dataset_story": ({"population_ref": candidate.dataset_story.population_ref,
-                           "dataset_tables": list(candidate.dataset_story.dataset_tables),
-                           "cross_dataset": candidate.dataset_story.cross_dataset,
-                           "codes": list(candidate.dataset_story.codes),
-                           "binding_plan": candidate.binding_plan,
-                           "plan_refusals": list(candidate.plan_refusals)}
-                          if candidate.dataset_story is not None else {}),
+        # B10: the grain decision, frozen with the option — the candidate's own grain and
+        # the UOA the human had confirmed when this card was served. Rides the story jsonb
+        # (like binding_plan) until D1 gives the record real columns.
+        "dataset_story": {
+            **({"population_ref": candidate.dataset_story.population_ref,
+                "dataset_tables": list(candidate.dataset_story.dataset_tables),
+                "cross_dataset": candidate.dataset_story.cross_dataset,
+                "codes": list(candidate.dataset_story.codes),
+                "binding_plan": candidate.binding_plan,
+                "plan_refusals": list(candidate.plan_refusals)}
+               if candidate.dataset_story is not None else {}),
+            "output_grain": request.output_grain,
+            "confirmed_uoa_entity": uoa_entity,
+            "confirmed_spine_ref": spine_ref},
         "policy_revision_pins": {"authority_matrix_hash": authority_matrix_hash()},
         "observation_id": observation_id,
         "context_hash": context_hash,
@@ -109,7 +117,7 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         "       review_current, recipe_revision_hash, confirmation_required_roles, "
         "       has_reviewed_formula_expectation, plan_envelope_present, validation_status, "
         "       outstanding_requirement_codes, policy_revision_pins, "
-        "       formula_expectation_revision, metadata_snapshot_id "
+        "       formula_expectation_revision, metadata_snapshot_id, dataset_story "
         "FROM semantic_option_decision "
         "WHERE considered_revision_id = %s AND option_id = %s",
         (considered_revision_id, option_id)).fetchone()
@@ -117,7 +125,7 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         return None
     (binding_state, generation_source, computation_kind, readiness, source_definition_id,
      review_current, recipe_revision_hash, confirmation_roles, has_reviewed, plan_present,
-     validation_status, outstanding, pins, formula_revision, snapshot_id) = row
+     validation_status, outstanding, pins, formula_revision, snapshot_id, story) = row
     return FrozenOptionFactsV1(
         binding_state=binding_state,
         generation_source=generation_source,
@@ -133,11 +141,29 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         outstanding_requirement_codes=tuple(outstanding or ()),
         policy_revision_pins=tuple(sorted(f"{k}:{v}" for k, v in (pins or {}).items())),
         formula_expectation_revision=formula_revision,
-        snapshot_id=snapshot_id or "")
+        snapshot_id=snapshot_id or "",
+        plan_refusal_codes=tuple((story or {}).get("plan_refusals") or ()),
+        confirmed_uoa_entity=(story or {}).get("confirmed_uoa_entity") or "")
+
+
+def _latest_confirmed_uoa(conn, intent_id: str) -> str | None:
+    """The UOA the intent most recently generated under — read from the NEWEST frozen
+    decision row (a UOA confirmation always rides a generation, so the newest row carries
+    the newest confirmed value). ``None`` when the intent never confirmed one — the UOA is
+    OPTIONAL by design (2026-08-13 steer): absence never blocks anything."""
+    row = conn.execute(
+        "SELECT d.dataset_story->>'confirmed_uoa_entity' "
+        "FROM semantic_option_decision d "
+        "JOIN contract_considered_revision r "
+        "  ON r.considered_revision_id = d.considered_revision_id "
+        "WHERE r.intent_id = %s ORDER BY d.recorded_at DESC, d.decision_id DESC LIMIT 1",
+        (intent_id,)).fetchone()
+    return row[0] if row is not None else None
 
 
 def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
-                                      snapshot_id: str | None):
+                                      snapshot_id: str | None,
+                                      intent_id: str | None = None):
     """The activation policy's CURRENT layer — the small re-read at the durable write.
 
     Everything here fails toward blocking (the same posture as the dataclass defaults):
@@ -178,9 +204,24 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         except Exception:
             freshness = "unverifiable"
 
+    # B10 item 4 — the UOA re-read. Absence is FREE both ways (the confirmation is
+    # optional); a frozen UOA the caller cannot re-verify fails closed like everything else.
+    def _norm(value):                         # human vocabulary: case never means drift
+        return value.strip().casefold() if value else None
+
+    frozen_uoa = _norm(frozen.confirmed_uoa_entity)
+    if intent_id is not None:
+        try:
+            uoa_now = frozen_uoa == _norm(_latest_confirmed_uoa(conn, intent_id))
+        except Exception:
+            uoa_now = frozen_uoa is None
+    else:
+        uoa_now = frozen_uoa is None
+
     return CurrentActivationStateV1(
         review_current=review_now,
         policy_revisions_current=pins_current,
+        uoa_current=uoa_now,
         snapshot_freshness=freshness,
         # Effective readiness is the FROZEN readiness until a re-fold exists (C-phase): honest,
         # and materialization stays blocked regardless (readiness != MATERIALIZATION_READY for

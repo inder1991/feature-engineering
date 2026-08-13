@@ -65,6 +65,11 @@ class ConfirmedScope:
     expansion: ScopeExpansion = ScopeExpansion.EXACT
     unscoped: bool = False
     modelling_contexts: tuple[str, ...] = ()
+    # B10: the HUMAN-CONFIRMED unit of analysis + its spine table ref (yes/no on the derived
+    # proposal; alternatives come from the catalog's REALISTIC list). target_entity above
+    # stays the recognizer's soft proposal input — these two are decisions.
+    uoa_entity: str | None = None
+    spine_ref: str | None = None
     target_entity: str | None = None
 
 

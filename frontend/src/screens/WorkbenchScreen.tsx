@@ -61,6 +61,9 @@ import {
   contractConfirm, contractConsideredSet, contractDraft, contractIntake, contractIntakeTarget,
   contractRecognitions, featureFreshness,
   featureRecipe, refineCandidate, registerFeature,
+  contractUoaProposal,
+  type UoaOption,
+  type UoaProposalResp,
 } from '../api'
 import { getSession } from '../session'
 
@@ -705,6 +708,13 @@ export function WorkbenchScreen() {
   // (recipe_id -> codes), present only when the ranking flag is on; presentation-only, never a rejection.
   const [scopeContexts, setScopeContexts] = useState<string[]>([])
   const [scopeEntity, setScopeEntity] = useState<string | null>(null)
+  // B10 — the unit-of-analysis confirmation: the server DERIVES a proposal from the signed
+  // target's table grain; the human answers yes/no (or picks from the catalog's realistic
+  // closed list). OPTIONAL by design: skipping it never blocks generation; confirming it makes
+  // a wrong-grain candidate an actionable UOA_MISMATCH instead of a silently-served card.
+  const [uoaProposal, setUoaProposal] = useState<UoaProposalResp | null>(null)
+  const [uoaChoice, setUoaChoice] = useState<UoaOption | null>(null)
+  const [uoaPicking, setUoaPicking] = useState(false)
   const [signalWarnings, setSignalWarnings] = useState<Record<string, string[]> | null>(null)
   // The scoped considered-set's per-recipe dispositions (the lens) and the scope id the last scoped
   // run was governed by — the prior scope a broaden supersedes. Both null on the unscoped path.
@@ -756,6 +766,26 @@ export function WorkbenchScreen() {
   selectedRef.current = selected
   const registeredRef = useRef(registered)
   registeredRef.current = registered
+
+  // B10: derive the UOA proposal when a recognition lands (target + source known). A fetch
+  // failure leaves the block absent — the confirmation is optional, absence is free.
+  useEffect(() => {
+    let cancelled = false
+    setUoaProposal(null)
+    setUoaChoice(null)
+    setUoaPicking(false)
+    const catalogSource = source.trim()
+    if (!recognition || !catalogSource) return
+    contractUoaProposal(catalogSource, {
+      targetRef: target.trim() || undefined,
+      recognizedEntity: scopeEntity ?? undefined,
+    }).then(
+      resp => { if (!cancelled) setUoaProposal(resp) },
+      () => { /* optional: absence never blocks */ },
+    )
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recognition?.recognition_id])
 
   useEffect(() => {
     if (!focusTarget.current) return
@@ -1140,6 +1170,8 @@ export function WorkbenchScreen() {
           // SOFT dimensions the human confirmed/overrode: ranking nudges only, never a scope filter.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
+          uoaEntity: uoaChoice?.entity ?? null,
+          spineRef: uoaChoice?.spine_ref ?? null,
         },
         supersedesScopeId: transition?.supersedesScopeId,
       })
@@ -1188,6 +1220,9 @@ export function WorkbenchScreen() {
           // Dimensions are SOFT ranking nudges that still apply to the broadened (unscoped) set.
           modellingContexts: scopeContexts,
           targetEntity: scopeEntity,
+          // Confirmed DATA orthogonal to use-case scoping — a broaden does not forget it.
+          uoaEntity: uoaChoice?.entity ?? null,
+          spineRef: uoaChoice?.spine_ref ?? null,
         },
         supersedesScopeId: transition?.supersedesScopeId
           ?? lastScopeId
@@ -2140,6 +2175,70 @@ export function WorkbenchScreen() {
               </p>
             )}
           </div>
+          {/* B10 — the unit-of-analysis confirmation: yes/no on the DERIVED proposal, or one of
+              the catalog's realistic spine-backed entities (a closed list, never free text).
+              Optional: skipping it never gates the confirm button. */}
+          {uoaProposal && (uoaProposal.proposed || uoaProposal.alternatives.length > 0) && (
+            <div className="uoa-confirm" style={{ marginTop: 16 }}>
+              <h3 style={{ margin: '0 0 8px' }}>Unit of analysis (optional)</h3>
+              {uoaChoice ? (
+                <p style={{ margin: 0 }}>
+                  Predicting per <strong>{uoaChoice.entity}</strong>{' '}
+                  (spine: {uoaChoice.spine_table} via {uoaChoice.spine_ref})
+                  <button
+                    type="button"
+                    className="btn"
+                    style={{ marginLeft: 8 }}
+                    onClick={() => { setUoaChoice(null); setUoaPicking(false) }}
+                  >
+                    Change
+                  </button>
+                </p>
+              ) : uoaPicking || !uoaProposal.proposed ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                  {uoaProposal.alternatives.map(a => (
+                    <button
+                      key={a.spine_ref}
+                      type="button"
+                      className="btn"
+                      onClick={() => { setUoaChoice(a); setUoaPicking(false) }}
+                    >
+                      {a.entity} — {a.spine_table} via {a.spine_ref}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div>
+                  <p style={{ margin: '0 0 8px' }}>
+                    You're predicting per <strong>{uoaProposal.proposed.entity}</strong>{' '}
+                    (spine: {uoaProposal.proposed.spine_table} via{' '}
+                    {uoaProposal.proposed.spine_ref}) — correct?
+                  </p>
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setUoaChoice(uoaProposal.proposed as UoaOption)}
+                    >
+                      Yes
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={() => setUoaPicking(true)}
+                    >
+                      No — pick another
+                    </button>
+                  </div>
+                </div>
+              )}
+              {uoaProposal.contradiction && (
+                <p className="hint" role="status" style={{ marginTop: 8 }}>
+                  {uoaProposal.contradiction}
+                </p>
+              )}
+            </div>
+          )}
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 16 }}>
             {primaryCandidate !== null && (
               <button

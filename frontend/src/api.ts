@@ -1425,6 +1425,35 @@ export interface ConfirmedScopeInput {
   // scope-narrowing filter). `targetEntity` is null when the human proposed/kept no grain.
   modellingContexts: string[]
   targetEntity: string | null
+  // B10 — the CONFIRMED unit of analysis (a yes/no on the server-derived proposal, or one of the
+  // catalog's realistic alternatives). Optional by design: absent never blocks anything; when
+  // present, a candidate computing at a different grain becomes an actionable UOA_MISMATCH.
+  uoaEntity?: string | null
+  spineRef?: string | null
+}
+
+// B10 — the derived unit-of-analysis proposal: the target table's declared grain entity plus the
+// catalog's realistic alternatives (a closed list — the UI never free-texts a UOA). A recognizer
+// entity that disagrees is surfaced as `contradiction`, stated, never silently resolved.
+export interface UoaOption {
+  entity: string
+  spine_table: string
+  spine_ref: string
+}
+export interface UoaProposalResp {
+  proposed: UoaOption | null
+  alternatives: UoaOption[]
+  contradiction: string | null
+}
+
+export function contractUoaProposal(
+  catalogSource: string,
+  opts: { targetRef?: string; recognizedEntity?: string } = {},
+): Promise<UoaProposalResp> {
+  const params = new URLSearchParams({ catalog_source: catalogSource })
+  if (opts.targetRef) params.set('target_ref', opts.targetRef)
+  if (opts.recognizedEntity) params.set('recognized_entity', opts.recognizedEntity)
+  return request(`/contract/uoa-proposal?${params.toString()}`)
 }
 
 // One stage evaluation on a recipe's disposition. `reason_codes` carry the WHY the UI renders;
@@ -1589,6 +1618,8 @@ export function contractConsideredSet(
           unscoped: opts.confirmedScope.unscoped,
           modelling_contexts: opts.confirmedScope.modellingContexts,
           target_entity: opts.confirmedScope.targetEntity,
+          uoa_entity: opts.confirmedScope.uoaEntity ?? null,
+          spine_ref: opts.confirmedScope.spineRef ?? null,
         }
       : null,
     // Lineage/history only for a broaden: the prior scope this run supersedes. Never used to

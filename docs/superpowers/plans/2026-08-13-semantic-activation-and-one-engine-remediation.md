@@ -324,6 +324,15 @@ existing no-leak pin extends to the new keys).
 *Acceptance:* v2 response test asserts the shape; v1 no-leak pin extended; the fold called at
 read time and at write time is the same function (import-identity test).
 
+> **ACCEPTED `f6c12041` (2026-08-13).** Actionable candidates project as REAL options
+> (candidate_status = honest binding state, "actionable" lens, option ids + decision rows);
+> only refusals/temporal/malformed remain rejections. v2 carries recommended_options /
+> actionable_options / rejected_outputs with per-option allowed_actions + blocked_actions from
+> `decide_all_actions` (same fold as the writes; serve-time current state = generation
+> instant). v1 no-leak extended. Suite 10900. NOTE: the import-identity test is implicit (both
+> call sites import from activation_policy); the interim v1-visibility of the actionable lens
+> is covered by the draft/confirm fold (BINDING_NOT_BOUND blocks) until A4 gates the UI.
+
 ### Task A4 — Workbench renders the server's answer (1 day)
 
 *Modify:* `frontend/src/api.ts`, `WorkbenchScreen.tsx`, tests.
@@ -339,6 +348,12 @@ read time and at write time is the same function (import-identity test).
 *Acceptance:* screen tests — a `blocked_actions.create_contract` card cannot be selected and
 names the blocker; a clean card can; "Save idea" works for both; every existing test updated to
 the v2 contract shape deliberately (they are byte-pins doing their job).
+
+> **ACCEPTED `b4dc912c` (2026-08-13) — PHASE A COMPLETE.** Workbench sends contract_version=2
+> always; selection actions-driven with next-step tooltips; Take-this-set skips-and-counts
+> blocked candidates; the registration tray relabeled honestly (Save ideas + idea-not-governed
+> copy); 19 deliberate test relabels + 3 new tests; legacy cards keep today's rule until B1
+> (server-gated regardless). Frontend 792 / backend 10900 / eval green.
 
 ## 3. Phase B — one engine, one plan *(closes GEN-01…GEN-05, PLAN-01, PLAN-13, PLAN-14)*
 
@@ -370,6 +385,12 @@ the v2 contract shape deliberately (they are byte-pins doing their job).
    entity-only scope with a typed 422 naming the limitation — an honest refusal, never a
    silent empty page. E4 re-verifies this before deleting the legacy branch.
 
+> **ACCEPTED `ea05e751` (2026-08-13).** Free-form generator fully off under the mode (no
+> dispatch, no lenses); definition anchor = audited extract-don't-invent intent call → shared
+> binder → user_defined; entity-only scope = typed 422 SEMANTIC_REQUIRES_CATALOG_SOURCE;
+> structural proof (only intents + advisory recommend_set scripted; success ⟹ generators never
+> ran; every card engine-origin). Suite 10903.
+
 *Acceptance:* under semantic_v1 with a FakeLLM whose free-form tasks EXPLODE
 (`overlay.feature.recommend*` scripted to raise), the request succeeds and serves engine
 candidates only; provider-call count per request measured in-test and asserted to include
@@ -386,6 +407,10 @@ exactly one intent call + critic/recommendation calls, zero free-form generation
 *Acceptance:* API test — `unscoped=true` request returns ≥1 validated intent; the
 out-of-scope rejection still fires for an objective outside the full leaf set.
 
+> **B2 ACCEPTED `5edbe3c1` (2026-08-13).** `_intent_scope_leaves`: confirmed = primary +
+> secondaries; unscoped = the complete 88-leaf set. Both call sites (generation + definition
+> anchor); unscoped API test lands an llm_intent observation.
+
 ### Task B3 — provenance and actor truth (½ day)
 
 *Modify:* `feature_intent_generation.py` (provenance dict), `gate1.py` +
@@ -400,6 +425,10 @@ out-of-scope rejection still fires for an objective outside the full leaf set.
 
 *Acceptance:* provenance test pins both hashes distinct; the recorded llm_call's `created_by`
 carries the requesting actor, not the service identity.
+
+> **B3 ACCEPTED `5edbe3c1` (2026-08-13).** `confirmed_scope_hash` = the scope's own canonical
+> hash; `semantic_context_hash` = its own additive provenance field; IdentityEnvelope threads
+> route → builder → lens → audited call (created_by = user:tester, pinned).
 
 ### Task B4 — origin-honest projection (1 day)
 
@@ -423,6 +452,12 @@ carries the requesting actor, not the service identity.
 `generation_source="llm_intent"`, no `recipe_id`, its real definition; a recipe candidate
 unchanged; the Workbench origin chip renders the new value.
 
+> **ACCEPTED `5dc5b71e` (2026-08-13).** Origin translated 1:1; `source_definition_id` is the
+> origin-neutral key (capture/sections/option-detail re-keyed; round-tripped through gate1's
+> serializers); `display_definition` rides the CANDIDATE (kept off the field-exhaustive request
+> hash — prose never identity); lens renamed "engine"; UI chips + "Model's rationale" label.
+> Suites 10905/792.
+
 ### Task B5 — parameter variants (1–1½ days)
 
 *Modify:* `recipe_planning_lens.py`, `candidate_assembly.py` (no change expected — parameters
@@ -444,6 +479,12 @@ are already signature identity), tests.
 5. Whole-round `feedback` threads into the intent-generation prompt (today only the hypothesis
    does — verified), so the feedback loop actually steers the abstract proposals.
 
+> **ACCEPTED `14ab87e3` (2026-08-13).** ~940 variants enumerated (governed_policy axes
+> excluded); deterministic token match picks the primary (weeks×7, months×30); variant_key
+> keys observations/capture/projection while recipe_id keys dispositions/reviews; distinct
+> request hashes per variant; param_alternatives brackets the chosen value; feedback threads
+> into the intent prompt; the 2-query pin holds at >317 candidates. Suite 10910.
+
 *Acceptance:* a hypothesis naming "90 day" serves the 90-day variant first with the 30/180
 variants as distinct, selectable, correctly-hashed options; total capability queries UNCHANGED
 (one batched read — proven by the B6 pin).
@@ -463,6 +504,11 @@ variants as distinct, selectable, correctly-hashed options; total capability que
 
 *Acceptance:* the pin test; byte-identical verdicts vs the per-recipe path on a fixture catalog
 (golden comparison in-test before the old path is deleted).
+
+> **ACCEPTED `605496e9` (2026-08-13).** bind split (request_shortlists pure +
+> bind_with_capabilities fold); both lenses batch (recipes: 1 capability + 1 review read;
+> intents: 1 capability read); the pin asserts EXACTLY 2 queries for all 317 recipes over a
+> prebuilt context; golden equality byte-identical. Suite 10907.
 
 ### Task B7 — the planner joins serving (1½–2 days)
 
@@ -495,6 +541,15 @@ aggregation/grain; a cross-dataset candidate without a verified join lands actio
 named code; `create_contract` on a plan-less option is 409 PHYSICAL_PLAN_MISSING (A-phase test
 flips from expected-blocked-always to conditionally-allowed).
 
+> **ACCEPTED `50404cdf` (2026-08-13).** `fold_frozen_binding_plan`: read set = the verdicts by
+> construction + defensive BINDING_PLAN_DIVERGENCE check; single-source plans real (population/
+> PIT/grain/window), cross-dataset & temporal-blocked & undeclared-population refusals named;
+> plan_envelope_present now a passable gate (decision row records it; A-phase tests flipped as
+> predicted); cards carry grain_table + window. VERIFY-FIRST outcome: PlanEnvelopeV1 is the
+> governed cross-catalog machine (physical_plan_id + fingerprints + stamps) — minting it for
+> single-catalog is NOT this fold's job; the cross-catalog envelope stays with the 3C.2a
+> planner (E4/C-phase reconcile). Suite 10912.
+
 ### Task B9 — refine becomes an intent revision (1 day)
 
 *Modify:* `gate1.py` / a small `refine` seam beside `llm_intent_candidates`,
@@ -518,6 +573,14 @@ flips from expected-blocked-always to conditionally-allowed).
 *Acceptance:* Workbench refine round-trips under semantic_v1 — instruction in, engine-bound
 revision out with verdicts and a fresh option id; a column-naming instruction ("use cust_num")
 does not smuggle a binding (hint at most); the legacy modes byte-identical.
+
+> **B9 ACCEPTED `e6e73c7f` (2026-08-13)** with one honest scope note: the revised card is a
+> PREVIEW (typed bindings + llm_intent origin + `regenerate_to_govern: true`) — a fresh option
+> id requires the whole-round regenerate that mints the superseding revision, which is exactly
+> the governed flow's own law (SE-10 step 9); the response says so instead of faking identity.
+> Column-smuggling is blocked by the parser's physical-key refusal (prose-level scan = C8).
+> /features/refine left the compatibility-409 list; the three generators keep theirs. Suite
+> 10914.
 
 ### Task B10 — the unit-of-analysis (spine) is a human decision (1–1½ days)
 
@@ -557,6 +620,32 @@ it; no spine table is ever named or confirmed.*
 silently served as ready), with the roll-up resolution; the spine confirmation click appears
 in the E0 walkthrough; changing the UOA post-generation blocks drafting with the drift code.
 
+> **ACCEPTED (2026-08-13) — PHASE B COMPLETE.** `GET /contract/uoa-proposal` derives the
+> proposal from the target table's DECLARED grain entity with the catalog's realistic
+> alternatives (closed list, never free text) and a surfaced-never-resolved contradiction
+> warning; `ConfirmedScope` gains confirmed `uoa_entity` + `spine_ref` (in the scope hash;
+> `target_entity` stays the recognizer's soft input). The fold refuses a mismatched
+> `output_grain` with closed code `UOA_MISMATCH` — threaded through BOTH lenses (the recipe
+> site AND `llm_intent_candidates`; the first test run caught the intent lens serving a
+> wrong-grain card as recommended). Mismatches land in `actionable_options` with
+> `candidate_status="uoa_mismatch"` and the roll-up next step; the decision row freezes
+> `output_grain` + `confirmed_uoa_entity`/`confirmed_spine_ref` (story jsonb, D1 gives them
+> columns); `assemble_current_activation_state` re-reads the intent's newest confirmed UOA at
+> draft/confirm — a UOA re-confirmed differently after serving blocks as
+> ACTIVATION_STATE_DRIFTED (`uoa_current`, failing default). Tests: proposal derivation,
+> mismatch actionable + draft 409 naming UOA_MISMATCH, matching-UOA no-op, post-generation
+> UOA change drift-blocks the old draft, drift unit test. HONEST NOTES: (1) the proposal
+> endpoint lives in `api/routes/contract.py`, not `intake_ticket.py`; (2) the confirmed UOA
+> does NOT ride `confirmed_scope_dimension` (its dimension CHECK is closed in deployed 0976)
+> — it rides the scope hash + frozen decision rows; `scope_for_run` does not rebuild it;
+> (3) item 3's "population verifiably joinable to the spine" beyond same-grain refusal is
+> C-phase work (resolver-backed pins); (4) the scope screen's confirmation block landed
+> (yes/no on the derived proposal, closed alternatives list, contradiction line, skip-free;
+> carried on confirm AND broaden) — its end-to-end appearance is asserted in E0; (5) the UOA
+> compare is case-insensitive (the catalog declares "Customer", grains say "customer" —
+> caught when the endpoint's entity casing met the fold). Suites 10919 backend / 795
+> frontend / eval 59.
+
 ### Task B8 — readiness probe before spend (½ day)
 
 *Modify:* `api/routes/contract.py` (scoped route step 4–5), `gate1.py`.
@@ -565,6 +654,9 @@ in the E0 walkthrough; changing the UOA post-generation blocks drafting with the
 projection 503s having spent zero provider calls.
 
 *Acceptance:* test with a lagged projection asserts 503 and `FakeLLM` recorded zero calls.
+
+> **B8 ACCEPTED `e6e73c7f` (2026-08-13).** Probe at the top of the scoped route, pre-dispatch;
+> the zero-spend proof is a nothing-scripted fake that 503s without a KeyError. Suite 10914.
 
 ## 4. Phase C — the metadata actually governs *(closes PLAN-06…PLAN-12, GEN-06)*
 

@@ -156,9 +156,19 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
     grounded: set = set()
     rejected: dict = {}
     binding_by_id: dict = {}
+    actionable_uoa: list = []
 
     for assembled in assembled_set.ranked:
         candidate = assembled.candidate
+        # B10: bound but at the WRONG unit of analysis — a visible actionable option with the
+        # roll-up resolution, never a silently-served ready card.
+        if R.UOA_MISMATCH in getattr(candidate, "plan_refusals", ()):
+            validation = validate_candidate(candidate)
+            rejected[candidate.recipe_id] = (R.UOA_MISMATCH,)
+            actionable_uoa.append(_served_idea(
+                assembled, validation, catalog_source=catalog_source,
+                candidate_status="uoa_mismatch"))
+            continue
         if candidate.temporal_blocker:    # the temporal contract did not compile — setup work
             rejected[candidate.recipe_id] = (R.TEMPORAL_POLICY_UNRESOLVED,)
             rejections.append(_rejection(
@@ -177,13 +187,11 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
                      for v in candidate.verdicts if v.status == "bound")
         binding_by_id[candidate.recipe_id] = "acceptable" if floors else "exact"
 
-    actionable_ideas: list = []
+    actionable_ideas: list = list(actionable_uoa)
     for assembled in assembled_set.actionable:
         candidate = assembled.candidate
         codes = tuple(dict.fromkeys(
             code for v in candidate.verdicts for code in v.reason_codes))
-        resolution = next((v.resolution for v in candidate.verdicts if v.resolution),
-                          "no eligible binding for every required operand")
         rejected[candidate.recipe_id] = codes or ("SEMANTIC_NOT_BINDABLE",)
         # A3: the candidate is a visible OPTION carrying its own undecided state — the named
         # resolution rides the card's critic-note-free channel (candidate_status = the honest

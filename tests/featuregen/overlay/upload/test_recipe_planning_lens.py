@@ -524,3 +524,38 @@ def test_divergence_and_cross_dataset_refuse_the_plan_never_substitute():
                            codes=(R.RELATIONSHIP_REQUIRED,))
     plan, refusals = fold_frozen_binding_plan(request, verdicts, cross, "pit", "", "bank")
     assert plan is None and refusals == (R.RELATIONSHIP_REQUIRED,)
+
+
+def test_a_capitalized_uoa_matches_the_lowercase_grain():
+    """B10: the catalog declares 'Customer'; the planning grain says 'customer' — the SAME
+    unit of analysis, never a refusal. A genuinely different UOA still refuses."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        RequiredOperandV1,
+        planning_request_from_user_definition,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
+    from featuregen.overlay.upload.recipe_planning_lens import (
+        DatasetStoryV1,
+        fold_frozen_binding_plan,
+    )
+
+    exemplar = v2_recipe_by_id("customer_activity_recency")
+    request = planning_request_from_user_definition(
+        definition_id="user:uoa_case_probe", primary_objective=exemplar.primary_objective,
+        output=exemplar.output,
+        operands=(RequiredOperandV1(role="who", concept="customer_id",
+                                    operand_class="entity_key"),),
+        source_grain="transaction", output_grain="customer",
+        temporal=exemplar.temporal, content_hash="uoacasehash")
+    verdicts = (OperandBindingVerdictV1(role="who", status="bound",
+                                        selected_ref="public.customers.cust_id"),)
+    story = DatasetStoryV1(population_ref="customers", population_basis="declared_grain",
+                           dataset_tables=("customers",), cross_dataset=False, codes=())
+    plan, refusals = fold_frozen_binding_plan(
+        request, verdicts, story, "pit", "", "bank", uoa_entity="Customer")
+    assert refusals == () and plan is not None
+
+    plan, refusals = fold_frozen_binding_plan(
+        request, verdicts, story, "pit", "", "bank", uoa_entity="Account")
+    assert plan is None and refusals == (R.UOA_MISMATCH,)

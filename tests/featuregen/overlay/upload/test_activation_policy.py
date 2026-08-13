@@ -43,6 +43,7 @@ CLEAN_CURRENT = CurrentActivationStateV1(
     requirements_closed=True,
     execution_authority_evaluated=True,
     execution_floor_met=True,
+    uoa_current=True,
 )
 
 
@@ -195,3 +196,16 @@ def test_every_blocker_code_has_a_reason_family():
                                    "execute_materialization")
     for blocker in decision.blockers:
         assert R.reason_family(blocker.code)
+
+
+def test_a_uoa_reconfirmed_differently_after_serving_is_activation_drift():
+    """B10 item 4: the human changed the confirmed unit of analysis AFTER this card was
+    served — the card answers a stale question; every rung above save_idea blocks with the
+    regenerate blocker."""
+    from dataclasses import replace
+
+    moved = replace(CLEAN_CURRENT, uoa_current=False)
+    decision = activation_decision(CLEAN_FROZEN, moved, "create_contract")
+    assert not decision.allowed
+    assert "ACTIVATION_STATE_DRIFTED" in codes(decision)
+    assert activation_decision(CLEAN_FROZEN, moved, "save_idea").allowed

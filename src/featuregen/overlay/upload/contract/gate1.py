@@ -806,7 +806,8 @@ def _confirmed_scope_hash(scope) -> str:
         return canonical_hash({"unscoped": True})
     return canonical_hash({
         "primary": scope.primary, "secondary": sorted(scope.secondary),
-        "expansion": str(scope.expansion), "unscoped": scope.unscoped})
+        "expansion": str(scope.expansion), "unscoped": scope.unscoped,
+        "uoa_entity": scope.uoa_entity, "spine_ref": scope.spine_ref})
 
 
 def _intent_scope_leaves(scope) -> tuple:
@@ -972,7 +973,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                         + (f"\n\nHuman feedback on the previous round: {feedback}"
                            if feedback else "")),
                     actor=actor_envelope,
-                    confirmed_scope_hash=_confirmed_scope_hash(scope))
+                    confirmed_scope_hash=_confirmed_scope_hash(scope),
+                    uoa_entity=getattr(scope, "uoa_entity", None))
                 all_candidates.extend(intent_cands)
             except Exception:
                 logger.exception("semantic-v1 intent generation failed "
@@ -998,7 +1000,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         semantic_decision_facts = {
             idea.source_definition_id: decision_facts_for_candidate(
                 candidates_by_id[idea.source_definition_id], idea,
-                observation_ids.get(idea.source_definition_id), context_hash_value)
+                observation_ids.get(idea.source_definition_id), context_hash_value,
+                uoa_entity=getattr(scope, "uoa_entity", None),
+                spine_ref=getattr(scope, "spine_ref", None))
             for idea in (*projection.ideas, *projection.actionable_ideas)
             if idea.source_definition_id and idea.source_definition_id in candidates_by_id
         }

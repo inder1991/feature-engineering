@@ -27,7 +27,7 @@ actually take. A blocked action never hides a candidate — the caller serves th
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 
@@ -63,6 +63,8 @@ class FrozenOptionFactsV1:
     policy_revision_pins: tuple[str, ...] = ()
     formula_expectation_revision: str = ""
     snapshot_id: str = ""
+    plan_refusal_codes: tuple[str, ...] = ()   # WHY no plan folded (B7/B10 refusals)
+    confirmed_uoa_entity: str = ""              # the UOA the human had confirmed at serving
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +83,7 @@ class CurrentActivationStateV1:
     requirements_closed: bool = False           # every typed requirement has a recorded result
     execution_authority_evaluated: bool = False  # False until C2 lands the execution matrix
     execution_floor_met: bool = False
+    uoa_current: bool = False                   # the confirmed UOA has not moved since serving
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,13 +126,23 @@ def _contract_blockers(frozen: FrozenOptionFactsV1,
             "a conceptual idea has no exact computation — save it as an idea; the formula "
             "seam is what promotes it"))
     if not frozen.plan_envelope_present:
-        blockers.append(BlockerV1(
-            R.PHYSICAL_PLAN_MISSING,
-            "no frozen source/join/point-in-time plan exists for this candidate — regenerate "
-            "once planning resolves, or resolve the named plan refusal"))
+        if R.UOA_MISMATCH in frozen.plan_refusal_codes:
+            blockers.append(BlockerV1(
+                R.UOA_MISMATCH,
+                "this computes at a different grain than your confirmed unit of analysis — "
+                "roll it up via a matching-grain recipe, or change the confirmed UOA at scope"))
+        else:
+            blockers.append(BlockerV1(
+                R.PHYSICAL_PLAN_MISSING,
+                "no frozen source/join/point-in-time plan exists for this candidate — "
+                "regenerate once planning resolves, or resolve the named plan refusal"))
     if current.snapshot_freshness != "current":
         blockers.append(BlockerV1(R.SNAPSHOT_STALE_REGENERATE, _REGENERATE_STEP))
     if not current.policy_revisions_current:
+        blockers.append(BlockerV1(R.ACTIVATION_STATE_DRIFTED, _REGENERATE_STEP))
+    if not current.uoa_current:
+        # B10 item 4: the human re-confirmed a DIFFERENT unit of analysis after this card was
+        # served — the card answers a question nobody is asking anymore. Regenerate.
         blockers.append(BlockerV1(R.ACTIVATION_STATE_DRIFTED, _REGENERATE_STEP))
     return blockers
 
