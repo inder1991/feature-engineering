@@ -6,7 +6,7 @@ from ._helpers import AUTH
 
 def _feat(conn, name="avg_bal"):
     return register_feature(conn, FeatureSpec(name=name, aggregation="avg_90d",
-                                              derives_from=(("bank", "public.accounts.balance"),)))
+                                              derives_from=(("bank", "public.accounts.balance"),)), lifecycle_state="idea")
 
 
 def test_registry_list_and_detail_with_stamp(make_client, conn):
@@ -22,6 +22,9 @@ def test_registry_list_and_detail_with_stamp(make_client, conn):
 def test_consumer_registration_endpoints(make_client, conn):
     fid = _feat(conn)
     client = make_client()
+    # A2: a consumer registers only against a GOVERNED feature. This test exercises the
+    # consumer endpoints' mechanics, not activation — flip the fixture feature deliberately.
+    conn.execute("UPDATE feature SET lifecycle_state = 'governed' WHERE feature_id = %s", (fid,))
     r = client.post(f"/features/{fid}/consumers",
                     json={"model_ref": "churn_v3", "purpose": "churn", "environment": "prod"},
                     headers=AUTH)
@@ -49,7 +52,7 @@ def test_feature_360_read_scopes_the_lineage(make_client, conn):
     from ._helpers import PII_AUTH
     build_graph(conn, "bank", [CanonicalRow("bank", "accounts", "ssn", "text", sensitivity="pii")])
     fid = register_feature(conn, FeatureSpec(name="uses_pii", aggregation="count",
-                                             derives_from=(("bank", "public.accounts.ssn"),)))
+                                             derives_from=(("bank", "public.accounts.ssn"),)), lifecycle_state="idea")
     # data_owner (no pii_reader): the pii lineage is WITHHELD (can't enumerate where pii lives)
     assert make_client().get(f"/features/{fid}", headers=AUTH).json()["derives_from"] == []
     # pii_reader: sees the lineage

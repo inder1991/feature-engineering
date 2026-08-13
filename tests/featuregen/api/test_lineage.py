@@ -29,7 +29,7 @@ def _ids(body):
     return {n["id"] for n in body["nodes"]}
 
 
-def _register_feature(client, name="avg_balance", derives=("public.accounts.balance",)):
+def _register_feature(client, name="avg_balance", derives=("public.accounts.balance",), lifecycle_state="idea"):
     res = client.post("/features", json={
         "name": name,
         "derives_from": [{"catalog_source": "deposits", "object_ref": r} for r in derives],
@@ -130,9 +130,12 @@ def test_unknown_anchor_404(client):
 
 
 # ---- features layer: direction asymmetry ---------------------------------------------------
-def test_direction_up_vs_down_asymmetric_for_features(client):
+def test_direction_up_vs_down_asymmetric_for_features(client, conn):
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    fid = _register_feature(client)
+    fid = _register_feature(client, lifecycle_state="idea")
+    # A2: a consumer registers only against a GOVERNED feature. This test exercises lineage
+    # direction mechanics, not activation — flip the fixture feature deliberately.
+    conn.execute("UPDATE feature SET lifecycle_state = 'governed' WHERE feature_id = %s", (fid,))
     r = client.post(f"/features/{fid}/consumers",
                     json={"model_ref": "churn_risk_model"}, headers=AUTH)
     assert r.status_code == 200
@@ -168,7 +171,7 @@ def test_feature_expands_upstream_to_its_other_source_tables(client):
 def test_layers_param_excludes_edge_classes(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     upload_csv(client, "cards", CARDS_CSV)
-    _register_feature(client)
+    _register_feature(client, lifecycle_state="idea")
     only_joins = _lineage(client, depth=3, layers="joins").json()
     kinds = {e["kind"] for e in only_joins["edges"]}
     assert kinds == {"contains", "join"}
@@ -251,7 +254,7 @@ def test_join_edges_carry_authority_state(client, conn):
 def test_pii_column_absent_without_role_and_its_feature_edge_disappears(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     fid = _register_feature(client, name="risk_flag",
-                            derives=("public.accounts.balance", "public.customers.email"))
+                            derives=("public.accounts.balance", "public.customers.email"), lifecycle_state="idea")
     without = _lineage(client, depth=3).json()
     assert "deposits:public.customers.email" not in _ids(without)  # node absent
     assert f"feature:{fid}" in _ids(without)                       # still reachable via balance
@@ -272,7 +275,7 @@ def test_sensitive_anchor_absent_without_role(client):
 # ---- stale sources are SHOWN, flagged (unlike search's fail-closed list) --------------------
 def test_stale_source_shown_and_flagged(client, conn):
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    fid = _register_feature(client)
+    fid = _register_feature(client, lifecycle_state="idea")
     conn.execute(
         "UPDATE overlay_drift_watermark "
         "SET last_completed_at = last_completed_at - interval '3 days' "
@@ -297,7 +300,7 @@ def test_rbac_consistent_with_search(client):
 
 def test_features_layer_requires_feature_read(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    _register_feature(client)
+    _register_feature(client, lifecycle_state="idea")
     # data_owner holds catalog:read but not feature:read -> the features layer is absent
     owner = _lineage(client, headers=OWNER, depth=2, layers="features").json()
     assert not any(n["kind"] == "feature" for n in owner["nodes"])
@@ -361,7 +364,7 @@ def test_table_node_carries_last_vouched_and_quarantine_pending(client):
 
 def test_feature_node_carries_verification_and_omits_empty_rationale(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    fid = _register_feature(client)
+    fid = _register_feature(client, lifecycle_state="idea")
     feat = next(n for n in _lineage(client, direction="down", depth=2).json()["nodes"]
                 if n["id"] == f"feature:{fid}")
     # Direct registration (POST /features) is UNVERIFIED under the honest-verification lifecycle
@@ -373,7 +376,7 @@ def test_feature_node_carries_verification_and_omits_empty_rationale(client):
 
 def test_feature_node_carries_rationale_from_its_hypothesis(client, conn):
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    fid = _register_feature(client)
+    fid = _register_feature(client, lifecycle_state="idea")
     # A feature born from a hypothesis: feature -> latest contract -> contract_intent (Feature 360).
     conn.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
                  "VALUES (%s, %s, %s)", ("int_x", "sharp balance drops precede churn", "hypothesis"))

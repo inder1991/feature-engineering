@@ -52,7 +52,7 @@ def test_confirm_registers_versioned_contract_and_wires_feature(db):
 def test_confirm_stamps_both_feature_and_contract_design_checked(db):
     # The governed path EARNS DESIGN-CHECKED: the confirm re-runs the MCV, so BOTH the feature row and
     # the contract row it registers must be stamped DESIGN-CHECKED (not the UNVERIFIED default). Guards
-    # the first-confirm register_feature(..., verification="DESIGN-CHECKED") fix.
+    # the first-confirm register_feature(..., verification="DESIGN-CHECKED", lifecycle_state="idea") fix.
     _bank(db)
     c = confirm_contract(db, _draft(), actor="ds1")
     feat_stamp = db.execute("SELECT verification FROM feature WHERE feature_id = %s",
@@ -69,7 +69,7 @@ def test_restamp_update_flips_only_contract_less_features(db):
     # DESIGN-CHECKED. (The migration runs on an empty test schema, so exercise its UPDATE here.)
     from featuregen.overlay.upload.features import FeatureSpec, register_feature
     _bank(db)
-    legacy = register_feature(db, FeatureSpec(name="legacy", verification="DESIGN-CHECKED"))  # no contract
+    legacy = register_feature(db, FeatureSpec(name="legacy", verification="DESIGN-CHECKED"), lifecycle_state="idea")  # no contract
     governed = confirm_contract(db, _draft(), actor="ds1").feature_id                          # has a contract
     db.execute("UPDATE feature SET verification = 'UNVERIFIED' "
                "WHERE verification = 'DESIGN-CHECKED' "

@@ -604,7 +604,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         feature_id = register_feature(conn, FeatureSpec(
             name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
             aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs,
-            verification="DESIGN-CHECKED"))   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
+            verification="DESIGN-CHECKED"),   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
+            lifecycle_state="governed")       # A2: confirm is the ONLY writer that mints governed
         version = 1                            # the feature row must exist before the contract FK below
     # H2b STEP 2 — read the CURRENT pointer (the AUTHORITATIVE superseded target). Prefer the pointer's
     # prior contract; fall back to the legacy latest-by-feature_name contract when no pointer exists yet

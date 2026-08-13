@@ -348,7 +348,7 @@ def test_registry_dedup_skips_already_registered(db):
     _bank(db)
     _fresh_watermark(db, "bank", NOW)
     register_feature(db, FeatureSpec(name="existing", aggregation="avg_90d",
-                                     derives_from=(("bank", "public.accounts.balance"),)))
+                                     derives_from=(("bank", "public.accounts.balance"),)), lifecycle_state="idea")
     client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
         {"name": "dup", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"}]})})
     out = recommend_features(db, "x", client, catalog_source="bank", now=NOW, critic=False)

@@ -36,13 +36,24 @@ class FeatureFreshness:
     stale_sources: list[str] = field(default_factory=list)
 
 
-def register_feature(conn, spec: FeatureSpec) -> str:
+class IdeaNotConsumableError(ValueError):
+    """A saved idea was offered where only a governed feature may serve (model consumer)."""
+
+
+def register_feature(conn, spec: FeatureSpec, *, lifecycle_state: str) -> str:
+    """Register one feature. ``lifecycle_state`` is MANDATORY — every writer states its intent
+    (remediation A2, validated finding 2): 'idea' = a saved sketch (direct save; never a model
+    consumer's feature); 'governed' = created through contract confirmation behind the
+    activation policy. No default exists on the column or here, so a new caller cannot
+    silently mint a governed-looking row."""
+    if lifecycle_state not in ("idea", "governed"):
+        raise ValueError(f"lifecycle_state must be 'idea' or 'governed', got {lifecycle_state!r}")
     feature_id = mint_id("feat")
     conn.execute(
         "INSERT INTO feature (feature_id, name, description, grain_table, aggregation, as_of_column, "
-        "verification) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        "verification, lifecycle_state) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
         (feature_id, spec.name, spec.description, spec.grain_table, spec.aggregation,
-         spec.as_of_column, spec.verification))
+         spec.as_of_column, spec.verification, lifecycle_state))
     for catalog_source, object_ref in spec.derives_from:
         conn.execute(
             "INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
@@ -91,12 +102,14 @@ def list_features(conn, *, limit: int = 50) -> list[dict]:
         feature_current_contract,
     )
     rows = conn.execute(
-        "SELECT feature_id, name, grain_table, aggregation, as_of_column, verification, created_at "
+        "SELECT feature_id, name, grain_table, aggregation, as_of_column, verification, created_at, "
+        "lifecycle_state "
         "FROM feature ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
     out: list[dict] = []
     for r in rows:
         item = {"feature_id": r[0], "name": r[1], "grain_table": r[2], "aggregation": r[3],
-                "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat()}
+                "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat(),
+                "lifecycle_state": r[7], "governed": r[7] == "governed"}
         contract_id = feature_current_contract(conn, r[0])
         if contract_id is not None:
             eff_status, eff_verif = contract_read_status(conn, contract_id)
@@ -131,8 +144,16 @@ def register_consumer(conn, *, model_ref: str, feature_id: str, purpose: str = "
                       environment: str = "dev", actor: str = "") -> str | None:
     """Register a model/consumer as a user of a feature (SP-14). Idempotent per (model, feature, env).
     Returns the consumer_id, or None if the feature doesn't exist (checked first — no FK abort)."""
-    if conn.execute("SELECT 1 FROM feature WHERE feature_id = %s", (feature_id,)).fetchone() is None:
+    row = conn.execute(
+        "SELECT lifecycle_state FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
+    if row is None:
         return None
+    if row[0] == "idea":
+        # A2 (validated finding 2): an IDEA is a saved sketch — it must never become a model's
+        # input. Refuse loudly; the caller's fix is to govern the feature first.
+        raise IdeaNotConsumableError(
+            f"feature {feature_id!r} is a saved idea, not a governed feature — a model "
+            "consumer may only register against a governed feature")
     row = conn.execute(
         "INSERT INTO feature_consumer (consumer_id, model_ref, feature_id, purpose, environment, actor) "
         "VALUES (%s, %s, %s, %s, %s, %s) "

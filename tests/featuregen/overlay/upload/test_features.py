@@ -32,7 +32,7 @@ def test_register_feature_and_drift_impact(db):
         name="avg_balance_90d", description="90-day average balance",
         grain_table="accounts", aggregation="avg_90d", as_of_column="posted_at",
         derives_from=(("deposits", "public.accounts.balance"),
-                      ("deposits", "public.accounts.posted_at"))))
+                      ("deposits", "public.accounts.posted_at"))), lifecycle_state="idea")
     assert fid.startswith("feat")
     # drift impact: which features break if accounts.balance changes?
     assert features_affected_by(db, "deposits", "public.accounts.balance") == [fid]
@@ -45,7 +45,7 @@ def test_feature_freshness_follows_stalest_source(db):
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
     ingest_upload(db, "deposits", rows, actor=_actor(), now=now)   # writes a fresh watermark
     fid = register_feature(db, FeatureSpec(
-        name="bal", derives_from=(("deposits", "public.accounts.balance"),)))
+        name="bal", derives_from=(("deposits", "public.accounts.balance"),)), lifecycle_state="idea")
     assert feature_freshness(db, fid, now=now).fresh is True
     # 3 days later the source watermark is beyond the 24h window -> the feature is stale.
     later = now + timedelta(days=3)

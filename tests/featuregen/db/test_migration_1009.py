@@ -40,7 +40,7 @@ def _contract(conn, contract_id: str = "c_c4_1") -> str:
     """A minimal parent contract row for the FKs. contract.feature_id FKs feature (0972), so a
     feature row is seeded first; feature_name/version are NOT NULL (0960)."""
     feature_id = f"f_{contract_id}"
-    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, "fx"))
+    conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) VALUES (%s, %s, 'idea')", (feature_id, "fx"))
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, version) "
         "VALUES (%s, %s, 'fx', 1)", (contract_id, feature_id))

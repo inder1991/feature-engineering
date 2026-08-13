@@ -54,7 +54,7 @@ def _seed_feature(db, feature_id: str, name: str) -> None:
     """RF-I4: contract.feature_id is FK-constrained (contract_feature_id_fk, migration 0972) —
     every contract insert must reference a REAL feature row, never a bogus id."""
     db.execute(
-        "INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, name))
+        "INSERT INTO feature (feature_id, name, lifecycle_state) VALUES (%s, %s, 'idea')", (feature_id, name))
 
 
 def test_contract_has_validation_status_and_requirements_columns(db):

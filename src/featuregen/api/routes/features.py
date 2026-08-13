@@ -23,6 +23,7 @@ from featuregen.overlay.upload.features import (
     features_affected_by,
     features_for_consumer,
     list_features,
+    IdeaNotConsumableError,
     register_consumer,
     register_feature,
 )
@@ -57,14 +58,17 @@ def create_feature(
     body: FeatureSpecIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
-) -> dict[str, str]:
-    """Registration is the explicit-confirm step — suggestions only become features here."""
+) -> dict:
+    """Direct registration saves an IDEA (remediation A2): browsable and labeled, never a
+    governed feature and never a model consumer's input. Governing happens ONLY through the
+    contract confirm path, behind the activation policy."""
     spec = FeatureSpec(
         name=body.name, description=body.description, grain_table=body.grain_table,
         aggregation=body.aggregation, as_of_column=body.as_of_column,
         derives_from=tuple((d.catalog_source, d.object_ref) for d in body.derives_from))
     try:
-        return {"feature_id": register_feature(conn, spec)}
+        return {"feature_id": register_feature(conn, spec, lifecycle_state="idea"),
+                "lifecycle_state": "idea", "governed": False}
     except psycopg.errors.UniqueViolation as exc:   # feature.name is unique (0970)
         raise HTTPException(status_code=409, detail=f"a feature named {body.name!r} already exists") from exc
 
@@ -109,9 +113,12 @@ def get_registered_feature(feature_id: str, conn: _Conn, identity: _Identity) ->
 # ---- model <-> feature consumer registration (SP-14) --------------------------------------------
 @router.post("/features/{feature_id}/consumers", dependencies=[Depends(require_feature_generate)])
 def add_consumer(feature_id: str, body: ConsumerIn, conn: _Conn, identity: _Identity) -> dict:
-    cid = register_consumer(conn, model_ref=body.model_ref, feature_id=feature_id,
-                            purpose=body.purpose, environment=body.environment,
-                            actor=identity.subject)
+    try:
+        cid = register_consumer(conn, model_ref=body.model_ref, feature_id=feature_id,
+                                purpose=body.purpose, environment=body.environment,
+                                actor=identity.subject)
+    except IdeaNotConsumableError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     if cid is None:
         raise HTTPException(status_code=404, detail=f"unknown feature {feature_id!r}")
     return {"consumer_id": cid}

@@ -558,7 +558,7 @@ def test_list_features_serves_read_gated_stamp_not_mutable_feature_row(db):
 def test_list_features_directly_registered_feature_keeps_honest_stamp(db):
     """[4]: a feature with NO governing contract keeps its honest ``feature`` stamp (UNVERIFIED) and
     carries no gated effective fields — the gate only overrides a governed feature."""
-    fid = register_feature(db, FeatureSpec(name="direct_only_feat"))
+    fid = register_feature(db, FeatureSpec(name="direct_only_feat"), lifecycle_state="idea")
     listed = {f["feature_id"]: f for f in list_features(db)}[fid]
     assert listed["verification"] == "UNVERIFIED"
     assert "effective_verification" not in listed

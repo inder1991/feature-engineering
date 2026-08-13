@@ -51,7 +51,7 @@ def _migration_1011_sql() -> str:
 
 def _feature(conn, feature_id: str) -> str:
     # feature.name carries a UNIQUE constraint (0970), so name is derived from the (unique) feature_id.
-    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, feature_id))
+    conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) VALUES (%s, %s, 'idea')", (feature_id, feature_id))
     return feature_id
 
 

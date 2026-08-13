@@ -163,7 +163,7 @@ def test_refine_rejects_a_revision_that_duplicates_a_registered_feature(db):
     _bank(db)
     register_feature(db, FeatureSpec(
         name="latest_balance", aggregation="latest",
-        derives_from=(("bank", "public.accounts.balance"),)))
+        derives_from=(("bank", "public.accounts.balance"),)), lifecycle_state="idea")
     client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
         {"name": "balance_now", "derives_from": ["public.accounts.balance"],
          "aggregation": "latest"}]})})

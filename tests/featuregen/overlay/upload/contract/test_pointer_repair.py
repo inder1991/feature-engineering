@@ -137,7 +137,7 @@ def test_repair_on_legacy_zero_input_contract_preserves_compat_and_sets_pointer(
     fid = register_feature(db, FeatureSpec(
         name="legacy_zero_input", description="legacy", grain_table="accounts",
         as_of_column="posted_at", derives_from=[("bank", "public.accounts.balance")],
-        verification="DESIGN-CHECKED"))
+        verification="DESIGN-CHECKED"), lifecycle_state="idea")
     cid = _insert_legacy_contract(db, fid, "legacy_zero_input")
     assert _pointer(db, fid) is None
     assert db.execute("SELECT count(*) FROM contract_input_column WHERE contract_id = %s",
@@ -163,7 +163,7 @@ def test_repair_and_backfill_deterministic_under_a_version_tie(db):
     nothing ties ``contract.feature_name`` to ``feature_id``), so two contracts can tie at one version for
     a feature_id. Repair AND backfill must resolve the tie IDENTICALLY on every run via the total order
     ``ORDER BY version DESC, contract_id DESC``."""
-    fid = register_feature(db, FeatureSpec(name="tie_feat", description="tie"))
+    fid = register_feature(db, FeatureSpec(name="tie_feat", description="tie"), lifecycle_state="idea")
     # two contracts, SAME feature_id + version, distinct feature_name (dodges 0961's unique) + distinct id.
     _insert_legacy_contract(db, fid, "tie_feat", version=1, contract_id="contract_aaa_lo")
     _insert_legacy_contract(db, fid, "tie_feat_alt", version=1, contract_id="contract_zzz_hi")
@@ -187,7 +187,7 @@ def test_backfill_releases_advisory_locks_per_feature_not_held_to_commit(db):
                           "AND pid = pg_backend_pid()").fetchone()[0]
 
     for name in ("legacy_lock_a", "legacy_lock_b"):
-        fid = register_feature(db, FeatureSpec(name=name, description="legacy"))
+        fid = register_feature(db, FeatureSpec(name=name, description="legacy"), lifecycle_state="idea")
         _insert_legacy_contract(db, fid, name)
     before = held()
     n = backfill_feature_pointers(db)
@@ -237,6 +237,6 @@ def test_backfill_is_idempotent_second_full_sweep_is_a_noop(db):
 
 
 def test_backfill_leaves_contractless_feature_without_pointer(db):
-    fid = register_feature(db, FeatureSpec(name="direct_feat_h2d", description="registered directly"))
+    fid = register_feature(db, FeatureSpec(name="direct_feat_h2d", description="registered directly"), lifecycle_state="idea")
     backfill_feature_pointers(db)
     assert _pointer(db, fid) is None                   # no contract -> stays pointer-less (UNVERIFIED)

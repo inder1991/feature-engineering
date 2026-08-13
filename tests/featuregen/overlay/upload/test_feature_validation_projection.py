@@ -31,7 +31,7 @@ _CTR = 0
 
 def _contract(conn, contract_id: str) -> str:
     feature_id = f"f_{contract_id}"
-    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, feature_id))
+    conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) VALUES (%s, %s, 'idea')", (feature_id, feature_id))
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, version) "
         "VALUES (%s, %s, %s, 1)", (contract_id, feature_id, feature_id))
@@ -326,7 +326,7 @@ def test_genuine_poison_still_degrades_and_skips(conn) -> None:
 # --------------------------------------------------------------------------------------------------
 def _seed_committed_contract(conn, contract_id: str) -> None:
     feature_id = f"f_{contract_id}"
-    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, feature_id))
+    conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) VALUES (%s, %s, 'idea')", (feature_id, feature_id))
     conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version) "
                  "VALUES (%s, %s, %s, 1)", (contract_id, feature_id, feature_id))
 

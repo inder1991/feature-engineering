@@ -600,7 +600,8 @@ def _record_published_feature(conn, *, feature: str, contract: str, marker: str)
     """A registered feature -> its CURRENT contract version -> that version's bridge-marker
     dependency row: the real `feature` / `contract` / `feature_current_contract` /
     `contract_metadata_dependency` chain, whose FKs and composite UNIQUE the insert must satisfy."""
-    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s) "
+    conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) "
+                 "VALUES (%s, %s, 'governed') "
                  "ON CONFLICT (feature_id) DO NOTHING", (feature, f"feature-{feature}"))
     conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version) "
                  "VALUES (%s, %s, %s, 1) ON CONFLICT (contract_id) DO NOTHING",
