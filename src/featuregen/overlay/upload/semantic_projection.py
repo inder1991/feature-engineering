@@ -123,12 +123,14 @@ def _served_idea(assembled, validation, *, catalog_source: str,
     description = description or request.conceptual_reason
     bound_refs = [v.selected_ref for v in candidate.verdicts
                   if v.status == "bound" and v.selected_ref]
+    plan = getattr(candidate, "binding_plan", None) or {}
     return FeatureIdea(
         name=request.output.display_label or candidate.recipe_id,
         description=description,
         derives_from=list(bound_refs),
         aggregation=None,
-        grain_table=None,
+        grain_table=plan.get("population_ref"),
+        window=(f"{plan['window']}d" if plan.get("window") else None),
         derives_pairs=tuple((catalog_source, ref) for ref in bound_refs),
         rationale=request.conceptual_reason,
         validation_status=("DESIGN_CHECKED" if validation.status == "design_checked"

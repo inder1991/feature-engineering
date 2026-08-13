@@ -208,6 +208,55 @@ def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
     return out
 
 
+def fold_frozen_binding_plan(request, verdicts, story, pit_text: str,
+                             temporal_blocker: str, catalog_source: str):
+    """B7 (PLAN-01 closed for the single-source class) — the plan is a VALIDATION over the
+    exact frozen bindings, never a second binder:
+
+    * the read set IS the bound refs (divergence impossible by construction; the defensive
+      check below still runs — a bound ref outside the story's tables is
+      BINDING_PLAN_DIVERGENCE, never a silent substitution);
+    * single-source + declared population + compiled temporal → a real plan
+      {source, population, read set, PIT, grain, window};
+    * cross-dataset (until governed join facts prove the hop) or an uncompiled temporal
+      contract → NO plan, with the named refusal — actionable, never governable.
+
+    The governed CROSS-catalog envelope (physical_plan_id + catalog fingerprints) remains the
+    3C.2a planner's job; this fold is the single-source half the semantic path serves today.
+    Returns (plan | None, refusal_codes)."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+
+    bound = {v.role: v.selected_ref for v in verdicts
+             if v.status == "bound" and v.selected_ref}
+    if not bound:
+        return None, (R.BINDING_NOT_BOUND,)
+    if story is None or story.cross_dataset:
+        return None, (R.RELATIONSHIP_REQUIRED,)
+    if temporal_blocker:
+        return None, (R.TEMPORAL_POLICY_UNRESOLVED,)
+    if story.population_ref is None:
+        return None, (R.POPULATION_DATASET_UNDECLARED,)
+    # Defensive divergence check: every bound ref's table must be one the dataset story saw.
+    read_set = tuple(sorted(bound.values()))
+    tables = set(story.dataset_tables)
+    for ref in read_set:
+        table = ref.split(".")[-2] if ref.count(".") >= 2 else ""
+        if table and table not in tables:
+            return None, (R.BINDING_PLAN_DIVERGENCE,)
+    window = dict(request.parameter_values).get("window")
+    return {
+        "plan_kind": "single_source",
+        "catalog_source": catalog_source,
+        "source_table": story.dataset_tables[0] if story.dataset_tables else "",
+        "population_ref": story.population_ref,
+        "read_set": list(read_set),
+        "role_bindings": {role: ref for role, ref in sorted(bound.items())},
+        "pit": pit_text,
+        "output_grain": request.output_grain,
+        "window": window,
+    }, ()
+
+
 def _variant_key(recipe_id: str, variant: dict) -> str:
     if not variant:
         return recipe_id
@@ -269,6 +318,12 @@ class V2RecipeCandidateV1:
     # SE-8 steps 2+3: the feature-level dataset decision (population + cross-dataset need),
     # folded from the frozen context's DECLARED facts. None only on legacy fixtures.
     dataset_story: DatasetStoryV1 | None = None
+    # B7: the FROZEN-BINDINGS plan — source/read-set/PIT/grain computed OVER the exact bound
+    # refs (built FROM the verdicts, so the planner can never choose different columns than
+    # the user saw). None = no plan exists yet (cross-dataset without a verified path,
+    # temporal blocked, or nothing bound) — the activation fold keeps create_contract blocked.
+    binding_plan: dict | None = None
+    plan_refusals: tuple = ()
     # B5: the variant identity — recipe_id + this candidate's exact parameter choice. Every
     # authored parameterization is its OWN candidate; the variant key is what capture, facts,
     # and option identity key on (recipe_id stays the DISPOSITION/review key).
@@ -372,7 +427,11 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             review_current=current,
             review_missing_roles=missing_roles,
             eligibility=eligibility,
-            dataset_story=fold_dataset_story(request, verdicts, context),
+            dataset_story=(story := fold_dataset_story(request, verdicts, context)),
+            binding_plan=(plan_and_refusals := fold_frozen_binding_plan(
+                request, verdicts, story, pit_text, temporal_blocker,
+                catalog_source))[0],
+            plan_refusals=plan_and_refusals[1],
             display_definition=recipe.business_definition,
             variant_key=_variant_key(recipe.recipe_id, variant),
             variant_primary=is_primary,
@@ -433,7 +492,10 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             review_current=False,
             review_missing_roles=(),
             eligibility=eligibility,
-            dataset_story=fold_dataset_story(request, verdicts, context),
+            dataset_story=(istory := fold_dataset_story(request, verdicts, context)),
+            binding_plan=(iplan := fold_frozen_binding_plan(
+                request, verdicts, istory, "", "", context.catalog_source))[0],
+            plan_refusals=iplan[1],
             display_definition=intent.business_definition,
             variant_key=request.source_definition_id))
     return tuple(candidates), rejections

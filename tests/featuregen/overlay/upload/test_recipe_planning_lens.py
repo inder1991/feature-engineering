@@ -463,3 +463,64 @@ def test_month_tokens_convert_to_banking_days():
     assert _hypothesis_window_tokens("churn within 3 months") == {90}
     assert _hypothesis_window_tokens("a 90-day window and 2 weeks") == {90, 14}
     assert _hypothesis_window_tokens("no windows here") == set()
+
+
+# ── B7: the plan validates the frozen bindings — it never chooses ───────────────────────────────
+
+def test_a_bound_single_source_candidate_carries_a_real_plan(db):
+    """The read set IS the bound refs — the exact columns the user saw — with population,
+    PIT, grain, and the chosen window. plan_envelope_present becomes a passable gate."""
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="a 90 day window")
+    bound = next(c for c in candidates
+                 if c.recipe_id == EXEMPLAR.recipe_id and c.binding_state == "bound"
+                 and c.variant_primary and not c.temporal_blocker)
+    plan = bound.binding_plan
+    assert plan is not None and plan["plan_kind"] == "single_source"
+    expected_reads = sorted(v.selected_ref for v in bound.verdicts
+                            if v.status == "bound" and v.selected_ref)
+    assert plan["read_set"] == expected_reads                  # verdicts ARE the read set
+    assert plan["role_bindings"] == {v.role: v.selected_ref for v in bound.verdicts
+                                     if v.status == "bound" and v.selected_ref}
+    assert plan["population_ref"] == "transactions"
+    assert plan["pit"] == bound.temporal_pit_text
+    assert plan["window"] == 90
+
+
+def test_divergence_and_cross_dataset_refuse_the_plan_never_substitute():
+    from types import SimpleNamespace
+
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        RequiredOperandV1,
+        planning_request_from_user_definition,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import OperandBindingVerdictV1
+    from featuregen.overlay.upload.recipe_planning_lens import (
+        DatasetStoryV1,
+        fold_frozen_binding_plan,
+    )
+
+    exemplar = v2_recipe_by_id("customer_activity_recency")
+    request = planning_request_from_user_definition(
+        definition_id="user:plan_probe", primary_objective=exemplar.primary_objective,
+        output=exemplar.output,
+        operands=(RequiredOperandV1(role="who", concept="customer_id",
+                                    operand_class="entity_key"),),
+        source_grain="transaction", output_grain="customer",
+        temporal=exemplar.temporal, content_hash="planhash")
+    verdicts = (OperandBindingVerdictV1(role="who", status="bound",
+                                        selected_ref="public.OTHER_TABLE.cust_id"),)
+    story = DatasetStoryV1(population_ref="customers", population_basis="declared_grain",
+                           dataset_tables=("customers",), cross_dataset=False, codes=())
+    plan, refusals = fold_frozen_binding_plan(request, verdicts, story, "pit", "", "bank")
+    assert plan is None
+    assert refusals == (R.BINDING_PLAN_DIVERGENCE,)            # a bound ref OUTSIDE the story
+
+    cross = DatasetStoryV1(population_ref="customers", population_basis="declared_grain",
+                           dataset_tables=("customers", "events"), cross_dataset=True,
+                           codes=(R.RELATIONSHIP_REQUIRED,))
+    plan, refusals = fold_frozen_binding_plan(request, verdicts, cross, "pit", "", "bank")
+    assert plan is None and refusals == (R.RELATIONSHIP_REQUIRED,)

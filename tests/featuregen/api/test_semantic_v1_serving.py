@@ -246,7 +246,7 @@ def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeyp
     assert frozen.binding_state == "bound"
     assert frozen.generation_source == "llm_intent"
     assert frozen.confirmation_required_roles
-    assert frozen.plan_envelope_present is False               # honest until B7
+    assert frozen.plan_envelope_present is True                # B7: the plan FOLDED here
     assert load_frozen_option_facts(
         conn, considered_revision_id=revision_id, option_id="opt_nope") is None
 
@@ -277,11 +277,13 @@ def test_draft_of_a_semantic_option_is_blocked_by_the_activation_policy(
     assert detail["code"] == "ACTIVATION_BLOCKED"
     assert detail["action"] == "create_contract"
     codes = {b["code"] for b in detail["blockers"]}
-    # The four truths about THIS option, all named at once:
+    # The remaining truths about THIS option, all named at once:
     assert "PROPOSED_METADATA_ONLY" in codes            # all-proposed metadata needs the funnel
     assert "CONCEPTUAL_PATTERN_NOT_AUTHORABLE" in codes  # a conceptual idea has no computation
-    assert "PHYSICAL_PLAN_MISSING" in codes             # honest until B7 wires the planner
     assert "SNAPSHOT_STALE_REGENERATE" in codes         # unverifiable snapshot FAILS CLOSED
+    # B7 flipped this gate from a wall into a door: the single-source frozen-bindings plan
+    # FOLDED for this candidate, so the plan blocker is honestly ABSENT now.
+    assert "PHYSICAL_PLAN_MISSING" not in codes
     assert all(b["next_step"] for b in detail["blockers"])
 
 

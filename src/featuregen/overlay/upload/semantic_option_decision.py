@@ -49,11 +49,16 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "outstanding_requirement_codes": sorted({req.code for req in idea.requirements}),
         "has_reviewed_formula_expectation": has_reviewed_expectation(candidate.recipe_id),
         "formula_expectation_revision": "",   # pinned when the formula seam mints one (Phase E)
-        "plan_envelope_present": False,       # honest until B7 wires the planner
+        # B7: a REAL gate now — True iff the frozen-bindings plan folded (single-source, bound,
+        # declared population, compiled temporal). The plan itself rides the story jsonb until
+        # D1 enriches the record with its own column.
+        "plan_envelope_present": candidate.binding_plan is not None,
         "dataset_story": ({"population_ref": candidate.dataset_story.population_ref,
                            "dataset_tables": list(candidate.dataset_story.dataset_tables),
                            "cross_dataset": candidate.dataset_story.cross_dataset,
-                           "codes": list(candidate.dataset_story.codes)}
+                           "codes": list(candidate.dataset_story.codes),
+                           "binding_plan": candidate.binding_plan,
+                           "plan_refusals": list(candidate.plan_refusals)}
                           if candidate.dataset_story is not None else {}),
         "policy_revision_pins": {"authority_matrix_hash": authority_matrix_hash()},
         "observation_id": observation_id,
