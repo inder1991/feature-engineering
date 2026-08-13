@@ -1834,16 +1834,8 @@ def select_and_record_gate1_choice(
     # from the revision's own public entries (the same name-match _chosen_feature_from_snapshot
     # used — ambiguity already failed closed above), so the activation fold can load the A1b
     # decision row for semantic options. Legacy pre-revision choices keep option_id None.
-    option_id = None
-    if revision_id is not None:
-        for feature_set in public.get("alternatives", []):
-            for entry in feature_set.get("features", []):
-                if entry.get("name") == chosen_option_id and entry.get("option_id"):
-                    option_id = entry["option_id"]
-        anchor_entry = public.get("anchor")
-        if (chosen_source == "anchor" and anchor_entry
-                and anchor_entry.get("name") == chosen_option_id):
-            option_id = anchor_entry.get("option_id")
+    option_id = (_option_id_from_public(public, chosen_source, chosen_option_id)
+                 if revision_id is not None else None)
     return DraftChoice(feature, lineage, revision_id, revision_hash, option_id=option_id)
 
 
@@ -1895,6 +1887,24 @@ def gate1_choice(conn, intent_id: str) -> dict | None:
     )
 
 
+def _option_id_from_public(public: dict, chosen_source: str,
+                           chosen_option_id: str) -> str | None:
+    """Recover the opaque option id for a name-addressed choice from the revision's OWN public
+    entries — same matching _chosen_feature_from_snapshot used; ambiguity already failed
+    closed there, so a lone surviving match is safe to key on."""
+    option_id = None
+    anchor_entry = public.get("anchor")
+    if chosen_source == "anchor":
+        if anchor_entry and anchor_entry.get("name") == chosen_option_id:
+            option_id = anchor_entry.get("option_id")
+        return option_id
+    for feature_set in public.get("alternatives", []):
+        for entry in feature_set.get("features", []):
+            if entry.get("name") == chosen_option_id and entry.get("option_id"):
+                option_id = entry["option_id"]
+    return option_id
+
+
 def recorded_gate1_draft_choice(conn, intent_id: str) -> DraftChoice | None:
     """Reload the chosen feature and lineage from the immutable revision recorded at draft time."""
     choice = gate1_choice(conn, intent_id)
@@ -1925,8 +1935,12 @@ def recorded_gate1_draft_choice(conn, intent_id: str) -> DraftChoice | None:
         raise Gate1Error("recorded choice revision hash mismatch")
     feature = _operand_roles_from_revision(revision, _chosen_feature_from_snapshot(
         revision["public"], choice["chosen_source"], choice["chosen_option_id"]))
+    # A2 slice 3: the CONFIRM path re-checks activation, so the reloaded choice carries the
+    # option id too (recovered exactly as the draft path recovers it).
+    option_id = _option_id_from_public(
+        revision["public"], choice["chosen_source"], choice["chosen_option_id"])
     return (
-        DraftChoice(feature, lineage, verified_id, verified_hash)
+        DraftChoice(feature, lineage, verified_id, verified_hash, option_id=option_id)
         if feature is not None
         else None
     )

@@ -1327,6 +1327,32 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     if recorded_choice is None:
         raise HTTPException(status_code=422,
                             detail="the chosen feature is not in the recorded considered set")
+    # A2 slice 3 — the confirm re-check (draft-then-confirm race defense): the SAME activation
+    # fold that gated the draft runs again at the GOVERNING write, over the same frozen
+    # decision row and a FRESH current-state re-read. A review revoked, a policy moved, or a
+    # snapshot drifted between draft and confirm blocks HERE, with the same typed shape.
+    if recorded_choice.considered_revision_id and recorded_choice.option_id:
+        from featuregen.overlay.upload.semantic_option_decision import (
+            assemble_current_activation_state,
+            load_frozen_option_facts,
+        )
+
+        frozen = load_frozen_option_facts(
+            conn, considered_revision_id=recorded_choice.considered_revision_id,
+            option_id=recorded_choice.option_id)
+        if frozen is not None:
+            current = assemble_current_activation_state(
+                conn, frozen=frozen,
+                snapshot_id=(recorded_choice.snapshot_lineage or {}).get("snapshot_id"))
+            decision = activation_decision(frozen, current, "create_contract",
+                                           actor=identity.subject)
+            if not decision.allowed:
+                raise HTTPException(status_code=409, detail={
+                    "code": "ACTIVATION_BLOCKED",
+                    "action": "create_contract",
+                    "blockers": [{"code": b.code, "next_step": b.next_step}
+                                 for b in decision.blockers],
+                })
     chosen = recorded_choice.feature
     draft = body.to_draft()
     if (draft.feature_name != chosen.name

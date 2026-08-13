@@ -280,3 +280,41 @@ def test_draft_of_a_semantic_option_is_blocked_by_the_activation_policy(
     assert "PHYSICAL_PLAN_MISSING" in codes             # honest until B7 wires the planner
     assert "SNAPSHOT_STALE_REGENERATE" in codes         # unverifiable snapshot FAILS CLOSED
     assert all(b["next_step"] for b in detail["blockers"])
+
+
+def test_confirm_re_checks_activation_even_when_a_choice_was_recorded(
+        make_client, conn, monkeypatch):
+    """A2 slice 3 — the race defense at the GOVERNING write: the draft route records the
+    Gate-1 choice BEFORE the fold blocks it, so a client could skip straight to /contract/
+    confirm with a hand-built draft body. The confirm re-check runs the SAME fold over the
+    same frozen decision row and blocks with the same typed shape — the governing write is
+    never softer than the draft."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    body = _post(client)
+    option = next(f for s_ in body["alternatives"] for f in s_["features"]
+                  if f.get("recipe_id"))
+
+    # Draft: blocked by the fold — but the choice row is recorded first (by design: the
+    # choice audit trail exists even for refused activations).
+    res = client.post("/contract/draft", json={
+        "intent_id": body["intent_id"],
+        "chosen_option_id": option["name"],
+        "expected_generation_run_id": body["generation_run_id"],
+    }, headers=AUTH)
+    assert res.status_code == 409
+
+    # Straight to confirm with a hand-built draft body: the re-check blocks identically.
+    res = client.post("/contract/confirm", json={
+        "feature_name": option["name"],
+        "definition": "hand-built definition smuggled past the draft",
+        "derives_from": option.get("derives_from", []),
+        "intent_id": body["intent_id"],
+    }, headers=AUTH)
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "ACTIVATION_BLOCKED"
+    assert detail["action"] == "create_contract"
+    assert {b["code"] for b in detail["blockers"]} >= {
+        "PROPOSED_METADATA_ONLY", "CONCEPTUAL_PATTERN_NOT_AUTHORABLE"}

@@ -126,7 +126,7 @@ def get_feature(conn, feature_id: str, *, roles: Iterable[str] = ()) -> dict | N
     so the registry can't be used to enumerate where restricted/PII columns live."""
     row = conn.execute(
         "SELECT feature_id, name, description, grain_table, aggregation, as_of_column, verification, "
-        "created_at FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
+        "created_at, lifecycle_state FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
     if row is None:
         return None
     derives = conn.execute(
@@ -137,6 +137,7 @@ def get_feature(conn, feature_id: str, *, roles: Iterable[str] = ()) -> dict | N
     return {"feature_id": row[0], "name": row[1], "description": row[2], "grain_table": row[3],
             "aggregation": row[4], "as_of_column": row[5], "verification": row[6],
             "created_at": row[7].isoformat(),
+            "lifecycle_state": row[8], "governed": row[8] == "governed",
             "derives_from": [{"catalog_source": d[0], "object_ref": d[1]} for d in derives]}
 
 

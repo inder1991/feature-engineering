@@ -227,6 +227,16 @@ losing shortlist, plan envelope, decision manifest) — it does not create it.
 revision; A2's facts assembler reads ONLY this row + the revision (test stubs FeatureIdea-only
 paths to explode).
 
+> **ACCEPTED `eafda5dc` (2026-08-13).** Migration 1063 + `semantic_option_decision.py`:
+> append-only rows keyed UNIQUE (revision, option) with exact observation_id links (LIFE-03
+> closed at the store level); facts captured at serving time with HONEST origin (the frozen
+> row says llm_intent while the wire still says recipe — activation never inherits GEN-05);
+> `load_frozen_option_facts` → FrozenOptionFactsV1; persist only on the actual revision INSERT.
+> `persist_semantic_candidates` returns {definition_id: observation_id}. API round-trip test +
+> append-only guard. Suite 10894. NOTE for A2: on the small test fixture no RECIPE serves all
+> the way to a card (1 bound candidate blocked pre-serving) — the E0 walkthrough fixture must
+> be richer so a recipe path exercises create_contract; the intent path covers save_idea.
+
 ### Task A2 — wire the policy into every durable route (1–2 days)
 
 *Modify:* `api/routes/features.py`, `api/routes/contract.py` (draft + confirm),
@@ -246,6 +256,24 @@ paths to explode).
    registered as a model consumer — hard refusal + test), `features_for_consumer`, lineage /
    drift-impact queries, feature-detail. Ideas are visible where humans browse, labeled;
    invisible where models consume.
+
+> **SLICE 1 ACCEPTED `982e6ff8` (2026-08-13).** Migration 1064 (deliberate backfill:
+> has-current-contract → governed, else idea; no column default), `register_feature` mandatory
+> closed `lifecycle_state` kwarg, POST /features → idea with honest response, govern.py confirm
+> = the ONLY governed minting, `IdeaNotConsumableError` → typed 409 with nothing written,
+> registry rows labeled. Every raw seeder/caller updated explicitly (five test seeders → idea,
+> governance-queue seeder → governed with reasons, consumer-mechanics fixtures flipped with
+> comments). Suite 10896; eval green.
+>
+> **SLICE 2 ACCEPTED `0759a168` (2026-08-13).** `assemble_current_activation_state` (review
+> revalidated at the frozen revision; policy-pin drift = regenerate; absent snapshot =
+> unverifiable = fails closed); /contract/draft runs the fold for every option with a
+> decision row → typed 409 ACTIVATION_BLOCKED with all blockers + next steps (legacy options
+> keep the standalone drift check until B1/E4); the verified-revision choice path recovers
+> option ids so the fold reaches every scope-execution mode; negative-path test proves the
+> served intent option blocks with all four truths named. Suite 10897. REMAINING (slice 3):
+> confirm re-check (race defense), formula/materialization boundary calls, deeper read-path
+> labeling (features_for_consumer, lineage/impact).
 3. `/contract/draft`: assemble `OptionActivationFactsV1` from the verified revision option
    (+ the stored `semantic_option_decision` once D1 lands; until then from the option's
    FeatureIdea fields — binding/confirmation/validation are already on the wire there) and call
@@ -491,6 +519,44 @@ flips from expected-blocked-always to conditionally-allowed).
 revision out with verdicts and a fresh option id; a column-naming instruction ("use cust_num")
 does not smuggle a binding (hint at most); the legacy modes byte-identical.
 
+### Task B10 — the unit-of-analysis (spine) is a human decision (1–1½ days)
+
+*User steer 2026-08-13: "make it explicit — human verifies the UOA based on the target."*
+*Verified gap: `ConfirmedScope.target_entity` is documented as "a grain nudge (never a
+reject)" feeding only a soft ranking signal; NOTHING compares a candidate's `output_grain` to
+it; no spine table is ever named or confirmed.*
+
+*Modify:* `contract/intake_ticket.py` (UOA derivation), `taxonomy/applicability.py`
+(ConfirmedScope), `api/routes/contract.py` (scope confirm), `recipe_planning_lens.py` +
+`semantic_eligibility_reasons.py` (the fold), `activation_policy.py` +
+`semantic_option_decision.py` (frozen facts), Workbench scope screen, E0.
+
+1. **Derive the proposal from the signed target**: the target column's table + that table's
+   DECLARED grain entity (churn_flag on bo_cib_customer keyed by cust_num → "you are
+   predicting per CUSTOMER; spine = bo_cib_customer via cust_num"). Contradiction warning
+   when the recognizer's target_entity disagrees with the target table's grain entity —
+   surfaced, never silently resolved.
+2. **The human confirms it as a YES/NO on the derived proposal** — "You're predicting per
+   CUSTOMER (spine: bo_cib_customer via cust_num) — correct?" Yes = one click. No = pick from
+   the catalog's REALISTIC alternatives only: the entities that actually have a declared-grain
+   spine table in scope (Customer via cust_num, Account via acct_ref, …) — a short closed
+   list derived from the catalog, NEVER a free-text box (user refinement 2026-08-13). Same
+   show-doesn't-gate pattern as the target. `ConfirmedScope` gains `uoa_entity` + `spine_ref`
+   (CONFIRMED values; `target_entity` remains the recognizer's soft proposal input).
+3. **The engine consumes it**: a candidate whose `output_grain` ≠ the confirmed UOA lands in
+   the ACTIONABLE section with new closed code `UOA_MISMATCH` and the honest resolution
+   ("this computes per account — your unit of analysis is customer; roll it up via a
+   customer-grain recipe or change the confirmed UOA"). The dataset story's population must
+   be the confirmed spine or verifiably joinable to it — the population blocker names the
+   spine, not a guess.
+4. **Activation freezes it**: the decision row gains `output_grain` + the confirmed UOA at
+   generation; `create_contract` blocks on mismatch. A UOA changed after generation is
+   ACTIVATION_STATE_DRIFTED (regenerate).
+
+*Acceptance:* an account-grain candidate under a confirmed customer UOA is actionable (never
+silently served as ready), with the roll-up resolution; the spine confirmation click appears
+in the E0 walkthrough; changing the UOA post-generation blocks drafting with the drift code.
+
 ### Task B8 — readiness probe before spend (½ day)
 
 *Modify:* `api/routes/contract.py` (scoped route step 4–5), `gate1.py`.
@@ -618,6 +684,59 @@ namespace-mates from the registry, content-hashed into the context), `recipe_ope
 descendant concept and eligibility still refuses a mismatched meaning; closure changes move the
 context hash.
 
+### Task C9 — history requirements per catalog: declared, listed, confirmed (1½ days)
+
+*User steer 2026-08-13: "the history requirements per catalog should be listed and confirmed
+with human at some stage in the process."*
+*Verified gap: NO declared history-depth fact exists anywhere — the only defense is the
+runtime EVENT_HISTORY_VERIFICATION check, so a 180-day feature over 13 months of data and one
+over 13 DAYS look identical until someone runs the data check.*
+
+*Modify:* `generation_semantic_context.py` (table_facts v3→v4 + pin test),
+`column_capabilities.py`, `semantic_eligibility.py` + reasons, the governance funnel
+(SE-4b pattern) + a listing API/section, tests. Mechanism = the SE-8p2 dataset-axis template,
+reused exactly: a TABLE-level fact with its own evidence authority.
+
+*Steer refinement (user, 2026-08-13): "we don't have such things in governance and we want
+to keep this info OPTIONAL — most business users won't have this technical info." This also
+catches a design error in the first draft: "undeclared → provisional" would demote candidates
+for missing OPTIONAL metadata, violating invariant 6 (missing ≠ contradictory). Corrected:*
+
+1. **The fact is OPTIONAL, with TWO entry points and a valid third of "never"** (user
+   refinement 2026-08-13): (a) AT UPLOAD — an optional field in the upload manifest lands as
+   `source/declared` with zero extra clicks; (b) ANY LATER TIME — the optional governance
+   panel writes `human/confirmed`; (c) never — permanently fine. A correction is a new,
+   stronger evidence row (append-only), never an overwrite. An `llm/proposed` depth clears
+   NOTHING. Nobody is ever REQUIRED to provide it.
+2. **Absence changes nothing**: no depth declared → the candidate keeps EXACTLY today's
+   behavior — eligible, with the runtime EVENT_HISTORY_VERIFICATION data check as its named
+   homework (which already exists on every event anchor). At most a presentation-only
+   `history_depth_absent` marker rides `missing_context` — never a status change, never a
+   blocker, never a new to-do pushed at a business user.
+3. **Only a KNOWN contradiction bites**: when someone DID declare a depth and the variant's
+   window exceeds it (W > D at declared-or-better authority) → **blocked**
+   `HISTORY_DEPTH_INSUFFICIENT` ("reduce the window or extend the source's history") — with
+   B5's variants this is surgical: the 180-day variant blocks, the 30-day variant of the SAME
+   recipe stays eligible. Declaring MORE information can only make the engine smarter, never
+   the workflow harder.
+4. **The LISTING is an optional enrichment panel, not a gate**: a per-catalog "How far back
+   does this data go?" section — business phrasing, never the column name — computed from the
+   applicable recipes/variants (per event table: the MAX window any applicable variant needs,
+   beside whatever is declared and by whom): "transactions — features here look back up to
+   180 days; source says 400 days ✓ / accounts — features look back 90 days; not stated —
+   add it if you know". Answering is one optional click that writes the evidence row;
+   ignoring the panel costs nothing. No funnel to-do count, no walkthrough requirement.
+5. **Runtime honesty unchanged**: the gauntlet's EVENT_HISTORY_VERIFICATION stays on every
+   bound event anchor — declared depth is a claim about intent; the data check verifies the
+   rows actually reach that far.
+
+*Acceptance:* the banking battery gains BOTH directions — window-exceeds-declared-depth
+blocks at declared+ (proposed never blocks), and an UNDECLARED depth leaves the candidate's
+status byte-identical to today (only the runtime check named); the listing endpoint returns
+the computed requirements beside declared values; an optional confirm writes the evidence row
+and a previously-blocked variant clears on regenerate. NOT in the E0 mandatory walkthrough —
+it appears only as an optional branch.
+
 ### Task C8 — prose physical-reference detector (½ day)
 
 *Modify:* `feature_intent.py`, tests.
@@ -714,7 +833,9 @@ its real surface:
    assert the target candidate is served with `create_contract` BLOCKED, codes
    `PROPOSED_METADATA_ONLY` + `RECIPE_REVIEW_NOT_CURRENT` (+ `PHYSICAL_PLAN_MISSING` until B7);
 2. confirm the concept through the REAL funnel route; record a review through the REAL
-   `POST /recipes/{id}/reviews`; regenerate;
+   `POST /recipes/{id}/reviews`; confirm the UOA/spine at scope (B10 — plain-English, one
+   click); regenerate. (C9's history panel is OPTIONAL enrichment — exercised as a branch,
+   never a required step);
 3. assert `create_contract` now ALLOWED → draft → confirm → feature registered with
    `lifecycle_state='governed'` and the contract carrying `FORMULA_BLOCKED` readiness honestly;
 4. assert `materialize` refused with the typed code;
@@ -787,7 +908,8 @@ B1 ◄──────────┘ (A2's negative tests make B1's serving c
 B2, B3, B4 — independent, parallel after B1
 B6 ──► B5 (batching lands FIRST — variant expansion must never create a 936-candidate N+1)
 B6 ──► B7 (the planner consumes the batched capability universe)
-B8 — independent; B9 after B4 (refine revises honest-origin intents)
+B8 — independent; B9 after B4 (refine revises honest-origin intents); B10 after B2 (intake owns the derivation)
+C9 parallel after C1 (it reuses the SE-8p2 table-fact mechanism, not the resolver)
 C1 ──► C2 ──► (A2 materialize flips floor-driven)
 C3, C4, C5, C6, C7, C8 — parallel after C1
 D1 ──► D2 ──► D3; D4 after D1
