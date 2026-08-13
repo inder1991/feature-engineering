@@ -18,9 +18,9 @@ from featuregen.idgen import mint_id
 
 def persist_semantic_candidates(conn, *, generation_run_id: str, context,
                                 candidates) -> dict[str, str]:
-    """Append one observation per candidate; returns {source_definition_id: observation_id}
-    so callers can LINK derived records (the A1b option decision) to the exact row — never
-    "newest for the definition" (LIFE-03's wrong-row defect)."""
+    """Append one observation per candidate; returns {variant_key: observation_id} (the
+    variant key falls back to the recipe id when a candidate has no parameters) so callers
+    LINK derived records to the exact row — never "newest for the definition" (LIFE-03)."""
     from psycopg.types.json import Jsonb
 
     from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
@@ -46,7 +46,9 @@ def persist_semantic_candidates(conn, *, generation_run_id: str, context,
             " source_definition_id, planning_request_hash, relationship, binding_state, "
             " readiness, review_current, temporal_blocked, verdicts, eligibility, policy_hashes) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (observation_ids.setdefault(candidate.recipe_id, mint_id("sco")),
+            (observation_ids.setdefault(
+                getattr(candidate, "variant_key", "") or candidate.recipe_id,
+                mint_id("sco")),
              generation_run_id, context.catalog_source, context_hash,
              candidate.planning_request.origin, candidate.recipe_id,
              candidate.planning_request_hash, candidate.relationship,

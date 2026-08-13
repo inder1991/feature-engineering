@@ -949,7 +949,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
 
         v2_candidates = v2_recipe_candidates(
             conn, catalog_source=catalog_source, roles=roles, scope=scope,
-            context=semantic_context)
+            context=semantic_context, redacted_hypothesis=intent.redacted_hypothesis)
         # SE-6 wire-up: the LLM proposes ABSTRACT intents (one audited structured call over the
         # physically-blind capability inventory) and the SAME binder decides which columns
         # serve. Recipe and intent candidates assemble TOGETHER — the semantic signature merges
@@ -967,7 +967,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                 intent_cands, intent_rejections = llm_intent_candidates(
                     conn, client, context=semantic_context,
                     scope_leaves=_intent_scope_leaves(scope),
-                    redacted_hypothesis=intent.redacted_hypothesis,
+                    redacted_hypothesis=(
+                        intent.redacted_hypothesis
+                        + (f"\n\nHuman feedback on the previous round: {feedback}"
+                           if feedback else "")),
                     actor=actor_envelope,
                     confirmed_scope_hash=_confirmed_scope_hash(scope))
                 all_candidates.extend(intent_cands)
@@ -989,7 +992,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             decision_facts_for_candidate,
         )
 
-        candidates_by_id = {c.recipe_id: c for c in all_candidates}
+        candidates_by_id = {(c.variant_key or c.recipe_id): c for c in all_candidates}
         context_hash_value = (semantic_context.context_hash()
                               if semantic_context is not None else "")
         semantic_decision_facts = {

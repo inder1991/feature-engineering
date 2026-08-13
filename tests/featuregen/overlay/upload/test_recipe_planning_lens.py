@@ -100,9 +100,16 @@ def test_candidates_carry_the_complete_gate1_data(db):
     scope = ConfirmedScope(primary=EXEMPLAR.primary_objective)
     candidates = v2_recipe_candidates(db, catalog_source=SOURCE, scope=scope)
     # The exemplar is the ONE primary at this objective and therefore ordered FIRST; the
-    # supporting recipes (secondary-objective matches) follow it, never precede it.
+    # supporting recipes (secondary-objective matches) follow it, never precede it. B5: each
+    # recipe now yields one candidate PER authored variant — the exemplar's variants lead as
+    # a block, then supporting recipes' variants.
     assert candidates[0].recipe_id == EXEMPLAR.recipe_id
-    assert all(c.relationship == "supporting" for c in candidates[1:])
+    exemplar_block = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
+    assert list(candidates[:len(exemplar_block)]) == exemplar_block   # tuple vs list
+    assert sum(1 for c in exemplar_block if c.variant_primary) == 1   # exactly one primary
+    assert len({c.variant_key for c in exemplar_block}) == len(exemplar_block)
+    assert all(c.relationship == "supporting"
+               for c in candidates[len(exemplar_block):])
     candidate = candidates[0]
     assert candidate.relationship == "primary"
     assert candidate.recipe_revision_hash == canonical_recipe_v2_hash(EXEMPLAR)
@@ -387,7 +394,10 @@ def test_a_full_unscoped_run_is_two_queries_with_a_prebuilt_context(db):
             context=context)
     finally:
         db.execute = original
-    assert len(candidates) == len(V2_RECIPES)
+    # B5: one candidate per authored VARIANT (~940) — and the query count is STILL 2:
+    # variant expansion multiplies folds, never reads (the whole point of B6-before-B5).
+    assert len(candidates) > len(V2_RECIPES)
+    assert len({c.recipe_id for c in candidates}) == len(V2_RECIPES)
     assert len(calls) == 2, calls
 
 
@@ -415,3 +425,41 @@ def test_the_batched_fold_is_byte_identical_to_the_per_request_path(db):
         verdicts, eligibility = bind_planning_request(db, request, context)
         assert verdicts == candidate.verdicts, candidate.recipe_id
         assert eligibility == candidate.eligibility, candidate.recipe_id
+
+
+# ── B5: parameter variants — enumerated, hypothesis-matched, honestly labeled ───────────────────
+
+def test_a_90_day_hypothesis_leads_with_the_90_day_variant(db):
+    """GEN-03 closed: the exemplar authors window ∈ (30, 90, 180). A hypothesis naming
+    "90 days" makes the 90-day variant PRIMARY (deterministic token match, no LLM); all three
+    variants exist as distinct candidates with distinct keys and hashes; the card names its
+    alternatives with the chosen value bracketed."""
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="balances decline over 90 days before churn")
+    block = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
+    assert len(block) == 3
+    primary = next(c for c in block if c.variant_primary)
+    assert dict(primary.planning_request.parameter_values)["window"] == 90
+    assert primary.variant_key == f"{EXEMPLAR.recipe_id}@window=90"
+    assert "30/[90]/180" in primary.param_alternatives
+    assert len({c.planning_request_hash for c in block}) == 3   # variants are IDENTITY
+
+
+def test_no_window_token_leads_with_the_authored_first_value(db):
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE, scope=ConfirmedScope(primary=EXEMPLAR.primary_objective),
+        redacted_hypothesis="customers with declining balances churn")
+    block = [c for c in candidates if c.recipe_id == EXEMPLAR.recipe_id]
+    primary = next(c for c in block if c.variant_primary)
+    assert dict(primary.planning_request.parameter_values)["window"] == 30   # authored-first
+
+
+def test_month_tokens_convert_to_banking_days():
+    from featuregen.overlay.upload.recipe_planning_lens import _hypothesis_window_tokens
+
+    assert _hypothesis_window_tokens("churn within 3 months") == {90}
+    assert _hypothesis_window_tokens("a 90-day window and 2 weeks") == {90, 14}
+    assert _hypothesis_window_tokens("no windows here") == set()

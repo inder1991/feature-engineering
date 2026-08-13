@@ -137,7 +137,8 @@ def _served_idea(assembled, validation, *, catalog_source: str,
         generation_source=generation_source,
         candidate_status=candidate_status,
         recipe_id=(candidate.recipe_id if request.origin == "recipe_v2" else None),
-        source_definition_id=candidate.recipe_id,
+        source_definition_id=(getattr(candidate, "variant_key", "")
+                              or candidate.recipe_id),
         input_role_bindings=_role_bindings(candidate, catalog_source),
         operand_roles=tuple(sorted(
             (v.selected_ref, v.role) for v in candidate.verdicts

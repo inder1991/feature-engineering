@@ -156,6 +156,75 @@ def v2_applicability_as_result(scope: ConfirmedScope):
         reason_codes={rid: reasons[rel] for rid, rel in v2.by_recipe.items()})
 
 
+_WINDOW_TOKEN = None  # compiled lazily
+
+
+def _hypothesis_window_tokens(redacted_hypothesis: str) -> set:
+    """Deterministic token pass (B5 — no LLM): the integer day-counts a hypothesis names.
+    "90-day", "90 day", "90d" → {90}; "3 months" → {90} (banking-calendar 30-day months)."""
+    import re
+    global _WINDOW_TOKEN
+    if _WINDOW_TOKEN is None:
+        _WINDOW_TOKEN = re.compile(
+            r"(\d+)\s*-?\s*(day|days|d\b|week|weeks|month|months)", re.IGNORECASE)
+    tokens: set = set()
+    for number, unit in _WINDOW_TOKEN.findall(redacted_hypothesis or ""):
+        factor = {"week": 7, "weeks": 7, "month": 30, "months": 30}.get(unit.lower(), 1)
+        tokens.add(int(number) * factor)
+    return tokens
+
+
+def _variant_axes(recipe):
+    """The enumerable parameters: everything except governed_policy references (those are
+    reviewed policies, never free literals to sweep)."""
+    return [p for p in recipe.parameters
+            if p.parameter_class != "governed_policy" and p.allowed_values]
+
+
+def _enumerate_variant_requests(ordered, redacted_hypothesis: str):
+    """B5 (GEN-03 closed): every authored parameterization is its OWN planning request —
+    bounded by the registry's authoring (≈940 total). The PRIMARY variant per recipe is the
+    deterministic hypothesis match (a "90 day" hypothesis leads with the 90-day variant) or
+    the authored-first values when nothing matches. Binding cost is folds, not queries (B6)."""
+    from itertools import product
+
+    tokens = _hypothesis_window_tokens(redacted_hypothesis)
+    out = []
+    for recipe in ordered:
+        axes = _variant_axes(recipe)
+        if not axes:
+            out.append((recipe, planning_request_from_recipe(recipe), {}, True))
+            continue
+        combos = [dict(zip((p.name for p in axes), values))
+                  for values in product(*(p.allowed_values for p in axes))]
+        primary = combos[0]                                   # authored-first default
+        for combo in combos:
+            if any(isinstance(v, int) and v in tokens for v in combo.values()):
+                primary = combo
+                break
+        for combo in combos:
+            out.append((recipe, planning_request_from_recipe(recipe, parameter_values=combo),
+                        combo, combo == primary))
+    return out
+
+
+def _variant_key(recipe_id: str, variant: dict) -> str:
+    if not variant:
+        return recipe_id
+    slug = ";".join(f"{k}={variant[k]}" for k in sorted(variant))
+    return f"{recipe_id}@{slug}"
+
+
+def _param_alternatives_text(recipe, variant: dict) -> str:
+    """The card's honest 'also available' line: every axis with the CHOSEN value bracketed."""
+    parts = []
+    for p in _variant_axes(recipe):
+        chosen = variant.get(p.name)
+        rendered = "/".join(f"[{v}]" if v == chosen else str(v) for v in p.allowed_values)
+        parts.append(f"{p.name}: {rendered}")
+    return "; ".join(parts)
+
+
 def fold_binding_state(verdicts: tuple[OperandBindingVerdictV1, ...],
                        definition: RecipeDefinitionV2) -> str:
     """The candidate-level state, fail-closed in severity order: any BLOCKED required operand
@@ -200,6 +269,12 @@ class V2RecipeCandidateV1:
     # SE-8 steps 2+3: the feature-level dataset decision (population + cross-dataset need),
     # folded from the frozen context's DECLARED facts. None only on legacy fixtures.
     dataset_story: DatasetStoryV1 | None = None
+    # B5: the variant identity — recipe_id + this candidate's exact parameter choice. Every
+    # authored parameterization is its OWN candidate; the variant key is what capture, facts,
+    # and option identity key on (recipe_id stays the DISPOSITION/review key).
+    variant_key: str = ""
+    variant_primary: bool = True
+    param_alternatives: str = ""
     # B4: the candidate's own business definition for the card — recipes carry the authored
     # business_definition, intents carry the model's. DISPLAY ONLY: deliberately not on the
     # planning request, whose hash is field-exhaustive (prose must never be identity).
@@ -232,6 +307,7 @@ def _compile_temporal(definition: RecipeDefinitionV2) -> tuple[str, str]:
 
 def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
                          scope: ConfirmedScope, context=None,
+                         redacted_hypothesis: str = "",
                          ) -> tuple[V2RecipeCandidateV1, ...]:
     """Assemble every eligible recipe's candidate data for one catalog, primary first then
     authored registry order — deterministic, no score. Binding runs through the SHARED
@@ -266,15 +342,15 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
         review_validity,
     )
 
-    requests = [(recipe, planning_request_from_recipe(recipe)) for recipe in ordered]
+    requests = _enumerate_variant_requests(ordered, redacted_hypothesis)
     union_refs = list(dict.fromkeys(
-        ref for _recipe, request in requests
+        ref for _recipe, request, _variant, _primary in requests
         for refs in request_shortlists(request, context).values() for ref in refs))
     capabilities = compile_capabilities(conn, context, union_refs)
     events_by_recipe = review_events_all(conn)
 
     candidates: list[V2RecipeCandidateV1] = []
-    for recipe, request in requests:
+    for recipe, request, variant, is_primary in requests:
         verdicts, eligibility = bind_with_capabilities(conn, request, context, capabilities)
         revision_hash = canonical_recipe_v2_hash(recipe)
         pit_text, temporal_blocker = _compile_temporal(recipe)
@@ -297,7 +373,10 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             review_missing_roles=missing_roles,
             eligibility=eligibility,
             dataset_story=fold_dataset_story(request, verdicts, context),
-            display_definition=recipe.business_definition))
+            display_definition=recipe.business_definition,
+            variant_key=_variant_key(recipe.recipe_id, variant),
+            variant_primary=is_primary,
+            param_alternatives=_param_alternatives_text(recipe, variant)))
     return tuple(candidates)
 
 
@@ -355,7 +434,8 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
             review_missing_roles=(),
             eligibility=eligibility,
             dataset_story=fold_dataset_story(request, verdicts, context),
-            display_definition=intent.business_definition))
+            display_definition=intent.business_definition,
+            variant_key=request.source_definition_id))
     return tuple(candidates), rejections
 
 
