@@ -278,3 +278,138 @@ def test_new_operand_spec_fields_are_hash_bearing():
         for op in PROBE_RECIPE.operands)
     assert (canonical_recipe_v2_hash(PROBE_RECIPE)
             != canonical_recipe_v2_hash(replace(PROBE_RECIPE, operands=demanding)))
+
+
+# ── C6: rank before truncating — authority wins over position ──────────────────────────────────
+
+def _wide_catalog(db, n: int = 25):
+    """N same-concept amount columns; the LAST one (index 20+ in ref order) gets the human
+    confirmation. Pre-C6 the stable-ref cut at 16 dropped it before anyone looked."""
+    rows = [(CanonicalRow(SOURCE, "transactions", "acct_ref", "integer", is_grain=True,
+                          entity="Account"), "account_id"),
+            (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp"),
+             "event_timestamp"),
+            (CanonicalRow(SOURCE, "transactions", "dc_flag", "text"),
+             "debit_credit_indicator")]
+    for i in range(n):
+        rows.append((CanonicalRow(SOURCE, "transactions", f"amt_{i:02d}", "numeric",
+                                  additivity="additive", currency="USD"), "monetary_flow"))
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+
+
+def _confirm_concept(db, object_ref: str, concept: str) -> None:
+    logical = logical_ref_of(db, SOURCE, object_ref)
+    record_field_evidence(
+        db, logical_ref=logical, field_name="concept", proposed_value=concept,
+        producer="human", strength="confirmed", producer_ref="user:sme",
+        source_snapshot_id="snap-test",
+        input_hash=field_input_hash(logical_ref=logical, field_name="concept",
+                                    material=concept))
+
+
+def _bind_probe(db):
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    request = planning_request_from_recipe(PROBE_RECIPE)
+    return bind_planning_request(db, request, context)
+
+
+def test_a_confirmed_column_at_index_20_of_25_wins_the_shortlist(db):
+    """C6's acceptance: authority ranks BEFORE the cut, so the human-confirmed column deep
+    in ref order enters the shortlist and WINS — and the verdict records the truncation."""
+    _wide_catalog(db, 25)
+    _confirm_concept(db, "public.transactions.amt_20", "monetary_flow")
+    verdicts, eligibility = _bind_probe(db)
+    amount = next(v for v in verdicts if v.role == "amount")
+    assert amount.status == "bound"
+    assert amount.selected_ref == "public.transactions.amt_20"
+    assert amount.shortlist_truncated is True
+
+
+def test_truncation_survives_to_the_observation_row(db):
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+        planning_request_hash,
+    )
+    from featuregen.overlay.upload.recipe_planning_lens import V2RecipeCandidateV1
+    from featuregen.overlay.upload.semantic_candidate_store import (
+        persist_semantic_candidates,
+    )
+
+    _wide_catalog(db, 25)
+    _confirm_concept(db, "public.transactions.amt_20", "monetary_flow")
+    verdicts, eligibility = _bind_probe(db)
+    request = planning_request_from_recipe(PROBE_RECIPE)
+    candidate = V2RecipeCandidateV1(
+        recipe_id=PROBE_RECIPE.recipe_id, relationship="primary",
+        planning_request=request, planning_request_hash=planning_request_hash(request),
+        recipe_revision_hash="rev", verdicts=verdicts,
+        binding_state="bound", readiness="FORMULA_BLOCKED",
+        temporal_pit_text="pit", temporal_blocker="",
+        review_current=False, review_missing_roles=(), eligibility=eligibility)
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    persist_semantic_candidates(
+        db, generation_run_id="fgr_c6_probe", context=context, candidates=[candidate])
+    rows = db.execute(
+        "SELECT verdicts FROM semantic_candidate_observation "
+        "WHERE generation_run_id = 'fgr_c6_probe'").fetchall()
+    assert rows
+    stored = [v for row in rows for v in row[0] if v["role"] == "amount"]
+    assert stored and stored[0]["shortlist_truncated"] is True
+
+
+def test_the_hint_promotes_an_eligible_ref_and_cannot_promote_a_blocked_one(db):
+    """C6 rule 4: the user's binding hint is a RANKING signal — it orders retrieval among
+    peers; it never overrides eligibility (a blocked column stays blocked, hinted or not)."""
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        RequiredOperandV1,
+        planning_request_from_user_definition,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    _wide_catalog(db, 25)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    exemplar = PROBE_RECIPE.operands[1]
+    request = planning_request_from_user_definition(
+        definition_id="user:hint_probe", primary_objective=PROBE_RECIPE.primary_objective,
+        output=PROBE_RECIPE.output,
+        operands=(RequiredOperandV1(
+            role="amount", concept="monetary_flow", operand_class="measure",
+            unit_expectation=exemplar.unit_expectation,
+            binding_hint_refs=("public.transactions.amt_22",)),),
+        source_grain="transaction", output_grain="account",
+        temporal=PROBE_RECIPE.temporal, content_hash="hinthash")
+    verdicts, _ = bind_planning_request(db, request, context)
+    amount = next(v for v in verdicts if v.role == "amount")
+    assert amount.status == "bound"
+    assert amount.selected_ref == "public.transactions.amt_22", \
+        "equal-authority peers — the user's hint orders retrieval"
+
+    # The hinted ref is structurally BLOCKED (an identifier hinted as a measure): the hint
+    # cannot promote it — eligibility still decides.
+    request2 = planning_request_from_user_definition(
+        definition_id="user:hint_probe2", primary_objective=PROBE_RECIPE.primary_objective,
+        output=PROBE_RECIPE.output,
+        operands=(RequiredOperandV1(
+            role="amount", concept="monetary_flow", operand_class="measure",
+            alternative_concepts=("account_id",),
+            binding_hint_refs=("public.transactions.acct_ref",)),),
+        source_grain="transaction", output_grain="account",
+        temporal=PROBE_RECIPE.temporal, content_hash="hinthash2")
+    verdicts, _ = bind_planning_request(db, request2, context)
+    amount = next(v for v in verdicts if v.role == "amount")
+    assert amount.selected_ref != "public.transactions.acct_ref"

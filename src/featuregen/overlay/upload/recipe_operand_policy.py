@@ -139,6 +139,9 @@ class OperandBindingVerdictV1:
     tie_break_verdict_ref: str | None = None
     reason_codes: tuple[str, ...] = ()
     resolution: str = ""
+    # C6: this operand's shortlist was CUT at the per-operand bound after authority ranking —
+    # the audit fact that says "the search was bounded", persisted with the observation.
+    shortlist_truncated: bool = False
 
 
 def governed_economic_role(conn, catalog_source: str, object_ref: str) -> str | None:
@@ -372,6 +375,13 @@ def bind_v2_operands(conn, definition, *, catalog_source: str,
 MAX_CANDIDATES_PER_OPERAND = 16
 MAX_BINDING_ASSIGNMENTS = 4096
 
+#: C6 retrieval ranking — authority tiers, strongest first. Retrieval ORDER only: eligibility
+#: still decides every survivor exactly; an unknown authority ranks last, never errors.
+_AUTHORITY_RANK: dict[str, int] = {
+    "human/confirmed": 6, "source/attested": 5, "source/declared": 4,
+    "human/proposed": 3, "llm/proposed": 2, "graph_hint": 1, "absent": 0,
+}
+
 
 def bind_planning_request(conn, request, context):
     """Bind every operand of one planning request against one frozen context, fail-closed.
@@ -403,7 +413,11 @@ def request_shortlists(request, context) -> dict[str, tuple[str, ...]]:
         for concept_name in (operand.concept, *operand.alternative_concepts):
             refs.extend(index.get(concept_name, ()))
         deduped = list(dict.fromkeys(refs))
-        shortlists[operand.role] = tuple(deduped[:MAX_CANDIDATES_PER_OPERAND])
+        # C6: NO blind cut here — the per-operand bound applies AFTER authority ranking (in
+        # bind_with_capabilities, where the evidence pins exist). A pre-ranking cut in stable
+        # ref order silently dropped a human-confirmed column at index 20 of 25. The
+        # assignments cap stays as the safety bound retrieval can never exceed.
+        shortlists[operand.role] = tuple(deduped[:MAX_BINDING_ASSIGNMENTS])
     return shortlists
 
 
@@ -419,10 +433,29 @@ def bind_with_capabilities(conn, request, context, capabilities):
     verdicts: list[OperandBindingVerdictV1] = []
     bound_by_group: dict[str, list[tuple[str, OperandBindingVerdictV1]]] = {}
 
+    hint_refs = frozenset(
+        ref for op in request.operands for ref in getattr(op, "binding_hint_refs", ()))
+
     for operand in request.operands:
+        # C6 — rank BEFORE truncating, with the evidence in hand: authority tier →
+        # exact-concept-before-alternative → governed economic role → the user's hint →
+        # stable ref order. THEN cut at the per-operand bound. The hint is a RANKING signal
+        # only (user-origin, already validated) — eligibility still decides every survivor.
+        ranked = sorted(
+            (ref for ref in shortlists[operand.role] if ref in capabilities),
+            key=lambda ref: (
+                -_AUTHORITY_RANK.get(capabilities[ref].concept_authority, 0),
+                0 if capabilities[ref].concept == operand.concept else 1,
+                0 if (operand.economic_role
+                      and capabilities[ref].economic_role == operand.economic_role) else 1,
+                0 if ref in hint_refs else 1,
+                ref))
+        truncated = len(ranked) > MAX_CANDIDATES_PER_OPERAND
+        shortlist = ranked[:MAX_CANDIDATES_PER_OPERAND]
+
         tiers: dict[str, list[str]] = {"eligible": [], "provisional": []}
         blocked_refs: list[tuple[str, tuple[str, ...]]] = []
-        for ref in shortlists[operand.role]:
+        for ref in shortlist:
             capability = capabilities.get(ref)
             if capability is None:
                 continue
@@ -437,6 +470,18 @@ def bind_with_capabilities(conn, request, context, capabilities):
 
         bindable = tiers["eligible"] or tiers["provisional"]
         if not bindable:
+            # C6 rule 3: a REQUIRED operand whose shortlist was CUT and yielded no winner
+            # fails closed as AMBIGUOUS-with-truncation — an incomplete search must never
+            # report the confident "nothing carries this concept".
+            if truncated and operand.required:
+                verdicts.append(OperandBindingVerdictV1(
+                    role=operand.role, status="ambiguous", tied_refs=tuple(shortlist),
+                    reason_codes=(AMBIGUOUS_BY_CLASS[operand.operand_class],),
+                    shortlist_truncated=True,
+                    resolution=("the candidate search was bounded and no survivor was "
+                                "eligible — narrow the operand's concept/economic role, or "
+                                "adjudicate the tie at ingest warming")))
+                continue
             if blocked_refs:
                 codes = tuple(dict.fromkeys(
                     code for _ref, ref_codes in blocked_refs for code in ref_codes))
@@ -456,7 +501,15 @@ def bind_with_capabilities(conn, request, context, capabilities):
 
         selected_ref = bindable[0]
         verdict_ref: str | None = None
-        if len(bindable) > 1:
+        own_hints = frozenset(getattr(operand, "binding_hint_refs", ()))
+        hinted = [ref for ref in bindable if ref in own_hints]
+        if len(bindable) > 1 and len(hinted) == 1:
+            # C6 rule 4: the user NAMED this column — that is the requester's own
+            # adjudication among BINDABLE peers. It never promotes a blocked or ineligible
+            # ref (those never reach `bindable`), and it never manufactures a tie.
+            selected_ref = hinted[0]
+            verdict_ref = "user_hint"
+        elif len(bindable) > 1:
             tied_cols = tuple(columns_by_ref[ref] for ref in bindable)
             tie_verdict, tie_key = _consult_request_tie_break(
                 conn, request, operand, tied_cols)
@@ -483,7 +536,8 @@ def bind_with_capabilities(conn, request, context, capabilities):
             tied_refs=tuple(bindable) if len(bindable) > 1 else (),
             tie_break_verdict_ref=verdict_ref,
             reason_codes=selected_eligibility.reason_codes,   # floor codes RIDE the binding
-            resolution=selected_eligibility.resolution)
+            resolution=selected_eligibility.resolution,
+            shortlist_truncated=truncated)
         verdicts.append(binding)
         if operand.distinct_binding_group:
             bound_by_group.setdefault(operand.distinct_binding_group, []).append(

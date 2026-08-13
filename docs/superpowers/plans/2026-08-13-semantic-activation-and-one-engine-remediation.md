@@ -855,6 +855,19 @@ observation row), tests.
 truncation flag survives to the observation row; the hint promotes an eligible ref and cannot
 promote a blocked one.
 
+> **ACCEPTED (2026-08-13).** `request_shortlists` no longer blind-cuts at 16 (safety bound =
+> MAX_BINDING_ASSIGNMENTS); the cut moved to `bind_with_capabilities` AFTER the authority
+> ranking (tier → exact-concept-before-alternative → governed economic role → the user's
+> hint → stable ref), where the evidence pins exist. `OperandBindingVerdictV1` gains additive
+> `shortlist_truncated` (persists to the observation row via the existing asdict
+> serialization — proven by test). A REQUIRED operand whose cut shortlist yields no winner
+> fails closed as REQUIRED_OPERAND_AMBIGUOUS+truncated, never "missing" from an incomplete
+> search. The hint is (a) a retrieval ranking signal and (b) the requester's OWN adjudication
+> among BINDABLE same-tier peers (`tie_break_verdict_ref="user_hint"`) — it never reaches a
+> blocked or ineligible ref (those never enter `bindable`). Acceptance tests: index-20-of-25
+> confirmed column WINS with truncation recorded; observation round-trip; hint adjudicates
+> equal peers and cannot promote a structurally-blocked hinted ref.
+
 ### Task C7 — semantic closure for retrieval (1 day)
 
 *Modify:* `generation_semantic_context.py` (versioned closure map: concept → self + ancestors +
