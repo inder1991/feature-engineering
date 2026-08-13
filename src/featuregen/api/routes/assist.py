@@ -121,7 +121,21 @@ def refine(
 ) -> dict:
     """One human-directed revision of one candidate. Both outcomes are 200: a gauntlet rejection of
     the revision is data the reviewer acts on, not a server error. The revision stays a proposal;
-    registration remains the separate explicit POST /features confirm."""
+    registration remains the separate explicit POST /features confirm.
+
+    B9: under semantic_v1 the revision goes through the ENGINE — the model revises the
+    MEANING (one audited intent call seeded with the candidate + the instruction), the shared
+    binder re-binds from scratch, the gauntlet re-validates. The revised card is a PREVIEW:
+    save-idea works on it; GOVERNING it requires a whole-round regenerate, which mints the
+    fresh run + superseding revision the governed flow demands (SE-10 step 9)."""
+    from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
+
+    if RecipeRolloutConfig.from_env().semantic_planning == "semantic_v1":
+        if body.catalog_source is None:
+            raise HTTPException(status_code=422, detail={
+                "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
+                "message": "semantic refine plans over one catalog — name a catalog_source"})
+        return _refine_as_intent_revision(conn, body, client, identity)
     _compatibility_only_guard()
     revised, rejection = refine_idea(conn, body.candidate.model_dump(), body.instruction, client,
                                      catalog_source=body.catalog_source,
@@ -135,6 +149,51 @@ def refine(
     rej = rejection or {}
     return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))},
             "compatibility_only": True}
+
+
+def _refine_as_intent_revision(conn, body, client, identity) -> dict:
+    """B9 — the engine's refine: meaning revised, columns re-chosen by the binder, validation
+    re-run. A column-naming instruction cannot smuggle a binding — physical keys are refused
+    by the intent parser, and the binder alone assigns refs."""
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_planning_lens import llm_intent_candidates
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+    context = build_generation_semantic_context(
+        conn, catalog_source=body.catalog_source, roles=identity.role_claims)
+    candidate = body.candidate.model_dump()
+    seed = (
+        "REVISE the feature below per the analyst's instruction — return ONE revised abstract "
+        "intent (meaning only; a deterministic stage assigns physical data).\n"
+        f"Current feature: {candidate.get('name', '')} — {candidate.get('description', '')}\n"
+        f"Instruction: {body.instruction}")
+    from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
+
+    from featuregen.overlay.field_evidence import canonical_hash
+
+    candidates, rejections = llm_intent_candidates(
+        conn, client, context=context, scope_leaves=selectable_leaves(),
+        redacted_hypothesis=seed, actor=identity,
+        confirmed_scope_hash=canonical_hash({"unscoped": True, "route": "refine"}))
+    if not candidates:
+        first = rejections[0] if rejections else {"code": "INTENT_GENERATION_UNAVAILABLE",
+                                                  "detail": "no valid revision returned"}
+        return {"rejected": {"reason": str(first.get("detail", "")),
+                             "code": str(first.get("code", ""))}}
+    projection = project_assembled_set(
+        assemble_candidates(list(candidates)),
+        catalog_source=body.catalog_source, target_ref=body.target_ref)
+    served = projection.ideas or projection.actionable_ideas
+    if not served:
+        reject = projection.rejections[0] if projection.rejections else {
+            "reason": "the revision did not survive validation", "code": "REFUSED"}
+        return {"rejected": {"reason": str(reject.get("reason", "")),
+                             "code": str(reject.get("code", ""))}}
+    return {"revised": serialize_feature_idea(served[0], feature_context=True),
+            "regenerate_to_govern": True}
 
 
 @router.post("/features/recommend-sets", dependencies=[Depends(require_feature_generate)])

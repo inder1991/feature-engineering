@@ -264,14 +264,13 @@ def test_direct_feature_routes_refuse_in_enforced_semantic_mode(make_client, mon
     route. Checked BEFORE any model dispatch — no spend on a refused request."""
     monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake())
+    # B9: /features/refine LEFT this list — under the mode it serves the engine's
+    # intent-revision path (its own test below); the three GENERATORS keep their 409s
+    # until E4 deletes them.
     for path, body in (
         ("/features/recommend", {"objective": "o", "catalog_source": "upl"}),
         ("/features/recommend-sets", {"objective": "o", "catalog_source": "upl"}),
         ("/features/recipe", {"query": "q", "catalog_source": "upl"}),
-        ("/features/refine", {
-            "candidate": {"name": "n", "description": "d", "derives_from": [],
-                          "aggregation": None, "grain_table": None},
-            "instruction": "i", "catalog_source": "upl"}),
     ):
         res = client.post(path, json=body, headers=AUTH)
         assert res.status_code == 409, (path, res.text)
@@ -285,3 +284,35 @@ def test_direct_routes_serve_marked_compatibility_only_outside_enforcement(make_
                       json={"objective": "o", "catalog_source": "deposits"}, headers=AUTH)
     assert res.status_code == 200
     assert res.json()["compatibility_only"] is True
+
+
+def test_refine_under_semantic_v1_revises_the_meaning_through_the_engine(
+        make_client, conn, monkeypatch):
+    """B9: refine round-trips under the mode — instruction in, ENGINE-bound revision out with
+    typed role bindings; the free-form refine path never dispatches (unscripted => would 500).
+    The revised card is a preview: governing requires a whole-round regenerate."""
+    import sys
+    sys.path.insert(0, ".")
+    from tests.featuregen.api.test_semantic_v1_serving import (
+        _bank,
+        _intent_payload,
+    )
+
+    fake = FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=_intent_payload()),
+    })
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    res = make_client(llm_client=fake).post("/features/refine", json={
+        "candidate": {"name": "activity_recency", "description": "days since last event",
+                      "derives_from": [], "aggregation": None, "grain_table": None},
+        "instruction": "make it deposits only",
+        "catalog_source": "bank",
+    }, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert "revised" in body, body
+    revised = body["revised"]
+    assert revised["generation_source"] == "llm_intent"        # honest origin
+    assert revised.get("input_role_bindings"), "the BINDER chose the revised columns"
+    assert body["regenerate_to_govern"] is True

@@ -104,6 +104,7 @@ from featuregen.overlay.upload.contract.scope_records import (
 )
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
+    check_projection_readiness,
     compare_snapshot_to_current,
     ensure_generation_run,
 )
@@ -657,6 +658,15 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             require_live_ready(conn)
         except LiveActivationNotReady as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
+    # B8 (PLAN-14 closed): the projection-readiness gate runs BEFORE any model dispatch — a
+    # lagged catalog projection 503s here having spent ZERO provider calls. (It previously
+    # fired inside the snapshot persist, AFTER generation.) Only the semantic serving mode
+    # pays LLM bills in this builder, but the probe is cheap and honest for every mode.
+    if body.catalog_source is not None:
+        try:
+            check_projection_readiness(conn)
+        except CatalogProjectionUnavailable as e:
+            raise HTTPException(status_code=503, detail=e.detail) from e
     # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists

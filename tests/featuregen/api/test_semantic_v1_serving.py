@@ -424,3 +424,28 @@ def test_the_intent_call_is_attributed_to_the_requesting_human(make_client, conn
         "ORDER BY created_at DESC LIMIT 1").fetchone()
     assert row is not None, "the intent call was durably recorded"
     assert row[0].get("subject") == "user:tester"             # the AUTH header's human
+
+
+def test_a_lagged_projection_refuses_before_any_provider_spend(
+        make_client, conn, monkeypatch):
+    """B8 (PLAN-14 closed): the readiness gate fires BEFORE model dispatch — the 503 arrives
+    with the FakeLLM never called (an unscripted call would KeyError-500, and the fake here
+    scripts nothing at all)."""
+    from featuregen.intake.llm import FakeLLM
+
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    from featuregen.overlay.upload.feature_metadata_snapshot import (
+        CatalogProjectionUnavailable,
+    )
+
+    def lagged(_conn):
+        raise CatalogProjectionUnavailable("CATALOG_PROJECTION_UNAVAILABLE", "probe lagged")
+
+    monkeypatch.setattr(
+        "featuregen.api.routes.contract.check_projection_readiness", lagged)
+    res = make_client(llm_client=FakeLLM(script={})).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
+    }, headers=AUTH)
+    assert res.status_code == 503, res.text
