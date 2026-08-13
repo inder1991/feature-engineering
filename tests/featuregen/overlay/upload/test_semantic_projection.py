@@ -136,7 +136,10 @@ def test_an_uncompiled_temporal_contract_is_a_named_rejection():
     assert result.rejected_ids["recipe:proj_probe"] == (R.TEMPORAL_POLICY_UNRESOLVED,)
 
 
-def test_actionable_candidates_reject_with_their_named_resolution():
+def test_actionable_candidates_become_visible_options_never_rejections():
+    """A3 (validated finding 8): undecided work is an OPTION carrying its honest state — it
+    projects as an idea (so it mints an option id and a decision row and can be SAVED), while
+    its codes still ride rejected_ids for the disposition lens. Only refusals reject."""
     blocked = (
         OperandBindingVerdictV1(role="who", status="blocked",
                                 tied_refs=("public.events.customer_id",),
@@ -145,6 +148,9 @@ def test_actionable_candidates_reject_with_their_named_resolution():
         BOUND[1],
     )
     result = _project([_candidate(verdicts=blocked, binding_state="blocked")])
-    assert not result.ideas
-    assert result.rejections[0]["reason"] == "a human confirms the economic role"
+    assert not result.ideas                                   # not RECOMMENDED
+    assert not result.rejections                              # and not HIDDEN either
+    (option,) = result.actionable_ideas
+    assert option.candidate_status == "blocked"               # the honest state, on the card
+    assert option.recipe_id == "recipe:proj_probe"
     assert R.ECONOMIC_ROLE_UNPROVEN in result.rejected_ids["recipe:proj_probe"]

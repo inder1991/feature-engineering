@@ -776,6 +776,59 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         # from — the address of GET /contract/considered-revisions/{id}/options/{option_id}.
         response["considered_revision_id"] = cs.considered_revision_id
         response["considered_content_hash"] = cs.considered_content_hash
+        # A3: the three-section shape + per-option actions from the SAME fold the durable
+        # writes consult. At serve time the current state IS generation time (the review fold,
+        # pins, and snapshot were computed in this very transaction), so the current layer is
+        # constructed from the frozen facts — the durable writes re-read for real later.
+        from featuregen.overlay.upload.activation_policy import (
+            CurrentActivationStateV1,
+            FrozenOptionFactsV1,
+            decide_all_actions,
+        )
+
+        recommended, actionable = [], []
+        for feature_set in response["alternatives"]:
+            for entry in feature_set["features"]:
+                rid = entry.get("recipe_id")
+                facts = cs.semantic_decision_facts_by_definition_id.get(rid) if rid else None
+                if facts is None or not entry.get("option_id"):
+                    continue
+                frozen = FrozenOptionFactsV1(
+                    binding_state=facts["binding_state"],
+                    generation_source=facts["generation_source"],
+                    computation_kind=facts["computation_kind"],
+                    readiness=facts["readiness"],
+                    review_current=facts["review_current"],
+                    source_definition_id=facts["source_definition_id"],
+                    recipe_revision_hash=facts["recipe_revision_hash"],
+                    confirmation_required_roles=tuple(facts["confirmation_required_roles"]),
+                    has_reviewed_formula_expectation=facts[
+                        "has_reviewed_formula_expectation"],
+                    plan_envelope_present=facts["plan_envelope_present"],
+                    validation_status=facts["validation_status"],
+                    outstanding_requirement_codes=tuple(
+                        facts["outstanding_requirement_codes"]))
+                current = CurrentActivationStateV1(
+                    review_current=facts["review_current"],
+                    policy_revisions_current=True,
+                    snapshot_freshness="current",
+                    effective_readiness=facts["readiness"])
+                decisions = decide_all_actions(frozen, current)
+                section_entry = {
+                    "option_id": entry["option_id"],
+                    "name": entry.get("name"),
+                    "recipe_id": rid,
+                    "binding_state": facts["binding_state"],
+                    "allowed_actions": [a for a, d in decisions.items() if d.allowed],
+                    "blocked_actions": {
+                        a: [{"code": b.code, "next_step": b.next_step} for b in d.blockers]
+                        for a, d in decisions.items() if not d.allowed},
+                }
+                (recommended if facts["binding_state"] == "bound"
+                 else actionable).append(section_entry)
+        response["recommended_options"] = recommended
+        response["actionable_options"] = actionable
+        response["rejected_outputs"] = cs.rejections
     # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
     # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
     # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering

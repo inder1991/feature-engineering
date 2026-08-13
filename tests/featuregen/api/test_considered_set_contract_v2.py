@@ -181,3 +181,39 @@ def test_draft_refuses_on_a_stale_semantic_snapshot(make_client, conn, monkeypat
     detail = res.json()["detail"]
     assert detail["code"] == "SEMANTIC_SNAPSHOT_STALE"
     assert detail["reason"] == "SNAPSHOT_ITEM_DRIFT"
+
+
+def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, monkeypatch):
+    """A3: recommended / actionable / rejected — actionable candidates are OPTIONS with ids
+    and per-action verdicts from the SAME activation fold the durable writes consult;
+    save_idea is always allowed, create_contract blocked with named next steps."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    body = _post(make_client(llm_client=_fake()), contract_version=2)
+
+    assert "recommended_options" in body and "actionable_options" in body
+    assert "rejected_outputs" in body
+    sections = body["recommended_options"] + body["actionable_options"]
+    assert sections, "the engine served at least one sectioned option"
+    for entry in sections:
+        assert entry["option_id"] and entry["recipe_id"]
+        assert "save_idea" in entry["allowed_actions"]          # an idea is an idea, always
+        assert "create_contract" in entry["blocked_actions"]    # nothing authorable yet here
+        blockers = entry["blocked_actions"]["create_contract"]
+        assert all(b["code"] and b["next_step"] for b in blockers)
+    for entry in body["actionable_options"]:
+        assert entry["binding_state"] in ("ambiguous", "missing", "blocked")
+        # every actionable option is a REAL option: it has a decision row at its exact key
+        row = conn.execute(
+            "SELECT 1 FROM semantic_option_decision WHERE option_id = %s",
+            (entry["option_id"],)).fetchone()
+        assert row is not None
+
+
+def test_v1_never_carries_the_section_keys(make_client, conn, monkeypatch):
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    body = _post(make_client(llm_client=_fake()))
+    for key in ("recommended_options", "actionable_options", "rejected_outputs",
+                "contract_version", "semantic_planning_mode"):
+        assert key not in body

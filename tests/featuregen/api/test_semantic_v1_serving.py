@@ -230,8 +230,11 @@ def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeyp
         if f.get("recipe_id")}
     assert {r[0] for r in rows} == served_engine_options       # the EXACT keys the human sees
 
-    option_id, definition_id, source, observation_id, review_current, roles, kind = rows[0]
-    assert source == "llm_intent"                              # honest origin, per-row
+    # A3 widened this: ACTIONABLE recipe options freeze decision rows too, so pick the
+    # intent's row explicitly rather than positionally.
+    intent_rows = [r for r in rows if r[2] == "llm_intent"]
+    assert intent_rows, "the intent option froze a row with its HONEST origin"
+    option_id, definition_id, source, observation_id, review_current, roles, kind = intent_rows[0]
     assert kind == "conceptual_pattern"                        # the structural ceiling
     assert observation_id, "linked to the exact observation, never newest-for-definition"
     assert review_current is False

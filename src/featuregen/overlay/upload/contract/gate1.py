@@ -930,7 +930,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             idea.recipe_id: decision_facts_for_candidate(
                 candidates_by_id[idea.recipe_id], idea,
                 observation_ids.get(idea.recipe_id), context_hash_value)
-            for idea in projection.ideas
+            for idea in (*projection.ideas, *projection.actionable_ideas)
             if idea.recipe_id and idea.recipe_id in candidates_by_id
         }
         rejections.extend({"name": r.get("detail", "intent"), "reason": r.get("detail", ""),
@@ -943,6 +943,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             alternatives.append(FeatureSet(lens="templates", features=order_ideas_by_use_case(
                 projection.ideas,
                 signed_reading["business_domain"] if signed_reading else ())))
+        # A3: actionable candidates are VISIBLE OPTIONS in their own lens — they mint option
+        # ids and decision rows like every served card (save_idea works; the activation fold
+        # blocks everything stronger with their named codes). Never hidden as rejections.
+        if projection.actionable_ideas:
+            alternatives.append(FeatureSet(lens="actionable",
+                                           features=projection.actionable_ideas))
         rejections.extend(projection.rejections)
         logger.info(
             "semantic-v1 served: ideas=%d rejections=%d grounded=%s",

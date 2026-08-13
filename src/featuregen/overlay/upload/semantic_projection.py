@@ -47,9 +47,16 @@ _CONFIRMATION_CODES = frozenset({R.PROPOSED_METADATA_ONLY, R.SEMANTIC_AUTHORITY_
 
 @dataclass(frozen=True, slots=True)
 class SemanticProjectionV1:
-    """One projection pass: served ideas + honest refusals, in assembly order."""
+    """One projection pass: served ideas + ACTIONABLE options + honest refusals.
+
+    A3 (validated finding 8): actionable candidates (blocked/ambiguous/missing with a named
+    resolution) are OPTIONS now, not rejections — they project as ideas too, so they mint
+    option ids and decision rows and can be SAVED as ideas while create_contract stays
+    blocked. Only gauntlet-refused, temporal-uncompiled, and malformed output remain
+    rejections."""
 
     ideas: list
+    actionable_ideas: list                # undecided work, save_idea-able, never hidden
     rejections: list                      # the V1 wire shape: {name, reason, code}
     grounded_ids: frozenset
     rejected_ids: dict
@@ -95,7 +102,8 @@ def _rejection(candidate, codes, reason: str) -> dict:
             "code": codes[0] if codes else "SEMANTIC_NOT_BINDABLE"}
 
 
-def _served_idea(assembled, validation, *, catalog_source: str):
+def _served_idea(assembled, validation, *, catalog_source: str,
+                 candidate_status: str = ""):
     from featuregen.overlay.upload.feature_assist import FeatureIdea
     from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 
@@ -119,6 +127,7 @@ def _served_idea(assembled, validation, *, catalog_source: str):
                            else "NEEDS_EXTERNAL_VALIDATION"),
         requirements=_requirements(validation, catalog_source),
         generation_source="recipe",
+        candidate_status=candidate_status,
         recipe_id=candidate.recipe_id,
         input_role_bindings=_role_bindings(candidate, catalog_source),
         operand_roles=tuple(sorted(
@@ -156,6 +165,7 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
                      for v in candidate.verdicts if v.status == "bound")
         binding_by_id[candidate.recipe_id] = "acceptable" if floors else "exact"
 
+    actionable_ideas: list = []
     for assembled in assembled_set.actionable:
         candidate = assembled.candidate
         codes = tuple(dict.fromkeys(
@@ -163,11 +173,17 @@ def project_assembled_set(assembled_set: AssembledSetV1, *, catalog_source: str,
         resolution = next((v.resolution for v in candidate.verdicts if v.resolution),
                           "no eligible binding for every required operand")
         rejected[candidate.recipe_id] = codes or ("SEMANTIC_NOT_BINDABLE",)
-        rejections.append(_rejection(candidate, codes, resolution))
+        # A3: the candidate is a visible OPTION carrying its own undecided state — the named
+        # resolution rides the card's critic-note-free channel (candidate_status = the honest
+        # binding state; the wire section carries blockers from the activation fold).
+        validation = validate_candidate(candidate)
+        actionable_ideas.append(_served_idea(
+            assembled, validation, catalog_source=catalog_source,
+            candidate_status=candidate.binding_state))
 
     return SemanticProjectionV1(
-        ideas=ideas, rejections=rejections, grounded_ids=frozenset(grounded),
-        rejected_ids=rejected, binding_by_id=binding_by_id)
+        ideas=ideas, actionable_ideas=actionable_ideas, rejections=rejections,
+        grounded_ids=frozenset(grounded), rejected_ids=rejected, binding_by_id=binding_by_id)
 
 
 __all__ = ["SemanticProjectionV1", "project_assembled_set"]
