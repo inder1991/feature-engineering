@@ -98,7 +98,8 @@ class IntentGenerationResult:
 
 def generate_feature_intents(conn, client, *, context: GenerationSemanticContextV1,
                              scope_leaves, redacted_hypothesis: str,
-                             model_feature_refs=(), actor=None) -> IntentGenerationResult:
+                             model_feature_refs=(), actor=None,
+                             confirmed_scope_hash: str = "") -> IntentGenerationResult:
     """One audited structured call → validated intents + per-item rejections."""
     from featuregen.overlay.upload.enrich_llm import drive_audited_structured_call
 
@@ -122,7 +123,10 @@ def generate_feature_intents(conn, client, *, context: GenerationSemanticContext
         "output_schema_version": f"{FEATURE_INTENT_SCHEMA_ID}@1",
         "model": getattr(client, "model", None) or "unknown",
         "call_ref": call.llm_call_ref or "unrecorded",
-        "confirmed_scope_hash": context.context_hash(),
+        # B3 (GEN-04 closed): the scope hash is the SCOPE's hash — two human scopes over one
+        # catalog are two identities. The catalog context hash is its own provenance key.
+        "confirmed_scope_hash": confirmed_scope_hash,
+        "semantic_context_hash": context.context_hash(),
     }
     offered_specs = set(model_feature_refs)
     scope = set(scope_leaves)

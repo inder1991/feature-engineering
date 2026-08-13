@@ -66,6 +66,9 @@ class GenerationProvenanceV1:
     model: str
     call_ref: str
     confirmed_scope_hash: str
+    #: B3: the frozen catalog context this intent was generated against — its OWN key; the
+    #: scope hash above is the HUMAN's scope identity, never the catalog's.
+    semantic_context_hash: str = ""
 
     def __post_init__(self) -> None:
         for name in ("prompt_ref", "output_schema_version", "model", "call_ref",

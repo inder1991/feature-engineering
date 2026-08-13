@@ -799,8 +799,31 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
         logger.exception("semantic-shadow comparison failed (response unaffected)")
 
 
+def _confirmed_scope_hash(scope) -> str:
+    """B3: the HUMAN scope's own content identity — two scopes over one catalog are two
+    identities (GEN-04's defect was stamping the catalog hash here)."""
+    if scope is None:
+        return canonical_hash({"unscoped": True})
+    return canonical_hash({
+        "primary": scope.primary, "secondary": sorted(scope.secondary),
+        "expansion": str(scope.expansion), "unscoped": scope.unscoped})
+
+
+def _intent_scope_leaves(scope) -> tuple:
+    """B2 (GEN-02 closed): the objective vocabulary the intent parser validates against. A
+    confirmed scope = its primary + secondaries; an UNSCOPED/broadened scope = the COMPLETE
+    selectable-leaf set (88 leaves) — a wider vocabulary, never an empty one that would reject
+    every intent as out-of-scope."""
+    if scope and scope.primary:
+        return (scope.primary, *scope.secondary)
+    from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
+
+    return selectable_leaves()
+
+
 def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_context,
-                                 catalog_source: str, target_ref: str | None) -> list:
+                                 catalog_source: str, target_ref: str | None,
+                                 actor_envelope=None) -> list:
     """B1 — the definition-mode anchor under semantic_v1: ONE audited extraction call (the
     intents schema, seeded with the analyst's redacted definition and an extract-don't-invent
     instruction), bound by the SHARED engine, projected through the SAME projection. Fail-soft:
@@ -815,8 +838,9 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
     try:
         candidates, _rejections = llm_intent_candidates(
             conn, client, context=semantic_context,
-            scope_leaves=((scope.primary, *scope.secondary) if scope and scope.primary
-                          else ()),
+            scope_leaves=_intent_scope_leaves(scope),
+            actor=actor_envelope,
+            confirmed_scope_hash=_confirmed_scope_hash(scope),
             redacted_hypothesis=(
                 "EXTRACT the single feature the analyst has ALREADY DEFINED below as one "
                 "abstract intent — do not invent alternatives, do not improve it:\n"
@@ -840,7 +864,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                          templates: Sequence[Template] | None = None,
                          generation_run_id: str | None = None,
                          scope: ConfirmedScope | None = None,
-                         semantic_mode: str = "legacy") -> ConsideredSet:
+                         semantic_mode: str = "legacy",
+                         actor_envelope=None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -941,9 +966,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
 
                 intent_cands, intent_rejections = llm_intent_candidates(
                     conn, client, context=semantic_context,
-                    scope_leaves=(scope.primary, *scope.secondary) if scope.primary
-                                 else (),
-                    redacted_hypothesis=intent.redacted_hypothesis)
+                    scope_leaves=_intent_scope_leaves(scope),
+                    redacted_hypothesis=intent.redacted_hypothesis,
+                    actor=actor_envelope,
+                    confirmed_scope_hash=_confirmed_scope_hash(scope))
                 all_candidates.extend(intent_cands)
             except Exception:
                 logger.exception("semantic-v1 intent generation failed "
@@ -1065,7 +1091,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             ideas = _extracted_definition_anchor(
                 conn, client, intent=intent, scope=scope,
                 semantic_context=semantic_context, catalog_source=catalog_source,
-                target_ref=target_ref)
+                target_ref=target_ref, actor_envelope=actor_envelope)
         else:
             ideas = recommend_features(
                 conn, intent.redacted_definition, client, entity=entity,

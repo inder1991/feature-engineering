@@ -75,6 +75,7 @@ def _run(db, script_output, **kwargs):
         "overlay.feature.intents": FakeResponse(output=script_output)})
     return generate_feature_intents(
         db, client, context=context, scope_leaves=SCOPE,
+        confirmed_scope_hash="scope-hash-test",
         redacted_hypothesis="declining activity precedes dormancy", **kwargs), context
 
 
@@ -85,7 +86,9 @@ def test_a_valid_intent_parses_with_our_provenance_never_the_models(db):
     intent = result.intents[0]
     assert intent.operation_class == "sum"
     # Provenance is the CALL's, tied to the frozen context — whatever the model wrote is gone.
-    assert intent.generation_provenance.confirmed_scope_hash == context.context_hash()
+    # B3: the scope hash is the SCOPE's identity; the catalog context hash is its own key.
+    assert intent.generation_provenance.confirmed_scope_hash == "scope-hash-test"
+    assert intent.generation_provenance.semantic_context_hash == context.context_hash()
     assert intent.generation_provenance.output_schema_version == "feature_intents@1"
 
 

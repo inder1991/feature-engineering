@@ -759,7 +759,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             # scope the V2 lens classifies against. In `legacy` (the frozen default) the
             # builder ignores both — byte-identical.
             scope=scope,
-            semantic_mode=semantic_mode)
+            semantic_mode=semantic_mode,
+            actor_envelope=identity)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
     except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered

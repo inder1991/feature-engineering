@@ -380,3 +380,42 @@ def test_definition_mode_anchor_is_extracted_through_the_engine(
     assert anchor is not None
     assert anchor["generation_source"] == "user_defined"
     assert anchor.get("input_role_bindings"), "the SHARED binder chose the anchor's columns"
+
+
+def test_unscoped_generation_accepts_intents_from_the_full_vocabulary(
+        make_client, conn, monkeypatch):
+    """B2 (GEN-02 closed): an unscoped request used to pass an EMPTY objective vocabulary, so
+    every proposed intent was rejected out-of-scope. Now the whole selectable-leaf set is the
+    vocabulary — the intent survives; an objective OUTSIDE even that set still rejects."""
+    fake = FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=_intent_payload()),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "templates", "reasoning": "engine set"}),
+    })
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    res = make_client(llm_client=fake).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"unscoped": True},
+    }, headers=AUTH)
+    assert res.status_code == 200, res.text
+
+    rows = conn.execute(
+        "SELECT COUNT(*) FROM semantic_candidate_observation "
+        "WHERE source_origin = 'llm_intent'").fetchone()
+    assert rows[0] >= 1, "the unscoped intent survived the vocabulary check"
+
+
+def test_the_intent_call_is_attributed_to_the_requesting_human(make_client, conn, monkeypatch):
+    """B3 (GEN-04's other half): the audited intent call records the HUMAN who asked — never
+    the fallback service identity — and its provenance carries the SCOPE's own hash as a
+    distinct key from the catalog context hash."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    _post(make_client(llm_client=_fake_with_intents()))
+
+    row = conn.execute(
+        "SELECT created_by FROM llm_call WHERE task = 'overlay.feature.intents' "
+        "ORDER BY created_at DESC LIMIT 1").fetchone()
+    assert row is not None, "the intent call was durably recorded"
+    assert row[0].get("subject") == "user:tester"             # the AUTH header's human

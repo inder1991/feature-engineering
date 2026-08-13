@@ -274,7 +274,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
 
 
 def llm_intent_candidates(conn, client, *, context, scope_leaves,
-                          redacted_hypothesis: str, actor=None):
+                          redacted_hypothesis: str, actor=None,
+                          confirmed_scope_hash: str = ""):
     """SE-6 wire-up — LLM intents through the SAME engine as recipes: one audited structured
     call proposes ABSTRACT intents (concepts, operand classes, temporal contracts — never
     physical refs), each adapts to the neutral planning request, and the SHARED capability
@@ -292,7 +293,8 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
 
     result = generate_feature_intents(
         conn, client, context=context, scope_leaves=scope_leaves,
-        redacted_hypothesis=redacted_hypothesis, actor=actor)
+        redacted_hypothesis=redacted_hypothesis, actor=actor,
+        confirmed_scope_hash=confirmed_scope_hash)
     candidates = []
     rejections = [dict(r) for r in result.rejections]
     for intent in result.intents:
