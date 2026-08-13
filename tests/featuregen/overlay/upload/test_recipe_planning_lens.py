@@ -358,3 +358,60 @@ def test_crossing_datasets_is_a_feature_level_relationship_need():
     assert story.dataset_tables == ("customers", "events")
     assert R.RELATIONSHIP_REQUIRED in story.codes
     assert R.POPULATION_DATASET_UNDECLARED not in story.codes
+
+
+# ── B6: the run's DB work is O(fact families), never O(recipes) ────────────────────────────────
+
+def test_a_full_unscoped_run_is_two_queries_with_a_prebuilt_context(db):
+    """The PLAN-13 pin: binding ALL 317 recipes over a prebuilt context costs exactly ONE
+    batched capability read + ONE review-event read — a 318th recipe changes the fold count,
+    never the query count. (Tie-break consultation would add reads only on GENUINE same-tier
+    ties, which this fixture has none of.)"""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+
+    _catalog(db)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    calls: list[str] = []
+    original = db.execute
+
+    def counting(query, *args, **kwargs):
+        calls.append(str(query))
+        return original(query, *args, **kwargs)
+
+    db.execute = counting
+    try:
+        candidates = v2_recipe_candidates(
+            db, catalog_source=SOURCE, scope=ConfirmedScope(primary=None, unscoped=True),
+            context=context)
+    finally:
+        db.execute = original
+    assert len(candidates) == len(V2_RECIPES)
+    assert len(calls) == 2, calls
+
+
+def test_the_batched_fold_is_byte_identical_to_the_per_request_path(db):
+    """Golden equality: every candidate's verdicts + eligibility from the batched run match
+    the single-request wrapper exactly — the batch changed WHERE the read happens, never a
+    single decision."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    _catalog(db)
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE,
+        scope=ConfirmedScope(primary=EXEMPLAR.primary_objective), context=context)
+    assert candidates
+    for candidate in candidates:
+        request = planning_request_from_recipe(v2_recipe_by_id(candidate.recipe_id))
+        verdicts, eligibility = bind_planning_request(db, request, context)
+        assert verdicts == candidate.verdicts, candidate.recipe_id
+        assert eligibility == candidate.eligibility, candidate.recipe_id

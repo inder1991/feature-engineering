@@ -316,22 +316,34 @@ def bind_planning_request(conn, request, context):
     consults the SHARED tie-break store and otherwise fails closed (ambiguous, no selection);
     blocked / not_applicable candidates never bind and never manufacture a tie."""
     from featuregen.overlay.upload.column_capabilities import compile_capabilities
-    from featuregen.overlay.upload.semantic_eligibility import evaluate_operand
 
+    shortlists = request_shortlists(request, context)
+    all_refs = list(dict.fromkeys(ref for refs in shortlists.values() for ref in refs))
+    capabilities = compile_capabilities(conn, context, all_refs)   # ONE query, whole request
+    return bind_with_capabilities(conn, request, context, capabilities)
+
+
+def request_shortlists(request, context) -> dict[str, tuple[str, ...]]:
+    """PURE: per-role shortlists from the frozen concept index (B6 split — callers batch the
+    capability read across MANY requests, then fold each purely)."""
     index = context.concept_index
     shortlists: dict[str, tuple[str, ...]] = {}
-    truncated: dict[str, bool] = {}
     for operand in request.operands:
         refs: list[str] = []
         for concept_name in (operand.concept, *operand.alternative_concepts):
             refs.extend(index.get(concept_name, ()))
         deduped = list(dict.fromkeys(refs))
-        truncated[operand.role] = len(deduped) > MAX_CANDIDATES_PER_OPERAND
         shortlists[operand.role] = tuple(deduped[:MAX_CANDIDATES_PER_OPERAND])
+    return shortlists
 
-    all_refs = list(dict.fromkeys(ref for refs in shortlists.values() for ref in refs))
-    capabilities = compile_capabilities(conn, context, all_refs)   # ONE query, whole request
 
+def bind_with_capabilities(conn, request, context, capabilities):
+    """The fold over PRE-COMPILED capabilities. ``conn`` is used ONLY by the tie-break
+    consultation (reached solely when a genuine same-tier tie exists — bounded by real ties,
+    never by candidate count)."""
+    from featuregen.overlay.upload.semantic_eligibility import evaluate_operand
+
+    shortlists = request_shortlists(request, context)
     columns_by_ref = {c.object_ref: c for c in context.columns}
     eligibility: dict[tuple[str, str], object] = {}
     verdicts: list[OperandBindingVerdictV1] = []

@@ -252,13 +252,36 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
     ordered += [recipe for recipe in V2_RECIPES
                 if applicability.by_recipe[recipe.recipe_id] == "supporting"]
 
+    # B6 (PLAN-13 closed): the run's DB work is O(fact families), never O(recipes) —
+    # ONE batched capability read over the union of every recipe's shortlists, ONE review-event
+    # read for the whole store, then pure folds per recipe.
+    from featuregen.overlay.upload.column_capabilities import compile_capabilities
+    from featuregen.overlay.upload.recipe_operand_policy import (
+        bind_with_capabilities,
+        request_shortlists,
+    )
+    from featuregen.overlay.upload.recipe_review import review_events_all
+    from featuregen.overlay.upload.recipe_review_validity import (
+        by_role_at_revision,
+        review_validity,
+    )
+
+    requests = [(recipe, planning_request_from_recipe(recipe)) for recipe in ordered]
+    union_refs = list(dict.fromkeys(
+        ref for _recipe, request in requests
+        for refs in request_shortlists(request, context).values() for ref in refs))
+    capabilities = compile_capabilities(conn, context, union_refs)
+    events_by_recipe = review_events_all(conn)
+
     candidates: list[V2RecipeCandidateV1] = []
-    for recipe in ordered:
-        request = planning_request_from_recipe(recipe)
-        verdicts, eligibility = bind_planning_request(conn, request, context)
+    for recipe, request in requests:
+        verdicts, eligibility = bind_with_capabilities(conn, request, context, capabilities)
         revision_hash = canonical_recipe_v2_hash(recipe)
         pit_text, temporal_blocker = _compile_temporal(recipe)
-        current, missing_roles = _review_validity(conn, recipe, revision_hash)
+        validity = review_validity(
+            recipe, by_role_at_revision(events_by_recipe.get(recipe.recipe_id, []),
+                                        revision_hash))
+        current, missing_roles = validity.current, validity.missing_roles
         candidates.append(V2RecipeCandidateV1(
             recipe_id=recipe.recipe_id,
             relationship=applicability.by_recipe[recipe.recipe_id],
@@ -302,9 +325,21 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
         confirmed_scope_hash=confirmed_scope_hash)
     candidates = []
     rejections = [dict(r) for r in result.rejections]
-    for intent in result.intents:
-        request = planning_request_from_feature_intent(intent)
-        verdicts, eligibility = bind_planning_request(conn, request, context)
+    # B6: one batched capability read across ALL intents, pure folds per intent.
+    from featuregen.overlay.upload.column_capabilities import compile_capabilities
+    from featuregen.overlay.upload.recipe_operand_policy import (
+        bind_with_capabilities,
+        request_shortlists,
+    )
+
+    intent_requests = [(intent, planning_request_from_feature_intent(intent))
+                       for intent in result.intents]
+    union_refs = list(dict.fromkeys(
+        ref for _intent, request in intent_requests
+        for refs in request_shortlists(request, context).values() for ref in refs))
+    capabilities = compile_capabilities(conn, context, union_refs)
+    for intent, request in intent_requests:
+        verdicts, eligibility = bind_with_capabilities(conn, request, context, capabilities)
         candidates.append(V2RecipeCandidateV1(
             recipe_id=request.source_definition_id,
             relationship="primary",
