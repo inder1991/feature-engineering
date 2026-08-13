@@ -722,6 +722,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # planned — while the legacy object still feeds the legacy machinery (shadow planner,
     # scoped-grounding narrowing) untouched. In legacy/shadow the two are the same object.
     semantic_mode = RecipeRolloutConfig.from_env().semantic_planning
+    # B1: under semantic_v1 an entity-only (cross-catalog) request is REFUSED typed — the
+    # semantic engine plans over one frozen catalog context; until a multi-catalog context is
+    # chartered, an honest refusal beats a silently empty page (the legacy free-form path that
+    # used to fill it no longer runs under the mode).
+    if semantic_mode == "semantic_v1" and body.catalog_source is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
+            "message": "semantic generation plans over ONE catalog; entity-only cross-catalog "
+                       "scope is not yet supported — name a catalog_source",
+        })
     if semantic_mode == "semantic_v1":
         from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
 

@@ -321,3 +321,62 @@ def test_confirm_re_checks_activation_even_when_a_choice_was_recorded(
     assert detail["action"] == "create_contract"
     assert {b["code"] for b in detail["blockers"]} >= {
         "PROPOSED_METADATA_ONLY", "CONCEPTUAL_PATTERN_NOT_AUTHORABLE"}
+
+
+def test_the_free_form_generator_never_runs_under_semantic_v1(make_client, conn, monkeypatch):
+    """B1 (GEN-01 closed): the FakeLLM scripts ONLY the intents task — an unscripted task
+    raises KeyError inside FakeLLM, so the request SUCCEEDING proves the free-form
+    recommend/recommend_set/near-label calls were never dispatched. One generation
+    architecture, one provider bill."""
+    # recommend_set stays scripted: it is a kept ADVISORY pass (an annotator, not a
+    # generator). The GENERATORS (overlay.feature.recommend / recommend_features) remain
+    # unscripted — success proves they never dispatched.
+    fake = FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=_intent_payload()),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "templates", "reasoning": "engine set"}),
+    })
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    body = _post(make_client(llm_client=fake))
+    served = [f for s_ in body["alternatives"] for f in s_["features"]]
+    assert served, "the engine alone serves the considered set"
+    assert all(f.get("recipe_id") for f in served)             # every card is engine-origin
+    assert {s_["lens"] for s_ in body["alternatives"]} <= {"templates", "actionable"}
+
+
+def test_entity_only_scope_is_refused_typed_under_semantic_v1(make_client, conn, monkeypatch):
+    """B1: no catalog_source under the mode = typed 422, never a silently empty page."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    res = make_client(llm_client=_fake()).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn",
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
+    }, headers=AUTH)
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["code"] == "SEMANTIC_REQUIRES_CATALOG_SOURCE"
+
+
+def test_definition_mode_anchor_is_extracted_through_the_engine(
+        make_client, conn, monkeypatch):
+    """B1: the analyst's own definition is EXTRACTED as an abstract intent and bound by the
+    shared engine — generation_source stays the server-assigned user_defined, and no free-form
+    recommend_features call happens (unscripted => would 500)."""
+    fake = FakeLLM(script={
+        "overlay.feature.intents": FakeResponse(output=_intent_payload()),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "templates", "reasoning": "engine set"}),
+    })
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    res = make_client(llm_client=fake).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS,
+        "definition": "days since the customer's most recent transaction",
+        "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
+    }, headers=AUTH)
+    assert res.status_code == 200, res.text
+    anchor = res.json()["anchor"]
+    assert anchor is not None
+    assert anchor["generation_source"] == "user_defined"
+    assert anchor.get("input_role_bindings"), "the SHARED binder chose the anchor's columns"

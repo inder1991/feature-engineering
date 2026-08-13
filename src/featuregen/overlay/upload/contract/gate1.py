@@ -799,6 +799,39 @@ def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: Confirm
         logger.exception("semantic-shadow comparison failed (response unaffected)")
 
 
+def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_context,
+                                 catalog_source: str, target_ref: str | None) -> list:
+    """B1 — the definition-mode anchor under semantic_v1: ONE audited extraction call (the
+    intents schema, seeded with the analyst's redacted definition and an extract-don't-invent
+    instruction), bound by the SHARED engine, projected through the SAME projection. Fail-soft:
+    an extraction failure returns no anchor (the response's alternatives still serve), because
+    the anchor is a convenience — never a second generation architecture."""
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.recipe_planning_lens import llm_intent_candidates
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+    if client is None or semantic_context is None:
+        return []
+    try:
+        candidates, _rejections = llm_intent_candidates(
+            conn, client, context=semantic_context,
+            scope_leaves=((scope.primary, *scope.secondary) if scope and scope.primary
+                          else ()),
+            redacted_hypothesis=(
+                "EXTRACT the single feature the analyst has ALREADY DEFINED below as one "
+                "abstract intent — do not invent alternatives, do not improve it:\n"
+                + intent.redacted_definition))
+        if not candidates:
+            return []
+        projection = project_assembled_set(
+            assemble_candidates(list(candidates)),
+            catalog_source=catalog_source, target_ref=target_ref)
+        return list(projection.ideas[:1])
+    except Exception:
+        logger.exception("definition-anchor extraction failed (no anchor served)")
+        return []
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None,
@@ -851,11 +884,18 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if catalog_source is not None:
         semantic_context = build_generation_semantic_context(
             conn, catalog_source=catalog_source, roles=roles)
-    report = recommend_feature_sets_report(
-        conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
-        roles=roles, target_ref=target_ref, feedback=feedback, now=now)
-    alternatives = list(report.sets)
-    rejections = list(report.rejections)
+    # B1 (GEN-01 closed): under semantic_v1 the free-form physical-column generator does not
+    # run AT ALL — no dispatch, no legacy lenses. The engine's projection is the only
+    # candidate source; legacy/shadow modes keep the report byte-identical.
+    if semantic_mode == "semantic_v1" and catalog_source is not None:
+        alternatives: list[FeatureSet] = []
+        rejections: list[dict] = []
+    else:
+        report = recommend_feature_sets_report(
+            conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
+            roles=roles, target_ref=target_ref, feedback=feedback, now=now)
+        alternatives = list(report.sets)
+        rejections = list(report.rejections)
     grounded_template_ids: frozenset[str] = frozenset()   # per-template grounding outcome for Task 5's
     rejected_template_ids: dict[str, tuple[str, ...]] = {}   # disposition stage (empty on a no-catalog run)
     incomplete_template_ids: dict[str, tuple[str, ...]] = {}
@@ -1017,9 +1057,20 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                                  generation_run_id=generation_run_id)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
-        ideas = recommend_features(
-            conn, intent.redacted_definition, client, entity=entity, catalog_source=catalog_source,
-            roles=roles, target_ref=target_ref, now=now, target=1)
+        if semantic_mode == "semantic_v1" and catalog_source is not None:
+            # B1: the anchor is EXTRACTED as an abstract intent (meaning only — the model is
+            # instructed to extract the analyst's OWN definition, never invent alternatives),
+            # then the SHARED binder chooses columns. Physical refs the user typed were already
+            # demoted to hints by the intent parser's forbidden-key rule.
+            ideas = _extracted_definition_anchor(
+                conn, client, intent=intent, scope=scope,
+                semantic_context=semantic_context, catalog_source=catalog_source,
+                target_ref=target_ref)
+        else:
+            ideas = recommend_features(
+                conn, intent.redacted_definition, client, entity=entity,
+                catalog_source=catalog_source,
+                roles=roles, target_ref=target_ref, now=now, target=1)
         # H1a: the definition anchor is the USER's own definition run through the validated loop — the
         # server-assigned generation_source for the user-anchor path is "user_defined" (distinct from the
         # LLM alternatives' "llm_freeform" and the recipe lens's "recipe"). Never read from LLM output.
