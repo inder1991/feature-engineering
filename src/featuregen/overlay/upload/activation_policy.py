@@ -53,6 +53,7 @@ class FrozenOptionFactsV1:
     computation_kind: str                       # deterministic_formula | governed_model_output | conceptual_pattern
     readiness: str                              # authored RECIPE_READINESS at generation
     review_current: bool                        # BR-23 fold at generation, recipe-origin only
+    source_definition_id: str = ""
     recipe_revision_hash: str = ""
     confirmation_required_roles: tuple[str, ...] = ()
     has_reviewed_formula_expectation: bool = False

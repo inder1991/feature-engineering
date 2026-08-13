@@ -250,3 +250,33 @@ def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeyp
     with _pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         with conn.transaction():
             conn.execute("UPDATE semantic_option_decision SET review_current = true")
+
+
+def test_draft_of_a_semantic_option_is_blocked_by_the_activation_policy(
+        make_client, conn, monkeypatch):
+    """A2 slice 2 — the negative path that makes end-to-end testing honest: the served intent
+    option (conceptual, all-proposed metadata, no plan, no verifiable snapshot) 409s at draft
+    with EVERY blocker named and a next step per blocker. Nothing hides; nothing proceeds."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    body = _post(client)
+
+    option = next(f for s_ in body["alternatives"] for f in s_["features"]
+                  if f.get("recipe_id"))
+    res = client.post("/contract/draft", json={
+        "intent_id": body["intent_id"],
+        "chosen_option_id": option["name"],
+        "expected_generation_run_id": body["generation_run_id"],
+    }, headers=AUTH)
+    assert res.status_code == 409, res.text
+    detail = res.json()["detail"]
+    assert detail["code"] == "ACTIVATION_BLOCKED"
+    assert detail["action"] == "create_contract"
+    codes = {b["code"] for b in detail["blockers"]}
+    # The four truths about THIS option, all named at once:
+    assert "PROPOSED_METADATA_ONLY" in codes            # all-proposed metadata needs the funnel
+    assert "CONCEPTUAL_PATTERN_NOT_AUTHORABLE" in codes  # a conceptual idea has no computation
+    assert "PHYSICAL_PLAN_MISSING" in codes             # honest until B7 wires the planner
+    assert "SNAPSHOT_STALE_REGENERATE" in codes         # unverifiable snapshot FAILS CLOSED
+    assert all(b["next_step"] for b in detail["blockers"])

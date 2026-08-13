@@ -100,6 +100,7 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
     """The activation policy's frozen layer, from the exact (revision, option) key."""
     row = conn.execute(
         "SELECT binding_state, generation_source, computation_kind, readiness, "
+        "       source_definition_id, "
         "       review_current, recipe_revision_hash, confirmation_required_roles, "
         "       has_reviewed_formula_expectation, plan_envelope_present, validation_status, "
         "       outstanding_requirement_codes, policy_revision_pins, "
@@ -109,8 +110,8 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         (considered_revision_id, option_id)).fetchone()
     if row is None:
         return None
-    (binding_state, generation_source, computation_kind, readiness, review_current,
-     recipe_revision_hash, confirmation_roles, has_reviewed, plan_present,
+    (binding_state, generation_source, computation_kind, readiness, source_definition_id,
+     review_current, recipe_revision_hash, confirmation_roles, has_reviewed, plan_present,
      validation_status, outstanding, pins, formula_revision, snapshot_id) = row
     return FrozenOptionFactsV1(
         binding_state=binding_state,
@@ -118,6 +119,7 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         computation_kind=computation_kind,
         readiness=readiness,
         review_current=review_current,
+        source_definition_id=source_definition_id,
         recipe_revision_hash=recipe_revision_hash,
         confirmation_required_roles=tuple(confirmation_roles or ()),
         has_reviewed_formula_expectation=has_reviewed,
@@ -129,5 +131,62 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         snapshot_id=snapshot_id or "")
 
 
-__all__ = ["decision_facts_for_candidate", "load_frozen_option_facts",
-           "persist_option_decisions"]
+def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
+                                      snapshot_id: str | None):
+    """The activation policy's CURRENT layer — the small re-read at the durable write.
+
+    Everything here fails toward blocking (the same posture as the dataclass defaults):
+    a review that cannot be re-verified is not current; an absent snapshot is unverifiable;
+    a policy hash that moved since generation is drift. NOTHING here re-binds or substitutes —
+    divergence surfaces as a typed regenerate blocker in the fold."""
+    from featuregen.overlay.upload.activation_policy import CurrentActivationStateV1
+    from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
+
+    review_now = False
+    if frozen.generation_source == "recipe" and frozen.source_definition_id:
+        try:
+            from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+            from featuregen.overlay.upload.recipe_review_validity import (
+                review_validity,
+                reviews_by_role_for_revision,
+            )
+
+            definition = v2_recipe_by_id(frozen.source_definition_id)
+            by_role = reviews_by_role_for_revision(
+                conn, recipe_id=definition.recipe_id,
+                recipe_revision_hash=frozen.recipe_revision_hash)
+            review_now = review_validity(definition, by_role).current
+        except Exception:                     # unknown recipe / store error → NOT current
+            review_now = False
+
+    pins_current = (f"authority_matrix_hash:{authority_matrix_hash()}"
+                    in frozen.policy_revision_pins)
+
+    freshness = "unverifiable"
+    if snapshot_id:
+        try:
+            from featuregen.overlay.upload.feature_metadata_snapshot import (
+                compare_snapshot_to_current,
+            )
+
+            freshness = compare_snapshot_to_current(conn, snapshot_id).status
+        except Exception:
+            freshness = "unverifiable"
+
+    return CurrentActivationStateV1(
+        review_current=review_now,
+        policy_revisions_current=pins_current,
+        snapshot_freshness=freshness,
+        # Effective readiness is the FROZEN readiness until a re-fold exists (C-phase): honest,
+        # and materialization stays blocked regardless (readiness != MATERIALIZATION_READY for
+        # every recipe today, schema unsupported, execution authority unevaluated).
+        effective_readiness=frozen.readiness,
+        formula_expectation_revision=frozen.formula_expectation_revision,
+        formula_schema_supported=False,
+        requirements_closed=False,
+        execution_authority_evaluated=False,
+        execution_floor_met=False)
+
+
+__all__ = ["assemble_current_activation_state", "decision_facts_for_candidate",
+           "load_frozen_option_facts", "persist_option_decisions"]

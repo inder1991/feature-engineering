@@ -1830,7 +1830,21 @@ def select_and_record_gate1_choice(
             revision_hash,
         ),
     )
-    return DraftChoice(feature, lineage, revision_id, revision_hash)
+    # A2 slice 2: when the choice resolved against a VERIFIED revision, recover the option id
+    # from the revision's own public entries (the same name-match _chosen_feature_from_snapshot
+    # used — ambiguity already failed closed above), so the activation fold can load the A1b
+    # decision row for semantic options. Legacy pre-revision choices keep option_id None.
+    option_id = None
+    if revision_id is not None:
+        for feature_set in public.get("alternatives", []):
+            for entry in feature_set.get("features", []):
+                if entry.get("name") == chosen_option_id and entry.get("option_id"):
+                    option_id = entry["option_id"]
+        anchor_entry = public.get("anchor")
+        if (chosen_source == "anchor" and anchor_entry
+                and anchor_entry.get("name") == chosen_option_id):
+            option_id = anchor_entry.get("option_id")
+    return DraftChoice(feature, lineage, revision_id, revision_hash, option_id=option_id)
 
 
 def considered_snapshot_lineage(conn, intent_id: str) -> dict | None:

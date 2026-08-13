@@ -40,6 +40,7 @@ from featuregen.overlay.upload.contract.author import (
     _envelope_join_path,
     draft_contract,
 )
+from featuregen.overlay.upload.activation_policy import activation_decision
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
     UnknownConsideredOption,
@@ -1185,7 +1186,35 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     # kinds this build cannot re-derive) must not brick drafting — absence of proof is not
     # proof of drift.
     lineage_snapshot_id = (choice.snapshot_lineage or {}).get("snapshot_id")
-    if lineage_snapshot_id:
+    # A2 slice 2 — the activation fold at the durable write. An option with an A1b decision
+    # row is a SEMANTIC option: its frozen facts + the current-state re-read go through
+    # activation_decision, which owns EVERY create_contract rule (snapshot freshness included,
+    # failing CLOSED on unverifiable — the semantic workflow has no compatibility debt).
+    # An option WITHOUT a decision row is a legacy/free-form candidate: it keeps the standalone
+    # drift check below until B1/E4 retire that path entirely.
+    frozen = None
+    if choice.considered_revision_id and choice.option_id:
+        from featuregen.overlay.upload.semantic_option_decision import (
+            assemble_current_activation_state,
+            load_frozen_option_facts,
+        )
+
+        frozen = load_frozen_option_facts(
+            conn, considered_revision_id=choice.considered_revision_id,
+            option_id=choice.option_id)
+    if frozen is not None:
+        current = assemble_current_activation_state(
+            conn, frozen=frozen, snapshot_id=lineage_snapshot_id)
+        decision = activation_decision(frozen, current, "create_contract",
+                                       actor=identity.subject)
+        if not decision.allowed:
+            raise HTTPException(status_code=409, detail={
+                "code": "ACTIVATION_BLOCKED",
+                "action": "create_contract",
+                "blockers": [{"code": b.code, "next_step": b.next_step}
+                             for b in decision.blockers],
+            })
+    elif lineage_snapshot_id:
         freshness = compare_snapshot_to_current(conn, lineage_snapshot_id)
         if freshness.status == "drifted":
             raise HTTPException(status_code=409, detail={
