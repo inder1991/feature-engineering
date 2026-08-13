@@ -796,6 +796,19 @@ as the legacy path persists them.
 *Acceptance:* read-allowed-use-denied column refuses activation with the named code (the
 review's §10 case); licensed case carries revision ids end to end.
 
+> **ACCEPTED (2026-08-13).** The capability compiles the licence state in ONE bulk
+> content-verified read (`active_pii_use_policies` — absence, revocation, and tamper all
+> refuse; the read is SKIPPED entirely when the shortlist binds no personal data, so the
+> query pin holds). `evaluate_operand` refuses unlicensed personal data with
+> `PERSONAL_DATA_POLICY_REQUIRED` naming the governance action (provisional — a policy
+> question with an owner, never structural); the code rides the gauntlet's requirements into
+> the frozen decision, and `activation_decision` refuses `create_contract` while it is
+> outstanding (save_idea stays open). The licensed case carries the EXACT revision ids:
+> capability → eligibility verdict → served idea's `personal_data_policy_revision_ids`
+> (the same carrier the legacy path persists). Tests: §10 unlicensed/licensed at the fold,
+> the compile round-trip against a real approved policy (`pep_flag`, the standing example),
+> and the activation refusal.
+
 ### Task C5 — DESIGN_CHECKED means every family evaluated (1 day)
 
 *Modify:* `typed_gauntlet.py`, tests.

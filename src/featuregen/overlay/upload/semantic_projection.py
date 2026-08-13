@@ -124,6 +124,13 @@ def _served_idea(assembled, validation, *, catalog_source: str,
     bound_refs = [v.selected_ref for v in candidate.verdicts
                   if v.status == "bound" and v.selected_ref]
     plan = getattr(candidate, "binding_plan", None) or {}
+    # C4: the licensing provenance rides the card exactly as the legacy path carried it —
+    # the union of the bound operands' ACTIVE policy revisions (empty = nothing needed one).
+    eligibility = candidate.eligibility or {}
+    licence_ids = tuple(sorted({
+        rid for v in candidate.verdicts if v.status == "bound" and v.selected_ref
+        for rid in getattr(eligibility.get((v.role, v.selected_ref)), 
+                           "personal_data_policy_revision_ids", ())}))
     return FeatureIdea(
         name=request.output.display_label or candidate.recipe_id,
         description=description,
@@ -145,6 +152,7 @@ def _served_idea(assembled, validation, *, catalog_source: str,
         operand_roles=tuple(sorted(
             (v.selected_ref, v.role) for v in candidate.verdicts
             if v.status == "bound" and v.selected_ref)),
+        personal_data_policy_revision_ids=licence_ids,
     )
 
 

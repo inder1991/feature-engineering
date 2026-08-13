@@ -220,3 +220,34 @@ def test_a_lone_proposal_still_pins_proposed_so_the_floors_ride(db):
         db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
     assert caps[ref].concept_authority == "llm/proposed"
     assert caps[ref].authority_conflicts == ()
+
+
+# ── C4: the licence compiles onto the capability in ONE bulk read ──────────────────────────────
+
+def test_the_capability_carries_the_personal_data_licence_state(db):
+    """A personal-data concept compiles `personal_data_required`; with no active policy it is
+    unlicensed; approving the purpose licenses it WITH the exact revision id. The licence
+    read is skipped entirely for a shortlist with no personal data (the query pin holds)."""
+    from featuregen.overlay.upload.pii_policy_store import approve_pii_use_policy
+
+    rows = [
+        (CanonicalRow(SOURCE, "customers", "pep_ind", "text",
+                      definition="politically exposed person marker"), "pep_flag"),
+    ]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    ref = "public.customers.pep_ind"
+
+    caps = compile_capabilities(
+        db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
+    assert caps[ref].personal_data_required is True
+    assert caps[ref].personal_data_licensed is False
+    assert caps[ref].personal_data_policy_revision_ids == ()
+
+    revision_id, _v = approve_pii_use_policy(
+        db, concept_name="pep_flag", purpose="AML transaction monitoring",
+        expected_pointer_version=0, actor="admin@bank")
+    caps = compile_capabilities(
+        db, build_generation_semantic_context(db, catalog_source=SOURCE), [ref])
+    assert caps[ref].personal_data_licensed is True
+    assert caps[ref].personal_data_policy_revision_ids == (revision_id,)

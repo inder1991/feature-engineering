@@ -295,3 +295,29 @@ def test_summing_what_cannot_be_summed_is_blocked_by_declared_additivity():
     averaged = _Output(entity_agg="average over accounts", time_agg="mean over window")
     verdict = evaluate_operand(summed, ratio_col, output=averaged, temporal_anchor="event")
     assert R.ADDITIVITY_INCOMPATIBLE not in verdict.reason_codes
+
+
+# ── C4: personal data — read-allowed is not use-allowed ────────────────────────────────────────
+
+def test_unlicensed_personal_data_is_a_policy_question_with_an_owner():
+    """The review's §10 case in the ENGINE path: a readable personal-data column refuses use
+    with the named governance action — and an ACTIVE licence clears it, carrying the exact
+    revision that did (provenance the served card takes forward)."""
+    pep = capability(concept="pep_flag", possible_operand_classes=("status", "dimension"),
+                     type_family="text", declared_type="text", currency=None,
+                     personal_data_required=True, personal_data_licensed=False)
+    verdict = evaluate_operand(operand(concept="pep_flag", operand_class="dimension"), pep)
+    assert verdict.status == "provisional"
+    assert R.PERSONAL_DATA_POLICY_REQUIRED in verdict.reason_codes
+    assert "Data-use policies" in verdict.resolution
+    assert verdict.personal_data_policy_revision_ids == ()
+
+    licensed = capability(concept="pep_flag",
+                          possible_operand_classes=("status", "dimension"),
+                          type_family="text", declared_type="text", currency=None,
+                          personal_data_required=True, personal_data_licensed=True,
+                          personal_data_policy_revision_ids=("pup_abc123",))
+    verdict = evaluate_operand(operand(concept="pep_flag", operand_class="dimension"),
+                               licensed)
+    assert R.PERSONAL_DATA_POLICY_REQUIRED not in verdict.reason_codes
+    assert verdict.personal_data_policy_revision_ids == ("pup_abc123",)

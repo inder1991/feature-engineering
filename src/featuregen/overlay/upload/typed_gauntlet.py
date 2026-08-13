@@ -32,6 +32,7 @@ _REQUIREMENT_CODES = frozenset({
     R.PROPOSED_METADATA_ONLY, R.SEMANTIC_AUTHORITY_INSUFFICIENT,
     R.CURRENCY_POLICY_MISSING, R.RELATIONSHIP_REQUIRED,
     R.STATUS_POLICY_UNRESOLVED,                     # C3: named setup work, never silent
+    R.PERSONAL_DATA_POLICY_REQUIRED,                # C4: a policy question with an owner
 })
 
 

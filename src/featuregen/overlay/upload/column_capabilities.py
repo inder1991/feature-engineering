@@ -96,6 +96,12 @@ class ColumnCapabilityV1:
     # C3: a governed signed-amount convention at AUTHORING authority rides this column —
     # one of the two representations that license opposing legs on one physical column.
     sign_convention_cleared: bool = False
+    # C4 (D14 in the engine path): this column's concept is PERSONAL DATA; whether an ACTIVE
+    # content-verified use policy licenses it, and WHICH revision did. Absence, revocation,
+    # and tamper are indistinguishable here — none of them licenses (the store's own law).
+    personal_data_required: bool = False
+    personal_data_licensed: bool = False
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
 
 
 def _authority(pins: dict[tuple[str, str], str], logical_ref: str, field: str,
@@ -154,6 +160,18 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
                 sign_cleared.add(logical_ref)
 
     from featuregen.overlay.upload.concepts import concept as registered_concept
+    from featuregen.overlay.upload.concepts import is_personal_data
+
+    # C4: ONE bulk license read for the whole shortlist — skipped entirely when no member
+    # is personal data (most compiles). The store content-verifies every returned revision;
+    # a PolicyStoreConflict propagates by design (tamper must never degrade to "unlicensed").
+    pii_concepts = {col.concept for _ref, col in members
+                    if col.concept and is_personal_data(col.concept)}
+    licensed_by_concept: dict[str, str] = {}
+    if pii_concepts:
+        from featuregen.overlay.upload.pii_policy_store import active_pii_use_policies
+
+        licensed_by_concept = active_pii_use_policies(conn, pii_concepts)
 
     capabilities: dict[str, ColumnCapabilityV1] = {}
     for ref, col in members:
@@ -203,7 +221,12 @@ def compile_capabilities(conn, context: GenerationSemanticContextV1,
             retrieval_text=" ".join(filter(None, (
                 col.definition, col.ai_summary, col.semantic_terms))),
             authority_conflicts=tuple(sorted(conflicts.get(logical_ref, ()))),
-            sign_convention_cleared=logical_ref in sign_cleared)
+            sign_convention_cleared=logical_ref in sign_cleared,
+            personal_data_required=bool(col.concept and is_personal_data(col.concept)),
+            personal_data_licensed=col.concept in licensed_by_concept,
+            personal_data_policy_revision_ids=(
+                (licensed_by_concept[col.concept],)
+                if col.concept in licensed_by_concept else ()))
     return capabilities
 
 

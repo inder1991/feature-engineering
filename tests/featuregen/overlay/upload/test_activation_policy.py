@@ -247,3 +247,17 @@ def test_materialization_is_floor_driven_not_unconditionally_blocked():
                           execution_floor_met=False)
     decision = activation_decision(CLEAN_FROZEN, unevaluated, "request_materialization")
     assert "EXECUTION_AUTHORITY_UNEVALUATED" in codes(decision)
+
+
+def test_unlicensed_personal_data_refuses_the_governed_contract():
+    """C4: the frozen decision carried PERSONAL_DATA_POLICY_REQUIRED among its outstanding
+    requirements — read-allowed is not use-allowed, and no governed contract forms over it.
+    The blocker names the governance action; save_idea stays open."""
+    from dataclasses import replace
+
+    frozen = replace(CLEAN_FROZEN,
+                     outstanding_requirement_codes=("PERSONAL_DATA_POLICY_REQUIRED",))
+    decision = activation_decision(frozen, CLEAN_CURRENT, "create_contract")
+    assert not decision.allowed
+    assert "PERSONAL_DATA_POLICY_REQUIRED" in codes(decision)
+    assert activation_decision(frozen, CLEAN_CURRENT, "save_idea").allowed

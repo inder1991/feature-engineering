@@ -111,6 +111,9 @@ _RESOLUTIONS: dict[str, str] = {
                              "realization), then regenerate",
     R.CURRENCY_POLICY_MISSING: "declare the currency (fixed code or per-row column) — money "
                                "is refused until it is known",
+    R.PERSONAL_DATA_POLICY_REQUIRED: "this column is personal data and no active use policy "
+                                     "licenses it — a governance owner declares the purpose "
+                                     "under Governance -> Data-use policies",
     R.SOURCE_GRAIN_MISMATCH: "this operand requires a differently-shaped source (event rows "
                              "vs point-in-time snapshots) — bind a column from a table of the "
                              "declared shape the recipe expects",
@@ -144,6 +147,9 @@ class OperandEligibilityVerdictV1:
     resolution: str
     policy_version: str
     policy_content_hash: str
+    # C4: the ACTIVE policy revisions that license this column's personal data (empty when
+    # none needed or none granted) — provenance the served idea carries forward.
+    personal_data_policy_revision_ids: tuple[str, ...] = ()
 
 
 def _primary(codes: list[str]) -> str | None:
@@ -272,6 +278,10 @@ def evaluate_operand(operand: RequiredOperandV1,
     # visible setup work riding every candidate that depends on it (never a silent skip).
     if operand.status_policy_ref:
         codes.append(R.STATUS_POLICY_UNRESOLVED)
+    # C4 (D14): unlicensed personal data is a POLICY question with an owner — a purpose
+    # declared in Governance clears it; nothing else does.
+    if capability.personal_data_required and not capability.personal_data_licensed:
+        codes.append(R.PERSONAL_DATA_POLICY_REQUIRED)
 
     if blocked:
         status = "blocked"
@@ -288,6 +298,7 @@ def _verdict(operand: RequiredOperandV1, capability: ColumnCapabilityV1,
     checks = tuple(code for code in codes
                    if R.reason_family(code) in ("needs_setup", "needs_data_check"))
     return OperandEligibilityVerdictV1(
+        personal_data_policy_revision_ids=capability.personal_data_policy_revision_ids,
         operand_role=operand.role,
         object_ref=capability.object_ref,
         status=status,

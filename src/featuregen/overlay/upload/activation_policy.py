@@ -148,6 +148,14 @@ def _contract_blockers(frozen: FrozenOptionFactsV1,
         # B10 item 4: the human re-confirmed a DIFFERENT unit of analysis after this card was
         # served — the card answers a question nobody is asking anymore. Regenerate.
         blockers.append(BlockerV1(R.ACTIVATION_STATE_DRIFTED, _REGENERATE_STEP))
+    if R.PERSONAL_DATA_POLICY_REQUIRED in frozen.outstanding_requirement_codes:
+        # C4 (D14): read-allowed is not use-allowed — unlicensed personal data never
+        # underwrites a governed contract; the fix is a purpose with an owner.
+        blockers.append(BlockerV1(
+            R.PERSONAL_DATA_POLICY_REQUIRED,
+            "a bound column is personal data with no active use policy — a governance "
+            "owner declares the purpose under Governance -> Data-use policies, then "
+            "regenerate"))
     if not frozen.confirmation_required_roles and not current.authoring_floor_met:
         # C2: the AUTHORING floor, re-read at the durable write. The serve-time answer rides
         # the frozen confirmation_required_roles (funnel-named, role-specific); THIS rule
