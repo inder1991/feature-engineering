@@ -2,7 +2,7 @@
 
 Date: 2026-07-23
 
-Interactive version: [Feature Generation Workflow](./feature-generation-workflow.html)
+Interactive version: [Feature Engineering Platform Flow](./feature-engineering-platform-flow.html)
 
 ## Scope And Baseline
 

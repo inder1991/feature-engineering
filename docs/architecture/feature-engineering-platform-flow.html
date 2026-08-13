@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Feature Generation Architecture</title>
+  <title>Feature Engineering Platform Flow</title>
   <style>
     :root {
       --paper: #f5f7f3;
@@ -1033,13 +1033,12 @@
     <header class="topbar">
       <div class="identity">
         <p class="eyebrow">FeatureGen / architecture control room</p>
-        <h1>Feature Generation Workflow</h1>
+        <h1>Feature Engineering Platform Flow</h1>
       </div>
       <div class="baseline">
-        <span>Implemented baseline</span>
-        <span class="commit">origin/main 3668b93</span>
-        <span>Formula critic</span>
-        <span class="commit">in flight 1c01bfc</span>
+        <span>Current code baseline</span>
+        <span class="commit">formula + materialization wired</span>
+        <span>Customer data remains external</span>
       </div>
     </header>
 
@@ -1115,8 +1114,8 @@
               <h2 id="inspector-title">End-to-end feature generation</h2>
               <p id="inspector-summary" class="inspector-summary">
                 The live platform governs metadata, proposes features, validates contracts, and records
-                lineage. Formula authoring is under construction; compilation and data execution remain
-                outside the platform.
+                lineage. Governed formula authoring and materialization are wired through durable
+                traces, queues and control-plane records; customer row data remains outside the platform.
               </p>
               <div class="fact">
                 <span class="fact-label">Authority boundary</span>
@@ -1137,7 +1136,8 @@
               <div class="fact">
                 <span class="fact-label">Durable state</span>
                 <span id="inspector-store" class="fact-value">
-                  PostgreSQL graph, authority, audit, intent, contract, feature and shadow stores.
+                  PostgreSQL graph, authority, audit, intent, contract, feature, formula-trace and
+                  materialization control-plane stores.
                 </span>
               </div>
               <div id="inspector-links-fact" class="fact" hidden>
@@ -1759,12 +1759,12 @@ pit: required</pre>
       },
 
       {
-        id: "intent_adapter", lane: "formula", y: 85, title: "Feature to AuthoringIntent handoff",
-        meta: "integration not wired", status: "planned", groups: ["formula"],
-        summary: "A future adapter will convert the governed feature/contract into the minimal typed intent used by formula authoring.",
-        authority: "The handoff must preserve server-authoritative operands, grain and validation requirements.",
-        code: ["No production adapter or API route yet"],
-        store: "No authoring manifest table yet."
+        id: "intent_adapter", lane: "formula", y: 85, title: "Recipe formula authoring handoff",
+        meta: "governed shadow work item", status: "shadow", groups: ["formula"],
+        summary: "Confirmed recipe work can create a durable shadow work item and replayable AuthoringIntent for governed formula authoring.",
+        authority: "The handoff is derived from the server-stored recipe and contract context; shadow output cannot promote a feature by itself.",
+        code: ["overlay/upload/recipe_formula_shadow.py", "overlay/upload/recipe_formula_worker.py", "formula/replay_authoring.py"],
+        store: "recipe_formula_shadow_work_item plus formula_authoring_run and formula_authoring_trace_event."
       },
       {
         id: "formula_author", lane: "formula", y: 205, title: "Sequential-turn formula author",
@@ -1772,7 +1772,7 @@ pit: required</pre>
         summary: "A bounded LLM loop emits either one governed tool call or a final raw TypedFormula proposal on each turn.",
         authority: "Tool results are read-scoped metadata treated as data, never instructions. Every turn uses the audited call seam.",
         code: ["formula/author.py", "formula/turns.py", "formula/audited.py"],
-        store: "llm_call rows under a supplied authoring run bucket; owning run persistence is still planned."
+        store: "Audited llm_call rows and append-only authoring trace events under a durable authoring run."
       },
       {
         id: "formula_tools", lane: "formula", y: 330, title: "Seven governed authoring tools",
@@ -1800,11 +1800,11 @@ pit: required</pre>
       },
       {
         id: "formula_critic", lane: "formula", y: 705, title: "Independent formula critic",
-        meta: "closed finding codes", status: "inflight", groups: ["formula"],
+        meta: "closed finding codes", status: "implemented", groups: ["formula"],
         summary: "A separate model/context reviews missing operands, slot direction, filters, windows, unjustified operands and weak proxies.",
         authority: "The critic never mutates the formula. Blocking findings prevent automatic resolution; malformed responses fail closed.",
-        code: ["formula/critic.py on merge/b-slice-to-main"],
-        store: "Critic llm_call and findings hash; trace integration remains planned."
+        code: ["formula/critic.py", "formula/authoring.py", "formula/replay_authoring.py"],
+        store: "Independent audited llm_call, findings hash and redacted trace event."
       },
       {
         id: "formula_result", lane: "formula", y: 830, title: "Disposition and content identity",
@@ -1812,56 +1812,56 @@ pit: required</pre>
         summary: "Structural, capability, output, expectation, critic and technical axes fold into one honest result. Resolved formulas receive a canonical content hash.",
         authority: "Unresolved output carries a proposal, never a fabricated authoritative TypedFormula.",
         code: ["formula/result.py", "formula/canonical.py", "formula/_jcs.py"],
-        store: "Library result only; durable trace, formula version and API are not complete."
+        store: "Disposition, canonical content hash and terminal authoring-trace event; materialization admission re-verifies the trace."
       },
       {
-        id: "formula_orchestrator", lane: "formula", y: 950, title: "Orchestrator, trace, gold gate and API",
-        meta: "Child 1 completion work", status: "planned", groups: ["formula"],
-        summary: "The remaining slice must wire all authoring stages, persist a manifest-first trace, evaluate real-provider gold cases and expose a controlled API.",
-        authority: "The gold gate must prove false-resolve zero and exact positive outcomes before formula authoring is enabled.",
-        code: ["Planned: formula/authoring.py, formula/trace.py, formula/gold.py and API route"],
-        store: "Planned authoring_run and append-only authoring_trace_event."
+        id: "formula_orchestrator", lane: "formula", y: 950, title: "Orchestration, trace and gold gate",
+        meta: "bounded run / replayable evidence", status: "implemented", groups: ["formula"],
+        summary: "The orchestrator composes authoring, parsing, capability, C1 output authority, independent critique and disposition into a bounded, manifest-first run. Gold and replay harnesses verify the governed path.",
+        authority: "Only a terminal, hash-consistent resolved authoring run can pass materialization admission; failures remain incomplete or non-resolved.",
+        code: ["formula/authoring.py", "formula/trace.py", "formula/gold.py", "formula/replay_authoring.py"],
+        store: "Write-once authoring manifests and append-only trace events."
       },
 
       {
-        id: "freeze", lane: "materialization", y: 120, title: "Approve immutable formula version",
-        meta: "Child 2", status: "planned", groups: ["materialization"],
-        summary: "Human review will freeze the selected TypedFormula and bind its content hash, versions, contract and provenance.",
-        authority: "A candidate formula cannot execute until approval creates an immutable version.",
-        code: ["Planned child of the materialization design"],
-        store: "Planned formula-version artifact linked to feature_versions."
+        id: "freeze", lane: "materialization", y: 120, title: "Trace-verified materialization admission",
+        meta: "resolved run + immutable evidence", status: "implemented", groups: ["materialization"],
+        summary: "Materialization admits only a resolved formula whose terminal trace, intent hash, canonical formula hash and schema version all re-verify against durable evidence.",
+        authority: "A caller cannot materialize a bare formula or substitute a different result for a legitimate authoring run.",
+        code: ["materialize/admission.py", "materialize/authoring_trace.py", "materialize/resolve.py"],
+        store: "Formula authoring trace plus immutable resolved-input evidence."
       },
       {
-        id: "compile", lane: "materialization", y: 275, title: "Compile and submit",
-        meta: "Child 3 and Child 4", status: "planned", groups: ["materialization"],
-        summary: "A platform-neutral compiler will lower the formula to a signed external submission with pinned operands, windows, grain and policy versions.",
-        authority: "Compilation must preserve formula identity and reject unsupported backend semantics.",
-        code: ["Planned compiler and external-platform adapter"],
-        store: "Planned immutable submission/outbox records."
+        id: "compile", lane: "materialization", y: 275, title: "Compile, seal and queue",
+        meta: "flag-gated control plane", status: "implemented", groups: ["materialization"],
+        summary: "A flag-gated request queues a worker that resolves admitted inputs, builds a group plan and execution IR, renders a sealed Kedro project, and records the compilation and run lifecycle.",
+        authority: "The worker re-derives identity and refuses unsupported semantics, unsafe reads, stale inputs and unverifiable artifacts before a run can start.",
+        code: ["api/routes/materialization_runs.py", "materialize/compile/chain.py", "materialize/queue_lane.py", "materialize/control_plane.py"],
+        store: "materialization request, queue, compiled artifact, plan revision and append-only run events."
       },
       {
-        id: "execute", lane: "materialization", y: 445, title: "External execution platform",
-        meta: "customer runtime", status: "external", groups: ["materialization"],
-        summary: "The customer platform compiles to its native engine, reads actual data, computes the feature and measures required validations.",
-        authority: "Execution is outside FeatureGen. The external platform is authoritative only for the observations it signs.",
-        code: ["External implementation"],
-        store: "Customer warehouse, lakehouse or feature-store runtime."
+        id: "execute", lane: "materialization", y: 445, title: "Generated project execution",
+        meta: "Kedro / Spark submission", status: "implemented", groups: ["materialization"],
+        summary: "The sealed project is validated and submitted with exactly the prepared run parameters; it stages, computes and publishes the feature group through the selected supported mechanism.",
+        authority: "The runtime reads customer-owned data outside FeatureGen. Submission and publication require the pinned capability attestation and exact sealed artifact.",
+        code: ["materialize/submit.py", "materialize/validation.py", "materialize/render/project.py", "materialize/publish.py"],
+        store: "Generated project tree, validation report, run manifest and publication record."
       },
       {
-        id: "attestation", lane: "materialization", y: 620, title: "Signed validation attestation",
-        meta: "round trip", status: "planned", groups: ["materialization", "governance"],
-        summary: "Signed observations will answer requirements such as numeric type, unique grain, temporal population, lag and row-level execution checks.",
-        authority: "FeatureGen re-derives the expected request and verifies signature, scope, formula hash and freshness before promotion.",
-        code: ["Planned attestation endpoint and verification store"],
-        store: "Planned append-only attestation and verification events."
+        id: "attestation", lane: "materialization", y: 620, title: "Validation and publication attestation",
+        meta: "sealed artifact + capability proof", status: "implemented", groups: ["materialization", "governance"],
+        summary: "The control plane records validation findings, the capability attestation that permits publication, and a terminal manifest with publication location, counts and checks.",
+        authority: "A compile or execution result never becomes a success merely because a process was invoked; validation and publication evidence must be complete and hash-consistent.",
+        code: ["materialize/validation.py", "materialize/control_plane.py", "materialize/publish.py"],
+        store: "Validation report, publication capability attestation, run events and materialization run manifest."
       },
       {
         id: "data_checked", lane: "materialization", y: 790, title: "DATA-CHECKED and usefulness",
-        meta: "future promotion", status: "planned", groups: ["materialization", "governance"],
-        summary: "Successful data checks can mint DATA-CHECKED; downstream backtesting and model evaluation can later mint USEFULNESS-CHECKED.",
+        meta: "promotion not wired", status: "planned", groups: ["materialization", "governance"],
+        summary: "The materialization plane now records validation and publication evidence, but it does not yet mint DATA-CHECKED. Downstream backtesting and model evaluation remain required for USEFULNESS-CHECKED.",
         authority: "No coverage or quality threshold is fabricated from metadata-only evidence.",
-        code: ["governance/attributes.py vocabulary exists; promotion paths are planned"],
-        store: "feature_versions and future attestation/usefulness evidence."
+        code: ["governance/attributes.py", "materialize/control_plane.py"],
+        store: "feature_versions plus materialization evidence; promotion workflow remains planned."
       }
     ];
 
@@ -1881,13 +1881,13 @@ pit: required</pre>
       ["considered", "draft"], ["draft", "confirm"], ["admin", "confirm"],
       ["confirm", "registry"], ["live_gate", "recipe_planner", "control"],
       ["planner_shadow", "live_gate", "shadow"], ["registry", "validation_ladder"],
-      ["registry", "intent_adapter", "planned"], ["intent_adapter", "formula_author", "planned"],
+      ["registry", "intent_adapter", "shadow"], ["intent_adapter", "formula_author", "shadow"],
       ["formula_author", "formula_tools"], ["formula_tools", "formula_author"],
       ["formula_author", "formula_validation"], ["formula_validation", "formula_output"],
       ["operational", "formula_output"], ["formula_output", "formula_critic"],
-      ["formula_critic", "formula_result"], ["formula_result", "formula_orchestrator", "planned"],
-      ["formula_orchestrator", "freeze", "planned"], ["freeze", "compile", "planned"],
-      ["compile", "execute", "planned"], ["customer_data", "execute"],
+      ["formula_critic", "formula_result"], ["formula_result", "formula_orchestrator"],
+      ["formula_orchestrator", "freeze", "shadow"], ["freeze", "compile"],
+      ["compile", "execute"], ["customer_data", "execute"],
       ["execute", "attestation"], ["attestation", "data_checked", "planned"],
       ["data_checked", "validation_ladder", "planned"],
       ["audit_runtime", "pass_a", "control"], ["audit_runtime", "llm_ideas", "control"],

@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FeatureGen Ingestion Flow</title>
+  <style>
+    :root { --ink:#17201b; --muted:#5f6f65; --paper:#f5f7f3; --surface:#fff; --line:#cbd5ce; --green:#287a4b; --green-soft:#e4f2e9; --amber:#865f05; --amber-soft:#fff1c9; --blue:#315f9b; --blue-soft:#e7effa; --red:#a94435; --red-soft:#fae8e3; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--paper); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header { padding:28px max(20px,calc((100% - 1180px)/2)); color:#f8fbf9; background:#17201b; }
+    .eyebrow { margin:0 0 6px; color:#9fc7ad; font:700 11px ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.08em; text-transform:uppercase; }
+    h1 { margin:0; font-size:clamp(26px,4vw,42px); line-height:1.1; }
+    header p:last-child { max-width:800px; margin:12px 0 0; color:#d3ddd6; line-height:1.55; }
+    main { width:min(1180px,100%); margin:auto; padding:28px 20px 48px; }
+    .notice { padding:14px 16px; border-left:4px solid var(--blue); background:var(--blue-soft); color:#27486f; line-height:1.5; }
+    h2 { margin:32px 0 12px; font-size:22px; }
+    .flow { display:grid; grid-template-columns:repeat(7,minmax(135px,1fr)); gap:14px; align-items:stretch; margin-top:18px; overflow-x:auto; padding-bottom:8px; }
+    .stage { position:relative; min-width:135px; padding:14px; border:1px solid var(--line); border-top:4px solid var(--green); border-radius:7px; background:var(--surface); cursor:pointer; text-align:left; color:var(--ink); }
+    .stage:hover,.stage[aria-pressed="true"] { outline:3px solid rgba(49,95,155,.22); border-color:var(--blue); }
+    .stage:not(:last-child)::after { content:"→"; position:absolute; z-index:2; top:50%; right:-15px; transform:translateY(-50%); color:var(--muted); font-size:22px; }
+    .stage-num { display:block; color:var(--green); font:800 11px ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .stage strong { display:block; margin-top:7px; font-size:14px; line-height:1.25; }
+    .stage small { display:block; margin-top:6px; color:var(--muted); font-size:12px; line-height:1.35; }
+    .branches { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:20px; }
+    .branch { padding:16px; border:1px solid var(--line); border-radius:7px; background:var(--surface); }
+    .branch h3 { margin:0 0 7px; font-size:16px; }
+    .branch p { margin:0; color:var(--muted); line-height:1.5; }
+    .branch.quarantine { border-left:5px solid var(--red); background:var(--red-soft); }
+    .branch.review { border-left:5px solid var(--amber); background:var(--amber-soft); }
+    .detail { display:grid; grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr); gap:24px; margin-top:26px; padding:22px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+    .detail h3 { margin:0 0 8px; font-size:22px; }
+    .detail p,.detail li { color:#44534a; line-height:1.55; }
+    .detail ul { padding-left:20px; margin:12px 0; }
+    .example { padding:15px; border-left:4px solid var(--green); background:var(--green-soft); }
+    .example strong { display:block; margin-bottom:6px; }
+    pre { margin:0; overflow:auto; white-space:pre-wrap; font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace; color:#284334; }
+    .legend { display:flex; flex-wrap:wrap; gap:10px 18px; margin-top:18px; color:var(--muted); font-size:12px; }
+    .legend span::before { content:""; display:inline-block; width:10px; height:10px; margin-right:6px; border-radius:2px; vertical-align:middle; background:var(--green); }
+    .legend .proposal::before { background:var(--amber); } .legend .blocked::before { background:var(--red); } .legend .control::before { background:var(--blue); }
+    table { width:100%; border-collapse:collapse; background:var(--surface); }
+    th,td { padding:12px; border:1px solid var(--line); text-align:left; vertical-align:top; line-height:1.45; }
+    th { background:#eef2ed; font-size:12px; text-transform:uppercase; }
+    code { font:12px ui-monospace,SFMono-Regular,Consolas,monospace; }
+    @media(max-width:760px) { .detail,.branches { grid-template-columns:1fr; } .flow { grid-template-columns:repeat(7,160px); } }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="eyebrow">FeatureGen / architecture guide</p>
+    <h1>Ingestion flow, stage by stage</h1>
+    <p>How catalog metadata becomes governed, searchable context for safe feature discovery. Select a stage to inspect its purpose, controls, and banking example.</p>
+  </header>
+  <main>
+    <div class="notice"><strong>Boundary:</strong> ingestion processes metadata—schemas, glossaries, table and column facts, and relationship claims. Customer transaction rows remain in the bank-controlled data platform.</div>
+
+    <h2>Primary ingestion path</h2>
+    <div class="flow" id="flow" aria-label="Seven-stage ingestion flow">
+      <button class="stage" type="button" data-stage="0" aria-pressed="true"><span class="stage-num">01</span><strong>Submit source</strong><small>Upload or approved import</small></button>
+      <button class="stage" type="button" data-stage="1" aria-pressed="false"><span class="stage-num">02</span><strong>Canonicalize</strong><small>Adapt every source shape</small></button>
+      <button class="stage" type="button" data-stage="2" aria-pressed="false"><span class="stage-num">03</span><strong>Validate</strong><small>Check identity and structure</small></button>
+      <button class="stage" type="button" data-stage="3" aria-pressed="false"><span class="stage-num">04</span><strong>Establish facts</strong><small>Evidence and enrichment</small></button>
+      <button class="stage" type="button" data-stage="4" aria-pressed="false"><span class="stage-num">05</span><strong>Build graph</strong><small>Tables, columns, declared edges</small></button>
+      <button class="stage" type="button" data-stage="5" aria-pressed="false"><span class="stage-num">06</span><strong>Govern candidates</strong><small>Grain, joins, semantics</small></button>
+      <button class="stage" type="button" data-stage="6" aria-pressed="false"><span class="stage-num">07</span><strong>Project and close</strong><small>Drift, read models, run status</small></button>
+    </div>
+
+    <div class="branches" aria-label="Controlled exception paths">
+      <section class="branch quarantine"><h3>Invalid row → quarantine</h3><p>Malformed identities, duplicate records, conflicts, or structural failures are retained with a reason but do not enter the graph or authority layer.</p></section>
+      <section class="branch review"><h3>Large change → hold for review</h3><p>A material source reduction or unexpected replacement is held before it can remove or alter trusted catalog context.</p></section>
+    </div>
+
+    <section class="detail" aria-live="polite">
+      <div>
+        <p class="eyebrow" id="detail-number">Stage 01</p>
+        <h3 id="detail-title">Submit source and open a run</h3>
+        <p id="detail-summary"></p>
+        <h4>What the platform does</h4>
+        <ul id="detail-actions"></ul>
+        <h4>Control objective</h4>
+        <p id="detail-control"></p>
+      </div>
+      <aside class="example">
+        <strong>Retail-banking example</strong>
+        <pre id="detail-example"></pre>
+      </aside>
+    </section>
+
+    <h2>What is produced at each stage</h2>
+    <table>
+      <thead><tr><th>Stage</th><th>Primary output</th><th>What it is safe for</th><th>What it is not yet safe for</th></tr></thead>
+      <tbody>
+        <tr><td>Submit and canonicalize</td><td>Durable run record and normalized metadata rows</td><td>Traceability and consistent processing</td><td>Operational feature decisions</td></tr>
+        <tr><td>Validate</td><td>Accepted rows, quarantined rows, held-run decisions</td><td>Building from structurally sound inputs</td><td>Assuming business meaning or join safety</td></tr>
+        <tr><td>Facts and graph</td><td>Source evidence, proposed enrichments, tables, columns, declared edges</td><td>Search, discovery, and candidate generation</td><td>Using all visible values as authority</td></tr>
+        <tr><td>Govern candidates</td><td>Approved facts, joins, grain, availability, and semantic bindings</td><td>Feature grounding and deterministic planning</td><td>Claiming data-level performance or usefulness</td></tr>
+        <tr><td>Project and close</td><td>Fresh read models, drift events, terminal ingestion status</td><td>Repeatable downstream reads and impact management</td><td>Ignoring an explicit stale or held state</td></tr>
+      </tbody>
+    </table>
+    <div class="legend"><span>Implemented controlled path</span><span class="proposal">Candidate or advisory output</span><span class="blocked">Blocked or quarantined path</span><span class="control">Governance / integrity control</span></div>
+  </main>
+  <script>
+    const stages = [
+      { title: 'Submit source and open a run', summary: 'A data engineer uploads a schema or glossary file, or starts an approved OpenMetadata import. Before the content is parsed, the platform creates a durable ingestion run.', actions: ['Records the actor, source profile, fingerprint, effective flags and start time.', 'Links every later stage outcome to the same run.', 'Accepts bounded source formats such as CSV, XLSX, FTR glossary and OpenMetadata import.'], control: 'No input is processed as an anonymous or untraceable change. A run establishes the audit and recovery boundary before any graph or evidence write.', example: 'Request: import retail_core catalog\nSource: OpenMetadata / core-banking\nRun: ING-2026-08-13-001\nInitial state: OPEN\n\nThe run will later show accepted objects, quarantined rows, holds, drift, and terminal status.' },
+      { title: 'Canonicalize source-specific records', summary: 'Dedicated adapters transform each input format into a canonical structural row, with glossary content retained in a schema-preserving sidecar where applicable.', actions: ['Maps source headers and objects into a single representation.', 'Preserves source identity and provenance.', 'Uses a SourceCapabilityProfile to identify what the source is allowed to assert.'], control: 'Downstream logic sees one controlled representation rather than many loosely interpreted file formats. The platform does not infer identity when an adapter cannot establish it.', example: 'CSV input:\nTABLE,COLUMN,TYPE\ntransactions,transaction_amount,decimal\n\nCanonical row:\nsource=retail_core\ntable=transactions\ncolumn=transaction_amount\ndeclared_type=decimal' },
+      { title: 'Validate, quarantine, and apply the change brake', summary: 'The platform validates identifiers, duplicates, conflicts, and structural limits. It also compares the new source with the prior accepted state to detect unsafe replacement.', actions: ['Rejects malformed identity and width violations.', 'Quarantines duplicate or conflicting records with a reason.', 'Holds a run when a large change needs review.', 'Prevents quarantined rows from creating graph or evidence records.'], control: 'A catalog must not become more trusted merely because a file was uploaded. Bad records are visible and recoverable, but cannot contaminate downstream feature context.', example: 'Conflict detected:\ntransactions.transaction_amount\n- source row 41: decimal\n- source row 162: varchar\n\nOutcome: QUARANTINED\nNo operational type fact is created.' },
+      { title: 'Assert source facts and run advisory enrichment', summary: 'Accepted structural records create source-backed facts. Configured enrichment may propose business concepts, definitions, domains, table facts, and semantic interpretations using metadata-only context.', actions: ['Writes source evidence and provenance.', 'Runs bounded, audited structured LLM enrichment when enabled.', 'Treats AI results as proposed or advisory.', 'Retains stronger source and human evidence as the basis for authority.'], control: 'AI can accelerate understanding but cannot promote its own interpretation into an operational fact. Provider failures remain visible and fail-contained.', example: 'Input metadata:\ntransactions.transaction_amount\n"Monetary value of posted transaction"\n\nAdvisory enrichment:\nconcept = transaction monetary amount\ndomain = payments\nsemantic type = currency amount\n\nStatus: PROPOSED, pending policy and/or human decision.' },
+      { title: 'Build the searchable catalog graph', summary: 'Validated records become table and column nodes with containment and declared relationship edges. The graph is the discovery substrate used by catalog search, lineage, and feature context retrieval.', actions: ['Creates table and column graph nodes.', 'Creates containment edges such as table contains column.', 'Retains declared joins and lineage as discoverable relationships.', 'Supports asset-detail, search, and lineage read APIs.'], control: 'A graph edge supports discovery, not automatic execution. Feature generation consumes governed relationship authority rather than every edge visible in the graph.', example: 'Graph:\ntransactions ─contains→ transaction_amount\ntransactions ─declares→ account_id\naccounts ─contains→ customer_id\n\nDisplayed candidate link:\ntransactions.account_id → accounts.account_id' },
+      { title: 'Govern table facts, join candidates, and semantic bindings', summary: 'Additional stages propose and confirm the information required for safe feature assembly: grain, time availability, relationship cardinality, entity bridges, approved joins, and semantic meaning.', actions: ['Pass B proposes table grain and availability.', 'Pass C discovers candidate joins.', 'Semantic stages propose bindings such as event time or monetary amount.', 'Authorized reviewers and policy resolution create load-bearing decisions.', 'Operational readers verify evidence, hashes, decision uniqueness, and projection health.'], control: 'The platform separates a plausible relationship from an approved one. Only verified facts and governed relationships can drive deterministic planning or a feature contract.', example: 'Candidate join:\ntransactions.account_id → accounts.account_id\ncardinality: many-to-one\n\nAfter owner confirmation:\nstatus: APPROVED\nallowed use: customer-level feature assembly\nrequired time policy: booking_timestamp <= scoring_time' },
+      { title: 'Project read models, detect drift, and terminalize the run', summary: 'The ingestion tail rebuilds the fast read projections used by search and feature generation, detects changes against prior state, and closes the run with complete counts and honest status.', actions: ['Drains authority projections and rebuilds table, join, and semantic views.', 'Checks projection freshness and degrades operational reads when unavailable.', 'Records schema, relationship, and semantic drift.', 'Marks affected contracts or downstream assets for revalidation when required.', 'Writes final counts, stage dispositions, and terminal run status.'], control: 'Consumers do not silently use an outdated projection. Drift becomes an explicit event, and terminal run status communicates whether the catalog state is safe to consume.', example: 'Prior: accounts.customer_id type UUID\nCurrent: accounts.customer_id type VARCHAR\n\nDrift event: TYPE_CHANGED\nImpact: dependent feature contracts flagged for revalidation\nRun final: COMPLETED_WITH_DRIFT' }
+    ];
+    const buttons = [...document.querySelectorAll('[data-stage]')];
+    function showStage(index) {
+      const stage = stages[index];
+      document.getElementById('detail-number').textContent = `Stage ${String(index + 1).padStart(2, '0')}`;
+      document.getElementById('detail-title').textContent = stage.title;
+      document.getElementById('detail-summary').textContent = stage.summary;
+      document.getElementById('detail-control').textContent = stage.control;
+      document.getElementById('detail-example').textContent = stage.example;
+      const list = document.getElementById('detail-actions');
+      list.replaceChildren(...stage.actions.map(text => { const item = document.createElement('li'); item.textContent = text; return item; }));
+      buttons.forEach(button => button.setAttribute('aria-pressed', String(Number(button.dataset.stage) === index)));
+    }
+    buttons.forEach(button => button.addEventListener('click', () => showStage(Number(button.dataset.stage))));
+    showStage(0);
+  </script>
+</body>
+</html>

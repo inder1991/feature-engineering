@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Simple Catalog Ingestion Flow</title>
+  <style>
+    :root { --ink:#152019; --muted:#5e6d64; --paper:#f4f7f3; --card:#fff; --line:#cad4cc; --green:#18764a; --green-bg:#e0f4e7; --llm:#b12470; --llm-bg:#ffe4f1; --warning:#926400; --warning-bg:#fff0bf; --danger:#a73a31; --danger-bg:#fbe5e1; --blue:#2f5f98; --blue-bg:#e5effc; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    header { padding:30px max(20px,calc((100% - 1120px)/2)); color:#f8fbf9; background:#16221a; }
+    .kicker { margin:0 0 7px; color:#a3d0b2; font:700 11px ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.08em; text-transform:uppercase; }
+    h1 { margin:0; font-size:clamp(26px,4vw,42px); line-height:1.1; }
+    header p:last-child { max-width:760px; margin:12px 0 0; color:#ced8d0; line-height:1.55; }
+    main { width:min(1120px,100%); margin:auto; padding:28px 20px 48px; }
+    .flow { display:grid; grid-template-columns:repeat(6,minmax(145px,1fr)); gap:16px; align-items:stretch; margin:20px 0 28px; overflow-x:auto; padding:6px 4px 14px; }
+    .stage { position:relative; min-width:145px; padding:17px 14px; border:1px solid var(--line); border-top:5px solid var(--green); border-radius:8px; background:var(--card); }
+    .stage:not(:last-child)::after { content:'→'; position:absolute; top:50%; right:-17px; z-index:2; color:var(--muted); font-size:24px; transform:translateY(-50%); }
+    .stage.llm { border:3px solid var(--llm); border-top-width:6px; background:var(--llm-bg); box-shadow:0 0 0 4px rgba(177,36,112,.12); }
+    .stage.llm::before { content:'LLM CALL'; display:inline-block; margin-bottom:9px; padding:3px 5px; border-radius:3px; background:var(--llm); color:#fff; font:800 10px ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.06em; }
+    .num { display:block; color:var(--green); font:800 11px ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .llm .num { color:var(--llm); }
+    strong { display:block; margin-top:6px; font-size:15px; line-height:1.2; }
+    small { display:block; margin-top:7px; color:var(--muted); line-height:1.4; }
+    .llm small { color:#782149; }
+    .path { display:grid; grid-template-columns:1fr auto 1fr; gap:16px; align-items:stretch; margin:24px 0; }
+    .route { padding:18px; border-radius:8px; border:1px solid var(--line); background:var(--card); }
+    .route h2 { margin:0 0 8px; font-size:18px; }.route p { margin:0; color:var(--muted); line-height:1.5; }
+    .route.safe { border-left:6px solid var(--green); background:var(--green-bg); }.route.stop { border-left:6px solid var(--danger); background:var(--danger-bg); }
+    .arrow { align-self:center; color:var(--muted); font-size:28px; }
+    h2 { margin:32px 0 13px; font-size:22px; }
+    .explain { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+    .item { padding:17px; border:1px solid var(--line); border-radius:8px; background:var(--card); }.item h3 { margin:0 0 8px; font-size:16px; }.item p { margin:0; color:var(--muted); line-height:1.5; }.item.llm-detail { border:2px solid var(--llm); background:var(--llm-bg); }.item.llm-detail h3 { color:#7b204c; }
+    .example { margin-top:22px; padding:18px; border-left:5px solid var(--blue); background:var(--blue-bg); }.example h2 { margin:0 0 8px; }.example p { margin:0; color:#2d4c71; line-height:1.55; }
+    .outcomes { display:grid; grid-template-columns:repeat(4,1fr); gap:16px; }.outcome { padding:17px; border:1px solid var(--line); border-radius:8px; background:var(--card); }.outcome h3 { margin:0 0 8px; font-size:16px; }.outcome p { margin:0; color:var(--muted); line-height:1.5; }.outcome.good { border-top:5px solid var(--green); background:var(--green-bg); }.outcome.quarantine { border-top:5px solid var(--danger); background:var(--danger-bg); }.outcome.rejected { border-top:5px solid #7d3029; background:#f4dfdc; }.outcome.validation { border-top:5px solid var(--warning); background:var(--warning-bg); }.tag { display:inline-block; margin-bottom:8px; padding:3px 6px; border-radius:3px; font:800 10px ui-monospace,SFMono-Regular,Consolas,monospace; letter-spacing:.05em; }.good .tag { background:var(--green); color:#fff; }.quarantine .tag,.rejected .tag { background:var(--danger); color:#fff; }.validation .tag { background:var(--warning); color:#fff; }
+    .legend { display:flex; flex-wrap:wrap; gap:14px; margin-top:20px; color:var(--muted); font-size:13px; }.legend span::before { content:''; display:inline-block; width:11px; height:11px; margin-right:6px; border-radius:2px; background:var(--green); }.legend .llm-key::before { background:var(--llm); }.legend .stop-key::before { background:var(--danger); }
+    @media(max-width:980px) { .outcomes { grid-template-columns:repeat(2,1fr); } }
+    @media(max-width:800px) { .flow { grid-template-columns:repeat(6,165px); }.path,.explain,.outcomes { grid-template-columns:1fr; }.arrow { transform:rotate(90deg); justify-self:center; } }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="kicker">FeatureGen / simple ingestion view</p>
+    <h1>From a human upload to a trusted catalog</h1>
+    <p>AI helps interpret metadata, but it never approves data meaning, joins, or feature use on its own.</p>
+  </header>
+  <main>
+    <section class="flow" aria-label="Simple catalog ingestion flow">
+      <article class="stage"><span class="num">01 / HUMAN</span><strong>Upload a catalog</strong><small>A data engineer uploads CSV, Excel, glossary, or starts an approved connector import.</small></article>
+      <article class="stage"><span class="num">02 / PLATFORM</span><strong>Read and validate</strong><small>Normalize the file, detect bad identifiers, duplicates, conflicts, and unsafe changes.</small></article>
+      <article class="stage llm"><span class="num">03 / AI-ASSISTED</span><strong>Inspect metadata</strong><small>The LLM reads approved metadata only and suggests concepts, definitions, and domains.</small></article>
+      <article class="stage"><span class="num">04 / PLATFORM</span><strong>Build catalog graph</strong><small>Create searchable table and column records with discoverable relationships.</small></article>
+      <article class="stage llm"><span class="num">05 / AI-ASSISTED</span><strong>Suggest table and join context</strong><small>The LLM can assist candidate enrichment; all results remain proposed until governed.</small></article>
+      <article class="stage"><span class="num">06 / HUMAN + PLATFORM</span><strong>Confirm and publish</strong><small>Authorized reviewers approve load-bearing facts; projections become ready for feature discovery.</small></article>
+    </section>
+
+    <section class="path" aria-label="Decision after validation">
+      <article class="route stop"><h2>Invalid or risky input</h2><p>Quarantine the row or hold the full import for review. It stays visible with a reason, but it does not become catalog authority.</p></article>
+      <div class="arrow" aria-hidden="true">→</div>
+      <article class="route safe"><h2>Accepted input</h2><p>Create source-backed facts, run allowed enrichment, build the graph, and send candidates through governance and projection.</p></article>
+    </section>
+
+    <h2>What happens at every stage</h2>
+    <section class="explain">
+      <article class="item"><h3>1. Upload and run record</h3><p>The platform opens an ingestion run before parsing. It records who submitted the source, which profile applied, the fingerprint, and the final outcome.</p></article>
+      <article class="item"><h3>2. Validate before trust</h3><p>Every source is converted to a canonical shape. Invalid identity, conflicting column definitions, or an unexpectedly large source change are quarantined or held.</p></article>
+      <article class="item llm-detail"><h3>3. LLM call: metadata enrichment</h3><p>Only permitted metadata is sent to the LLM through an audited structured call. It may suggest that <code>transaction_amount</code> is a currency amount; it cannot make that claim authoritative.</p></article>
+      <article class="item"><h3>4. Searchable graph</h3><p>Accepted tables and columns become nodes; containment and declared relationships become graph edges. This enables search, lineage, and discovery.</p></article>
+      <article class="item llm-detail"><h3>5. LLM call: candidate context</h3><p>AI-assisted stages may propose table semantics, join candidates, or semantic bindings. These are clearly labelled proposals and cannot bypass governance.</p></article>
+      <article class="item"><h3>6. Human approval and readiness</h3><p>Data owners approve the facts and relationships that may be used operationally. The platform rebuilds projections, detects drift, and closes the ingestion run honestly.</p></article>
+    </section>
+
+    <section class="example">
+      <h2>Example: transaction catalog upload</h2>
+      <p>A human uploads a file with <code>transactions.transaction_amount</code> and <code>transactions.booking_timestamp</code>. Validation confirms the column identities. The <strong>pink LLM stage</strong> proposes “currency amount” and “event time” from approved metadata. A data owner confirms the relevant semantics and relationship to <code>accounts</code>. Only then can a feature such as “30-day transaction value” use this context safely.</p>
+    </section>
+    <h2>Example outcomes</h2>
+    <section class="outcomes" aria-label="Examples of ingestion and validation outcomes">
+      <article class="outcome good"><span class="tag">GOOD / ACCEPTED</span><h3>Clear source metadata</h3><p><code>transactions.transaction_amount</code> has one valid identity, declared type <code>decimal</code>, and a consistent source definition. It enters the graph and source-evidence layer.</p></article>
+      <article class="outcome quarantine"><span class="tag">QUARANTINED</span><h3>Conflicting catalog rows</h3><p>The same column appears twice: once as <code>decimal</code> and once as <code>varchar</code>. Both claims are retained for review, but no operational type fact is created.</p></article>
+      <article class="outcome rejected"><span class="tag">REJECTED</span><h3>Unsafe feature candidate</h3><p>A proposed feature uses a post-outcome transaction timestamp for a churn model. The deterministic feature checks reject it for temporal leakage; it cannot become a contract.</p></article>
+      <article class="outcome validation"><span class="tag">TO BE VALIDATED</span><h3>Data-dependent claim</h3><p>A candidate assumes <code>customer_id</code> is unique at the required grain. Metadata alone cannot prove it, so the platform records an external validation requirement rather than claiming success.</p></article>
+    </section>
+    <div class="legend"><span>Controlled platform stage</span><span class="llm-key">Audited LLM call — advisory only</span><span class="stop-key">Quarantine or review path</span></div>
+  </main>
+</body>
+</html>
