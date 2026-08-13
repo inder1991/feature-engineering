@@ -567,3 +567,45 @@ def test_a_uoa_changed_after_serving_blocks_the_old_draft_as_drift(
     assert res.status_code == 409, res.text
     blocker_codes = {b["code"] for b in res.json()["detail"]["blockers"]}
     assert "ACTIVATION_STATE_DRIFTED" in blocker_codes
+
+
+def test_the_decision_record_is_the_full_evidence_and_detail_serves_it_by_exact_key(
+        make_client, conn, monkeypatch):
+    """D1: the decision row carries the COMPLETE audit (planning request, verdicts, the
+    losing shortlist, tri-state validation) + PLAN-15's manifest of consumed-input hashes;
+    the option-detail route serves it by the EXACT (revision, option) key — never
+    newest-row-for-the-definition — with the linked observation joined by observation_id."""
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    client = make_client(llm_client=_fake_with_intents())
+    body = _post(client)
+
+    revision_id = conn.execute(
+        "SELECT considered_revision_id FROM contract_considered_revision "
+        "WHERE generation_run_id = %s", (body["generation_run_id"],)).fetchone()[0]
+    option_id, evidence, manifest = conn.execute(
+        "SELECT option_id, evidence, decision_manifest FROM semantic_option_decision "
+        "WHERE considered_revision_id = %s AND generation_source = 'llm_intent' LIMIT 1",
+        (revision_id,)).fetchone()
+
+    # The stored record IS the audit — nothing re-derived at read time.
+    assert evidence["planning_request"]["origin"] == "llm_intent"
+    assert evidence["verdicts"], "every binder verdict frozen verbatim"
+    assert evidence["validation"]["families"], "the tri-state family report frozen"
+    assert manifest["semantic_context_hash"]
+    assert manifest["authority_matrix_hash"]
+    assert manifest["planning_request_hash"]
+
+    res = client.get(
+        f"/contract/considered-revisions/{revision_id}/options/{option_id}",
+        headers=AUTH)
+    assert res.status_code == 200, res.text
+    detail = res.json()
+    record = detail["decision_record"]
+    assert record["evidence"]["validation"]["families"]
+    assert record["decision_manifest"]["planning_request_hash"] == \
+        record["planning_request_hash"], "the manifest agrees with the row's own identity"
+    # The observation is joined by the EXACT id the decision froze.
+    assert detail.get("semantic_evidence"), "the exact-linked observation rides the detail"
+    assert (detail["semantic_evidence"]["planning_request_hash"]
+            == record["planning_request_hash"])

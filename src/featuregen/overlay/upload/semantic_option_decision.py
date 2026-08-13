@@ -75,6 +75,77 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "policy_revision_pins": {"authority_matrix_hash": authority_matrix_hash()},
         "observation_id": observation_id,
         "context_hash": context_hash,
+        # D1 — the FULL evidence record: what the card was built from, verbatim.
+        "evidence": _evidence_record(candidate, idea),
+        "decision_manifest": _decision_manifest(candidate, context_hash),
+    }
+
+
+def _evidence_record(candidate, idea) -> dict:
+    """D1: the complete audit riding the decision — planning request + every verdict + the
+    per-candidate eligibility (the LOSING shortlist and its truncation marker included) +
+    the typed validation with its family tri-state. Serialized verbatim, never re-derived."""
+    from dataclasses import asdict
+
+    from featuregen.overlay.upload.typed_gauntlet import validate_candidate
+
+    validation = validate_candidate(candidate)
+    eligibility = candidate.eligibility or {}
+    return {
+        "planning_request": asdict(candidate.planning_request),
+        "verdicts": [asdict(v) for v in candidate.verdicts],
+        "eligibility_audit": [
+            {"role": role, "object_ref": ref, **asdict(verdict)}
+            for (role, ref), verdict in sorted(eligibility.items())],
+        "validation": {
+            "status": validation.status,
+            "refusals": list(validation.refusals),
+            "requirements": [asdict(r) for r in validation.requirements],
+            "families": [asdict(f) for f in validation.families],
+        },
+    }
+
+
+def _decision_manifest(candidate, context_hash: str) -> dict:
+    """PLAN-15's seal: the content hashes of every consumed input. A reader can prove WHAT
+    this decision consumed without trusting prose."""
+    from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
+    from featuregen.overlay.upload.field_resolution import canonical_hash
+    from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
+    from featuregen.overlay.upload.typed_gauntlet import TYPED_GAUNTLET_VERSION
+
+    return {
+        "semantic_context_hash": context_hash,
+        "authority_matrix_hash": authority_matrix_hash(),
+        "typed_gauntlet_version": TYPED_GAUNTLET_VERSION,
+        "operand_class_map_version": OPERAND_CLASS_MAP_VERSION,
+        "planning_request_hash": candidate.planning_request_hash,
+        "binding_plan_hash": (canonical_hash(candidate.binding_plan)
+                              if candidate.binding_plan else ""),
+        "recipe_revision_hash": candidate.recipe_revision_hash,
+    }
+
+
+def load_option_decision_record(conn, *, considered_revision_id: str,
+                                option_id: str) -> dict | None:
+    """D1 read side: the FULL stored record by its exact primary key — LIFE-03's wrong-row
+    risk is structurally gone (never "newest row for the definition"). Verification is the
+    caller's: the manifest's planning_request_hash must match the option identity it serves."""
+    row = conn.execute(
+        "SELECT decision_id, source_definition_id, generation_source, planning_request_hash, "
+        "       binding_state, readiness, review_current, validation_status, dataset_story, "
+        "       evidence, decision_manifest, observation_id, context_hash, recorded_at "
+        "FROM semantic_option_decision "
+        "WHERE considered_revision_id = %s AND option_id = %s",
+        (considered_revision_id, option_id)).fetchone()
+    if row is None:
+        return None
+    return {
+        "decision_id": row[0], "source_definition_id": row[1], "generation_source": row[2],
+        "planning_request_hash": row[3], "binding_state": row[4], "readiness": row[5],
+        "review_current": row[6], "validation_status": row[7], "dataset_story": row[8],
+        "evidence": row[9], "decision_manifest": row[10], "observation_id": row[11],
+        "context_hash": row[12], "recorded_at": str(row[13]),
     }
 
 
@@ -93,9 +164,9 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
             " validation_status, outstanding_requirement_codes, "
             " has_reviewed_formula_expectation, formula_expectation_revision, "
             " plan_envelope_present, dataset_story, policy_revision_pins, "
-            " metadata_snapshot_id, observation_id, context_hash) "
+            " metadata_snapshot_id, observation_id, context_hash, evidence, decision_manifest) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s, %s, %s) "
+            "%s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (considered_revision_id, option_id) DO NOTHING",
             (mint_id("sod"), considered_revision_id, option_id, generation_run_id,
              facts["source_definition_id"], facts["generation_source"],
@@ -107,7 +178,9 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
              facts["has_reviewed_formula_expectation"],
              facts["formula_expectation_revision"], facts["plan_envelope_present"],
              Jsonb(facts["dataset_story"]), Jsonb(facts["policy_revision_pins"]),
-             metadata_snapshot_id, facts.get("observation_id"), facts["context_hash"]))
+             metadata_snapshot_id, facts.get("observation_id"), facts["context_hash"],
+             Jsonb(facts.get("evidence") or {}),
+             Jsonb(facts.get("decision_manifest") or {})))
         written += 1
     return written
 
@@ -281,4 +354,5 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
 
 
 __all__ = ["assemble_current_activation_state", "decision_facts_for_candidate",
-           "load_frozen_option_facts", "persist_option_decisions"]
+           "load_frozen_option_facts", "load_option_decision_record",
+           "persist_option_decisions"]

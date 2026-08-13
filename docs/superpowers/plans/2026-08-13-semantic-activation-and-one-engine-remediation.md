@@ -1007,6 +1007,22 @@ the option record** — LIFE-03's wrong-row risk is structurally gone.
 metadata to explode); detail returns exactly the selected candidate's evidence for merged
 twins and variants; hash verification test (tamper → typed 409).
 
+> **ACCEPTED (2026-08-14).** Migration 1065 (the reserved slot — sign needed no store):
+> additive `evidence` + `decision_manifest` jsonb on the append-only 1063 table (the
+> existing guard triggers make them write-once with the row). `evidence` = the COMPLETE
+> audit frozen verbatim at serving: full planning request, every verdict, the per-candidate
+> eligibility with the losing shortlist and its truncation marker, and the typed validation
+> with C5's family tri-state. `decision_manifest` = PLAN-15's seal: content hashes of every
+> consumed input (context, authority matrix, gauntlet version, operand-class map, planning
+> request, binding plan, recipe revision). `load_option_decision_record` reads by the EXACT
+> (revision, option) primary key; the option-detail route serves it with the observation
+> joined by the frozen `observation_id` — LIFE-03's newest-row-for-the-definition read
+> survives ONLY as the compatibility path for pre-A1b revisions. Verification is real: a
+> manifest disagreeing with the row's own request identity is a typed 409
+> (DECISION_RECORD_TAMPERED). Frozen-layer no-recompute was already A1b's property
+> (`load_frozen_option_facts`); the detail read adds no recomputation either — everything
+> served is the stored jsonb.
+
 ### Task D2 — executable identity vs display identity (½ day)
 
 *Modify:* `candidate_assembly.py`, `gate1.py` option-id mint.

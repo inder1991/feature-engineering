@@ -352,12 +352,44 @@ def considered_option_detail(considered_revision_id: str, option_id: str,
         "option_id": option_id,
         "option": option,
     }
-    # The semantic evidence for a recipe-sourced option: this generation run's persisted
-    # observation for that definition — verdicts, per-shortlist eligibility, policy hashes,
-    # and the frozen context hash. Bounded to the newest row; absent means the run predates
-    # the observation store or the option is not recipe-sourced — honest absence, no backfill.
+    # D1 — the STORED decision record by its exact (revision, option) key: the full audit
+    # (planning request, verdicts, eligibility incl. the losing shortlist, validation with
+    # families) + PLAN-15's decision manifest. LIFE-03's wrong-row risk is structurally
+    # gone: never "newest observation for the definition". Verification is real: a manifest
+    # whose planning_request_hash disagrees with the stored option identity is a typed 409.
+    from featuregen.overlay.upload.semantic_option_decision import (
+        load_option_decision_record,
+    )
+
     identity = option.get("canonical_candidate_identity") or {}
     feature_body = identity.get("feature") or {}
+    record = load_option_decision_record(
+        conn, considered_revision_id=considered_revision_id, option_id=option_id)
+    if record is not None:
+        stored_request_hash = (record.get("decision_manifest") or {}).get(
+            "planning_request_hash")
+        if (stored_request_hash
+                and record["planning_request_hash"] != stored_request_hash):
+            raise HTTPException(status_code=409, detail={
+                "code": "DECISION_RECORD_TAMPERED",
+                "message": "the stored decision's manifest disagrees with its own request "
+                           "identity — the record cannot be served"})
+        detail["decision_record"] = record
+        # The exact-linked observation (never newest-row): the run's raw binder output.
+        if record.get("observation_id"):
+            row = conn.execute(
+                "SELECT context_hash, planning_request_hash, binding_state, verdicts, "
+                "eligibility, policy_hashes FROM semantic_candidate_observation "
+                "WHERE observation_id = %s", (record["observation_id"],)).fetchone()
+            if row is not None:
+                detail["semantic_evidence"] = {
+                    "context_hash": row[0], "planning_request_hash": row[1],
+                    "binding_state": row[2], "verdicts": row[3],
+                    "eligibility": row[4], "policy_hashes": row[5],
+                }
+        return detail
+    # Compatibility: an option with no decision row (pre-A1b revisions, non-semantic
+    # options) keeps the newest-observation read — honest absence, no backfill.
     recipe_id = feature_body.get("source_definition_id") or feature_body.get("recipe_id")
     if recipe_id:
         row = conn.execute(
