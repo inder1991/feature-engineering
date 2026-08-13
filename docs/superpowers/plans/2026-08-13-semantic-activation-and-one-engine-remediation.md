@@ -620,7 +620,7 @@ it; no spine table is ever named or confirmed.*
 silently served as ready), with the roll-up resolution; the spine confirmation click appears
 in the E0 walkthrough; changing the UOA post-generation blocks drafting with the drift code.
 
-> **ACCEPTED (2026-08-13) — PHASE B COMPLETE.** `GET /contract/uoa-proposal` derives the
+> **ACCEPTED `5c931df5` (2026-08-13) — PHASE B COMPLETE.** `GET /contract/uoa-proposal` derives the
 > proposal from the target table's DECLARED grain entity with the catalog's realistic
 > alternatives (closed list, never free text) and a surfaced-never-resolved contradiction
 > warning; `ConfirmedScope` gains confirmed `uoa_entity` + `spine_ref` (in the scope hash;
@@ -940,6 +940,28 @@ the SME session.
 
 *Acceptance:* the test is green and RUNS IN THE DEFAULT SUITE (not eval-marked) — from the day
 it lands, any regression that breaks the end-to-end path breaks the build.
+
+> **ACCEPTED (2026-08-13).** `tests/featuregen/api/test_e2e_walkthrough.py` — ONE default-suite
+> test walks the whole workflow: blocked card (PROPOSED_METADATA_ONLY +
+> RECIPE_REVIEW_NOT_CURRENT, save_idea still allowed) → REAL funnel confirm
+> (`POST /governance/concept-confirmations`, CAS anchors from the queue) → REAL reviews
+> (`POST /recipes/complaint_count/reviews`, all required roles, two identities) → UOA one-click
+> confirm (proposal endpoint asserted: Customer via public.accounts.customer_id) → regenerate →
+> create_contract ALLOWED → draft → confirm → `lifecycle_state='governed'` → materialization
+> typed refusal (READINESS_NOT_MATERIALIZATION_READY + EXECUTION_AUTHORITY_UNEVALUATED, never
+> in allowed_actions) → conceptual intent saves as idea → refine round-trips
+> (regenerate_to_govern) → suggestions v4 serves the SAME binding ranked. UAT runbook:
+> `docs/architecture/2026-08-13-semantic-v1-uat-runbook.md` (same walk as human clicks; sign-off
+> scope = authoring ready, materialization visibly unavailable). DISCOVERIES: (1) the hero is
+> `complaint_count` — `tenure_days` binds but its AUTHORED temporal has no snapshot policy, so
+> it is honestly rejected TEMPORAL_POLICY_UNRESOLVED (asserted in-test; recipe setup work, and
+> the old "small fixture serves no recipe card" note was stale — A3 made ~100 recipes serve);
+> (2) the fixture records llm/proposed FIELD EVIDENCE per column (what the funnel reads — the
+> real freshly-ingested shape); (3) the C0 seal's isolation gates are stubbed so generation
+> SEALS FOR REAL in the READ COMMITTED harness (production always seals; isolation pinning has
+> its own suite); (4) PRODUCT FIX: `recipe_review.record_decision` held this codebase's ONLY
+> route-level `conn.commit()` — redundant under get_conn's commit-on-success and a request-
+> atomicity/test-isolation defect; removed.
 
 ### Task E1 — banking acceptance corpus (2 days)
 

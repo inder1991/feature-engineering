@@ -191,7 +191,8 @@ def record_decision(
             supersedes_event_id=body.supersedes_event_id)
     except RecipeReviewError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    conn.commit()
+    # No route-level commit: get_conn commits on success (one transaction per request) — a
+    # mid-handler commit was this codebase's only one, and it broke request atomicity.
     return {"event_id": event_id, "recipe_revision_hash": live_hash}
 
 
