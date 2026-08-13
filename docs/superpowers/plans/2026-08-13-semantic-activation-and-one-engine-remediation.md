@@ -1039,6 +1039,19 @@ origin", never "a different computation". The OPTION ID additionally hashes the 
 recipe/intent pair with identical executable semantics still merges; drift in any manifest
 hash mints a new id.
 
+> **ACCEPTED (2026-08-14).** `semantic_signature` gains `mechanism_identity` (the pinned
+> formula expectation ref, "" when none) — two formulas are two visibly distinct cards.
+> DESIGN SIMPLIFICATION discovered mid-build: the planned "unpinned twin folds into a
+> single-mechanism group" rule is UNREACHABLE by the planning contract's own atomicity law
+> (deterministic ⟹ formula present, enforced at construction; conceptual ⟹ formula refused)
+> — pinned-vs-unpinned "identical executable semantics" cannot exist, so the fold was
+> dropped rather than shipped dead. The cross-origin merge stays where it is real: identical
+> conceptual twins (both formula-less by contract) fold into one corroborated card, recipe
+> primacy intact. A conceptual candidate never merges with a deterministic one (a different
+> computation — three cards, not two; tested). Option ids are v3: the PHYSICAL identity
+> (planning-request hash + binding plan + the D1 decision manifest) hashes in on top of the
+> executable identity — drift in any consumed input mints a new id.
+
 ### Task D3 — Workbench audit drawer + card sections (1½ days)
 
 *Modify:* `WorkbenchScreen.tsx`, `api.ts` (detail client), tests.

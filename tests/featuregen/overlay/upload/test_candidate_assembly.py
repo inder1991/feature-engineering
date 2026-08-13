@@ -164,3 +164,49 @@ def test_assembly_is_deterministic_under_input_shuffle():
             == [a.signature for a in baseline.actionable]
         assert [c.source_definition_id for a in again.ranked for c in a.corroborations] \
             == [c.source_definition_id for a in baseline.ranked for c in a.corroborations]
+
+
+# ── D2: the candidate seen is the candidate governed — mechanism IN the identity ───────────────
+
+def test_two_formulas_are_two_cards_and_identical_semantics_still_merge():
+    """D2's acceptance: candidates differing ONLY in formula expectation render as TWO
+    cards. The cross-origin merge stays possible exactly where executable semantics are
+    IDENTICAL — which the planning contract makes well-defined (deterministic always carries
+    its formula, conceptual never does), so pinned-vs-unpinned "twins" cannot exist."""
+    from dataclasses import replace
+
+    from featuregen.overlay.upload.feature_planning_contracts import FormulaReferenceV2
+
+    def _pinned(definition_id, ref):
+        # ONE replace: the dataclass validates each construction, and a deterministic
+        # request without its formula (or vice versa) refuses — atomicity is the contract.
+        return _candidate(replace(
+            _request(definition_id, origin="recipe_v2"),
+            computation_kind="deterministic_formula", conceptual_reason="",
+            formula=FormulaReferenceV2(expectation_ref=ref,
+                                       formula_schema_version="formula-v2",
+                                       result_class="sum")))
+
+    recipe_a = _pinned("recipe:alpha", "retail:alpha")
+    recipe_b = _pinned("recipe:beta", "retail:beta")
+    intent = _candidate(_request("intent:twin", origin="llm_intent"))   # formula=None
+
+    # Two pinned mechanisms: TWO visibly distinct cards even though everything else is
+    # identical — no shared card ever hides different formulas behind secret option ids.
+    assembled = assemble_candidates([recipe_a, recipe_b])
+    assert len(assembled.ranked) + len(assembled.actionable) == 2
+
+    # A conceptual candidate is a DIFFERENT computation from a deterministic one — even the
+    # same meaning+binding never merges across that line (three cards, not two).
+    assembled = assemble_candidates([recipe_a, recipe_b, intent])
+    assert len(assembled.ranked) + len(assembled.actionable) == 3
+
+    # And the cross-origin merge the assembly exists for is untouched: identical conceptual
+    # twins (both formula-less by contract) still fold into one corroborated card.
+    conceptual_recipe = _candidate(_request("recipe:twin", origin="recipe_v2"))
+    conceptual_intent = _candidate(_request("intent:twin2", origin="llm_intent"))
+    assembled = assemble_candidates([conceptual_recipe, conceptual_intent])
+    total = list(assembled.ranked) + list(assembled.actionable)
+    assert len(total) == 1
+    assert total[0].candidate.planning_request.origin == "recipe_v2"   # primacy holds
+    assert any(c.origin == "llm_intent" for c in total[0].corroborations)

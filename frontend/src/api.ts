@@ -1446,6 +1446,55 @@ export interface UoaProposalResp {
   contradiction: string | null
 }
 
+// D3 — the on-demand audit read (UI-02): the FULL stored decision for one served option,
+// by its exact (revision, option) key. `decision_record` is D1's frozen evidence + PLAN-15
+// manifest; `semantic_evidence` is the exact-linked observation. Both absent on pre-A1b
+// revisions — the drawer renders honest absence, never recomputed stand-ins.
+export interface OptionDecisionRecord {
+  decision_id: string
+  source_definition_id: string
+  generation_source: string
+  planning_request_hash: string
+  binding_state: string
+  readiness: string
+  review_current: boolean
+  validation_status: string
+  dataset_story: Record<string, unknown> | null
+  evidence: {
+    planning_request?: Record<string, unknown>
+    verdicts?: Array<Record<string, unknown>>
+    eligibility_audit?: Array<Record<string, unknown>>
+    validation?: {
+      status?: string
+      families?: Array<{ family: string; state: string; reason?: string }>
+      requirements?: Array<Record<string, unknown>>
+    }
+  }
+  decision_manifest: Record<string, string>
+  observation_id: string | null
+  context_hash: string
+  recorded_at: string
+}
+
+export interface OptionDetailResp {
+  considered_revision_id: string
+  considered_content_hash: string
+  generation_run_id: string
+  option_id: string
+  option: Record<string, unknown>
+  decision_record?: OptionDecisionRecord
+  semantic_evidence?: Record<string, unknown>
+}
+
+export function contractOptionDetail(
+  consideredRevisionId: string,
+  optionId: string,
+): Promise<OptionDetailResp> {
+  // One template literal deliberately: the proxy-coverage guard extracts path literals, and
+  // a split string would read `/options/...` as its own unproxied root.
+  return request(`/contract/considered-revisions/${encodeURIComponent(consideredRevisionId)}/options/${encodeURIComponent(optionId)}`)
+}
+
 export function contractUoaProposal(
   catalogSource: string,
   opts: { targetRef?: string; recognizedEntity?: string } = {},

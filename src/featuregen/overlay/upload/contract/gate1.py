@@ -1307,10 +1307,21 @@ def _with_option_ids(cs: ConsideredSet, generation_identity: str) -> ConsideredS
     for path, source, lens, feature in _option_positions(cs):
         identity_hash = canonical_hash(
             _candidate_identity(path=path, source=source, lens=lens, feature=feature))
+        # D2: the PHYSICAL identity rides the option id on top of the executable identity —
+        # the frozen decision facts (which carry the plan envelope and the manifest hashes)
+        # keyed by the served definition. Drift in any consumed input mints a NEW id.
+        facts = (cs.semantic_decision_facts_by_definition_id or {}).get(
+            (feature.source_definition_id if feature is not None else None) or "")
+        physical = {
+            "planning_request_hash": facts.get("planning_request_hash", ""),
+            "binding_plan": (facts.get("dataset_story") or {}).get("binding_plan"),
+            "manifest": facts.get("decision_manifest") or {},
+        } if facts else {}
         option_id = "opt_" + canonical_hash({
-            "version": "considered-option-id-v2",
+            "version": "considered-option-id-v3",
             "generation_identity": generation_identity,
             "candidate_identity_hash": identity_hash,
+            "physical_identity": physical,
         })[:32]
         if option_id in seen:
             raise Gate1Error("duplicate considered option identity")

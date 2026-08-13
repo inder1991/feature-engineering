@@ -64,6 +64,9 @@ import {
   contractUoaProposal,
   type UoaOption,
   type UoaProposalResp,
+  contractOptionDetail,
+  type OptionDetailResp,
+  type OptionDecisionRecord,
 } from '../api'
 import { getSession } from '../session'
 
@@ -633,6 +636,88 @@ function RankedRecipeRow({ recipe, warnings }: { recipe: RankedRecipe; warnings?
   )
 }
 
+// D3 — the drawer body: everything rendered here is the STORED record verbatim; nothing is
+// recomputed at read time. Sections: frozen roles + measured authorities, the losing
+// shortlist (the candidates the engine considered and did not choose, with codes), the
+// dataset story, the plan/PIT summary, the policy hashes, and the revision identity.
+function AuditDrawerBody({ record }: { record: OptionDecisionRecord }) {
+  const verdicts = record.evidence.verdicts ?? []
+  const audit = record.evidence.eligibility_audit ?? []
+  const bound = new Set(verdicts
+    .filter(v => v.status === 'bound' && v.selected_ref)
+    .map(v => `${String(v.role)}:${String(v.selected_ref)}`))
+  const losing = audit.filter(e =>
+    !bound.has(`${String(e.role)}:${String(e.object_ref)}`))
+  const story = (record.dataset_story ?? {}) as Record<string, unknown>
+  const plan = (story.binding_plan ?? null) as Record<string, unknown> | null
+  const families = record.evidence.validation?.families ?? []
+  return (
+    <div style={{ display: 'grid', gap: 10 }}>
+      <section aria-label="frozen roles">
+        <h4 style={{ margin: '0 0 4px' }}>Bound roles (frozen at serving)</h4>
+        <ul style={{ margin: 0, paddingLeft: 16 }}>
+          {verdicts.map((v, i) => (
+            <li key={i}>
+              <span style={{ fontWeight: 600 }}>{String(v.role)}</span>
+              {' — '}{String(v.status)}
+              {v.selected_ref ? <> · <span className="mono">{String(v.selected_ref)}</span></> : null}
+              {Array.isArray(v.reason_codes) && v.reason_codes.length > 0
+                ? <> · {v.reason_codes.join(', ')}</> : null}
+            </li>
+          ))}
+        </ul>
+      </section>
+      {losing.length > 0 && (
+        <section aria-label="losing shortlist">
+          <h4 style={{ margin: '0 0 4px' }}>Considered and not chosen</h4>
+          <ul style={{ margin: 0, paddingLeft: 16 }}>
+            {losing.map((e, i) => (
+              <li key={i}>
+                <span className="mono">{String(e.object_ref)}</span>
+                {' — '}{String(e.status)}
+                {Array.isArray(e.reason_codes) && e.reason_codes.length > 0
+                  ? <> · {e.reason_codes.join(', ')}</> : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {plan && (
+        <section aria-label="plan summary">
+          <h4 style={{ margin: '0 0 4px' }}>Frozen plan</h4>
+          <p style={{ margin: 0 }}>
+            Reads <span className="mono">{String(plan.source_table ?? '')}</span>
+            {plan.window ? <> over {String(plan.window)} days</> : null}
+            {plan.population_ref
+              ? <>; population <span className="mono">{String(plan.population_ref)}</span></>
+              : null}
+            {plan.pit ? <>; point-in-time: {String(plan.pit)}</> : null}
+          </p>
+        </section>
+      )}
+      {families.length > 0 && (
+        <section aria-label="policy families">
+          <h4 style={{ margin: '0 0 4px' }}>Design checks by family</h4>
+          <p style={{ margin: 0 }}>
+            {families.map(f =>
+              `${f.family}: ${f.state}${f.reason ? ` (${f.reason})` : ''}`).join(' · ')}
+          </p>
+        </section>
+      )}
+      <section aria-label="revision identity">
+        <h4 style={{ margin: '0 0 4px' }}>Identity</h4>
+        <p className="mono" style={{ margin: 0, fontSize: 12, overflowWrap: 'anywhere' }}>
+          request {record.planning_request_hash.slice(0, 16)}… ·
+          context {record.context_hash.slice(0, 16)}… ·
+          matrix {(record.decision_manifest.authority_matrix_hash ?? '').slice(0, 16)}… ·
+          recorded {record.recorded_at}
+        </p>
+      </section>
+    </div>
+  )
+}
+
+
 export function WorkbenchScreen() {
   const [goal, setGoal] = useState('')
   const [hypothesis, setHypothesis] = useState('')
@@ -663,6 +748,12 @@ export function WorkbenchScreen() {
   // them is still gated server-side.
   const [optionActions, setOptionActions] =
     useState<Record<string, OptionActionsEntry>>({})
+  // D3 (UI-02) — the audit drawer: fetched ON DEMAND per option from the stored decision
+  // record (never recomputed). Keyed by option id; null while loading, absent when closed.
+  const [consideredRevisionId, setConsideredRevisionId] = useState<string | null>(null)
+  const [auditOpenFor, setAuditOpenFor] = useState<string | null>(null)
+  const [auditDetail, setAuditDetail] = useState<OptionDetailResp | null>(null)
+  const [auditError, setAuditError] = useState('')
   const [rejections, setRejections] = useState<Rejection[]>([])
   const [rejectionsOpen, setRejectionsOpen] = useState(false)
   // Which set's features the one detail list shows (multi-set rounds only).
@@ -994,6 +1085,10 @@ export function WorkbenchScreen() {
     setOptionActions(Object.fromEntries(
       [...(cs.recommended_options ?? []), ...(cs.actionable_options ?? [])]
         .map(entry => [entry.option_id, entry])))
+    setConsideredRevisionId(cs.considered_revision_id ?? null)
+    setAuditOpenFor(null)
+    setAuditDetail(null)
+    setAuditError('')
     // The detail list opens on the advisory pick when there is one among the surviving sets.
     setActiveLens(
       lenses.length > 1
@@ -1141,6 +1236,26 @@ export function WorkbenchScreen() {
         : 'Could not record the target decision. Try again.')
     } finally {
       setIntakeBusy(false)
+    }
+  }
+
+  // D3: open/close the audit drawer for one option — the stored decision record on demand.
+  async function toggleAudit(optionId: string) {
+    if (auditOpenFor === optionId) {
+      setAuditOpenFor(null)
+      setAuditDetail(null)
+      return
+    }
+    if (!consideredRevisionId) return
+    setAuditOpenFor(optionId)
+    setAuditDetail(null)
+    setAuditError('')
+    try {
+      setAuditDetail(await contractOptionDetail(consideredRevisionId, optionId))
+    } catch (err) {
+      setAuditError(err instanceof ApiError
+        ? err.detail
+        : 'Could not load the stored decision record.')
     }
   }
 
@@ -2706,6 +2821,40 @@ export function WorkbenchScreen() {
                       <p style={{ color: 'var(--ink-soft)' }}>
                         Also available — {c.idea.param_alternatives}
                       </p>
+                    )}
+                    {/* D3 (UI-02): the audit drawer — the STORED decision record on demand,
+                        by exact (revision, option) key. Only options with decision rows
+                        (engine candidates on a v2 revision) offer it. */}
+                    {c.kind === 'generated' && c.idea.option_id
+                      && consideredRevisionId
+                      && optionActions[c.idea.option_id] && (
+                      <div>
+                        <button
+                          type="button"
+                          className="btn"
+                          aria-expanded={auditOpenFor === c.idea.option_id}
+                          onClick={() => void toggleAudit(c.idea.option_id!)}
+                        >
+                          {auditOpenFor === c.idea.option_id
+                            ? 'Hide decision record' : 'Decision record'}
+                        </button>
+                        {auditOpenFor === c.idea.option_id && (
+                          <div aria-label="decision record" className="audit-drawer"
+                               style={{ marginTop: 8, padding: 12, fontSize: 13,
+                                        border: '1px solid var(--line)', borderRadius: 6 }}>
+                            {auditError && <p role="alert">{auditError}</p>}
+                            {!auditError && !auditDetail && <p>Loading the stored record…</p>}
+                            {auditDetail?.decision_record ? (
+                              <AuditDrawerBody record={auditDetail.decision_record} />
+                            ) : auditDetail && !auditError ? (
+                              <p className="hint">
+                                No stored decision record — this option predates the
+                                decision store. Nothing is recomputed in its place.
+                              </p>
+                            ) : null}
+                          </div>
+                        )}
+                      </div>
                     )}
                     {/* Exploring mode's honest asymmetry, stated on the card (intake spec
                         default): with no declared target the leakage screens cannot run for an

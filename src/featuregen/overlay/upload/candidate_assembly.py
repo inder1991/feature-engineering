@@ -47,12 +47,24 @@ _READINESS_RANK = {
 _ORIGIN_PRIMACY = {"recipe_v2": 0, "user_definition": 1, "llm_intent": 2}
 
 
+def mechanism_identity(candidate) -> str:
+    """D2 — the candidate's EXECUTABLE mechanism: the pinned formula expectation reference,
+    or "" when the candidate carries none (a conceptual pattern, or an intent whose formula
+    is unauthored). Two different non-empty mechanisms are two different computations —
+    never one card."""
+    formula = candidate.planning_request.formula
+    return formula.expectation_ref if formula is not None else ""
+
+
 def semantic_signature(candidate) -> str:
-    """The candidate's computation identity — hash of meaning + binding, never of origin."""
+    """The candidate's computation identity — hash of meaning + binding + MECHANISM (D2:
+    the candidate seen is the candidate governed, so a different formula expectation is a
+    visibly different card, never a secret behind a shared one), never of origin."""
     from featuregen.overlay.field_evidence import canonical_hash
 
     request = candidate.planning_request
     return canonical_hash({
+        "mechanism": mechanism_identity(candidate),
         "version": ASSEMBLY_VERSION,
         "output": {"type": request.output.output_type,
                    "unit_kind": request.output.unit_kind,
@@ -123,7 +135,14 @@ class AssembledSetV1:
 
 
 def assemble_candidates(candidates) -> AssembledSetV1:
-    """Merge by semantic signature, choose primacy, split ranked-vs-actionable, order both."""
+    """Merge by semantic signature — which since D2 INCLUDES the executable mechanism —
+    choose primacy, split ranked-vs-actionable, order both.
+
+    Two different formula expectations are two visibly distinct cards, never one card with a
+    secret difference. A cross-origin merge (recipe + intent twin) is only possible when the
+    executable semantics are IDENTICAL — and the planning contract itself guarantees that is
+    well-defined: a deterministic request always carries its formula (atomically enforced)
+    and a conceptual pattern never does, so "same signature" always means "same mechanism"."""
     groups: dict[str, list] = {}
     for candidate in candidates:
         groups.setdefault(semantic_signature(candidate), []).append(candidate)
@@ -149,4 +168,4 @@ def assemble_candidates(candidates) -> AssembledSetV1:
 
 
 __all__ = ["ASSEMBLY_VERSION", "AssembledCandidateV1", "AssembledSetV1", "CorroborationV1",
-           "assemble_candidates", "semantic_signature"]
+           "assemble_candidates", "mechanism_identity", "semantic_signature"]

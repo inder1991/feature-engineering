@@ -21,6 +21,7 @@ vi.mock('../api', async importOriginal => {
     registerFeature: vi.fn(),
     featureFreshness: vi.fn(),
     contractUoaProposal: vi.fn(),
+    contractOptionDetail: vi.fn(),
   }
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
@@ -33,6 +34,7 @@ const contractConfirm = vi.mocked(api.contractConfirm)
 const refineCandidate = vi.mocked(api.refineCandidate)
 const featureRecipe = vi.mocked(api.featureRecipe)
 const contractUoaProposal = vi.mocked(api.contractUoaProposal)
+const contractOptionDetail = vi.mocked(api.contractOptionDetail)
 const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
 
@@ -53,6 +55,7 @@ beforeEach(() => {
   registerFeature.mockReset()
   featureFreshness.mockReset()
   contractUoaProposal.mockReset()
+  contractOptionDetail.mockReset()
   // B10 default: no proposal — the UOA block stays absent unless a test scripts one.
   contractUoaProposal.mockResolvedValue({ proposed: null, alternatives: [], contradiction: null })
   // Most pre-Delivery-0 tests pin the emergency compatibility UI. Delivery-0 tests explicitly
@@ -2693,5 +2696,83 @@ describe('A4: actions-driven selection', () => {
     await renderAndGenerate([idea('legacy_card')])
     const checkbox = await screen.findByRole('checkbox', { name: /Select legacy_card/ })
     expect(checkbox).toBeEnabled()
+  })
+})
+
+describe('D3: the audit drawer', () => {
+  function withDecisionSections(cs: api.ConsideredSetResp, optionId: string) {
+    return {
+      ...cs,
+      contract_version: 2,
+      considered_revision_id: 'crv_test',
+      recommended_options: [{
+        option_id: optionId, name: null, recipe_id: 'recipe:x',
+        binding_state: 'bound',
+        allowed_actions: ['save_idea', 'create_contract'],
+        blocked_actions: {},
+      }],
+    }
+  }
+
+  const RECORD: api.OptionDecisionRecord = {
+    decision_id: 'sod_1', source_definition_id: 'complaint_count@window=90',
+    generation_source: 'recipe', planning_request_hash: 'prh_abcdef1234567890',
+    binding_state: 'bound', readiness: 'FORMULA_BLOCKED', review_current: true,
+    validation_status: 'NEEDS_EXTERNAL_VALIDATION',
+    dataset_story: {
+      binding_plan: { source_table: 'accounts', window: 90,
+                      population_ref: 'accounts', pit: 'event-anchored trailing window' },
+    },
+    evidence: {
+      verdicts: [
+        { role: 'who', status: 'bound', selected_ref: 'public.accounts.customer_id',
+          reason_codes: [] },
+      ],
+      eligibility_audit: [
+        { role: 'who', object_ref: 'public.accounts.customer_id', status: 'eligible',
+          reason_codes: [] },
+        { role: 'who', object_ref: 'public.accounts.alt_id', status: 'provisional',
+          reason_codes: ['PROPOSED_METADATA_ONLY'] },
+      ],
+      validation: { status: 'needs_external_validation',
+                    families: [{ family: 'leakage', state: 'evaluated' }] },
+    },
+    decision_manifest: { authority_matrix_hash: 'amh_1234567890abcdef' },
+    observation_id: 'sco_1', context_hash: 'ctx_abcdef1234567890',
+    recorded_at: '2026-08-14 00:00:00+00',
+  }
+
+  it('fetches the stored record on demand and renders the losing shortlist', async () => {
+    const round = singleSetRound([idea('audited')])
+    const cs = considered(round)
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce(withDecisionSections(cs, optionId))
+    contractOptionDetail.mockResolvedValue({
+      considered_revision_id: 'crv_test', considered_content_hash: 'h',
+      generation_run_id: 'run_1', option_id: optionId, option: {},
+      decision_record: RECORD,
+    })
+    await renderAndGenerateRaw()
+    expect(contractOptionDetail).not.toHaveBeenCalled()      // ON DEMAND, never eager
+    await userEvent.click(await screen.findByRole('button', { name: 'Decision record' }))
+    expect(contractOptionDetail).toHaveBeenCalledWith('crv_test', optionId)
+    expect(await screen.findByText(/Considered and not chosen/)).toBeInTheDocument()
+    expect(screen.getByText('public.accounts.alt_id')).toBeInTheDocument()
+    expect(screen.getByText(/Reads/)).toBeInTheDocument()    // the frozen plan section
+    expect(screen.getByText(/leakage: evaluated/)).toBeInTheDocument()
+  })
+
+  it('renders honest absence for an option with no stored record', async () => {
+    const round = singleSetRound([idea('legacy_opt')])
+    const cs = considered(round)
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce(withDecisionSections(cs, optionId))
+    contractOptionDetail.mockResolvedValue({
+      considered_revision_id: 'crv_test', considered_content_hash: 'h',
+      generation_run_id: 'run_1', option_id: optionId, option: {},
+    })
+    await renderAndGenerateRaw()
+    await userEvent.click(await screen.findByRole('button', { name: 'Decision record' }))
+    expect(await screen.findByText(/No stored decision record/)).toBeInTheDocument()
   })
 })
