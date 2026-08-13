@@ -878,6 +878,20 @@ namespace-mates from the registry, content-hashed into the context), `recipe_ope
 descendant concept and eligibility still refuses a mismatched meaning; closure changes move the
 context hash.
 
+> **ACCEPTED (2026-08-13).** Context v4: `concept_closure` (enriched concept → self + is-a
+> ancestors + namespace mates, from the frozen registry — new `namespace_mates` helper) rides
+> the field-exhaustive hash, so any closure change IS a new context (pre-C7 frozen options
+> drift honestly — C2's rollout pattern). Shortlist assembly widens through the closure
+> (126 registered descendant concepts previously NEVER retrieved for their ancestor
+> operands — `interest_income` for `monetary_flow`); eligibility accepts a registered
+> DESCENDANT (its is-a path reaches a wanted name — the specialized flow IS the flow) and
+> refuses a namespace MATE with CONCEPT_MISMATCH (join-candidacy peer, never a meaning
+> substitute — retrieved into the audit, visible, refused). SELECTION law sharpened by E0
+> itself: an exact-name candidate outranks a closure descendant in selection — the closure
+> adds recall when the exact meaning is absent and never manufactures a tie against it (the
+> walkthrough caught `origination_date` tying the exact `event_ts` before this rule).
+> Tests: descendant binds; mate retrieval-only; closure moves the hash; E0 green.
+
 ### Task C9 — history requirements per catalog: declared, listed, confirmed (1½ days)
 
 *User steer 2026-08-13: "the history requirements per catalog should be listed and confirmed

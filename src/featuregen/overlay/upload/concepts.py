@@ -1506,6 +1506,20 @@ def denomination_concepts() -> frozenset[str]:
     return frozenset(c.name for c in _ALL if is_currency_denomination(c.name))
 
 
+def namespace_mates(name: str | None) -> tuple[str, ...]:
+    """Registered concepts sharing ``name``'s identifier NAMESPACE (the issuer's value space)
+    — the join-candidacy peers (three-axis model), NOT meaning-substitutes. Sorted, excludes
+    ``name`` itself; empty for non-identifiers and unknown names."""
+    if not name:
+        return ()
+    record = CONCEPT_REGISTRY.get(name)
+    if record is None or record.namespace is None:
+        return ()
+    return tuple(sorted(
+        c.name for c in _ALL
+        if c.namespace == record.namespace and c.name != name))
+
+
 def concept_path(name: str | None) -> tuple[str, ...]:
     """The selected concept followed by every ``is_a`` ancestor (semantic plan Task 1).
 

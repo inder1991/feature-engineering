@@ -210,11 +210,16 @@ def evaluate_operand(operand: RequiredOperandV1,
     if capability.blocked_sensitivity:
         return _verdict(operand, capability, "blocked", [R.PROTECTED_CHARACTERISTIC_BLOCKED])
 
-    # 1. Controlled meaning: the concept must MATCH (primary or a declared alternative) —
-    #    anything else is a different meaning entirely, not a lesser one.
+    # 1. Controlled meaning: the concept must MATCH — the exact name, a declared
+    #    alternative, or (C7) a registered DESCENDANT whose is-a path reaches a wanted name
+    #    (a specialized flow IS the flow it specializes). A namespace MATE is a join-candidacy
+    #    peer, never a meaning-substitute — it stays CONCEPT_MISMATCH by design.
     accepted = {operand.concept, *operand.alternative_concepts}
     if capability.concept not in accepted:
-        return _verdict(operand, capability, "not_applicable", [R.CONCEPT_MISMATCH])
+        from featuregen.overlay.upload.concepts import concept_path
+
+        if not accepted.intersection(concept_path(capability.concept)):
+            return _verdict(operand, capability, "not_applicable", [R.CONCEPT_MISMATCH])
 
     # 2. Structural contradictions (KNOWN incompatibility — never missing evidence).
     if operand.operand_class == "measure" and capability.identifier_like:

@@ -37,7 +37,7 @@ GENERATION_CONTEXT_CONTRACT = "generation-semantic-context"
 # v2: ColumnIndexV1 gained schema_name (Layer B keys field_evidence by schema-preserving
 # logical_ref). v3: the context gained table_facts (the event_or_snapshot dataset axis).
 # Pre-live: stored older pins verify as drifted against newer rebuilds — honestly.
-GENERATION_CONTEXT_VERSION = "3"
+GENERATION_CONTEXT_VERSION = "4"     # v4 (C7): + concept_closure — retrieval widening map
 _OWNER = "featuregen.overlay.upload.generation_semantic_context"
 
 register_contract_version(GENERATION_CONTEXT_CONTRACT, GENERATION_CONTEXT_VERSION, owner=_OWNER)
@@ -79,6 +79,11 @@ class GenerationSemanticContextV1:
     #: table_name -> the event_or_snapshot DISPLAY value ("event" | "snapshot" | None) — the
     #: dataset axis Layer B pins authority onto. Absence is a fact, never an inferred default.
     table_facts: dict[str, str] = field(default_factory=dict)
+    #: C7 — enriched concept -> its RETRIEVAL closure (self + is-a ancestors + namespace
+    #: mates), from the frozen registry. Consulted by shortlist ASSEMBLY only (an operand
+    #: asking an ancestor retrieves the descendant's columns); eligibility still decides the
+    #: meaning exactly. Field-exhaustive hashing makes any closure change a new context.
+    concept_closure: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def context_hash(self) -> str:
         """The run's context identity — field-exhaustive, so ANY visible difference (a column,
@@ -121,6 +126,12 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
     for col in columns:
         if col.concept:
             concept_index.setdefault(col.concept, []).append(col.object_ref)
+    from featuregen.overlay.upload.concepts import concept_path, namespace_mates
+
+    concept_closure = {
+        name: tuple(dict.fromkeys((*concept_path(name), *namespace_mates(name))))
+        for name in concept_index
+    }
 
     return GenerationSemanticContextV1(
         catalog_source=catalog_source,
@@ -130,6 +141,7 @@ def build_generation_semantic_context(conn, *, catalog_source: str, roles=(),
         field_policy_version=FIELD_POLICY_VERSION,
         columns=columns,
         concept_index={k: tuple(v) for k, v in concept_index.items()},
+        concept_closure=concept_closure,
         table_facts={name: value for name, value in table_rows if value})
 
 

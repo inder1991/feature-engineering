@@ -413,3 +413,84 @@ def test_the_hint_promotes_an_eligible_ref_and_cannot_promote_a_blocked_one(db):
     verdicts, _ = bind_planning_request(db, request2, context)
     amount = next(v for v in verdicts if v.role == "amount")
     assert amount.selected_ref != "public.transactions.acct_ref"
+
+
+# ── C7: semantic closure — a registered descendant retrieves and binds; a mate does not ────────
+
+def test_an_operand_retrieves_and_binds_a_registered_descendant_concept(db):
+    """C7's acceptance: `interest_income` IS-A `monetary_flow` in the registry — a column
+    enriched with the descendant retrieves for the ancestor operand AND binds (the meaning
+    matches by construction); a genuinely different meaning still refuses."""
+    rows = [(CanonicalRow(SOURCE, "transactions", "acct_ref", "integer", is_grain=True,
+                          entity="Account"), "account_id"),
+            (CanonicalRow(SOURCE, "transactions", "int_income", "numeric",
+                          additivity="additive", currency="USD"), "interest_income"),
+            (CanonicalRow(SOURCE, "transactions", "dc_flag", "text"),
+             "debit_credit_indicator"),
+            (CanonicalRow(SOURCE, "transactions", "booked_ts", "timestamp"),
+             "event_timestamp")]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    verdicts, eligibility = _bind_probe(db)
+    amount = next(v for v in verdicts if v.role == "amount")
+    assert amount.status == "bound", (amount.status, amount.reason_codes)
+    assert amount.selected_ref == "public.transactions.int_income", \
+        "the registered descendant IS the requested meaning"
+
+
+def test_a_namespace_mate_is_retrieval_only_never_a_meaning_substitute(db):
+    """C7: `counterparty_id` shares customer_id's namespace (join candidacy) but is NOT a
+    meaning substitute — retrieved into the audit, refused by eligibility (CONCEPT_MISMATCH)."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        RequiredOperandV1,
+        planning_request_from_user_definition,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
+
+    rows = [(CanonicalRow(SOURCE, "trades", "cpty_ref", "varchar(20)"), "counterparty_id"),
+            (CanonicalRow(SOURCE, "trades", "booked_ts", "timestamp"), "event_timestamp")]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    context = build_generation_semantic_context(db, catalog_source=SOURCE)
+    request = planning_request_from_user_definition(
+        definition_id="user:mate_probe", primary_objective=PROBE_RECIPE.primary_objective,
+        output=PROBE_RECIPE.output,
+        operands=(RequiredOperandV1(role="who", concept="customer_id",
+                                    operand_class="entity_key"),),
+        source_grain="transaction", output_grain="customer",
+        temporal=PROBE_RECIPE.temporal, content_hash="matehash")
+    verdicts, eligibility = bind_planning_request(db, request, context)
+    who = next(v for v in verdicts if v.role == "who")
+    assert who.status != "bound", "a join-candidacy peer never binds as the meaning"
+    mate = eligibility.get(("who", "public.trades.cpty_ref"))
+    assert mate is not None, "the mate WAS retrieved — visible in the audit"
+    assert mate.status == "not_applicable"
+    assert R.CONCEPT_MISMATCH in mate.reason_codes
+
+
+def test_closure_changes_move_the_context_hash(db):
+    """C7: the closure is context CONTENT — enriching a column with a descendant concept
+    changes what retrieval can see, so it must be a NEW context identity."""
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+
+    rows = [(CanonicalRow(SOURCE, "transactions", "amount", "numeric",
+                          additivity="additive", currency="USD"), "monetary_flow")]
+    build_graph(db, SOURCE, [r for r, _ in rows],
+                concepts={content_hash(r): c for r, c in rows})
+    before = build_generation_semantic_context(db, catalog_source=SOURCE)
+    assert "monetary_flow" in before.concept_closure
+    assert "monetary_flow" in before.concept_closure["monetary_flow"]
+
+    rows2 = [(CanonicalRow(SOURCE, "transactions", "int_inc", "numeric",
+                           additivity="additive", currency="USD"), "interest_income")]
+    build_graph(db, SOURCE, [r for r, _ in rows2],
+                concepts={content_hash(r): c for r, c in rows2})
+    after = build_generation_semantic_context(db, catalog_source=SOURCE)
+    assert "monetary_flow" in after.concept_closure["interest_income"]
+    assert after.context_hash() != before.context_hash()

@@ -407,11 +407,19 @@ def request_shortlists(request, context) -> dict[str, tuple[str, ...]]:
     """PURE: per-role shortlists from the frozen concept index (B6 split — callers batch the
     capability read across MANY requests, then fold each purely)."""
     index = context.concept_index
+    closure = getattr(context, "concept_closure", {}) or {}
     shortlists: dict[str, tuple[str, ...]] = {}
     for operand in request.operands:
+        wanted = {operand.concept, *operand.alternative_concepts}
         refs: list[str] = []
         for concept_name in (operand.concept, *operand.alternative_concepts):
             refs.extend(index.get(concept_name, ()))
+        # C7 — closure widening: a column enriched with a concept whose CLOSURE (self +
+        # is-a ancestors + namespace mates) reaches a wanted name is RETRIEVED too.
+        # Retrieval only: eligibility still refuses a mismatched meaning exactly.
+        for enriched, members in closure.items():
+            if enriched not in wanted and wanted.intersection(members):
+                refs.extend(index.get(enriched, ()))
         deduped = list(dict.fromkeys(refs))
         # C6: NO blind cut here — the per-operand bound applies AFTER authority ranking (in
         # bind_with_capabilities, where the evidence pins exist). A pre-ranking cut in stable
@@ -469,6 +477,15 @@ def bind_with_capabilities(conn, request, context, capabilities):
                 blocked_refs.append((ref, verdict.reason_codes))
 
         bindable = tiers["eligible"] or tiers["provisional"]
+        # C7: an EXACT-name candidate (the operand's concept or a declared alternative)
+        # outranks a closure-widened descendant in SELECTION — the closure adds recall when
+        # the exact meaning is absent; it never manufactures a tie against it.
+        if bindable:
+            wanted_names = {operand.concept, *operand.alternative_concepts}
+            exact = [ref for ref in bindable
+                     if capabilities[ref].concept in wanted_names]
+            if exact:
+                bindable = exact
         if not bindable:
             # C6 rule 3: a REQUIRED operand whose shortlist was CUT and yielded no winner
             # fails closed as AMBIGUOUS-with-truncation — an incomplete search must never
