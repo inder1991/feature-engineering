@@ -210,6 +210,14 @@ async function renderAndGenerate(
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 }
 
+async function renderAndGenerateRaw() {
+  // The caller has already queued its own contractConsideredSet mock (e.g. with v2 sections).
+  render(<WorkbenchScreen />)
+  await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+  await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+  await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+}
+
 async function renderAndGenerateSets(round: api.FeatureSetsResult) {
   contractConsideredSet.mockResolvedValue(considered(round))
   render(<WorkbenchScreen />)
@@ -226,7 +234,7 @@ async function registerSelection(count: number) {
   const plural = count === 1 ? 'feature' : 'features'
   await userEvent.click(
     screen.getByRole('button', { name: `Approve and register ${count} ${plural}` }))
-  await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+  await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
 }
 
 async function openDescribe() {
@@ -635,10 +643,9 @@ describe('selection and registration', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
     expect(registerFeature).not.toHaveBeenCalled()
     expect(screen.getByText(
-      'Your approval writes these features into the registry with their lineage, under your '
-      + 'name.',
+      /saves the selected candidates as IDEAS/,
     )).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
     expect(registerFeature).toHaveBeenCalledTimes(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
@@ -656,7 +663,7 @@ describe('selection and registration', () => {
     await renderAndGenerate([IDEA])
     await selectCandidate('avg_balance')
     await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
-    const confirm = screen.getByRole('button', { name: 'Confirm approval' })
+    const confirm = screen.getByRole('button', { name: 'Save ideas' })
     await userEvent.click(confirm)
     await userEvent.click(confirm)
     expect(registerFeature).toHaveBeenCalledTimes(1)
@@ -677,10 +684,9 @@ describe('selection and registration', () => {
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Approve and register 2 features' }))
     expect(screen.getByText(
-      'Your approval writes these features into the registry with their lineage, under your '
-      + 'name.',
+      /saves the selected candidates as IDEAS/,
     )).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     expect(await screen.findByText('feat_02')).toBeInTheDocument()
     expect(screen.getByText('feat_01')).toBeInTheDocument()
     expect(registerFeature).toHaveBeenCalledTimes(2)
@@ -761,7 +767,7 @@ describe('selection and registration', () => {
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
     expect(screen.getByLabelText('Entity')).toBeDisabled()
     expect(screen.getByLabelText('Target column')).toBeDisabled()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     // Still locked while the batch is in flight.
     expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
@@ -1579,7 +1585,7 @@ describe('per-candidate feedback', () => {
     // Confirm step: both revision actions lock with the feedback channels.
     expect(screen.getByRole('button', { name: 'Approve revision' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Revert to original' })).toBeDisabled()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     // In flight: an Approve revision click is inert, even force-dispatched past the disabled
     // attribute, so the batch writes the ORIGINAL spec.
     const approve = screen.getByRole('button', { name: 'Approve revision' })
@@ -2551,5 +2557,66 @@ describe('parameter alternatives line', () => {
     expect(await screen.findByText('Also available — window: 30/[90]/180')).toBeInTheDocument()
     // absent field (flag off / nothing to choose) renders nothing
     expect(screen.getAllByText(/Also available/)).toHaveLength(1)
+  })
+})
+
+
+// ── A4: the server decides selectability — the client renders, never re-implements ─────────────
+
+describe('A4: actions-driven selection', () => {
+  function withActions(
+    cs: api.ConsideredSetResp,
+    entries: Partial<api.OptionActionsEntry>[],
+  ): api.ConsideredSetResp {
+    return {
+      ...cs,
+      contract_version: 2,
+      recommended_options: entries.map(e => ({
+        option_id: e.option_id ?? 'opt_x',
+        name: e.name ?? null,
+        recipe_id: e.recipe_id ?? 'recipe:x',
+        binding_state: e.binding_state ?? 'bound',
+        allowed_actions: e.allowed_actions ?? ['save_idea'],
+        blocked_actions: e.blocked_actions ?? {},
+      })),
+    }
+  }
+
+  it('disables selection when the server blocks create_contract and names the next step', async () => {
+    const round = singleSetRound([idea('needs_confirmation')])
+    const cs = considered(round)
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce(withActions(cs, [{
+      option_id: optionId,
+      allowed_actions: ['save_idea'],
+      blocked_actions: { create_contract: [{
+        code: 'PROPOSED_METADATA_ONLY',
+        next_step: 'confirm the AI-proposed concept(s) in the Governance screen',
+      }] },
+    }]))
+    await renderAndGenerateRaw()
+    const checkbox = await screen.findByRole('checkbox', { name: /Select needs_confirmation/ })
+    expect(checkbox).toBeDisabled()
+    expect(checkbox).toHaveAttribute(
+      'title', expect.stringContaining('confirm the AI-proposed concept'))
+  })
+
+  it('keeps selection enabled when the server allows create_contract', async () => {
+    const round = singleSetRound([idea('all_clear')])
+    const cs = considered(round)
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce(withActions(cs, [{
+      option_id: optionId,
+      allowed_actions: ['save_idea', 'create_contract'],
+    }]))
+    await renderAndGenerateRaw()
+    const checkbox = await screen.findByRole('checkbox', { name: /Select all_clear/ })
+    expect(checkbox).toBeEnabled()
+  })
+
+  it('cards without an actions entry keep today\'s behavior (legacy bridge until B1)', async () => {
+    await renderAndGenerate([idea('legacy_card')])
+    const checkbox = await screen.findByRole('checkbox', { name: /Select legacy_card/ })
+    expect(checkbox).toBeEnabled()
   })
 })

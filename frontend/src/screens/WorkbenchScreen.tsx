@@ -54,6 +54,7 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
+  type OptionActionsEntry,
   type IntakeReading, type IntakeResp,
   type JoinStep, type RankedRecipe, type Recipe, type RecipeDisposition, type RecognitionCandidate,
   type RecognitionResp, type RefineRejection, type Rejection, type SetRecommendation,
@@ -653,6 +654,11 @@ export function WorkbenchScreen() {
   // one (or zero) renders the flat single list exactly as before the sets model.
   const [setLenses, setSetLenses] = useState<string[]>([])
   const [recommendation, setRecommendation] = useState<SetRecommendation | null>(null)
+  // A4: option_id -> the server's action verdicts (same fold as the durable writes). Empty for
+  // legacy/free-form cards until B1 retires them — those keep today's behavior, and drafting
+  // them is still gated server-side.
+  const [optionActions, setOptionActions] =
+    useState<Record<string, OptionActionsEntry>>({})
   const [rejections, setRejections] = useState<Rejection[]>([])
   const [rejectionsOpen, setRejectionsOpen] = useState(false)
   // Which set's features the one detail list shows (multi-set rounds only).
@@ -954,6 +960,9 @@ export function WorkbenchScreen() {
     setGenerated(candidates)
     setSetLenses(lenses)
     setRecommendation(cs.recommendation)
+    setOptionActions(Object.fromEntries(
+      [...(cs.recommended_options ?? []), ...(cs.actionable_options ?? [])]
+        .map(entry => [entry.option_id, entry])))
     // The detail list opens on the advisory pick when there is one among the surviving sets.
     setActiveLens(
       lenses.length > 1
@@ -1561,13 +1570,26 @@ export function WorkbenchScreen() {
     setConfirmingBatch(false)
     setConfirmingGovern(false)
     setActiveLens(lens)
+    let skipped = 0
     setSelected(prev => {
       const next = { ...prev }
       for (const c of generated ?? []) {
-        if (c.lenses.includes(lens) && !registered[c.key]) next[c.key] = lens
+        if (!c.lenses.includes(lens) || registered[c.key]) continue
+        // A4: batch selection honors the server's verdicts — a blocked candidate is skipped
+        // and COUNTED, never silently included and never silently dropped.
+        const entry = c.idea.option_id ? optionActions[c.idea.option_id] : undefined
+        if (entry && !entry.allowed_actions.includes('create_contract')) {
+          skipped += 1
+          continue
+        }
+        next[c.key] = lens
       }
       return next
     })
+    setNotice(skipped > 0
+      ? `Skipped ${skipped} candidate${skipped === 1 ? '' : 's'} that need${skipped === 1 ? 's' : ''} `
+        + 'a decision first — see the actionable section on each card.'
+      : '')
   }
 
   async function confirmRegistration() {
@@ -2433,7 +2455,20 @@ export function WorkbenchScreen() {
                   ? 'earlier round'
                   : `${c.lenses[0] ?? 'unscoped'}; ${generationSourceLabel(c.idea)}`
                 : null
-              const canSelect = c.kind === 'generated' || c.name.trim() !== ''
+              // A4: the SERVER decides selectability. A card with an option-actions entry is
+              // selectable only when create_contract is allowed; its first blocker's next
+              // step becomes the disabled control's tooltip. Cards without an entry
+              // (legacy/free-form, pre-B1) keep today's rule — the draft fold still gates.
+              const actionsEntry = c.kind === 'generated' && c.idea.option_id
+                ? optionActions[c.idea.option_id]
+                : undefined
+              const canSelect = actionsEntry
+                ? actionsEntry.allowed_actions.includes('create_contract')
+                : c.kind === 'generated' || c.name.trim() !== ''
+              const blockedTitle = actionsEntry && !canSelect
+                ? actionsEntry.blocked_actions.create_contract?.[0]?.next_step
+                  ?? 'not yet actionable'
+                : undefined
               const description = c.kind === 'generated' ? c.idea.description : c.description
               const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
               const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
@@ -2456,6 +2491,7 @@ export function WorkbenchScreen() {
                     <input
                       type="checkbox"
                       aria-label={`Select ${displayName}${variantContext ? ` (${variantContext})` : ''}`}
+                      title={blockedTitle}
                       checked={c.key in selected}
                       disabled={batchBusy || !canSelect}
                       onChange={() => toggleSelect(
@@ -2789,8 +2825,9 @@ export function WorkbenchScreen() {
                 {confirmingBatch ? (
                   <>
                     <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
-                      Your approval writes these features into the registry with their lineage,
-                      under your name.
+                      This saves the selected candidates as IDEAS — browsable sketches recorded
+                      under your name with their lineage. An idea is not a governed feature and
+                      can never feed a model; governing happens through a contract.
                     </p>
                     <button
                       type="button"
@@ -2798,7 +2835,7 @@ export function WorkbenchScreen() {
                       disabled={batchBusy}
                       onClick={() => void confirmRegistration()}
                     >
-                      Confirm approval
+                      Save ideas
                     </button>
                     <button
                       type="button"

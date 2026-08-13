@@ -1284,6 +1284,18 @@ export interface RankedRecipe {
   initial_view_reasons: string[]
 }
 
+// A3/A4: one option's server-computed action verdicts — the SAME activation fold the
+// durable writes consult. The client renders these; it re-implements NO policy.
+export interface OptionActionBlocker { code: string; next_step: string }
+export interface OptionActionsEntry {
+  option_id: string
+  name: string | null
+  recipe_id: string | null
+  binding_state: string
+  allowed_actions: string[]
+  blocked_actions: Record<string, OptionActionBlocker[]>
+}
+
 export interface ConsideredSetResp {
   intent_id: string
   anchor: FeatureIdea | null
@@ -1297,6 +1309,15 @@ export interface ConsideredSetResp {
   scope_id?: string
   in_scope_count?: number
   dispositions?: RecipeDisposition[]
+  // v2 (A3): the three-section shape + provenance. Present only when contract_version=2 was
+  // requested — which the Workbench now always does.
+  contract_version?: number
+  semantic_planning_mode?: string
+  considered_revision_id?: string | null
+  considered_content_hash?: string | null
+  recommended_options?: OptionActionsEntry[]
+  actionable_options?: OptionActionsEntry[]
+  rejected_outputs?: Rejection[]
   // Phase 2A — deterministic presentation-priority ranking of the ELIGIBLE recipes, present ONLY
   // when the backend ranking flag is on. Distinct from `recommendation` (the LLM starting-set pick)
   // and from `dispositions` (the per-recipe lens). `ranking_version` stamps the mapping/taxonomy
@@ -1543,6 +1564,10 @@ export function contractConsideredSet(
   return post('/contract/considered-set', {
     hypothesis,
     objective,
+    // A4: the Workbench speaks ONLY the semantic contract — explicit opt-in per request,
+    // never inferred from optional fields. The server keeps v1 byte-frozen for nothing but
+    // the emergency unscoped path.
+    contract_version: 2,
     definition: opts.definition ?? '',
     catalog_source: opts.catalogSource ?? null,
     entity: opts.entity ?? null,
