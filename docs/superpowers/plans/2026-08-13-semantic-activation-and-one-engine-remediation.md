@@ -155,6 +155,17 @@ Deferral is honest only while the UI marks the capability unavailable — D-2 gu
 *Acceptance:* `pytest -m eval` green or every remaining red named in this file with an owner
 task; `ruff check` clean on program files; `git diff --check` clean.
 
+> **ACCEPTED `f0ff3faa` (2026-08-13).** Triage verdict: 26/28 failures = ONE harness defect —
+> color-forcing terminal env made the mutation child colorize its captured summary, the
+> color-naive parse read `failed=[]`, and every KILLED mutation reported as uncaught (also
+> explains the review's 2 vs this env's 28). Fixed both ways (child NO_COLOR/--color=no +
+> ANSI-stripping parser). `feature_gen_reads_the_thin_menu` retired with rationale (victims
+> deleted in wave B; invariant structural). Count gate rebaselined 277→364 with attribution.
+> 26 ruff + 2 whitespace fixed — and an honesty correction recorded: the review's "~30 ruff
+> errors" was RIGHT; my earlier "not reproducible" was a zsh no-word-split artifact. Eval: 59
+> passed (was 28 failed). Full suite 10868. The plan file itself is now COMMITTED (this repo's
+> first tracked copy) — acceptance rows continue in-file.
+
 ### Task A1 — the activation policy fold (1 day)
 
 *Create:* `src/featuregen/overlay/upload/activation_policy.py` + `test_activation_policy.py`.
@@ -189,6 +200,14 @@ where they exist (`PROPOSED_METADATA_ONLY`, `TEMPORAL_POLICY_UNRESOLVED`…) and
 
 *Acceptance:* table-driven tests — every rule row has a positive and a negative case; an
 unknown action raises; the fold is pure (no conn parameter exists in its signature).
+
+> **ACCEPTED `3cd09a0a` (2026-08-13).** `activation_policy.py`: FrozenOptionFactsV1 +
+> CurrentActivationStateV1 (every default the failing side; unverifiable snapshot fails
+> CLOSED), the five-action ladder, twelve new closed blocker codes with families and named
+> next steps, `decide_all_actions` as the wire-shape source. 39 tests — each rule row both
+> directions, FORMULA_BLOCKED contracts allowed per SE-12 rule 3, authoring never deadlocked,
+> materialize requires exact MATERIALIZATION_READY + schema support, execution authority fails
+> closed pending C2. Suite 10893. NOT YET WIRED — A1b (the decision record) then A2 (routes).
 
 ### Task A1b — the minimal option-decision record, BEFORE any enforcement (1 day)
 

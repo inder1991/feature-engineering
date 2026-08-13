@@ -163,6 +163,9 @@ class ConsideredSet:
         str, tuple[str, ...]
     ] = field(default_factory=dict)
     option_ids_by_path: dict[str, str] = field(default_factory=dict)
+    # A1b: per-served-definition frozen facts captured at the semantic branch, written as
+    # immutable semantic_option_decision rows once option ids mint at revision-persist time.
+    semantic_decision_facts_by_definition_id: dict[str, dict] = field(default_factory=dict)
     considered_revision_id: str | None = None
     considered_content_hash: str | None = None
 
@@ -864,6 +867,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
     # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
     # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
+    semantic_decision_facts: dict[str, dict] = {}
     if catalog_source is not None and semantic_mode == "semantic_v1" and scope is not None:
         # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
         # (frozen context → capability binder → eligibility fold → assembly → typed gauntlet),
@@ -904,13 +908,31 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             except Exception:
                 logger.exception("semantic-v1 intent generation failed "
                                  "(recipe lens serves alone)")
+        observation_ids: dict[str, str] = {}
         if semantic_context is not None:
-            persist_semantic_candidates(
+            observation_ids = persist_semantic_candidates(
                 conn, generation_run_id=generation_run_id or "unattributed",
                 context=semantic_context, candidates=all_candidates)
         projection = project_assembled_set(
             assemble_candidates(all_candidates),
             catalog_source=catalog_source, target_ref=target_ref)
+        # A1b: freeze each SERVED option's activation facts now, while the candidate, its
+        # projection, and its exact observation id are all in hand. Written as immutable rows
+        # at revision-persist time (option ids mint there), same request transaction.
+        from featuregen.overlay.upload.semantic_option_decision import (
+            decision_facts_for_candidate,
+        )
+
+        candidates_by_id = {c.recipe_id: c for c in all_candidates}
+        context_hash_value = (semantic_context.context_hash()
+                              if semantic_context is not None else "")
+        semantic_decision_facts = {
+            idea.recipe_id: decision_facts_for_candidate(
+                candidates_by_id[idea.recipe_id], idea,
+                observation_ids.get(idea.recipe_id), context_hash_value)
+            for idea in projection.ideas
+            if idea.recipe_id and idea.recipe_id in candidates_by_id
+        }
         rejections.extend({"name": r.get("detail", "intent"), "reason": r.get("detail", ""),
                            "code": r.get("code", "INTENT_REJECTED")}
                           for r in intent_rejections)
@@ -1034,7 +1056,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                        recipe_grounding_context_by_candidate_key=(
                            recipe_grounding_context_by_candidate_key
                        ),
-                       recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id)
+                       recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id,
+                       semantic_decision_facts_by_definition_id=semantic_decision_facts)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",
                 intent.intent_id, catalog_source, tuple(roles),
@@ -1303,7 +1326,7 @@ def _persist_considered_revision(
     }
     digest = canonical_hash(envelope)
     revision_id = mint_id("crv")
-    conn.execute(
+    cursor = conn.execute(
         "INSERT INTO contract_considered_revision "
         "(considered_revision_id, intent_id, generation_run_id, metadata_snapshot_id, "
         "metadata_snapshot_content_hash, considered_json, considered_content_hash, "
@@ -1328,6 +1351,23 @@ def _persist_considered_revision(
     ).fetchone()
     if row is None or row[1] != digest:
         raise Gate1Error("considered revision conflicts with an existing generation run")
+    # A1b: the immutable option-decision rows — one per SERVED semantic option, keyed to the
+    # exact (revision, option) the human will act on. Written only when this call actually
+    # inserted the revision (rowcount 0 = idempotent replay; the rows already exist).
+    if cursor.rowcount == 1 and cs.semantic_decision_facts_by_definition_id:
+        from featuregen.overlay.upload.semantic_option_decision import (
+            persist_option_decisions,
+        )
+
+        facts_by_option: dict[str, dict] = {}
+        for option_id, entry in considered.get("options_by_id", {}).items():
+            feature = (entry.get("canonical_candidate_identity") or {}).get("feature") or {}
+            facts = cs.semantic_decision_facts_by_definition_id.get(feature.get("recipe_id"))
+            if facts is not None:
+                facts_by_option[option_id] = facts
+        persist_option_decisions(
+            conn, considered_revision_id=row[0], generation_run_id=generation_run_id,
+            metadata_snapshot_id=metadata_snapshot_id, facts_by_option_id=facts_by_option)
     return row[0], row[1]
 
 

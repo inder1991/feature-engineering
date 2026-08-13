@@ -17,8 +17,10 @@ from featuregen.idgen import mint_id
 
 
 def persist_semantic_candidates(conn, *, generation_run_id: str, context,
-                                candidates) -> int:
-    """Append one observation per candidate; returns the row count written."""
+                                candidates) -> dict[str, str]:
+    """Append one observation per candidate; returns {source_definition_id: observation_id}
+    so callers can LINK derived records (the A1b option decision) to the exact row — never
+    "newest for the definition" (LIFE-03's wrong-row defect)."""
     from psycopg.types.json import Jsonb
 
     from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
@@ -33,7 +35,7 @@ def persist_semantic_candidates(conn, *, generation_run_id: str, context,
         "semantic_authority_policy_version": SEMANTIC_AUTHORITY_POLICY_VERSION,
         "operand_class_map_version": OPERAND_CLASS_MAP_VERSION,
     }
-    written = 0
+    observation_ids: dict[str, str] = {}
     for candidate in candidates:
         eligibility = [
             {"role": role, "object_ref": ref, **asdict(verdict)}
@@ -44,15 +46,15 @@ def persist_semantic_candidates(conn, *, generation_run_id: str, context,
             " source_definition_id, planning_request_hash, relationship, binding_state, "
             " readiness, review_current, temporal_blocked, verdicts, eligibility, policy_hashes) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (mint_id("sco"), generation_run_id, context.catalog_source, context_hash,
+            (observation_ids.setdefault(candidate.recipe_id, mint_id("sco")),
+             generation_run_id, context.catalog_source, context_hash,
              candidate.planning_request.origin, candidate.recipe_id,
              candidate.planning_request_hash, candidate.relationship,
              candidate.binding_state, candidate.readiness, candidate.review_current,
              bool(candidate.temporal_blocker),
              Jsonb([asdict(v) for v in candidate.verdicts]),
              Jsonb(eligibility), Jsonb(policy_hashes)))
-        written += 1
-    return written
+    return observation_ids
 
 
 __all__ = ["persist_semantic_candidates"]

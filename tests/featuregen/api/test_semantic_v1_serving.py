@@ -142,12 +142,8 @@ def test_legacy_default_is_untouched_by_the_serving_branch(make_client, conn, mo
     _post(make_client(llm_client=_fake()))
 
 
-def test_semantic_v1_binds_llm_intents_through_the_same_engine(
-        make_client, conn, monkeypatch, caplog):
-    """SE-6 wired: the model proposes an ABSTRACT intent (concepts + classes, no refs), the
-    SHARED binder chooses the columns, and the observation store records an llm_intent-origin
-    candidate beside the recipes — one engine, both origins."""
-    intent_payload = {"intents": [{
+def _intent_payload() -> dict:
+    return {"intents": [{
         "display_name": "Days since last activity (model)",
         "business_definition": "Days elapsed since the customer's most recent event.",
         "primary_objective": CHURN,
@@ -170,14 +166,25 @@ def test_semantic_v1_binds_llm_intents_through_the_same_engine(
                      "window_unit": "days", "cutoff_inclusivity": "inclusive"},
         "rationale": "recency is the strongest dormancy precursor",
     }]}
-    fake = FakeLLM(script={
+
+
+def _fake_with_intents() -> FakeLLM:
+    return FakeLLM(script={
         "overlay.feature.recommend": FakeResponse(output={"features": [
             {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
              "aggregation": "avg_90d"}]}),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits"}),
-        "overlay.feature.intents": FakeResponse(output=intent_payload),
+        "overlay.feature.intents": FakeResponse(output=_intent_payload()),
     })
+
+
+def test_semantic_v1_binds_llm_intents_through_the_same_engine(
+        make_client, conn, monkeypatch, caplog):
+    """SE-6 wired: the model proposes an ABSTRACT intent (concepts + classes, no refs), the
+    SHARED binder chooses the columns, and the observation store records an llm_intent-origin
+    candidate beside the recipes — one engine, both origins."""
+    fake = _fake_with_intents()
     _bank(conn)
     monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     _post(make_client(llm_client=fake))
@@ -191,3 +198,55 @@ def test_semantic_v1_binds_llm_intents_through_the_same_engine(
     # The engine DECIDED the binding (bound on this catalog: customer_id + event_ts exist);
     # whatever the state, it came from the shared binder, never from model-named columns.
     assert binding_state in ("bound", "ambiguous", "missing", "blocked")
+
+
+def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeypatch):
+    """A1b: every SERVED semantic option gets one immutable decision row, keyed to the exact
+    (revision, option), linked to its exact observation, loadable as the activation policy's
+    frozen layer — and the store refuses rewrites. Driven through the INTENT path (on this
+    small fixture no recipe binds all the way to a served card), which also proves the
+    decision row's origin honesty: the wire may still say "recipe" (GEN-05, fixed in B4) but
+    the FROZEN record says llm_intent."""
+    import psycopg
+    import pytest as _pytest
+
+    from featuregen.overlay.upload.semantic_option_decision import load_frozen_option_facts
+
+    _bank(conn)
+    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    body = _post(make_client(llm_client=_fake_with_intents()))
+
+    revision_id = conn.execute(
+        "SELECT considered_revision_id FROM contract_considered_revision "
+        "WHERE generation_run_id = %s", (body["generation_run_id"],)).fetchone()[0]
+    rows = conn.execute(
+        "SELECT option_id, source_definition_id, generation_source, observation_id, "
+        "       review_current, confirmation_required_roles, computation_kind "
+        "FROM semantic_option_decision WHERE considered_revision_id = %s",
+        (revision_id,)).fetchall()
+    assert rows, "the served intent option froze a decision row"
+    served_engine_options = {
+        f["option_id"] for s_ in body["alternatives"] for f in s_["features"]
+        if f.get("recipe_id")}
+    assert {r[0] for r in rows} == served_engine_options       # the EXACT keys the human sees
+
+    option_id, definition_id, source, observation_id, review_current, roles, kind = rows[0]
+    assert source == "llm_intent"                              # honest origin, per-row
+    assert kind == "conceptual_pattern"                        # the structural ceiling
+    assert observation_id, "linked to the exact observation, never newest-for-definition"
+    assert review_current is False
+    assert roles, "all-proposed metadata => confirmation roles recorded"
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert frozen is not None
+    assert frozen.binding_state == "bound"
+    assert frozen.generation_source == "llm_intent"
+    assert frozen.confirmation_required_roles
+    assert frozen.plan_envelope_present is False               # honest until B7
+    assert load_frozen_option_facts(
+        conn, considered_revision_id=revision_id, option_id="opt_nope") is None
+
+    with _pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        with conn.transaction():
+            conn.execute("UPDATE semantic_option_decision SET review_current = true")
