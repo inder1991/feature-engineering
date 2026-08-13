@@ -869,11 +869,24 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                         facts["outstanding_requirement_codes"]),
                     plan_refusal_codes=tuple(
                         (facts.get("dataset_story") or {}).get("plan_refusals", ())))
+                # C2: the serve-time execution floor is folded from the authorities the
+                # engine JUST measured (the frozen operand_authorities); authoring is True
+                # at the generation instant — any failure rides confirmation_required_roles.
+                from featuregen.overlay.upload.semantic_eligibility import clears
+
+                story = facts.get("dataset_story") or {}
+                serve_authorities = list((story.get("operand_authorities") or {}).values())
+                plan_present = facts.get("plan_envelope_present", False)
                 current = CurrentActivationStateV1(
                     review_current=facts["review_current"],
                     policy_revisions_current=True,
                     snapshot_freshness="current",
                     uoa_current=True,
+                    authoring_floor_met=True,
+                    execution_authority_evaluated=bool(plan_present and serve_authorities),
+                    execution_floor_met=bool(serve_authorities) and all(
+                        clears(a or "absent", "execution_at_governed")
+                        for a in serve_authorities),
                     effective_readiness=facts["readiness"])
                 decisions = decide_all_actions(frozen, current)
                 section_entry = {

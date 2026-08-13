@@ -43,6 +43,7 @@ CLEAN_CURRENT = CurrentActivationStateV1(
     requirements_closed=True,
     execution_authority_evaluated=True,
     execution_floor_met=True,
+    authoring_floor_met=True,
     uoa_current=True,
 )
 
@@ -209,3 +210,40 @@ def test_a_uoa_reconfirmed_differently_after_serving_is_activation_drift():
     assert not decision.allowed
     assert "ACTIVATION_STATE_DRIFTED" in codes(decision)
     assert activation_decision(CLEAN_FROZEN, moved, "save_idea").allowed
+
+
+def test_an_authority_that_weakened_since_serving_blocks_authoring_as_drift():
+    """C2: the card was served clean (no confirmation-required roles), but a bound operand's
+    CURRENT resolved authority no longer clears the authoring floor — the durable write
+    refuses with the named re-confirm step. The serve-time story is untouched: a card whose
+    floors failed AT SERVING carries PROPOSED_METADATA_ONLY instead (no double-naming)."""
+    from dataclasses import replace
+
+    weakened = replace(CLEAN_CURRENT, authoring_floor_met=False)
+    decision = activation_decision(CLEAN_FROZEN, weakened, "create_contract")
+    assert not decision.allowed
+    assert "SEMANTIC_AUTHORITY_INSUFFICIENT" in codes(decision)
+
+    served_blocked = replace(CLEAN_FROZEN, confirmation_required_roles=("customer",))
+    decision = activation_decision(served_blocked, weakened, "create_contract")
+    assert "PROPOSED_METADATA_ONLY" in codes(decision)
+    assert "SEMANTIC_AUTHORITY_INSUFFICIENT" not in codes(decision)
+
+
+def test_materialization_is_floor_driven_not_unconditionally_blocked():
+    """C2 closes A1's placeholder: with the floor EVALUATED and met (plus readiness, formula,
+    schema, checks), materialization is allowed; an unmet floor names the raise-authority
+    step; an unevaluated floor still fails closed."""
+    from dataclasses import replace
+
+    assert activation_decision(CLEAN_FROZEN, CLEAN_CURRENT,
+                               "request_materialization").allowed
+
+    unmet = replace(CLEAN_CURRENT, execution_floor_met=False)
+    decision = activation_decision(CLEAN_FROZEN, unmet, "request_materialization")
+    assert "EXECUTION_AUTHORITY_UNMET" in codes(decision)
+
+    unevaluated = replace(CLEAN_CURRENT, execution_authority_evaluated=False,
+                          execution_floor_met=False)
+    decision = activation_decision(CLEAN_FROZEN, unevaluated, "request_materialization")
+    assert "EXECUTION_AUTHORITY_UNEVALUATED" in codes(decision)

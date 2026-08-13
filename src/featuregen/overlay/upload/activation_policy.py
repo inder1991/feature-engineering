@@ -65,6 +65,9 @@ class FrozenOptionFactsV1:
     snapshot_id: str = ""
     plan_refusal_codes: tuple[str, ...] = ()   # WHY no plan folded (B7/B10 refusals)
     confirmed_uoa_entity: str = ""              # the UOA the human had confirmed at serving
+    read_set: tuple[str, ...] = ()              # the frozen plan's bound refs (C2 floor input)
+    plan_catalog_source: str = ""
+    operand_authorities: tuple[tuple[str, str], ...] = ()  # (ref, measured authority) at serving
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,8 +84,9 @@ class CurrentActivationStateV1:
     formula_expectation_revision: str = ""
     formula_schema_supported: bool = False      # the execution engine ADVERTISES this schema
     requirements_closed: bool = False           # every typed requirement has a recorded result
-    execution_authority_evaluated: bool = False  # False until C2 lands the execution matrix
-    execution_floor_met: bool = False
+    execution_authority_evaluated: bool = False  # the C2 execution floor was actually folded
+    execution_floor_met: bool = False           # every bound operand clears execution_at_governed
+    authoring_floor_met: bool = False           # every bound operand STILL clears authoring
     uoa_current: bool = False                   # the confirmed UOA has not moved since serving
 
 
@@ -144,6 +148,14 @@ def _contract_blockers(frozen: FrozenOptionFactsV1,
         # B10 item 4: the human re-confirmed a DIFFERENT unit of analysis after this card was
         # served — the card answers a question nobody is asking anymore. Regenerate.
         blockers.append(BlockerV1(R.ACTIVATION_STATE_DRIFTED, _REGENERATE_STEP))
+    if not frozen.confirmation_required_roles and not current.authoring_floor_met:
+        # C2: the AUTHORING floor, re-read at the durable write. The serve-time answer rides
+        # the frozen confirmation_required_roles (funnel-named, role-specific); THIS rule
+        # catches drift only — a value confirmed at serving whose authority weakened since.
+        blockers.append(BlockerV1(
+            R.SEMANTIC_AUTHORITY_INSUFFICIENT,
+            "a bound operand's metadata authority dropped below the authoring floor since "
+            "this card was served — re-confirm the value, then regenerate"))
     return blockers
 
 
@@ -177,8 +189,8 @@ def _materialization_blockers(frozen: FrozenOptionFactsV1,
     if not current.execution_authority_evaluated:
         blockers.append(BlockerV1(
             R.EXECUTION_AUTHORITY_UNEVALUATED,
-            "the execution-authority matrix is not implemented yet (remediation C2) — "
-            "materialization fails closed until it is"))
+            "the execution-authority floor was not evaluated for this option (no frozen "
+            "plan read set) — regenerate so the floor can be measured"))
     elif not current.execution_floor_met:
         blockers.append(BlockerV1(
             R.EXECUTION_AUTHORITY_UNMET,

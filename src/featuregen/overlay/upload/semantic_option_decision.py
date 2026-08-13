@@ -67,7 +67,11 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
                if candidate.dataset_story is not None else {}),
             "output_grain": request.output_grain,
             "confirmed_uoa_entity": uoa_entity,
-            "confirmed_spine_ref": spine_ref},
+            "confirmed_spine_ref": spine_ref,
+            # C2: the bound operands' MEASURED authorities at serving — what the execution
+            # floor re-checks against current resolutions at the durable write.
+            "operand_authorities": {binding.ref[1]: binding.authority
+                                    for binding in idea.input_role_bindings}},
         "policy_revision_pins": {"authority_matrix_hash": authority_matrix_hash()},
         "observation_id": observation_id,
         "context_hash": context_hash,
@@ -143,7 +147,12 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         formula_expectation_revision=formula_revision,
         snapshot_id=snapshot_id or "",
         plan_refusal_codes=tuple((story or {}).get("plan_refusals") or ()),
-        confirmed_uoa_entity=(story or {}).get("confirmed_uoa_entity") or "")
+        confirmed_uoa_entity=(story or {}).get("confirmed_uoa_entity") or "",
+        read_set=tuple(((story or {}).get("binding_plan") or {}).get("read_set") or ()),
+        plan_catalog_source=(((story or {}).get("binding_plan") or {})
+                             .get("catalog_source") or ""),
+        operand_authorities=tuple(sorted(
+            ((story or {}).get("operand_authorities") or {}).items())))
 
 
 def _latest_confirmed_uoa(conn, intent_id: str) -> str | None:
@@ -204,6 +213,42 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         except Exception:
             freshness = "unverifiable"
 
+    # C2 — the authoring + execution floors, re-read at the durable write: every ref in the
+    # frozen plan's read set must STILL clear the matrix column under its CURRENT resolved
+    # authority (C1's read-only pins — the same resolver law generation served from). No
+    # read set (no plan) → the floors are honestly UNEVALUATED and fail closed.
+    authoring_now = False
+    execution_evaluated = False
+    execution_now = False
+    if frozen.read_set and frozen.plan_catalog_source:
+        try:
+            from featuregen.overlay.upload.field_resolution import current_resolution_pins
+            from featuregen.overlay.upload.object_ref import normalize_ref
+            from featuregen.overlay.upload.semantic_eligibility import clears
+
+            logical_by_ref = {}
+            for ref in frozen.read_set:
+                parts = ref.split(".")
+                if len(parts) >= 3:
+                    logical_by_ref[ref] = normalize_ref(
+                        frozen.plan_catalog_source, parts[-3], parts[-2], parts[-1])
+            pins = current_resolution_pins(
+                conn, logical_refs=list(logical_by_ref.values()), fields=("concept",))
+            authorities = []
+            for logical in logical_by_ref.values():
+                pin = pins.get((logical, "concept"))
+                authorities.append(f"{pin.producer}/{pin.strength}"
+                                   if pin is not None and pin.producer else "absent")
+            authoring_now = bool(authorities) and all(
+                clears(a, "authoring") for a in authorities)
+            execution_now = bool(authorities) and all(
+                clears(a, "execution_at_governed") for a in authorities)
+            execution_evaluated = True
+        except Exception:                     # unreadable floors → unevaluated, fail closed
+            authoring_now = False
+            execution_evaluated = False
+            execution_now = False
+
     # B10 item 4 — the UOA re-read. Absence is FREE both ways (the confirmation is
     # optional); a frozen UOA the caller cannot re-verify fails closed like everything else.
     def _norm(value):                         # human vocabulary: case never means drift
@@ -230,8 +275,9 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         formula_expectation_revision=frozen.formula_expectation_revision,
         formula_schema_supported=False,
         requirements_closed=False,
-        execution_authority_evaluated=False,
-        execution_floor_met=False)
+        execution_authority_evaluated=execution_evaluated,
+        execution_floor_met=execution_now,
+        authoring_floor_met=authoring_now)
 
 
 __all__ = ["assemble_current_activation_state", "decision_facts_for_candidate",

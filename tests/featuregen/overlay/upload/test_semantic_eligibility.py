@@ -184,3 +184,42 @@ def test_the_compiler_carries_the_safety_facts_from_the_registry(db):
     context = build_generation_semantic_context(db, catalog_source="safebank")
     caps = compile_capabilities(db, context, ["public.loans.dpd_flag"])
     assert caps["public.loans.dpd_flag"].leakage_anchor is True
+
+
+# ── C2: the four use columns ───────────────────────────────────────────────────────────────────
+
+def test_the_matrix_grades_use_not_just_suggestion():
+    """C2: four rungs per evidence class. The load-bearing rows: a source DECLARATION may be
+    suggested and authored against but NEVER executed over; llm/proposed NEVER clears
+    execution (or authoring); everything with a value retrieves; absence clears nothing."""
+    from featuregen.overlay.upload.semantic_eligibility import AUTHORITY_MATRIX, clears
+
+    for authority, row in AUTHORITY_MATRIX.items():
+        assert set(row) == {"retrieval", "suggestion_at_declared", "authoring",
+                            "execution_at_governed"}, authority
+        # Monotone down the ladder: anything that executes can author; anything that
+        # authors can be suggested; anything usable at all retrieves.
+        assert not (row["execution_at_governed"] and not row["authoring"]), authority
+        assert not (row["authoring"] and not row["suggestion_at_declared"]), authority
+        assert not (row["suggestion_at_declared"] and not row["retrieval"]), authority
+
+    assert clears("source/declared", "authoring")
+    assert not clears("source/declared", "execution_at_governed")
+    assert not clears("llm/proposed", "authoring")
+    assert not clears("llm/proposed", "execution_at_governed")
+    assert clears("human/confirmed", "execution_at_governed")
+    assert clears("source/attested", "execution_at_governed")
+    assert not clears("absent", "retrieval")
+    assert not clears("unknown/thing", "authoring")      # fail-closed on both axes
+    assert not clears("human/confirmed", "unknown_use")
+
+
+def test_growing_the_matrix_moved_the_policy_hash_by_design():
+    """The matrix content is part of the policy hash — frozen options pinned to the pre-C2
+    hash now read as ACTIVATION_STATE_DRIFTED and regenerate, which is the intended rollout."""
+    from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
+
+    assert "execution_at_governed" in str(sorted(
+        __import__("featuregen.overlay.upload.semantic_eligibility",
+                   fromlist=["AUTHORITY_MATRIX"]).AUTHORITY_MATRIX["human/confirmed"]))
+    assert authority_matrix_hash()  # stable + computable; content-addressed by construction

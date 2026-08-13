@@ -31,19 +31,46 @@ from featuregen.overlay.upload.recipe_operand_policy import _CLASS_TYPE_FAMILIES
 
 SEMANTIC_AUTHORITY_POLICY_VERSION = "semantic-authority@1"
 
-#: The §7 matrix, as data. Keys are evidence classes; values say what the class may CLEAR.
-#: ``suggestion_at_declared`` — may it satisfy an operand whose suggestion floor is `declared`?
-#: (Every V2 operand's floor is `declared` today — measured.) Anything absent here is unknown
-#: and clears nothing (fail-closed).
+#: The §7 matrix, as data — FOUR use columns per evidence class (remediation C2). Keys are
+#: evidence classes; values say what the class may CLEAR at each rung of use:
+#:
+#: * ``retrieval`` — may the value even be SHOWN/shortlisted as context? (Everything with a
+#:   value retrieves — retrieval is honesty, not authority; only true absence retrieves
+#:   nothing.)
+#: * ``suggestion_at_declared`` — may it satisfy an operand whose suggestion floor is
+#:   `declared`? (Every V2 operand's floor is `declared` today — measured.)
+#: * ``authoring`` — may a governed CONTRACT be authored over it (create_contract /
+#:   author_formula)? Same bar as suggestion today: a proposal never underwrites a contract.
+#: * ``execution_at_governed`` — may a MATERIALIZATION execute over it? Only a human
+#:   confirmation or a source attestation clears execution; a source DECLARATION is enough
+#:   to suggest and author against, but running a pipeline over it requires the stronger
+#:   fact. ``llm/proposed`` NEVER clears execution.
+#:
+#: Anything absent here is unknown and clears nothing (fail-closed). The matrix content is
+#: part of ``authority_matrix_hash`` — growing it MOVES the policy hash by design (frozen
+#: options pinned to the old hash surface ACTIVATION_STATE_DRIFTED and regenerate).
 AUTHORITY_MATRIX: dict[str, dict[str, bool]] = {
-    "human/confirmed":  {"suggestion_at_declared": True},
-    "source/attested":  {"suggestion_at_declared": True},
-    "source/declared":  {"suggestion_at_declared": True},
-    "human/proposed":   {"suggestion_at_declared": False},   # a proposal is a proposal
-    "llm/proposed":     {"suggestion_at_declared": False},
-    "graph_hint":       {"suggestion_at_declared": False},   # display-only current value
-    "absent":           {"suggestion_at_declared": False},
+    "human/confirmed":  {"retrieval": True, "suggestion_at_declared": True,
+                         "authoring": True, "execution_at_governed": True},
+    "source/attested":  {"retrieval": True, "suggestion_at_declared": True,
+                         "authoring": True, "execution_at_governed": True},
+    "source/declared":  {"retrieval": True, "suggestion_at_declared": True,
+                         "authoring": True, "execution_at_governed": False},
+    "human/proposed":   {"retrieval": True, "suggestion_at_declared": False,
+                         "authoring": False, "execution_at_governed": False},
+    "llm/proposed":     {"retrieval": True, "suggestion_at_declared": False,
+                         "authoring": False, "execution_at_governed": False},
+    "graph_hint":       {"retrieval": True, "suggestion_at_declared": False,
+                         "authoring": False, "execution_at_governed": False},
+    "absent":           {"retrieval": False, "suggestion_at_declared": False,
+                         "authoring": False, "execution_at_governed": False},
 }
+
+
+def clears(authority: str, use: str) -> bool:
+    """May evidence of class ``authority`` clear the ``use`` rung? Fail-closed on both axes:
+    an unknown class clears nothing, an unknown use is never cleared."""
+    return AUTHORITY_MATRIX.get(authority, {}).get(use, False)
 
 
 def authority_matrix_hash() -> str:
@@ -209,4 +236,5 @@ def _verdict(operand: RequiredOperandV1, capability: ColumnCapabilityV1,
 
 
 __all__ = ["AUTHORITY_MATRIX", "OperandEligibilityVerdictV1",
-           "SEMANTIC_AUTHORITY_POLICY_VERSION", "authority_matrix_hash", "evaluate_operand"]
+           "SEMANTIC_AUTHORITY_POLICY_VERSION", "authority_matrix_hash", "clears",
+           "evaluate_operand"]

@@ -709,6 +709,21 @@ real floor check against every bound operand's measured authority.
 llm/proposed NEVER clears it); the A2 materialize tests flip from unconditional-block to
 floor-driven.
 
+> **ACCEPTED (2026-08-13).** AUTHORITY_MATRIX grew the four use columns (+ `clears()` fail-
+> closed on both axes); the matrix rides the policy hash, so pre-C2 frozen options read as
+> ACTIVATION_STATE_DRIFTED and regenerate — the intended rollout. Monotone-ladder pin
+> (execute ⟹ author ⟹ suggest ⟹ retrieve) + the load-bearing rows: source/declared authors
+> but NEVER executes; llm/proposed clears neither. The decision row freezes
+> `operand_authorities` (measured at serving) + the plan's `read_set`/catalog rides to
+> FrozenOptionFactsV1; `assemble_current_activation_state` re-folds BOTH floors at the
+> durable write through C1's `current_resolution_pins` (the same resolver law, read-only) —
+> `authoring_floor_met` catches only DRIFT (serve-time failures keep riding
+> confirmation_required_roles, no double-naming: guarded + tested), and the execution floor
+> replaces A1's unconditional EXECUTION_AUTHORITY_UNEVALUATED with evaluated/met from the
+> matrix. Serve-time sections fold the frozen authorities the same way. E0's step 4 flipped
+> deliberately: after the funnel confirmations the floor is measured and MET (neither
+> EXECUTION code appears) and the honest remainder refuses (readiness + formula schema).
+
 ### Task C3 — enforce or refuse every authored constraint (2–3 days, the long tail)
 
 *Modify:* `semantic_eligibility.py`, `recipe_operand_policy.py`, `typed_gauntlet.py`,

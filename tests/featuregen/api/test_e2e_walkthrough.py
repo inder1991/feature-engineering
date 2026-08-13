@@ -255,10 +255,14 @@ def test_the_whole_workflow_walks_end_to_end(make_client, conn, monkeypatch):
     assert readiness == [("FORMULA_BLOCKED",)], readiness
 
     # ── Step 4: materialization is VISIBLY unavailable — the typed ladder refusal, never
-    # a silent success and never a hidden button. ───────────────────────────────────────
+    # a silent success and never a hidden button. C2 made the execution floor REAL: after
+    # the funnel confirmations the floor is measured and MET (neither EXECUTION code
+    # appears), and what still refuses is the honest remainder — no executable formula.
     mat_blocked = _blocker_codes(entry2, "request_materialization")
     assert "READINESS_NOT_MATERIALIZATION_READY" in mat_blocked, mat_blocked
-    assert "EXECUTION_AUTHORITY_UNEVALUATED" in mat_blocked, mat_blocked
+    assert "FORMULA_SCHEMA_UNSUPPORTED" in mat_blocked, mat_blocked
+    assert "EXECUTION_AUTHORITY_UNEVALUATED" not in mat_blocked, mat_blocked
+    assert "EXECUTION_AUTHORITY_UNMET" not in mat_blocked, mat_blocked
     assert "request_materialization" not in entry2["allowed_actions"]
 
     # ── Step 5: the conceptual LLM intent saves as an IDEA — browsable, labeled, never a
