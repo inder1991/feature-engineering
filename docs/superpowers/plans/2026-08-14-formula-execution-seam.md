@@ -1147,6 +1147,59 @@ release so a rollback reads correctly.
 - Migration audit: apply against a **populated** `semantic_option_decision` (the standing lesson —
   CI is blind to legacy data; repro against a seeded legacy shape).
 
+> **ACCEPTED `PENDING-B1` (2026-08-14).** Migration **1066** adds `binding_plan jsonb` and
+> `binding_plan_hash text` to `semantic_option_decision` — additive, nullable, `IF NOT EXISTS`, no
+> default and no backfill. `decision_facts_for_candidate` computes the plan's identity ONCE and
+> hands the same string to both the new column and `decision_manifest.binding_plan_hash`, so the
+> seal and the sealed thing cannot be two answers; `persist_option_decisions` writes both;
+> `load_frozen_option_facts` and the new public `frozen_binding_plan` read the column and fall
+> back to `dataset_story->'binding_plan'`. The story copy is still written, for one release.
+>
+> **THE AUDIT FOUND SOMETHING, AND IT IS THE WHOLE REASON THE STANDING LESSON EXISTS.** The
+> migration was mutated to do what a careless author would do — `UPDATE semantic_option_decision
+> SET binding_plan = dataset_story->'binding_plan' WHERE binding_plan IS NULL` — and run against a
+> POPULATED table. It does not merely violate the no-backfill rule: **1063's append-only trigger
+> physically refuses it** (`semantic_option_decision is append-only: UPDATE is not allowed`). On a
+> fresh CI database that migration passes, because there are no rows to update. Only
+> `test_migration_1066_applies_to_a_POPULATED_legacy_table` — which drops the two columns, seeds
+> rows in the exact pre-1066 shape and then runs the migration file's own SQL — can see it. The
+> same test proves the converse the task asked for: the ALTER succeeds on a populated table, the
+> append-only triggers are never reached (a nullable column with no default is a catalog-only
+> change), every seeded row's pre-1066 bytes are digest-identical afterwards, the new columns are
+> NULL, those rows still read through the story fallback, and an UPDATE is still refused after the
+> ALTER.
+>
+> **Deviations and judgements, each deliberate:**
+> (a) **The seal is checked on BOTH storage generations, not only the new column.** A legacy row's
+> story copy is exactly as tamper-worthy as a new row's column, and a guard that only covered the
+> new path would be opt-out for every row that predates it. A row written before migration 1065
+> (`decision_manifest = '{}'`) carries no seal at all and is read rather than refused — there is
+> nothing to compare against, and minting a hash for it here would seal a value this deployment
+> computed rather than the one generation froze.
+> (b) **The refusal is a typed `OptionDecisionIntegrityError`**, the same idiom
+> `ShadowIntegrityError` uses, raised from the reader. The two `api/routes/contract.py` call sites
+> are deliberately NOT given a 409 arm: nothing conflicts and no retry helps — an append-only row
+> whose bytes disagree with its own seal means an out-of-band write, and dressing that up as a
+> client-fixable conflict would send a caller looking for a problem they do not have.
+> (c) **NULL, never `'{}'`.** 1065 could add `NOT NULL DEFAULT '{}'::jsonb` because an absent
+> evidence record and an empty one mean the same thing; here `'{}'` would be a plan with no source
+> table and an empty read set — a shape `fold_frozen_binding_plan` never returns and which the
+> activation policy would read as "a plan exists and it authorizes nothing".
+> (d) `load_option_decision_record` was left alone. It already returns `dataset_story`, so it
+> already exposes the plan; adding the column would be a second copy of the same bytes on a wire
+> projection with no reader for it.
+>
+> **Both mutants were run before the tests were trusted:** a story-only reader (the pre-B1
+> expression) fails `test_the_column_is_the_source_once_the_story_copy_is_gone` and the tamper
+> case; a reader that skips the seal fails both tamper cases with `DID NOT RAISE`.
+>
+> 12 tests in `tests/featuregen/overlay/upload/test_option_decision_binding_plan.py`.
+> Gates: full suite **11090 passed, 20 skipped** (baseline on `b9979fd0` was 11079/20);
+> `-m eval` **73 passed**; ruff clean on both touched files. **mypy honesty:**
+> `semantic_option_decision.py` carries **1 pre-existing error** (`v2_recipe_by_id` returning
+> `RecipeDefinitionV2 | None` at the review re-read) — measured on `b9979fd0` by swapping HEAD's
+> file back in: the identical error, at a shifted line. This commit adds none and fixes none.
+
 ### Task B2 — the envelope rides the authoring intent (1 day)
 
 `AuthoringIntent.recipe_authoring_context: dict[str, Any] | None` (`formula/turns.py:157`) already

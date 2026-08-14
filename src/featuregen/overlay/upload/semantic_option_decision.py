@@ -12,6 +12,19 @@ from psycopg.types.json import Jsonb
 from featuregen.idgen import mint_id
 from featuregen.overlay.upload.activation_policy import FrozenOptionFactsV1
 
+
+class OptionDecisionIntegrityError(RuntimeError):
+    """A stored decision row disagrees with its own seal — B1's load-time refusal.
+
+    ``semantic_option_decision`` is append-only (1063's two triggers refuse UPDATE, DELETE and
+    TRUNCATE) and the plan and its hash are written by ONE statement from ONE facts dict, so the
+    two can only disagree if the stored bytes were altered out of band. That is exactly the state
+    in which a governed reader must refuse rather than carry on: everything the activation policy
+    decides about execution authority is derived from ``read_set``, and a read set nobody can
+    authenticate is not a read set. Named and typed for the same reason
+    ``ShadowIntegrityError`` is — a caller that wants to classify this must not be reduced to
+    matching a message."""
+
 #: origin (planning contract) -> server-assigned generation_source. The DECISION row is honest
 #: about origin even while the wire projection still labels intents as recipes (GEN-05 — fixed
 #: by remediation B4); activation must never inherit that lie.
@@ -48,9 +61,15 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
                                  spine_ref: str | None = None) -> dict:
     """Assemble ONE candidate's frozen facts at serving time (gate1's semantic branch), where
     the candidate, its projection (`idea`), and its observation id are all in hand."""
+    from featuregen.overlay.upload.field_resolution import canonical_hash
     from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
 
     request = candidate.planning_request
+    # B1: ONE computation of the plan's identity, handed to BOTH the column and the manifest, so
+    # the seal and the sealed thing can never be two answers. `""` for a candidate with no plan —
+    # the same empty string the manifest has always carried there.
+    binding_plan_hash = (canonical_hash(candidate.binding_plan)
+                         if candidate.binding_plan else "")
     return {
         "source_definition_id": candidate.recipe_id,
         "generation_source": _GENERATION_SOURCE_BY_ORIGIN.get(request.origin, request.origin),
@@ -78,9 +97,14 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
             candidate.recipe_id),
         "formula_expectation_revision": "",   # pinned when the formula seam mints one (Phase E)
         # B7: a REAL gate now — True iff the frozen-bindings plan folded (single-source, bound,
-        # declared population, compiled temporal). The plan itself rides the story jsonb until
-        # D1 enriches the record with its own column.
+        # declared population, compiled temporal).
         "plan_envelope_present": candidate.binding_plan is not None,
+        # B1: the plan itself, as a FIRST-CLASS fact. `persist_option_decisions` writes it to
+        # migration 1066's own column; the `dataset_story` copy below stays for one release so a
+        # rollback to the pre-1066 reader still finds it. The two are byte-identical by
+        # construction — one object, referenced twice, never re-derived.
+        "binding_plan": candidate.binding_plan,
+        "binding_plan_hash": binding_plan_hash,
         # B10: the grain decision, frozen with the option — the candidate's own grain and
         # the UOA the human had confirmed when this card was served. Rides the story jsonb
         # (like binding_plan) until D1 gives the record real columns.
@@ -104,7 +128,7 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "context_hash": context_hash,
         # D1 — the FULL evidence record: what the card was built from, verbatim.
         "evidence": _evidence_record(candidate, idea),
-        "decision_manifest": _decision_manifest(candidate, context_hash),
+        "decision_manifest": _decision_manifest(candidate, context_hash, binding_plan_hash),
     }
 
 
@@ -139,11 +163,14 @@ def _evidence_record(candidate, idea) -> dict:
     }
 
 
-def _decision_manifest(candidate, context_hash: str) -> dict:
+def _decision_manifest(candidate, context_hash: str, binding_plan_hash: str) -> dict:
     """PLAN-15's seal: the content hashes of every consumed input. A reader can prove WHAT
-    this decision consumed without trusting prose."""
+    this decision consumed without trusting prose.
+
+    ``binding_plan_hash`` is PASSED IN rather than recomputed (B1): it is the seal migration
+    1066's column is checked against at load, and a second ``canonical_hash`` call here would be a
+    second chance to answer differently about the same object."""
     from featuregen.overlay.upload.concept_operand_classes import OPERAND_CLASS_MAP_VERSION
-    from featuregen.overlay.upload.field_resolution import canonical_hash
     from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
     from featuregen.overlay.upload.typed_gauntlet import TYPED_GAUNTLET_VERSION
 
@@ -153,8 +180,7 @@ def _decision_manifest(candidate, context_hash: str) -> dict:
         "typed_gauntlet_version": TYPED_GAUNTLET_VERSION,
         "operand_class_map_version": OPERAND_CLASS_MAP_VERSION,
         "planning_request_hash": candidate.planning_request_hash,
-        "binding_plan_hash": (canonical_hash(candidate.binding_plan)
-                              if candidate.binding_plan else ""),
+        "binding_plan_hash": binding_plan_hash,
         "recipe_revision_hash": candidate.recipe_revision_hash,
     }
 
@@ -197,9 +223,10 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
             " validation_status, outstanding_requirement_codes, "
             " has_reviewed_formula_expectation, formula_expectation_revision, "
             " plan_envelope_present, dataset_story, policy_revision_pins, "
-            " metadata_snapshot_id, observation_id, context_hash, evidence, decision_manifest) "
+            " metadata_snapshot_id, observation_id, context_hash, evidence, decision_manifest, "
+            " binding_plan, binding_plan_hash) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
-            "%s, %s, %s, %s, %s, %s, %s, %s) "
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (considered_revision_id, option_id) DO NOTHING",
             (mint_id("sod"), considered_revision_id, option_id, generation_run_id,
              facts["source_definition_id"], facts["generation_source"],
@@ -213,21 +240,90 @@ def persist_option_decisions(conn, *, considered_revision_id: str, generation_ru
              Jsonb(facts["dataset_story"]), Jsonb(facts["policy_revision_pins"]),
              metadata_snapshot_id, facts.get("observation_id"), facts["context_hash"],
              Jsonb(facts.get("evidence") or {}),
-             Jsonb(facts.get("decision_manifest") or {})))
+             Jsonb(facts.get("decision_manifest") or {}),
+             # B1 — migration 1066. NULL, never `Jsonb(None)` and never `{}`: a candidate that
+             # folded no plan has no plan, and an empty object would read as one that authorizes
+             # nothing. `.get` because a facts dict assembled by an older build carries neither
+             # key, and such a row must still be writable — it simply reads through the story.
+             (Jsonb(facts["binding_plan"]) if facts.get("binding_plan") is not None else None),
+             facts.get("binding_plan_hash")))
         written += 1
     return written
 
 
+def frozen_binding_plan(conn, *, considered_revision_id: str,
+                        option_id: str) -> dict | None:
+    """The FROZEN PLAN ENVELOPE of one served option, or ``None`` when it folded none.
+
+    B1's public read side, and the one place the two storage generations are reconciled:
+    migration 1066's ``binding_plan`` column when the row has it, the ``dataset_story``'s
+    ``binding_plan`` key when it does not (every row written before 1066). Both are checked
+    against the seal the decision manifest already carried.
+
+    Raises:
+        OptionDecisionIntegrityError: the stored plan does not hash to the manifest's
+            ``binding_plan_hash``.
+    """
+    row = conn.execute(
+        "SELECT binding_plan, dataset_story, decision_manifest "
+        "FROM semantic_option_decision "
+        "WHERE considered_revision_id = %s AND option_id = %s",
+        (considered_revision_id, option_id)).fetchone()
+    if row is None:
+        return None
+    return _verified_plan(row[0], row[1], row[2],
+                          f"{considered_revision_id}/{option_id}")
+
+
+def _verified_plan(column, story, manifest, label: str) -> dict | None:
+    """The plan the row carries, proven against the manifest's seal.
+
+    The COLUMN wins where both exist — it is the record's own field, the story copy is the
+    compatibility copy, and B1 writes them from one object so they cannot differ. The seal is
+    checked whichever side answered: a legacy row's story copy is exactly as tamper-worthy as a
+    new row's column, and checking only the new path would make the guard opt-out for every row
+    that predates it.
+
+    A manifest with no ``binding_plan_hash`` (a row written before migration 1065 added the
+    manifest at all) is not checked and not refused: there is nothing to compare against, and
+    inventing a hash for it here would seal a value this deployment computed rather than the one
+    generation froze. That is the honest limit of what an unseated row can prove about itself.
+    """
+    plan = column if column is not None else ((story or {}).get("binding_plan"))
+    sealed = (manifest or {}).get("binding_plan_hash")
+    if not sealed:
+        return plan
+    from featuregen.overlay.upload.field_resolution import canonical_hash
+
+    actual = canonical_hash(plan) if plan else ""
+    if actual != sealed:
+        raise OptionDecisionIntegrityError(
+            f"the frozen binding plan of option decision {label} hashes to {actual!r}, but its "
+            f"decision manifest seals binding_plan_hash={sealed!r}: the stored plan is not the "
+            f"one this decision recorded, and the read set an execution authority is judged "
+            f"against cannot be taken from it")
+    return plan
+
+
 def load_frozen_option_facts(conn, *, considered_revision_id: str,
                              option_id: str) -> FrozenOptionFactsV1 | None:
-    """The activation policy's frozen layer, from the exact (revision, option) key."""
+    """The activation policy's frozen layer, from the exact (revision, option) key.
+
+    ``read_set`` and ``plan_catalog_source`` come from the frozen PLAN — migration 1066's column
+    where the row has one, the ``dataset_story`` copy where it does not (:func:`_verified_plan`) —
+    so a legacy row keeps answering exactly as it did while a new row reads its own field.
+
+    Raises:
+        OptionDecisionIntegrityError: the stored plan disagrees with the manifest's seal.
+    """
     row = conn.execute(
         "SELECT binding_state, generation_source, computation_kind, readiness, "
         "       source_definition_id, "
         "       review_current, recipe_revision_hash, confirmation_required_roles, "
         "       has_reviewed_formula_expectation, plan_envelope_present, validation_status, "
         "       outstanding_requirement_codes, policy_revision_pins, "
-        "       formula_expectation_revision, metadata_snapshot_id, dataset_story "
+        "       formula_expectation_revision, metadata_snapshot_id, dataset_story, "
+        "       binding_plan, decision_manifest "
         "FROM semantic_option_decision "
         "WHERE considered_revision_id = %s AND option_id = %s",
         (considered_revision_id, option_id)).fetchone()
@@ -235,7 +331,10 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         return None
     (binding_state, generation_source, computation_kind, readiness, source_definition_id,
      review_current, recipe_revision_hash, confirmation_roles, has_reviewed, plan_present,
-     validation_status, outstanding, pins, formula_revision, snapshot_id, story) = row
+     validation_status, outstanding, pins, formula_revision, snapshot_id, story,
+     plan_column, manifest) = row
+    plan = _verified_plan(plan_column, story, manifest,
+                          f"{considered_revision_id}/{option_id}") or {}
     return FrozenOptionFactsV1(
         binding_state=binding_state,
         generation_source=generation_source,
@@ -254,9 +353,8 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         snapshot_id=snapshot_id or "",
         plan_refusal_codes=tuple((story or {}).get("plan_refusals") or ()),
         confirmed_uoa_entity=(story or {}).get("confirmed_uoa_entity") or "",
-        read_set=tuple(((story or {}).get("binding_plan") or {}).get("read_set") or ()),
-        plan_catalog_source=(((story or {}).get("binding_plan") or {})
-                             .get("catalog_source") or ""),
+        read_set=tuple(plan.get("read_set") or ()),
+        plan_catalog_source=plan.get("catalog_source") or "",
         operand_authorities=tuple(sorted(
             ((story or {}).get("operand_authorities") or {}).items())))
 
@@ -386,6 +484,7 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         authoring_floor_met=authoring_now)
 
 
-__all__ = ["assemble_current_activation_state", "decision_facts_for_candidate",
+__all__ = ["OptionDecisionIntegrityError", "assemble_current_activation_state",
+           "decision_facts_for_candidate", "frozen_binding_plan",
            "has_reviewed_formula_expectation", "load_frozen_option_facts",
            "load_option_decision_record", "persist_option_decisions"]

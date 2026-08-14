@@ -1,0 +1,32 @@
+-- src/featuregen/db/migrations/1066_semantic_option_decision_binding_plan.sql
+-- Task B1 of the formula/execution seam (reservation 1066 per that plan's D-8): the FROZEN PLAN
+-- ENVELOPE becomes a real column on the decision record.
+--
+-- Until now the envelope `recipe_planning_lens.fold_frozen_binding_plan` produces — the plan the
+-- human's card was built from: {plan_kind, catalog_source, source_table, population_ref, read_set,
+-- role_bindings, pit, output_grain, window} — rode inside the `dataset_story` jsonb under the key
+-- `binding_plan`, and `load_frozen_option_facts` reached into that blob by string path for
+-- `read_set` and `catalog_source`. 1063's own header called that out: Task D1 "ENRICHES this
+-- record". This is the enrichment for the plan, and `binding_plan_hash` is the seal the manifest
+-- already carried (`decision_manifest->>'binding_plan_hash'`) written where a reader can index it.
+--
+--   * ADDITIVE and NULLABLE, with NO backfill of invented values. Every row written before this
+--     migration keeps NULL in both columns and is read through the `dataset_story` path — the
+--     reader handles both and a test proves the two agree on a row that carries both. Backfilling
+--     `binding_plan` from the story would be a WRITE into an append-only governance record: the
+--     column would then hold a value this deployment computed rather than the one generation
+--     froze, and nothing downstream could tell the two apart.
+--   * NO DEFAULT, deliberately. 1065 added `NOT NULL DEFAULT '{}'::jsonb` for its two evidence
+--     columns because an absent evidence record and an empty one mean the same thing there. They
+--     do not here: `'{}'::jsonb` would be a plan with no source table, no population and an empty
+--     read set — a shape `fold_frozen_binding_plan` never returns and which the activation policy
+--     would read as "a plan exists and it authorizes nothing". NULL is the honest absence.
+--   * THE 1063 APPEND-ONLY GUARD IS UNCHANGED and is not weakened by this. Its two triggers fire
+--     BEFORE UPDATE/DELETE FOR EACH ROW and BEFORE TRUNCATE FOR EACH STATEMENT; adding a nullable
+--     column with no default is a catalog-only change in PostgreSQL 11+ (no table rewrite, no row
+--     UPDATE), so no trigger is reached, no row is touched and no stored byte changes. Audited
+--     against a POPULATED table rather than assumed — see
+--     `tests/featuregen/overlay/upload/test_option_decision_binding_plan.py`.
+ALTER TABLE semantic_option_decision
+    ADD COLUMN IF NOT EXISTS binding_plan      jsonb NULL,
+    ADD COLUMN IF NOT EXISTS binding_plan_hash text  NULL;
