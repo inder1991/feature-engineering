@@ -926,7 +926,7 @@ revision hash; the blueprint hash is derived from the same definition.
 - `test_the_merchant_v1_entry_is_untouched` — D-7: the v1 registry entry for
   `merchant_mcc_diversity` still says `merchant`, still refuses, and no task moved it.
 
-> **A5 — THE MECHANISM HALF. ACCEPTED `PENDING-A5` (2026-08-14). THE REGISTRY-GROWTH HALF IS
+> **A5 — THE MECHANISM HALF. ACCEPTED `f0d208d8` (2026-08-14). THE REGISTRY-GROWTH HALF IS
 > OPERATOR-GATED AND DELIBERATELY NOT DONE.**
 >
 > **`RECIPE_FORMULA_V2_EXPECTATIONS` DID NOT GROW, AND THAT IS THE FINDING.** Under D-2,
