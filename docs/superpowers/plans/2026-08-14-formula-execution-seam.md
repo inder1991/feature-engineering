@@ -833,7 +833,7 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > orchestrator is monkeypatched to RAISE if it is ever reached).
 > Gates: full suite **11051 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean.
 
-> **A4 INCREMENT 3 — THE CAPTURE WIDENING (A4 PROPER). ACCEPTED `<hash>` (2026-08-14).**
+> **A4 INCREMENT 3 — THE CAPTURE WIDENING (A4 PROPER). ACCEPTED `06e935d1` (2026-08-14).**
 >
 > **THE HEADLINE, AND IT IS REAL:** `posted_debit_amount` — the one `formula-v2` recipe the
 > registry calls `FORMULA_AUTHORABLE` — is served by the semantic engine, resolves to an EXACT
