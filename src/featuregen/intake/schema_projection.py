@@ -45,6 +45,14 @@ def _project(node: object) -> object:
         return node
     # 1) nullable-enum → anyOf union (before stripping, so we don't touch enum on plain strings)
     node = _normalize_nullable_enum(node)
+    # 1b) TYPE ARRAYS → anyOf. Defensive normalization (2026-08-14): a billing 400 was
+    #     briefly misread as the provider rejecting list-valued "type" (the error envelope's
+    #     own 'type' field tripped the keyword scan — see llm_claude._rejected_schema_keyword's
+    #     guard). No rejection of type arrays was actually observed — but the anyOf form is
+    #     semantically identical, universally accepted, and narrows the provider-grammar
+    #     surface we depend on, so the normalization stays. Constraints ride the non-null
+    #     variants; "null" gets its bare arm. Canonical schemas stay strict JSON Schema.
+    node = _normalize_type_array(node)
     # 2) drop unsupported constraint keywords at this level
     for kw in list(node):
         if kw in PROVIDER_UNSUPPORTED_KEYWORDS:
@@ -103,6 +111,22 @@ def _normalize_nullable_enum(node: dict) -> dict:
     return rebuilt
 
 
+def _normalize_type_array(node: dict) -> dict:
+    t = node.get("type")
+    if not isinstance(t, list):
+        return node
+    keep = {k: v for k, v in node.items() if k != "type"}
+    variants: list[dict] = []
+    for st in t:
+        if st == "null":
+            variants.append({"type": "null"})
+        else:
+            variants.append({"type": st, **{k: v for k, v in keep.items()
+                                            if k not in ("anyOf", "oneOf", "allOf")}})
+    carried = {k: v for k, v in keep.items() if k in ("anyOf", "oneOf", "allOf")}
+    return {**carried, "anyOf": variants}
+
+
 def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
     """List `"<keyword> at <path>"` for every provider-incompatibility in `schema` ([] = clean)."""
     problems: list[str] = []
@@ -117,9 +141,11 @@ def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
     for kw in schema:
         if kw in PROVIDER_UNSUPPORTED_KEYWORDS:
             problems.append(f"{kw} at {_path}")
-    t, enum = schema.get("type"), schema.get("enum")
-    if isinstance(t, list) and "null" in t and isinstance(enum, list):
-        problems.append(f"nullable-enum at {_path}")
+    t = schema.get("type")
+    if isinstance(t, list):
+        # Defensive (2026-08-14): type arrays are normalized to anyOf on the wire, so one
+        # surviving projection is a projection bug — flag them all.
+        problems.append(f"type-array at {_path}")
     # Anthropic rejects an OPEN object (`additionalProperties: true`, or the open default of absence).
     # This is the guard's blind spot that let permissive feature schemas reach the wire. A typed
     # sub-schema (dict) form is left to the recursion below, not flagged here.

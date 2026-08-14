@@ -191,11 +191,28 @@ _SCHEMA_KEYWORDS = ("maxLength", "maxItems", "minItems", "minimum", "maximum",
 
 def _rejected_schema_keyword(message: str) -> str | None:
     """Best-effort extraction of the rejected JSON-Schema keyword from a provider 400 message.
-    Returns only a keyword token — never the message body — so nothing content-bearing is logged."""
+    Returns only a keyword token — never the message body — so nothing content-bearing is logged.
+
+    Guarded (2026-08-14 incident): a 400 whose message does not mention the schema/format at
+    all is NOT a schema rejection — the provider's generic error envelope contains
+    `'type': 'invalid_request_error'`, and a bare-substring scan read that as the JSON-Schema
+    keyword "type", dressing a CREDIT-EXHAUSTION 400 up as a schema rejection and sending the
+    on-call down a schema-grammar rabbit hole. Only a message that names the schema context
+    may claim one."""
+    lowered = message.lower()
+    if not any(marker in lowered for marker in ("schema", "output_config", "output format",
+                                                "json_schema")):
+        return None
     for kw in _SCHEMA_KEYWORDS:
         if kw in message:
             return kw
     return None
+
+
+def _billing_exhausted(message: str) -> bool:
+    """A 400 that is really an ACCOUNT state, not a request defect."""
+    lowered = message.lower()
+    return "credit balance" in lowered or "billing" in lowered
 
 
 #: `max_retries` for the Anthropic client. ZERO, deliberately.
@@ -304,12 +321,22 @@ class ClaudeLLM:
         except anthropic.APIStatusError as exc:  # map transport/status failures to the taxonomy
             status = getattr(exc, "status_code", 0)
             if status == 400:
-                # A schema-rejection 400 (the provider refusing a structured-output schema) is
-                # logged as HTTP status + a single JSON-Schema keyword TOKEN only — never the
-                # request/response body or any PII. It still falls through to the taxonomy below.
-                keyword = _rejected_schema_keyword(str(getattr(exc, "message", exc)))
-                logger.warning("anthropic rejected structured-output schema (HTTP 400, keyword=%s)",
-                               keyword or "unknown")
+                message = str(getattr(exc, "message", exc))
+                if _billing_exhausted(message):
+                    # The account, not the request: name it so the operator tops up billing
+                    # instead of debugging schemas (the 2026-08-14 misclassification).
+                    logger.warning(
+                        "anthropic rejected the call: ACCOUNT CREDIT EXHAUSTED (HTTP 400) — "
+                        "top up billing; no request change can fix this")
+                else:
+                    # A schema-rejection 400 (the provider refusing a structured-output
+                    # schema) is logged as HTTP status + a single JSON-Schema keyword TOKEN
+                    # only — never the request/response body or any PII. It still falls
+                    # through to the taxonomy below.
+                    keyword = _rejected_schema_keyword(message)
+                    logger.warning(
+                        "anthropic rejected structured-output schema (HTTP 400, keyword=%s)",
+                        keyword or "unknown")
             if status in (401, 403):
                 return _fail(PROVIDER_AUTH_ERROR)   # auth/permission → fail closed + security-audit
             if status == 429 or status >= 500:

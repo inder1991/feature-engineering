@@ -2,7 +2,7 @@
 
 One-shot replay of the cluster's recorded hypotheses through BOTH generation paths, against
 a full LOCAL CLONE of the cluster database (migrations 1063–1065 applied to the copy only —
-the cluster schema untouched). Operator sign-off pending on the adjudication below.
+the cluster schema untouched). **Operator sign-off: ACCEPTED 2026-08-14** — E3 closed; E4 unblocked.
 
 ## Verdict
 
@@ -15,20 +15,27 @@ the cluster schema untouched). Operator sign-off pending on the adjudication bel
 One hypothesis of three skipped: its recognition failed on the provider incident below and
 no stored classified attempt existed. Recorded honestly in the table.
 
-## Finding 1 — PROVIDER INCIDENT (live-impacting, its own task)
+## Finding 1 — CORRECTED: account credit exhaustion, masked by a misclassification bug
 
-At ~13:45 local, Anthropic began REJECTING every structured-output schema this app sends
-(HTTP 400, `keyword=type`) — recognitions, the legacy free-form generator
-(`feature_ideas`), and the intent task alike. Calls that succeeded at 13:27–13:44 fail
-since. The schemas carry JSON-Schema union types (`"type": ["string", "null"]`), the likely
-newly-rejected construct. **This affects the deployed cluster identically**: every
-LLM-dependent stage now fails closed until the schemas are rewritten (e.g. unions →
-`anyOf`, or optional-with-sentinel). Filed as a follow-up development task — it is not an
-E3/E4 artifact.
+At ~13:45 local every provider call began failing with HTTP 400. The FIRST diagnosis
+(recorded in an earlier revision of this report) was a provider-side schema rejection of
+JSON-Schema union types — WRONG. The truth, found by bisecting with raw calls: **the
+Anthropic account's credit balance ran out** (the divergence run's legacy generation legs
+consumed the remainder), and our own error reporter turned the billing message into a fake
+schema diagnosis: the provider's generic error envelope contains `'type':
+'invalid_request_error'`, and a bare-substring keyword scan read that as the JSON-Schema
+keyword `type`, logging "rejected structured-output schema (keyword=type)".
+
+Fixes landed with this report: (a) billing 400s are now named as ACCOUNT CREDIT EXHAUSTED
+in the log with the operator action stated; (b) the schema-keyword scan claims a schema
+rejection only when the message actually references the schema context (regression-tested
+against the real billing envelope); (c) a defensive wire normalization (type arrays → anyOf)
+plus a registry-wide projection ratchet, kept on their own merits. OPERATOR ACTION: top up
+the Anthropic account — every LLM stage on the cluster fails closed until then.
 
 ## Finding 2 — the resilience asymmetry the incident exposed
 
-Through the total provider-schema outage, the SEMANTIC path kept serving 33–45 recipe
+Through the total provider outage (whatever its cause), the SEMANTIC path kept serving 33–45 recipe
 candidates per hypothesis (the engine is deterministic; only the additive intent lens
 degraded). The LEGACY path served ZERO — the model is its only generator. The outage was an
 unplanned chaos test, and the one-engine architecture passed it.

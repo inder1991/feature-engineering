@@ -76,3 +76,23 @@ def test_schema_rejection_400_records_keyword(monkeypatch, caplog):
         out = llm.call(_req())
     assert out.status  # a fail status, not a raise
     assert any("maxLength" in r.message and "400" in r.message for r in caplog.records)
+
+
+def test_a_billing_400_is_never_reported_as_a_schema_rejection(monkeypatch, caplog):
+    """2026-08-14: the provider's generic error envelope contains 'type':
+    'invalid_request_error', and the bare-substring keyword scan read that as the JSON-Schema
+    keyword "type" — a CREDIT-EXHAUSTION 400 was reported as a schema rejection, sending the
+    diagnosis down a schema-grammar rabbit hole. The account state is now named as itself."""
+    from featuregen.intake.llm_claude import _billing_exhausted, _rejected_schema_keyword
+
+    billing = ("Error code: 400 - {'type': 'error', 'error': {'type': "
+               "'invalid_request_error', 'message': 'Your credit balance is too low to "
+               "access the Anthropic API. Please go to Plans & Billing.'}}")
+    assert _billing_exhausted(billing)
+    assert _rejected_schema_keyword(billing) is None, \
+        "no schema context in the message — no schema keyword may be claimed"
+
+    real_schema_rejection = ("output_config.format.schema: unsupported JSON Schema "
+                             "keyword 'type' at properties.note")
+    assert not _billing_exhausted(real_schema_rejection)
+    assert _rejected_schema_keyword(real_schema_rejection) == "type"

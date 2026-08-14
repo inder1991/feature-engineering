@@ -9,14 +9,14 @@ ships FakeLLM + the taxonomy + the store; the real Claude adapter lives in llm_c
 from __future__ import annotations
 
 import hashlib
-import psycopg
-import logging
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
