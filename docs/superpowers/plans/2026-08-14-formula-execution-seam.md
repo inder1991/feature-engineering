@@ -1043,7 +1043,7 @@ claiming `FORMULA_AUTHORABLE` that folds to `FORMULA_BLOCKED` is a `RecipeContra
   promises, observed through the serving path.
 - Pin the **new** readiness distribution (the §0.2 counts will move; the number is evidence).
 
-> **ACCEPTED `PENDING-A6` (2026-08-14).** `fold_readiness` is now called on the serving path, and
+> **ACCEPTED `4510d08b` (2026-08-14).** `fold_readiness` is now called on the serving path, and
 > the authored `readiness=` literal is an assertion the registry checks against it at import.
 >
 > **THE DISTRIBUTION DID NOT MOVE, AND THAT IS THE MEASUREMENT.** The task says *"the §0.2 counts
