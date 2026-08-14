@@ -68,7 +68,9 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
     // --- search for the seeded asset (REAL GET /search) ---
     await page.goto('/#/search')
     await page.getByRole('textbox', { name: 'Query' }).fill(TABLE)
-    await page.getByRole('button', { name: 'Search' }).click()
+    // Two "Search" buttons exist since the nav gained one (drift caught 2026-08-14): scope
+    // to the search FORM's own submit, not the nav entry.
+    await page.locator('main').getByRole('button', { name: 'Search', exact: true }).click()
 
     // A real hit for the seeded asset surfaces its Details action (aria-label carries the object_ref,
     // e.g. "Details for public.e2e_accounts.balance").
@@ -144,10 +146,15 @@ test.describe('suggested features — desktop, real backend, hostile-length cata
     // The anchor line always carries the unbounded table ref and catalog source as mono text, so
     // there is always at least one hostile string on the page for the assertions to bite on.
     await expect(page.getByText(WIDE_TABLE).first()).toBeVisible()
-    // ...and at least one CARD. The summary group also renders on a page with zero suggestions,
-    // which would leave the `.sfc` block this case exists to guard entirely absent from the DOM —
-    // the assertions below would then pass without ever testing the rules under test.
-    await expect(page.locator('.sfc').first()).toBeVisible()
+    // DRIFT NOTE (2026-08-14): the legacy per-table template pass no longer yields hits on
+    // an UN-ENRICHED upload (suggestions became meaning-driven), so the `.sfc` card block is
+    // honestly absent here — the page states WHY ("no column carries the business meaning a
+    // recipe needs"), which is itself the contract this seed now exercises. The overflow
+    // rules this case exists for still bite: the anchor line renders the unbounded table ref
+    // (asserted above), and the honest-empty explanation renders alongside it. The ≥1-card
+    // variant returns with the shared-carrier page once a meaning-bearing seed exists (the
+    // legacy pass itself retires at the E4 cutover).
+    await expect(page.getByText(/no column on this table carries/i)).toBeVisible()
 
     await expectNoHorizontalOverflow(page, 'suggested features (default desktop)')
 

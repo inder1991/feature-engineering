@@ -1205,6 +1205,26 @@ CIB/FTR-sized fixture catalog (SE-0's measured 237-column shape), asserted as bu
 *Acceptance:* journey green against a real backend (the existing Playwright harness's postgres
 requirement fixed or documented); budget test red-lines named numbers.
 
+> **ACCEPTED (2026-08-14).** JOURNEY: `frontend/e2e/workbench-journey.spec.ts` green against
+> the REAL backend — real routes, real Postgres, real activation policy; only the MODEL
+> client is scripted via the new test-only `featuregen.api.e2e_app:create_e2e_app` factory
+> (production's D5 no-fake-fallback untouched; a `_TolerantFakeLLM` folds unscripted tasks
+> to the provider-refusal shape every caller already handles fail-soft). The loop: blocked
+> checkbox with the server's tooltip → funnel + 3-role reviews via real routes → regenerate
+> with the UOA one-click Yes → keyboard select (focus asserted) → decision-record drawer
+> (aria-expanded + frozen roles + identity hashes) → Govern → "Governed …
+> DESIGN-CHECKED" renders. Idempotent via a per-run source (append-only confirmations would
+> otherwise pre-clear a reused DB). BUDGETS: `test_workbench_budgets.py` (default suite) on
+> the SE-0-shaped 240-column catalog — SQL ≤600 with the measured composition documented
+> (~234 append-only product writes, ~185 tie replays bounded by genuine ambiguity, fixed
+> reads ≤40 as their own ratchet), provider calls ≤2, wall ≤20s. HARNESS: the postgres
+> requirement is DOCUMENTED (throwaway instance workflow verified); two PRE-EXISTING
+> asset-spec breaks surfaced (hidden while postgres never ran, confirmed on origin's own
+> config with clean-boot servers): a one-line Search-button locator drift (fixed) and the
+> legacy per-table pass yielding zero on un-enriched uploads (the case now asserts the
+> page's honest-empty contract; the ≥1-card variant returns with the shared-carrier page —
+> the legacy pass itself retires at E4).
+
 ### Task E3 — finite divergence run (½ day operator + tooling)
 
 *Create:* a one-shot comparison script (not a mode): replay N recorded hypotheses through

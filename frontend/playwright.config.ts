@@ -70,8 +70,12 @@ export default defineConfig({
       // `uv run` resolves the project's uv-managed .venv from the repo-root cwd, so the backend
       // imports `featuregen` even in a fresh/CI shell where the venv is NOT activated (a bare
       // `uvicorn` would not be on PATH).
+      // E2: the E2E factory — the REAL app over a SCRIPTED model client (featuregen.api.
+      // e2e_app; production's D5 no-fake-fallback rule is untouched). semantic_v1 turns the
+      // one-engine serving path on, so the Workbench journey exercises the real activation
+      // policy end to end with zero provider spend.
       command:
-        `uv run uvicorn --factory featuregen.api.app:create_app_from_env `
+        `uv run uvicorn --factory featuregen.api.e2e_app:create_e2e_app `
         + `--host 127.0.0.1 --port ${BACKEND_PORT}`,
       cwd: '..',
       url: `http://127.0.0.1:${BACKEND_PORT}/health`,
@@ -83,14 +87,17 @@ export default defineConfig({
         FEATUREGEN_DSN: DSN,
         FEATUREGEN_AUTH_STUB: '1',
         FEATUREGEN_AUTO_MIGRATE: '1',
+        FEATUREGEN_SEMANTIC_PLANNING: 'semantic_v1',
       },
     },
     {
-      // The frontend (Vite dev server + its API proxy to the backend).
+      // The frontend (Vite dev server + its API proxy to the backend). The intent-
+      // confirmation UI is ON so the journey drives the recognition → confirm-scope flow.
       command: `npm run dev -- --host 127.0.0.1 --port ${FRONTEND_PORT} --strictPort`,
       url: BASE_URL,
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
+      env: { VITE_INTENT_CONFIRMATION_UI: '1' },
     },
   ],
 })
