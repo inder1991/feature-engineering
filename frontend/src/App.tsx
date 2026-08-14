@@ -200,8 +200,9 @@ const PAGES: PageHead[] = [
     eyebrow: 'CATALOG · GENERATE',
     title: 'Feature generation',
     description:
-      'State a hypothesis and goal, generate a safe candidate set, then register drafts or govern the '
-      + 'ones that matter into signed contracts.',
+      'State a hypothesis and goal, plan a candidate set over one catalog, then save ideas — '
+      + 'browsable sketches, never a model input — or govern the ones that matter into signed '
+      + 'contracts.',
   },
   {
     route: 'analysis',

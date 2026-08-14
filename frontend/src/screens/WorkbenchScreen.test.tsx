@@ -168,9 +168,11 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+// E4 cutover: the form collects a catalog source and a target column. There is no entity field —
+// the engine plans over ONE frozen catalog context, so an entity-only request is refused typed by
+// the route and the screen stopped inviting it.
 interface Scope {
   source?: string
-  entity?: string
   target?: string
 }
 
@@ -206,9 +208,6 @@ async function renderAndGenerate(
   render(<WorkbenchScreen />)
   if (scope.source) {
     await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
-  }
-  if (scope.entity) {
-    await userEvent.type(screen.getByLabelText('Entity'), scope.entity)
   }
   if (scope.target) {
     await userEvent.type(screen.getByLabelText('Target column'), scope.target)
@@ -276,7 +275,7 @@ describe('gates strip', () => {
     render(<WorkbenchScreen />)
     // No goal yet: stating it is the current step, everything downstream is upcoming.
     expect(gateState('State the goal')).toBe('active')
-    expect(gateState('Propose in sets')).toBe('todo')
+    expect(gateState('Plan over the catalog')).toBe('todo')
     expect(gateState('Compare, mix, give feedback')).toBe('todo')
     expect(gateState('You approve')).toBe('todo')
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
@@ -285,10 +284,10 @@ describe('gates strip', () => {
     expect(gateState('State the goal')).toBe('active')
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     expect(gateState('State the goal')).toBe('done')
-    expect(gateState('Propose in sets')).toBe('active')
+    expect(gateState('Plan over the catalog')).toBe('active')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
-    expect(gateState('Propose in sets')).toBe('done')
+    expect(gateState('Plan over the catalog')).toBe('done')
     expect(gateState('Compare, mix, give feedback')).toBe('active')
     expect(gateState('You approve')).toBe('todo')
     await selectCandidate('avg_balance')
@@ -299,39 +298,70 @@ describe('gates strip', () => {
     expect(gateState('You approve')).toBe('done')
   })
 
-  it('names the actor on every gate and keeps the mockup copy', () => {
+  // The strip copy is PINNED because it is the screen's promise about who does what. After the
+  // E4 cutover the promise changed: cell 1 names the two human steps before generation (the scope
+  // confirmation, and the optional unit of analysis), cell 2 names the ONE engine's real output
+  // (governed recipes + model intents over the frozen catalog context, not "one set per strategy
+  // lens" — that was the deleted free-form generator), and cell 4 speaks the shipped vocabulary
+  // (save an idea or govern a contract; nothing "registers" any more).
+  it('names the actor on every gate and pins the post-cutover copy', () => {
     render(<WorkbenchScreen />)
     const strip = screen.getByRole('list', { name: 'Where you are in the loop' })
     expect(within(strip).getAllByText('You')).toHaveLength(3)
     expect(within(strip).getByText('Engine')).toBeInTheDocument()
-    expect(within(strip).getByText('Nothing generates without your intent.')).toBeInTheDocument()
     expect(
-      within(strip).getByText('One set per strategy lens, all safety-checked.'),
+      within(strip).getByText(
+        'Nothing generates until you confirm the scope, and optionally the unit of analysis.'),
+    ).toBeInTheDocument()
+    expect(
+      within(strip).getByText(
+        "Governed recipes and model intents over the catalog's confirmed meaning."),
     ).toBeInTheDocument()
     expect(
       within(strip).getByText('Take a set or pick a la carte across sets.'),
     ).toBeInTheDocument()
     expect(
-      within(strip).getByText('Nothing registers without your click, under your name.'),
+      within(strip).getByText('Nothing is saved or governed without your click, under your name.'),
     ).toBeInTheDocument()
+    // The deleted generator's vocabulary is gone from the strip, not merely reworded around.
+    expect(within(strip).queryByText(/strategy lens/i)).toBeNull()
+  })
+
+  it('the engine path card describes the engine, not the deleted free-form generator', () => {
+    render(<WorkbenchScreen />)
+    expect(screen.getByText(
+      "Governed recipes and model intents planned over this catalog's confirmed meaning, "
+      + 'grouped by operation class — blockers and their next steps named, never hidden.',
+    )).toBeInTheDocument()
+    expect(screen.queryByText(/one validated set per strategy lens/i)).toBeNull()
   })
 })
 
 describe('generation', () => {
   it('passes the hypothesis, goal, and every scope field through to the considered-set call', async () => {
-    await renderAndGenerate([], {
-      source: 'deposits', entity: 'customer', target: 'public.labels.churned',
-    })
+    await renderAndGenerate([], { source: 'deposits', target: 'public.labels.churned' })
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: 'deposits', entity: 'customer', targetRef: 'public.labels.churned',
+      catalogSource: 'deposits', targetRef: 'public.labels.churned',
     })
   })
 
   it('leaves blank scope fields undefined in the considered-set call', async () => {
     await renderAndGenerate([])
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: undefined, entity: undefined, targetRef: undefined,
+      catalogSource: undefined, targetRef: undefined,
     })
+  })
+
+  // E4 cutover: entity-only generation is refused typed by the route
+  // (422 SEMANTIC_REQUIRES_CATALOG_SOURCE) and the cross-catalog lens is unreachable over HTTP, so
+  // the form must not offer an Entity field — and must say the catalog is required, not optional.
+  it('offers no entity field and frames the catalog source as required', () => {
+    render(<WorkbenchScreen />)
+    expect(screen.queryByLabelText('Entity')).toBeNull()
+    expect(screen.getByText(
+      "Required. The catalog the engine plans over: generation reads one catalog's governed "
+      + 'meaning. Cross-catalog generation returns in a later release.',
+    )).toBeInTheDocument()
   })
 
   it('shows the empty note only after a generation round returns nothing', async () => {
@@ -773,7 +803,6 @@ describe('selection and registration', () => {
     // Confirm step: no new round and no scope edit can pull rows out from under the approval.
     expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
-    expect(screen.getByLabelText('Entity')).toBeDisabled()
     expect(screen.getByLabelText('Target column')).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     // Still locked while the batch is in flight.
@@ -861,13 +890,15 @@ describe('scope changes', () => {
     expect(status).toHaveTextContent('Scope changed. Regenerate to refresh candidates.')
   })
 
-  it('editing the entity clears generated candidates but keeps drafts', async () => {
+  // The entity field is gone (E4), so the target column is the one scope edit that invalidates
+  // generated candidates WITHOUT touching the source snapshot the drafts were drafted against.
+  it('editing the target clears generated candidates but keeps drafts', async () => {
     featureRecipe.mockResolvedValue(recipeWith([]))
     await renderAndGenerate([IDEA], { source: 'deposits' })
     await openDescribe()
     await draftFeature('total spend per customer')
     expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
     expect(screen.getByText('total_spend_per_customer')).toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
@@ -889,20 +920,20 @@ describe('scope changes', () => {
     await selectCandidate('avg_balance')
     await selectCandidate('txn_count')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Approve and register 2 features' }),
     ).not.toBeInTheDocument()
   })
 
-  it('editing the entity clears the sets row and the rejections panel too', async () => {
+  it('editing the target clears the sets row and the rejections panel too', async () => {
     await renderAndGenerateSets(multiSetRound([
       { name: 'days_to_churn', reason: 'derives from the target column', code: 'LEAKAGE' },
     ]))
     expect(await screen.findByText('Temporal set')).toBeInTheDocument()
     expect(screen.getByText('1 rejected')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
     expect(screen.queryByText('1 rejected')).not.toBeInTheDocument()
     expect(screen.queryByText(/engine's pick/i)).not.toBeInTheDocument()
@@ -1232,7 +1263,7 @@ describe('whole-round feedback', () => {
 
   it('regenerates with the feedback and the original goal, pinning the selection', async () => {
     await renderAndGenerate([IDEA, OTHER_IDEA], {
-      source: 'deposits', entity: 'customer', target: 'public.labels.churned',
+      source: 'deposits', target: 'public.labels.churned',
     })
     await selectCandidate('avg_balance')
     // The goal input is edited after the round: feedback still reruns the ROUND's objective.
@@ -1244,7 +1275,7 @@ describe('whole-round feedback', () => {
     // Feedback routes through considered-set with the ROUND's snapshotted hypothesis + objective
     // (the goal input now reads 'predict churn fast') plus the instruction as `feedback`.
     expect(contractConsideredSet).toHaveBeenLastCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: 'deposits', entity: 'customer', targetRef: 'public.labels.churned',
+      catalogSource: 'deposits', targetRef: 'public.labels.churned',
       feedback: 'more behavioral signals',
     })
     // The selected candidate is pinned: kept, still selected. The unselected one is replaced.
@@ -1374,7 +1405,7 @@ describe('whole-round feedback', () => {
     const pending = deferred<api.ConsideredSetResp>()
     contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
-    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await userEvent.type(screen.getByLabelText('Target column'), 'c')
     await act(async () => {
       pending.resolve(considered(singleSetRound([idea('stale_signal')])))
     })
@@ -1393,7 +1424,7 @@ describe('whole-round feedback', () => {
     expect(screen.getByRole('button', {
       name: 'Regenerate with feedback · round 2 of 3',
     })).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
@@ -1807,6 +1838,12 @@ describe('per-candidate feedback', () => {
 })
 
 describe('govern', () => {
+  // The ROW's governed mark ("Governed <contract> v<n> · DESIGN-CHECKED"), matched precisely
+  // rather than by a bare /governed/i: the gates strip also says the word (cell 4 promises
+  // nothing is saved or governed without your click), and a matcher that cannot tell the promise
+  // from the minted contract would pass whether or not a contract was ever written.
+  const GOVERNED_MARK = /Governed .*DESIGN-CHECKED/i
+
   // A ContractDraft for avg_balance, mirroring IDEA. contractDraft returns it wrapped; the
   // server-side intent from the considered-set mock is 'int_1' (see `considered`).
   const AVG_DRAFT: api.ContractDraft = {
@@ -1834,7 +1871,7 @@ describe('govern', () => {
     )).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
     // The row shows the minted contract; the two-gate flow ran with the intent from generate.
-    expect(await screen.findByText(/governed/i)).toBeInTheDocument()
+    expect(await screen.findByText(GOVERNED_MARK)).toBeInTheDocument()
     expect(screen.getByText('contract_1')).toBeInTheDocument()
     expect(contractDraft).toHaveBeenCalledWith(
       'int_1', 'alternative', 'opt_0_0_avg_balance', '', undefined)
@@ -1882,7 +1919,7 @@ describe('govern', () => {
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
-    expect(await screen.findByText(/governed/i)).toBeInTheDocument()
+    expect(await screen.findByText(GOVERNED_MARK)).toBeInTheDocument()
     expect(screen.getByText('contract_2')).toBeInTheDocument()
     // The two-gate flow ran with the FRESH intent from the feedback round, for the fresh candidate.
     expect(contractDraft).toHaveBeenCalledWith(
@@ -1907,7 +1944,7 @@ describe('govern', () => {
     expect(
       await screen.findByText('the safety gauntlet rejected the contract'),
     ).toBeInTheDocument()
-    expect(screen.queryByText(/governed/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(GOVERNED_MARK)).not.toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
     // The failed candidate stays selected, so Govern is offered again for a retry.
     expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
@@ -1974,7 +2011,7 @@ describe('Gate #1 scope confirmation', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(contractConsideredSet).toHaveBeenCalledTimes(1)
     expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
-      catalogSource: undefined, entity: undefined, targetRef: undefined,
+      catalogSource: undefined, targetRef: undefined,
     })
     expect(contractRecognitions).not.toHaveBeenCalled()
     // No confirm step and no lens render when the flags are off.

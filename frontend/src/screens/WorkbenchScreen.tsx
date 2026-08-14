@@ -11,7 +11,13 @@
 //   candidate (batch in-flight ref + per-candidate registered state).
 // - Every fetch handler carries an out-of-order guard (monotonic sequence refs).
 // - Scope edits invalidate candidates: source edits clear everything (draft snapshots no longer
-//   match the context), entity/target edits clear generated candidates, sets, and rejections.
+//   match the context), target edits clear generated candidates, sets, and rejections.
+//
+// E4 cutover (2026-08-14): the engine is the ONLY generation path, and it plans over ONE frozen
+// catalog context. An entity-only (cross-catalog) request is refused typed by the route
+// (422 SEMANTIC_REQUIRES_CATALOG_SOURCE), so the form no longer COLLECTS an entity — a field
+// whose only reachable outcome is a refusal is an invitation to fail. The API opt survives in
+// api.ts (the wire field is still accepted); the screen simply never fills it.
 //
 // Multi-set model decisions (documented for the record):
 // - Generation always calls /features/recommend-sets. There is NO silent fallback to
@@ -743,7 +749,6 @@ export function WorkbenchScreen() {
   const [intentId, setIntentId] = useState<string | null>(null)
   const [generationRunId, setGenerationRunId] = useState<string | null>(null)
   const [source, setSource] = useState('')
-  const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
   // The mandatory read (intake build): the DRAFT ticket for the target confirm block, fetched
   // alongside recognition. Null = not fetched or unavailable — the manual target field is the
@@ -1068,9 +1073,9 @@ export function WorkbenchScreen() {
     if (hadCandidates) setScopeChanged(true)
   }
 
-  // Entity and target edits invalidate generated candidates and their round's sets and
-  // rejections (they were gathered and screened for the previous scope). Drafts survive: their
-  // snapshot source is unchanged.
+  // A target edit invalidates generated candidates and their round's sets and rejections (they
+  // were gathered and screened for the previous scope). Drafts survive: their snapshot source is
+  // unchanged.
   function invalidateGenerated() {
     const hadGenerated = (generated?.length ?? 0) > 0
     voidInFlightRounds()
@@ -1082,11 +1087,6 @@ export function WorkbenchScreen() {
     clearSets()
     clearFeedback()
     if (hadGenerated) setScopeChanged(true)
-  }
-
-  function changeEntity(value: string) {
-    setEntity(value)
-    invalidateGenerated()
   }
 
   function changeTarget(value: string) {
@@ -1309,7 +1309,6 @@ export function WorkbenchScreen() {
     try {
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
-        entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
         intentId: rec.intent_id,
         recognitionId: rec.recognition_id,
@@ -1356,7 +1355,6 @@ export function WorkbenchScreen() {
     try {
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
-        entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
         // Prefer the committed intentId: from the disposition-lens broaden (~post-generation) `rec` is
         // already cleared, so falling back to `rec?.intent_id` alone would mint a FRESH intent and orphan
@@ -1437,7 +1435,6 @@ export function WorkbenchScreen() {
       // (one provider, identical failure — show the honest notice).
       const cs = await contractConsideredSet(hypothesis.trim(), objective, {
         catalogSource: source.trim() || undefined,
-        entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
       })
       if (seq !== generateSeq.current) return
@@ -1497,7 +1494,6 @@ export function WorkbenchScreen() {
       // input; scope cannot have drifted (a scope edit voids the round).
       const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
         catalogSource: source.trim() || undefined,
-        entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
         feedback: instruction,
       })
@@ -1600,7 +1596,9 @@ export function WorkbenchScreen() {
           aggregation: idea.aggregation, grain_table: idea.grain_table,
         },
         instruction,
-        source.trim() || null, entity.trim() || null, target.trim() || null,
+        // Entity is always null: refine plans through the same one-catalog engine, and the
+        // screen no longer collects a cross-catalog entity (see the E4 note at the top).
+        source.trim() || null, null, target.trim() || null,
         // The current goal rides along so the engine revises against the objective, not the
         // instruction alone.
         goal.trim() || null,
@@ -1895,17 +1893,22 @@ export function WorkbenchScreen() {
     // candidates into a signed contract; undefined until the first successful generate.
     <section data-intent-id={intentId ?? undefined}>
       <div className="gates" role="list" aria-label="Where you are in the loop">
+        {/* E4 cutover: cells 1 and 2 name what the ONE engine actually does. Cell 1 folds in the
+            two human steps that sit between the brief and generation — the scope confirmation
+            (always) and the one-click unit of analysis (optional, and skipping it never blocks).
+            Cell 2 names the engine's real output: authored recipes and model intents planned over
+            the frozen catalog context, never the deleted free-form column generator. */}
         <Gate
           state={gate1}
           who="You"
           title="State the goal"
-          sub="Nothing generates without your intent."
+          sub="Nothing generates until you confirm the scope, and optionally the unit of analysis."
         />
         <Gate
           state={gate2}
           who="Engine"
-          title="Propose in sets"
-          sub="One set per strategy lens, all safety-checked."
+          title="Plan over the catalog"
+          sub="Governed recipes and model intents over the catalog's confirmed meaning."
         />
         <Gate
           state={gate3}
@@ -1917,7 +1920,7 @@ export function WorkbenchScreen() {
           state={gate4}
           who="You"
           title="You approve"
-          sub="Nothing registers without your click, under your name."
+          sub="Nothing is saved or governed without your click, under your name."
         />
       </div>
       <div className="panel">
@@ -1966,7 +1969,7 @@ export function WorkbenchScreen() {
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
             <div className="field" style={{ flex: '1 1 220px' }}>
               <label htmlFor="wb-source">Catalog source</label>
-              {/* Scope edits clear candidates, so all three lock under feedbackLocked: a row
+              {/* Scope edits clear candidates, so both lock under feedbackLocked: a row
                   must not leave view while its registration is being written. */}
               <input
                 id="wb-source"
@@ -1976,20 +1979,8 @@ export function WorkbenchScreen() {
                 disabled={feedbackLocked}
               />
               <p className="hint" style={HELP_STYLE}>
-                Optional. Scopes candidates to one upload source; blank searches every catalog.
-              </p>
-            </div>
-            <div className="field" style={{ flex: '1 1 220px' }}>
-              <label htmlFor="wb-entity">Entity</label>
-              <input
-                id="wb-entity"
-                value={entity}
-                onChange={e => changeEntity(e.target.value)}
-                placeholder="e.g. customer"
-                disabled={feedbackLocked}
-              />
-              <p className="hint" style={HELP_STYLE}>
-                Optional. Gathers from every catalog holding this entity, e.g. Customer.
+                Required. The catalog the engine plans over: generation reads one catalog's
+                governed meaning. Cross-catalog generation returns in a later release.
               </p>
             </div>
             <div className="field" style={{ flex: '1 1 220px' }}>
@@ -2022,7 +2013,8 @@ export function WorkbenchScreen() {
                 {generating ? 'Generating' : 'Generate candidate sets'}
               </span>
               <span className="d">
-                One validated set per strategy lens, with causal rationales and an advisory pick.
+                Governed recipes and model intents planned over this catalog's confirmed meaning,
+                grouped by operation class — blockers and their next steps named, never hidden.
               </span>
             </button>
             <button
