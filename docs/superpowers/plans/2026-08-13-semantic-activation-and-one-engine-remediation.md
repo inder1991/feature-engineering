@@ -1176,6 +1176,25 @@ code/action/served variant the table names.
 
 *Acceptance:* all 14 green; each case's docstring cites its review row.
 
+> **ACCEPTED (2026-08-14).** `tests/eval/gold/test_banking_acceptance.py` — all 14 §10 rows
+> END TO END (route in, wire out), each docstring citing its row; versioned v1 fixture
+> builders; eval-marked (the eval gate is now 73). THE CORPUS EARNED ITS KEEP ON DAY ONE —
+> two real defects found and fixed: (1) the projection's legacy-map translate-and-drop meant
+> C3/C4's requirement codes (STATUS_POLICY_UNRESOLVED, PERSONAL_DATA_POLICY_REQUIRED, …)
+> never reached the FROZEN decision facts on the real path — C4's activation rule could
+> never fire on the wire; the frozen facts now carry the gauntlet's RAW vocabulary alongside
+> the card's legacy translation; (2) a LATENT SERVING CRASH: CURRENCY_CONSISTENT registers
+> at schema v2 but the projection minted at the v1 default — UnknownRequirement the first
+> time a currency-expecting operand bound a currency-less column; requirements now mint at
+> each code's OWN registered version. DESIGN FACTS the corpus surfaced: the intent wire
+> schema cannot even EXPRESS distinct groups / currency expectations / aggregation policies
+> (deliberate — authored-recipe vocabulary), so rows 5/6/7 bind at the RECIPE surface: a
+> misdeclared stock summed by rfm_monetary_amount; a currency-less amount under its per-row
+> expectation; fan_in_fan_out's party legs colliding on one identity column. Case 13's
+> supersession uses `changes_required` (the vocabulary has no "revoked"). Cards speak the
+> closed legacy data-check names (GRAIN_IS_UNIQUE); the D1 decision record serves the raw
+> gauntlet codes — both asserted where each belongs.
+
 ### Task E2 — Workbench journey + budgets (1½ days)
 
 *Create:* Playwright hypothesis → considered set → blocked-select → save-idea →

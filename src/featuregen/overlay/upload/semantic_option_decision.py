@@ -47,7 +47,15 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "review_current": candidate.review_current,
         "recipe_revision_hash": candidate.recipe_revision_hash,
         "validation_status": idea.validation_status,
-        "outstanding_requirement_codes": sorted({req.code for req in idea.requirements}),
+        # The outstanding codes are the GAUNTLET's raw vocabulary, not the card's legacy
+        # translation: the projection maps data checks onto the closed legacy registry and
+        # deliberately drops the policy/setup states (STATUS_POLICY_UNRESOLVED,
+        # PERSONAL_DATA_POLICY_REQUIRED, ...) from the card's requirement list — but the
+        # FROZEN facts must carry them, or activation's rules (C4) can never fire. Found by
+        # the E1 gold corpus: the card-only read silently dropped every non-legacy code.
+        "outstanding_requirement_codes": sorted(
+            {req.code for req in idea.requirements}
+            | {req.code for req in _candidate_validation(candidate).requirements}),
         "has_reviewed_formula_expectation": has_reviewed_expectation(candidate.recipe_id),
         "formula_expectation_revision": "",   # pinned when the formula seam mints one (Phase E)
         # B7: a REAL gate now — True iff the frozen-bindings plan folded (single-source, bound,
@@ -79,6 +87,12 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "evidence": _evidence_record(candidate, idea),
         "decision_manifest": _decision_manifest(candidate, context_hash),
     }
+
+
+def _candidate_validation(candidate):
+    from featuregen.overlay.upload.typed_gauntlet import validate_candidate
+
+    return validate_candidate(candidate)
 
 
 def _evidence_record(candidate, idea) -> dict:

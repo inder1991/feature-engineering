@@ -82,7 +82,10 @@ def _role_bindings(candidate, catalog_source: str):
 
 
 def _requirements(validation, catalog_source: str):
-    from featuregen.overlay.upload.validation_requirements import build_requirement
+    from featuregen.overlay.upload.validation_requirements import (
+        REQUIREMENT_SCHEMA_REGISTRY,
+        build_requirement,
+    )
 
     projected = []
     for requirement in validation.requirements:
@@ -92,7 +95,12 @@ def _requirements(validation, catalog_source: str):
         projected.append(build_requirement(
             code=legacy_code,
             operand=(catalog_source, requirement.object_ref),
-            detail=f"[{requirement.code}] {requirement.detail}"))
+            detail=f"[{requirement.code}] {requirement.detail}",
+            # Each code's OWN registered schema version — CURRENCY_CONSISTENT registers at
+            # v2 (measure-suggestion params), and minting it at the v1 default CRASHED the
+            # serving path the first time a currency-expecting operand bound a currency-less
+            # column (found by the E1 gold corpus, case 6).
+            schema_version=REQUIREMENT_SCHEMA_REGISTRY[legacy_code].schema_version))
     return tuple(projected)
 
 
@@ -155,6 +163,7 @@ def _served_idea(assembled, validation, *, catalog_source: str,
             (v.selected_ref, v.role) for v in candidate.verdicts
             if v.status == "bound" and v.selected_ref)),
         personal_data_policy_revision_ids=licence_ids,
+        param_alternatives=getattr(candidate, "param_alternatives", ""),
     )
 
 
