@@ -161,6 +161,11 @@ class ConsideredSet:
     recipe_candidate_keys_by_recipe_id: dict[
         str, tuple[str, ...]
     ] = field(default_factory=dict)
+    # B2: the FROZEN PLAN ENVELOPE per served candidate key — in memory only, never serialized
+    # into the considered revision and never hashed into `considered_content_hash`. It travels
+    # from the candidate that folded it to the formula-shadow work item that freezes it, so the
+    # plan the human was shown is the plan compilation will be held to.
+    binding_plan_by_candidate_key: dict[str, dict] = field(default_factory=dict)
     option_ids_by_path: dict[str, str] = field(default_factory=dict)
     # A1b: per-served-definition frozen facts captured at the semantic branch, written as
     # immutable semantic_option_decision rows once option ids mint at revision-persist time.
@@ -805,12 +810,20 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
 
 def _engine_recipe_contexts(
     *, catalog_source: str, context, candidates_by_id: dict, served_ideas,
-) -> tuple[dict[str, RecipeGroundingContextV1], dict[str, tuple[str, ...]]]:
-    """The two server-private recipe maps, rebuilt from the ENGINE's served candidates.
+) -> tuple[dict[str, RecipeGroundingContextV1], dict[str, tuple[str, ...]],
+           dict[str, dict]]:
+    """The server-private recipe maps, rebuilt from the ENGINE's served candidates.
 
-    ``(contexts by candidate key, candidate keys by recipe id)`` — exactly the pair the legacy
-    grounding pass returned, so every consumer (Delivery-B formula-shadow capture, the private
-    considered revision, E4b's operand-role reattachment) reads the same shape from either source.
+    ``(contexts by candidate key, candidate keys by recipe id, FROZEN PLAN ENVELOPE by candidate
+    key)`` — the first two are exactly the pair the legacy grounding pass returned, so every
+    consumer (Delivery-B formula-shadow capture, the private considered revision, E4b's
+    operand-role reattachment) reads the same shape from either source.
+
+    The third is B2's, and it is deliberately NOT folded into ``RecipeGroundingContextV1``: that
+    type is serialized into the considered revision and hashed into ``considered_content_hash``,
+    so growing it would move a governed identity for a value nothing on the wire reads. The
+    envelope is carried in memory, from the candidate that produced it to the work item that
+    freezes it, and nowhere else.
 
     ONE context per served RECIPE, at its LEADING variant. Both consuming maps are keyed by
     ``recipe_id`` — the key the dispositions and the ranking use — while B5 serves one card per
@@ -846,6 +859,7 @@ def _engine_recipe_contexts(
 
     contexts: dict[str, RecipeGroundingContextV1] = {}
     keys_by_recipe: dict[str, tuple[str, ...]] = {}
+    plans: dict[str, dict] = {}
     for recipe_id, candidate in leading.items():
         try:
             grounding = build_v2_recipe_grounding_context(
@@ -863,7 +877,13 @@ def _engine_recipe_contexts(
             continue
         contexts[grounding.recipe_candidate_key] = grounding
         keys_by_recipe[recipe_id] = (grounding.recipe_candidate_key,)
-    return contexts, keys_by_recipe
+        # B2: the plan the LEADING variant folded, keyed the way the capture path looks things up.
+        # Absent for a candidate that folded none — never `{}`, which would read as a plan that
+        # authorizes nothing.
+        plan = getattr(candidate, "binding_plan", None)
+        if plan is not None:
+            plans[grounding.recipe_candidate_key] = plan
+    return contexts, keys_by_recipe, plans
 
 
 def build_considered_set(conn, intent: Intent, client: LLMClient, *,
@@ -936,6 +956,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
     binding_quality_by_template: dict[str, str] = {}   # per-template binding signal for the ranker (A3)
     recipe_grounding_context_by_candidate_key: dict[str, RecipeGroundingContextV1] = {}
     recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
+    binding_plan_by_candidate_key: dict[str, dict] = {}
     semantic_decision_facts: dict[str, dict] = {}
     if catalog_source is not None and scope is not None:
         # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
@@ -1017,7 +1038,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
         # reloaded option lose its operand roles. The engine has the same facts — the authored
         # definition, the resolved variant, and the binder's per-role column — so it fills them.
         if semantic_context is not None:
-            recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id = (
+            (recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id,
+             binding_plan_by_candidate_key) = (
                 _engine_recipe_contexts(
                     catalog_source=catalog_source,
                     context=semantic_context,
@@ -1153,6 +1175,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                            recipe_grounding_context_by_candidate_key
                        ),
                        recipe_candidate_keys_by_recipe_id=recipe_candidate_keys_by_recipe_id,
+                       binding_plan_by_candidate_key=binding_plan_by_candidate_key,
                        semantic_decision_facts_by_definition_id=semantic_decision_facts)
     logger.info("considered-set built: intent=%s catalog=%s roles=%s → lenses=%s, %d rejected, "
                 "anchor=%s, recommended_lens=%s",

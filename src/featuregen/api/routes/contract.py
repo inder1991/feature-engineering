@@ -1021,6 +1021,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
                     candidate_keys_by_recipe_id=cs.recipe_candidate_keys_by_recipe_id,
                     grounding_context_by_candidate_key=(
                         cs.recipe_grounding_context_by_candidate_key),
+                    binding_plan_by_candidate_key=cs.binding_plan_by_candidate_key,
                     identity=identity,
                     request_read_scope_hash=revision[2],
                 )

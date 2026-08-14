@@ -255,6 +255,16 @@ def _obligor_catalog(conn) -> None:
     )
 
 
+def _flatten_keys(value) -> set[str]:
+    """Every key anywhere in a nested payload — so "the envelope is not on the wire" is checked
+    at any depth, not only at the top level."""
+    if isinstance(value, dict):
+        return set(value) | {k for v in value.values() for k in _flatten_keys(v)}
+    if isinstance(value, list):
+        return {k for item in value for k in _flatten_keys(item)}
+    return set()
+
+
 def _posted_debit_catalog(conn) -> None:
     """A posted-transaction catalog the V2 ``posted_debit_amount`` recipe binds on — the ONE
     ``formula-v2``-declaring recipe the registry calls FORMULA_AUTHORABLE, and the recipe A2's
@@ -628,14 +638,28 @@ def test_the_v2_exemplar_recipe_reaches_a_work_item(make_client, conn, monkeypat
                 if item["selected_for_initial_view"]}
     assert "posted_debit_amount" in selected, body["ranking"]
     work = conn.execute(
-        "SELECT recipe_candidate_key,provider_input_json,recipe_expectation_json "
+        "SELECT recipe_candidate_key,provider_input_json,recipe_expectation_json,"
+        "binding_plan_json,binding_plan_hash "
         "FROM recipe_formula_shadow_work_item "
         "WHERE generation_run_id=%s AND recipe_id='posted_debit_amount'",
         (body["generation_run_id"],),
     ).fetchall()
     assert len(work) == 1, work
-    candidate_key, provider_input, expectation = work[0]
+    candidate_key, provider_input, expectation, plan, plan_hash = work[0]
     assert candidate_key
+    # B2: the FROZEN PLAN ENVELOPE the human's card was built from rides the work item — the
+    # governed plan and the plan that will execute stop being two independent derivations.
+    assert plan is not None, "the served candidate folded a plan; the work item must carry it"
+    assert plan["plan_kind"] == "single_source"
+    assert plan["catalog_source"] == "posting_bank"
+    assert plan["source_table"] == "txns"
+    assert plan["output_grain"] == "account"
+    assert plan_hash and len(plan_hash) == 64
+    # ...and it is NOT on the wire to a provider. The whitelist is fail-close and this is
+    # server-private plan detail: a provider authors a formula, it does not read our plan.
+    assert "binding_plan" not in provider_input
+    assert "read_set" not in provider_input
+    assert "population_ref" not in _flatten_keys(provider_input)
     # The payload DECLARES its generation — which is exactly what the egress gate dispatched on,
     # and what the worker gate will read.
     assert provider_input["formula_expectation"]["formula_schema_version"] == "formula-v2"

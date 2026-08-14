@@ -336,8 +336,10 @@ coexist and the v1 one goes on refusing until a human decides. A5's acceptance n
 active-revision pointer and must be used for exactly that. This plan reserves, now, by name:
 **1066** `semantic_option_decision.binding_plan` (the envelope as a real column, task B1);
 **1067** `materialization_request.considered_revision_id + option_id` (the governed provenance link,
-task B4); **1055** `feature_active_revision` (G-3, task D3). Nothing else. All deploy backend-first,
-under the standing explicit-approval rule.
+task B4); **1068** `recipe_formula_shadow_work_item.binding_plan_json` (the envelope on the work
+item, task B2 — **added at execution; see B2's acceptance row for why the original list was short
+by one**); **1055** `feature_active_revision` (G-3, task D3). Nothing else. All deploy
+backend-first, under the standing explicit-approval rule.
 
 **D-9. What stays deferred, honestly.** Multi-feature groups beyond one member (the group machinery
 exists; nothing maps a logical group to its members — `materialization_runs.py` says so and takes
@@ -1222,6 +1224,63 @@ plan detail and the egress whitelist is fail-close). The envelope is added to th
 - `test_the_provider_payload_is_byte_identical_to_before` — the egress guarantee, asserted on bytes.
 - `test_a_pre_B2_work_item_still_verifies` — the versioned-material property above.
 
+> **ACCEPTED `PENDING-B2` (2026-08-14).** The frozen plan envelope now rides the work item, sealed
+> by its own hash and folded into `_work_item_material`, and it does **not** ride the provider
+> payload.
+>
+> **THE PLAN DEFECT, AND IT IS A MIGRATION RESERVATION.** The task says the envelope is "added to
+> the work item's `provider_input_json`-adjacent material" and hashed so `verify_work_item_payload`
+> covers it. `recipe_formula_shadow_work_item` (migration 1023) **has no column it could ride in**,
+> and none of its five jsonb columns may absorb it: `provider_input_json` is the payload the egress
+> whitelist seals and this very task asserts byte-identical; `binding_envelope_json` is the formula
+> AUTHORITY envelope, a different envelope with its own content hash; the other three are the bound
+> expectation, the frozen configuration and the request identity. So D-8's list was short by one and
+> **migration 1068** is it — additive, nullable, no default, no backfill (1023's write-once triggers
+> refuse UPDATE in any case). D-8 and §8 are corrected in this commit.
+>
+> **The carrier, and what it deliberately is not.** `_engine_recipe_contexts` now returns a third
+> map — plan by candidate key — filled from the candidate that folded it, carried on `ConsideredSet`
+> **in memory only**, and handed to `capture_ranked_shadow`. It is NOT folded into
+> `RecipeGroundingContextV1`, which is serialized into the considered revision and hashed into
+> `considered_content_hash`: growing that type would move a governed identity for a value nothing on
+> the wire reads. `_capture_selected_entry`'s new parameter is **required, not defaulted**, so a
+> future call site cannot silently drop the envelope.
+>
+> **The two material shapes are pinned against a LITERAL, not against the implementation.**
+> `_work_item_material` folds the two keys in only when a plan is present, and
+> `_PRE_B2_MATERIAL_KEYS` writes out the 21 keys a pre-B2 row was sealed under. A work item written
+> before B2 has NULL columns and therefore hashes the pre-B2 way, which is the whole compatibility
+> claim: 1023 forbids rewriting those rows, so a material that folded the keys in unconditionally
+> would terminalize every queued item with `WORK_ITEM_PAYLOAD_HASH_MISMATCH`. That mutant was built
+> and run — it fails `test_the_two_material_shapes_are_pinned`. A second mutant (verify ignores the
+> envelope) fails two cases, one of them on the exact code.
+>
+> **"Byte-identical to before" is proved three ways rather than asserted.** (1)
+> `build_recipe_authoring_egress`'s signature is asserted to be exactly
+> `{hypothesis, prediction_goal, expectation}` — no call site *could* pass a plan; (2)
+> `recipe_egress.py` is untouched by this commit, so A4-increment-1's pinned v1 payload digest
+> (`09ce6764…`) and the frozen-arm source digest (`c063aad8…`) remain the byte-level guard and stay
+> green; (3) the stored `provider_input_json` is the caller's bytes unchanged, and no key of the
+> envelope appears anywhere in it **at any depth** (the API-level test flattens the payload rather
+> than checking the top level).
+>
+> **Honest limit, recorded:** the envelope's own hash is checked by `verify_work_item_payload`,
+> which the *worker* calls. `materialize/resolve.py` (B3) reads the column directly and does not
+> re-check it, because the only correct hasher lives in `overlay/upload/` and copying it into
+> `materialize/` would be a second, drifting implementation of the seal. The consequence is bounded:
+> the envelope is a CONSTRAINT on compilation, so a tampered one degrades the B3 check toward what
+> compilation did before B3 — it can never widen what compilation reads, which is derived
+> independently from governed catalog facts.
+>
+> 6 new cases in `tests/featuregen/overlay/upload/test_recipe_formula_shadow.py`, plus the
+> end-to-end assertions on `test_the_v2_exemplar_recipe_reaches_a_work_item` — the served
+> exemplar's plan (`single_source` / `posting_bank` / `txns` / `account`) is now on its work item.
+> Gates: full suite **11096 passed, 20 skipped** (11090/20 on `b8325da2`); `-m eval` **73 passed**;
+> ruff clean on all touched files. **mypy honesty:** the three touched source files carry **7
+> pre-existing errors** (measured on `b8325da2` by swapping HEAD's files back in: the identical 7).
+> This commit adds none — the first draft added one (`"object" has no attribute "binding_plan"` on
+> the deliberately-untyped `leading` map) and it was fixed before the gate rather than accepted.
+
 ### Task B3 — compilation CONSUMES the envelope (2½ days)
 
 The core of D-4.
@@ -1537,7 +1596,8 @@ E1 needs D3; E2 needs E1 + explicit user go ────────────
   `spark_semantics_gate.py`) are **not** `test_*` files and are not collected by the default suite,
   by design: `pyspark`/`kedro` are not dependencies of this platform. Run them via `make l0-gate`
   for any task touching `render/` or the chain.
-- Migrations **1055** (reserved, G-3), **1066**, **1067** — those three and no others. The free
+- Migrations **1055** (reserved, G-3), **1066**, **1067**, **1068** (added at execution, task B2) —
+  those four and no others. The free
   frontier is 1066 (1065 is the highest applied; 1055 is a live reservation, not an error). Claiming
   a number appends to the Track-1-owned reservation table **in the same commit** — never "next
   available" at execution time. Deploy backend-first, with explicit user approval per the standing

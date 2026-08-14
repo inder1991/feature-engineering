@@ -570,6 +570,7 @@ def test_formula_capture_rejects_missing_sealed_generation_input_before_work_ins
         entry=entry,
         common=common,
         grounding_context_by_candidate_key={"candidate-1": object()},
+        binding_plan_by_candidate_key={},
         metadata_snapshot_id="snapshot-test",
         metadata_snapshot_content_hash="snapshot-hash-test",
         identity=IdentityEnvelope(
@@ -625,6 +626,7 @@ def test_formula_redactor_failure_persists_no_raw_prose_or_work(
         entry=entry,
         common=common,
         grounding_context_by_candidate_key={"candidate-1": object()},
+        binding_plan_by_candidate_key={},
         metadata_snapshot_id="snapshot-test",
         metadata_snapshot_content_hash="snapshot-hash-test",
         identity=IdentityEnvelope(
@@ -808,3 +810,172 @@ def test_one_capture_failure_does_not_erase_other_ranked_entries(
         ("CAPTURE_PERSIST_FAILED",),
         ("SECOND_ENTRY_RECORDED",),
     ]
+
+
+# ── B2: the frozen plan envelope rides the work item, never the provider payload ─────────────────
+
+#: A real envelope shape — the nine keys ``fold_frozen_binding_plan`` returns, nothing invented.
+_B2_PLAN = {
+    "plan_kind": "single_source",
+    "catalog_source": "posting_bank",
+    "source_table": "txns",
+    "population_ref": "txns",
+    "read_set": ["public.txns.acct_id", "public.txns.event_ts", "public.txns.txn_amt"],
+    "role_bindings": {"amount": "public.txns.txn_amt"},
+    "pit": "trailing 90d observation window over event_time events",
+    "output_grain": "account",
+    "window": 90,
+}
+
+
+def _b2_values(db, suffix: str) -> dict:
+    intent_id, run_id, revision_id, considered_hash, _manifest = _declare(db, suffix)
+    return {
+        "work_item_id": f"work-b2-{suffix}",
+        "idempotency_key": f"work-b2-key-{suffix}",
+        "capture_entry_id": f"entry-b2-{suffix}",
+        "generation_run_id": run_id,
+        "intent_id": intent_id,
+        "considered_revision_id": revision_id,
+        "considered_content_hash": considered_hash,
+        "metadata_snapshot_id": None,
+        "metadata_snapshot_content_hash": None,
+        "recipe_id": "posted_debit_amount",
+        "recipe_candidate_key": f"candidate-b2-{suffix}",
+        "recipe_expectation": {"recipe": "posted_debit_amount"},
+        "recipe_expectation_hash": content_hash({"recipe": "posted_debit_amount"}),
+        "binding_envelope": {"bindings": []},
+        "binding_envelope_hash": content_hash({"bindings": []}),
+        "provider_input": {"hypothesis": "h"},
+        "provider_input_hash": content_hash({"hypothesis": "h"}),
+        "frozen_configuration": {"configuration_hash": "config-hash"},
+        "frozen_configuration_hash": "config-hash",
+        "request_identity": {"subject": "user:test"},
+        "request_read_scope_hash": "scope-hash",
+    }
+
+
+def _stored_work_item(db, work_item_id: str) -> dict:
+    cursor = db.execute(
+        "SELECT * FROM recipe_formula_shadow_work_item WHERE work_item_id=%s", (work_item_id,))
+    columns = [description.name for description in cursor.description]
+    return dict(zip(columns, cursor.fetchone(), strict=True))
+
+
+def test_the_work_item_carries_the_frozen_plan_and_its_hash(db):
+    """B2: the envelope is a durable, SEALED field of the work item — its own hash, and folded
+    into the payload material so ``verify_work_item_payload`` covers it."""
+    values = _b2_values(db, "carry")
+    write_work_item(db, **values, binding_plan=_B2_PLAN)
+    row = _stored_work_item(db, "work-b2-carry")
+
+    assert row["binding_plan_json"] == _B2_PLAN
+    assert row["binding_plan_hash"] == content_hash(_B2_PLAN)
+    assert verify_work_item_payload(row) is None
+    # And the envelope is NOT in the provider payload: it is server-private plan detail.
+    assert "binding_plan" not in row["provider_input_json"]
+
+
+def test_a_pre_B2_work_item_still_verifies(db):
+    """THE compatibility property. A work item written before B2 has NULL columns, so it must
+    hash against the PRE-B2 material shape — 1023 forbids rewriting it, and a material that
+    folded the two keys in unconditionally would terminalize every queued item with
+    ``WORK_ITEM_PAYLOAD_HASH_MISMATCH``."""
+    values = _b2_values(db, "legacy")
+    write_work_item(db, **values)                      # no binding_plan — the pre-B2 call
+    row = _stored_work_item(db, "work-b2-legacy")
+
+    assert (row["binding_plan_json"], row["binding_plan_hash"]) == (None, None)
+    assert verify_work_item_payload(row) is None
+
+
+#: The material a work item hashed BEFORE B2, written out rather than derived — so the
+#: compatibility claim is pinned against a literal and not against the implementation it is
+#: supposed to constrain. A row sealed under these 21 keys must go on verifying forever: 1023
+#: forbids rewriting it.
+_PRE_B2_MATERIAL_KEYS = frozenset({
+    "work_item_id", "idempotency_key", "capture_entry_id", "generation_run_id", "intent_id",
+    "considered_revision_id", "considered_content_hash", "metadata_snapshot_id",
+    "metadata_snapshot_content_hash", "recipe_id", "recipe_candidate_key", "recipe_expectation",
+    "recipe_expectation_hash", "binding_envelope", "binding_envelope_hash", "provider_input",
+    "provider_input_hash", "frozen_configuration", "frozen_configuration_hash",
+    "request_identity", "request_read_scope_hash",
+})
+
+
+def test_the_two_material_shapes_are_pinned(db):
+    """Both shapes, side by side, so neither can drift into the other. Without a plan the
+    material is EXACTLY the pre-B2 dict (no new keys at all); with one it gains exactly two."""
+    common = {
+        "work_item_id": "w", "idempotency_key": "k", "capture_entry_id": "e",
+        "generation_run_id": "r", "intent_id": "i", "considered_revision_id": "rev",
+        "considered_content_hash": "ch", "metadata_snapshot_id": None,
+        "metadata_snapshot_content_hash": None, "recipe_id": "x", "recipe_candidate_key": "c",
+        "recipe_expectation": {}, "recipe_expectation_hash": "eh", "binding_envelope": {},
+        "binding_envelope_hash": "bh", "provider_input": {}, "provider_input_hash": "ph",
+        "frozen_configuration": {}, "frozen_configuration_hash": "fh",
+        "request_identity": {}, "request_read_scope_hash": None,
+    }
+    without = shadow_module._work_item_material(**common)
+    with_plan = shadow_module._work_item_material(
+        **common, binding_plan=_B2_PLAN, binding_plan_hash=content_hash(_B2_PLAN))
+
+    assert set(without) == _PRE_B2_MATERIAL_KEYS
+    assert set(with_plan) - set(without) == {"binding_plan", "binding_plan_hash"}
+    assert content_hash(with_plan) != content_hash(without)
+
+
+def test_a_tampered_frozen_plan_fails_its_own_hash(db):
+    """The envelope is sealed twice — by its own hash and by the payload material — so an
+    out-of-band edit is named precisely rather than surfacing as a generic payload mismatch."""
+    values = _b2_values(db, "tamper")
+    write_work_item(db, **values, binding_plan=_B2_PLAN)
+    row = _stored_work_item(db, "work-b2-tamper")
+
+    row["binding_plan_json"] = {**_B2_PLAN, "source_table": "somewhere_else"}
+    assert verify_work_item_payload(row) == "BINDING_PLAN_HASH_MISMATCH"
+
+
+def test_a_repeated_work_item_with_a_DIFFERENT_plan_is_refused(db):
+    """The envelope is part of the work item's identity: re-writing the same idempotency key with
+    another plan conflicts with the stored material rather than being silently ignored."""
+    values = _b2_values(db, "conflict")
+    write_work_item(db, **values, binding_plan=_B2_PLAN)
+    write_work_item(db, **values, binding_plan=_B2_PLAN)          # idempotent, same bytes
+    with pytest.raises(ShadowIntegrityError):
+        write_work_item(db, **values, binding_plan={**_B2_PLAN, "window": 30})
+
+
+def test_the_provider_payload_is_byte_identical_to_before(db):
+    """B2's governed-security half. The egress whitelist is FAIL-CLOSE, so the envelope must not
+    be able to reach a provider at all — and "must not" is proved three ways rather than asserted:
+
+    1. ``build_recipe_authoring_egress`` takes no plan argument, so no call site could pass one;
+    2. ``recipe_egress`` is untouched by B2 — the v1 provider payload's pinned digest in
+       ``test_recipe_egress.py`` (``09ce6764…``, which is also its ``content_hash``) is the
+       byte-level guard and stays green;
+    3. the bytes actually stored in ``provider_input_json`` are the caller's, unchanged, and carry
+       no key of the envelope at any depth.
+    """
+    import inspect
+
+    signature = inspect.signature(build_recipe_authoring_egress)
+    assert set(signature.parameters) == {"hypothesis", "prediction_goal", "expectation"}
+
+    values = _b2_values(db, "egress")
+    payload = dict(values["provider_input"])
+    write_work_item(db, **values, binding_plan=_B2_PLAN)
+    row = _stored_work_item(db, "work-b2-egress")
+
+    assert row["provider_input_json"] == payload
+    assert content_hash(row["provider_input_json"]) == values["provider_input_hash"]
+    envelope_keys = set(_B2_PLAN) - {"window"}      # "window" is a legitimate formula word
+    assert envelope_keys.isdisjoint(_all_keys(row["provider_input_json"]))
+
+
+def _all_keys(value) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {k for v in value.values() for k in _all_keys(v)}
+    if isinstance(value, list):
+        return {k for item in value for k in _all_keys(item)}
+    return set()

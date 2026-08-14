@@ -240,8 +240,23 @@ def _work_item_material(
     frozen_configuration_hash: str,
     request_identity: dict,
     request_read_scope_hash: str | None,
+    binding_plan: dict | None = None,
+    binding_plan_hash: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    """The hashed material of one work item — TWO shapes, on purpose (task B2).
+
+    The frozen PLAN ENVELOPE is folded in only when the work item carries one. That is what lets a
+    work item written before B2 go on verifying: its columns are NULL, so the material it hashes is
+    byte-for-byte the pre-B2 dict and its sealed ``payload_hash`` still matches. Adding the two
+    keys unconditionally — as ``None`` — would change every stored row's expected digest, and 1023
+    forbids rewriting them, so every queued item would terminalize
+    ``WORK_ITEM_PAYLOAD_HASH_MISMATCH``.
+
+    A work item whose candidate folded NO plan hashes the old way too, and that is honest rather
+    than lossy: absence is absence, and the row's own ``payload_hash`` pins whichever shape was
+    written, so a plan cannot be stripped from a sealed row without the digest moving.
+    """
+    material: dict[str, Any] = {
         "work_item_id": work_item_id,
         "idempotency_key": idempotency_key,
         "capture_entry_id": capture_entry_id,
@@ -264,10 +279,20 @@ def _work_item_material(
         "request_identity": request_identity,
         "request_read_scope_hash": request_read_scope_hash,
     }
+    if binding_plan is not None or binding_plan_hash is not None:
+        material["binding_plan"] = binding_plan
+        material["binding_plan_hash"] = binding_plan_hash
+    return material
 
 
 def verify_work_item_payload(row: Mapping[str, Any]) -> str | None:
-    """Return a stable integrity failure code, or ``None`` for an exact frozen payload."""
+    """Return a stable integrity failure code, or ``None`` for an exact frozen payload.
+
+    B2: the frozen plan envelope is covered by the same seal as everything else — its own hash
+    first (``BINDING_PLAN_HASH_MISMATCH``), then the whole material's. A row with NULL columns is
+    a pre-B2 work item and is verified against the pre-B2 material shape
+    (:func:`_work_item_material`), so replay of anything already on the queue is unaffected.
+    """
     expectation = row.get("recipe_expectation_json")
     binding = row.get("binding_envelope_json")
     provider_input = row.get("provider_input_json")
@@ -291,6 +316,12 @@ def verify_work_item_payload(row: Mapping[str, Any]) -> str | None:
         return "PROVIDER_INPUT_HASH_MISMATCH"
     if configuration.get("configuration_hash") != row.get("frozen_configuration_hash"):
         return "FROZEN_CONFIGURATION_HASH_MISMATCH"
+    binding_plan = row.get("binding_plan_json")
+    binding_plan_hash = row.get("binding_plan_hash")
+    if binding_plan is not None and not isinstance(binding_plan, dict):
+        return "WORK_ITEM_SHAPE_INVALID"
+    if binding_plan is not None and content_hash(binding_plan) != binding_plan_hash:
+        return "BINDING_PLAN_HASH_MISMATCH"
     material = _work_item_material(
         work_item_id=row["work_item_id"],
         idempotency_key=row["idempotency_key"],
@@ -313,6 +344,8 @@ def verify_work_item_payload(row: Mapping[str, Any]) -> str | None:
         frozen_configuration_hash=row["frozen_configuration_hash"],
         request_identity=identity,
         request_read_scope_hash=row.get("request_read_scope_hash"),
+        binding_plan=binding_plan,
+        binding_plan_hash=binding_plan_hash,
     )
     if content_hash(material) != row.get("payload_hash"):
         return "WORK_ITEM_PAYLOAD_HASH_MISMATCH"
@@ -831,8 +864,17 @@ def write_work_item(
     frozen_configuration_hash: str,
     request_identity: dict,
     request_read_scope_hash: str | None,
+    binding_plan: dict | None = None,
 ) -> None:
-    """Persist immutable worker input and its minimal outbox pointer atomically."""
+    """Persist immutable worker input and its minimal outbox pointer atomically.
+
+    ``binding_plan`` is the FROZEN PLAN ENVELOPE the human's card was built from (B2) — server-
+    private plan detail that is deliberately NOT in ``provider_input``: the egress whitelist is
+    fail-close and a provider authors a formula, it does not read our governed plan. Its hash is
+    DERIVED here rather than accepted from the caller, so the seal is always the seal of the bytes
+    actually stored.
+    """
+    binding_plan_hash = None if binding_plan is None else content_hash(binding_plan)
     material = _work_item_material(
         work_item_id=work_item_id,
         idempotency_key=idempotency_key,
@@ -855,6 +897,8 @@ def write_work_item(
         frozen_configuration_hash=frozen_configuration_hash,
         request_identity=request_identity,
         request_read_scope_hash=request_read_scope_hash,
+        binding_plan=binding_plan,
+        binding_plan_hash=binding_plan_hash,
     )
     digest = content_hash(material)
     inserted = conn.execute(
@@ -865,8 +909,8 @@ def write_work_item(
         "recipe_expectation_json,recipe_expectation_hash,binding_envelope_json,"
         "binding_envelope_hash,provider_input_json,provider_input_hash,"
         "frozen_configuration_json,frozen_configuration_hash,request_identity_json,"
-        "request_read_scope_hash,payload_hash) VALUES "
-        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+        "request_read_scope_hash,binding_plan_json,binding_plan_hash,payload_hash) VALUES "
+        "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
         "ON CONFLICT (idempotency_key) DO NOTHING RETURNING work_item_id",
         (
             work_item_id,
@@ -890,6 +934,8 @@ def write_work_item(
             frozen_configuration_hash,
             Jsonb(request_identity),
             request_read_scope_hash,
+            None if binding_plan is None else Jsonb(binding_plan),
+            binding_plan_hash,
             digest,
         ),
     ).fetchone()
@@ -1008,6 +1054,7 @@ def _capture_selected_entry(
     entry: RankedCaptureEntryV1,
     common: dict[str, Any],
     grounding_context_by_candidate_key: Mapping[str, Any],
+    binding_plan_by_candidate_key: Mapping[str, Any],
     metadata_snapshot_id: str | None,
     metadata_snapshot_content_hash: str | None,
     identity: IdentityEnvelope,
@@ -1142,6 +1189,10 @@ def _capture_selected_entry(
         frozen_configuration_hash=configuration.configuration_hash,
         request_identity=identity_to_jsonb(identity),
         request_read_scope_hash=request_read_scope_hash,
+        # B2 — the frozen plan envelope, from the SAME candidate this capture ground. `None` for a
+        # candidate that folded no plan (cross-dataset, unbound, blocked temporal): the work item
+        # honestly carries no envelope, and compilation then derives its plan as it always did.
+        binding_plan=binding_plan_by_candidate_key.get(entry.recipe_candidate_key),
     )
 
 
@@ -1162,6 +1213,7 @@ def capture_ranked_shadow(
     grounding_context_by_candidate_key: Mapping[str, Any],
     identity: IdentityEnvelope,
     request_read_scope_hash: str | None,
+    binding_plan_by_candidate_key: Mapping[str, Any] | None = None,
 ) -> ShadowReconciliation:
     """Capture the complete ranked population without making a provider call.
 
@@ -1231,6 +1283,7 @@ def capture_ranked_shadow(
                     entry=entry,
                     common=common,
                     grounding_context_by_candidate_key=grounding_context_by_candidate_key,
+                    binding_plan_by_candidate_key=binding_plan_by_candidate_key or {},
                     metadata_snapshot_id=metadata_snapshot_id,
                     metadata_snapshot_content_hash=metadata_snapshot_content_hash,
                     identity=identity,
