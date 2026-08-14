@@ -14,6 +14,15 @@ the store BR-23 proper folds validity from. What ships here is exactly the schem
 What does NOT ship here (BR-23 proper): the review-validity fold over required roles, the decision
 APIs and permissions, dependency invalidation, and batch reports. Nothing in the platform READS
 this store yet — it exists so evidence lands durably from the first migrated family onward.
+
+``formula_expectation_hash`` is the content hash of the BLUEPRINT the recipe would be captured
+with (``recipe_formula_shadow.capture_blueprint_hash``, task A5) — the executable shape the
+decision authorizes, ``None`` when the recipe determines none. It needs no migration and no
+freshness flag: a blueprint is a pure function of the definition, and ``recipe_revision_hash``
+already pins the definition, so *"reviewed at this revision"* and *"reviewed this blueprint"*
+are the same fact. It is NOT the ``gold_v2`` fixture pin from
+``RECIPE_FORMULA_V2_EXPECTATIONS`` (which the route recorded before A5): that pin is a code
+constant recoverable from the recipe id at any time, and absent for 316 of the 317 recipes.
 """
 from __future__ import annotations
 
@@ -45,6 +54,7 @@ class RecipeReviewEventV1:
     reviewer_role: str
     reviewed_primary_objective: str
     reviewed_supporting_objectives: tuple[str, ...]
+    #: A5: the captured blueprint's content hash at this revision (see the module docstring).
     formula_expectation_hash: str | None
     gold_corpus_refs: tuple[str, ...]
     policy_dependencies: tuple[str, ...]

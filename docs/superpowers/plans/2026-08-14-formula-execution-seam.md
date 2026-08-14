@@ -926,6 +926,94 @@ revision hash; the blueprint hash is derived from the same definition.
 - `test_the_merchant_v1_entry_is_untouched` — D-7: the v1 registry entry for
   `merchant_mcc_diversity` still says `merchant`, still refuses, and no task moved it.
 
+> **A5 — THE MECHANISM HALF. ACCEPTED `PENDING-A5` (2026-08-14). THE REGISTRY-GROWTH HALF IS
+> OPERATOR-GATED AND DELIBERATELY NOT DONE.**
+>
+> **`RECIPE_FORMULA_V2_EXPECTATIONS` DID NOT GROW, AND THAT IS THE FINDING.** Under D-2,
+> membership here *is* review: an added entry flips `has_reviewed_formula_expectation`, which is
+> the blocker this very task proves clears. So growing it is a governance act with an operator's
+> name on it, not an engineering step — and the two things that would make it an engineering
+> step are both absent. A2 derives a blueprint for 90 of the 317 recipes, but nothing in a
+> derivation says a human reviewed one; and no `recipe_review_event` exists anywhere in this
+> repository's fixtures or seeds (whether the live store holds any is an operator fact this
+> branch cannot read). Choosing which of the 90 count as reviewed would have been an engineer
+> inventing governance. `posted_debit_amount` stays the only entry, and
+> `test_the_v2_registry_pins_reviewed_fixtures` now asserts the **exact set** so a later silent
+> addition fails CI rather than quietly clearing a materialization gate.
+>
+> **What the operator must do to add one entry** (stated in the registry module's own docstring,
+> so it travels with the code, and all four are required per entry):
+> 1. an `approved` `recipe_review_event` from every role `required_reviewer_roles(recipe)` names,
+>    at the recipe's **current** `canonical_recipe_v2_hash` — `POST /recipes/{id}/reviews` is the
+>    surface, and each event now carries the blueprint hash the decision covers;
+> 2. a reviewed `tests/featuregen/formula/gold_v2/` fixture for that expectation;
+> 3. its canonical proposal sha256, pinned in the registry beside the fixture name;
+> 4. green `validate_v2_expectation_registry()` **and** the fixture-side pin test in
+>    `tests/featuregen/overlay/upload/recipes/test_transaction_foundation.py`, which parses the
+>    named fixture under `parse_versioned`, requires `formula_schema_version == 2` and compares
+>    `expected_proposal_hash` to the pin — editing either side alone fails CI.
+>
+> **The mechanism, landed.** `recipe_formula_shadow.capture_blueprint_hash(recipe_id)` sits
+> beside `capture_blueprint_for` and resolves through it, so the hash a review records is the
+> hash of the blueprint the **capture path would actually bind** — one resolution, never a
+> second derivation. `CaptureBlueprintV1.content_hash()` dispatches by generation exactly as
+> `.bind()` does. Measured today: `posted_debit_amount` → `0d843082…` (v2, derived),
+> `merchant_mcc_diversity` → `5d93b5e7…` and `obligor_facility_count` → `97564d1c…` (v1,
+> reviewed registry blueprints).
+>
+> **THREE PLAN DEFECTS FOUND AND CORRECTED:**
+>
+> 1. **The store needed no change at all; the ROUTE was the whole job, and it was recording
+>    something else.** The task says *"Modify `recipe_review.py` / the review store"*.
+>    `recipe_review_event.formula_expectation_hash` has existed since migration 1060 and
+>    `record_review_event` has always accepted it — but its only writer,
+>    `api/routes/recipe_review.record_decision`, was writing the **`gold_v2` fixture pin** from
+>    `RECIPE_FORMULA_V2_EXPECTATIONS`, which is a code constant recoverable from the recipe id at
+>    any time and is `None` for 316 of the 317 recipes. That is not a blueprint hash and it says
+>    nothing about the decision. The swap is one line plus the resolver; the store change is
+>    documentation.
+> 2. **"the derived blueprint hash" is the wrong resolution for the two `formula-v1` recipes, and
+>    taking it literally would have silently resolved D-7.** `merchant_mcc_diversity` derives a
+>    *customer*-grain v2 blueprint while the expectation that actually governs it is the reviewed
+>    *merchant*-grain v1 one. Recording the derived hash would have written down "this approval
+>    covers the customer-grain shape" — the re-key the plan forbids, arriving through the back
+>    door. `capture_blueprint_hash` resolves by the recipe's own declared
+>    `formula_schema_version`, so a v1 recipe records its reviewed v1 blueprint and the
+>    disagreement stays open and observable.
+> 3. **`EXTERNAL_VALIDATION_OUTSTANDING` is not among "the other three" on this row, and the
+>    reason is a rule, not a fixture accident.** `_materialization_blockers` short-circuits it on
+>    `frozen.validation_status == "DESIGN_CHECKED"`, which is `FeatureIdea`'s default. The
+>    acceptance test therefore asserts the **exact intersection** with the six
+>    materialization-only codes rather than a subset: `{READINESS_NOT_MATERIALIZATION_READY,
+>    FORMULA_SCHEMA_UNSUPPORTED, EXECUTION_AUTHORITY_UNEVALUATED}` for the exemplar, and the same
+>    set **plus `FORMULA_NOT_REVIEWED`** for the discriminator. Exactly one code differs between
+>    the two rows; a policy that had stopped blocking altogether could not pass both.
+>
+> **The seam is proved on a real DB row, not a constructed fact:**
+> `test_a_registered_expectation_flips_has_reviewed_formula_expectation` freezes a real
+> `semantic_option_decision` through `decision_facts_for_candidate` → `persist_option_decisions`,
+> loads it through `load_frozen_option_facts`, assembles the current layer with
+> `assemble_current_activation_state`, and asks `activation_decision(…,
+> "execute_materialization")`. **`FORMULA_NOT_REVIEWED` is gone — the first of §0.3's four codes
+> to fall.** `balance_slope` (derivable, unregistered, otherwise identical in the fixture) still
+> carries it, which is what proves the test measures the registry and not the fixture.
+>
+> **D-7 untouched, asserted three ways:** the v1 registry entry still declares
+> `grain.entity == "merchant"` while the definition's `output_grain` is `customer`;
+> `capture_blueprint_for` still resolves the reviewed object **by identity** (`is`); and the
+> route records the merchant-grain hash for it. Nothing re-keyed, nothing deleted.
+>
+> Also landed: `GET /recipes/{id}/reviews` now exposes `formula_expectation_hash` per event (it
+> was written and never readable), and the review store's docstring states the column's meaning
+> where it lives. The v1-pin-recording mutant was restored and run first — it fails
+> `test_a_decision_records_the_blueprint_it_covers_not_the_fixture_pin` on the exact byte
+> difference, so the route test discriminates.
+>
+> 8 new cases in `tests/featuregen/overlay/upload/test_reviewed_expectation_seam.py`, 2 in
+> `tests/featuregen/api/routes/test_recipe_review_route.py`.
+> Gates: full suite **11069 passed, 20 skipped** (baseline on `8cc50cad` was 11059/20);
+> `-m eval` **73 passed**; ruff + mypy clean on the four touched source files.
+
 ### Task A6 — readiness folds instead of asserting (1½ days)
 
 `V2RecipeCandidateV1.readiness` is the authored literal; `fold_readiness` is never called on the

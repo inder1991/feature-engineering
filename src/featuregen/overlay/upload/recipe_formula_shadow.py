@@ -52,11 +52,13 @@ from featuregen.overlay.upload.recipe_formula_contracts import (
     RecipeFormulaExpectationBlueprintV1,
     RecipeFormulaPreflightError,
     bind_formula_expectation,
+    expectation_content_hash,
 )
 from featuregen.overlay.upload.recipe_formula_contracts_v2 import (
     BoundRecipeFormulaExpectationV2,
     RecipeFormulaExpectationBlueprintV2,
     bind_formula_expectation_v2,
+    expectation_content_hash_v2,
 )
 from featuregen.overlay.upload.recipe_formula_expectations import (
     RECIPE_FORMULA_EXPECTATIONS,
@@ -99,6 +101,13 @@ class CaptureBlueprintV1:
             return bind_formula_expectation_v2(context, self.blueprint)
         return bind_formula_expectation(context, self.blueprint)
 
+    def content_hash(self) -> str:
+        """The blueprint's identity, hashed by its own generation's hasher — the same dispatch
+        :meth:`bind` makes, so there is one answer per recipe and not two."""
+        if isinstance(self.blueprint, RecipeFormulaExpectationBlueprintV2):
+            return expectation_content_hash_v2(self.blueprint)
+        return expectation_content_hash(self.blueprint)
+
 
 @cache
 def capture_blueprint_for(recipe_id: str) -> CaptureBlueprintV1 | None:
@@ -131,6 +140,25 @@ def formula_capturable_recipe_ids() -> frozenset[str]:
     return frozenset(
         definition.recipe_id for definition in V2_RECIPES
         if capture_blueprint_for(definition.recipe_id) is not None)
+
+
+def capture_blueprint_hash(recipe_id: str) -> str | None:
+    """The content hash of the blueprint this recipe WOULD be captured with (task A5).
+
+    Recorded on every review event, so *"reviewed at this revision"* and *"reviewed this
+    blueprint"* are ONE fact rather than two that can drift: the blueprint is a pure function
+    of the definition, and ``recipe_review_event.recipe_revision_hash`` already pins the
+    definition. ``None`` where :func:`capture_blueprint_for` resolves nothing — the review is
+    still recorded, it simply covers no executable shape yet.
+
+    It resolves through :func:`capture_blueprint_for` deliberately: the reviewer's decision
+    must name the blueprint the CAPTURE path would bind, never a second derivation of it. For
+    a ``formula-v1`` recipe that is the reviewed v1 registry blueprint — which is why a review
+    of ``merchant_mcc_diversity`` records its MERCHANT-grain hash and not the customer-grain
+    one its definition derives (D-7 stays an open governance decision, not a silent re-key).
+    """
+    resolved = capture_blueprint_for(recipe_id)
+    return None if resolved is None else resolved.content_hash()
 
 
 @dataclass(frozen=True, slots=True)

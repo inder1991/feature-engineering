@@ -117,6 +117,51 @@ def test_the_detail_serves_the_definition_the_reviewer_signs(client):
     assert r.status_code == 404
 
 
+def test_a_decision_records_the_blueprint_it_covers_not_the_fixture_pin(client):
+    """A5: the event carries the content hash of the blueprint the CAPTURE path would bind for
+    this recipe — the executable shape the approval authorizes — beside the revision hash that
+    pins the definition it derives from. Before A5 the route recorded the ``gold_v2`` fixture
+    pin, a code constant that is absent for 316 of the 317 recipes and says nothing about this
+    decision; both readings are asserted so the swap cannot silently revert."""
+    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
+        RECIPE_FORMULA_V2_EXPECTATIONS,
+    )
+    from featuregen.overlay.upload.recipe_formula_shadow import capture_blueprint_hash
+
+    expected = capture_blueprint_hash(RECIPE_ID)
+    pinned_fixture_hash = RECIPE_FORMULA_V2_EXPECTATIONS[RECIPE_ID][1]
+    assert expected is not None and expected != pinned_fixture_hash
+
+    r = client.post(PATH, headers=_governor("omar"),
+                    json=_decision(reviewer_role="formula_engineering"))
+    assert r.status_code == 201, r.text
+    event = client.get(PATH, headers=_reader()).json()["events"][-1]
+    assert event["formula_expectation_hash"] == expected
+    assert event["recipe_revision_hash"] == LIVE_HASH
+
+    # D-7: the v1-declaring recipe records its REVIEWED merchant-grain blueprint, never the
+    # customer-grain one its definition derives. One resolution, not a second derivation.
+    v1_id = "merchant_mcc_diversity"
+    v1_hash = canonical_recipe_v2_hash(v2_recipe_by_id(v1_id))
+    r = client.post(f"/recipes/{v1_id}/reviews", headers=_governor("lin"),
+                    json=_decision(reviewed_revision_hash=v1_hash))
+    assert r.status_code == 201, r.text
+    v1_event = client.get(f"/recipes/{v1_id}/reviews", headers=_reader()).json()["events"][-1]
+    assert v1_event["formula_expectation_hash"] == capture_blueprint_hash(v1_id)
+
+
+def test_a_recipe_with_no_bindable_blueprint_records_no_hash(client):
+    """A conceptual pattern determines no blueprint. The decision is still recorded — it simply
+    covers no executable shape, and the event says so honestly rather than inventing one."""
+    target = "salary_confidence"                     # conceptual_pattern, no formula
+    live = canonical_recipe_v2_hash(v2_recipe_by_id(target))
+    r = client.post(f"/recipes/{target}/reviews", headers=_governor("priya"),
+                    json=_decision(reviewed_revision_hash=live))
+    assert r.status_code == 201, r.text
+    event = client.get(f"/recipes/{target}/reviews", headers=_reader()).json()["events"][-1]
+    assert event["formula_expectation_hash"] is None
+
+
 def test_full_approval_folds_current_with_two_identities(client):
     recipe = v2_recipe_by_id(RECIPE_ID)
     from featuregen.overlay.upload.recipe_review_validity import required_reviewer_roles

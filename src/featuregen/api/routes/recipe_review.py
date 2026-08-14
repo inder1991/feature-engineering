@@ -141,6 +141,7 @@ def recipe_reviews(recipe_id: str, conn: _Conn) -> dict:
             "event_id": e.event_id, "recipe_revision_hash": e.recipe_revision_hash,
             "decision": e.decision, "reviewer": e.reviewer,
             "reviewer_role": e.reviewer_role, "rationale": e.rationale,
+            "formula_expectation_hash": e.formula_expectation_hash,
             "gold_corpus_refs": list(e.gold_corpus_refs),
             "policy_dependencies": list(e.policy_dependencies),
             "supersedes_event_id": e.supersedes_event_id,
@@ -165,13 +166,15 @@ def record_decision(
             f"{body.reviewed_revision_hash[:12]}…, live {live_hash[:12]}… — re-review the "
             "current revision"))
 
-    expectation_hash = None
-    if recipe.formula is not None:
-        from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
-            RECIPE_FORMULA_V2_EXPECTATIONS,
-        )
-        pinned = RECIPE_FORMULA_V2_EXPECTATIONS.get(recipe.formula.expectation_ref)
-        expectation_hash = pinned[1] if pinned else None
+    # A5 — the DERIVED BLUEPRINT hash, not the registry's gold-fixture pin. The pin is a code
+    # constant recoverable from the recipe id at any time and is absent for 316 of the 317
+    # recipes, so recording it said almost nothing about THIS decision. The blueprint hash is
+    # the executable shape the approval authorizes; being a pure function of the definition, the
+    # `recipe_revision_hash` this event already carries pins it, which is exactly what makes
+    # "reviewed at this revision" and "reviewed this blueprint" one fact.
+    from featuregen.overlay.upload.recipe_formula_shadow import capture_blueprint_hash
+
+    expectation_hash = capture_blueprint_hash(recipe_id)
 
     try:
         event_id = record_review_event(

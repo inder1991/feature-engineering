@@ -19,6 +19,24 @@ the only thing that may be looked up here: 295 of the 317 registry recipes decla
 not their own name (``retail:balance_slope`` for ``balance_slope``), and the three that agree do
 so by coincidence. A caller holding a recipe id resolves its definition first — see
 ``semantic_option_decision.has_reviewed_formula_expectation``.
+
+**GROWING THIS REGISTRY IS AN OPERATOR ACT, NOT AN ENGINEERING ONE (D-2, task A5).** Membership
+here IS review: an added entry flips ``has_reviewed_formula_expectation``, which clears the
+``FORMULA_NOT_REVIEWED`` activation blocker on the materialization ladder. A2 derives a
+blueprint for 90 of the 317 recipes, but *which* of those 90 a human has actually reviewed is a
+governance answer no derivation can supply, and no ``recipe_review_event`` row exists yet. So
+``posted_debit_amount`` remains the only entry. Adding one requires, per entry, all four:
+
+1. an ``approved`` ``recipe_review_event`` from every role
+   ``recipe_review_validity.required_reviewer_roles`` names, at the recipe's CURRENT
+   ``canonical_recipe_v2_hash`` — the event carries the blueprint hash the decision covers
+   (``recipe_formula_shadow.capture_blueprint_hash``);
+2. a reviewed ``tests/featuregen/formula/gold_v2/`` fixture for that expectation;
+3. its canonical proposal sha256, pinned here beside the fixture name;
+4. green ``validate_v2_expectation_registry`` (below) and the fixture-side pin test in
+   ``tests/featuregen/overlay/upload/recipes/test_transaction_foundation.py`` — which parses the
+   named fixture under ``parse_versioned``, requires ``formula_schema_version == 2``, and
+   compares its ``expected_proposal_hash`` to the pin, so editing either side alone fails CI.
 """
 from __future__ import annotations
 
