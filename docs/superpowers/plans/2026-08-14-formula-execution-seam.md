@@ -734,6 +734,72 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > `manifest_hash`, `ON CONFLICT (manifest_id) DO NOTHING` plus `_checked_existing` (`:109`) means
 > existing rows are never rewritten, so the change lands on new runs only.
 
+> **A4 INCREMENT 1 — THE EGRESS v2 ARM. ACCEPTED `b77456dd` (2026-08-14).** The governed-security
+> half, landed on its own because widening the fail-close boundary to a provider is not a
+> side-effect of a capture change. `_validate_formula_expectation` is now a **dispatcher**: the v1
+> arm and the v2 arm are separate functions and the payload's own declaration chooses.
+>
+> **The A4-a repro was reproduced first and now passes.** Before:
+> `RecipeEgressViolation: expressions[0] keys differ: missing=[], unknown=['aggregation_argument',
+> 'authority_refs', 'second_operand_ref', 'term_name', 'term_sign']`. After: a derived,
+> bound `posted_debit_amount` expectation crosses the gate and carries
+> `formula_schema_version="formula-v2"`.
+>
+> **v1 byte-identity is MEASURED, not asserted.** HEAD's module was loaded from git beside the new
+> one and both were run over 33 payloads (the reviewed merchant payload plus 32 mutations, one per
+> v1 bound): **31 outcomes identical, message for message.** The only two differences are payloads
+> that *declare* a schema version — a case that could not exist before this commit, and both are
+> still refused, now by name. Two digests are pinned in `test_recipe_egress.py`: the canonical v1
+> provider payload (`09ce6764…`, which is also its `content_hash`) and the frozen v1 arm's own
+> source (`c063aad8…`). Live work items were sealed against exactly those bytes.
+>
+> **Deviations from the increment as briefed, each deliberate:**
+> (a) **The v1 arm is the UNDECLARED shape, and that is the fail-close reading — not a hole.**
+> "Fail-close on anything undeclared" cannot mean "refuse the v1 shape": the worker re-validates
+> each work item's *stored* `provider_input_json` before every dispatch
+> (`recipe_formula_worker.py:301`), and those bytes are sealed into `provider_input_hash` /
+> `payload_hash`. A key added to v1 would refuse every work item already on the queue. So absence
+> IS the v1 declaration; the v1 arm exact-keys six/seven/nine keys and refuses everything else;
+> and any *present* declaration other than `"formula-v2"` — including `null`, `""`, `2` and
+> `"formula-v1"` — is a named refusal. Five cases assert it.
+> (b) **`authority_refs` is a bounded OBJECT of four named policy identifiers, not a list.** The
+> brief said "bounded list"; `AuthorityRefsV2` is a four-field dataclass
+> (`status_policy_ref` / `direction_policy_ref` / `reversal_policy_ref` /
+> `currency_conversion_ref`). The arm exact-keys those four, bounds each to 128 chars, **character-
+> classes each against `[A-Za-z0-9][A-Za-z0-9_.:+-]*`** — an authority ref is a key, never prose,
+> and prose is what leaks — and restates the schema's non-vacuity law (a block with four blanks is
+> refused, not forwarded).
+> (c) **"validated against the closed grammar vocabulary" was applied to `aggregation`, which is
+> the key that has one.** `aggregation_argument` is a number; what makes it real is the rule table:
+> `aggregation` must be an `AggregateFunctionV2` member, and `operation_rule` then decides whether
+> the argument is required (percentile, strictly inside (0,100)) or forbidden, whether an operand
+> is required, and whether a second operand is required/forbidden. Three keys are bounded by one
+> closed table instead of by three hand-written guesses.
+> (d) **`term_sign ∈ {1,−1}` holds only inside a signed sum.** The bound type defaults
+> `term_name=""` / `term_sign=0` for every other shape, so the arm asserts the coherence:
+> ±1 with a non-blank name inside a `signed_sum` (and at least two terms), exactly `""`/`0`
+> outside one. A name or a sign on a unary body is refused.
+> (e) **The v2 arm closes nine vocabularies v1 only bounded as text** (`final_operation`,
+> `aggregation`, `basis`, `unit`, both inclusivities, `empty_window`, `null_input`,
+> `decimal.rounding`, `decimal.overflow`). The v1 arm is frozen, so this strictness lands only
+> where it is new. The token vocabularies are read from the grammar (our own authored words); the
+> *bounds* — 4 expressions, 16 grain refs, 100 000 window length, 12 offset periods — are stated
+> in `recipe_egress` itself, so a grammar that widens can never silently widen the boundary.
+> `test_the_egress_offset_bound_is_pinned_against_the_grammar` is where the two are reconciled.
+> (f) **The v2 projection stays as narrow as v1's**, plus the declaration: `expectation_ref`,
+> `recipe_candidate_key`, `blueprint_content_hash`, `semantic_parameter_binding_hash` and
+> `allocation_policy_ref` are server-private and asserted absent. A provider authors a formula; it
+> does not audit our registry.
+>
+> **One forward gap recorded, not fixed here:** `recipe_formula_worker._formula_refs` (`:84`)
+> collects `operand_ref` and `event_time_ref` only, so a v2 expression's `second_operand_ref`
+> would never reach `FrozenRecipeReadContext.load`. Harmless today — increment 2 stops every v2
+> work item before that line — but the eventual replay-shaped v2 orchestrator must widen it.
+>
+> 42 new cases in `tests/featuregen/formula/test_recipe_egress.py` (51 total in the file).
+> Gates: full suite **11048 passed, 20 skipped** (baseline on `3e875ad3` was 11006/20);
+> `-m eval` **73 passed**; ruff + mypy clean on the touched files.
+
 ### Task A5 — the reviewed-expectation seam (1 day)
 
 **Modify:** `src/featuregen/overlay/upload/recipe_formula_expectations_v2.py` — grow
