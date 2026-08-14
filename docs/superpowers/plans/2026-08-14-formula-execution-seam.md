@@ -1224,7 +1224,7 @@ plan detail and the egress whitelist is fail-close). The envelope is added to th
 - `test_the_provider_payload_is_byte_identical_to_before` — the egress guarantee, asserted on bytes.
 - `test_a_pre_B2_work_item_still_verifies` — the versioned-material property above.
 
-> **ACCEPTED `PENDING-B2` (2026-08-14).** The frozen plan envelope now rides the work item, sealed
+> **ACCEPTED `bc7c8451` (2026-08-14).** The frozen plan envelope now rides the work item, sealed
 > by its own hash and folded into `_work_item_material`, and it does **not** ride the provider
 > payload.
 >
