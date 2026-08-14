@@ -1319,7 +1319,7 @@ current members before adding one, and do not confuse the compilation-side
 - `test_a_run_without_an_envelope_compiles_exactly_as_before` — every existing `test_chain.py` case
   is byte-identical (53 cases; this is the regression guard on the whole phase).
 
-> **ACCEPTED `PENDING-B3` (2026-08-14).** D-4 is real: the governed plan the human was shown and the
+> **ACCEPTED `7cb2f98d` (2026-08-14).** D-4 is real: the governed plan the human was shown and the
 > plan that executes are no longer two independent derivations that nothing compares.
 > `ResolvedFeature`/`ResolvedFeatureInput`/`AdmittedFeature` each gain `plan_envelope`, admission
 > gains **check 7**, `compile_ir` gains `plan_envelope=` and validates AFTER compiling, and
