@@ -435,7 +435,7 @@ without a `formula` (governed-model-output and conceptual recipes have none).
 - `test_a_v2_blueprint_whose_grain_role_is_not_bound_is_refused` — the D-7 property, in the v2 binder
 - `test_the_bound_expectation_is_hash_stable_over_role_order`
 
-> **ACCEPTED `PENDING-A1` (2026-08-14).** `recipe_formula_contracts_v2.py` — 6 new types
+> **ACCEPTED `24a31734` (2026-08-14).** `recipe_formula_contracts_v2.py` — 6 new types
 > (`WindowPolicyExpectationV2` with `offset_periods`, `ExpressionRoleExpectationV2` with
 > `second_operand_role` / `aggregation_argument` / `authority_refs` / term name+sign,
 > `GrainExpectationV2`, `RecipeFormulaExpectationBlueprintV2`, and the two bound mirrors),
@@ -480,7 +480,12 @@ window's `empty_window` and `null_input`; `definition.formula.result_class` → 
 **Refuses (never guesses)** with named codes: `MULTIPLE_MEASURE_OPERANDS_UNRESOLVED` (the body shape
 is not derivable from a single measure), `NO_MEASURE_OPERAND`, `AGGREGATION_UNDECLARED`,
 `TEMPORAL_BLOCKED`. A refusal is a recipe that keeps `FORMULA_BLOCKED` **with a named blocker** —
-exactly the readiness ladder's contract.
+exactly the readiness ladder's contract. **Corrected at execution: eleven codes, not four** —
+the seven added (`NOT_A_DETERMINISTIC_FORMULA`, `WINDOW_NOT_EVENT_ANCHORED`,
+`WINDOW_UNIT_UNSUPPORTED`, `GRAIN_KEY_UNRESOLVED`, `OUTPUT_POLICY_UNDERIVABLE`,
+`PARAMETER_PROJECTION_UNDERIVABLE`, `AUTHORITY_REFS_AMBIGUOUS`) each name a distinct way the
+definition fails to determine the blueprint, and the largest of them accounts for a third of the
+registry. See the acceptance row.
 
 **Acceptance (tests):** `tests/featuregen/overlay/upload/test_blueprint_derivation.py`
 - `test_the_exemplar_derives_to_the_reviewed_gold_fixture_shape` — `posted_debit_amount`'s derived
@@ -500,6 +505,60 @@ exactly the readiness ladder's contract.
 > below 296. That number IS the deliverable of this task — it is the first true measurement of how
 > many banking recipes are executable-shaped, and every refusal code is a named piece of registry
 > work, not a mystery.
+
+> **ACCEPTED `PENDING-A2` (2026-08-14).** `recipe_formula_blueprint_derivation.py` —
+> `derive_blueprint_v2(definition)`, pure (one parameter, asserted over the signature), plus
+> `derive_registry_blueprints()` for the sweep.
+>
+> **THE MEASUREMENT: 90 of 317 recipes derive a blueprint.** Every other recipe carries exactly
+> one named blocker: `WINDOW_NOT_EVENT_ANCHORED` 102 · `MULTIPLE_MEASURE_OPERANDS_UNRESOLVED` 65 ·
+> `NOT_A_DETERMINISTIC_FORMULA` 19 · `AGGREGATION_UNDECLARED` 19 · `OUTPUT_POLICY_UNDERIVABLE` 6 ·
+> `WINDOW_UNIT_UNSUPPORTED` 6 · `NO_MEASURE_OPERAND` 4 · `TEMPORAL_BLOCKED` 3 ·
+> `PARAMETER_PROJECTION_UNDERIVABLE` 2 · `GRAIN_KEY_UNRESOLVED` 1. The counts are pinned in
+> `EXPECTED_OUTCOMES`. The single largest blocker is **not** formula grammar: 102 recipes are
+> as-of / effective-interval / contractual-future anchored and `WindowPolicyV2` has no shape for
+> a snapshot read at the cutoff. That is the next real piece of grammar work, and it was
+> invisible before this task.
+>
+> **Deviations from the task as authored, each deliberate and each measured:**
+> (a) **eleven refusal codes, not four.** The four authored ones are all present; the other seven
+> exist because the definition genuinely fails to determine the blueprint in seven *distinct*
+> ways, and collapsing them would hand a reviewer "underivable" with no action attached — the
+> opposite of "every refusal code is a named piece of registry work". Ten fire on the shipped
+> registry; `AUTHORITY_REFS_AMBIGUOUS` fires only by construction today and is kept so the
+> derivation can never silently pick one of two governed policies of the same kind.
+> (b) **three fields have no structural source anywhere in the registry and are DECLARED
+> constants of the derivation, stated once in the module docstring:** `timezone_policy` is empty
+> for all 317 recipes (→ `UTC`, what the reviewed v1 blueprints declare); `scale_policy` is empty
+> for all 317 (→ precision 38, scale 0 for counts / 6 otherwise, matching the v1 blueprints and
+> the gold exemplar); and the window inclusivity convention is taken from `compile_temporal`'s own
+> compiled PIT text, `(cutoff − L, cutoff]`.
+> (c) **the authored acceptance test `test_the_exemplar_derives_to_the_reviewed_gold_fixture_shape`
+> is not executable as written at A2** — it asks for a *proposal* that `parse_versioned` accepts,
+> and nothing renders a blueprint into a proposal until A3. The test ships as the same oracle at
+> the level A2 actually produces: every field the blueprint and the reviewed proposal both carry
+> is asserted equal, field by field.
+>
+> **Three disagreements between the derivation and the reviewed gold fixture, recorded not
+> fudged** (each pinned by an assertion so it cannot drift unnoticed):
+> 1. **timezone** — derived `UTC`, fixture `Asia/Dubai`. No registry source exists; the reviewer's
+>    to set.
+> 2. **window inclusivity** — derived `(start, end]` from the recipe's own compiled PIT text,
+>    fixture `[start, end)`. **The reviewed gold corpus and the recipe registry disagree about
+>    which end of a trailing window is closed.** This is a governance question, not a bug to pick
+>    a side on, and it is exactly the kind of thing the fixture-as-oracle test exists to surface.
+> 3. **policy-ref namespace** — the gold corpus writes `policy:eligible-posted-status`, the
+>    registry writes `eligible_status:foundation-posted-events`. The *set* of governed policies
+>    agrees (all four declared on both sides); only the spelling differs.
+>
+> **D-7 holds structurally:** `merchant_mcc_diversity` derives `grain.entity == "customer"` from
+> its own definition, while the reviewed v1 registry entry still says `merchant` and still
+> refuses. Both are asserted in one test; no task re-keyed anything.
+>
+> 12 tests in `tests/featuregen/overlay/upload/test_blueprint_derivation.py`, including
+> `test_a_derived_blueprint_binds_against_a_grounded_context` — derivation and A1's binder proved
+> to be one path end to end (blueprint → bound refs → `bank::public.txns.txn_amt`, 90-day window).
+> Gates: full suite **10979 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean.
 
 ### Task A3 — the v2 authoring orchestrator ⟨LLM⟩ (3 days)
 
