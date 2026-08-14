@@ -734,7 +734,7 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > `manifest_hash`, `ON CONFLICT (manifest_id) DO NOTHING` plus `_checked_existing` (`:109`) means
 > existing rows are never rewritten, so the change lands on new runs only.
 
-> **A4 INCREMENT 1 — THE EGRESS v2 ARM. ACCEPTED `b77456dd` (2026-08-14).** The governed-security
+> **A4 INCREMENT 1 — THE EGRESS v2 ARM. ACCEPTED `162fb706` (2026-08-14).** The governed-security
 > half, landed on its own because widening the fail-close boundary to a provider is not a
 > side-effect of a capture change. `_validate_formula_expectation` is now a **dispatcher**: the v1
 > arm and the v2 arm are separate functions and the payload's own declaration chooses.
