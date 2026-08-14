@@ -1319,6 +1319,84 @@ current members before adding one, and do not confuse the compilation-side
 - `test_a_run_without_an_envelope_compiles_exactly_as_before` — every existing `test_chain.py` case
   is byte-identical (53 cases; this is the regression guard on the whole phase).
 
+> **ACCEPTED `PENDING-B3` (2026-08-14).** D-4 is real: the governed plan the human was shown and the
+> plan that executes are no longer two independent derivations that nothing compares.
+> `ResolvedFeature`/`ResolvedFeatureInput`/`AdmittedFeature` each gain `plan_envelope`, admission
+> gains **check 7**, `compile_ir` gains `plan_envelope=` and validates AFTER compiling, and
+> `CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE` joins the closed §14 vocabulary with the
+> discipline its neighbours carry. **Nothing substitutes:** every check runs on a complete artifact
+> or a complete IR and the only outcome other than `None` is a refusal naming both sides.
+>
+> **THREE PLAN DEFECTS FOUND AND CORRECTED, and the first changes what an acceptance test can be:**
+>
+> 1. **`test_the_compiled_pit_clause_is_the_frozen_pit_text` is not executable, because there is no
+>    compiled PIT clause.** `PitSpec` (`expression_ir.py:284`) carries structured fields and renders
+>    no text anywhere in `materialize/`; `envelope["pit"]` is the human-facing PROSE
+>    `recipe_temporal_v2.compile_temporal` writes (*"trailing 90d observation window over posted_ts
+>    events: (cutoff − 90d, cutoff], values knowable strictly at or before the cutoff"*). Re-parsing
+>    that prose to manufacture a comparison would be exactly the second derivation D-4 forbids. What
+>    the two sides genuinely share is the WINDOW — frozen as a number, compiled as `window_length` —
+>    so `test_the_compiled_window_is_the_frozen_window` is that test, checked on EVERY expression
+>    (a ratio has two), and the frozen prose rides the refusal verbatim so an operator reads what
+>    the human was told.
+> 2. **The two sides do not speak the same dialect, and "must be a SUBSET of `envelope["read_set"]`"
+>    taken literally would have compared nothing to nothing.** `physical_read_set` emits governed
+>    LOGICAL refs (`hdfc::public.transactions.merchant_id`); the envelope's read set is the semantic
+>    context's OBJECT refs (`public.transactions.merchant_id`) with the catalog carried once beside
+>    them as `catalog_source` — which is precisely why `assemble_current_activation_state` has to
+>    `normalize_ref(plan_catalog_source, *ref.split(".")[-3:])` before it can ask anything about
+>    them. `_envelope_ref` is the one translation, and it handles the trap that comes with it: a
+>    RELATION ref has two path segments, and shifting it one segment left would name a table
+>    `transactions` in a schema `public` — equal to nothing, unequal to everything, and the read-set
+>    check would silently pass forever. Pinned by `test_a_relation_ref_is_not_read_as_a_column`.
+> 3. **The allowed additions are THREE classes, not "the spine's own keys".** The spine's relation,
+>    keys, read set and availability column (the envelope names the population by TABLE only, so its
+>    columns cannot be in the read set); each expression's AVAILABILITY column (§8 rule 1 — a
+>    governed catalog fact, never a role the recipe bound); and each expression's SOURCE RELATION
+>    (which enters the read set as a relation element while admission's check 7 already compared it
+>    against `source_table`, in the envelope's own vocabulary — comparing it here would ask one
+>    question twice in two dialects). `test_the_allowed_additions_are_exactly_the_spine_keys` pins
+>    the exact five refs, so a fourth class must be argued for in the open.
+>
+> **Deviations and judgements, each deliberate:**
+> (a) **Check 7 is split by what is KNOWABLE where.** The grain and the source relation are
+> properties of the ARTIFACT and are checked at admission — the earliest point, and therefore the
+> point at which nothing downstream has been produced. The read set, the population and the window
+> need physical resolution and are checked after compiling. `test_a_divergent_source_table_refuses_by_name`
+> asserts both halves of what the task asked: the code, and that `compile_ir` was never reached.
+> (b) **Absence asserts nothing — neither a missing envelope nor a blank field.** Every work item
+> written before migration 1068 carries none, and the whole materialization path predates the
+> envelope; `window` is `None` for a recipe with no window parameter and `output_grain` is `""` for
+> a request that declared none. Reading absence as an assertion would refuse the majority of genuine
+> features for having been served by an earlier build.
+> (c) **The envelope is outside `authoring_intent_hash`.** It is provenance, not identity: two
+> inputs differing only in it re-hash identically and both admit
+> (`test_the_envelope_is_outside_the_intent_hash`). The check-6 proof is untouched.
+> (d) **The chain wiring is asserted from the AST** — `compile_ir` is called in exactly one place
+> and must be handed `feature.plan_envelope`, so admission's check 7 and the compile checks are
+> about ONE object. Without it the phase could validate nothing in production while every unit test
+> passed.
+> (e) `_split_table_ref` parses by hand rather than through `object_ref.parse_ref`: a malformed
+> relation must not raise a bare `ValueError` out of a governed gate (§14) — it simply compares
+> unequal and is refused as the divergence it is.
+>
+> **The regression guard holds:** `test_a_run_without_an_envelope_compiles_exactly_as_before`
+> asserts `None`, `{}` and a MATCHING envelope produce the identical `FormulaExecutionIRV1` and the
+> identical `ir_hash`; all 53 `test_chain.py` cases and the whole 1902-test `materialize/` package
+> are green unchanged.
+>
+> **Four mutants were built and run before the tests were trusted:** validation made a no-op (5
+> failures), the carve-out widened to "anything the compiler read" (2), admission's check 7 removed
+> (2), and the pre-existing `_read_intent` monkeypatch in `test_resolve.py` — which now receives a
+> pair — corrected rather than deleted.
+>
+> 14 new cases in `tests/featuregen/materialize/test_plan_envelope.py`, 5 in `test_admission.py`,
+> 1 enum entry in `test_codes.py`'s exact-set assertion.
+> Gates: full suite **11115 passed, 20 skipped** (11096/20 on `65fab2c6`); `-m eval` **73 passed**;
+> ruff clean on `src/featuregen/materialize/` and `tests/featuregen/materialize/`; **mypy clean on
+> all five touched source files** (`ir.py`, `admission.py`, `resolve.py`, `codes.py`,
+> `compile/chain.py` — no pre-existing errors in this package).
+
 ### Task B4 — governed provenance on the request (1 day) — **migration 1067**
 
 Today `materialization_request` carries a logical group name, an actor, a roles snapshot, an

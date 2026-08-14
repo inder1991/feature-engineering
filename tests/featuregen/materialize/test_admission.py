@@ -539,3 +539,72 @@ def test_admit_artifacts_requires_a_connection():
     import featuregen.materialize.admission as m
 
     assert "conn" in inspect.signature(m.admit_artifacts).parameters
+
+
+# ── check 7: the artifact is the one the human's governed plan described (B3 / D-4) ──────────────
+
+#: The frozen plan envelope for ``total_debit_amount_30d``, in the envelope's OWN dialect: object
+#: refs, with the catalog carried once beside them (``fold_frozen_binding_plan``'s shape).
+_ENVELOPE = {
+    "plan_kind": "single_source",
+    "catalog_source": "hdfc",
+    "source_table": "transactions",
+    "population_ref": "customers",
+    "read_set": ["public.transactions.txn_amt", "public.transactions.txn_dt"],
+    "role_bindings": {"amount": "public.transactions.txn_amt"},
+    "pit": "trailing 30d observation window over txn_dt events",
+    "output_grain": "customer",
+    "window": 30,
+}
+
+
+def test_an_artifact_matching_its_frozen_plan_is_admitted(catalog, resolved_run) -> None:
+    """Check 7 through the REAL gate, and the envelope is carried onto the admitted artifact so
+    ``compile_ir`` validates the same object this gate did — never a second read of it."""
+    admitted = admit_artifacts(
+        catalog, [dataclasses.replace(_input(resolved_run), plan_envelope=_ENVELOPE)])
+    assert admitted[0].plan_envelope == _ENVELOPE
+
+
+def test_an_artifact_at_a_DIFFERENT_GRAIN_than_its_plan_is_refused(catalog, resolved_run) -> None:
+    """The governed plan said this option computes per customer; the artifact does not. They are
+    not the same feature, and the gate never substitutes one for the other."""
+    with pytest.raises(MaterializationRefused) as excinfo:
+        admit_artifacts(catalog, [dataclasses.replace(
+            _input(resolved_run), plan_envelope={**_ENVELOPE, "output_grain": "merchant"})])
+    assert excinfo.value.code is CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE
+
+
+def test_an_artifact_reading_a_DIFFERENT_TABLE_than_its_plan_is_refused(
+        catalog, resolved_run) -> None:
+    with pytest.raises(MaterializationRefused) as excinfo:
+        admit_artifacts(catalog, [dataclasses.replace(
+            _input(resolved_run), plan_envelope={**_ENVELOPE, "source_table": "cards"})])
+    assert excinfo.value.code is CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE
+    assert "cards" in excinfo.value.detail
+
+
+def test_an_input_with_NO_envelope_is_admitted_exactly_as_before(catalog, resolved_run) -> None:
+    """Every work item written before migration 1068 carries no envelope. Refusing them would make
+    B3 a breaking change to a governed lane rather than a check added to it — and the admitted
+    artifact must be IDENTICAL apart from the field itself."""
+    with_none = admit_artifacts(catalog, [_input(resolved_run)])[0]
+    with_empty = admit_artifacts(
+        catalog, [dataclasses.replace(_input(resolved_run), plan_envelope={})])[0]
+    assert with_none.plan_envelope is None
+    # Carried verbatim (an empty envelope is not silently normalized to `None` — the artifact
+    # records what it was admitted against), and identical in every other field.
+    assert with_empty.plan_envelope == {}
+    assert dataclasses.replace(with_empty, plan_envelope=None) == with_none
+
+
+def test_the_envelope_is_outside_the_intent_hash(catalog, resolved_run) -> None:
+    """Check 6's proof is untouched by B3. The envelope is PROVENANCE, not an input to identity:
+    two inputs differing only in it re-hash to the same ``intent_hash`` and both admit."""
+    from featuregen.materialize.authoring_trace import authoring_intent_hash
+
+    plain = _input(resolved_run)
+    carried = dataclasses.replace(plain, plan_envelope=_ENVELOPE)
+    assert authoring_intent_hash(plain.intent) == authoring_intent_hash(carried.intent)
+    assert admit_artifacts(catalog, [plain])[0].formula_content_hash == (
+        admit_artifacts(catalog, [carried])[0].formula_content_hash)

@@ -59,7 +59,7 @@ still covers both element kinds without minting a second rule here. See :func:`_
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -296,6 +296,7 @@ def compile_ir(
     bridge_realizations: tuple[CurrentBridgeRealizationV1, ...] | None = None,
     crosswalks: tuple[AdmittedCrosswalkV1, ...] = (),
     execution_tier: ExecutionTier = ExecutionTier.PRODUCTION,
+    plan_envelope: Mapping[str, Any] | None = None,
 ) -> FormulaExecutionIRV1 | MaterializationRefused:
     """Compile ONE admitted feature into its complete executable plan, or refuse it (§2).
 
@@ -305,9 +306,20 @@ def compile_ir(
     1. the spine declaration, validated by Task 4 against the governed facts — a group with no
        attested population has nothing for its features to land on, so it is answered first;
     2. the formula's grain ENTITY against the population's;
-    3. every body expression, in Child-1's own path order, via ``compile_expression``.
+    3. every body expression, in Child-1's own path order, via ``compile_expression``;
+    4. **the frozen plan envelope, AFTER the IR is complete** (D-4, task B3) — see
+       :func:`_validate_plan_envelope`. It runs last because everything it compares (the resolved
+       read set, the compiled PIT window, the validated population) exists only once the first
+       three have produced an IR.
 
     Only the reported code depends on that order; every branch refuses.
+
+    ``plan_envelope`` is the plan the option was SERVED with, frozen at generation
+    (``recipe_planning_lens.fold_frozen_binding_plan`` → ``semantic_option_decision.binding_plan``,
+    migration 1066 → the work item, migration 1068). Compilation does not consume it as an input:
+    it derives every answer exactly as it did before and then **refuses on divergence**, never
+    substitutes. ``None`` — every run whose work item predates B2, and every direct caller — compiles
+    byte-for-byte as before.
 
     The declaration is validated on every call rather than once per group. §4 requires it to be
     declared once per materialization CONTRACT, and that is enforced where the group exists — in
@@ -362,7 +374,7 @@ def compile_ir(
         expressions.append(compiled)
 
     body = formula.body
-    return FormulaExecutionIRV1(
+    compiled_ir = FormulaExecutionIRV1(
         feature_name=admitted.feature_name,
         formula_content_hash=admitted.formula_content_hash,
         final_operation=body.final_operation,
@@ -381,6 +393,145 @@ def compile_ir(
         spine=spine,
         output_policy=formula.output,
         authoring_run_id=admitted.authoring_run_id)
+    divergence = _validate_plan_envelope(compiled_ir, plan_envelope)
+    return compiled_ir if divergence is None else divergence
+
+
+# ── D-4: the frozen plan envelope is CONSUMED, never re-derived (task B3) ────────────────────────
+
+
+def _envelope_ref(catalog_source: str, ref: str) -> tuple[str, str, str, str]:
+    """One ref as ``(source, schema, table, column)``, case-folded — from EITHER vocabulary.
+
+    The two sides do not speak the same dialect and pretending they do is how this check would
+    quietly pass everything. The compiler emits governed LOGICAL refs
+    (``bank::public.txns.txn_amt``); the frozen envelope's ``read_set`` is the semantic context's
+    OBJECT refs (``public.txns.txn_amt``) with the catalog carried once, beside them, as
+    ``catalog_source`` — which is exactly why ``assemble_current_activation_state`` has to
+    ``normalize_ref(frozen.plan_catalog_source, *ref.split('.')[-3:])`` before it can ask anything
+    about them. Both shapes are accepted, and the LAST three path segments are what name the
+    column, so a ref that carries its own source is not read as one whose schema is ``bank::public``.
+    A RELATION ref (``bank::public.txns``) folds to an empty ``column`` rather than being shifted
+    one segment left — read as a column it would name a table called ``txns`` in a schema called
+    ``public``, and would then compare equal to nothing and unequal to everything.
+    """
+    source, sep, path = ref.partition("::")
+    if not sep:
+        source, path = catalog_source, ref
+    parts = [part.strip().lower() for part in path.split(".")]
+    if len(parts) >= 3:
+        schema, table, column = parts[-3], parts[-2], parts[-1]
+    elif len(parts) == 2:
+        schema, table, column = parts[0], parts[1], ""
+    else:
+        schema, table, column = "", parts[0], ""
+    return source.strip().lower(), schema, table, column
+
+
+def _allowed_additions(ir: FormulaExecutionIRV1, catalog_source: str) -> set[tuple[str, ...]]:
+    """The refs compilation legitimately reads that the human's plan never named.
+
+    The comparison is a SUBSET, not an equality, and this function is the whole reason it is safe
+    to be one — it says precisely which additions are permitted, so a join hop, a bridge endpoint
+    or a filter column the human never saw is a divergence rather than an unremarked widening.
+
+    Exactly three classes, and all three are structural rather than incidental:
+
+    * **the SPINE's own columns.** ``fold_frozen_binding_plan``'s read set is the bound operand
+      refs — the columns the recipe's roles resolved to. The population is a separate governed
+      declaration (§4) validated at compile time, and its source relation, ordered keys, read set
+      and availability column are read by every group compiled against it. The envelope names the
+      population by table (``population_ref``), never by column, so its columns cannot be in the
+      read set and their absence is not evidence of anything.
+    * **each expression's AVAILABILITY column** (§8 rule 1). Every row an expression aggregates is
+      admitted or excluded by it, so it is read whether or not anything else names it — and it is a
+      governed catalog FACT about the table, not a role the recipe bound, so the semantic engine
+      never had it to freeze.
+    * **each expression's SOURCE RELATION** — the table itself, which enters the read set as a
+      relation element (``RefRole.SOURCE_TABLE``) while the envelope names it once, by table, as
+      ``source_table``. Comparing it here would ask the same question twice in two vocabularies;
+      it is admission's check 7 that owns it, and that check has already run by the time an IR
+      exists.
+    """
+    spine = ir.spine
+    extra = {spine.source_table_ref, *spine.ordered_key_refs, *spine.read_set}
+    if spine.availability_ref is not None:
+        extra.add(spine.availability_ref)
+    for expression in ir.expressions:
+        extra.add(expression.pit.availability_ref)
+        extra.update(ref.logical_ref for ref in expression.physical_read_set
+                     if RefRole.SOURCE_TABLE in ref.roles)
+    return {_envelope_ref(catalog_source, ref) for ref in extra}
+
+
+def _validate_plan_envelope(
+    ir: FormulaExecutionIRV1, envelope: Mapping[str, Any] | None
+) -> MaterializationRefused | None:
+    """``None``, or the divergence between what was compiled and what the human was shown (D-4).
+
+    ⚠️ **NOTHING HERE SUBSTITUTES.** The IR is already complete when this runs; every check reads
+    it and compares, and the only outcome other than ``None`` is a refusal naming BOTH sides. That
+    is the same law ``fold_frozen_binding_plan`` applies to itself with ``BINDING_PLAN_DIVERGENCE``
+    and ``govern.py`` applies at the governing write.
+
+    ⚠️ **AN ABSENT ENVELOPE, AND AN ABSENT FIELD, ASSERT NOTHING.** A run with no envelope compiles
+    exactly as it did before B3; a field the envelope left blank (``window`` is ``None`` for a recipe
+    with no window parameter, ``population_ref`` is absent on an intent that declared none) is not
+    a claim that compilation must match. Reading absence as an assertion would refuse the majority
+    of genuine features for having been served by an earlier build.
+
+    **What is NOT checked, and why — a correction to the task as authored.** B3 asks that "the
+    compiled ``PitSpec``'s rendered clause must match ``envelope['pit']``". There is no such clause:
+    ``PitSpec`` carries structured fields and renders no text anywhere in ``materialize/``, while
+    ``envelope['pit']`` is the human-facing PROSE ``recipe_temporal_v2.compile_temporal`` writes
+    (*"trailing 90d observation window over posting_ts events: (cutoff − 90d, cutoff], values
+    knowable strictly at or before the cutoff"*). The two are not two spellings of one thing, and
+    re-parsing that prose to manufacture a comparison would be the second derivation D-4 exists to
+    forbid. What the two sides genuinely share is the WINDOW, which the envelope froze as a number,
+    and that is compared below.
+    """
+    if not envelope:
+        return None
+    catalog_source = str(envelope.get("catalog_source") or "")
+
+    declared_read_set = envelope.get("read_set") or ()
+    if declared_read_set:
+        frozen = {_envelope_ref(catalog_source, str(ref)) for ref in declared_read_set}
+        compiled = {_envelope_ref(catalog_source, ref)
+                    for ref in physical_read_set([ir], ir.spine)}
+        unexplained = compiled - frozen - _allowed_additions(ir, catalog_source)
+        if unexplained:
+            return _refuse(
+                CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE,
+                f"{ir.feature_name} compiles to read "
+                f"{sorted('.'.join(part for part in ref if part) for ref in unexplained)}, which "
+                f"the frozen plan's read set does not name and which is neither a spine column nor "
+                f"an availability gate: the human approved reading "
+                f"{sorted(str(ref) for ref in declared_read_set)} in catalog "
+                f"{catalog_source!r}")
+
+    declared_population = str(envelope.get("population_ref") or "").strip().lower()
+    if declared_population:
+        _source, _schema, table, _column = _envelope_ref(
+            catalog_source, ir.spine.source_table_ref)
+        if table != declared_population:
+            return _refuse(
+                CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE,
+                f"{ir.feature_name} lands on the population "
+                f"{ir.spine.source_table_ref!r}, but the frozen plan the option was served with "
+                f"declares population_ref={envelope.get('population_ref')!r}")
+
+    declared_window = envelope.get("window")
+    if isinstance(declared_window, int) and not isinstance(declared_window, bool):
+        for expression in ir.expressions:
+            if expression.pit.window_length != declared_window:
+                return _refuse(
+                    CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE,
+                    f"{ir.feature_name}/{expression.expr_path} compiles a window of "
+                    f"{expression.pit.window_length} {expression.pit.window_unit}, but the frozen "
+                    f"plan the option was served with declares window={declared_window!r} "
+                    f"({envelope.get('pit')!r})")
+    return None
 
 
 # ── Gate 2 (§1.3) ────────────────────────────────────────────────────────────────────────────────

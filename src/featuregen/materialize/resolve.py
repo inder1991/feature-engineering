@@ -43,7 +43,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from featuregen.contracts.db import DbConn
 from featuregen.formula.control import FormulaControlFlow
@@ -67,8 +67,8 @@ __all__ = ["ResolvedFeature", "resolve_feature_inputs"]
 #: The columns of ONE ``recipe_formula_shadow_work_item`` that carry an authoring intent. Read-only
 #: use of a store `overlay/upload/` owns: this module never writes it.
 _SELECT_WORK_ITEM = (
-    "SELECT recipe_id, provider_input_json FROM recipe_formula_shadow_work_item "
-    "WHERE work_item_id = %s"
+    "SELECT recipe_id, provider_input_json, binding_plan_json "
+    "FROM recipe_formula_shadow_work_item WHERE work_item_id = %s"
 )
 _SELECT_MANIFEST_VERSIONS = (
     "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s"
@@ -94,6 +94,13 @@ class ResolvedFeature:
     authoring_run_id: str
     intent_hash: str
     input: ResolvedFeatureInput
+    #: B3 — the FROZEN PLAN ENVELOPE the served option was built from (migration 1066, carried on
+    #: the work item by 1068), or ``None`` for a work item written before B2. PROVENANCE, not a
+    #: second intent: it is deliberately outside ``authoring_intent_hash``'s five fields, so the
+    #: check-6 proof is untouched by its presence or absence. Duplicated onto ``input`` for the same
+    #: reason ``authoring_run_id`` is duplicated here — the gate that consumes it should not have to
+    #: reach through the other object to find it.
+    plan_envelope: Mapping[str, Any] | None = None
 
 
 def resolve_feature_inputs(
@@ -153,7 +160,7 @@ def _require_a_well_formed_group(work_item_ids: Sequence[str]) -> tuple[str, ...
 def _resolve_one(conn: DbConn, work_item_id: str) -> ResolvedFeature:
     """Reconstruct ONE feature's admission input from its durable identity."""
     run_id = _authoring_run_id(work_item_id)
-    intent = _read_intent(conn, work_item_id)
+    intent, envelope = _read_intent(conn, work_item_id)
     intent_hash = _verify_manifest_intent(conn, run_id, intent, work_item_id)
     result = _restore_result(conn, run_id, intent_hash, work_item_id)
     _require_resolved(result, run_id, work_item_id)
@@ -161,7 +168,9 @@ def _resolve_one(conn: DbConn, work_item_id: str) -> ResolvedFeature:
         work_item_id=work_item_id,
         authoring_run_id=run_id,
         intent_hash=intent_hash,
-        input=ResolvedFeatureInput(intent=intent, result=result),
+        input=ResolvedFeatureInput(
+            intent=intent, result=result, plan_envelope=envelope),
+        plan_envelope=envelope,
     )
 
 
@@ -176,8 +185,10 @@ def _authoring_run_id(work_item_id: str) -> str:
     return "far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24]
 
 
-def _read_intent(conn: DbConn, work_item_id: str) -> AuthoringIntent:
-    """The authoring intent a work item was worked under.
+def _read_intent(
+    conn: DbConn, work_item_id: str
+) -> tuple[AuthoringIntent, Mapping[str, Any] | None]:
+    """The authoring intent a work item was worked under, and its frozen plan envelope.
 
     THE ONE PLACE that knows where an intent's material is durably kept. The projection is
     ``recipe_formula_worker.py:343-349`` verbatim — the same five fields, from the same immutable
@@ -187,11 +198,20 @@ def _read_intent(conn: DbConn, work_item_id: str) -> AuthoringIntent:
     A missing row is NOT an error here: it means the durable identity names nothing, which is the
     same state as a run that never happened, so it is left to :func:`_verify_manifest_intent` and
     the restore to refuse as ``AUTHORING_RUN_INCOMPLETE`` rather than raising a different shape of
-    failure for what is the same fact."""
+    failure for what is the same fact.
+
+    ⚠️ **THE ENVELOPE IS READ, NOT RE-SEALED HERE.** ``binding_plan_json`` carries its own hash on
+    the same row and `verify_work_item_payload` — the shadow store's own verifier, which the
+    authoring worker runs — covers both. This module does not re-check it, because the only correct
+    hasher lives in ``overlay/upload/`` and a copy of it here would be a second implementation of
+    the seal, free to drift. The exposure is bounded and stated rather than implied: the envelope is
+    a CONSTRAINT applied to a compilation that derives its own answers from governed catalog facts,
+    so a tampered envelope can only weaken the divergence check back toward the behaviour before it
+    existed — never widen what a compilation is allowed to read."""
     row = conn.execute(_SELECT_WORK_ITEM, (work_item_id,)).fetchone()
     if row is None:
-        return AuthoringIntent(name="", hypothesis="", target_entity="")
-    recipe_id, provider_input = row
+        return AuthoringIntent(name="", hypothesis="", target_entity=""), None
+    recipe_id, provider_input, binding_plan = row
     material = provider_input if isinstance(provider_input, Mapping) else {}
     expectation = material.get("formula_expectation")
     grain_keys = (
@@ -205,7 +225,7 @@ def _read_intent(conn: DbConn, work_item_id: str) -> AuthoringIntent:
         # rebuild as `{}` and not as `None`: those hash differently, and `None` here would refuse a
         # genuine feature at check 6. Keyed off the column's shape, never off its truthiness.
         recipe_authoring_context=dict(material) if isinstance(provider_input, Mapping) else None,
-    )
+    ), (dict(binding_plan) if isinstance(binding_plan, Mapping) else None)
 
 
 def _verify_manifest_intent(

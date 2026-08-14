@@ -85,6 +85,17 @@ class CompilationRefusalCode(StrEnum):
     PARTITION_IDENTITY_UNKNOWN = "PARTITION_IDENTITY_UNKNOWN"
     UNACCOUNTED_LOGICAL_REF = "UNACCOUNTED_LOGICAL_REF"
 
+    #: D-4: what was compiled is not what the human's governed plan said. The frozen plan envelope
+    #: (`semantic_option_decision.binding_plan`, migration 1066, carried to compilation on the work
+    #: item by 1068) names the source table, the population, the read set, the grain and the window
+    #: the option was SERVED with; compilation derives its own answers from governed catalog facts,
+    #: and this code fires when the two disagree. It is a COMPILATION refusal — decided from
+    #: governed metadata alone, before a row is read — and it is never a substitution: the envelope
+    #: is validated against, never used to overwrite what compilation computed, exactly as
+    #: `fold_frozen_binding_plan` applies `BINDING_PLAN_DIVERGENCE` to itself. A run that carries no
+    #: envelope (every work item written before migration 1068) cannot raise it.
+    PLAN_ENVELOPE_DIVERGENCE = "PLAN_ENVELOPE_DIVERGENCE"
+
 
 class PublicationRefusalCode(StrEnum):
     """Publication decisions — the group may have computed, but must not publish.

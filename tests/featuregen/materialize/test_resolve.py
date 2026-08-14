@@ -252,7 +252,9 @@ def test_a_look_alike_intent_is_refused_by_ADMISSIONS_check_6(catalog, resolvabl
     (resolved,) = resolve_feature_inputs(catalog, work_item_ids=[resolvable])
     assert admit_artifacts(catalog, [resolved.input])
 
-    swapped = dataclasses.replace(resolved.input, intent=_look_alike(resolved.input.intent))
+    swapped = dataclasses.replace(
+        resolved.input,
+        intent=_look_alike((resolved.input.intent, resolved.plan_envelope))[0])
 
     with pytest.raises(MaterializationRefused) as e:
         admit_artifacts(catalog, [swapped])
@@ -277,13 +279,18 @@ def test_the_fifth_intent_field_is_inside_the_proof(catalog, resolvable) -> None
     assert e.value.code is CompilationRefusalCode.INTENT_HASH_MISMATCH
 
 
-def _look_alike(intent):
+def _look_alike(read):
     """Same name, same entity, same grain keys — a different hypothesis. Everything a
-    self-consistency check would compare still agrees."""
+    self-consistency check would compare still agrees.
+
+    ``_read_intent`` returns ``(intent, plan_envelope)`` since B3, and the envelope is passed
+    through UNCHANGED: the look-alike must differ in the intent alone, or the test would be proving
+    something about the envelope instead of about check 6."""
+    intent, envelope = read
     return type(intent)(
         name=intent.name, hypothesis="a hypothesis nobody authored under",
         target_entity=intent.target_entity, target_grain_keys=intent.target_grain_keys,
-        recipe_authoring_context=intent.recipe_authoring_context)
+        recipe_authoring_context=intent.recipe_authoring_context), envelope
 
 
 def test_the_seam_refuses_a_mismatched_manifest_before_it_gets_that_far(

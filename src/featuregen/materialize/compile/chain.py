@@ -459,8 +459,11 @@ def compile_feature_group(
 
     irs: list[FormulaExecutionIRV1] = []
     for feature in admitted:
+        # B3/D-4: the envelope admission validated this artifact against is the one compilation is
+        # held to — carried on the admitted feature, never re-read from anywhere else.
         compiled = compile_ir(conn, feature, roles=roles, spine_decl=spine_declaration,
-                              inventory=inventory, execution_tier=execution_tier)
+                              inventory=inventory, execution_tier=execution_tier,
+                              plan_envelope=feature.plan_envelope)
         if isinstance(compiled, MaterializationRefused):
             return stop.refused(ChainStage.COMPILE, compiled)
         irs.append(compiled)

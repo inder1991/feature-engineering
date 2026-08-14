@@ -82,6 +82,7 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from featuregen.contracts.db import DbConn
 
@@ -94,6 +95,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.formula.canonical import formula_content_hash as _formula_content_hash
 from featuregen.formula.result import AuthoringResult
 from featuregen.formula.schema import SchemaError, TypedFormulaV1
+from featuregen.formula.schema import body_expressions as _body_expressions
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.materialize import authoring_trace as _trace
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
@@ -152,6 +154,12 @@ class ResolvedFeatureInput:
 
     intent: AuthoringIntent
     result: AuthoringResult
+    #: B3 — the FROZEN PLAN ENVELOPE the served option was built from, or ``None`` for an input
+    #: whose work item predates migration 1068. It is PROVENANCE the gate validates against, never
+    #: an input to the intent hash: check 6 re-derives ``authoring_intent_hash`` from the five
+    #: fields of ``intent`` and this field is not one of them, so an envelope's presence, absence or
+    #: content cannot move that digest.
+    plan_envelope: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +176,9 @@ class AdmittedFeature:
     formula_content_hash: str
     intent: AuthoringIntent
     authoring_run_id: str
+    #: The envelope this artifact was ADMITTED against, carried forward so ``compile_ir`` validates
+    #: the same object check 7 did rather than re-reading it from somewhere else.
+    plan_envelope: Mapping[str, Any] | None = None
 
 
 def admit_artifacts(
@@ -202,6 +213,7 @@ def _admit_one(conn: DbConn, item: ResolvedFeatureInput) -> AdmittedFeature:
     _verify_schema_version(formula, run_id)                              # 4b (BR-6)
     _verify_axes(event, result, run_id)                                  # 5
     _verify_intent_hash(conn, item.intent, run_id)                       # 6
+    _verify_plan_envelope(formula, item.plan_envelope, run_id)           # 7 (B3)
 
     return AdmittedFeature(
         feature_name=hive_identifier(item.intent.name),
@@ -209,6 +221,7 @@ def _admit_one(conn: DbConn, item: ResolvedFeatureInput) -> AdmittedFeature:
         formula_content_hash=content_hash,
         intent=item.intent,
         authoring_run_id=run_id,
+        plan_envelope=item.plan_envelope,
     )
 
 
@@ -400,6 +413,73 @@ def _verify_intent_hash(conn: DbConn, intent: AuthoringIntent, run_id: str) -> N
             f"the intent supplied for authoring run {run_id} hashes to {supplied}, but the run's "
             f"manifest records intent_hash={recorded!r}",
         )
+
+
+# ── 7. the artifact is the one the human's governed plan described (D-4) ─────────────────────────
+
+
+def _verify_plan_envelope(
+    formula: TypedFormulaV1, envelope: Mapping[str, Any] | None, run_id: str
+) -> None:
+    """``PLAN_ENVELOPE_DIVERGENCE`` unless the artifact matches the plan the option was served with.
+
+    THE ARTIFACT-SHAPED HALF of D-4, and it is deliberately small: this gate holds a formula and an
+    intent, not a compilation, so it can answer exactly two of the envelope's questions — the grain
+    entity the feature is computed at, and the relation its expressions read. The rest of the
+    envelope (the read set, the population, the window) is only knowable once physical resolution
+    has run, and is checked in :func:`~featuregen.materialize.ir.compile_ir`, after compiling.
+
+    ⚠️ **A missing envelope is not a failure, and must not become one.** Every work item written
+    before migration 1068 carries none, and the whole materialization path predates the envelope;
+    refusing them here would make B3 a breaking change to a governed lane rather than a check added
+    to it. Likewise a BLANK field inside an envelope is not an assertion — ``output_grain`` is ``""``
+    for a planning request that declared none — so only what the envelope actually states is
+    compared.
+
+    Case is folded on both sides for the same reason ``fold_frozen_binding_plan`` folds it on the
+    UOA: the catalog says ``Customer``, the planning grain says ``customer``, and a capitalization
+    is not a different unit of analysis.
+    """
+    if not envelope:
+        return
+    declared_grain = str(envelope.get("output_grain") or "").strip().lower()
+    if declared_grain and formula.grain.entity.strip().lower() != declared_grain:
+        raise MaterializationRefused(
+            CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE,
+            f"authoring run {run_id}: the artifact is computed at "
+            f"{formula.grain.entity!r} grain, but the frozen plan the option was served with says "
+            f"output_grain={envelope.get('output_grain')!r}. The governed plan and the artifact "
+            f"are not the same feature, and compilation never substitutes one for the other",
+        )
+    declared_table = str(envelope.get("source_table") or "").strip().lower()
+    declared_catalog = str(envelope.get("catalog_source") or "").strip().lower()
+    if not declared_table:
+        return
+    for path, expression in _body_expressions(formula.body):
+        source, schema, table = _split_table_ref(expression.source_relation.table_ref)
+        if table != declared_table or (declared_catalog and source != declared_catalog):
+            raise MaterializationRefused(
+                CompilationRefusalCode.PLAN_ENVELOPE_DIVERGENCE,
+                f"authoring run {run_id}: {path} reads "
+                f"{expression.source_relation.table_ref!r} ({source}::{schema}.{table}), but the "
+                f"frozen plan the option was served with names source_table="
+                f"{envelope.get('source_table')!r} in catalog "
+                f"{envelope.get('catalog_source')!r}",
+            )
+
+
+def _split_table_ref(table_ref: str) -> tuple[str, str, str]:
+    """``(source, schema, table)`` from a ``source::schema.table`` logical ref, case-folded.
+
+    Parsed here rather than through ``object_ref.parse_ref`` because a malformed ref must not raise
+    a bare ``ValueError`` out of a governed gate (§14): an unparseable relation simply compares
+    unequal to whatever the envelope declared, and is refused as the divergence it is.
+    """
+    source, _, path = table_ref.partition("::")
+    parts = path.split(".")
+    schema = parts[0] if len(parts) > 1 else ""
+    table = parts[-1] if parts else ""
+    return source.strip().lower(), schema.strip().lower(), table.strip().lower()
 
 
 # ── the feature name (spec §1.2, final paragraph) ────────────────────────────────────────────────
