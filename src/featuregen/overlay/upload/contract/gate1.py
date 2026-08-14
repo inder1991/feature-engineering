@@ -1269,6 +1269,10 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
     # snapshots keep their historical bytes).
     if f.param_alternatives:
         d["param_alternatives"] = f.param_alternatives
+    # D3 1b: the typed operation class — ADDITIVE-when-present, so pre-D3 payloads stay
+    # byte-identical (the byte-identity pin holds) and engine cards carry the browsing axis.
+    if getattr(f, "operation_class", ""):
+        d["operation_class"] = f.operation_class
     return d
 
 
@@ -1511,6 +1515,7 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         name=d["name"], description=d.get("description", ""),
         derives_from=list(d.get("derives_from", [])),
         aggregation=d.get("aggregation"), grain_table=d.get("grain_table"),
+        operation_class=d.get("operation_class", ""),
         derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])),
         verification=d.get("verification", "DESIGN-CHECKED"),      # was dropped pre-3A-ii
         critic_note=d.get("critic_note", ""),                      # was dropped pre-3A-ii

@@ -328,6 +328,9 @@ export interface FeatureIdea {
   // Task 4b (flag-gated server-side): the recipe's untaken parameterisations, chosen value
   // marked — "window: 30/[90]/180". Presentation only; absent when there is nothing to choose.
   param_alternatives?: string
+  // D3 1b: the TYPED operation class (closed RESULT_CLASS_ADDITIVITY vocabulary) — the
+  // browsing axis. "" / absent for conceptual patterns and free-form ideas.
+  operation_class?: string
   // SE-12: the honest tri-state the backend has always computed (DESIGN_CHECKED |
   // NEEDS_EXTERNAL_VALIDATION) — a SEPARATE axis from the hyphenated `verification` stamp.
   // Absent on pre-Slice-3 snapshots; an unknown value from a newer backend must still render.

@@ -1201,7 +1201,8 @@ describe('SE-12: the honest tri-state, typed inputs, and outstanding checks', ()
     expect(inputs).toHaveTextContent('when')
     expect(inputs).toHaveTextContent('human/confirmed')
     // Only the proposed binding asks for Gate-1 confirmation; the confirmed one is settled.
-    expect(screen.getAllByText('needs confirmation')).toHaveLength(1)
+    // D3 (UI-06): the chip became a deep LINK to the asset field-decision screen.
+    expect(screen.getAllByText('needs confirmation →')).toHaveLength(1)
   })
 
   it('renders outstanding checks as tasks, with the backend prose as fine print', async () => {
@@ -2774,5 +2775,56 @@ describe('D3: the audit drawer', () => {
     await renderAndGenerateRaw()
     await userEvent.click(await screen.findByRole('button', { name: 'Decision record' }))
     expect(await screen.findByText(/No stored decision record/)).toBeInTheDocument()
+  })
+})
+
+describe('D3: operation-class grouping, buildability, and the deep link', () => {
+  it('groups the list by typed operation class with fact headings', async () => {
+    const flows = { ...idea('net_flow'), operation_class: 'sum' }
+    const ratios = { ...idea('util_ratio'), operation_class: 'ratio' }
+    const conceptual = idea('pattern_idea')                 // no class — conceptual
+    contractConsideredSet.mockResolvedValueOnce(
+      considered(singleSetRound([flows, ratios, conceptual])))
+    await renderAndGenerateRaw()
+    expect(await screen.findByRole('heading', { name: 'Flows & sums' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Ratios & utilization' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Conceptual patterns' })).toBeInTheDocument()
+  })
+
+  it('a single-class round keeps the flat list — no heading noise', async () => {
+    const a = { ...idea('flow_a'), operation_class: 'sum' }
+    const b = { ...idea('flow_b'), operation_class: 'sum' }
+    contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([a, b])))
+    await renderAndGenerateRaw()
+    await screen.findByText('flow_a')
+    expect(screen.queryByRole('heading', { name: 'Flows & sums' })).not.toBeInTheDocument()
+  })
+
+  it('renders the server buildability verdict and links confirmation to the exact field', async () => {
+    const card = {
+      ...idea('gated'),
+      input_role_bindings: [{
+        role: 'who', ref: ['cib', 'public.accounts.customer_id'] as [string, string],
+        authority: 'llm/proposed', confirmation_required: true,
+      }],
+    }
+    const cs = considered(singleSetRound([card]))
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce({
+      ...cs, contract_version: 2,
+      recommended_options: [{
+        option_id: optionId, name: null, recipe_id: 'r', binding_state: 'bound',
+        allowed_actions: ['save_idea'],
+        blocked_actions: { create_contract: [{
+          code: 'PROPOSED_METADATA_ONLY',
+          next_step: 'confirm the AI-proposed concept(s) in the Governance screen',
+        }] },
+      }],
+    })
+    await renderAndGenerateRaw()
+    expect(await screen.findByText(/confirm the AI-proposed concept/)).toBeInTheDocument()
+    const link = screen.getByText('needs confirmation →') as HTMLAnchorElement
+    expect(link.getAttribute('href')).toBe(
+      '#asset?source=cib&object_ref=public.accounts.customer_id')
   })
 })

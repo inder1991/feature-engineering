@@ -1072,6 +1072,21 @@ hash mints a new id.
 *Acceptance:* screen tests per section; the deep link carries the exact field; a post-confirm
 regenerate mints a new revision (route already does — test the UI flow).
 
+> **ACCEPTED (2026-08-14).** Drawer (UI-02, shipped with `010b6c13`): on-demand fetch of the
+> STORED decision record by exact key — frozen roles + authorities, the losing shortlist,
+> the frozen plan, family tri-states, revision identity; honest absence for pre-A1b options.
+> 1b: `operation_class` rides the card (FeatureIdea + projection stamps the formula's
+> result_class + both gate1 serializers round-trip it); the browsing list groups under FACT
+> headings from the closed vocabulary ("Flows & sums", "Ratios & utilization", "Conceptual
+> patterns"…) only when ≥2 real groups exist — a single-class round keeps the flat list
+> byte-identical, and group order = first appearance so the engine's ranking still leads.
+> §UI-04: the card carries "can it be built" (the SERVER's verdict — plannable, or the first
+> blocker's named next step) and review currency as its OWN chip (derived from the server's
+> RECIPE_REVIEW_NOT_CURRENT blocker code, never folded into one green badge). UI-06: the
+> needs-confirmation chip is now a deep LINK to `#asset?source=…&object_ref=…` — the exact
+> field, asserted in-test; regeneration on return is the route's existing law. One deliberate
+> relabel ("needs confirmation →").
+
 ### Task D4 — Suggested Features on the shared carrier (1–1½ days)
 
 *Modify:* `suggestions.py`, `suggestion_contract.py`, `SuggestedFeaturesScreen.tsx`,

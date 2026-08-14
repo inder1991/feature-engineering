@@ -51,7 +51,7 @@
 //   row or pull it out of view while its registration is being written.
 // - Scope edits bump the generation sequence so an in-flight round (generate or feedback) that
 //   resolves after the edit is discarded, never applied against the new scope.
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
+import { Fragment, type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
   type OptionActionsEntry,
@@ -636,6 +636,23 @@ function RankedRecipeRow({ recipe, warnings }: { recipe: RankedRecipe; warnings?
   )
 }
 
+// D3 1b — headings are FACTS about the feature (the closed operation-class vocabulary),
+// never names of the prompt that produced it. Unlisted/absent classes read as conceptual.
+const OPERATION_GROUPS: Record<string, string> = {
+  sum: 'Flows & sums', count: 'Counts & frequency', distinct_count: 'Counts & frequency',
+  ratio: 'Ratios & utilization', share: 'Ratios & utilization',
+  recency: 'Recency & activity', extremum: 'Extremes & thresholds',
+  dispersion: 'Volatility & dispersion', slope: 'Trends & slopes',
+  snapshot: 'Point-in-time state', flag: 'Flags & indicators',
+}
+
+function operationGroup(c: Candidate): string {
+  if (c.kind !== 'generated') return 'Drafts'
+  const klass = c.idea.operation_class ?? ''
+  return OPERATION_GROUPS[klass] ?? 'Conceptual patterns'
+}
+
+
 // D3 — the drawer body: everything rendered here is the STORED record verbatim; nothing is
 // recomputed at read time. Sections: frozen roles + measured authorities, the losing
 // shortlist (the candidates the engine considered and did not choose, with codes), the
@@ -917,6 +934,26 @@ export function WorkbenchScreen() {
     ? (generated ?? []).filter(c => c.kept === true || c.lenses.includes(activeLens))
     : generated ?? []
   const listCandidates: Candidate[] = [...visibleGenerated, ...drafts]
+  // D3 1b: group the browsing list by each candidate's TYPED operation class. Only when at
+  // least two REAL groups exist (else the flat list stays byte-identical); order = first
+  // appearance, so the engine's ranking still decides what leads.
+  const groupOrder: string[] = []
+  for (const c of listCandidates) {
+    const g = operationGroup(c)
+    if (!groupOrder.includes(g)) groupOrder.push(g)
+  }
+  const groupedList: Array<{ heading: string | null; candidate: Candidate }> = []
+  if (groupOrder.length > 1) {
+    for (const g of groupOrder) {
+      let first = true
+      for (const c of listCandidates.filter(x => operationGroup(x) === g)) {
+        groupedList.push({ heading: first ? g : null, candidate: c })
+        first = false
+      }
+    }
+  } else {
+    for (const c of listCandidates) groupedList.push({ heading: null, candidate: c })
+  }
   // One definition per non-empty line: the button label and its gating read this directly.
   const draftLines = describeText.split('\n').map(line => line.trim()).filter(Boolean)
   // Only generated candidates pass the design gauntlet, so the design-checked explanation
@@ -2656,7 +2693,7 @@ export function WorkbenchScreen() {
             </>
           )}
           <ul className="rows">
-            {listCandidates.map(c => {
+            {groupedList.map(({ heading, candidate: c }) => {
               const reg = registered[c.key]
               const gov = governed[c.key]
               const error = errors[c.key]
@@ -2685,6 +2722,19 @@ export function WorkbenchScreen() {
                   ?? 'not yet actionable'
                 : undefined
               const description = c.kind === 'generated' ? c.idea.description : c.description
+              // D3 §UI-04 "can it be built": the SERVER's own verdict — plannable when
+              // create_contract is allowed; else the first blocker's named next step.
+              const buildability = actionsEntry
+                ? (actionsEntry.allowed_actions.includes('create_contract')
+                  ? 'Plannable — a governed contract is available'
+                  : actionsEntry.blocked_actions.create_contract?.[0]?.next_step ?? null)
+                : null
+              // Review currency is its OWN axis (never folded into one green badge): derived
+              // from the server's blocker codes, shown only for recipe-origin cards.
+              const reviewNotCurrent = c.kind === 'generated'
+                && c.idea.generation_source === 'recipe'
+                && (actionsEntry?.blocked_actions.create_contract ?? [])
+                  .some(b => b.code === 'RECIPE_REVIEW_NOT_CURRENT')
               const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
               const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
               const derives = c.kind === 'generated'
@@ -2693,9 +2743,18 @@ export function WorkbenchScreen() {
               const refine = refines[c.key] ?? EMPTY_REFINE
               const refineExhausted = refine.rounds >= FEEDBACK_ROUNDS
               return (
+                <Fragment key={c.key}>
+                {heading !== null && (
+                  <li aria-hidden={false} role="presentation" className="row-group-heading"
+                      style={{ listStyle: 'none', paddingTop: 10 }}>
+                    <h4 style={{ margin: 0, fontSize: 13, color: 'var(--ink-soft)',
+                                 textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                      {heading}
+                    </h4>
+                  </li>
+                )}
                 <li
                   className="row"
-                  key={c.key}
                   id={`wb-row-${c.key}`}
                   tabIndex={-1}
                   style={{ alignItems: 'flex-start' }}
@@ -2748,6 +2807,9 @@ export function WorkbenchScreen() {
                         && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
                         <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
                       )}
+                      {reviewNotCurrent && (
+                        <span className="badge stale">review not current</span>
+                      )}
                       {/* Pinned through a whole-round regeneration. Registered rows skip the
                           chip: Registered is already their mark. */}
                       {c.kind === 'generated' && c.kept === true && !reg && !gov && (
@@ -2765,6 +2827,11 @@ export function WorkbenchScreen() {
                       )}
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
+                    {buildability && (
+                      <p style={{ color: 'var(--ink-soft)', fontSize: 13 }} role="note">
+                        {buildability}
+                      </p>
+                    )}
                     {c.kind === 'generated' && c.idea.rationale && (
                       <p style={{ color: 'var(--ink-soft)' }}>
                         {c.idea.generation_source === 'llm_intent'
@@ -2791,9 +2858,19 @@ export function WorkbenchScreen() {
                             {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
                             {binding.authority && <> · {binding.authority}</>}
                             {binding.confirmation_required && (
-                              <span className="badge stale" style={{ marginLeft: 6 }}>
-                                needs confirmation
-                              </span>
+                              // UI-06: straight to the asset field-decision screen, focused
+                              // on THIS field. Returning regenerates a fresh run — the card
+                              // never self-approves its own metadata.
+                              <a
+                                className="badge stale"
+                                style={{ marginLeft: 6 }}
+                                href={binding.ref
+                                  ? `#asset?source=${encodeURIComponent(binding.ref[0])}`
+                                    + `&object_ref=${encodeURIComponent(binding.ref[1])}`
+                                  : '#governance'}
+                              >
+                                needs confirmation →
+                              </a>
                             )}
                           </li>
                         ))}
@@ -3071,6 +3148,7 @@ export function WorkbenchScreen() {
                     )}
                   </div>
                 </li>
+                </Fragment>
               )
             })}
             {selectedCount > 0 && (

@@ -1656,6 +1656,10 @@ class FeatureIdea:
     grain_ref: tuple[str, str] | None = None              # the grain the feature is computed per
     time_ref: tuple[str, str] | None = None               # the point-in-time column
     window: str | None = None                             # e.g. "90d"
+    # D3 1b: the TYPED operation class (closed RESULT_CLASS_ADDITIVITY vocabulary, e.g.
+    # "sum"/"ratio"/"recency") — the browsing axis. "" for conceptual patterns and
+    # free-form ideas; a heading is a fact about the feature, never a prompt name.
+    operation_class: str = ""
     grouping_refs: tuple[tuple[str, str], ...] = ()       # group-by columns
     # ── Slice 3 tri-state honest status (a NEW axis; `verification` above is unchanged) ──
     validation_status: str = "DESIGN_CHECKED"             # in VALIDATION_STATES
