@@ -209,7 +209,13 @@ def test_the_column_shape_is_pinned(conn) -> None:
     """Name and nullability for every column. The nullable set is the design: ``generation_id``,
     ``run_id`` and ``resolved_input_digest`` are unknown at request time — the whole reason the row
     can exist before any work does — while identity, roles, activation state and lifecycle are known
-    the moment somebody asks."""
+    the moment somebody asks.
+
+    ``considered_revision_id``/``option_id`` (migration **1067**, task B4) are the governed option a
+    human approved, and they are nullable for a different reason than the three above: they are not
+    "unknown yet" but "not applicable" — the work-item-driven path predates the link and must keep
+    working. Stated half-way they are refused, by a CHECK and by the record type; this pin is what
+    made adding them a decision rather than a drift."""
     rows = conn.execute(
         "SELECT column_name, is_nullable FROM information_schema.columns "
         "WHERE table_name = 'materialization_request' ORDER BY column_name").fetchall()
@@ -228,6 +234,8 @@ def test_the_column_shape_is_pinned(conn) -> None:
         "accepted_at": "YES",
         "lease_expires_at": "YES",
         "updated_at": "NO",
+        "considered_revision_id": "YES",
+        "option_id": "YES",
     }
 
 

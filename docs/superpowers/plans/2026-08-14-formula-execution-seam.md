@@ -1420,6 +1420,71 @@ blocker codes** when it is not allowed. The `activation_state` jsonb records the
 - `test_an_allowed_option_mints_a_request_carrying_its_provenance`
 - `test_the_legacy_work_item_path_still_accepts` — nullable FK, proven.
 
+> **ACCEPTED `PENDING-B4` (2026-08-14).** A materialization run now has governed provenance and a
+> blocked option cannot be materialized. Migration **1067** adds `considered_revision_id` +
+> `option_id` to `materialization_request` with a composite FK to
+> `semantic_option_decision (considered_revision_id, option_id)` — 1063's own UNIQUE constraint is
+> the target — nullable because the work-item-driven path predates the link and must keep working.
+> `POST /materialization-runs` accepts the pair, calls `load_frozen_option_facts` +
+> `assemble_current_activation_state` + `activation_decision(…, "execute_materialization", actor)`,
+> and refuses **409 `ACTIVATION_BLOCKED`** carrying every blocker's `code` AND its `next_step` — the
+> same body shape `contract.py` already returns, so a client that renders one renders both. The
+> decision is written verbatim into `activation_state`, which is what that column was for.
+>
+> **PLAN DEFECT: "each of the four §0.3 codes, one case each" is not achievable on this branch, and
+> it is C-phase's absence rather than a test-design problem.** `EXECUTION_AUTHORITY_UNEVALUATED` and
+> `EXECUTION_AUTHORITY_UNMET` are the two arms of ONE rule, so they can never both appear;
+> `formula_schema_supported` and `requirements_closed` are hardwired `False` and
+> `effective_readiness` is the frozen literal until C1/C2/C3, so no fixture can clear them
+> individually without inventing C-phase. **Measured** on a bound option with a frozen plan, the set
+> that actually blocks is `{READINESS_NOT_MATERIALIZATION_READY, FORMULA_SCHEMA_UNSUPPORTED,
+> EXECUTION_AUTHORITY_UNMET}` — `UNMET`, not `UNEVALUATED`, because B1's plan gives the current
+> layer a read set to evaluate, which is exactly the reliability §0.3 predicted B1 would buy. Each
+> is asserted present with its `next_step`, one parametrized case each, and the exact intersection
+> with the six materialization-only codes is asserted rather than a subset.
+>
+> **The positive control is real and reachable**, without which every refusal above could be passing
+> for the wrong reason: `test_an_allowed_option_mints_a_request_carrying_its_provenance` patches
+> **only** `assemble_current_activation_state` (C-phase's job, and its own comment says so) and
+> never `activation_decision` — the real fold over a real frozen `semantic_option_decision` row is
+> what returns `allowed=True`, mints the request and stores the pair.
+>
+> **Deviations and judgements, each deliberate:**
+> (a) **Three refusal shapes, told apart on purpose.** No option key → accept (the legacy path,
+> proven). HALF a key → 422 (an option is addressed by both halves; recording it would put
+> provenance in the table nothing could resolve). A key naming no decision row → **404, not 409**:
+> "this approval does not exist" is a different fact from "this approval is blocked", and a caller
+> chasing the wrong one wastes a governance conversation.
+> (b) **The option key joins `IDEMPOTENT_IDENTITY_FIELDS`.** One idempotency key reused for a
+> DIFFERENT governed option is not a retry — it is a second approval being answered with the first
+> one's run. `test_request_store.py`'s partition assertion forced the decision, which is what that
+> assertion exists for.
+> (c) **The gate runs BEFORE anything is minted**, asserted: a blocked option leaves no request row
+> and no queue row, the same "a typo leaves nothing behind" property the existing pre-flight has.
+> (d) **`test_migration_1053.py::test_the_column_shape_is_pinned` was updated, not bypassed** — it
+> caught the two new columns exactly as designed, and its docstring now records why these two are
+> nullable for a different reason than `generation_id`/`run_id` ("not applicable", not "unknown
+> yet").
+> (e) **`MATCH SIMPLE` plus a CHECK, not `MATCH FULL`.** With the default, a row where either column
+> is NULL satisfies the FK, so the legacy path is unconstrained while a *stated* pair must be real;
+> the half-stated case is closed by its own named CHECK so the error says "an option is named by
+> BOTH halves" instead of quoting a foreign key.
+>
+> **The migration is audited against a POPULATED table:** the link is dropped, a request is seeded
+> in the pre-1067 shape, and 1067's own SQL is run against it — the ALTER lands, 1053's `updated_at`
+> trigger is never reached (`updated_at` is byte-identical afterwards), no value is backfilled, the
+> legacy row still reads, and the new constraints then bite (a pair naming no decision row is
+> refused by the FK, half a key by the CHECK). Re-runnability is proved by applying it twice.
+>
+> **Two mutants were run before the tests were trusted:** a gate that never refuses (5 failures) and
+> a route that validates but never records the provenance (2).
+>
+> 13 cases in `tests/featuregen/api/test_materialization_option_link.py`, 1 pin updated in
+> `test_migration_1053.py`.
+> Gates: full suite **11128 passed, 20 skipped** (11115/20 on `30ad17de`); `-m eval` **73 passed**;
+> ruff clean and **mypy clean** on both touched source files (`materialization_runs.py`,
+> `request_store.py` — no pre-existing errors in either).
+
 ---
 
 ## 4. Phase C — engine capability registration *(weld 4)*

@@ -173,6 +173,12 @@ class MaterializationRunIn(BaseModel):
     published_schema: list[str] | None = None
     #: §5.4's declared tightenings, if any.
     contract_overrides: dict[str, Any] | None = None
+    #: B4 — the GOVERNED OPTION this run is being asked for: the exact
+    #: ``semantic_option_decision (considered_revision_id, option_id)`` a human acted on. Optional
+    #: as a PAIR, because the work-item-driven path predates the link and must keep working; stated
+    #: half-way it is a 422, because half a key names no approval.
+    considered_revision_id: str | None = None
+    option_id: str | None = None
 
 
 @router.post("/materialization-runs", status_code=202,
@@ -195,10 +201,11 @@ def trigger_materialization(
     _require_usable_identifiers(body)
     members = _well_formed_group(body.work_item_ids)
     _require_every_member_exists(conn, members)
+    activation = _require_the_option_allows_materialization(conn, body, identity)
     minted = mint_id(_REQUEST_PREFIX)
     job = _job(minted, members, body)
 
-    recorded = _record(conn, minted, body, members, identity)
+    recorded = _record(conn, minted, body, members, identity, activation)
     duplicate = recorded.request_id != minted
     if duplicate:
         # The stored request is the one being answered about, and the message id is derived from it.
@@ -226,6 +233,8 @@ def trigger_materialization(
         "logical_group_name": recorded.logical_group_name,
         "lifecycle_state": recorded.lifecycle_state.value,
         "work_item_ids": list(members),
+        "considered_revision_id": recorded.considered_revision_id,
+        "option_id": recorded.option_id,
         "queue_id": queue_id,
         "duplicate": duplicate,
         "detail": ("this idempotency key already named a materialization request; it is still "
@@ -264,6 +273,8 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
         "authorized_roles": list(stored.authorized_roles),
         "idempotency_key": stored.idempotency_key,
         "activation_state": dict(stored.activation_state),
+        "considered_revision_id": stored.considered_revision_id,
+        "option_id": stored.option_id,
         "lifecycle_state": stored.lifecycle_state.value,
         "terminal": stored.lifecycle_state.is_terminal(),
         "generation_id": stored.generation_id,
@@ -361,6 +372,78 @@ def _require_every_member_exists(conn: psycopg.Connection, members: tuple[str, .
                    f"members), and an id naming no row could never be resolved")
 
 
+#: The activation ACTION this surface asks about. One string, in one place, so the route and the
+#: policy cannot come to disagree about which rung of the five-rung ladder a compile sits on.
+_MATERIALIZATION_ACTION = "execute_materialization"
+
+
+def _require_the_option_allows_materialization(
+    conn: psycopg.Connection, body: MaterializationRunIn, identity: IdentityEnvelope,
+) -> dict[str, Any]:
+    """The GOVERNED gate (B4): a blocked option cannot be materialized, and the refusal SAYS WHY.
+
+    Returns what will be recorded in ``activation_state`` — the decision verbatim, which is what
+    that column was for (``request_store.py:203-206`` calls it *"evidence about the world the
+    decision was made in"*).
+
+    **The two layers are both real reads, and neither is asserted.** ``load_frozen_option_facts``
+    returns what the human was SHOWN, frozen at generation; ``assemble_current_activation_state``
+    re-reads what is true NOW (is the review still valid, has a policy hash moved, do the operands
+    still clear the execution floor). ``activation_decision`` folds them. A route that consulted
+    only the frozen layer would let an approval outlive the thing it approved.
+
+    **409, not 403.** Nothing here is a permission failure — the caller passed
+    ``require_confirmer``. It is a conflict with a durable governed record: this option, right now,
+    is not in a state that may be materialized. The body carries every blocker's ``code`` AND its
+    ``next_step``, because a refusal a person cannot act on is an outage with better manners. The
+    shape is exactly the one ``contract.py`` already returns for ``ACTIVATION_BLOCKED``, so a client
+    that renders one renders both.
+
+    **No option key is not a refusal.** The work-item-driven path predates this link and must keep
+    working; requiring a key would break a shipped surface. What is refused is HALF a key (422 — an
+    option is addressed by both halves) and a key naming no decision row (404 — the caller is citing
+    an approval that does not exist, which is worth distinguishing from one that is merely blocked).
+    """
+    if body.considered_revision_id is None and body.option_id is None:
+        return {}
+    if body.considered_revision_id is None or body.option_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail="a governed option is named by BOTH considered_revision_id and option_id; half "
+                   "a key names no approval and would record provenance nothing could resolve")
+
+    from featuregen.overlay.upload.activation_policy import activation_decision
+    from featuregen.overlay.upload.semantic_option_decision import (
+        assemble_current_activation_state,
+        load_frozen_option_facts,
+    )
+
+    frozen = load_frozen_option_facts(
+        conn, considered_revision_id=body.considered_revision_id, option_id=body.option_id)
+    if frozen is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no option decision {body.option_id!r} in considered revision "
+                   f"{body.considered_revision_id!r}: a materialization request may only cite an "
+                   f"option that was actually served, because that row IS the approval")
+    current = assemble_current_activation_state(
+        conn, frozen=frozen, snapshot_id=frozen.snapshot_id or None)
+    decision = activation_decision(
+        frozen, current, _MATERIALIZATION_ACTION, actor=identity.subject)
+    blockers = [{"code": blocker.code, "next_step": blocker.next_step}
+                for blocker in decision.blockers]
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": "ACTIVATION_BLOCKED",
+            "action": _MATERIALIZATION_ACTION,
+            "considered_revision_id": body.considered_revision_id,
+            "option_id": body.option_id,
+            "blockers": blockers,
+        })
+    return {"action": _MATERIALIZATION_ACTION, "allowed": True, "blockers": blockers,
+            "considered_revision_id": body.considered_revision_id, "option_id": body.option_id}
+
+
 def _job(request_id: str, members: tuple[str, ...],
          body: MaterializationRunIn) -> MaterializationJobV1:
     """The declarations as the WORKER's job, validated by the worker's own reader.
@@ -390,7 +473,8 @@ def _job(request_id: str, members: tuple[str, ...],
 
 
 def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunIn,
-            members: tuple[str, ...], identity: IdentityEnvelope) -> MaterializationRequestV1:
+            members: tuple[str, ...], identity: IdentityEnvelope,
+            activation: dict[str, Any]) -> MaterializationRequestV1:
     """Mint the request — or return the one this idempotency key already named.
 
     ``authorized_roles`` is the requester's role CLAIMS, snapshotted here and never re-read: Gate 2
@@ -410,6 +494,11 @@ def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunI
     ``True`` here would record a claim this function never made: an operator reading the row back
     could not tell an observation from a constant. So the flag is consulted again, and what is
     stored is whatever it said.
+
+    B4 folds the GOVERNED decision into that same evidence, VERBATIM — the action, the verdict and
+    every blocker with its next step, exactly as ``activation_decision`` returned it. It is recorded
+    rather than re-derived for the identical reason the flag is: a reader must be able to tell what
+    was observed from what a later build would compute.
     """
     try:
         return record_request(
@@ -420,10 +509,13 @@ def _record(conn: psycopg.Connection, request_id: str, body: MaterializationRunI
             authorized_roles=identity.role_claims,
             idempotency_key=body.idempotency_key,
             activation_state={"flag": MATERIALIZATION_FLAG,
-                              "enabled": materialization_enabled(), "surface": "http"},
+                              "enabled": materialization_enabled(), "surface": "http",
+                              **({"activation": activation} if activation else {})},
             resolved_input_digest=materialize_hash({
                 "logical_group_name": body.logical_group_name,
                 "work_item_ids": list(members)}),
+            considered_revision_id=body.considered_revision_id,
+            option_id=body.option_id,
         )
     except ValueError as exc:
         # By the time this runs, every ValueError `MaterializationRequestV1.__post_init__` could

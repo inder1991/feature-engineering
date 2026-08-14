@@ -122,7 +122,8 @@ _LEASED_STATES: frozenset[RequestLifecycle] = frozenset(
 REQUEST_COLUMNS = (
     "request_id, logical_group_name, requested_by, authorized_roles, idempotency_key, "
     "activation_state, lifecycle_state, generation_id, run_id, resolved_input_digest, "
-    "requested_at, accepted_at, lease_expires_at, updated_at")
+    "requested_at, accepted_at, lease_expires_at, updated_at, "
+    "considered_revision_id, option_id")
 
 
 #: The terminal states, as SQL literals rather than a bound parameter — deliberately, and measured.
@@ -222,6 +223,11 @@ class MaterializationRequestV1:
     accepted_at: _datetime.datetime | None
     lease_expires_at: _datetime.datetime | None
     updated_at: _datetime.datetime
+    #: B4 (migration 1067) — the GOVERNED OPTION this run was approved for: the exact
+    #: ``semantic_option_decision (considered_revision_id, option_id)`` a human acted on, or NULL
+    #: for the work-item-driven path that predates the link. Both or neither, enforced by a CHECK.
+    considered_revision_id: str | None = None
+    option_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.request_id, field="request_id",
@@ -249,8 +255,15 @@ class MaterializationRequestV1:
                 f"at accept time, which is a mapping of names to values")
         object.__setattr__(self, "activation_state", dict(self.activation_state))
         object.__setattr__(self, "lifecycle_state", RequestLifecycle(self.lifecycle_state))
-        for name in ("generation_id", "run_id", "resolved_input_digest"):
+        for name in ("generation_id", "run_id", "resolved_input_digest",
+                     "considered_revision_id", "option_id"):
             _optional_text(getattr(self, name), field=name)
+        if (self.considered_revision_id is None) != (self.option_id is None):
+            raise ValueError(
+                "materialization request names half a governed option "
+                f"(considered_revision_id={self.considered_revision_id!r}, "
+                f"option_id={self.option_id!r}): an option decision is addressed by BOTH halves, "
+                "and half a key names no approval. Migration 1067 carries the same rule as a CHECK")
         for name in ("requested_at", "updated_at"):
             _instant(getattr(self, name), field=name)
         for name in ("accepted_at", "lease_expires_at"):
@@ -273,8 +286,14 @@ class MaterializationRequestV1:
 #: The fields that make a request THE request its idempotency key names. A retry that matches on all
 #: of them is the same request and gets the stored row back; one that differs is a key reused for
 #: different work, and answering it with the stored row would report the wrong request as queued.
+#:
+#: B4 adds the option key to this set, deliberately. One idempotency key reused for a DIFFERENT
+#: governed option is not a retry of the same request — it is a second approval being answered with
+#: the first one's run, which is exactly the substitution `resolved_input_digest` is here to
+#: prevent for membership.
 IDEMPOTENT_IDENTITY_FIELDS: tuple[str, ...] = (
-    "logical_group_name", "requested_by", "resolved_input_digest")
+    "logical_group_name", "requested_by", "resolved_input_digest",
+    "considered_revision_id", "option_id")
 
 #: The complement, with the reason each field is NOT compared. Named rather than left implicit so
 #: that a column added to the record forces a decision: the test suite asserts these two sets
@@ -324,8 +343,14 @@ def record_request(
     idempotency_key: str,
     activation_state: Mapping[str, Any],
     resolved_input_digest: str | None = None,
+    considered_revision_id: str | None = None,
+    option_id: str | None = None,
 ) -> MaterializationRequestV1:
     """Record the request at ``requested`` — the run's identity, minted before any work begins.
+
+    ``considered_revision_id``/``option_id`` name the GOVERNED OPTION a human approved (B4,
+    migration 1067). Both or neither; a pair that names no ``semantic_option_decision`` row is
+    refused by the foreign key. Omitting them is the work-item-driven path that predates the link.
 
     A duplicate ``idempotency_key`` returns the **existing** row rather than raising: a retried HTTP
     call must not become a second run, and answering the retry with the row it already has is the
@@ -351,18 +376,22 @@ def record_request(
         accepted_at=None,
         lease_expires_at=None,
         updated_at=_datetime.datetime.now(tz=_datetime.UTC),
+        considered_revision_id=considered_revision_id,
+        option_id=option_id,
     )
     inserted = _row(conn.execute(
         "INSERT INTO materialization_request (request_id, logical_group_name, requested_by, "
         "authorized_roles, idempotency_key, activation_state, lifecycle_state, "
-        "resolved_input_digest) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "resolved_input_digest, considered_revision_id, option_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         # The arbiter is named: a conflict on the PRIMARY KEY (one request_id reused for a second
         # request) is a caller bug and still raises, rather than being swallowed as a retry.
         f"ON CONFLICT (idempotency_key) DO NOTHING RETURNING {REQUEST_COLUMNS}",
         (candidate.request_id, candidate.logical_group_name, candidate.requested_by,
          list(candidate.authorized_roles), candidate.idempotency_key,
          Jsonb(dict(candidate.activation_state)), candidate.lifecycle_state.value,
-         candidate.resolved_input_digest)).fetchone())
+         candidate.resolved_input_digest, candidate.considered_revision_id,
+         candidate.option_id)).fetchone())
     if inserted is not None:
         return inserted
 
