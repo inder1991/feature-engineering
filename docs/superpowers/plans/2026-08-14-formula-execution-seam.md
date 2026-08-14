@@ -387,7 +387,7 @@ without a `formula` (governed-model-output and conceptual recipes have none).
 - `test_a_recipe_with_no_formula_reference_is_not_reviewed` — a `conceptual_pattern` recipe.
 - Full backend suite + `pytest -m eval` green (the eval marker joins the gate here, per §8).
 
-> **ACCEPTED `b260fba8` (2026-08-14).** `semantic_option_decision.has_reviewed_formula_expectation(
+> **ACCEPTED `df418c10` (2026-08-14).** `semantic_option_decision.has_reviewed_formula_expectation(
 > recipe_id)` — a named public seam, not an inline expression, because A6 needs the same resolution
 > on the serving path: resolve the definition via `v2_recipe_by_id`, ask the registry with
 > `definition.formula.expectation_ref`, and answer `False` for a candidate the registry never
@@ -416,19 +416,52 @@ without a `formula` (governed-model-output and conceptual recipes have none).
   names), `grain: GrainExpectationV2(entity, key_roles)`,
   `semantic_parameter_projections`, `body_shape` (unary / ratio / diff / composite).
 - `bind_formula_expectation_v2(context: RecipeGroundingContextV1, blueprint:
-  RecipeFormulaExpectationBlueprintV2) -> BoundRecipeFormulaExpectationV2` — the exact five
-  preflight refusals the v1 binder raises, restated: `RECIPE_EXPECTATION_MISMATCH`,
+  RecipeFormulaExpectationBlueprintV2) -> BoundRecipeFormulaExpectationV2` — the preflight
+  refusals the v1 binder raises, restated: `RECIPE_EXPECTATION_MISMATCH`,
   `RECIPE_DEFINITION_HASH_MISMATCH`, `SEMANTIC_PARAMETER_HASH_MISMATCH`,
   `FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED`, and duplicate-role. Raises
   `RecipeFormulaPreflightError` with the same closed codes, so the shadow's `technical_axis` needs
-  no new vocabulary.
+  no new vocabulary. **Corrected at execution:** "the exact five" undercounts — the v1 binder
+  raises **ten** distinct codes (the five above plus `FORMULA_BINDING_MISSING`,
+  `FORMULA_BINDING_SOURCE_MISMATCH`, `FORMULA_BINDING_SHAPE_INVALID`,
+  `FORMULA_AUTHORING_UNSUPPORTED`, `SEMANTIC_PARAMETER_PROJECTION_INCOMPLETE`,
+  `SEMANTIC_WINDOW_INVALID`). The v2 binder restates **all** of them; restating five and
+  inventing behaviour for the rest is what "the same closed vocabulary" forbids.
 - `validate_blueprint_v2(blueprint)` — construction-time law, mirroring `validate_blueprint`.
 
 **Acceptance (tests):** `tests/featuregen/overlay/upload/test_recipe_formula_contracts_v2.py`
 - `test_binding_a_v2_expectation_produces_exact_refs_for_every_role`
-- each of the five preflight refusals asserted by code, one test each
+- each preflight refusal asserted by code, one test each
 - `test_a_v2_blueprint_whose_grain_role_is_not_bound_is_refused` — the D-7 property, in the v2 binder
 - `test_the_bound_expectation_is_hash_stable_over_role_order`
+
+> **ACCEPTED `PENDING-A1` (2026-08-14).** `recipe_formula_contracts_v2.py` — 6 new types
+> (`WindowPolicyExpectationV2` with `offset_periods`, `ExpressionRoleExpectationV2` with
+> `second_operand_role` / `aggregation_argument` / `authority_refs` / term name+sign,
+> `GrainExpectationV2`, `RecipeFormulaExpectationBlueprintV2`, and the two bound mirrors),
+> `validate_blueprint_v2`, `bind_formula_expectation_v2`, `expectation_content_hash_v2`. v1 is
+> untouched; the version-neutral leaves (`RecipeFormulaPreflightError`,
+> `SemanticParameterProjectionV1/Kind`, `DecimalPolicyExpectationV1`, `_plain`) are imported
+> verbatim, the same law `schema_v2` states for the grammar.
+> **Deviations from the task as authored, each deliberate:**
+> (a) **ten preflight codes, not five** — corrected above; the v1 binder's whole vocabulary is
+> restated, because a v2 situation the v1 binder names must not get a new word.
+> (b) **`body_shape` is a derived property, not a field.** The task lists both `final_operation`
+> and `body_shape`; `FinalOperationV2` already *is* that vocabulary (identity/ratio/difference/
+> signed_sum), and two stored fields could disagree. `BODY_SHAPE_BY_FINAL_OPERATION` maps one to
+> the other and `EXPRESSION_PATHS_BY_FINAL_OPERATION` pins each shape's canonical AST paths, so a
+> blueprint cannot declare a ratio and then carry `body.expr`.
+> (c) **`authority_refs` carries governed policy REFS, not role names.** The task says "role
+> names"; `AuthorityRefsV2`'s four fields are policy identifiers (`policy:eligible-posted-status`)
+> that bind to nothing physical and are identity-bearing exactly as authored. A role name in that
+> slot would not validate.
+> (d) The blueprint carries `expectation_ref` **and** `recipe_id` (A0's lesson: they are different
+> keys), and `allocation_policy_ref` for increment 8's source→output rollup.
+> 21 tests: the whole preflight vocabulary one case each, the D-7 grain-role refusal in the v2
+> binder, hash stability under reversed binding order, and the two v2-only forks (a bound
+> `second_operand_ref`, an order-sensitive aggregate refused on a `FUTURE_HORIZON` window).
+> **Nothing calls this module yet** — A2 derives blueprints into it, A4 binds them at capture.
+> Gates: full suite **10967 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean.
 
 ### Task A2 — derive the blueprint from the definition (2 days)
 
