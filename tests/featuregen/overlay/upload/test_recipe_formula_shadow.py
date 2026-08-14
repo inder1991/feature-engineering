@@ -30,14 +30,25 @@ from featuregen.overlay.upload.recipe_formula_contracts import (
     DecimalPolicyExpectationV1,
     WindowExpectationV1,
 )
+from featuregen.overlay.upload.recipe_formula_contracts_v2 import (
+    RecipeFormulaExpectationBlueprintV2,
+)
+from featuregen.overlay.upload.recipe_formula_expectations import (
+    RECIPE_FORMULA_EXPECTATIONS,
+)
 from featuregen.overlay.upload.recipe_formula_shadow import (
+    FORMULA_SCHEMA_V1,
+    FORMULA_SCHEMA_V2,
+    MAX_RECIPE_FORMULA_CAPTURES_PER_RUN,
     RankedCaptureEntryV1,
     ShadowIntegrityError,
     build_capture_entries,
+    capture_blueprint_for,
     capture_ranked_shadow,
     content_hash,
     declare_expected_run,
     finalize_manifest,
+    formula_capturable_recipe_ids,
     reconcile_run,
     verify_expected_run_payload,
     verify_manifest_payload,
@@ -47,6 +58,7 @@ from featuregen.overlay.upload.recipe_formula_shadow import (
     write_observation,
     write_work_item,
 )
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 
 
 def _seed_lineage(db, suffix: str = "1"):
@@ -186,6 +198,147 @@ def _bound_expectation() -> BoundRecipeFormulaExpectationV1:
         blueprint_content_hash="blueprint-hash",
         policy_version=1,
     )
+
+
+# ── task A4, increment 3: the capture population ───────────────────────────────────────────
+#: A2's measurement, re-pinned from the capture side: 90 of the 317 registry recipes have a
+#: bindable blueprint. A registry edit that loses derivability fails HERE too, where it changes
+#: what the platform actually captures.
+EXPECTED_CAPTURE_POPULATION = 90
+
+
+def test_the_capture_population_is_every_recipe_with_a_bindable_blueprint():
+    population = formula_capturable_recipe_ids()
+    assert len(population) == EXPECTED_CAPTURE_POPULATION
+    # Strictly wider than the two reviewed v1 entries it used to be — and it now contains the one
+    # v2 recipe the registry calls FORMULA_AUTHORABLE, which was never capturable before A4.
+    assert population > frozenset(RECIPE_FORMULA_EXPECTATIONS)
+    assert "posted_debit_amount" in population
+    # A recipe the registry never minted has no blueprint at all: an LLM intent or a user
+    # definition can never be captured by accident.
+    assert capture_blueprint_for("not_a_registry_recipe") is None
+    assert "not_a_registry_recipe" not in population
+
+
+def test_the_two_readings_of_formula_v1_still_agree():
+    """A4-c. "Declares ``formula-v1``" and "has a reviewed v1 registry entry" pick out the SAME
+    two recipes today, so keying the capture on the declared version (the plan's words) changes
+    nothing. This pins the agreement: a registry edit that separates the two readings — a third
+    v1-declaring recipe, or a v1 entry for a v2-declaring one — fails CI here instead of silently
+    changing which BINDER runs on a customer's request."""
+    declared_v1 = {definition.recipe_id for definition in V2_RECIPES
+                   if definition.formula is not None
+                   and definition.formula.formula_schema_version == FORMULA_SCHEMA_V1}
+    assert declared_v1 == set(RECIPE_FORMULA_EXPECTATIONS)
+    assert declared_v1 == {"merchant_mcc_diversity", "obligor_facility_count"}
+
+
+@pytest.mark.parametrize(("recipe_id", "declared"), [
+    ("merchant_mcc_diversity", FORMULA_SCHEMA_V1),
+    ("obligor_facility_count", FORMULA_SCHEMA_V1),
+    ("posted_debit_amount", FORMULA_SCHEMA_V2),
+])
+def test_a_recipe_resolves_the_blueprint_its_own_declaration_names(recipe_id, declared):
+    resolved = capture_blueprint_for(recipe_id)
+    assert resolved is not None
+    assert resolved.declared_schema_version == declared
+    is_v2 = isinstance(resolved.blueprint, RecipeFormulaExpectationBlueprintV2)
+    assert is_v2 == (declared == FORMULA_SCHEMA_V2)
+    if not is_v2:
+        # The v1 arm serves the REVIEWED entry verbatim — A4 derives no substitute for it, so
+        # D-7's merchant-grain disagreement stays exactly where the governance decision left it.
+        assert resolved.blueprint is RECIPE_FORMULA_EXPECTATIONS[recipe_id]
+
+
+def _entry_with_reason(entry: RankedCaptureEntryV1, reason: str) -> RankedCaptureEntryV1:
+    return RankedCaptureEntryV1(**{**asdict(entry), "capture_reason": reason})
+
+
+def test_the_renamed_capture_reasons_change_new_manifests_only(db):
+    """A4 drops ``_V1`` from both capture-reason literals. They ride ``capture_entries`` into the
+    SEALED ``manifest_hash``, so this asserts the consequence rather than discovering it: new runs
+    hash differently, and an already-stored manifest is NEVER rewritten."""
+    intent_id, run_id, revision_id, considered_hash, manifest_id = _declare(db, "reasons")
+    ranked = _ranked()
+    entries = build_capture_entries(
+        generation_run_id=run_id, ranking_version="rank-v1", ranked=ranked,
+        candidate_keys_by_recipe_id={"merchant_mcc_diversity": ("candidate-1",),
+                                     "obligor_facility_count": ("candidate-2",)},
+        capture_recipe_ids=formula_capturable_recipe_ids())
+    assert [entry.capture_reason for entry in entries] == [
+        "SELECTED_FORMULA_AUTHORABLE", "NOT_SELECTED"]
+
+    write_kwargs = dict(
+        generation_run_id=run_id, intent_id=intent_id, considered_revision_id=revision_id,
+        considered_content_hash=considered_hash, ranking_version="rank-v1", ranked=ranked,
+        ranking_enabled=True)
+    write_manifest(db, manifest_id=manifest_id, entries=entries, **write_kwargs)
+    stored = db.execute(
+        "SELECT manifest_hash,capture_entries FROM recipe_formula_shadow_run_manifest "
+        "WHERE manifest_id=%s", (manifest_id,)).fetchone()
+
+    # The same run, with the PRE-A4 spellings, is a different manifest hash…
+    legacy = tuple(_entry_with_reason(entries[0], "SELECTED_FORMULA_V1_AUTHORABLE")
+                   if entry is entries[0] else entry for entry in entries)
+    with pytest.raises(ShadowIntegrityError):
+        write_manifest(db, manifest_id=manifest_id, entries=legacy, **write_kwargs)
+    # …and the stored row is byte-identical to what it was. Append-only means append-only.
+    assert db.execute(
+        "SELECT manifest_hash,capture_entries FROM recipe_formula_shadow_run_manifest "
+        "WHERE manifest_id=%s", (manifest_id,)).fetchone() == stored
+    assert stored[1][0]["capture_reason"] == "SELECTED_FORMULA_AUTHORABLE"
+
+
+def test_a_wider_population_truncates_at_the_budget_and_says_so(db):
+    """A wider population makes ``BUDGET_TRUNCATED`` reachable — the honest outcome, and already
+    an observation axis. Truncation is RECORDED, never a silent drop: every declared entry still
+    gets exactly one observation, so the run reconciles COMPLETE."""
+    over_budget = 3
+    population = sorted(formula_capturable_recipe_ids())[
+        :MAX_RECIPE_FORMULA_CAPTURES_PER_RUN + over_budget]
+    assert len(population) == MAX_RECIPE_FORMULA_CAPTURES_PER_RUN + over_budget
+    intent_id, run_id, scope_id, revision_id, considered_hash = _seed_lineage(db, "budget")
+    ranked = tuple(
+        SimpleNamespace(
+            recipe_id=recipe_id, canonical_rank=index, selected_for_initial_view=True,
+            rank_reasons=("primary",), initial_view_reasons=("selected",))
+        for index, recipe_id in enumerate(population, start=1))
+    result = capture_ranked_shadow(
+        db,
+        generation_run_id=run_id,
+        intent_id=intent_id,
+        confirmed_scope_id=scope_id,
+        considered_revision_id=revision_id,
+        considered_content_hash=considered_hash,
+        metadata_snapshot_id="snapshot-budget",
+        metadata_snapshot_content_hash="snapshot-hash-budget",
+        ranked=ranked,
+        ranking_version="rank-v1",
+        ranking_enabled=True,
+        candidate_keys_by_recipe_id={rid: (f"candidate-{rid}",) for rid in population},
+        # No private context is handed over, so every in-budget entry stops at the same honest
+        # place — the point of this test is the BUDGET, and it must not depend on binding.
+        grounding_context_by_candidate_key={},
+        identity=IdentityEnvelope(
+            subject="user:test", actor_kind="human", authenticated=True,
+            auth_method="password", role_claims=("analyst",)),
+        request_read_scope_hash="scope-hash-budget")
+
+    assert result.status == "COMPLETE"
+    assert result.expected_observations == len(population)
+    axes = dict(db.execute(
+        "SELECT capture_axis,count(*) FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id=%s GROUP BY capture_axis", (run_id,)).fetchall())
+    assert axes == {"CAPTURE_INPUT_INCOMPLETE": MAX_RECIPE_FORMULA_CAPTURES_PER_RUN,
+                    "BUDGET_TRUNCATED": over_budget}
+    assert db.execute(
+        "SELECT DISTINCT technical_axis FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id=%s AND capture_axis='BUDGET_TRUNCATED'",
+        (run_id,)).fetchall() == [("CAPTURE_INCOMPLETE",)]
+    # A truncated entry is not work: nothing was enqueued for it.
+    assert db.execute(
+        "SELECT count(*) FROM recipe_formula_shadow_work_item WHERE generation_run_id=%s",
+        (run_id,)).fetchone()[0] == 0
 
 
 def test_expected_run_detects_wholly_missing_manifest(db):

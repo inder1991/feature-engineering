@@ -1,4 +1,15 @@
-"""Durable expected-set, ranking manifest, observations, and reconciliation for formula shadow."""
+"""Durable expected-set, ranking manifest, observations, and reconciliation for formula shadow.
+
+**The capture population (task A4)** is every recipe with a BINDABLE blueprint, resolved by the
+recipe's OWN declared ``formula_schema_version``: a ``formula-v1`` recipe binds the reviewed v1
+registry entry with the v1 binder, anything else derives its blueprint from its definition (A2)
+and binds it with the v2 binder. Before A4 the population was the two-entry v1 registry, so
+``posted_debit_amount`` — the one v2-authorable recipe — was never captured at all.
+
+The two readings of "v1" (declares ``formula-v1`` / has a v1 registry entry) pick out the same
+two recipes today, and a test pins that agreement so a registry edit which separates them fails
+CI instead of silently changing which binder runs.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -7,6 +18,7 @@ import logging
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
+from functools import cache, lru_cache
 from typing import Any
 
 from psycopg.types.json import Jsonb
@@ -31,13 +43,25 @@ from featuregen.overlay.upload.recipe_formula_authority import (
     FormulaAuthorityRejection,
     build_formula_authority_envelope,
 )
+from featuregen.overlay.upload.recipe_formula_blueprint_derivation import (
+    BlueprintDerivationRefusal,
+    derive_blueprint_v2,
+)
 from featuregen.overlay.upload.recipe_formula_contracts import (
+    BoundRecipeFormulaExpectationV1,
+    RecipeFormulaExpectationBlueprintV1,
     RecipeFormulaPreflightError,
     bind_formula_expectation,
+)
+from featuregen.overlay.upload.recipe_formula_contracts_v2 import (
+    BoundRecipeFormulaExpectationV2,
+    RecipeFormulaExpectationBlueprintV2,
+    bind_formula_expectation_v2,
 )
 from featuregen.overlay.upload.recipe_formula_expectations import (
     RECIPE_FORMULA_EXPECTATIONS,
 )
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES, v2_recipe_by_id
 from featuregen.runtime.outbox import (
     OutboxMessage,
     insert_outbox_message_checked,
@@ -51,8 +75,62 @@ MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12
 logger = logging.getLogger(__name__)
 
 
+#: The declared literals of ``FormulaReferenceV2.formula_schema_version``.
+FORMULA_SCHEMA_V1 = "formula-v1"
+FORMULA_SCHEMA_V2 = "formula-v2"
+
+
 class ShadowIntegrityError(RuntimeError):
     """A repeated shadow identity disagreed with its immutable stored material."""
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureBlueprintV1:
+    """The blueprint a recipe would be captured with, and the declaration that chose it."""
+
+    declared_schema_version: str
+    blueprint: RecipeFormulaExpectationBlueprintV1 | RecipeFormulaExpectationBlueprintV2
+
+    def bind(self, context) -> BoundRecipeFormulaExpectationV1 | BoundRecipeFormulaExpectationV2:
+        """Bind with the binder that matches the blueprint. Both raise the SAME closed
+        ``RecipeFormulaPreflightError`` vocabulary, so the shadow's ``technical_axis`` needs no
+        new words for a v2 expectation (task A1)."""
+        if isinstance(self.blueprint, RecipeFormulaExpectationBlueprintV2):
+            return bind_formula_expectation_v2(context, self.blueprint)
+        return bind_formula_expectation(context, self.blueprint)
+
+
+@cache
+def capture_blueprint_for(recipe_id: str) -> CaptureBlueprintV1 | None:
+    """The bindable blueprint for one recipe, chosen by ITS OWN declared schema version.
+
+    ``None`` means the platform has no blueprint to bind: an unregistered recipe id (an LLM
+    intent, a user definition), a recipe with no formula at all (conceptual patterns, governed
+    model outputs), a ``formula-v1`` recipe with no reviewed registry entry, or a recipe whose
+    definition does not structurally determine a v2 blueprint — A2's derivation refuses by name
+    for 227 of the 317 registry recipes, and each refusal is a named piece of registry work.
+
+    Cached: ``V2_RECIPES`` and the v1 registry are code constants.
+    """
+    definition = v2_recipe_by_id(recipe_id)
+    if definition is None or definition.formula is None:
+        return None
+    declared = definition.formula.formula_schema_version
+    if declared == FORMULA_SCHEMA_V1:
+        reviewed = RECIPE_FORMULA_EXPECTATIONS.get(recipe_id)
+        return None if reviewed is None else CaptureBlueprintV1(declared, reviewed)
+    derived = derive_blueprint_v2(definition)
+    if isinstance(derived, BlueprintDerivationRefusal):
+        return None
+    return CaptureBlueprintV1(declared, derived)
+
+
+@lru_cache(maxsize=1)
+def formula_capturable_recipe_ids() -> frozenset[str]:
+    """Every recipe with a bindable blueprint — the A4 capture population."""
+    return frozenset(
+        definition.recipe_id for definition in V2_RECIPES
+        if capture_blueprint_for(definition.recipe_id) is not None)
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,11 +546,15 @@ def build_capture_entries(
             candidate_resolution=resolution,
             capture_required=capture_required,
             capture_reason=(
-                "SELECTED_FORMULA_V1_AUTHORABLE"
+                # A4 dropped the ``_V1`` from both literals: the population is no longer the v1
+                # registry. These strings ride ``capture_entries`` into the SEALED manifest hash,
+                # so new runs hash differently — and existing rows are never rewritten (the store
+                # is append-only; ``_checked_existing`` compares stored to expected and raises).
+                "SELECTED_FORMULA_AUTHORABLE"
                 if capture_required
                 else "NOT_SELECTED"
                 if not item.selected_for_initial_view
-                else "RECIPE_NOT_FORMULA_V1_AUTHORABLE"
+                else "RECIPE_NOT_FORMULA_AUTHORABLE"
             ),
         ))
     return tuple(entries)
@@ -920,7 +1002,7 @@ def _capture_selected_entry(
         )
         return
     context = grounding_context_by_candidate_key.get(entry.recipe_candidate_key)
-    blueprint = RECIPE_FORMULA_EXPECTATIONS.get(entry.recipe_id)
+    blueprint = capture_blueprint_for(entry.recipe_id)
     if context is None or blueprint is None:
         write_observation(
             conn,
@@ -950,7 +1032,7 @@ def _capture_selected_entry(
         ):
             raise RecipeEgressViolation(
                 "formula authoring requires a verified sealed generation input")
-        expectation = bind_formula_expectation(context, blueprint)
+        expectation = blueprint.bind(context)
         egress = build_recipe_authoring_egress(
             hypothesis=sealed_input.redacted_hypothesis,
             prediction_goal=sealed_input.redacted_prediction_goal,
@@ -1074,7 +1156,7 @@ def capture_ranked_shadow(
         ranking_version=effective_ranking_version,
         ranked=ranked,
         candidate_keys_by_recipe_id=candidate_keys_by_recipe_id,
-        capture_recipe_ids=frozenset(RECIPE_FORMULA_EXPECTATIONS),
+        capture_recipe_ids=formula_capturable_recipe_ids(),
     )
     write_manifest(
         conn,

@@ -255,6 +255,98 @@ def _obligor_catalog(conn) -> None:
     )
 
 
+def _posted_debit_catalog(conn) -> None:
+    """A posted-transaction catalog the V2 ``posted_debit_amount`` recipe binds on — the ONE
+    ``formula-v2``-declaring recipe the registry calls FORMULA_AUTHORABLE, and the recipe A2's
+    derivation turns into a bindable blueprint.
+
+    All eight required operands are here (account key, event + booking + value timestamps, the
+    monetary measure, the direction and status columns the governed policies read, and the
+    transaction dimension), because the recipe cannot be served unless every required operand
+    grounds. The three FORMULA-bearing roles — ``account`` (grain), ``amount`` (operand and
+    source relation) and ``event_ts`` (the window's clock) — carry the three authorities
+    ``build_formula_authority_envelope`` demands: human-confirmed concept evidence, a grain fact
+    on the key, and a VERIFIED temporal-role decision on the clock.
+    """
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    catalog = [
+        (CanonicalRow(
+            "posting_bank", "txns", "acct_id", "string",
+            is_grain=True, entity="Account"), "account_id"),
+        (CanonicalRow(
+            "posting_bank", "txns", "txn_amt", "numeric"), "monetary_flow"),
+        (CanonicalRow(
+            "posting_bank", "txns", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow(
+            "posting_bank", "txns", "dr_cr_ind", "string"), "debit_credit_indicator"),
+        (CanonicalRow(
+            "posting_bank", "txns", "posting_status", "string"), "booking_status"),
+        (CanonicalRow(
+            "posting_bank", "txns", "txn_ref", "string", entity="Transaction"), "transaction_id"),
+        (CanonicalRow(
+            "posting_bank", "txns", "booking_ts", "timestamp"), "booking_date"),
+        (CanonicalRow(
+            "posting_bank", "txns", "value_ts", "timestamp"), "value_date"),
+        (CanonicalRow(
+            "posting_bank", "txns", "ingested_at", "timestamp",
+            as_of=True, as_of_basis="ingested_at"), "as_of_date"),
+        (CanonicalRow(
+            "posting_bank", "txns", "attrited", "boolean"), "outcome_label"),
+    ]
+    build_graph(
+        conn,
+        "posting_bank",
+        [row for row, _concept in catalog],
+        concepts={content_hash(row): concept for row, concept in catalog},
+    )
+    for row, concept in catalog[:8]:
+        ref = normalize_ref("posting_bank", None, row.table, row.column)
+        record_field_evidence(
+            conn,
+            logical_ref=ref,
+            field_name="concept",
+            proposed_value=concept,
+            producer=EvidenceProducer.HUMAN,
+            strength=AssertionStrength.CONFIRMED,
+            producer_ref="human:test",
+            source_snapshot_id="snapshot:test",
+            input_hash=field_input_hash(
+                logical_ref=ref, field_name="concept", material=concept),
+        )
+    event_ref = normalize_ref("posting_bank", None, "txns", "event_ts")
+    record_field_evidence(
+        conn,
+        logical_ref=event_ref,
+        field_name="temporal_role",
+        proposed_value="event",
+        producer=EvidenceProducer.HUMAN,
+        strength=AssertionStrength.CONFIRMED,
+        producer_ref="human:test",
+        source_snapshot_id="snapshot:test",
+        input_hash=field_input_hash(
+            logical_ref=event_ref, field_name="temporal_role", material="event"),
+    )
+    resolve_and_project(
+        conn,
+        source="posting_bank",
+        logical_refs=[event_ref],
+        fields=["temporal_role"],
+    )
+    conn.execute(
+        "UPDATE graph_node SET grain_fact_event_id='grain-account-test' "
+        "WHERE catalog_source='posting_bank' AND object_ref='public.txns.acct_id'",
+    )
+    conn.execute(
+        "INSERT INTO overlay_drift_watermark "
+        "(catalog_source,last_completed_at,last_run_id,head_seq) "
+        "VALUES ('posting_bank',%s,'r',0) "
+        "ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at=%s",
+        (now, now),
+    )
+
+
 def _stage(status: StageStatus) -> StageEvaluation:
     return StageEvaluation(status, (), "v", None)
 
@@ -506,6 +598,61 @@ def test_formula_shadow_captures_a_work_item_on_the_engine_path(
     assert conn.execute(
         "SELECT count(*) FROM outbox WHERE topic='recipe_formula_shadow.requested.v1'"
     ).fetchone()[0] == 1
+
+
+def test_the_v2_exemplar_recipe_reaches_a_work_item(make_client, conn, monkeypatch):
+    """A4: the FIRST time the v2 path produces durable authoring input.
+
+    Before this task the capture population was ``frozenset(RECIPE_FORMULA_EXPECTATIONS)`` — the
+    two reviewed v1 entries — so ``posted_debit_amount``, the one ``formula-v2`` recipe the
+    registry calls FORMULA_AUTHORABLE, was never captured at all. The population is now every
+    recipe with a BINDABLE blueprint, and this recipe's blueprint is DERIVED from its own
+    definition (A2) and bound by the v2 binder (A1).
+
+    The work item is real: an EXACT candidate, a v2-bound expectation, an authority envelope
+    re-resolved against raw evidence, a provider payload that crossed the fail-close whitelist's
+    new v2 arm (increment 1), and one transactional outbox pointer. What it is NOT is authored —
+    increment 2's worker gate stops it, honestly, because no v2 orchestrator exists yet.
+    """
+    _arm_shadow(conn, monkeypatch)
+    _posted_debit_catalog(conn)
+    body = _shadow_run(
+        make_client, conn,
+        use_case="payments.behaviour",
+        hypothesis="accounts posting more debit value are more likely to attrite",
+        objective="understand payment behaviour",
+        catalog_source="posting_bank",
+        target_ref="public.txns.attrited")
+
+    selected = {item["recipe_id"] for item in body["ranking"]
+                if item["selected_for_initial_view"]}
+    assert "posted_debit_amount" in selected, body["ranking"]
+    work = conn.execute(
+        "SELECT recipe_candidate_key,provider_input_json,recipe_expectation_json "
+        "FROM recipe_formula_shadow_work_item "
+        "WHERE generation_run_id=%s AND recipe_id='posted_debit_amount'",
+        (body["generation_run_id"],),
+    ).fetchall()
+    assert len(work) == 1, work
+    candidate_key, provider_input, expectation = work[0]
+    assert candidate_key
+    # The payload DECLARES its generation — which is exactly what the egress gate dispatched on,
+    # and what the worker gate will read.
+    assert provider_input["formula_expectation"]["formula_schema_version"] == "formula-v2"
+    # The v2 expectation is bound to the exact columns, not to authored roles.
+    assert expectation["grain_entity"] == "account"
+    assert expectation["grain_key_refs"] == ["posting_bank::public.txns.acct_id"]
+    assert expectation["expressions"][0]["operand_ref"] == "posting_bank::public.txns.txn_amt"
+    assert expectation["expressions"][0]["event_time_ref"] == "posting_bank::public.txns.event_ts"
+    assert expectation["expressions"][0]["aggregation"] == "sum"
+    # Nothing was recorded as an incomplete capture for it, and the outbox pointer rode along.
+    assert conn.execute(
+        "SELECT count(*) FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id=%s AND recipe_id='posted_debit_amount'",
+        (body["generation_run_id"],)).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT count(*) FROM outbox WHERE topic='recipe_formula_shadow.requested.v1'"
+    ).fetchone()[0] >= 1
 
 
 def test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreement(

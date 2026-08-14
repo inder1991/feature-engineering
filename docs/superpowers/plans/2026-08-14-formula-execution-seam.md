@@ -833,6 +833,76 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > orchestrator is monkeypatched to RAISE if it is ever reached).
 > Gates: full suite **11051 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean.
 
+> **A4 INCREMENT 3 — THE CAPTURE WIDENING (A4 PROPER). ACCEPTED `<hash>` (2026-08-14).**
+>
+> **THE HEADLINE, AND IT IS REAL:** `posted_debit_amount` — the one `formula-v2` recipe the
+> registry calls `FORMULA_AUTHORABLE` — is served by the semantic engine, resolves to an EXACT
+> candidate, derives its blueprint from its own definition (A2), binds it with the v2 binder (A1),
+> crosses the whitelist's new v2 arm (increment 1) and lands as a durable
+> `recipe_formula_shadow_work_item` row with its outbox pointer. **This is the first time the v2
+> path has produced durable authoring input.** `test_the_v2_exemplar_recipe_reaches_a_work_item`
+> asserts the bound refs, not merely a row: grain `account` →
+> `posting_bank::public.txns.acct_id`, operand → `…txn_amt`, clock → `…event_ts`, aggregation
+> `sum`, and the payload declaring `formula_schema_version="formula-v2"`.
+>
+> **The population** is `formula_capturable_recipe_ids()` — every recipe with a bindable
+> blueprint — resolved per recipe by `capture_blueprint_for(recipe_id)`, which switches on
+> `v2_recipe_by_id(recipe_id).formula.formula_schema_version` (A4-c, the declared literal).
+> **90 of 317**, exactly A2's derivable count, re-pinned from the capture side. `None` — never a
+> guess — for an unregistered id (LLM intents, user definitions), a recipe with no formula, a
+> `formula-v1` recipe with no reviewed entry, or a definition A2 refuses to derive from.
+>
+> **A4-c's agreement is pinned, in both directions:** `test_the_two_readings_of_formula_v1_still_agree`
+> asserts `{declares formula-v1} == set(RECIPE_FORMULA_EXPECTATIONS) == {merchant_mcc_diversity,
+> obligor_facility_count}`. A third v1-declaring recipe, or a v1 entry for a v2-declaring one,
+> fails CI instead of silently changing which binder runs on a customer's request.
+>
+> **D-7 is untouched and still observable.** `merchant_mcc_diversity` declares `formula-v1`, so it
+> still resolves the REVIEWED merchant-grain entry (asserted by identity: `is` the registry
+> object) and still refuses with `FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED`.
+> `test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreement` passes
+> **unchanged, not one line edited** — the widened population did not disturb it, which was not
+> guaranteed and was checked. The recipe's *derived* customer-grain blueprint exists (A2 proved
+> it) and is deliberately NOT substituted: re-keying a reviewed expectation is the operator's act.
+>
+> **The reason literals lost their `_V1`** (`SELECTED_FORMULA_AUTHORABLE` /
+> `RECIPE_NOT_FORMULA_AUTHORABLE`) and the consequence is asserted rather than discovered:
+> `test_the_renamed_capture_reasons_change_new_manifests_only` writes a manifest, then re-writes
+> the same `manifest_id` with the pre-A4 spelling, and proves (a) it raises `ShadowIntegrityError`
+> and (b) the stored row — hash and `capture_entries` alike — is byte-identical afterwards. The
+> store is append-only; `ON CONFLICT DO NOTHING` plus `_checked_existing` means new runs hash
+> differently and old rows are never rewritten.
+>
+> **`MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12` stays**, and a wider population makes
+> `BUDGET_TRUNCATED` reachable for the first time: 15 selected capturable recipes produce 12
+> capture attempts and 3 `BUDGET_TRUNCATED` / `CAPTURE_INCOMPLETE` observations, the run still
+> reconciles `COMPLETE`, and nothing is enqueued for a truncated entry.
+>
+> **Deviations from the task as briefed:**
+> (a) **The budget test lives in `test_recipe_formula_shadow.py`, not `test_contract_ranked.py`.**
+> The rule it tests is in `_capture_selected_entry`, and reaching it through the API would mean
+> building a catalog that grounds 13+ selected recipes — a fixture, not a proof, and one whose
+> failure mode would be "the catalog changed" rather than "the budget broke". `initial_view_size`
+> is 15 against a budget of 12, so the API path *can* truncate; the rule is proved where it lives.
+> The other two acceptance tests are in `test_contract_ranked.py` as briefed.
+> (b) **`capture_blueprint_for` and `formula_capturable_recipe_ids` are cached** (`functools`).
+> `V2_RECIPES` and the v1 registry are code constants; the derivation sweep is 81 ms and would
+> otherwise run per generation request.
+>
+> **Two forward gaps recorded, neither shipped as a defect** (both unreachable today because
+> increment 2 stops every v2 work item at the worker door, and both must be closed by whoever
+> builds the replay-shaped v2 orchestrator): `recipe_formula_worker._formula_refs` and
+> `recipe_formula_authority.build_formula_authority_envelope` each collect `operand_ref` and
+> `event_time_ref` only, so a v2 expression's `second_operand_ref` would reach neither the frozen
+> read context nor the authority envelope. No v2 blueprint the derivation currently produces
+> carries one (every derived expression is a single-operand identity body), so nothing is wrong
+> in the shipped registry — but a `date_diff_avg` or `effective_at_cutoff` blueprint would need
+> both widened first.
+>
+> 8 new cases (5 in `test_recipe_formula_shadow.py`, 1 in `test_contract_ranked.py` plus its
+> catalog fixture, 2 parametrized). Gates: full suite **11059 passed, 20 skipped**;
+> `-m eval` **73 passed**; ruff + mypy clean on the touched files.
+
 ### Task A5 — the reviewed-expectation seam (1 day)
 
 **Modify:** `src/featuregen/overlay/upload/recipe_formula_expectations_v2.py` — grow
