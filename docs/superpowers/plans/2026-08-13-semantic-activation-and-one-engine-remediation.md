@@ -51,6 +51,9 @@ could ever pass). The E2E test proves the refusal is typed and the UI says why â
 honest end of the pre-live workflow. **The completion claim this plan may make when done:
 "contract-authoring workflow ready for UAT; materialization visibly unavailable" â€” never
 "the complete generation-to-execution workflow is production-ready."**
+> **Superseded for materialization only, 2026-08-14:** the four welds that lift this restriction are
+> chartered in `docs/superpowers/plans/2026-08-14-formula-execution-seam.md`. Nothing else in this
+> file is superseded.
 
 | blocker code | clearing surface | verified |
 |---|---|---|
