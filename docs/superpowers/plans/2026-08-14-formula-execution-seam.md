@@ -587,7 +587,7 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
   its `llm_call` refs. Until billing is restored the suite drives A3 through a recorded-fixture
   client, and the task is marked *shipped, unverified against a live provider*.
 
-> **ACCEPTED `<A3-HASH>` (2026-08-14). SHIPPED, UNVERIFIED AGAINST A LIVE PROVIDER.** Four new
+> **ACCEPTED `0e876764` (2026-08-14). SHIPPED, UNVERIFIED AGAINST A LIVE PROVIDER.** Four new
 > modules — `formula/authoring_v2.py` (`run_authoring_v2`, the v2 sibling; the v1 orchestrator is
 > not touched, not deprecated, not deleted), `formula/result_v2.py`, `formula/turns_v2.py` — plus
 > `AUTHOR_INSTRUCTION_V2` / `AUTHOR_PROMPT_ID_V2` and the `AuthorTurnContract` value type in
