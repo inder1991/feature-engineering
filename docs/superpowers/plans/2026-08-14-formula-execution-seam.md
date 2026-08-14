@@ -800,7 +800,7 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > Gates: full suite **11048 passed, 20 skipped** (baseline on `3e875ad3` was 11006/20);
 > `-m eval` **73 passed**; ruff + mypy clean on the touched files.
 
-> **A4 INCREMENT 2 — THE WORKER SCHEMA-VERSION GATE. ACCEPTED `<hash>` (2026-08-14).** Small,
+> **A4 INCREMENT 2 — THE WORKER SCHEMA-VERSION GATE. ACCEPTED `10f25ddc` (2026-08-14).** Small,
 > mandatory, and landed BEFORE the population widens, because the order is the point: the moment a
 > v2 work item can exist, the live worker must already refuse to author it.
 >
