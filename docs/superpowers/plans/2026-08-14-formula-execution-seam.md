@@ -1420,7 +1420,7 @@ blocker codes** when it is not allowed. The `activation_state` jsonb records the
 - `test_an_allowed_option_mints_a_request_carrying_its_provenance`
 - `test_the_legacy_work_item_path_still_accepts` — nullable FK, proven.
 
-> **ACCEPTED `PENDING-B4` (2026-08-14).** A materialization run now has governed provenance and a
+> **ACCEPTED `a881ad59` (2026-08-14).** A materialization run now has governed provenance and a
 > blocked option cannot be materialized. Migration **1067** adds `considered_revision_id` +
 > `option_id` to `materialization_request` with a composite FK to
 > `semantic_option_decision (considered_revision_id, option_id)` — 1063's own UNIQUE constraint is
