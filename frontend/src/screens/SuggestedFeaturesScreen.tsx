@@ -419,15 +419,58 @@ function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock
         <ul className="rows" aria-label="bindable recipes">
           {semantic.ranked.map(entry => (
             <li key={entry.recipe_id}>
-              <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
-              <span className="badge ok">bindable</span>{' '}
-              <span className="badge">{entry.readiness.toLowerCase().replace(/_/g, ' ')}</span>
-              {entry.review_current
-                ? <span className="badge ok"> reviewed</span>
-                : <span className="badge"> unreviewed</span>}
-              {entry.corroborations.length > 0 && (
-                <span className="hint"> · also arrived at by {entry.corroborations
-                  .map(c => c.origin).join(', ')}</span>
+              {/* D4 (UI-05): ONE card model — the projected FeatureIdea carrier the
+                  Workbench renders, from the same server-side serializer. The raw
+                  recipe-id row survives only for pre-D4 deployments (no card). */}
+              {entry.card ? (
+                <div style={{ display: 'grid', gap: 4 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                    <span style={{ fontWeight: 600 }}>{entry.card.name}</span>
+                    <span className="badge ok">bindable</span>
+                    {entry.card.operation_class && (
+                      <span className="badge">{entry.card.operation_class}</span>
+                    )}
+                    {entry.card.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
+                      <span className="badge stale">
+                        needs data checks{entry.card.requirements?.length
+                          ? ` (${entry.card.requirements.length})` : ''}
+                      </span>
+                    )}
+                    {entry.review_current
+                      ? <span className="badge ok">reviewed</span>
+                      : <span className="badge">unreviewed</span>}
+                  </div>
+                  <p className="hint" style={{ margin: 0 }}>{entry.card.description}</p>
+                  {(entry.card.input_role_bindings?.length ?? 0) > 0 && (
+                    <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2,
+                        margin: 0, paddingLeft: 16, fontSize: 13 }}>
+                      {entry.card.input_role_bindings!.map(binding => (
+                        <li key={binding.role}>
+                          <span style={{ fontWeight: 600 }}>{binding.role}</span>
+                          {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
+                          {binding.authority && <> · {binding.authority}</>}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {entry.corroborations.length > 0 && (
+                    <span className="hint">also arrived at by {entry.corroborations
+                      .map(c => c.origin).join(', ')}</span>
+                  )}
+                </div>
+              ) : (
+                <>
+                  <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
+                  <span className="badge ok">bindable</span>{' '}
+                  <span className="badge">{entry.readiness.toLowerCase().replace(/_/g, ' ')}</span>
+                  {entry.review_current
+                    ? <span className="badge ok"> reviewed</span>
+                    : <span className="badge"> unreviewed</span>}
+                  {entry.corroborations.length > 0 && (
+                    <span className="hint"> · also arrived at by {entry.corroborations
+                      .map(c => c.origin).join(', ')}</span>
+                  )}
+                </>
               )}
             </li>
           ))}

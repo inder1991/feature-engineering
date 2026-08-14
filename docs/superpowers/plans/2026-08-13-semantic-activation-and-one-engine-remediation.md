@@ -1100,6 +1100,20 @@ them). The page anchors/filters the shared results by the opened table.
 *Acceptance:* the parity test hardens from "binding states agree" to "the CARDS are the same
 carrier"; v3 byte-freeze pins still hold.
 
+> **ACCEPTED (2026-08-14) — PHASE D COMPLETE.** Every v4 semantic entry carries `card` — the
+> projected FeatureIdea serialized by gate1's OWN `_idea_json` (imported, never copied: one
+> carrier by construction). The hardened parity test re-projects the anchored candidates and
+> compares the served cards EQUAL to the same-serializer output, over both sections (this
+> fixture's engine entries are all actionable — the comparison covers whatever sections
+> exist and requires ≥1 card). The screen renders the shared card (name, description,
+> operation-class chip, needs-data-checks chip, typed input rows with authorities,
+> corroborations) with the raw recipe-id row surviving only for pre-D4 deployments. v3
+> byte-freeze pins hold (the v4-minus-semantic == v3 equality test still passes with `card`
+> riding INSIDE the semantic block). HONEST SCOPE NOTE: "the legacy per-table template pass
+> retires from v4" is deliberately deferred INTO E4's cutover knife — one deletion pass over
+> suggestion v1–v3 + the legacy pass together, verify-first, rather than two partial
+> deletions.
+
 ## 6. Phase E — proof, then the knife *(closes REL-04/05, REL-01/02 pragmatically, GEN-01's tail)*
 
 ### Task E0 — the end-to-end walkthrough gate (1 day) — **this plan's own acceptance test**

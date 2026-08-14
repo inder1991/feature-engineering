@@ -334,9 +334,24 @@ def semantic_parity_block(conn, *, catalog_source: str, table: str, roles=()) ->
 
     anchored = [c for c in candidates if _on_table(c)]
     assembled = assemble_candidates(anchored)
+
+    # D4 (UI-05): every entry carries the PROJECTED card — built by the same projection and
+    # serialized by the SAME function the Workbench's considered set uses (imported from
+    # gate1, never copied), so the two surfaces render one card model by construction.
+    from featuregen.overlay.upload.contract.gate1 import _idea_json
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+
+    projection = project_assembled_set(assembled, catalog_source=catalog_source)
+    cards_by_definition = {
+        idea.source_definition_id: _idea_json(idea)
+        for idea in (*projection.ideas, *projection.actionable_ideas)
+        if idea.source_definition_id}
+
     def _entry(item) -> dict:
         candidate = item.candidate
         return {
+            "card": cards_by_definition.get(
+                getattr(candidate, "variant_key", "") or candidate.recipe_id),
             "recipe_id": candidate.recipe_id,
             "binding_state": candidate.binding_state,
             "readiness": candidate.readiness,

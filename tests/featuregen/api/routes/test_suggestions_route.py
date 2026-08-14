@@ -340,6 +340,47 @@ def test_the_page_and_the_workbench_agree_on_binding_validity(
         assert direct[entry["recipe_id"]] == entry["binding_state"], entry["recipe_id"]
 
 
+def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F811
+    """D4 hardens the SE-13 parity: not just "binding states agree" — the CARDS are the SAME
+    carrier. Every bound entry's `card` is the projected FeatureIdea serialized by gate1's
+    OWN serializer (proven by re-projecting and comparing equal), so the page and the
+    Workbench cannot render two different stories about one candidate."""
+    from featuregen.overlay.upload.candidate_assembly import assemble_candidates
+    from featuregen.overlay.upload.contract.gate1 import _idea_json
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
+    )
+    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
+    from featuregen.overlay.upload.semantic_projection import project_assembled_set
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
+
+    semantic = client.get(f"{PATH}?contract_version=4", headers=_h()).json()["semantic"]
+    entries = semantic["ranked"] + semantic["actionable"]
+    assert entries, "the anchored engine produced entries for this table"
+
+    context = build_generation_semantic_context(
+        conn, catalog_source=SOURCE, roles=("feature_engineer",))
+    candidates = v2_recipe_candidates(
+        conn, catalog_source=SOURCE, roles=("feature_engineer",),
+        scope=ConfirmedScope(primary=None, unscoped=True), context=context)
+    anchored = [c for c in candidates if any(
+        v.selected_ref and v.selected_ref.split(".")[-2] == TABLE
+        for v in c.verdicts if v.status == "bound")]
+    projection = project_assembled_set(assemble_candidates(anchored),
+                                       catalog_source=SOURCE)
+    expected = {idea.source_definition_id: _idea_json(idea)
+                for idea in (*projection.ideas, *projection.actionable_ideas)
+                if idea.source_definition_id}
+    carded = [entry for entry in entries if entry.get("card")]
+    assert carded, "the projection served at least one card for this table"
+    for entry in carded:
+        card = entry["card"]
+        key = card.get("source_definition_id")
+        assert key in expected, key
+        assert card == expected[key], \
+            "one candidate, one carrier — the page serves gate1's own serialization"
+
+
 def test_v3_carries_no_semantic_key_ever(client, ftr_catalog):  # noqa: F811
     v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
     assert "semantic" not in v3

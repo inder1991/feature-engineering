@@ -3305,6 +3305,9 @@ export interface SemanticEngineVerdict {
 }
 
 export interface SemanticEngineEntry {
+  // D4 (UI-05): the PROJECTED card — the same FeatureIdea carrier the Workbench renders,
+  // serialized by the same function server-side. Absent on pre-D4 deployments.
+  card?: FeatureIdea | null
   recipe_id: string
   binding_state: string          // bound | ambiguous | missing | blocked
   readiness: string              // the authored RECIPE_READINESS value
