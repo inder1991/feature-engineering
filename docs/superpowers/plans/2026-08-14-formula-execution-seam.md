@@ -506,7 +506,7 @@ registry. See the acceptance row.
 > many banking recipes are executable-shaped, and every refusal code is a named piece of registry
 > work, not a mystery.
 
-> **ACCEPTED `PENDING-A2` (2026-08-14).** `recipe_formula_blueprint_derivation.py` —
+> **ACCEPTED `0f124251` (2026-08-14).** `recipe_formula_blueprint_derivation.py` —
 > `derive_blueprint_v2(definition)`, pure (one parameter, asserted over the signature), plus
 > `derive_registry_blueprints()` for the sweep.
 >
