@@ -114,8 +114,14 @@ def test_flag_on_cross_catalog_request_is_refused_and_never_reaches_the_permissi
     res = client.post("/contract/considered-set", json=_ENTITY_ONLY_BODY, headers=AUTH)
     assert res.status_code == 422, res.text
     assert res.json()["detail"]["code"] == _REFUSAL
-    # the refusal precedes every write: no intent, no considered set, nothing to draft from.
+    # The refusal precedes every DURABLE write — asserted across the whole write set, not just the
+    # considered set. (The E4 cutover placed the refusal after the run mint and scope persist, so
+    # this request used to leave a generation run and a confirmed scope behind; the E4 follow-up
+    # moved it above them.)
     assert db.execute("SELECT count(*) FROM contract_considered").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM contract_intent").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM feature_generation_run").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
     assert permissive_calls == []     # the structural guarantee
 
 

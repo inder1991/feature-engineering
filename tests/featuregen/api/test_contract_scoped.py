@@ -348,6 +348,39 @@ def test_entity_only_scope_is_refused_before_any_shadow_dispatch(make_client, co
     assert conn.execute("SELECT 1").fetchone() == (1,)
 
 
+# ── E4 follow-up: the refusal precedes every durable write, so a refused request leaves NOTHING ───────
+def test_entity_only_refusal_leaves_no_run_and_no_scope_row(make_client, conn, monkeypatch):
+    """A refused request writes NO ``feature_generation_run`` and NO ``confirmed_generation_scope``.
+
+    The E4 cutover placed this typed 422 AFTER the route minted the generation run and persisted the
+    confirmed scope, so every entity-only request left two orphan rows behind: a run that generated
+    nothing and a scope that governed nothing, indistinguishable in the store from a real generation
+    that produced an empty page. The refusal now sits before the mint (it stays after the
+    live-activation interlock, which owes an unapproved deployment the stronger 503). This asserts
+    the whole write set, not just the response code — a refusal that still wrote would pass a
+    status-code-only test.
+    """
+    _bank_multi(conn)
+    runs_before = conn.execute(
+        "SELECT count(*) FROM feature_generation_run").fetchone()[0]
+    scopes_before = conn.execute(
+        "SELECT count(*) FROM confirmed_generation_scope").fetchone()[0]
+
+    res = make_client(_fake()).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                            "target_entity": "customer"}}, headers=AUTH)
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["code"] == "SEMANTIC_REQUIRES_CATALOG_SOURCE"
+
+    assert conn.execute(
+        "SELECT count(*) FROM feature_generation_run").fetchone()[0] == runs_before
+    assert conn.execute(
+        "SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == scopes_before
+    # …and the intent the route records first is not written either — nothing at all is durable.
+    assert conn.execute("SELECT count(*) FROM contract_intent").fetchone()[0] == 0
+
+
 # ── Fix 5: every disposition stage carries the replay stamps (evaluation_version + evaluated_at) ───────
 def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
     monkeypatch.setenv(FLAG, "1")

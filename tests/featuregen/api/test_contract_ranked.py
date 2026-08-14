@@ -17,12 +17,16 @@ plans — so every recipe id named below is a V2 id. Two of the old ones (``bala
 ``credit_utilisation``, ``stage_migration``) exist only in the legacy template registry and can no
 longer appear in a disposition at all.
 
-The ranker itself was NOT cut over: its signal bundle (family, explainability, PIT completeness,
-journey, semantic group) is authored on the legacy Template objects, so ``_rank_signals`` skips any
-rankable id with no template and the ranker deterministically drops it. The honest consequence, which
-:func:`test_flag_on_churn_scoped_ranks_eligible_set` states outright, is that the ranking is a SUBSET
-of the eligible set: a V2-only recipe is eligible and simply unrankable — dropped rather than ordered
-on signals nobody authored for it.
+THE RANKER IS NOW CUT OVER TOO (E4 follow-up, same date). The cutover left ``_rank_signals`` keyed on
+the LEGACY ``Template`` registry, so it skipped any rankable id with no template and the ranker
+deterministically dropped it — only the ~106 ids in both registries could ever be ranked, and an
+eligible V2-only recipe was silently absent from ``ranking``, from the initial view, and from
+formula-shadow capture selection. The profiles now come from the V2 registry
+(``ranking_signals.v2_rank_profiles``), so the ranking is the WHOLE eligible set, which is what
+:func:`test_flag_on_churn_scoped_ranks_eligible_set` asserts as an equality below. The five ordering
+axes are unchanged; ``ranking_version`` moved off ``APPLICABILITY_MAPPING_VERSION`` onto the ranker's
+own ``RANKING_MAPPING_VERSION``, because applicability did NOT change and one stamp cannot honestly
+speak for both mappings.
 """
 from tests.featuregen.api._helpers import AUTH
 
@@ -39,15 +43,15 @@ from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.disposition import (
     FinalDisposition,
     RecipeEvaluation,
     StageEvaluation,
     StageStatus,
 )
-from featuregen.overlay.upload.taxonomy.recognition import APPLICABILITY_MAPPING_VERSION
 from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK
-from featuregen.overlay.upload.templates import ALL_TEMPLATES
+from featuregen.overlay.upload.taxonomy.versions import RANKING_MAPPING_VERSION
 
 RANK_FLAG = "FEATUREGEN_INTENT_RANKING"
 SCOPE_FLAG = "FEATUREGEN_INTENT_SCOPED_APPLICABILITY"
@@ -62,8 +66,10 @@ CHURN_RECIPE = "balance_volatility"
 CREDIT_RECIPE = "days_past_due_max"
 FRAUD_RECIPE = "txn_velocity_spike"
 
-_FAMILY_BY_ID = {t.id: t.family for t in ALL_TEMPLATES}
-_PER_FAMILY_CAP = 3   # rank_eligible's default; the initial view holds at most this many per family
+#: The ranker's family axis — read from the V2 registry, the universe it now ranks.
+_FAMILY_BY_ID = {r.recipe_id: r.family for r in V2_RECIPES}
+_PER_FAMILY_CAP = 3    # rank_eligible's default; the strict pass holds at most this many per family
+_INITIAL_VIEW_SIZE = 15   # rank_eligible's default first-screen capacity
 
 
 def _fake() -> FakeLLM:
@@ -168,6 +174,87 @@ def _merchant_catalog(conn) -> None:
     )
 
 
+def _obligor_catalog(conn) -> None:
+    """A facility-event catalog the V2 ``obligor_facility_count`` recipe binds on.
+
+    The one recipe whose REVIEWED Formula-v1 blueprint and V2 operand contract agree role for role
+    (``obligor`` grain / ``facility`` operand / ``event_ts``), which is what makes it the honest
+    end-to-end proof that the engine path can now be captured at all. The three formula-bearing
+    columns carry HUMAN-CONFIRMED concept evidence (the authority envelope re-resolves each one),
+    the obligor key carries a grain fact, and the event timestamp carries a VERIFIED temporal-role
+    decision — the three authorities ``build_formula_authority_envelope`` demands.
+    """
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC)
+    catalog = [
+        (CanonicalRow(
+            "obligor_bank", "facility_events", "obligor_ref", "string",
+            is_grain=True, entity="Obligor"), "obligor_id"),
+        (CanonicalRow(
+            "obligor_bank", "facility_events", "facility_ref", "string",
+            entity="Facility"), "facility_id"),
+        (CanonicalRow(
+            "obligor_bank", "facility_events", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow(
+            "obligor_bank", "facility_events", "ingested_at", "timestamp",
+            as_of=True, as_of_basis="ingested_at"), "as_of_date"),
+        (CanonicalRow(
+            "obligor_bank", "facility_events", "defaulted", "boolean"), "outcome_label"),
+    ]
+    build_graph(
+        conn,
+        "obligor_bank",
+        [row for row, _concept in catalog],
+        concepts={content_hash(row): concept for row, concept in catalog},
+    )
+    for row, concept in catalog[:3]:
+        ref = normalize_ref("obligor_bank", None, row.table, row.column)
+        record_field_evidence(
+            conn,
+            logical_ref=ref,
+            field_name="concept",
+            proposed_value=concept,
+            producer=EvidenceProducer.HUMAN,
+            strength=AssertionStrength.CONFIRMED,
+            producer_ref="human:test",
+            source_snapshot_id="snapshot:test",
+            input_hash=field_input_hash(
+                logical_ref=ref, field_name="concept", material=concept),
+        )
+    event_ref = normalize_ref("obligor_bank", None, "facility_events", "event_ts")
+    record_field_evidence(
+        conn,
+        logical_ref=event_ref,
+        field_name="temporal_role",
+        proposed_value="event",
+        producer=EvidenceProducer.HUMAN,
+        strength=AssertionStrength.CONFIRMED,
+        producer_ref="human:test",
+        source_snapshot_id="snapshot:test",
+        input_hash=field_input_hash(
+            logical_ref=event_ref, field_name="temporal_role", material="event"),
+    )
+    resolve_and_project(
+        conn,
+        source="obligor_bank",
+        logical_refs=[event_ref],
+        fields=["temporal_role"],
+    )
+    conn.execute(
+        "UPDATE graph_node SET grain_fact_event_id='grain-obligor-test' "
+        "WHERE catalog_source='obligor_bank' "
+        "AND object_ref='public.facility_events.obligor_ref'",
+    )
+    conn.execute(
+        "INSERT INTO overlay_drift_watermark "
+        "(catalog_source,last_completed_at,last_run_id,head_seq) "
+        "VALUES ('obligor_bank',%s,'r',0) "
+        "ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at=%s",
+        (now, now),
+    )
+
+
 def _stage(status: StageStatus) -> StageEvaluation:
     return StageEvaluation(status, (), "v", None)
 
@@ -209,22 +296,19 @@ def test_flag_on_churn_scoped_ranks_eligible_set(make_client, conn, monkeypatch)
 
     body = _post_churn_scoped(make_client(_fake()))
 
-    assert "ranking" in body and body["ranking_version"] == APPLICABILITY_MAPPING_VERSION
+    assert "ranking" in body and body["ranking_version"] == RANKING_MAPPING_VERSION
     ranking = body["ranking"]
     assert ranking, "a churn-scoped run must rank at least one eligible recipe"
     ranked_ids = {r["recipe_id"] for r in ranking}
     assert CHURN_RECIPE in ranked_ids
 
-    # ONLY eligible recipes are ranked. The ranking is a SUBSET of the eligible set, not an equality:
-    # `_rank_signals` builds each recipe's bundle from the LEGACY Template metadata (family,
-    # explainability, PIT completeness, journey, semantic group), so a recipe that exists only in the
-    # V2 registry has no bundle and the ranker deterministically DROPS it rather than ordering it on
-    # invented signals. After the E4 cutover the eligible set comes from V2, so that gap is visible
-    # here — and it is a gap in the ranker, never a second eligibility policy.
+    # EVERY eligible recipe is ranked — an EQUALITY, not the subset this asserted while the ranker
+    # was still keyed on the legacy Template registry. The signal profiles are now derived over the
+    # V2 registry, which is the same universe the dispositions come from, so an eligible recipe
+    # always has a bundle to be ordered on and can never be silently dropped from the ranking.
     eligible = {d["recipe_id"] for d in body["dispositions"]
                 if d["final_disposition"] == "eligible"}
-    assert ranked_ids <= eligible
-    assert ranked_ids == {rid for rid in eligible if rid in _FAMILY_BY_ID}
+    assert ranked_ids == eligible
     # Out-of-scope / unbuildable / rejected recipes never appear in the ranking.
     non_eligible = {d["recipe_id"] for d in body["dispositions"]
                     if d["final_disposition"] != "eligible"}
@@ -235,15 +319,17 @@ def test_flag_on_churn_scoped_ranks_eligible_set(make_client, conn, monkeypatch)
     # Ordered by a dense, 1-based canonical_rank (stable total order).
     assert [r["canonical_rank"] for r in ranking] == list(range(1, len(ranking) + 1))
 
-    # Initial view RESPECTS the family cap: no family contributes more than per_family_cap recipes.
+    # Every ranked recipe carries a family the ranker's diversity pass can group on — the axis is
+    # read from the V2 registry now, so an eligible recipe always has one.
     selected = [r for r in ranking if r["selected_for_initial_view"]]
-    per_family: dict[str, int] = {}
-    for r in selected:
-        fam = _FAMILY_BY_ID[r["recipe_id"]]
-        per_family[fam] = per_family.get(fam, 0) + 1
-    assert all(count <= _PER_FAMILY_CAP for count in per_family.values()), per_family
-    # Fewer eligible than the initial-view size here, so every ranked recipe fits the initial view, and
-    # each carries its OWN initial-view reason stream (separate from rank_reasons).
+    assert all(r["recipe_id"] in _FAMILY_BY_ID for r in ranking)
+    # This churn-scoped catalog grounds FEWER recipes than the initial-view size, so pass 3's
+    # INCREMENTAL family-cap relaxation runs and every ranked recipe fits the view — one family may
+    # therefore exceed `per_family_cap`, which is the ranker's documented relaxation rather than a
+    # cap violation (the cap and its round-robin relaxation are pinned unit-side in
+    # `taxonomy/test_ranking.py`). Each selected recipe carries its OWN initial-view reason stream,
+    # separate from rank_reasons.
+    assert len(ranking) < _INITIAL_VIEW_SIZE
     assert selected == ranking
     for r in selected:
         assert "selected_initial_view" in r["initial_view_reasons"]
@@ -309,25 +395,9 @@ def test_formula_shadow_expected_declaration_failure_is_loud_503(
     assert response.json()["detail"] == "SHADOW_EXPECTATION_STORE_UNAVAILABLE"
 
 
-def test_formula_shadow_records_why_it_could_not_capture_on_the_engine_path(
-    make_client, conn, monkeypatch
-):
-    """Delivery-B formula shadow on a confirmed-scope run — and a GAP the E4 cutover opened.
-
-    The shadow capture needs the run's PRIVATE grounding context, looked up by
-    ``recipe_candidate_keys_by_recipe_id``. That map is populated only by the legacy
-    ``_template_candidates`` pass, which — since the E4 cutover (2026-08-14) — no longer runs when a
-    ``confirmed_scope`` is present: the semantic engine serves that path and does not fill it. So on
-    every confirmed-scope run the capture now resolves CANDIDATE_MISSING and writes NO work item.
-
-    That is a real regression in the shadow subsystem, not a property worth having, and this test is
-    deliberately written so it cannot be mistaken for one: it asserts the honest current behaviour —
-    the recipe is ranked and selected, the expected run is declared, and the shadow records an
-    OBSERVATION that names exactly why it captured nothing — and it will fail the moment the
-    capture starts working again, at which point it should be restored to asserting the work item.
-    Nothing about this is silent: CAPTURE_INPUT_INCOMPLETE / CANDIDATE_MISSING is precisely the
-    machine-readable "I could not do my job, here is why" the shadow was built to emit.
-    """
+def _arm_shadow(conn, monkeypatch) -> None:
+    """Formula-shadow enrolment, armed BEFORE the catalog is seeded — the capture requires the
+    REPEATABLE READ connection, and psycopg refuses to change isolation once a statement has run."""
     import psycopg
 
     conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
@@ -335,18 +405,20 @@ def test_formula_shadow_records_why_it_could_not_capture_on_the_engine_path(
     monkeypatch.setenv(RANK_FLAG, "1")
     monkeypatch.setenv(FORMULA_SHADOW_FLAG, "1")
     monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
-    _merchant_catalog(conn)
-    hypothesis = "merchant category breadth may indicate merchant fraud"
-    objective = "identify merchant fraud"
+
+
+def _shadow_run(make_client, conn, *, use_case, hypothesis, objective,
+                catalog_source, target_ref) -> dict:
+    """One confirmed-scope, formula-shadow-enrolled generation run over ``catalog_source``."""
     recognition = make_client(FakeLLM(script={
         RECOGNIZER_TASK: FakeResponse(output={
             "status": "classified",
             "candidates": [{
-                "use_case_id": "fraud.merchant_fraud",
+                "use_case_id": use_case,
                 "relationship": "primary",
                 "confidence": "high",
-                "evidence_spans": ["merchant fraud"],
-                "rationale": "the hypothesis concerns merchant fraud",
+                "evidence_spans": [objective],
+                "rationale": f"the hypothesis concerns {use_case}",
             }],
             "ambiguity_note": None,
         }),
@@ -360,60 +432,138 @@ def test_formula_shadow_records_why_it_could_not_capture_on_the_engine_path(
         json={
             "hypothesis": hypothesis,
             "objective": objective,
-            "catalog_source": "merchant_bank",
-            "target_ref": "public.tx.fraud_flag",
+            "catalog_source": catalog_source,
+            "target_ref": target_ref,
             "intent_id": recognition["intent_id"],
             "recognition_id": recognition["recognition_id"],
             "confirmed_scope": {
-                "primary": "fraud.merchant_fraud",
+                "primary": use_case,
                 "confirmation_source": "user_confirmed",
             },
         },
         headers=AUTH,
     )
     assert response.status_code == 200, response.text
-    body = response.json()
-    selected = {
-        item["recipe_id"]
-        for item in body["ranking"]
-        if item["selected_for_initial_view"]
-    }
-    merchant_disposition = next(
-        item for item in body["dispositions"]
-        if item["recipe_id"] == "merchant_mcc_diversity"
-    )
-    import json
+    return response.json()
 
-    assert "merchant_mcc_diversity" in selected, json.dumps({
-        "disposition": merchant_disposition,
-        "ranking": body["ranking"],
-    }, indent=2)
+
+def test_formula_shadow_captures_a_work_item_on_the_engine_path(
+    make_client, conn, monkeypatch
+):
+    """Delivery-B formula shadow captures REAL work off the engine path — the E4 follow-up fix.
+
+    The capture resolves a run's PRIVATE grounding context through
+    ``recipe_candidate_keys_by_recipe_id``. Until 2026-08-14 that map was filled only by the legacy
+    ``_template_candidates`` pass, which the E4 cutover stopped running on the confirmed-scope path:
+    the engine served the candidates and filled nothing, so EVERY capture resolved
+    ``CANDIDATE_MISSING`` and wrote zero work items — the whole subsystem was inert on the only path
+    there is. The engine now rebuilds both maps from the candidates it actually served, and this test
+    is the proof that the rebuilt context is not merely present but USABLE: it survives the
+    blueprint preflight, the authority envelope re-resolves every role against raw concept evidence,
+    the grain fact and the verified event-time decision, and an immutable work item plus its
+    transactional outbox pointer are written.
+
+    ``obligor_facility_count`` is the subject because it is the one recipe whose reviewed Formula-v1
+    blueprint and V2 operand contract agree role for role (see the sibling test below for the one
+    that does not, and why that is a different defect).
+    """
+    _arm_shadow(conn, monkeypatch)
+    _obligor_catalog(conn)
+    body = _shadow_run(
+        make_client, conn,
+        use_case="credit.monitoring.obligor",
+        hypothesis="obligors with more active facilities are harder to monitor",
+        objective="monitor obligor complexity",
+        catalog_source="obligor_bank",
+        target_ref="public.facility_events.defaulted")
+
+    selected = {item["recipe_id"] for item in body["ranking"]
+                if item["selected_for_initial_view"]}
+    assert "obligor_facility_count" in selected, body["ranking"]
     work = conn.execute(
-        "SELECT recipe_id,metadata_snapshot_id,binding_envelope_json,"
-        "provider_input_json FROM recipe_formula_shadow_work_item "
+        "SELECT recipe_id,recipe_candidate_key,metadata_snapshot_id,binding_envelope_json,"
+        "provider_input_json,request_read_scope_hash FROM recipe_formula_shadow_work_item "
         "WHERE generation_run_id=%s",
         (body["generation_run_id"],),
     ).fetchall()
+    assert [row[0] for row in work] == ["obligor_facility_count"], work
+    recipe_id, candidate_key, snapshot_id, envelope, provider_input, read_scope = work[0]
+    assert candidate_key and snapshot_id and read_scope
+    # The envelope names the exact bound refs, re-resolved — not the recipe's authored roles.
+    assert {b["role"] for b in envelope["bindings"]} == {"obligor", "facility", "event_ts"}
+    assert envelope["grain_facts"][0]["fact_event_id"] == "grain-obligor-test"
+    assert envelope["event_time_facts"][0]["temporal_role"] == "event"
+    assert provider_input
+    # A captured work item is NOT an observation — the observation is the worker's to write when it
+    # finishes. Nothing about this recipe was recorded as an incomplete capture.
+    incomplete = conn.execute(
+        "SELECT technical_axis FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id=%s AND recipe_id=%s",
+        (body["generation_run_id"], recipe_id),
+    ).fetchall()
+    assert incomplete == []
+    # …and the transactional outbox pointer the worker reads was written with it.
+    assert conn.execute(
+        "SELECT count(*) FROM outbox WHERE topic='recipe_formula_shadow.requested.v1'"
+    ).fetchone()[0] == 1
+
+
+def test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreement(
+    make_client, conn, monkeypatch
+):
+    """The SECOND authorable recipe gets as far as its reviewed blueprint and is refused BY it —
+    a different, still-open defect, recorded rather than hidden.
+
+    Before the E4 follow-up this run recorded ``CANDIDATE_MISSING``: the engine filled no
+    candidate-key map, so the capture never reached the blueprint at all. It now resolves an EXACT
+    candidate, finds the private context, and fails one step later — because the reviewed Formula-v1
+    blueprint for ``merchant_mcc_diversity`` was authored against the LEGACY template, whose grain
+    role was ``merchant``, while the V2 recipe computes per CUSTOMER. ``bind_formula_expectation``
+    refuses a source-entity role that is not one of the blueprint's grain key roles, which is
+    exactly right: silently authoring a merchant-grain formula for a customer-grain recipe is the
+    class of error the preflight exists to stop.
+
+    Re-keying a REVIEWED expectation to a different grain entity is a governance act, not a
+    follow-up fix, so it is named here and left open. The sibling test above proves the capture
+    path itself works end to end.
+    """
+    _arm_shadow(conn, monkeypatch)
+    _merchant_catalog(conn)
+    body = _shadow_run(
+        make_client, conn,
+        use_case="fraud.merchant_fraud",
+        hypothesis="merchant category breadth may indicate merchant fraud",
+        objective="identify merchant fraud",
+        catalog_source="merchant_bank",
+        target_ref="public.tx.fraud_flag")
+
+    selected = {item["recipe_id"] for item in body["ranking"]
+                if item["selected_for_initial_view"]}
+    assert "merchant_mcc_diversity" in selected, body["ranking"]
     observations = conn.execute(
         "SELECT recipe_id,capture_axis,authority_axis,technical_axis "
         "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
         (body["generation_run_id"],),
     ).fetchall()
-    # The expected-run declaration (the flag-on durability interlock) still happened — the shadow
-    # knows a run was owed to it, which is what makes the miss below detectable at all.
+    # The expected-run declaration (the flag-on durability interlock) happened, which is what makes
+    # any miss detectable at all.
     assert conn.execute(
         "SELECT count(*) FROM recipe_formula_shadow_expected_run "
         "WHERE generation_run_id=%s", (body["generation_run_id"],)).fetchone()[0] == 1
-    # …and the capture named its own failure instead of vanishing.
+    # The candidate RESOLVED (the map is filled) and the refusal names the blueprint's own rule —
+    # never CANDIDATE_MISSING, which would mean the engine handed the shadow nothing.
     assert ("merchant_mcc_diversity", "CAPTURE_INPUT_INCOMPLETE", "NOT_EVALUATED",
-            "CANDIDATE_MISSING") in observations
-    assert work == [], (
-        "the engine path fills no candidate-key map, so nothing can be captured — see this "
-        "test's docstring; restore the work-item assertions when that is fixed")
+            "FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED") in observations
+    assert all(row[3] != "CANDIDATE_MISSING" for row in observations), observations
+    manifest = conn.execute(
+        "SELECT capture_entries FROM recipe_formula_shadow_run_manifest "
+        "WHERE generation_run_id=%s", (body["generation_run_id"],)).fetchone()[0]
+    entry = next(e for e in manifest if e["recipe_id"] == "merchant_mcc_diversity")
+    assert entry["candidate_resolution"] == "EXACT" and entry["recipe_candidate_key"]
+    # Nothing was enqueued: a refused preflight is an observation, never work a provider would run.
     assert conn.execute(
-        "SELECT count(*) FROM outbox "
-        "WHERE topic='recipe_formula_shadow.requested.v1'"
-    ).fetchone()[0] == 0
+        "SELECT count(*) FROM recipe_formula_shadow_work_item WHERE generation_run_id=%s",
+        (body["generation_run_id"],)).fetchone()[0] == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════

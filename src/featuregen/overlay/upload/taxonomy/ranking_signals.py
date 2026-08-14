@@ -34,9 +34,16 @@ Four signals + a grouping key:
 
 ``semantic_group`` is the near-duplicate key: the source template id, which every grounded variant of a
 template carries. Behaviour-neutral, read-only — nothing here touches grounding or the considered-set.
+
+TWO UNIVERSES LIVE HERE (E4 follow-up, 2026-08-14). The derivations above are authored against the
+LEGACY ``Template``; :func:`v2_rank_profiles` and its two folds at the bottom of this module derive
+the same five axes over the ATOMIC V2 registry — the universe the engine actually plans and disposes
+since the cutover. The serving ranker consumes the V2 profiles; the legacy derivations stay for the
+legacy per-table grounding pass that still feeds the asset-detail column dossier.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from featuregen.overlay.upload.concepts import concept
@@ -47,6 +54,7 @@ from featuregen.overlay.upload.taxonomy.entity_graph import (
 from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
 from featuregen.overlay.upload.templates import (
+    ALL_TEMPLATES,
     BindingResolution,
     GroundedFeature,
     SourceEntityRoleResolution,
@@ -256,3 +264,129 @@ def semantic_group(t: Template) -> str:
     (e.g. ``balance_trend_90d`` / ``balance_trend_60d``) carries ``template_id == 'balance_trend'``, so
     they all share this group; the ranker keeps only one variant per group in the initial view (A2)."""
     return t.id
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The V2 recipe universe — the SAME five axes, derived over the registry the engine plans
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# Every derivation above is authored against a legacy :class:`Template`. Since the E4 cutover the
+# universe the engine plans, disposes and ranks is the ATOMIC V2 registry, so keying the ranker on
+# the legacy registry silently dropped the 126 recipes that have no legacy twin — an eligible recipe
+# that could never be ordered, never selected for the initial view, and never offered to formula
+# shadow capture. These derivations close that: one profile per V2 recipe, TOTAL over the registry.
+#
+# Where the V2 contract carries the fact, it is read directly (``family``, ``output_grain``, the
+# temporal COMPILER's verdict). Three of the ranker's inputs have no V2 field at all —
+# explainability, funnel journey, and regulatory modelling context are legacy AUTHORING metadata —
+# so they are bridged through ``replaces_legacy_ids``, which is source-controlled and explicit
+# (never heuristic, the same rule the alias map lives by). A V2-only recipe declares no legacy
+# source, so it carries an honest ABSENCE: no journey, no framework, and an unauthored
+# explainability that the ranker's documented total order sorts last on that axis — never an
+# invented ``"H"``.
+@dataclass(frozen=True, slots=True)
+class V2RankProfileV1:
+    """One V2 recipe's DESIGN-TIME ranking facts — everything the signal bundle needs that does not
+    depend on the request. Computed once for the whole registry (see :func:`v2_rank_profiles`); the
+    two request-dependent axes (confirmed modelling contexts, confirmed target entity) fold over it."""
+
+    recipe_id: str
+    family: str
+    semantic_group: str
+    explainability: str                    # "H" | "M" | "L", or "" when unauthored
+    journey_model_id: str | None
+    journey_stage_id: str | None
+    pit_completeness: PITCompleteness
+    own_modelling_contexts: frozenset[str]
+    grain_entity: str | None
+
+
+def _replaced_templates(recipe) -> tuple[Template, ...]:
+    """The legacy templates a V2 recipe DECLARES it replaces — source-controlled, never inferred.
+    Empty for the V2-only recipes (no legacy twin exists to inherit authoring from)."""
+    by_id = {t.id: t for t in ALL_TEMPLATES}
+    return tuple(t for rid in recipe.replaces_legacy_ids if (t := by_id.get(rid)) is not None)
+
+
+def _bridged_explainability(replaced: tuple[Template, ...]) -> str:
+    """The explainability the V2 recipe inherits from the legacy template(s) it replaces — the
+    WEAKEST of them when it replaces more than one, because a merged recipe is no more explainable
+    than its least explainable half. ``""`` when nothing is inherited: unauthored, and the ranker
+    orders an unrecognised label last on that axis rather than promoting a guess."""
+    order = {"H": 0, "M": 1, "L": 2}
+    labels = [t.explain for t in replaced if t.explain in order]
+    return max(labels, key=lambda label: order[label]) if labels else ""
+
+
+def _bridged_journey(replaced: tuple[Template, ...]):
+    """The funnel position inherited from the ONE legacy template that authored one. Two replaced
+    templates that disagree yield no journey — the diversity pass would otherwise spread the initial
+    view over a stage nobody assigned this recipe."""
+    from featuregen.overlay.upload.taxonomy.journey_stages import journey_metadata
+
+    found = {(m.journey_model_id, m.journey_stage_id)
+             for t in replaced
+             if (m := journey_metadata(t)).journey_stage_id is not None}
+    return found.pop() if len(found) == 1 else (None, None)
+
+
+_V2_RANK_PROFILES: dict[str, V2RankProfileV1] | None = None
+
+
+def v2_rank_profiles() -> dict[str, V2RankProfileV1]:
+    """Every V2 recipe's design-time ranking profile, keyed by ``recipe_id`` — computed once and
+    memoized (the registry is a frozen, import-time constant, so the profiles are too)."""
+    global _V2_RANK_PROFILES
+    if _V2_RANK_PROFILES is not None:
+        return _V2_RANK_PROFILES
+
+    from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+    from featuregen.overlay.upload.recipe_temporal_v2 import compile_temporal
+
+    profiles: dict[str, V2RankProfileV1] = {}
+    for recipe in V2_RECIPES:
+        replaced = _replaced_templates(recipe)
+        model_id, stage_id = _bridged_journey(replaced)
+        profiles[recipe.recipe_id] = V2RankProfileV1(
+            recipe_id=recipe.recipe_id,
+            family=recipe.family,
+            # Atomic by contract: a V2 recipe IS its own near-duplicate group. (Its parameter
+            # VARIANTS share the recipe id, which is exactly what the group dedup wants.)
+            semantic_group=recipe.recipe_id,
+            explainability=_bridged_explainability(replaced),
+            journey_model_id=model_id,
+            journey_stage_id=stage_id,
+            # BR-4: the temporal COMPILER's verdict, never keyword markers on a prose PIT rule.
+            pit_completeness=pit_completeness_v2(compile_temporal(recipe)),
+            own_modelling_contexts=frozenset().union(
+                *(_own_modelling_contexts(t) for t in replaced)) if replaced else frozenset(),
+            # The grain the recipe computes AT — authored on the V2 contract, so no concept
+            # archaeology is needed to recover what the legacy path inferred from its needs.
+            grain_entity=recipe.output_grain or None,
+        )
+    _V2_RANK_PROFILES = profiles
+    return profiles
+
+
+def modelling_context_fit_v2(
+    profile: V2RankProfileV1,
+    confirmed_contexts: tuple[str, ...] = ()) -> ModellingContextFit:
+    """:func:`modelling_context_fit`'s law, unchanged, over a V2 profile's own contexts."""
+    if not confirmed_contexts:
+        return ModellingContextFit.NEUTRAL
+    confirmed = set(confirmed_contexts)
+    if profile.own_modelling_contexts & confirmed:
+        return ModellingContextFit.REQUIRED_MATCH
+    if not profile.own_modelling_contexts:
+        return ModellingContextFit.COMPATIBLE
+    return ModellingContextFit.CONFLICT
+
+
+def entity_compatibility_v2(
+    profile: V2RankProfileV1, target_entity: str | None = None) -> EntityCompatibility:
+    """:func:`entity_compatibility`'s law, unchanged, over the recipe's AUTHORED output grain —
+    resolved by the same governed entity graph. No target, or a grain outside the graph's closed
+    vocabulary, is ``UNKNOWN``; it is never an applicability reject."""
+    if target_entity is None or profile.grain_entity is None:
+        return EntityCompatibility.UNKNOWN
+    return resolve_entity_compatibility(
+        profile.grain_entity, target_entity, ENTITY_GRAPH).status

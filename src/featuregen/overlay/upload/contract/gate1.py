@@ -57,6 +57,7 @@ from featuregen.overlay.upload.grounding_trace import (
     build_trace,
     dependency_pin,
 )
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -802,6 +803,69 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
         return []
 
 
+def _engine_recipe_contexts(
+    *, catalog_source: str, context, candidates_by_id: dict, served_ideas,
+) -> tuple[dict[str, RecipeGroundingContextV1], dict[str, tuple[str, ...]]]:
+    """The two server-private recipe maps, rebuilt from the ENGINE's served candidates.
+
+    ``(contexts by candidate key, candidate keys by recipe id)`` — exactly the pair the legacy
+    grounding pass returned, so every consumer (Delivery-B formula-shadow capture, the private
+    considered revision, E4b's operand-role reattachment) reads the same shape from either source.
+
+    ONE context per served RECIPE, at its LEADING variant. Both consuming maps are keyed by
+    ``recipe_id`` — the key the dispositions and the ranking use — while B5 serves one card per
+    authored parameterization, so a three-window recipe offers three candidates for one ranked row.
+    The leading variant is the answer: ``variant_primary`` is the deterministic hypothesis match
+    (or the authored-first default), i.e. the parameterization that fronts this recipe, which is
+    precisely what the retired legacy pass captured when ``choose_params`` picked one window per
+    template. Recording all three instead would resolve AMBIGUOUS and capture nothing — a
+    regression wearing a different reason code. The bindings are variant-INVARIANT (the binder
+    chooses columns per role, never per parameter), so only the captured window differs, and it
+    differs to the one the human is shown first.
+
+    The logical refs come from the frozen context's own index (schema-preserving, exactly as
+    ``logical_ref_of`` rebuilds them), so no per-binding query is issued.
+    """
+    from featuregen.overlay.upload.recipe_grounding_context import (
+        build_v2_recipe_grounding_context,
+    )
+
+    logical_refs = {
+        column.object_ref: normalize_ref(
+            catalog_source, column.schema_name or "public", column.table, column.column)
+        for column in context.columns}
+    leading: dict[str, object] = {}
+    for idea in served_ideas:
+        candidate = candidates_by_id.get(idea.source_definition_id)
+        if candidate is None or getattr(candidate, "recipe_id", None) is None:
+            continue
+        held = leading.get(candidate.recipe_id)
+        if held is None or (not getattr(held, "variant_primary", True)
+                            and getattr(candidate, "variant_primary", True)):
+            leading[candidate.recipe_id] = candidate
+
+    contexts: dict[str, RecipeGroundingContextV1] = {}
+    keys_by_recipe: dict[str, tuple[str, ...]] = {}
+    for recipe_id, candidate in leading.items():
+        try:
+            grounding = build_v2_recipe_grounding_context(
+                candidate, catalog_source=catalog_source,
+                logical_ref_by_object_ref=logical_refs)
+        except Exception:
+            # FAIL-SOFT, per recipe. These maps feed the formula SHADOW and role reattachment,
+            # never the answer the human is shown, so an un-canonicalizable candidate must not
+            # take the whole considered set down with it. It is not silent either: the recipe
+            # simply has no key, so the shadow records its own CANDIDATE_MISSING alongside this
+            # logged exception.
+            logger.exception("engine recipe grounding context failed for %s", recipe_id)
+            continue
+        if grounding is None:
+            continue
+        contexts[grounding.recipe_candidate_key] = grounding
+        keys_by_recipe[recipe_id] = (grounding.recipe_candidate_key,)
+    return contexts, keys_by_recipe
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          feedback: str | None = None, now=None,
@@ -945,6 +1009,20 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *,
             for idea in (*projection.ideas, *projection.actionable_ideas)
             if idea.source_definition_id and idea.source_definition_id in candidates_by_id
         }
+        # Delivery B / E4b: the server-PRIVATE replay context for every recipe-origin candidate
+        # this run SERVED (ideas and actionable options alike — both mint option ids, so both can
+        # be reloaded and both can be selected for formula-shadow capture). The legacy grounding
+        # pass used to be the only filler of these two maps; after the cutover it no longer runs
+        # here, and an empty map made every shadow capture resolve CANDIDATE_MISSING and every
+        # reloaded option lose its operand roles. The engine has the same facts — the authored
+        # definition, the resolved variant, and the binder's per-role column — so it fills them.
+        if semantic_context is not None:
+            recipe_grounding_context_by_candidate_key, recipe_candidate_keys_by_recipe_id = (
+                _engine_recipe_contexts(
+                    catalog_source=catalog_source,
+                    context=semantic_context,
+                    candidates_by_id=candidates_by_id,
+                    served_ideas=(*projection.ideas, *projection.actionable_ideas)))
         rejections.extend({"name": r.get("detail", "intent"), "reason": r.get("detail", ""),
                            "code": r.get("code", "INTENT_REJECTED")}
                           for r in intent_rejections)

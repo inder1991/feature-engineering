@@ -128,7 +128,6 @@ from featuregen.overlay.upload.taxonomy.disposition import (
     StageEvaluation,
     evaluate_dispositions,
 )
-from featuregen.overlay.upload.taxonomy.journey_stages import journey_metadata
 from featuregen.overlay.upload.taxonomy.ranking import (
     RankedRecipe,
     RankSignals,
@@ -138,10 +137,9 @@ from featuregen.overlay.upload.taxonomy.ranking_signals import (
     BindingQuality,
     EntityCompatibility,
     ModellingContextFit,
-    entity_compatibility,
-    modelling_context_fit,
-    pit_completeness,
-    semantic_group,
+    entity_compatibility_v2,
+    modelling_context_fit_v2,
+    v2_rank_profiles,
 )
 from featuregen.overlay.upload.taxonomy.recognition import (
     APPLICABILITY_MAPPING_VERSION,
@@ -149,7 +147,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
 )
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
-from featuregen.overlay.upload.templates import ALL_TEMPLATES
+from featuregen.overlay.upload.taxonomy.versions import RANKING_MAPPING_VERSION
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
@@ -456,7 +454,6 @@ def _disposition_json(ev: RecipeEvaluation) -> dict:
 # the ONE place FinalDisposition is read for ranking (``rankable_recipe_ids``), so the ranker stays
 # disposition-agnostic and survives the future policy initiative untouched. The three presentation layers
 # stay separate: the deterministic ``ranking`` here, the LLM ``recommendation``, and the human choice.
-_TEMPLATES_BY_ID = {t.id: t for t in ALL_TEMPLATES}
 
 
 def _intent_ranking_enabled() -> bool:
@@ -489,34 +486,41 @@ def rankable_recipe_ids(dispositions: list[RecipeEvaluation]) -> list[str]:
 def _rank_signals(rankable_ids: list[str], dispositions: list[RecipeEvaluation],
                   cs, scope: ConfirmedScope) -> dict[str, RankSignals]:
     """Assemble the typed :class:`RankSignals` per rankable recipe from four already-computed sources:
-    the disposition (``relevance_tier``), this run's grounding (``binding_quality``), the template's
-    design-time metadata (``pit_completeness`` / ``family`` / ``explainability`` / journey / semantic
+    the disposition (``relevance_tier``), this run's grounding (``binding_quality``), the RECIPE's
+    design-time profile (``pit_completeness`` / ``family`` / ``explainability`` / journey / semantic
     group), and the confirmed-scope DIMENSIONS (Task B3): ``modelling_context_fit`` from
     ``scope.modelling_contexts`` and the soft ``entity_compatibility`` from ``scope.target_entity``. A
-    dimension-free scope leaves those two at NEUTRAL / UNKNOWN (2A ranking is unaffected). A rankable id
-    with no known template is skipped (the ranker then deterministically drops it — it cannot be ordered
-    without a signal bundle)."""
+    dimension-free scope leaves those two at NEUTRAL / UNKNOWN (2A ranking is unaffected).
+
+    E4 follow-up (2026-08-14): the design-time half is keyed on the **V2 recipe registry**, not the
+    legacy ``Template`` registry. The rankable set comes from the V2 dispositions, so keying the
+    profiles on the legacy registry meant only the ~106 ids present in BOTH registries could ever be
+    ranked — an eligible V2-only recipe was silently dropped from ``ranking``, from the initial view,
+    and from formula-shadow capture selection. The five ordering axes are unchanged; only the
+    universe the profiles are read from moved. The ``profile is None`` skip below is now unreachable
+    by construction (the disposition universe IS the profile universe) and is kept only so the
+    function stays total for a caller that hands over an id from somewhere else."""
     tier_by_id = {ev.recipe_id: ev.relevance_tier for ev in dispositions}
+    profiles = v2_rank_profiles()
     signals: dict[str, RankSignals] = {}
     for rid in rankable_ids:
-        t = _TEMPLATES_BY_ID.get(rid)
-        if t is None:
+        profile = profiles.get(rid)
+        if profile is None:
             continue
-        journey = journey_metadata(t)
         signals[rid] = RankSignals(
             relevance_tier=tier_by_id.get(rid) or "supporting",   # ELIGIBLE => a real in-scope tier
             binding_quality=BindingQuality(
                 cs.binding_quality_by_template.get(rid, BindingQuality.ACCEPTABLE.value)),
             # Task B3: the confirmed modelling-context fit (NEUTRAL when none confirmed).
-            modelling_context_fit=modelling_context_fit(t, scope.modelling_contexts),
-            pit_completeness=pit_completeness(t),
-            explainability=t.explain,
-            family=t.family,
-            journey_model_id=journey.journey_model_id,
-            journey_stage_id=journey.journey_stage_id,
-            semantic_group=semantic_group(t),
+            modelling_context_fit=modelling_context_fit_v2(profile, scope.modelling_contexts),
+            pit_completeness=profile.pit_completeness,
+            explainability=profile.explainability,
+            family=profile.family,
+            journey_model_id=profile.journey_model_id,
+            journey_stage_id=profile.journey_stage_id,
+            semantic_group=profile.semantic_group,
             # Task B3: the SOFT grain fit (UNKNOWN when no target_entity confirmed) — never a reject.
-            entity_compatibility=entity_compatibility(t, scope.target_entity),
+            entity_compatibility=entity_compatibility_v2(profile, scope.target_entity),
         )
     return signals
 
@@ -726,6 +730,23 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             require_live_ready(conn)
         except LiveActivationNotReady as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
+    # B1: an entity-only (cross-catalog) request is REFUSED typed — the semantic engine plans
+    # over one frozen catalog context; until a multi-catalog context is chartered, an honest
+    # refusal beats a silently empty page (E4: the legacy free-form path that used to fill it is
+    # deleted, so there is no mode in which this request could be served).
+    #
+    # The refusal sits HERE, before the mint below, because a refused request must leave no
+    # trace: it used to fire after step 4/5 and so wrote an orphan ``feature_generation_run``
+    # and ``confirmed_generation_scope`` for a page that was never generated — rows that read,
+    # to anyone auditing the store, like generation runs that produced nothing. It stays AFTER
+    # the live-activation interlock above on purpose: an unapproved flag-on deployment gets the
+    # stronger, more accurate 503 rather than being told to name a catalog.
+    if body.catalog_source is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
+            "message": "semantic generation plans over ONE catalog; entity-only cross-catalog "
+                       "scope is not yet supported — name a catalog_source",
+        })
     # B8 (PLAN-14 closed): the projection-readiness gate runs BEFORE any model dispatch — a
     # lagged catalog projection 503s here having spent ZERO provider calls. (It previously
     # fired inside the snapshot persist, AFTER generation.) Only the semantic serving mode
@@ -793,16 +814,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
-    # B1: an entity-only (cross-catalog) request is REFUSED typed — the semantic engine plans
-    # over one frozen catalog context; until a multi-catalog context is chartered, an honest
-    # refusal beats a silently empty page (E4: the legacy free-form path that used to fill it is
-    # deleted, so there is no mode in which this request could be served).
-    if body.catalog_source is None:
-        raise HTTPException(status_code=422, detail={
-            "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
-            "message": "semantic generation plans over ONE catalog; entity-only cross-catalog "
-                       "scope is not yet supported — name a catalog_source",
-        })
+    # (B1's entity-only refusal moved ABOVE the mint — see the typed 422 before step 4.)
     # SE-7 part 4: the DISPOSITION universe is the V2 registry — the universe that was actually
     # planned. The legacy object still feeds the legacy machinery (shadow planner,
     # scoped-grounding narrowing) untouched.
@@ -941,7 +953,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     if ranking_enabled:
         rankable_ids = rankable_recipe_ids(dispositions)
         signals = _rank_signals(rankable_ids, dispositions, cs, scope)
-        ranking_version = APPLICABILITY_MAPPING_VERSION   # pinned BEFORE the ranker is called
+        # Pinned BEFORE the ranker is called. It is the RANKER's own mapping identity (the recipe
+        # universe + the per-axis derivation), not applicability's: the two moved apart when the
+        # ranker was re-keyed onto the V2 registry, and a stamp that cannot distinguish them cannot
+        # tell a replayer which mapping produced an order.
+        ranking_version = RANKING_MAPPING_VERSION
         ranked = tuple(rank_eligible(
             rankable_ids, signals, ranking_version=ranking_version))
         response["ranking"] = [_ranking_json(r) for r in ranked]

@@ -1339,6 +1339,73 @@ no orphaned persisted record references a deleted parser.
 > checks — `GRAIN_IS_UNIQUE` — and the deleted free-form candidate simply declared none. The card
 > got MORE honest; the view's headline followed it.
 
+> **E4 follow-up defects fixed (2026-08-14).** All three defects the cutover surfaced above are
+> CLOSED, and each asserted-as-current test is flipped into a fixed-behaviour pin.
+>
+> **(2 above, fixed first — user-visible) The ranker is re-keyed on the V2 recipe registry.**
+> `_rank_signals` now reads a per-recipe profile from `ranking_signals.v2_rank_profiles()` — 317
+> profiles, total over the registry — instead of `{t.id: t for t in ALL_TEMPLATES}`, so every
+> eligible recipe is rankable rather than only the ~106 with a legacy twin. The five ordering axes
+> are UNCHANGED: relevance tier still comes from the disposition, binding quality from this run's
+> grounding, modelling-context fit and the soft entity compatibility from the confirmed dimensions,
+> under the same laws (`modelling_context_fit_v2` / `entity_compatibility_v2` restate them verbatim).
+> Only the universe moved. Where the V2 contract carries the fact it is read directly — `family`,
+> `output_grain` as the grain entity, and the temporal COMPILER's verdict for PIT completeness
+> (never keyword markers on prose). Explainability, funnel journey and regulatory modelling context
+> have NO V2 field — they are legacy authoring metadata — so they are bridged through
+> `replaces_legacy_ids`, which is source-controlled and explicit, never heuristic. The 126 V2-only
+> recipes therefore carry an honest ABSENCE: no journey, no framework, and an unauthored
+> explainability that the ranker's documented total order sorts last on that axis rather than an
+> invented `"H"`. `ranking_version` moved off `APPLICABILITY_MAPPING_VERSION` onto a new
+> `RANKING_MAPPING_VERSION = "ranking-v2-recipes@1"`: the ranker's mapping changed and
+> applicability's did not, and one stamp that speaks for both can only lie about one of them.
+> FLIPPED: `test_flag_on_churn_scoped_ranks_eligible_set` asserted `ranked_ids <= eligible` with a
+> comment naming the gap; it now asserts `ranked_ids == eligible`. Its family-cap assertion was
+> restated honestly — with the whole eligible set ranked, pass 3's incremental cap RELAXATION runs
+> on this catalog, which is documented ranker behaviour (pinned unit-side in
+> `taxonomy/test_ranking.py`), not a cap violation.
+>
+> **(1) The Delivery-B formula shadow captures real work off the engine path.**
+> `build_v2_recipe_grounding_context` rebuilds a `RecipeGroundingContextV1` from an engine candidate
+> — the authored definition (`canonical-recipe-v2`), the resolved variant, and the shared binder's
+> per-role column — and `gate1._engine_recipe_contexts` fills both
+> `recipe_candidate_keys_by_recipe_id` and `recipe_grounding_context_by_candidate_key` from the
+> candidates the run SERVED (ideas and actionable options alike). Logical refs come from the frozen
+> context's own index, so no per-binding query is added. ONE context per served recipe, at its
+> LEADING variant: both maps are keyed by `recipe_id` (the dispositions' and the ranking's key)
+> while B5 serves one card per parameterization, so recording all of them would resolve AMBIGUOUS
+> and capture nothing — a regression wearing a different reason code. `variant_primary` is the
+> hypothesis match or the authored-first default, exactly what the retired `choose_params` pass
+> captured; bindings are variant-invariant, so only the captured window differs, to the one shown
+> first. E4b's `_revision_recipe_candidate_key` recovers with it. FLIPPED:
+> `test_formula_shadow_records_why_it_could_not_capture_on_the_engine_path` became TWO tests —
+> `test_formula_shadow_captures_a_work_item_on_the_engine_path` proves a real immutable work item
+> (authority envelope over the three re-resolved roles, grain fact, verified event-time decision)
+> plus its outbox pointer on a new obligor catalog, and
+> `test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreement` keeps the merchant
+> case, now resolving an EXACT candidate and failing one step later.
+>
+> **A FOURTH DEFECT SURFACED BY THE THIRD, open and named.** `merchant_mcc_diversity`'s REVIEWED
+> Formula-v1 blueprint declares grain entity/role `merchant` (authored against the legacy template),
+> while the V2 recipe computes per CUSTOMER. With the map filled, the capture now reaches
+> `bind_formula_expectation` and is refused `FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED` — correctly:
+> silently authoring a merchant-grain formula for a customer-grain recipe is the class of error the
+> preflight exists to stop. `validate_expectation_registry` still validates blueprint roles against
+> the LEGACY template's needs, so re-keying the blueprint is an expectation-registry cutover AND a
+> governance act on a reviewed artifact. NOT done here; asserted-as-current with a docstring saying
+> why. `obligor_facility_count` — the other authorable recipe — agrees role for role, which is what
+> the positive test above exercises.
+>
+> **(3) B1's typed 422 precedes every durable write.** The refusal moved above the run mint and the
+> scope persist (staying BELOW the live-activation interlock, so an unapproved flag-on deployment
+> still gets the stronger 503). A refused entity-only request now leaves no `contract_intent`, no
+> `feature_generation_run` and no `confirmed_generation_scope` — previously two orphan rows per
+> refusal, indistinguishable in the store from a run that generated an empty page. NEW PIN:
+> `test_entity_only_refusal_leaves_no_run_and_no_scope_row` asserts the whole write set;
+> `test_flag_on_cross_catalog_request_is_refused_and_never_reaches_the_permissive_path` had a
+> comment claiming "the refusal precedes every write" that was not true of runs and scopes — it now
+> asserts all four tables.
+
 ## 7. Sequencing and dependencies
 
 ```

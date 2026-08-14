@@ -202,6 +202,108 @@ def canonical_recipe_v2_hash(definition: Any) -> str:
     return content_hash(canonical_recipe_v2(definition))
 
 
+def build_v2_recipe_grounding_context(
+    candidate: Any,
+    *,
+    catalog_source: str,
+    logical_ref_by_object_ref: dict[str, str],
+) -> RecipeGroundingContextV1 | None:
+    """The server-private replay context for ONE engine-served V2 recipe candidate.
+
+    The legacy builder above takes a ``Template`` + its ``GroundedFeature``; since the E4 cutover the
+    only thing that grounds recipes on the serving path is the semantic engine, whose candidate
+    carries the same three facts in V2 vocabulary: the definition (hashed as ``canonical-recipe-v2``),
+    the resolved parameter variant, and the per-role column the SHARED binder chose. Reconstructing
+    the record from those is what keeps the Delivery-B formula shadow and E4b's operand-role
+    reattachment working — both look candidates up by ``recipe_candidate_key``, and the engine used to
+    supply none, so every capture resolved ``CANDIDATE_MISSING`` and wrote no work item.
+
+    Returns ``None`` for a candidate that is not recipe-origin (an LLM intent has no authored
+    definition to hash), that bound nothing, or whose bound ref is absent from the frozen context's
+    index — a context whose refs cannot be keyed back to field evidence would only fail later, and
+    failing to build it is the honest absence.
+    """
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+    from featuregen.overlay.upload.templates import BindingResolution, GroundedNeedBinding
+
+    request = candidate.planning_request
+    if request.origin != "recipe_v2":
+        return None
+    definition = v2_recipe_by_id(candidate.recipe_id)
+    if definition is None:
+        return None
+    operands = {operand.role: operand for operand in request.operands}
+    bound = [v for v in candidate.verdicts
+             if v.status == "bound" and v.selected_ref and v.role in operands]
+    if not bound:
+        return None
+
+    need_bindings: list[GroundedNeedBinding] = []
+    for verdict in sorted(bound, key=lambda v: v.role):
+        operand = operands[verdict.role]
+        logical_ref = logical_ref_by_object_ref.get(verdict.selected_ref)
+        if logical_ref is None:
+            return None
+        tied = tuple(sorted({
+            ref for object_ref in (verdict.tied_refs or (verdict.selected_ref,))
+            if (ref := logical_ref_by_object_ref.get(object_ref)) is not None}))
+        need_bindings.append(GroundedNeedBinding(
+            role=verdict.role,
+            catalog_source=catalog_source,
+            logical_ref=logical_ref,
+            graph_object_ref=verdict.selected_ref,
+            expected_concept=operand.concept,
+            optional=not operand.required,
+            join_role=operand.join_role or None,
+            temporal_role=operand.temporal_role or None,
+            distinct_binding_group=operand.distinct_binding_group or None,
+            # A ``bound`` verdict IS the binder's single resolution — an unadjudicated tie is
+            # ``ambiguous`` and never reaches here (see `fold_binding_state`).
+            binding_resolution=BindingResolution.UNIQUE,
+            tied_candidate_logical_refs=tied,
+            tied_candidate_set_hash=content_hash({
+                "version": "grounding-candidates-v1", "logical_refs": sorted(set(tied))}),
+        ))
+
+    parameters = tuple((name, _scalar(value))
+                       for name, value in sorted(request.parameter_values))
+    parameter_hash = semantic_parameter_hash(candidate.recipe_id, parameters)
+    definition_json = canonical_recipe_v2(definition)
+    entity_keys = [operand.role for operand in request.operands
+                   if operand.operand_class == "entity_key"]
+    if len(entity_keys) == 1:
+        source_role, resolution = (
+            entity_keys[0], SourceEntityRoleResolution.INFERRED_UNAMBIGUOUS)
+    elif entity_keys:
+        source_role, resolution = None, SourceEntityRoleResolution.AMBIGUOUS
+    else:
+        source_role, resolution = None, SourceEntityRoleResolution.NOT_APPLICABLE
+
+    candidate_key = content_hash({
+        "version": "recipe-candidate-v2",
+        "generation_source": "recipe",
+        "recipe_id": candidate.recipe_id,
+        # The VARIANT is part of the identity: two windows are two candidates, and a capture that
+        # confused them would author a formula for a quantity the human never saw.
+        "variant_key": candidate.variant_key or candidate.recipe_id,
+        "recipe_revision_hash": candidate.recipe_revision_hash,
+        "planning_request_hash": candidate.planning_request_hash,
+        "semantic_parameter_binding_hash": parameter_hash,
+        "ordered_bindings": [[b.role, b.logical_ref] for b in need_bindings],
+    })
+    return RecipeGroundingContextV1(
+        recipe_candidate_key=candidate_key,
+        recipe_id=candidate.recipe_id,
+        source_entity_need_role=source_role,
+        source_entity_role_resolution=resolution,
+        need_bindings=tuple(need_bindings),
+        semantic_parameters=parameters,
+        semantic_parameter_binding_hash=parameter_hash,
+        template_definition=definition_json,
+        template_content_hash=content_hash(definition_json),
+    )
+
+
 def assert_canonical_recipe_exhaustive() -> None:
     """Import/test seam: every behavior-bearing dataclass field is serialized."""
     template_keys = set(canonical_template(_EXHAUSTIVENESS_TEMPLATE)["template"])
