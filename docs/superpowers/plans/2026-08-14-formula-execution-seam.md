@@ -1147,7 +1147,7 @@ release so a rollback reads correctly.
 - Migration audit: apply against a **populated** `semantic_option_decision` (the standing lesson —
   CI is blind to legacy data; repro against a seeded legacy shape).
 
-> **ACCEPTED `PENDING-B1` (2026-08-14).** Migration **1066** adds `binding_plan jsonb` and
+> **ACCEPTED `31dd218f` (2026-08-14).** Migration **1066** adds `binding_plan jsonb` and
 > `binding_plan_hash text` to `semantic_option_decision` — additive, nullable, `IF NOT EXISTS`, no
 > default and no backfill. `decision_facts_for_candidate` computes the plan's identity ONCE and
 > hands the same string to both the new column and `decision_manifest.binding_plan_hash`, so the
