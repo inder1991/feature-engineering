@@ -684,8 +684,8 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 - `test_a_wider_population_truncates_at_the_budget_and_says_so` — `BUDGET_TRUNCATED` observations.
 
 > **TASK CORRECTED, NOT YET EXECUTED (2026-08-14, while landing A3).** A4 is not a one-day task and
-> its acceptance test cannot pass as authored, for a reason the plan does not mention. Verified by
-> reading, not remembered — every claim below has its file and line.
+> its acceptance test cannot pass as authored, for a reason the plan does not mention. Every claim
+> below has its file and line, and A4-a was **reproduced**, not inferred.
 >
 > **A4-a. The egress whitelist is fail-close and it is v1-SHAPED.**
 > `recipe_egress._validate_formula_expectation` (`:234`) calls `_exact_keys` on each expression
@@ -695,7 +695,10 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > `authority_refs`, `term_name`, `term_sign` on top), and its window carries `offset_periods`.
 > `build_recipe_authoring_egress` (`:353`) is annotated
 > `expectation: BoundRecipeFormulaExpectationV1` and projects six keys — which the v2 bound type
-> does happen to carry, so the failure is not a `KeyError` but the exact-key gate. **Consequence:
+> does happen to carry, so the failure is not a `KeyError` but the exact-key gate. Built one and
+> ran it: `RecipeEgressViolation: expressions[0] keys differ: missing=[], unknown=
+> ['aggregation_argument', 'authority_refs', 'second_operand_ref', 'term_name', 'term_sign']`.
+> **Consequence:
 > binding a v2 blueprint at capture produces a payload the gate REFUSES, so
 > `_capture_selected_entry` takes its `RecipeEgressViolation` arm (`:970`) and writes an
 > observation with `delivery_axis="EGRESS_REJECTED"` and NO work item.**
