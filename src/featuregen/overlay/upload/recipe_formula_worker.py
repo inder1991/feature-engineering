@@ -1,7 +1,23 @@
-"""Dedicated fenced worker for durable recipe-formula shadow work."""
+"""Dedicated fenced worker for durable recipe-formula shadow work.
+
+**This worker authors FORMULA-V1 AND ONLY FORMULA-V1.** ``run_authoring`` here is
+``formula/replay_authoring``'s orchestrator — the checkpoint/replay one with the frozen
+configuration, the v1 expectation validator, the v1 tool runner and ``formula_facts`` returning
+v1 ``ExprFacts`` keyed by body path. A3 landed ``run_authoring_v2`` as a SIBLING of the *other*,
+non-production ``formula/authoring.run_authoring``; nothing has yet built the replay-shaped v2
+orchestrator this worker would need.
+
+So a v2 work item is stopped at the door (task A4, increment 2). Letting one through would have
+it parsed by ``parse_proposal_v1`` and validated by the v1 expectation validator, and the run
+would terminalize ``invalid_formula → REJECTED`` — **a durable, dishonest verdict about a recipe
+the platform simply cannot author yet.** The terminal below states the truth instead: authoring
+never ran, nothing was dispatched, and the reason is a missing platform capability, not a
+property of the formula.
+"""
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
@@ -29,6 +45,7 @@ from featuregen.formula.recipe_authoring import (
     recipe_tool_runner,
 )
 from featuregen.formula.recipe_egress import (
+    FORMULA_EXPECTATION_SCHEMA_V2,
     RecipeEgressViolation,
     validate_recipe_provider_payload,
 )
@@ -59,12 +76,34 @@ from featuregen.runtime.queue import (
     renew_recipe_formula_shadow,
 )
 
+#: The one expectation generation this worker can author. A work item declaring anything else is
+#: terminalized without authoring, by the codes below.
+AUTHORABLE_EXPECTATION_SCHEMA = "formula-v1"
+#: The platform cannot author formula-v2 yet — a statement about US, never about the recipe.
+V2_AUTHORING_UNAVAILABLE = "V2_AUTHORING_UNAVAILABLE"
+#: A declaration this build has never heard of. Also not a verdict about the recipe.
+EXPECTATION_SCHEMA_UNKNOWN = "EXPECTATION_SCHEMA_UNKNOWN"
+
 
 @dataclass(frozen=True, slots=True)
 class FormulaShadowWorkerOutcome:
     status: str
     work_item_id: str | None = None
     observation_id: str | None = None
+
+
+def declared_expectation_schema(row: Mapping[str, Any]) -> str:
+    """The expectation generation this work item DECLARES, read from its frozen provider input.
+
+    Absence is ``formula-v1``: the v1 payload shape carries no version key and never did (see
+    ``recipe_egress``), and every work item written before A4 is exactly that shape.
+    """
+    provider_input = row.get("provider_input_json")
+    expectation = (provider_input.get("formula_expectation")
+                   if isinstance(provider_input, Mapping) else None)
+    declared = (expectation.get("formula_schema_version")
+                if isinstance(expectation, Mapping) else None)
+    return AUTHORABLE_EXPECTATION_SCHEMA if declared is None else str(declared)
 
 
 def _plain(value: Any) -> Any:
@@ -203,6 +242,24 @@ def process_recipe_formula_shadow_once(
             finalize_manifest(conn, row["generation_run_id"])
             return FormulaShadowWorkerOutcome(
                 "already_completed", row["work_item_id"], existing[0])
+
+        declared_schema = declared_expectation_schema(row)
+        if declared_schema != AUTHORABLE_EXPECTATION_SCHEMA:
+            # Every axis stays NOT_EVALUATED, exactly like the integrity terminal: we stopped
+            # before evaluating anything. authoring_axis is NOT_RUN, not UNSUPPORTED — the
+            # latter is a capability verdict about a PROPOSAL, and no proposal exists.
+            return _terminalize(conn, claim, row, axes={
+                "authorization_axis": "NOT_EVALUATED",
+                "authority_axis": "NOT_EVALUATED",
+                "drift_axis": "NOT_EVALUATED",
+                "configuration_axis": "NOT_EVALUATED",
+                "delivery_axis": "NOT_DISPATCHED",
+                "authoring_axis": "NOT_RUN",
+                "technical_axis": (
+                    V2_AUTHORING_UNAVAILABLE
+                    if declared_schema == FORMULA_EXPECTATION_SCHEMA_V2
+                    else EXPECTATION_SCHEMA_UNKNOWN),
+            })
 
         frozen_identity = row["request_identity_json"]
         principal = resolve_current_principal(

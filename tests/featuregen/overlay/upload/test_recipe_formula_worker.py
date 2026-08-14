@@ -4,6 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
 from psycopg.types.json import Jsonb
 
 from featuregen.formula.control import RecoveryRequiresReconciliation
@@ -24,7 +25,7 @@ from featuregen.overlay.upload.recipe_formula_worker import (
 from featuregen.runtime.queue import enqueue_checked
 
 
-def _seed_work(db, suffix: str = "1"):
+def _seed_work(db, suffix: str = "1", *, declared_schema: str | None = None):
     intent_id = f"intent-worker-{suffix}"
     run_id = f"run-worker-{suffix}"
     scope_id = f"scope-worker-{suffix}"
@@ -107,6 +108,8 @@ def _seed_work(db, suffix: str = "1"):
             "overflow": "error",
         },
     }
+    if declared_schema is not None:
+        expectation["formula_schema_version"] = declared_schema
     work_item_id = f"work-worker-{suffix}"
     write_work_item(
         db,
@@ -221,6 +224,86 @@ def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str) -> None:
 
 def _authoring_run_id(work_item_id: str) -> str:
     return "far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24]
+
+
+@pytest.mark.parametrize(("declared", "expected_code"), [
+    ("formula-v2", "V2_AUTHORING_UNAVAILABLE"),
+    ("formula-v7", "EXPECTATION_SCHEMA_UNKNOWN"),
+])
+def test_a_work_item_this_worker_cannot_author_never_reaches_the_v1_orchestrator(
+    db, monkeypatch, declared, expected_code
+) -> None:
+    """A4 increment 2. The live worker is v1-only (``replay_authoring.run_authoring``), and A3
+    could not wire a replay-shaped v2 sibling into it. Without this gate, widening the capture
+    population would hand a v2 work item to ``parse_proposal_v1`` and the run would record
+    ``invalid_formula → REJECTED`` — a durable, dishonest verdict about a recipe the platform
+    cannot author at all. The terminal here says that, and says nothing about the recipe.
+    """
+    work_item_id, run_id = _seed_work(db, f"schema-{declared}", declared_schema=declared)
+    called = False
+
+    def _run(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("the v1 orchestrator must never see a non-v1 work item")
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    # Everything downstream of the gate is left REAL: if the gate were absent the run would
+    # proceed, not be saved by a stub.
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-1",
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed"
+    assert outcome.work_item_id == work_item_id
+    assert not called
+    row = db.execute(
+        "SELECT capture_axis,authorization_axis,authority_axis,drift_axis,configuration_axis,"
+        "delivery_axis,authoring_axis,technical_axis,authoring_run_id,authoring_result_json "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone()
+    assert row == ("CAPTURED", "NOT_EVALUATED", "NOT_EVALUATED", "NOT_EVALUATED",
+                   "NOT_EVALUATED", "NOT_DISPATCHED", "NOT_RUN", expected_code, None, None)
+    # No verdict about the recipe was written anywhere, and nothing was dispatched.
+    assert db.execute("SELECT count(*) FROM llm_dispatch").fetchone()[0] == 0
+    # The run still reconciles — an unauthorable work item is an OUTCOME, not a hole.
+    assert db.execute(
+        "SELECT status FROM recipe_formula_shadow_run_manifest WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone()[0] == "COMPLETE"
+
+
+def test_a_v1_work_item_declaring_nothing_is_still_authored(db, monkeypatch, _dsn) -> None:
+    """The other half of the gate: absence of a declaration is the v1 shape, and every work item
+    written before A4 is exactly that. It must still reach the orchestrator."""
+    _work_item_id, _run_id = _seed_work(db, "undeclared")
+    _prepare_dispatch_ready(monkeypatch, "undeclared", _dsn)
+    reached = False
+
+    def _run(*args, **kwargs):
+        nonlocal reached
+        reached = True
+        return _AuthoringResult("RESOLVED", "ok", _authoring_run_id("work-worker-undeclared"))
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True)
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-1",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed", db.execute(
+        "SELECT last_error FROM queue WHERE message_id='formula-test-undeclared'"
+    ).fetchone()
+    assert reached
 
 
 def test_revoked_principal_terminalizes_without_dispatch(db, monkeypatch) -> None:

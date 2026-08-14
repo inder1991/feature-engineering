@@ -800,6 +800,39 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 > Gates: full suite **11048 passed, 20 skipped** (baseline on `3e875ad3` was 11006/20);
 > `-m eval` **73 passed**; ruff + mypy clean on the touched files.
 
+> **A4 INCREMENT 2 — THE WORKER SCHEMA-VERSION GATE. ACCEPTED `<hash>` (2026-08-14).** Small,
+> mandatory, and landed BEFORE the population widens, because the order is the point: the moment a
+> v2 work item can exist, the live worker must already refuse to author it.
+>
+> `recipe_formula_worker` now reads `declared_expectation_schema(row)` from the work item's frozen
+> `provider_input_json` and terminalizes anything that is not `formula-v1` **before any other
+> evaluation**, with `technical_axis="V2_AUTHORING_UNAVAILABLE"` (or `EXPECTATION_SCHEMA_UNKNOWN`
+> for a declaration this build has never heard of) and every other axis `NOT_EVALUATED` /
+> `NOT_DISPATCHED` / `NOT_RUN` — the shape the integrity terminal already uses for "we stopped
+> before evaluating anything".
+>
+> **Why `authoring_axis="NOT_RUN"` and not `UNSUPPORTED`:** `UNSUPPORTED` is a *capability verdict
+> about a proposal* (A3's D-3 invariant 4), and here no proposal exists and no provider was asked.
+> The observation says the PLATFORM cannot author v2 yet; it says nothing whatsoever about the
+> recipe. That is the whole reason this gate exists — without it, A4-b's failure mode is a durable
+> `invalid_formula → REJECTED` against a recipe nobody ever tried to author.
+>
+> **The declaration is read from the provider input, not from a new column** (D-8 reserves 1055 /
+> 1066 / 1067 and nothing else): increment 1 made `formula_schema_version` a validated, bounded
+> field of the payload, so the work item already carries its own generation. Absence is `formula-v1`
+> — every work item written before A4 is exactly the undeclared shape, and a test proves an
+> undeclared item still reaches the orchestrator.
+>
+> **Deviation:** two codes, not one. `V2_AUTHORING_UNAVAILABLE` is honest only for a v2
+> declaration; an unknown declaration gets `EXPECTATION_SCHEMA_UNKNOWN` rather than being told it
+> is v2. Both are `technical_axis` free text, the same slot `AUDIT_STORE_UNAVAILABLE` and
+> `FROZEN_CONFIGURATION_INVALID` already use — no migration, no CHECK-constraint change.
+>
+> 3 new cases in `tests/featuregen/overlay/upload/test_recipe_formula_worker.py`; the gate is
+> proved with the *real* downstream path in place (no stub could have hidden its absence — the v1
+> orchestrator is monkeypatched to RAISE if it is ever reached).
+> Gates: full suite **11051 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean.
+
 ### Task A5 — the reviewed-expectation seam (1 day)
 
 **Modify:** `src/featuregen/overlay/upload/recipe_formula_expectations_v2.py` — grow
