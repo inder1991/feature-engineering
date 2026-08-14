@@ -587,6 +587,77 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
   its `llm_call` refs. Until billing is restored the suite drives A3 through a recorded-fixture
   client, and the task is marked *shipped, unverified against a live provider*.
 
+> **ACCEPTED `<A3-HASH>` (2026-08-14). SHIPPED, UNVERIFIED AGAINST A LIVE PROVIDER.** Four new
+> modules — `formula/authoring_v2.py` (`run_authoring_v2`, the v2 sibling; the v1 orchestrator is
+> not touched, not deprecated, not deleted), `formula/result_v2.py`, `formula/turns_v2.py` — plus
+> `AUTHOR_INSTRUCTION_V2` / `AUTHOR_PROMPT_ID_V2` and the `AuthorTurnContract` value type in
+> `author.py`. 27 tests in `tests/featuregen/formula/test_authoring_v2.py`.
+>
+> **⟨LLM⟩ THE LIVE HALF IS DEFERRED, HONESTLY.** Anthropic billing is exhausted (D-10), so not one
+> provider call in this task was real: every run is a `FakeLLM` recorded fixture. What is proven is
+> the SEAM — stage order, axis mapping, artifact coherence, trace discipline, audit identity. What
+> is NOT proven is that a real model, given `AUTHOR_INSTRUCTION_V2` and held to
+> `proposal_v2.schema.json`, emits a usable v2 proposal at all. The instruction text is
+> **unevaluated prose** until one live run says otherwise, and no measurement here should be read
+> as evidence about it. `test_a_billing_refusal_is_technical_never_a_capability_or_schema_verdict`
+> is what makes the deferral safe rather than convenient: a `PROVIDER_NON_RETRYABLE` refusal folds
+> to `TECHNICAL_FAILURE` with `capability_status="ok"` and `structural_status="ok"` — a payment
+> problem can never be written down as a durable statement about the v2 grammar (the `3219a209`
+> precedent).
+>
+> **FOUR PLAN DEFECTS FOUND AND FIXED IN THIS COMMIT — the first is the material one:**
+>
+> 1. **`formula/authoring.py`'s `run_authoring` has NO production caller, and §0.2 presents it as
+>    the v1 path.** The LIVE authoring worker imports `run_authoring` from
+>    `formula/replay_authoring.py` (`recipe_formula_worker.py:35`) — a *different*, 684-line
+>    orchestrator carrying checkpoint/replay, `frozen_configuration`, `proposal_validator`,
+>    `tool_runner`, `authoring_run_id`, `facts_reader`, `critic_metadata_loader`,
+>    `progress_callback` and `lease_fence`. The codebase already records this at
+>    `materialize/authoring_trace.py:11-12` (*"`formula.authoring.run_authoring`, which no
+>    production code path invokes"*); the plan did not. **Consequence:** A3's *"Modify
+>    `recipe_formula_worker.py` — select the orchestrator by the bound expectation's schema
+>    version"* is not a small edit and is **NOT DONE HERE**. Routing a v2 work item through the live
+>    worker needs a *replay-shaped* v2 orchestrator plus v2 siblings of
+>    `recipe_authoring.recipe_expectation_validator`, `recipe_authoring.recipe_tool_runner` and
+>    `FrozenRecipeReadContext.formula_facts` (which returns v1 `ExprFacts` keyed by body path, not
+>    `OperandFactsV2` keyed by ref). That is its own task; A4's acceptance row records what the
+>    absence means for a captured v2 work item.
+> 2. **`-> AuthoringResult` is not achievable and `AuthoringResultV2` is not symmetry.** v1 fuses
+>    the authored structure and its resolved policy into `TypedFormulaV1`, which is why
+>    `derive_disposition` can demand one for a resolved output. **BR-6 never minted a
+>    `TypedFormulaV2`**: `resolve_output_v2` returns a `FormulaOutputPolicyV2` *beside* the
+>    proposal. So the v2 artifact IS the pair, and `derive_disposition_v2` restates the coherence
+>    law accordingly — a resolved output requires BOTH halves, an unresolved one carries the
+>    proposal and forbids the policy. The §F PRECEDENCE is not re-decided: `_fold_v2` is v1's fold
+>    verbatim and a test pins the two equal over all 432 axis combinations.
+> 3. **The chain's `→ critique →` step could not run.** `critic._proposal_plain` raised
+>    `SchemaError` on anything that was not a `TypedFormulaProposalV1`. Widened ADDITIVELY (the type
+>    gate still admits only parsed, semantically-validated proposals — now two of them) rather than
+>    forked: a critic finding says *"this operand is not what the intent asked for"*, which is a
+>    statement about the CATALOG, and the closed §G code set has no version in it.
+> 4. **Two smaller interface corrections.** `validate_semantics_v2` is not a separate stage —
+>    `parse_proposal_v2` already calls it (`parse_v2.py:158`). And `resolve_output_v2`'s fact bundle
+>    is keyed by operand **logical_ref**, not by v1's internal body path; a bundle keyed v1's way
+>    resolves every operand to empty facts and assembles a policy out of nothing.
+>
+> **Two things the code says that the plan did not anticipate, both kept:**
+> (a) `turns_v2` relaxes `final_operation` on the wire as well as `aggregation`, so an unknown
+> COMBINER now genuinely reaches the `unsupported_operation` arm — in v1 that arm was unreachable
+> through a provider because the wire pinned the const. (b) The v2 wire schema pins
+> `formula_schema_version` to 2, so a v1-declared body can never arrive on a v2 run: it fails
+> response validation and the run ends TECHNICAL ("the loop never got a v2 proposal"), never a
+> false verdict about the grammar. `_parse_v2`'s version guard stays as defence in depth for a
+> non-provider caller; both halves are asserted.
+>
+> **The schema-registry gate did its job and is recorded, not silenced:**
+> `test_llm_schema_inventory.py::test_every_requested_schema_pair_resolves` failed the moment
+> `formula_author_turn_v2` became statically requestable, because its registration hook only ran
+> the v1 contract. Fixed by registering the v2 contract in the same hook — the pair is now
+> genuinely registered, not exempted.
+>
+> Gates: full suite **11006 passed, 20 skipped**; `-m eval` **73 passed**; ruff clean on all seven
+> touched files; mypy clean on the three new modules.
+
 ### Task A4 — the shadow captures v2 recipes (1 day)
 
 **Modify:** `src/featuregen/overlay/upload/recipe_formula_shadow.py`
@@ -611,6 +682,54 @@ expectation's schema version; v1 work items keep `run_authoring` byte-for-byte.
 - `test_the_merchant_grain_disagreement_is_still_named` — the D-7 test at `:511` continues to pass
   unchanged for the v1 blueprint path.
 - `test_a_wider_population_truncates_at_the_budget_and_says_so` — `BUDGET_TRUNCATED` observations.
+
+> **TASK CORRECTED, NOT YET EXECUTED (2026-08-14, while landing A3).** A4 is not a one-day task and
+> its acceptance test cannot pass as authored, for a reason the plan does not mention. Verified by
+> reading, not remembered — every claim below has its file and line.
+>
+> **A4-a. The egress whitelist is fail-close and it is v1-SHAPED.**
+> `recipe_egress._validate_formula_expectation` (`:234`) calls `_exact_keys` on each expression
+> with exactly seven v1 keys (`expression_path, aggregation, operand_ref, source_relation_ref,
+> event_time_ref, window_length, window`) and on each window with exactly nine. A1's
+> `BoundExpressionExpectationV2` carries **twelve** (`second_operand_ref`, `aggregation_argument`,
+> `authority_refs`, `term_name`, `term_sign` on top), and its window carries `offset_periods`.
+> `build_recipe_authoring_egress` (`:353`) is annotated
+> `expectation: BoundRecipeFormulaExpectationV1` and projects six keys — which the v2 bound type
+> does happen to carry, so the failure is not a `KeyError` but the exact-key gate. **Consequence:
+> binding a v2 blueprint at capture produces a payload the gate REFUSES, so
+> `_capture_selected_entry` takes its `RecipeEgressViolation` arm (`:970`) and writes an
+> observation with `delivery_axis="EGRESS_REJECTED"` and NO work item.**
+> `test_the_v2_exemplar_recipe_reaches_a_work_item` therefore cannot pass until the egress contract
+> has a v2 arm. That arm is a **governed-security change** — the whitelist is the fail-close
+> boundary to a provider — so it is its own increment: a version-dispatched
+> `_validate_formula_expectation`, the v1 shape asserted byte-identical, and every new v2 key given
+> a real bound (`authority_refs` are policy identifiers → bounded text; `offset_periods` bounded;
+> `term_sign` ∈ {1,−1}; `second_operand_ref` validated as a ref). Not "assert the manifest hash
+> changed".
+>
+> **A4-b. A captured v2 work item would be authored by the V1 orchestrator.** Per A3's acceptance
+> row defect 1, the live worker calls `replay_authoring.run_authoring` and A3 did not (could not)
+> wire the v2 sibling into it. So the moment the population widens, a v2 work item is claimed by a
+> worker that parses it with `parse_proposal_v1`, validates it with the v1
+> `recipe_expectation_validator`, and would record `invalid_formula → REJECTED` — **a dishonest
+> durable verdict about a recipe the platform simply cannot author yet.** A4 must therefore either
+> land the replay-shaped v2 orchestrator first, or gate the worker on the work item's declared
+> expectation schema version with a named, non-authoring terminal. The second is small; it is not
+> optional, and it is not in the task as authored.
+>
+> **A4-c. The population selector.** `derive_registry_blueprints()` (A2) is the sweep;
+> `v2_recipe_by_id(recipe_id).formula_schema_version` is the `"formula-v1" | "formula-v2"` literal
+> (`recipe_contract_v2.py:246`) A4 should switch on. Measured: on the shipped registry, "declares
+> formula-v1" and "has a v1 registry entry" pick out the same two recipes, so the two readings
+> agree today — key on the declared version (the plan's words) and pin the agreement, so a future
+> registry edit that separates them fails CI instead of silently changing which binder runs.
+>
+> Everything else in the task as authored is correct and was confirmed: the population line is at
+> `recipe_formula_shadow.py:1077`, the blueprint lookup at `:923`, the two reason literals at
+> `:471`/`:475`, `MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12` at `:50`, and the manifest-hash
+> reasoning is exactly right — `write_manifest` (`:481`) hashes `capture_entries` into
+> `manifest_hash`, `ON CONFLICT (manifest_id) DO NOTHING` plus `_checked_existing` (`:109`) means
+> existing rows are never rewritten, so the change lands on new runs only.
 
 ### Task A5 — the reviewed-expectation seam (1 day)
 

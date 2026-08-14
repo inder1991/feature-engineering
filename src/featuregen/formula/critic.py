@@ -52,6 +52,14 @@ from featuregen.formula.schema import (
     TypedFormulaProposalV1,
     UnaryBody,
 )
+from featuregen.formula.schema_v2 import (
+    CompositeBodyV2,
+    DiffBodyV2,
+    RatioBodyV2,
+    TypedFormulaProposalV2,
+    UnaryBodyV2,
+    body_expressions_v2,
+)
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.column_authority import read_column_facts
@@ -232,14 +240,24 @@ _COLUMN_FACT_FIELDS: tuple[str, ...] = (
 )
 
 
-def proposal_column_refs(proposal: TypedFormulaProposalV1) -> tuple[str, ...]:
+def proposal_column_refs(proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2) -> tuple[
+        str, ...]:
     """Every column logical_ref the proposal stands on — grain keys plus, per body expression,
-    the operand, the window's event-time ref, and every filter-predicate left — sorted and
-    deduplicated so the context (and any hash over it) is deterministic."""
+    the operand, the window's event-time ref, the row-level second operand (v2), and every
+    filter-predicate left — sorted and deduplicated so the context (and any hash over it) is
+    deterministic.
+
+    Version-neutral by design (Task A3): a critic finding says "this operand is not what the intent
+    asked for", which is a statement about the CATALOG, not about the grammar the operand was
+    written in. Both generations therefore walk into the same three-key context and the same closed
+    §G code set; forking the critic would fork a review vocabulary that has no version in it."""
     refs: set[str] = set(proposal.grain.keys)
     for expr in _body_expressions(proposal.body):
         if expr.operand is not None:
             refs.add(expr.operand)
+        second = getattr(expr, "second_operand", None)
+        if second is not None:
+            refs.add(second)
         refs.add(expr.window.event_time_ref)
         if expr.filter is not None:
             _collect_filter_lefts(expr.filter, refs)
@@ -253,6 +271,8 @@ def _body_expressions(body):
         return (body.numerator, body.denominator)
     if isinstance(body, DiffBody):
         return (body.minuend, body.subtrahend)
+    if isinstance(body, (UnaryBodyV2, RatioBodyV2, DiffBodyV2, CompositeBodyV2)):
+        return body_expressions_v2(body)
     raise SchemaError(f"body must be UnaryBody | RatioBody | DiffBody, got {type(body).__name__}")
 
 
@@ -293,12 +313,18 @@ def _column_context(conn, ref: str, roles: tuple[str, ...]) -> dict:
             "data_type": row[0], "facts": facts}
 
 
-def _proposal_plain(proposal: TypedFormulaProposalV1) -> dict:
+def _proposal_plain(proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2) -> dict:
     """The proposal as plain JSON types (the authored ARTIFACT under review — enums to their
-    string values, tuples to lists). Never the author's reasoning: only the proposal itself."""
-    if not isinstance(proposal, TypedFormulaProposalV1):
+    string values, tuples to lists). Never the author's reasoning: only the proposal itself.
+
+    The type gate stays CLOSED, it just admits two members now: an arbitrary object reaching a
+    provider payload is exactly what this guard exists to stop, and widening it to
+    ``TypedFormulaProposalV2`` admits one more PARSED, semantically-validated type — never a raw
+    dict."""
+    if not isinstance(proposal, (TypedFormulaProposalV1, TypedFormulaProposalV2)):
         raise SchemaError(
-            f"critique covers TypedFormulaProposalV1 only, got {type(proposal).__name__}")
+            "critique covers TypedFormulaProposalV1 | TypedFormulaProposalV2 only, "
+            f"got {type(proposal).__name__}")
     # StrEnums are str subclasses and every literal value is already a canonical string, so a
     # JSON round-trip yields exactly the plain document the wire/audit layers expect.
     return json.loads(json.dumps(dataclasses.asdict(proposal)))
@@ -307,7 +333,7 @@ def _proposal_plain(proposal: TypedFormulaProposalV1) -> dict:
 def build_critic_metadata(
     conn,
     intent: AuthoringIntent,
-    proposal: TypedFormulaProposalV1,
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2,
     *,
     roles: tuple[str, ...],
     column_loader: Callable[[str], dict] | None = None,
@@ -384,7 +410,7 @@ def _parse_findings(output: dict | None) -> tuple[list[CriticFinding], bool, lis
 def critique(
     conn,
     intent: AuthoringIntent,
-    proposal: TypedFormulaProposalV1,
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2,
     client: LLMClient,
     *,
     roles: tuple[str, ...] | list[str] | tuple[()] = (),

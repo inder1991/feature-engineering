@@ -14,7 +14,7 @@ from pathlib import Path
 
 import featuregen
 from featuregen.documents.registry import DocumentSchemaRegistry
-from featuregen.formula.author import _register_turn_schema
+from featuregen.formula.author import AUTHOR_TURN_CONTRACT_V2, _register_turn_schema
 from featuregen.formula.critic import _register_critic_schema
 from featuregen.overlay.upload import feature_assist
 from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
@@ -196,7 +196,8 @@ def test_every_requested_schema_pair_resolves(db):
     registration hooks have run — a version bump without a registered body fails CI here, not as a
     live dispatch crash."""
     register_enrichment_schemas(db)
-    _register_turn_schema(db)
+    _register_turn_schema(db)                       # the v1 author turn contract (the default)
+    _register_turn_schema(db, AUTHOR_TURN_CONTRACT_V2)   # Task A3 — the v2 author turn contract
     _register_critic_schema(db)
     _register_selection_schema(db)
     reg = DocumentSchemaRegistry(db)
