@@ -20,7 +20,6 @@ import { expect, test } from 'playwright/test'
 // design), so a reused test DB would arrive pre-cleared and the blocked-state assertions
 // would be vacuous. A per-run source restores the freshly-ingested state every time.
 const SOURCE = `e2e_semantic_${Date.now()}`
-const CHURN = 'customer.relationship_attrition.churn'
 const here = dirname(fileURLToPath(import.meta.url))
 const repoRoot = join(here, '..', '..')
 

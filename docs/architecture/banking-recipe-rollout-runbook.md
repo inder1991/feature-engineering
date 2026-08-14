@@ -37,7 +37,7 @@ whether a switch is connected.
 | Env var | Default | Meaning | Consumer today (2026-08-11) |
 |---|---|---|---|
 | `FEATUREGEN_SUGGESTION_CONTRACT_V3` | — | — | **RETIRED 2026-08-11** — v3 serves unconditionally; version selection stays explicit via `contract_version` |
-| `FEATUREGEN_SEMANTIC_PLANNING` | legacy | semantic-planning pipeline mode (legacy / semantic_shadow / semantic_v1) | **WIRED for shadow** — `semantic_shadow` runs the V2 lens beside Gate-1's template lens (log-only); `semantic_v1` has no consumer yet (Tranche 3) |
+| `FEATUREGEN_SEMANTIC_PLANNING` | — | — | **RETIRED 2026-08-14 (E4 cutover)** — the semantic engine is the only pipeline, so the mode, its parser and its config carrier are DELETED rather than pinned to `semantic_v1`. Setting this variable now does nothing; rollback is the previous image. |
 | `FEATUREGEN_RECIPE_CONTRACT_V2` | — | — | **RETIRED 2026-08-11** (never had a consumer) — V2 serving arrives by direct cutover with SE Tranche 3 |
 | `FEATUREGEN_RECIPE_V2_FAMILIES` | — | — | **RETIRED 2026-08-11** (never had a consumer) |
 | `FEATUREGEN_RECIPE_V2_CANARY_CATALOGS` | — | — | **RETIRED 2026-08-11** (never had a consumer) |

@@ -1,25 +1,35 @@
 """Phase-1B Task 9 — feature-flag neutrality + emergency-rollback proof.
 
-The backend has ONE runtime flag, ``FEATUREGEN_INTENT_SCOPED_APPLICABILITY`` (default OFF), and it is
-the single emergency-rollback point: OFF → ``build_considered_set`` grounds ``ALL_TEMPLATES`` even when
-a confirmed scope/applicability is supplied. The other two Phase-1B flags (``intent_confirmation_ui`` /
+``FEATUREGEN_INTENT_SCOPED_APPLICABILITY`` (default OFF) was the single emergency-rollback point for
+Phase-1B scoped grounding: OFF → ``build_considered_set`` grounded ``ALL_TEMPLATES`` even when a
+confirmed scope/applicability was supplied. The other two Phase-1B flags (``intent_confirmation_ui`` /
 ``intent_disposition_lens``) are FRONTEND concerns (Task 8) and have no backend read.
 
-This file proves the rollout/rollback semantics WITHOUT changing production behaviour — the flag and the
-grounding path already exist (Tasks 4/7). Three scenarios:
+The E4 cutover (2026-08-14) moved the ground under scenarios 2 and 3. A request carrying a
+``confirmed_scope`` is now served by the SEMANTIC ENGINE (lenses ``engine`` / ``actionable``), whose
+eligibility is decided by the confirmed scope itself inside the engine — the legacy template-grounding
+pass that ``_templates_to_ground`` narrowed does not run on that path at all. So this flag can no
+longer widen or narrow what a scoped call serves: it survives as a recorded rollout dimension on the
+generation-run manifest and as the emergency ``legacy_unscoped`` lever, nothing more. The tests below
+say exactly that rather than asserting a difference the code can no longer produce. (The flag's real
+remaining effect — narrowing the legacy template universe when the builder is called directly with an
+``ApplicabilityResult`` — is covered at the builder level in
+``tests/featuregen/overlay/upload/contract/test_gate1_scoped.py``.)
+
+Three scenarios:
 
 1. **All-off neutrality** — flag unset (default off) + a no-scope call → the response is byte-identical
    to a pre-1B considered set (exact key set, no dispositions/run/scope fields) and NO recognition-attempt
    / confirmed-scope row is written.
 2. **Emergency rollback** — flag OFF + a *scoped* call (as if the UI is still sending confirmed scopes):
-   grounding FALLS BACK TO FULL (the template lens equals an unscoped call's), the scope row is STILL
-   persisted, and — separately — a ``/contract/recognitions`` call still writes its recognition-attempt
-   row (recognition telemetry retained during rollback).
-3. **Flag-on scoping** — the SAME scoped call with the flag ON now narrows (fewer candidates), proving
-   the flag is the single on/off switch between full and scoped grounding.
+   the engine still serves (rollback no longer reaches grounding), the scope row is STILL persisted, and
+   — separately — a ``/contract/recognitions`` call still writes its recognition-attempt row (recognition
+   telemetry retained during rollback).
+3. **Flag neutrality on the scoped path** — the SAME scoped call flag-ON serves the IDENTICAL candidate
+   set, while the run manifest records which way the flag was set.
 
-The catalog is a TWO-family (churn + credit) upload so "full vs narrowed" grounding is a real difference,
-mirroring ``tests/featuregen/api/test_contract_scoped.py``.
+The catalog is a TWO-family (churn + credit) upload so the unscoped legacy lens and the scoped engine
+lens are both non-trivially populated, mirroring ``tests/featuregen/api/test_contract_scoped.py``.
 """
 from datetime import UTC, datetime
 
@@ -52,11 +62,11 @@ _CLASSIFIED = FakeResponse(output={
 
 def _fake() -> FakeLLM:
     """The generation tasks ``build_considered_set`` drives (no recognizer entry — recognition is a
-    separate API step). Mirrors test_contract_scoped's client."""
+    separate API step). Only the ADVISORY set-recommendation pass is scripted: the free-form
+    ``overlay.feature.recommend`` generator was deleted in the E4 cutover (2026-08-14), and the
+    intents task is left unscripted on purpose — the intent lens fails soft, so the recipe half of
+    the engine serves alone and both scenarios below stay deterministic."""
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
@@ -104,9 +114,18 @@ def _bank_multi(conn) -> None:
         (now, now))
 
 
-def _templates_names(body: dict) -> set[str]:
-    """The names in the 'templates' grounding lens — the direct 'full vs narrowed' signal."""
-    return {f["name"] for s in body["alternatives"] if s["lens"] == "templates" for f in s["features"]}
+def _served(body: dict) -> dict[str, list[str]]:
+    """Every served lens and the names in it. Post-cutover a scoped call answers from the engine
+    (``engine`` / ``actionable``) and the legacy unscoped call from ``templates``, so the lens NAMES
+    are themselves the evidence of which pipeline answered."""
+    return {s["lens"]: sorted(f["name"] for f in s["features"]) for s in body["alternatives"]}
+
+
+def _run_flags(conn, run_id: str) -> dict:
+    """The rollout dimensions stamped on the durable generation-run manifest."""
+    return conn.execute(
+        "SELECT flags FROM feature_generation_run WHERE generation_run_id = %s",
+        (run_id,)).fetchone()[0]
 
 
 def _post(client, **extra) -> dict:
@@ -137,22 +156,29 @@ def test_all_off_no_scope_is_byte_identical_to_pre_1b(make_client, conn, monkeyp
     assert conn.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
 
 
-# ── Scenario 2: emergency rollback — flag OFF, scope still sent → FULL grounding, scope + telemetry kept ─
-def test_emergency_rollback_full_grounds_while_scope_and_recognition_retained(
+# ── Scenario 2: emergency rollback — flag OFF, scope still sent → the engine still serves; scope +
+#    telemetry kept ─────────────────────────────────────────────────────────────────────────────────────
+def test_emergency_rollback_retains_scope_and_recognition_while_the_engine_still_serves(
         make_client, conn, monkeypatch):
-    monkeypatch.delenv(FLAG, raising=False)   # EMERGENCY ROLLBACK: scoped grounding disabled (default off)
+    """After the E4 cutover this flag is no longer a grounding rollback. A scoped call is answered by
+    the ONE engine whether the flag is set or not — there is no legacy template lens left on that path
+    to fall back to — so the honest rollback guarantees are the two DURABLE ones: the confirmed scope is
+    still captured, and recognition telemetry is still written."""
+    monkeypatch.delenv(FLAG, raising=False)   # EMERGENCY ROLLBACK: the historical lever, default off
     assert _intent_scoped_applicability_enabled() is False
     _bank_multi(conn)
 
-    # The UI is still sending confirmed scopes; the backend must fall open to full grounding.
+    # The UI is still sending confirmed scopes.
     scoped = _post(make_client(_fake()), confirmed_scope=_scoped_body())
-    # A no-scope call on the SAME catalog is the full-grounding baseline.
+    # A no-scope call on the SAME catalog is the legacy emergency path, for contrast.
     unscoped = _post(make_client(_fake()))
 
-    # ROLLBACK PROOF #1 — grounding falls back to FULL: the scoped run grounds the SAME template lens as
-    # the unscoped run (scoping is disabled), and the two-family catalog surfaces more than the churn half.
-    assert _templates_names(scoped) == _templates_names(unscoped)
-    assert len(_templates_names(scoped)) > 0
+    # ROLLBACK TRUTH #1 — the flag does NOT reach grounding any more: the scoped run is served by the
+    # semantic engine (its lens names say so) while only the legacy unscoped route still grounds
+    # templates. Rolling the flag back cannot resurrect the old scoped-grounding pass.
+    assert set(_served(scoped)) <= {"engine", "actionable"}
+    assert any(_served(scoped).values()), "the engine still serves under rollback"
+    assert set(_served(unscoped)) == {"templates"}   # the legacy emergency path, unchanged
 
     # ROLLBACK PROOF #2 — the scope row is STILL persisted (rollback disables grounding, not scope capture).
     run = scoped["generation_run_id"]
@@ -178,15 +204,21 @@ def test_emergency_rollback_full_grounds_while_scope_and_recognition_retained(
     assert n == 1
 
 
-# ── Scenario 3: flag-on scoping — the SAME scoped call now narrows (the single on/off switch) ──────────
-def test_flag_on_same_scoped_call_narrows(make_client, conn, monkeypatch):
-    monkeypatch.setenv(FLAG, "1")   # the ONLY change vs scenario 2's scoped call
-    assert _intent_scoped_applicability_enabled() is True
+# ── Scenario 3: flag neutrality on the scoped path — the SAME scoped call serves the SAME set ─────────
+def test_flag_on_serves_the_identical_scoped_set_and_is_recorded_on_the_run(
+        make_client, conn, monkeypatch):
+    """The flag's post-cutover truth: flipping it changes NOTHING a scoped caller sees, because the
+    engine — not ``_templates_to_ground`` — decides that request's candidate universe from the confirmed
+    scope. What it still does is get RECORDED on the generation-run manifest, so a run stays auditable
+    against the rollout dimensions it executed under."""
     _bank_multi(conn)
 
-    scoped = _post(make_client(_fake()), confirmed_scope=_scoped_body())   # identical scoped payload
-    unscoped = _post(make_client(_fake()))
+    monkeypatch.delenv(FLAG, raising=False)
+    off = _post(make_client(_fake()), confirmed_scope=_scoped_body())
+    monkeypatch.setenv(FLAG, "1")   # the ONLY change vs the call above
+    assert _intent_scoped_applicability_enabled() is True
+    on = _post(make_client(_fake()), confirmed_scope=_scoped_body())   # identical scoped payload
 
-    # With the flag ON the SAME scoped payload narrows to fewer template candidates than a full run —
-    # proving the flag alone flips grounding between full (scenario 2) and scoped (here).
-    assert len(_templates_names(scoped)) < len(_templates_names(unscoped))
+    assert _served(on) == _served(off), "the flag no longer selects the served candidate set"
+    assert _run_flags(conn, off["generation_run_id"])["scoped_applicability"] is False
+    assert _run_flags(conn, on["generation_run_id"])["scoped_applicability"] is True

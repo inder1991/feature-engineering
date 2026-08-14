@@ -5,7 +5,7 @@ import {
   discoverServices, type DiscoveredService, type FeatureIdea, getAssetDetail, getIntegration,
   getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
   listContracts, listIntegrations, listSyncs, patchIntegration, patchSync, postFieldDecision,
-  getTableSuggestions, getTableSuggestionsV2,
+  getTableSuggestionsV4,
   previewSync, recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION, type Sync,
   type SyncPreview, uploadFile,
@@ -930,32 +930,28 @@ describe('asset detail + field-correction client (Delivery F/G)', () => {
   })
 
   // ---- the suggestion discovery contract ----------------------------------------------------
-  // v1 stays the SERVER default for the whole of Release A, so a v2 consumer asks in the URL. A
-  // client that instead probed a v1 body for an optional field could not tell "an older
-  // deployment" from "a suggestion with no category", which is exactly the confusion the explicit
-  // version exists to prevent.
-  it('asks for contract_version=2 explicitly, and leaves the v1 route unversioned', async () => {
+  // E4 (2026-08-14): v4 is the ONLY contract, and it is still asked for EXPLICITLY in the URL.
+  // The v1 (unversioned) and v2 clients are deleted with their contracts — a client that probed
+  // a body for an optional field could not tell "an older deployment" from "a suggestion with no
+  // category", which is exactly the confusion the explicit version exists to prevent.
+  it('asks for contract_version=4 explicitly — the only contract the route serves', async () => {
     fetchMock.mockImplementation(ok({ hits: [] }))
-    await getTableSuggestionsV2('core banking', 'public.comp fin tran')
+    await getTableSuggestionsV4('core banking', 'public.comp fin tran')
     expect(fetchMock.mock.calls[0][0]).toBe(
-      '/catalog/core%20banking/tables/public.comp%20fin%20tran/suggestions?contract_version=2')
-    fetchMock.mockClear()
-    await getTableSuggestions('core_banking', 'public.comp_fin_tran')
-    expect(fetchMock.mock.calls[0][0]).toBe(
-      '/catalog/core_banking/tables/public.comp_fin_tran/suggestions')
+      '/catalog/core%20banking/tables/public.comp%20fin%20tran/suggestions?contract_version=4')
   })
 
   it('carries the typed error_code off a handler refusal', async () => {
     fetchMock.mockImplementation(async () => new Response(JSON.stringify({
-      detail: 'unsupported contract_version 7; this deployment serves [1, 2]',
+      detail: 'unsupported contract_version 2; this deployment serves [4]',
       error_code: SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
     }), { status: 422 }))
-    const err = await getTableSuggestionsV2('core_banking', 't').catch((e: unknown) => e)
+    const err = await getTableSuggestionsV4('core_banking', 't').catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect(err).toMatchObject({
       status: 422,
       errorCode: SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
-      detail: 'unsupported contract_version 7; this deployment serves [1, 2]',
+      detail: 'unsupported contract_version 2; this deployment serves [4]',
     })
   })
 
@@ -967,7 +963,7 @@ describe('asset detail + field-correction client (Delivery F/G)', () => {
       detail: [{ loc: ['query', 'contract_version'], msg: 'Input should be a valid integer',
                  type: 'int_parsing' }],
     }), { status: 422 }))
-    const err = await getTableSuggestionsV2('core_banking', 't').catch((e: unknown) => e)
+    const err = await getTableSuggestionsV4('core_banking', 't').catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect(err).toMatchObject({ status: 422, errorCode: null })
     expect((err as ApiError).detail).toBe('query.contract_version: Input should be a valid integer')
@@ -976,7 +972,7 @@ describe('asset detail + field-correction client (Delivery F/G)', () => {
   it('leaves errorCode null on an ordinary error body', async () => {
     fetchMock.mockImplementation(async () =>
       new Response(JSON.stringify({ detail: 'requires permission catalog:read' }), { status: 403 }))
-    const err = await getTableSuggestionsV2('core_banking', 't').catch((e: unknown) => e)
+    const err = await getTableSuggestionsV4('core_banking', 't').catch((e: unknown) => e)
     expect(err).toMatchObject({ status: 403, errorCode: null })
   })
 })

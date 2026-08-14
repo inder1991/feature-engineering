@@ -1,13 +1,15 @@
-"""SE-10 (slice 1) — the semantic-candidate observation store: shadow truth as rows.
+"""SE-10 (slice 1) — the semantic-candidate observation store: what each run actually saw.
 
-Every semantic run (shadow today, `semantic_v1` serving later) persists ONE row per candidate:
-which definition, under which frozen context, bound in which state, with the binder's verdicts
-and the full per-candidate eligibility audit serialized whole, and the policy identities the
-decision was made under. Append-only (migration 1062's guard triggers) — an observation is what
-a run SAW; a changed catalog produces a NEW row under a NEW context hash, never an edit.
+Every semantic run persists ONE row per candidate: which definition, under which frozen context,
+bound in which state, with the binder's verdicts and the full per-candidate eligibility audit
+serialized whole, and the policy identities the decision was made under. Append-only (migration
+1062's guard triggers) — an observation is what a run SAW; a changed catalog produces a NEW row
+under a NEW context hash, never an edit.
 
-This is what turns SE-14's shadow metrics into queries instead of grepped logs, and it is the
-foundation SE-10's considered-revision extension builds on when `semantic_v1` serves.
+E4 (2026-08-14): the SHADOW half is gone — `semantic_shadow_metrics` existed to compare a
+candidate engine against the legacy path and feed the cutover gate, and both of those are
+spent. The store itself is NOT shadow machinery and stays: it is the serving path's audit
+trail, the row every frozen decision fact links to by exact observation id (LIFE-03).
 """
 from __future__ import annotations
 
@@ -60,46 +62,3 @@ def persist_semantic_candidates(conn, *, generation_run_id: str, context,
 
 
 __all__ = ["persist_semantic_candidates"]
-
-def semantic_shadow_metrics(conn) -> dict:
-    """SE-14's shadow metrics, computed from the observation rows — the MEASURED inputs the
-    cutover gate consumes. Every number here is a fact about recorded runs, never a projection:
-    an empty store yields zeros and ``observation_rows_present: False``, which the gate reads
-    as blocking (absence of evidence blocks a cutover; it never passes one)."""
-    from collections import Counter
-
-    rows = conn.execute(
-        "SELECT binding_state, source_origin, verdicts, temporal_blocked "
-        "FROM semantic_candidate_observation").fetchall()
-    by_state: Counter = Counter()
-    by_origin: Counter = Counter()
-    reason_codes: Counter = Counter()
-    identifier_preventions = 0
-    snapshot_preventions = 0
-    temporal_blocked = 0
-    for binding_state, origin, verdicts, blocked in rows:
-        by_state[binding_state] += 1
-        by_origin[origin] += 1
-        temporal_blocked += bool(blocked)
-        for verdict in verdicts or ():
-            for code in verdict.get("reason_codes", ()):
-                reason_codes[code] += 1
-                if code == "IDENTIFIER_NOT_A_MEASURE":
-                    identifier_preventions += 1
-                elif code == "SNAPSHOT_CANNOT_SUPPORT_EVENT_WINDOW":
-                    snapshot_preventions += 1
-    runs = conn.execute(
-        "SELECT COUNT(DISTINCT generation_run_id), COUNT(DISTINCT context_hash) "
-        "FROM semantic_candidate_observation").fetchone()
-    return {
-        "observation_rows_present": bool(rows),
-        "observations": len(rows),
-        "generation_runs": runs[0],
-        "distinct_contexts": runs[1],
-        "candidates_by_binding_state": dict(sorted(by_state.items())),
-        "candidates_by_origin": dict(sorted(by_origin.items())),
-        "reason_code_counts": dict(sorted(reason_codes.items())),
-        "identifier_as_measure_preventions": identifier_preventions,
-        "snapshot_as_event_preventions": snapshot_preventions,
-        "temporal_blocked_candidates": temporal_blocked,
-    }

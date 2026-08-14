@@ -8,7 +8,6 @@ import {
   type SuggestionGroupV2,
   type SuggestionOmittedCounts,
   type SuggestionSemanticBlock,
-  getTableSuggestionsV2,
   getTableSuggestionsV4,
 } from '../api'
 import { useIdentityKey } from '../session'
@@ -93,9 +92,9 @@ function NeighbourhoodNote({ n }: { n: JoinNeighbourhood | null }) {
 // payload at once — and, more importantly, each is stored WITH the read scope it belongs to.
 type Outcome =
   | { kind: 'loading' }
-  // `semantic` is present when the deployment served contract v4; absent means the screen fell
-  // back to the older page — the cards render either way, the engine section only with v4.
-  | { kind: 'ok'; page: FeatureSuggestionPageV2; semantic?: SuggestionSemanticBlock }
+  // v4 is the only contract the route serves, so `semantic` always rides with a served page —
+  // there is no older shape left to fall back to and no deployment that answers without it.
+  | { kind: 'ok'; page: FeatureSuggestionPageV2; semantic: SuggestionSemanticBlock }
   | { kind: 'forbidden' }
   | { kind: 'unsupported' }
   | { kind: 'error', detail: string }
@@ -134,10 +133,11 @@ export function SuggestedFeaturesScreen({
       if (live) setResult({ key: requestKey, outcome: o })
     }
     settle({ kind: 'loading' })
-    // SE-13: ask for contract v4 (the v3 execution truth + the engine's semantic block). An
-    // older backend that refuses v4 gets ONE graceful step down to the v2 page this screen has
-    // always rendered — a rolling deploy must not blank the page — and only a deployment that
-    // refuses BOTH is reported as unsupported.
+    // Contract v4 (the execution truth + the engine's semantic block) — the ONLY contract the
+    // route serves since the E4 cutover. The step-down to v2 that used to sit here is gone with
+    // v2 itself: there is no older payload to degrade to, so a server that refuses v4 is simply
+    // older than this screen and says so once, instead of trying a second version that would
+    // earn the same refusal.
     getTableSuggestionsV4(source, table)
       .then(body => settle({ kind: 'ok', page: body, semantic: body.semantic }))
       .catch((e: unknown) => {
@@ -147,15 +147,7 @@ export function SuggestedFeaturesScreen({
         if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })
         else if (e instanceof ApiError
           && e.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) {
-          getTableSuggestionsV2(source, table)
-            .then(body => settle({ kind: 'ok', page: body }))
-            .catch((e2: unknown) => {
-              if (e2 instanceof ApiError && e2.status === 403) settle({ kind: 'forbidden' })
-              else if (e2 instanceof ApiError
-                && e2.errorCode === SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION) {
-                settle({ kind: 'unsupported' })
-              } else settle({ kind: 'error', detail: e2 instanceof ApiError ? e2.detail : String(e2) })
-            })
+          settle({ kind: 'unsupported' })
         } else settle({ kind: 'error', detail: e instanceof ApiError ? e.detail : String(e) })
       })
     return () => {
@@ -200,8 +192,8 @@ export function SuggestedFeaturesScreen({
           <div className="callout-body">
             <p role="status">
               <strong>This deployment does not serve the discovery contract.</strong> The screen
-              asked for suggestion contract version 4, stepped down to version 2, and the server
-              refused both.
+              asked for suggestion contract version 4 — the only one this application speaks —
+              and the server refused it.
             </p>
             <p className="hint">
               The server is older than this screen. Nothing is wrong with the catalog or with your
@@ -370,10 +362,8 @@ export function SuggestedFeaturesScreen({
 
       {/* SE-13: the ENGINE's verdicts — the same lens the hypothesis Workbench serves from,
           run without a hypothesis and anchored to this table. Evidence beside the cards, never
-          a re-ranking of them; absent entirely when the deployment served the older contract. */}
-      {outcome.semantic && (
-        <SemanticEngineSection semantic={outcome.semantic} />
-      )}
+          a re-ranking of them. Always served now: v4 is the only contract. */}
+      <SemanticEngineSection semantic={outcome.semantic} />
 
       {Object.values(collection.omitted_counts).some(n => (n ?? 0) > 0) && (
         <section className="panel sug-omitted" data-testid="page-truncation">
@@ -419,59 +409,45 @@ function SemanticEngineSection({ semantic }: { semantic: SuggestionSemanticBlock
         <ul className="rows" aria-label="bindable recipes">
           {semantic.ranked.map(entry => (
             <li key={entry.recipe_id}>
-              {/* D4 (UI-05): ONE card model — the projected FeatureIdea carrier the
-                  Workbench renders, from the same server-side serializer. The raw
-                  recipe-id row survives only for pre-D4 deployments (no card). */}
-              {entry.card ? (
-                <div style={{ display: 'grid', gap: 4 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                    <span style={{ fontWeight: 600 }}>{entry.card.name}</span>
-                    <span className="badge ok">bindable</span>
-                    {entry.card.operation_class && (
-                      <span className="badge">{entry.card.operation_class}</span>
-                    )}
-                    {entry.card.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
-                      <span className="badge stale">
-                        needs data checks{entry.card.requirements?.length
-                          ? ` (${entry.card.requirements.length})` : ''}
-                      </span>
-                    )}
-                    {entry.review_current
-                      ? <span className="badge ok">reviewed</span>
-                      : <span className="badge">unreviewed</span>}
-                  </div>
-                  <p className="hint" style={{ margin: 0 }}>{entry.card.description}</p>
-                  {(entry.card.input_role_bindings?.length ?? 0) > 0 && (
-                    <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2,
-                        margin: 0, paddingLeft: 16, fontSize: 13 }}>
-                      {entry.card.input_role_bindings!.map(binding => (
-                        <li key={binding.role}>
-                          <span style={{ fontWeight: 600 }}>{binding.role}</span>
-                          {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
-                          {binding.authority && <> · {binding.authority}</>}
-                        </li>
-                      ))}
-                    </ul>
+              {/* D4 (UI-05): ONE card model — the projected FeatureIdea carrier the Workbench
+                  renders, from the same server-side serializer. The raw recipe-id row that used
+                  to stand in for a pre-D4 deployment is gone with E4's cutover: every server
+                  that answers v4 sends the card, and a recipe id is not a feature description. */}
+              <div style={{ display: 'grid', gap: 4 }}>
+                <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                  <span style={{ fontWeight: 600 }}>{entry.card?.name ?? entry.recipe_id}</span>
+                  <span className="badge ok">bindable</span>
+                  {entry.card?.operation_class && (
+                    <span className="badge">{entry.card.operation_class}</span>
                   )}
-                  {entry.corroborations.length > 0 && (
-                    <span className="hint">also arrived at by {entry.corroborations
-                      .map(c => c.origin).join(', ')}</span>
+                  {entry.card?.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
+                    <span className="badge stale">
+                      needs data checks{entry.card.requirements?.length
+                        ? ` (${entry.card.requirements.length})` : ''}
+                    </span>
                   )}
-                </div>
-              ) : (
-                <>
-                  <span className="mono" style={{ fontWeight: 600 }}>{entry.recipe_id}</span>{' '}
-                  <span className="badge ok">bindable</span>{' '}
-                  <span className="badge">{entry.readiness.toLowerCase().replace(/_/g, ' ')}</span>
                   {entry.review_current
-                    ? <span className="badge ok"> reviewed</span>
-                    : <span className="badge"> unreviewed</span>}
-                  {entry.corroborations.length > 0 && (
-                    <span className="hint"> · also arrived at by {entry.corroborations
-                      .map(c => c.origin).join(', ')}</span>
-                  )}
-                </>
-              )}
+                    ? <span className="badge ok">reviewed</span>
+                    : <span className="badge">unreviewed</span>}
+                </div>
+                <p className="hint" style={{ margin: 0 }}>{entry.card?.description}</p>
+                {(entry.card?.input_role_bindings?.length ?? 0) > 0 && (
+                  <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2,
+                      margin: 0, paddingLeft: 16, fontSize: 13 }}>
+                    {entry.card!.input_role_bindings!.map(binding => (
+                      <li key={binding.role}>
+                        <span style={{ fontWeight: 600 }}>{binding.role}</span>
+                        {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
+                        {binding.authority && <> · {binding.authority}</>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {entry.corroborations.length > 0 && (
+                  <span className="hint">also arrived at by {entry.corroborations
+                    .map(c => c.origin).join(', ')}</span>
+                )}
+              </div>
             </li>
           ))}
         </ul>

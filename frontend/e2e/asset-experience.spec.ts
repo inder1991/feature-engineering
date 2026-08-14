@@ -138,10 +138,11 @@ test.describe('suggested features — desktop, real backend, hostile-length cata
   }) => {
     await page.goto(`/#/suggested?source=${WIDE_SOURCE}&table=${WIDE_TABLE}`)
 
-    // NON-VACUITY GUARD. The summary group renders only once the REAL v2 route has answered for a
+    // NON-VACUITY GUARD. The summary group renders only once the REAL route has answered for a
     // table this catalog holds, so this fails loudly if the seed did not land, if the deployment
-    // does not serve contract_version=2, or if the read was refused — rather than letting the
-    // overflow assertions below pass against a blank page or an error callout.
+    // does not serve contract_version=4 (the only contract since the E4 cutover), or if the read
+    // was refused — rather than letting the overflow assertions below pass against a blank page
+    // or an error callout.
     await expect(page.getByRole('group', { name: /suggestion summary/i })).toBeVisible()
     // The anchor line always carries the unbounded table ref and catalog source as mono text, so
     // there is always at least one hostile string on the page for the assertions to bite on.
@@ -152,8 +153,10 @@ test.describe('suggested features — desktop, real backend, hostile-length cata
     // recipe needs"), which is itself the contract this seed now exercises. The overflow
     // rules this case exists for still bite: the anchor line renders the unbounded table ref
     // (asserted above), and the honest-empty explanation renders alongside it. The ≥1-card
-    // variant returns with the shared-carrier page once a meaning-bearing seed exists (the
-    // legacy pass itself retires at the E4 cutover).
+    // variant returns with the shared-carrier page once a meaning-bearing seed exists. The
+    // legacy pass did NOT retire at the E4 cutover after all: verify-first found it is still
+    // the asset-detail column dossier's only content source, so retiring it needs the
+    // column-anchored engine surface built first. This case's message is therefore unchanged.
     await expect(page.getByText(/no column on this table carries/i)).toBeVisible()
 
     await expectNoHorizontalOverflow(page, 'suggested features (default desktop)')

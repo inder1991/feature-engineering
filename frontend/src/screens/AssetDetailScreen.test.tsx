@@ -11,14 +11,12 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     getAssetDetail: vi.fn(),
     postFieldDecision: vi.fn(),
-    getTableSuggestionsV2: vi.fn(),
     getTableSuggestionsV4: vi.fn(),
   }
 })
 const getAssetDetail = vi.mocked(api.getAssetDetail)
 const postFieldDecision = vi.mocked(api.postFieldDecision)
-const getTableSuggestions = vi.mocked(api.getTableSuggestionsV2)
-const getTableSuggestionsV4 = vi.mocked(api.getTableSuggestionsV4)
+const getTableSuggestions = vi.mocked(api.getTableSuggestionsV4)
 
 beforeEach(() => {
   getAssetDetail.mockReset()
@@ -31,13 +29,6 @@ beforeEach(() => {
   })
   getTableSuggestions.mockReset()
   getTableSuggestions.mockResolvedValue(suggestionsFixture())
-  getTableSuggestionsV4.mockReset()
-  // Default: the older-backend answer — the screen steps down to v2, so every existing test
-  // keeps exercising the page exactly as before. v4-specific tests override per-case.
-  getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
-    422, 'unsupported contract_version 4; this deployment serves [1, 2, 3]', null,
-    api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
-  ))
 })
 
 function renderScreen() {

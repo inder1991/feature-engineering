@@ -208,7 +208,6 @@ def test_01_an_identifier_is_never_a_generic_measure(make_client, conn, monkeypa
     a measure." The model PROPOSES the identifier as the quantity; the serving path refuses
     it structurally — no confirmation can promote it."""
     source = "gold01"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     client = make_client(llm_client=_fake(_intent(
@@ -230,7 +229,6 @@ def test_02_a_proposed_key_is_visible_but_cannot_govern(make_client, conn, monke
     provisional; cannot govern." The card serves; create_contract is blocked with the funnel
     step; save_idea stays open."""
     source = "gold02"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     _propose_concepts(conn, source, rows)
@@ -249,7 +247,6 @@ def test_03_confirmation_makes_the_key_eligible_with_uniqueness_still_owed(
     roles; still subject to uniqueness check." The funnel clears the floor; the runtime
     grain-uniqueness data check stays NAMED on the card."""
     source = "gold03"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     _propose_concepts(conn, source, rows)
@@ -273,7 +270,6 @@ def test_04_an_event_window_over_a_declared_snapshot_refuses(make_client, conn, 
     from featuregen.overlay.upload.object_ref import normalize_ref
 
     source = "gold04"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     logical = normalize_ref(source, "public", "bo_cib_customer", None)
@@ -298,7 +294,6 @@ def test_05_a_balance_never_sums_across_time(make_client, conn, monkeypatch):
     catalog declares semi_additive (a stock) bound into a SUMMING recipe under an event
     anchor refuses by name — the declared stock/flow law, end to end."""
     source = "gold05"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         (CanonicalRow(source, "bo_cib_customer", "cust_num", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
@@ -326,7 +321,6 @@ def test_06_mixed_currencies_require_the_conversion_policy(make_client, conn, mo
     and currency source." rfm_monetary_amount expects per-row currency; an amount column with
     NO currency fact carries the named policy requirement — never a silent mixed-unit sum."""
     source = "gold06"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         (CanonicalRow(source, "bo_cib_customer", "cust_num", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
@@ -356,7 +350,6 @@ def test_07_opposing_legs_on_one_column_refuse_without_a_sign_representation(
     the governed representations. (The model cannot even EXPRESS distinct groups — the wire
     schema whitelists role/concept/class — so the law binds at the recipe surface.)"""
     source = "gold07"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         (CanonicalRow(source, "transactions", "cust_num", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
@@ -388,7 +381,6 @@ def test_08_status_policies_are_exact_never_inferred_from_prose(make_client, con
     reversal policy; do not infer from prose." Recipes referencing governed status policies
     carry STATUS_POLICY_UNRESOLVED as named setup work until a resolver serves them."""
     source = "gold08"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         *_cib_rows(source),
         # A status-bearing transaction shape, so a recipe that READS a governed status
@@ -415,7 +407,6 @@ def test_09_a_cross_table_feature_requires_the_verified_relationship(
     verified relationship, cardinality and PIT-safe path." Operands spanning two tables
     refuse as ONE feature until the relationship is governed."""
     source = "gold09"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         (CanonicalRow(source, "customer_master", "cust_num", "integer", is_grain=True,
                       entity="Customer"), "customer_id"),
@@ -443,7 +434,6 @@ def test_10_read_allowed_is_not_use_allowed(make_client, conn, monkeypatch):
     activation under purpose/use policy." A readable pep_flag with no active use policy is
     visible but PERSONAL_DATA_POLICY_REQUIRED blocks activation."""
     source = "gold10"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = [
         *_cib_rows(source),
         (CanonicalRow(source, "bo_cib_customer", "pep_ind", "text"), "pep_flag"),
@@ -464,7 +454,6 @@ def test_11_variants_are_explicit_and_the_hypothesis_selects(make_client, conn, 
     hypothesis-compatible variant." A "90 day" hypothesis leads with @window=90 and the card
     names the untaken parameterisations."""
     source = "gold11"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     client = make_client(llm_client=_fake())
@@ -483,7 +472,6 @@ def test_12_metadata_drift_after_consideration_never_silently_rebinds(
     """§10 row 12: "Metadata change after consideration — draft returns stale/regenerate;
     never silently rebinds." The sealed snapshot is re-verified at the durable write."""
     source = "gold12"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     monkeypatch.setattr(
         "featuregen.overlay.upload.contract.gate1._on_repeatable_read", lambda conn: True)
     monkeypatch.setattr(
@@ -520,7 +508,6 @@ def test_13_a_revoked_review_refuses_activation_at_the_governing_write(
     from featuregen.overlay.upload.recipe_review_validity import required_reviewer_roles
 
     source = "gold13"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     _propose_concepts(conn, source, rows)
@@ -564,7 +551,6 @@ def test_14_a_v2_formula_never_downgrades_into_a_v1_materializer(
     FORMULA_SCHEMA_UNSUPPORTED (the engine does not advertise the schema) and the action is
     never allowed."""
     source = "gold14"
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     rows = _cib_rows(source)
     _catalog(conn, source, rows)
     client = make_client(llm_client=_fake())

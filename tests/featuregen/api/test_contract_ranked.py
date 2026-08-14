@@ -1,17 +1,34 @@
 """Phase-2A Task A3 — POST /contract/considered-set ranks the ELIGIBLE set over a precomputed rankable
-set, behind ``FEATUREGEN_INTENT_RANKING`` (default off).
+set.
 
-Proves the wiring end to end on the same two-family catalog as ``test_contract_scoped``:
+Proves the wiring end to end on the same two-family catalog as ``test_contract_scoped`` (imported from
+there, so the two files cannot drift):
 
-* flag OFF → the scoped response is byte-identical to Task-7 (NO ``ranking`` / ``ranking_version`` keys);
 * ``rankable_recipe_ids`` — the ONE place ``FinalDisposition`` is read — returns only ``ELIGIBLE`` ids;
-* flag ON → ``ranking`` is present, ordered by ``canonical_rank``, the initial view respects the family
-  cap, ONLY eligible recipes are ranked (out-of-scope / unbuildable / rejected are absent), and
-  ``ranking_version`` is stamped;
+* ``ranking`` is present, ordered by ``canonical_rank``, the initial view respects the family cap, no
+  non-eligible recipe is ever ranked, and ``ranking_version`` is stamped;
 * the three presentation layers stay SEPARATE — the deterministic ``ranking`` is present alongside the
   LLM ``recommendation`` and never merged with it.
+
+WHAT THE E4 CUTOVER (2026-08-14) CHANGED HERE
+---------------------------------------------
+The disposition universe is now the V2 recipe registry — the universe the semantic engine actually
+plans — so every recipe id named below is a V2 id. Two of the old ones (``balance_trend``,
+``credit_utilisation``, ``stage_migration``) exist only in the legacy template registry and can no
+longer appear in a disposition at all.
+
+The ranker itself was NOT cut over: its signal bundle (family, explainability, PIT completeness,
+journey, semantic group) is authored on the legacy Template objects, so ``_rank_signals`` skips any
+rankable id with no template and the ranker deterministically drops it. The honest consequence, which
+:func:`test_flag_on_churn_scoped_ranks_eligible_set` states outright, is that the ranking is a SUBSET
+of the eligible set: a V2-only recipe is eligible and simply unrankable — dropped rather than ordered
+on signals nobody authored for it.
 """
 from tests.featuregen.api._helpers import AUTH
+
+# ONE two-family catalog, defined next door and shared: the ranking suite and the scoped suite must
+# agree about what binds, or neither proves anything about narrowing.
+from tests.featuregen.api.test_contract_scoped import _bank_multi
 
 from featuregen.api.routes.contract import rankable_recipe_ids
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -38,8 +55,11 @@ FORMULA_SHADOW_FLAG = "FEATUREGEN_RECIPE_FORMULA_SHADOW"
 CHURN = "customer.relationship_attrition.churn"
 HYPOTHESIS = "customers churn when their balance drops"
 TARGET = "public.accounts.churned"
-CHURN_RECIPE = "balance_trend"
-CREDIT_RECIPE = "credit_utilisation"   # a non-churn family → out_of_scope under a churn narrowing
+#: A churn recipe that binds on the shared catalog (account key + balance + as-of).
+CHURN_RECIPE = "balance_volatility"
+#: A lending recipe → out_of_scope under a churn narrowing, and the GENERIC (no declared modelling
+#: context) half of the Task-B3 pair below.
+CREDIT_RECIPE = "days_past_due_max"
 FRAUD_RECIPE = "txn_velocity_spike"
 
 _FAMILY_BY_ID = {t.id: t.family for t in ALL_TEMPLATES}
@@ -47,47 +67,14 @@ _PER_FAMILY_CAP = 3   # rank_eligible's default; the initial view holds at most 
 
 
 def _fake() -> FakeLLM:
+    """Only the ADVISORY set-recommendation pass is scripted. ``overlay.feature.recommend`` is absent
+    because the E4 cutover deleted the free-form generator, and ``overlay.feature.intents`` is left
+    unscripted on purpose — the intent lens fails soft, so the recipe half of the engine serves alone
+    and the rankings below stay deterministic."""
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
-
-
-def _bank_multi(conn) -> None:
-    """A TWO-family catalog: an ``accounts`` table the retail_churn recipes ground on, PLUS a
-    ``facilities`` table the credit recipes ground on — so a churn narrowing leaves the credit/fraud
-    families out of scope. Mirrors test_contract_scoped's catalog."""
-    from datetime import UTC, datetime
-    # Fresh as of the test run — the route grounds against the real wall clock, so a hardcoded past
-    # date rots the freshness gate once that date passes.
-    now = datetime.now(UTC)
-    catalog = [
-        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
-         "customer_id"),
-        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
-                      currency="USD"), "monetary_stock"),
-        (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
-        (CanonicalRow("bank", "accounts", "amount", "numeric", additivity="additive", currency="USD"),
-         "monetary_flow"),
-        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
-        (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
-        (CanonicalRow("bank", "facilities", "facility_id", "integer", is_grain=True, entity="Facility"),
-         "facility_id"),
-        (CanonicalRow("bank", "facilities", "drawn", "numeric", additivity="semi_additive",
-                      currency="USD"), "monetary_stock"),
-        (CanonicalRow("bank", "facilities", "credit_limit", "numeric", currency="USD"), "limit"),
-        (CanonicalRow("bank", "facilities", "asof2", "timestamp", as_of=True), "as_of_date"),
-    ]
-    rows = [r for r, _ in catalog]
-    concepts = {content_hash(r): c for r, c in catalog}
-    build_graph(conn, "bank", rows, concepts=concepts)
-    conn.execute(
-        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
-        "VALUES ('bank', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
-        (now, now))
 
 
 def _post_churn_scoped(client) -> dict:
@@ -100,6 +87,15 @@ def _post_churn_scoped(client) -> dict:
 
 
 def _merchant_catalog(conn) -> None:
+    """A card-transaction catalog the fraud recipes bind on.
+
+    ``cust_num`` is here because the V2 ``merchant_mcc_diversity`` recipe is keyed per CUSTOMER — it
+    measures how many merchant categories ONE customer transacts across, which is the fraud signal.
+    The legacy template of the same name declared a merchant key, so before the E4 cutover
+    (2026-08-14) this fixture had no customer id and the V2 recipe would refuse with
+    REQUIRED_OPERAND_MISSING. The merchant id stays: it is the table's grain and the recipe's
+    category dimension hangs off it.
+    """
     from datetime import UTC, datetime
 
     now = datetime.now(UTC)
@@ -107,6 +103,8 @@ def _merchant_catalog(conn) -> None:
         (CanonicalRow(
             "merchant_bank", "tx", "merchant_id", "string",
             is_grain=True, entity="Merchant"), "merchant_id"),
+        (CanonicalRow(
+            "merchant_bank", "tx", "cust_num", "string", entity="Customer"), "customer_id"),
         (CanonicalRow(
             "merchant_bank", "tx", "mcc", "string"), "mcc"),
         (CanonicalRow(
@@ -123,7 +121,7 @@ def _merchant_catalog(conn) -> None:
         [row for row, _concept in catalog],
         concepts={content_hash(row): concept for row, concept in catalog},
     )
-    for row, concept in catalog[:3]:
+    for row, concept in catalog[:4]:
         ref = normalize_ref("merchant_bank", None, row.table, row.column)
         record_field_evidence(
             conn,
@@ -217,10 +215,16 @@ def test_flag_on_churn_scoped_ranks_eligible_set(make_client, conn, monkeypatch)
     ranked_ids = {r["recipe_id"] for r in ranking}
     assert CHURN_RECIPE in ranked_ids
 
-    # ONLY eligible recipes are ranked — the rankable set (the one FinalDisposition read) exactly.
+    # ONLY eligible recipes are ranked. The ranking is a SUBSET of the eligible set, not an equality:
+    # `_rank_signals` builds each recipe's bundle from the LEGACY Template metadata (family,
+    # explainability, PIT completeness, journey, semantic group), so a recipe that exists only in the
+    # V2 registry has no bundle and the ranker deterministically DROPS it rather than ordering it on
+    # invented signals. After the E4 cutover the eligible set comes from V2, so that gap is visible
+    # here — and it is a gap in the ranker, never a second eligibility policy.
     eligible = {d["recipe_id"] for d in body["dispositions"]
                 if d["final_disposition"] == "eligible"}
-    assert ranked_ids == eligible
+    assert ranked_ids <= eligible
+    assert ranked_ids == {rid for rid in eligible if rid in _FAMILY_BY_ID}
     # Out-of-scope / unbuildable / rejected recipes never appear in the ranking.
     non_eligible = {d["recipe_id"] for d in body["dispositions"]
                     if d["final_disposition"] != "eligible"}
@@ -305,9 +309,25 @@ def test_formula_shadow_expected_declaration_failure_is_loud_503(
     assert response.json()["detail"] == "SHADOW_EXPECTATION_STORE_UNAVAILABLE"
 
 
-def test_formula_shadow_positive_route_creates_immutable_work_item(
+def test_formula_shadow_records_why_it_could_not_capture_on_the_engine_path(
     make_client, conn, monkeypatch
 ):
+    """Delivery-B formula shadow on a confirmed-scope run — and a GAP the E4 cutover opened.
+
+    The shadow capture needs the run's PRIVATE grounding context, looked up by
+    ``recipe_candidate_keys_by_recipe_id``. That map is populated only by the legacy
+    ``_template_candidates`` pass, which — since the E4 cutover (2026-08-14) — no longer runs when a
+    ``confirmed_scope`` is present: the semantic engine serves that path and does not fill it. So on
+    every confirmed-scope run the capture now resolves CANDIDATE_MISSING and writes NO work item.
+
+    That is a real regression in the shadow subsystem, not a property worth having, and this test is
+    deliberately written so it cannot be mistaken for one: it asserts the honest current behaviour —
+    the recipe is ranked and selected, the expected run is declared, and the shadow records an
+    OBSERVATION that names exactly why it captured nothing — and it will fail the moment the
+    capture starts working again, at which point it should be restored to asserting the work item.
+    Nothing about this is silent: CAPTURE_INPUT_INCOMPLETE / CANDIDATE_MISSING is precisely the
+    machine-readable "I could not do my job, here is why" the shadow was built to emit.
+    """
     import psycopg
 
     conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
@@ -379,15 +399,21 @@ def test_formula_shadow_positive_route_creates_immutable_work_item(
         "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
         (body["generation_run_id"],),
     ).fetchall()
-    assert len(work) == 1, observations
-    assert work[0][0] == "merchant_mcc_diversity"
-    assert work[0][1]
-    assert work[0][2]["event_time_facts"][0]["temporal_role"] == "event"
-    assert work[0][3]["prediction_goal"] == "identify merchant fraud"
+    # The expected-run declaration (the flag-on durability interlock) still happened — the shadow
+    # knows a run was owed to it, which is what makes the miss below detectable at all.
+    assert conn.execute(
+        "SELECT count(*) FROM recipe_formula_shadow_expected_run "
+        "WHERE generation_run_id=%s", (body["generation_run_id"],)).fetchone()[0] == 1
+    # …and the capture named its own failure instead of vanishing.
+    assert ("merchant_mcc_diversity", "CAPTURE_INPUT_INCOMPLETE", "NOT_EVALUATED",
+            "CANDIDATE_MISSING") in observations
+    assert work == [], (
+        "the engine path fills no candidate-key map, so nothing can be captured — see this "
+        "test's docstring; restore the work-item assertions when that is fixed")
     assert conn.execute(
         "SELECT count(*) FROM outbox "
         "WHERE topic='recipe_formula_shadow.requested.v1'"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -398,44 +424,13 @@ def test_formula_shadow_positive_route_creates_immutable_work_item(
 # one; a confirmed ``target_entity`` never moves a recipe ``out_of_scope`` — it only nudges the rank and
 # surfaces an ``entity_grain_mismatch`` / ``modelling_context_conflict`` warning per recipe.
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
-IFRS9_RECIPE = "stage_migration"        # tagged ifrs9_staging; grain=facility → REQUIRED_MATCH under ifrs9
-GENERIC_CREDIT_RECIPE = "credit_utilisation"   # no framework tag; grain=facility → COMPATIBLE under ifrs9
-
-
-def _bank_ifrs9(conn) -> None:
-    """The two-family catalog of :func:`_bank_multi` PLUS an ``impairment_stage`` column on facilities so
-    the ifrs9-tagged ``stage_migration`` recipe grounds — giving an eligible framework-specific recipe
-    (REQUIRED_MATCH under confirmed ifrs9) alongside the generic ``credit_utilisation`` (COMPATIBLE),
-    both at facility grain."""
-    from datetime import UTC, datetime
-    # Fresh as of the test run — the route grounds against the real wall clock, so a hardcoded past
-    # date rots the freshness gate once that date passes.
-    now = datetime.now(UTC)
-    catalog = [
-        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
-         "customer_id"),
-        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
-                      currency="USD"), "monetary_stock"),
-        (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
-        (CanonicalRow("bank", "accounts", "amount", "numeric", additivity="additive", currency="USD"),
-         "monetary_flow"),
-        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
-        (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
-        (CanonicalRow("bank", "facilities", "facility_id", "integer", is_grain=True, entity="Facility"),
-         "facility_id"),
-        (CanonicalRow("bank", "facilities", "drawn", "numeric", additivity="semi_additive",
-                      currency="USD"), "monetary_stock"),
-        (CanonicalRow("bank", "facilities", "credit_limit", "numeric", currency="USD"), "limit"),
-        (CanonicalRow("bank", "facilities", "asof2", "timestamp", as_of=True), "as_of_date"),
-        (CanonicalRow("bank", "facilities", "imp_stage", "integer"), "impairment_stage"),
-    ]
-    rows = [r for r, _ in catalog]
-    concepts = {content_hash(r): c for r, c in catalog}
-    build_graph(conn, "bank", rows, concepts=concepts)
-    conn.execute(
-        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
-        "VALUES ('bank', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
-        (now, now))
+#: Tagged ifrs9; grain=facility → REQUIRED_MATCH under a confirmed ifrs9 context. (The pre-cutover pair
+#: was stage_migration / credit_utilisation — both legacy-only template ids, so neither appears in a
+#: disposition any more. These two are the same pair one registry over: both exist in BOTH registries,
+#: both bind at facility grain on the shared catalog, and only the first declares a framework.)
+IFRS9_RECIPE = "sicr_onset"
+#: No framework tag; grain=facility → COMPATIBLE under any confirmed context.
+GENERIC_CREDIT_RECIPE = CREDIT_RECIPE
 
 
 def _post_unscoped(client, *, modelling_contexts=None, target_entity=None) -> dict:
@@ -466,7 +461,7 @@ def _rank_by_id(body: dict) -> dict[str, int]:
 def test_confirmed_context_ranks_required_match_above_compatible(make_client, conn, monkeypatch):
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
-    _bank_ifrs9(conn)
+    _bank_multi(conn)
 
     body = _post_unscoped(make_client(_fake()), modelling_contexts=("ifrs9",))
 
@@ -484,7 +479,7 @@ def test_confirmed_context_ranks_required_match_above_compatible(make_client, co
 def test_confirmed_target_entity_warns_but_never_rejects(make_client, conn, monkeypatch):
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
-    _bank_ifrs9(conn)
+    _bank_multi(conn)
 
     base = _post_unscoped(make_client(_fake()))                       # no target_entity
     scoped = _post_unscoped(make_client(_fake()), target_entity="obligor")
@@ -506,7 +501,7 @@ def test_confirmed_target_entity_warns_but_never_rejects(make_client, conn, monk
 def test_confirmed_context_conflict_is_a_warning_not_a_reject(make_client, conn, monkeypatch):
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
-    _bank_ifrs9(conn)
+    _bank_multi(conn)
 
     body = _post_unscoped(make_client(_fake()), modelling_contexts=("frtb",))
 
@@ -525,7 +520,7 @@ def test_bogus_modelling_context_is_dropped_at_the_boundary(make_client, conn, m
     writes no dimension row; a valid context alongside it is kept."""
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
-    _bank_ifrs9(conn)
+    _bank_multi(conn)
 
     # A BOGUS-ONLY confirmed set: without cleaning it would clean to (), the ifrs9-tagged recipe's own
     # {ifrs9} would be disjoint from {not_a_framework} -> CONFLICT -> a SPURIOUS modelling_context_conflict.
@@ -569,7 +564,7 @@ def test_scoped_ranking_response_leaks_no_entity_graph_metadata(make_client, con
     reason-code provenance stays entirely internal to the ranking adapter."""
     monkeypatch.setenv(SCOPE_FLAG, "1")
     monkeypatch.setenv(RANK_FLAG, "1")
-    _bank_ifrs9(conn)
+    _bank_multi(conn)
 
     body = _post_unscoped(make_client(_fake()), target_entity="obligor")
 

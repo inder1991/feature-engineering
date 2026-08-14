@@ -8,91 +8,100 @@ Two route-level guarantees on top of the builder unit tests (test_considered_set
   * a projection-lagged catalog surfaces as 503 CATALOG_PROJECTION_UNAVAILABLE (feature generation
     aborts rather than proceeding on a stale projected view).
 
-The shared API test conn is READ COMMITTED, so the builder itself takes no snapshot here (covered under
-REPEATABLE READ in the builder suite); the server considered-set row is seeded with a lineage to prove
-the draft/confirm RELOAD wiring reads the server value.
+The E4 cutover (2026-08-14) changed how these are driven and what the second one can assert. The
+free-form generator that used to fill a considered set from a scripted ``overlay.feature.recommend``
+response is deleted, so an option to draft now has to come from the ONE engine: a real
+``catalog_source`` + ``confirmed_scope``, with the option's activation blockers cleared through their
+real surfaces exactly as the E0 walkthrough does — ``governed_ready_round`` in
+``test_binding_confirmation`` performs that ritual and is imported here rather than re-typed. And
+because every served option is now a SEMANTIC option carrying a frozen decision
+row, the activation fold — not the old standalone drift check — owns snapshot freshness, and it fails
+CLOSED: a considered set with NO server lineage is no longer draftable-with-a-null-snapshot, it is
+refused. That is asserted below instead of the old "reports null" shape.
 """
 import psycopg
-from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
+from tests.featuregen.api._helpers import AUTH
+from tests.featuregen.api.test_binding_confirmation import governed_ready_round, seal_for_real
+from tests.featuregen.api.test_e2e_walkthrough import (
+    CHURN,
+    HYPOTHESIS,
+    SOURCE,
+    TARGET,
+    _cib,
+    _fake,
+)
 
-from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CATALOG_PROJECTION_UNAVAILABLE,
     CatalogProjectionUnavailable,
 )
 
 
-def _fake() -> FakeLLM:
-    return FakeLLM(script={
-        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary"}),
-        "overlay.enrich.definition": FakeResponse(output={"definition": "a column"}),
-        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
-        "overlay.feature.recommend": FakeResponse(output={"features": [{
-            "name": "avg_balance_90d", "description": "avg balance",
-            "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d",
-            "grain_table": "accounts"}]}),
-        "overlay.feature.recommend_set": FakeResponse(output={
-            "recommended_lens": "monetary", "reasoning": "fits the hypothesis"}),
-        "overlay.contract.draft": FakeResponse(output={
-            "definition": "Average 90-day end-of-day ledger balance per account."}),
-        "overlay.contract.critique": FakeResponse(output={"findings": []}),
-    })
-
-
-def _intent_id(client) -> str:
-    res = client.post("/contract/considered-set", json={
-        "hypothesis": "customers churn when their balance drops",
-        "definition": "90-day average balance per account",
-        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
-    assert res.status_code == 200
-    return res.json()["intent_id"]
-
-
-def test_draft_reloads_server_lineage_and_ignores_client_snapshot_id(make_client, conn):
+def test_draft_reloads_server_lineage_and_ignores_client_snapshot_id(
+        make_client, conn, monkeypatch):
+    seal_for_real(monkeypatch)
+    _cib(conn)
     client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    intent_id = _intent_id(client)
-    # Seed the SERVER considered-set row with a C0 snapshot lineage (as an RR feature-gen run would).
-    conn.execute(
-        "UPDATE contract_considered SET generation_run_id = %s, snapshot_id = %s, "
-        "snapshot_content_hash = %s WHERE intent_id = %s",
-        ("fgr_server", "snap_server", "sha256:server", intent_id))
+    body, card = governed_ready_round(client)
 
-    # The draft request model carries no snapshot id; a smuggled decoy field is simply ignored (Pydantic
-    # drops it) — the response carries the SERVER value reloaded from the considered-set row.
+    # The lineage the SERVER sealed and recorded on its own considered-set row — the only lineage
+    # there is. (The old version of this test overwrote it with decoy values; post-cutover the
+    # activation fold re-verifies the sealed snapshot at draft time, so a forged server row would
+    # simply fail closed. Reading the real row proves the same reload wiring without lying.)
+    server = conn.execute(
+        "SELECT generation_run_id, snapshot_id, snapshot_content_hash "
+        "FROM contract_considered WHERE intent_id = %s", (body["intent_id"],)).fetchone()
+    assert all(server), "generation under REPEATABLE READ seals a snapshot and records its lineage"
+
+    # The draft request model carries no snapshot id; a smuggled decoy field is simply ignored
+    # (Pydantic drops it) — the response carries the SERVER value reloaded from the considered-set row.
     dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "anchor",
-        "chosen_option_id": "avg_balance_90d", "why": "best fit",
+        "intent_id": body["intent_id"], "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"], "why": "best fit",
         "snapshot_id": "snap_CLIENT_FORGED"}, headers=AUTH)
-    assert dr.status_code == 200
+    assert dr.status_code == 200, dr.text
     assert dr.json()["snapshot"] == {
-        "generation_run_id": "fgr_server", "snapshot_id": "snap_server",
-        "content_hash": "sha256:server"}
+        "generation_run_id": server[0], "snapshot_id": server[1], "content_hash": server[2]}
 
     # Slice-3 flow unbroken: draft → confirm still registers a versioned contract.
-    draft = dr.json()["draft"]
+    draft = dict(dr.json()["draft"])
     draft["intent_id"] = dr.json()["intent_id"]
+    draft["expected_binding_hash"] = dr.json()["binding_hash"]
     cr = client.post("/contract/confirm", json=draft, headers=AUTH)
-    assert cr.status_code == 200
+    assert cr.status_code == 200, cr.text
     assert cr.json()["version"] == 1
     assert cr.json()["feature_id"].startswith("feat")
 
 
-def test_draft_snapshot_is_null_when_no_server_lineage(make_client):
-    # A pre-C0 / READ COMMITTED considered set records no lineage — draft honestly reports null (additive).
+def test_draft_without_server_lineage_fails_closed_as_stale(make_client, conn):
+    """A considered set that recorded NO lineage (a READ COMMITTED / pre-C0 run — here, the harness
+    transaction with the isolation gates left alone) used to draft happily and report ``snapshot:
+    null``. After the E4 cutover every served option is an engine option with a frozen decision row,
+    so the activation fold owns snapshot freshness and it fails CLOSED on the unverifiable: the draft
+    is refused with ACTIVATION_BLOCKED / SNAPSHOT_STALE_REGENERATE and a next step, rather than
+    proceeding over a catalog state nobody can prove. Absence of a seal is no longer a free pass."""
+    _cib(conn)
     client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    intent_id = _intent_id(client)
+    body, card = governed_ready_round(client)
+    assert conn.execute(
+        "SELECT snapshot_id FROM contract_considered WHERE intent_id = %s",
+        (body["intent_id"],)).fetchone()[0] is None, "no seal was taken on this connection"
+
     dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "anchor",
-        "chosen_option_id": "avg_balance_90d", "why": "best fit"}, headers=AUTH)
-    assert dr.status_code == 200
-    assert dr.json()["snapshot"] is None
+        "intent_id": body["intent_id"], "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"], "why": "best fit"}, headers=AUTH)
+    assert dr.status_code == 409, dr.text
+    detail = dr.json()["detail"]
+    assert detail["code"] == "ACTIVATION_BLOCKED"
+    blockers = {b["code"]: b["next_step"] for b in detail["blockers"]}
+    assert "SNAPSHOT_STALE_REGENERATE" in blockers, blockers
+    assert blockers["SNAPSHOT_STALE_REGENERATE"]     # the refusal names what to do next
+    assert conn.execute("SELECT count(*) FROM contract").fetchone()[0] == 0
 
 
-def test_considered_set_projection_unavailable_returns_503(make_client, monkeypatch):
+def test_considered_set_projection_unavailable_returns_503(make_client, conn, monkeypatch):
+    _cib(conn)
     client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
 
     def _lagged(*a, **k):
         raise CatalogProjectionUnavailable(
@@ -101,20 +110,22 @@ def test_considered_set_projection_unavailable_returns_503(make_client, monkeypa
 
     monkeypatch.setattr("featuregen.api.routes.contract.build_considered_set", _lagged)
     res = client.post("/contract/considered-set", json={
-        "hypothesis": "customers churn when their balance drops",
-        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+        "hypothesis": HYPOTHESIS, "objective": "predict churn",
+        "catalog_source": SOURCE, "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
+    }, headers=AUTH)
     assert res.status_code == 503
     assert "LAGGED" in res.json()["detail"]
     # ATOMIC: nothing feature-generation was committed for this aborted request.
     assert res.json().get("intent_id") is None
 
 
-def test_considered_set_serialization_failure_returns_409(make_client, monkeypatch):
+def test_considered_set_serialization_failure_returns_409(make_client, conn, monkeypatch):
     """MF-2: /contract/considered-set STAYS on REPEATABLE READ (it builds the snapshot), so a concurrent
     broaden race on its ``contract_considered ... ON CONFLICT (intent_id) DO UPDATE`` can raise 40001
     SerializationFailure. The route must map that to a designed 409 (re-fetch and retry), NEVER a 500."""
+    _cib(conn)
     client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
 
     def _conflict(*a, **k):
         raise psycopg.errors.SerializationFailure(
@@ -122,7 +133,9 @@ def test_considered_set_serialization_failure_returns_409(make_client, monkeypat
 
     monkeypatch.setattr("featuregen.api.routes.contract.build_considered_set", _conflict)
     res = client.post("/contract/considered-set", json={
-        "hypothesis": "customers churn when their balance drops",
-        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+        "hypothesis": HYPOTHESIS, "objective": "predict churn",
+        "catalog_source": SOURCE, "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
+    }, headers=AUTH)
     assert res.status_code == 409, res.text
     assert "concurrent" in res.json()["detail"]

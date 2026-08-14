@@ -58,12 +58,14 @@ def _post(client, **extra) -> dict:
     return res.json()
 
 
-def test_v2_is_asked_for_and_carries_the_marker_plus_the_mode(make_client, conn, monkeypatch):
+def test_v2_is_asked_for_and_carries_the_marker(make_client, conn):
+    """E4: the marker survives the cutover; `semantic_planning_mode` does NOT. It named which
+    of three pipelines answered, and there is one pipeline now — a constant that looks like a
+    reading is worse than no reading, so the key is gone rather than frozen to a value."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
     body = _post(make_client(llm_client=_fake()), contract_version=2)
     assert body["contract_version"] == 2
-    assert body["semantic_planning_mode"] == "semantic_shadow"
+    assert "semantic_planning_mode" not in body
 
 
 def test_v1_default_never_carries_the_new_keys(make_client, conn):
@@ -81,7 +83,6 @@ def test_v2_carries_the_revision_address_and_the_detail_endpoint_serves_it(
     from; the detail endpoint serves any of its options FROM THAT STORED REVISION, with the
     run's semantic evidence attached for recipe-sourced options when observations exist."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_shadow")
     client = make_client(llm_client=_fake())
     body = _post(client, contract_version=2)
     revision_id = body["considered_revision_id"]
@@ -188,7 +189,6 @@ def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, 
     and per-action verdicts from the SAME activation fold the durable writes consult;
     save_idea is always allowed, create_contract blocked with named next steps."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=_fake()), contract_version=2)
 
     assert "recommended_options" in body and "actionable_options" in body
@@ -213,7 +213,6 @@ def test_v2_serves_three_sections_with_actions_from_the_fold(make_client, conn, 
 
 def test_v1_never_carries_the_section_keys(make_client, conn, monkeypatch):
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=_fake()))
     for key in ("recommended_options", "actionable_options", "rejected_outputs",
                 "contract_version", "semantic_planning_mode"):

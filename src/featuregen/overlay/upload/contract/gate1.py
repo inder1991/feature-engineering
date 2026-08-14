@@ -24,7 +24,7 @@ from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
     requirements_to_json,
 )
-from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
+from featuregen.overlay.upload.contract.intake import Intent
 from featuregen.overlay.upload.contract.intake_ticket import signed_reading_for
 from featuregen.overlay.upload.contract.near_label_critic import annotate_near_label
 from featuregen.overlay.upload.contract.param_choice import choose_params
@@ -39,8 +39,6 @@ from featuregen.overlay.upload.feature_assist import (
     SetRecommendation,
     _candidate_columns,
     _validate_idea,
-    recommend_feature_sets_report,
-    recommend_features,
     recommend_set,
     set_signals,
 )
@@ -746,59 +744,6 @@ def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
     return run_id, snapshot.snapshot_id, snapshot.content_hash
 
 
-def _semantic_shadow_compare(conn, *, catalog_source: str, roles, scope: ConfirmedScope,
-                             grounded_ids: frozenset[str],
-                             rejected_ids: dict[str, tuple[str, ...]],
-                             semantic_context=None,
-                             generation_run_id: str | None = None) -> None:
-    """SE-7 part 2 — the shadow half of the semantic-planning rollout: the V2 lens runs beside
-    the legacy template lens and the divergence is LOGGED, never served. Fail-soft under a
-    savepoint: a shadow failure must not poison the user's request transaction (the same rule
-    the shadow planner obeys), and the response is byte-identical either way."""
-    from collections import Counter
-
-    from featuregen.overlay.upload.recipe_planning_lens import v2_recipe_candidates
-
-    context_hash = semantic_context.context_hash() if semantic_context is not None else ""
-    try:
-        with conn.transaction():                      # savepoint — shadow reads stay isolated
-            candidates = v2_recipe_candidates(
-                conn, catalog_source=catalog_source, roles=roles, scope=scope,
-                context=semantic_context)
-            # SE-10 slice 1: the observations become ROWS (append-only, migration 1062) —
-            # fleet metrics query them; the savepoint still shields the user's request.
-            if semantic_context is not None:
-                from featuregen.overlay.upload.semantic_candidate_store import (
-                    persist_semantic_candidates,
-                )
-
-                persist_semantic_candidates(
-                    conn, generation_run_id=generation_run_id or "unattributed",
-                    context=semantic_context, candidates=candidates)
-        by_state = Counter(candidate.binding_state for candidate in candidates)
-        logger.info(
-            "semantic-shadow: eligible=%d bound=%d ambiguous=%d missing=%d blocked=%d "
-            "review_current=%d temporal_blocked=%d | legacy grounded=%d rejected=%d "
-            "context=%s",
-            len(candidates), by_state.get("bound", 0), by_state.get("ambiguous", 0),
-            by_state.get("missing", 0), by_state.get("blocked", 0),
-            sum(1 for c in candidates if c.review_current),
-            sum(1 for c in candidates if c.temporal_blocker),
-            len(grounded_ids), len(rejected_ids), context_hash[:16] or "unassembled")
-        # SE-10 slice 2: assembly runs in shadow too — merge + designed order observed on real
-        # catalogs before anything serves it. Pure fold over the candidates already in hand.
-        from featuregen.overlay.upload.candidate_assembly import assemble_candidates
-
-        assembled = assemble_candidates(candidates)
-        merged = sum(len(a.corroborations) for a in assembled.ranked + assembled.actionable)
-        logger.info(
-            "semantic-shadow assembly: ranked=%d actionable=%d merged_twins=%d top=%s",
-            len(assembled.ranked), len(assembled.actionable), merged,
-            ",".join(a.candidate.recipe_id for a in assembled.ranked[:5]) or "-")
-    except Exception:
-        logger.exception("semantic-shadow comparison failed (response unaffected)")
-
-
 def _confirmed_scope_hash(scope) -> str:
     """B3: the HUMAN scope's own content identity — two scopes over one catalog are two
     identities (GEN-04's defect was stamping the catalog hash here)."""
@@ -825,9 +770,9 @@ def _intent_scope_leaves(scope) -> tuple:
 def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_context,
                                  catalog_source: str, target_ref: str | None,
                                  actor_envelope=None) -> list:
-    """B1 — the definition-mode anchor under semantic_v1: ONE audited extraction call (the
-    intents schema, seeded with the analyst's redacted definition and an extract-don't-invent
-    instruction), bound by the SHARED engine, projected through the SAME projection. Fail-soft:
+    """B1 — the definition-mode anchor: ONE audited extraction call (the intents schema, seeded
+    with the analyst's redacted definition and an extract-don't-invent instruction), bound by the
+    SHARED engine, projected through the SAME projection. Fail-soft:
     an extraction failure returns no anchor (the response's alternatives still serve), because
     the anchor is a convenience — never a second generation architecture."""
     from featuregen.overlay.upload.candidate_assembly import assemble_candidates
@@ -857,20 +802,32 @@ def _extracted_definition_anchor(conn, client, *, intent, scope, semantic_contex
         return []
 
 
-def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
+def build_considered_set(conn, intent: Intent, client: LLMClient, *,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
-                         objective: str = "", feedback: str | None = None, now=None,
+                         feedback: str | None = None, now=None,
                          applicability: ApplicabilityResult | None = None,
                          is_live: bool = False, target_entity: str | None = None,
                          templates: Sequence[Template] | None = None,
                          generation_run_id: str | None = None,
                          scope: ConfirmedScope | None = None,
-                         semantic_mode: str = "legacy",
                          actor_envelope=None) -> ConsideredSet:
-    """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
-    same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
-    Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
-    flow reaches Gate #1.
+    """The semantic engine's validated alternatives; the anchor is the requester's own definition run
+    through the same engine (definition mode only). Every option shown to the human has passed the
+    typed gauntlet. Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot
+    (BLOCKER 1) when the flow reaches Gate #1.
+
+    ONE ENGINE (E4 cutover, 2026-08-14): on the route's own path — a ``catalog_source`` AND the
+    human's ``scope`` — the candidate lens comes from the semantic engine (frozen context →
+    capability binder → eligibility fold → assembly → typed gauntlet) and from nothing else. The
+    free-form physical-column generator that used to fill this set is DELETED, not disabled: there
+    is no mode, no flag and no branch that can bring it back, and a caller with no
+    ``catalog_source`` is refused at the route (the engine plans over ONE frozen catalog context)
+    rather than silently served an emptier answer.
+
+    The two branches BELOW the engine are reachable only without a confirmed scope — the legacy
+    per-recipe template grounding pass, which the per-table suggestions page still shares, and the
+    governed cross-catalog lens. Neither is reachable from the scoped route, and retiring the
+    template pass is its own charter (it has a live consumer on the asset-detail page).
 
     ``applicability`` is the ONE applicability decision (computed once in the API layer, Task 7). When
     scoped grounding is enabled it narrows the template lens to the eligible recipe subset; either way it
@@ -897,44 +854,26 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # None on the legacy path / unsigned round — both consumers degrade (today's order; abstain).
     signed_reading = signed_reading_for(
         conn, hypothesis=intent.hypothesis, actor_json=_actor_json(intent.actor))
-    # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
-    # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
-    # so a required-but-ignored field (bug_003) now actually shapes generation.
-    redacted_goal = redact_free_text(objective, label="prediction goal")
-    gen_objective = (f"{intent.redacted_hypothesis}\n\nprediction goal: {redacted_goal}"
-                     if redacted_goal else intent.redacted_hypothesis)
     # SE-2: freeze the Layer-A semantic context BEFORE any model dispatch — the identity every
-    # downstream decision (and the shadow lens) can be tied to. Assembled on this connection
-    # (REPEATABLE READ on the production path), sealed into the metadata snapshot below.
+    # downstream decision can be tied to. Assembled on this connection (REPEATABLE READ on the
+    # production path), sealed into the metadata snapshot below.
     semantic_context = None
     if catalog_source is not None:
         semantic_context = build_generation_semantic_context(
             conn, catalog_source=catalog_source, roles=roles)
-    # B1 (GEN-01 closed): under semantic_v1 the free-form physical-column generator does not
-    # run AT ALL — no dispatch, no legacy lenses. The engine's projection is the only
-    # candidate source; legacy/shadow modes keep the report byte-identical.
-    if semantic_mode == "semantic_v1" and catalog_source is not None:
-        alternatives: list[FeatureSet] = []
-        rejections: list[dict] = []
-    else:
-        report = recommend_feature_sets_report(
-            conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
-            roles=roles, target_ref=target_ref, feedback=feedback, now=now)
-        alternatives = list(report.sets)
-        rejections = list(report.rejections)
+    # E4 (GEN-01 closed for good): the free-form physical-column generator does not run — it no
+    # longer EXISTS on this path. The engine's projection is the only candidate source, so the
+    # set starts empty and is filled below by the one engine.
+    alternatives: list[FeatureSet] = []
+    rejections: list[dict] = []
     grounded_template_ids: frozenset[str] = frozenset()   # per-template grounding outcome for Task 5's
     rejected_template_ids: dict[str, tuple[str, ...]] = {}   # disposition stage (empty on a no-catalog run)
     incomplete_template_ids: dict[str, tuple[str, ...]] = {}
     binding_quality_by_template: dict[str, str] = {}   # per-template binding signal for the ranker (A3)
     recipe_grounding_context_by_candidate_key: dict[str, RecipeGroundingContextV1] = {}
     recipe_candidate_keys_by_recipe_id: dict[str, tuple[str, ...]] = {}
-    # B4 two-source model: seed the considered set with grounded parametric templates alongside the LLM
-    # alternatives — but only where a single catalog is in scope to ground them (an entity-only,
-    # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
-    # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
-    # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
     semantic_decision_facts: dict[str, dict] = {}
-    if catalog_source is not None and semantic_mode == "semantic_v1" and scope is not None:
+    if catalog_source is not None and scope is not None:
         # SE-7 — the ENFORCED projection: the recipe lens is served from the semantic engine
         # (frozen context → capability binder → eligibility fold → assembly → typed gauntlet),
         # not from legacy template grounding. One engine, one eligibility policy. The LLM lens
@@ -977,7 +916,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                     uoa_entity=getattr(scope, "uoa_entity", None))
                 all_candidates.extend(intent_cands)
             except Exception:
-                logger.exception("semantic-v1 intent generation failed "
+                logger.exception("engine intent generation failed "
                                  "(recipe lens serves alone)")
         observation_ids: dict[str, str] = {}
         if semantic_context is not None:
@@ -1026,7 +965,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                                            features=projection.actionable_ideas))
         rejections.extend(projection.rejections)
         logger.info(
-            "semantic-v1 served: ideas=%d rejections=%d grounded=%s",
+            "engine served: ideas=%d rejections=%d grounded=%s",
             len(projection.ideas), len(projection.rejections),
             ",".join(sorted(projection.grounded_ids)) or "-")
     elif catalog_source is not None:
@@ -1081,31 +1020,18 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             if governed_ideas:
                 alternatives.append(FeatureSet(lens="templates", features=governed_ideas))
             rejections.extend(governed_rejections)
-    # SE-7 part 2 — the semantic_shadow observation: run the V2 planning lens beside the
-    # template lens and log the divergence. Read-only, fail-soft, response-invisible; the mode
-    # is ROUTE-resolved (the builder never reads env), same discipline as ``is_live``.
-    if semantic_mode == "semantic_shadow" and catalog_source is not None and scope is not None:
-        _semantic_shadow_compare(conn, catalog_source=catalog_source, roles=roles, scope=scope,
-                                 grounded_ids=grounded_template_ids,
-                                 rejected_ids=rejected_template_ids,
-                                 semantic_context=semantic_context,
-                                 generation_run_id=generation_run_id)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
-        if semantic_mode == "semantic_v1" and catalog_source is not None:
-            # B1: the anchor is EXTRACTED as an abstract intent (meaning only — the model is
-            # instructed to extract the analyst's OWN definition, never invent alternatives),
-            # then the SHARED binder chooses columns. Physical refs the user typed were already
-            # demoted to hints by the intent parser's forbidden-key rule.
-            ideas = _extracted_definition_anchor(
-                conn, client, intent=intent, scope=scope,
-                semantic_context=semantic_context, catalog_source=catalog_source,
-                target_ref=target_ref, actor_envelope=actor_envelope)
-        else:
-            ideas = recommend_features(
-                conn, intent.redacted_definition, client, entity=entity,
-                catalog_source=catalog_source,
-                roles=roles, target_ref=target_ref, now=now, target=1)
+        # B1: the anchor is EXTRACTED as an abstract intent (meaning only — the model is
+        # instructed to extract the analyst's OWN definition, never invent alternatives), then
+        # the SHARED binder chooses columns. Physical refs the user typed were already demoted
+        # to hints by the intent parser's forbidden-key rule. With no catalog in scope there is
+        # no frozen context to bind against, so there is no anchor — an honest absence, not a
+        # free-form guess at physical columns (E4: that generator is gone).
+        ideas = _extracted_definition_anchor(
+            conn, client, intent=intent, scope=scope,
+            semantic_context=semantic_context, catalog_source=catalog_source,
+            target_ref=target_ref, actor_envelope=actor_envelope)
         # H1a: the definition anchor is the USER's own definition run through the validated loop — the
         # server-assigned generation_source for the user-anchor path is "user_defined" (distinct from the
         # LLM alternatives' "llm_freeform" and the recipe lens's "recipe"). Never read from LLM output.

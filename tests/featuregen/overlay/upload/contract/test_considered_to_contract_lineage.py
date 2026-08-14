@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 
 import psycopg
 from tests.featuregen._helpers import mint_test_identity
+from tests.featuregen.overlay.upload.contract.test_gate1 import DEFINITION, EXTRACTED_INTENT
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -32,6 +33,7 @@ from featuregen.overlay.upload.contract.gate1 import (
 from featuregen.overlay.upload.contract.govern import confirm_contract
 from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.contract.review import author_contract
+from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
 
 NOW = datetime(2026, 7, 5, tzinfo=UTC)
@@ -51,11 +53,25 @@ def _rr(db) -> None:
 
 
 def _bank(db) -> None:
-    build_graph(db, "bank", [
-        CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
-        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"),
-        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True),
-        CanonicalRow("bank", "accounts", "churned", "boolean")])
+    """A CONCEPT-TAGGED churn catalog (mirrors test_gate1._bank_churn).
+
+    The untagged catalog this suite used to build produced candidates only because the free-form
+    generator invented them over raw columns; that generator is deleted (E4 cutover, 2026-08-14), so
+    the chain needs a catalog the recipe lens can ground on for the considered set to have anything
+    in it at all."""
+    catalog = [
+        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True,
+                      entity="Customer"), "customer_id"),
+        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
+                      currency="USD"), "monetary_stock"),
+        (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow("bank", "accounts", "amount", "numeric", additivity="additive",
+                      currency="USD"), "monetary_flow"),
+        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
+    ]
+    build_graph(db, "bank", [r for r, _ in catalog],
+                concepts={content_hash(r): c for r, c in catalog})
     db.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, "
         "head_seq) VALUES ('bank', %s, 'r', 0) "
@@ -63,17 +79,17 @@ def _bank(db) -> None:
 
 
 def _client() -> FakeLLM:
-    """Serves every task the whole considered-set → draft → confirm chain dispatches: set generation +
-    recommendation, the contract-draft narrative, and a clean critique (empty findings → the
-    critique→refine loop returns clean on the first pass, no refine)."""
+    """Serves every task the whole considered-set → draft → confirm chain dispatches: the
+    definition-mode anchor's extraction (the ONE generation call left after the E4 cutover,
+    2026-08-14 — ``overlay.feature.recommend`` is deleted), the set recommendation, the
+    contract-draft narrative, and a clean critique (empty findings → the critique→refine loop
+    returns clean on the first pass, no refine)."""
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
+        "overlay.feature.intents": FakeResponse(output=EXTRACTED_INTENT),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
         "overlay.contract.draft": FakeResponse(output={
-            "definition": "Average 90-day end-of-day ledger balance per account."}),
+            "definition": "Days since the customer's most recent recorded event."}),
         "overlay.contract.critique": FakeResponse(output={"findings": []}),
     })
 
@@ -83,14 +99,14 @@ def test_snapshot_lineage_threads_from_considered_set_to_confirmed_contract(db):
     _rr(db)
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per account", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     client = _client()
 
     # 1. Considered set on the RR feature-gen connection: mints the run, snapshots the in-scope catalog
     #    state, records the lineage on contract_considered (the builder's real snapshot — not seeded).
     cs = build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET,
                               now=NOW, generation_run_id="fgr_e2e")
-    assert cs.anchor is not None and cs.anchor.name == "avg_balance_90d"
+    assert cs.anchor is not None   # the definition anchor the rest of the chain is authored from
 
     considered = db.execute(
         "SELECT generation_run_id, snapshot_id, snapshot_content_hash "
@@ -164,7 +180,7 @@ def test_two_considered_sets_over_identical_state_seal_the_same_content_hash(db)
     ids: list[str] = []
     for i in range(2):
         intent = submit_intent(hypothesis="customers churn when their balance drops",
-                               definition="90-day average balance per account", actor="ds1")
+                               definition=DEFINITION, actor="ds1")
         build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET,
                              now=NOW, generation_run_id=f"fgr_det_{i}")
         row = db.execute(
@@ -188,7 +204,7 @@ def test_broaden_after_confirm_does_not_repoint_contract_snapshot_binding(db):
     _bank(db)
     client = _client()
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per account", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
 
     # 1. Considered set S1 → Gate #1 choice → draft → confirm. The contract binds to S1's snapshot.
     cs = build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET, now=NOW,

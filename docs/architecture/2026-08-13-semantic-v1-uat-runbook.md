@@ -8,9 +8,10 @@ path breaks the build).
 materialization is **visibly unavailable** (a typed refusal with named next steps, never a
 silent failure). Nothing in this walk executes a formula or touches warehouse data.
 
-**Precondition:** the backend runs with `FEATUREGEN_SEMANTIC_PLANNING=semantic_v1` and a
-catalog is ingested whose concepts are AI-proposed (the normal state after enrichment,
-before any SME confirmation). The walk below uses a churn hypothesis; any objective with a
+**Precondition:** a catalog is ingested whose concepts are AI-proposed (the normal state
+after enrichment, before any SME confirmation). There is no mode to set: since the E4 cutover
+(2026-08-14) the semantic engine is the only pipeline, and `FEATUREGEN_SEMANTIC_PLANNING` is
+deleted from the code and from the deployment manifest. The walk below uses a churn hypothesis; any objective with a
 bound recipe works the same way.
 
 ---

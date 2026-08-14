@@ -140,7 +140,6 @@ def _blocker_codes(entry: dict, action: str) -> set:
 
 
 def test_the_whole_workflow_walks_end_to_end(make_client, conn, monkeypatch):
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     _cib(conn)
     # The route harness shares ONE READ COMMITTED test transaction, so the C0 catalog seal's
     # isolation gate would skip snapshotting (production always seals — the REPEATABLE READ

@@ -10,7 +10,23 @@ from tests.featuregen.api.test_1b_rollout import (
     _recognizer,
 )
 
-from featuregen.intake.llm import FakeLLM, FakeResponse
+# The one place a genuinely draftable option is staged post-cutover: the E0 walkthrough's catalog
+# plus the funnel/review ritual that clears an engine card's activation blockers.
+from tests.featuregen.api.test_binding_confirmation import (
+    CATALOG,
+    governed_ready_round,
+    seal_for_real,
+)
+from tests.featuregen.api.test_e2e_walkthrough import _cib
+from tests.featuregen.api.test_e2e_walkthrough import _fake as _walkthrough_llm
+
+#: The hero recipe the walkthrough catalog can carry all the way to a governed contract.
+HERO = "complaint_count"
+
+# The generation+draft FakeLLM this file used to define is gone with the E4 cutover: its whole
+# reason to exist was scripting ``overlay.feature.recommend`` so the free-form generator would
+# invent ``avg_balance_90d`` to draft. That generator is deleted, and the walkthrough's client
+# (imported above) scripts exactly the tasks that can still be dispatched.
 
 
 def _body(**overrides):
@@ -21,30 +37,6 @@ def _body(**overrides):
     }
     body.update(overrides)
     return body
-
-
-def _generation_and_draft_llm() -> FakeLLM:
-    return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [{
-            "name": "avg_balance_90d",
-            "description": "average balance",
-            "derives_from": ["public.accounts.balance"],
-            "aggregation": "avg_90d",
-            "grain_table": "accounts",
-        }]}),
-        "overlay.feature.recommend_set": FakeResponse(output={
-            "recommended_lens": "monetary",
-            "reasoning": "fits the confirmed churn objective",
-        }),
-        "overlay.contract.draft": FakeResponse(output={
-            "definition": "Average balance over 90 days.",
-        }),
-        "overlay.contract.critique": FakeResponse(output={"findings": []}),
-        # The assist gauntlet's candidate critique. Absent, FakeLLM raises KeyError and the stage
-        # fails open — survivable for a test that only inspects the response, but it means the run
-        # never exercises a clean critique. Scripted empty so "no issues" is a real answer.
-        "overlay.feature.critique_candidates": FakeResponse(output={"issues": []}),
-    })
 
 
 def test_release_mode_rejects_missing_confirmed_scope(make_client, monkeypatch):
@@ -337,51 +329,70 @@ def test_release_mode_rejects_changed_recognition_text_before_minting_run(
     assert conn.execute("SELECT count(*) FROM feature_generation_run").fetchone()[0] == runs_before
 
 
+def _hero_card(body: dict) -> dict:
+    """The hero recipe's card in a served set — matched on its origin-neutral recipe id.
+
+    Post-cutover "the first alternative" is no longer a usable choice: the engine serves many
+    cards and only one of them has had its activation blockers cleared, so a positional pick
+    would draft a card the fold is right to refuse. Naming the recipe keeps this test about run
+    pinning rather than about which card happens to sort first.
+    """
+    cards = [feature for group in body["alternatives"] for feature in group["features"]
+             if (feature.get("source_definition_id") or "").split("@")[0] == HERO]
+    assert cards, [feature.get("source_definition_id")
+                   for group in body["alternatives"] for feature in group["features"]]
+    return cards[0]
+
+
 def test_release_mode_draft_reads_target_from_exact_generation_run(
         make_client, conn, monkeypatch):
+    """The exact-run pinning contract, walked over the ONE engine.
+
+    The E4 cutover (2026-08-14) deleted the free-form generator whose scripted ``avg_balance_90d``
+    used to be the first (and only) alternative here, so this test now drafts a real engine card —
+    which means its activation blockers must be cleared first, exactly as a human clears them. The
+    blockers are catalog- and recipe-level, so :func:`governed_ready_round` runs BEFORE release
+    mode is switched on (it uses the ordinary unscoped-recognition shape); everything the test is
+    actually about — run A vs run B, the mutable-pointer defense, the write-once choice revision —
+    then happens under ``confirmation_required`` as before.
+    """
+    seal_for_real(monkeypatch)
+    _cib(conn)
+    client = make_client(_walkthrough_llm())
+    governed_ready_round(client)          # concept funnel + recipe reviews: the blockers, cleared
+
     monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "confirmation_required")
-    _bank_multi(conn)
     recognition = make_client(_recognizer()).post(
         "/contract/recognitions",
         json={"hypothesis": HYPOTHESIS, "objective": "predict churn"},
         headers=AUTH,
     ).json()
-    client = make_client(_generation_and_draft_llm())
     generation_payload = {
         "hypothesis": HYPOTHESIS,
         "objective": "predict churn",
-        "catalog_source": "bank",
+        "catalog_source": CATALOG,
         "target_ref": TARGET,
         "intent_id": recognition["intent_id"],
         "recognition_id": recognition["recognition_id"],
         "confirmed_scope": {
             "primary": CHURN,
             "confirmation_source": "user_confirmed",
+            # The human's one-click yes on the derived unit of analysis — the third blocker.
+            "uoa_entity": "customer",
+            "spine_ref": "public.accounts.customer_id",
         },
     }
     generated = client.post(
         "/contract/considered-set", json=generation_payload, headers=AUTH)
     assert generated.status_code == 200, generated.text
     body = generated.json()
-    chosen = next(
-        feature
-        for feature_set in body["alternatives"]
-        for feature in feature_set["features"]
-    )
+    chosen = _hero_card(body)
     newer = client.post(
         "/contract/considered-set", json=generation_payload, headers=AUTH)
     assert newer.status_code == 200, newer.text
     assert newer.json()["generation_run_id"] != body["generation_run_id"]
-    assert next(
-        feature
-        for feature_set in newer.json()["alternatives"]
-        for feature in feature_set["features"]
-    )["option_id"] != chosen["option_id"]
-    newer_chosen = next(
-        feature
-        for feature_set in newer.json()["alternatives"]
-        for feature in feature_set["features"]
-    )
+    newer_chosen = _hero_card(newer.json())
+    assert newer_chosen["option_id"] != chosen["option_id"]
     wrong_run = client.post(
         "/contract/draft",
         json={

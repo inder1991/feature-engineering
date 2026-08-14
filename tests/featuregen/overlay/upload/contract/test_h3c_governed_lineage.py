@@ -204,17 +204,16 @@ def test_single_catalog_run_never_invokes_3b3c_compile(db, monkeypatch):
     from featuregen.intake.llm import FakeLLM, FakeResponse
     from featuregen.overlay.upload.contract.gate1 import build_considered_set
     from featuregen.overlay.upload.contract.intake import submit_intent
-    from featuregen.overlay.upload.feature_assist import SetsReport
     _catalog(db, "core")
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-                        lambda *a, **k: SetsReport(sets=[], rejections=[]))
     monkeypatch.setattr("featuregen.overlay.upload.contract.gate1._governed_cross_catalog_options",
                         lambda *a, **k: (_ for _ in ()).throw(
                             AssertionError("3B.3c must not run on a single-catalog run")))
+    # The free-form generator this test used to stub out no longer exists (E4 cutover, 2026-08-14),
+    # so the only task the builder dispatches on this path is the set recommendation.
     client = FakeLLM(script={"overlay.feature.recommend_set": FakeResponse(output={
         "recommended_lens": "templates", "reasoning": "advisory"})})
     intent = submit_intent(hypothesis="balances shape churn", actor="ds1")
-    cs = build_considered_set(db, intent, client, catalog_source="core", entity=None, now=_NOW)
+    cs = build_considered_set(db, intent, client, catalog_source="core", now=_NOW)
     assert cs is not None   # completed without ever entering the governed 3B.3c lens
 
 

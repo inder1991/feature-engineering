@@ -2827,11 +2827,13 @@ export interface FieldDecisionResult {
   actions: string[]
 }
 
-// ---- P4 v1: read-only per-table suggested features ----
+// ---- read-only per-table suggested features: the shared value types ----
 // GET-only, by design: the payload is what the deterministic engine can ground on ONE table (no
-// hypothesis, no intent, no LLM), and v1 offers no verb to accept, dismiss or govern a suggestion.
-// Every field below is the engine's own — statuses are the gauntlet's tri-state, `binding_quality`
-// is the signal it already returns. There is no relevance score in this system, so there is none here.
+// hypothesis, no intent, no LLM), and the route offers no verb to accept, dismiss or govern a
+// suggestion. Every field below is the engine's own — statuses are the gauntlet's tri-state,
+// `binding_quality` is the signal it already returns. There is no relevance score in this system,
+// so there is none here. The v1 CARD and PAGE types that used to live here went with contract v1
+// at the E4 cutover; what remains is what v2/v3/v4 still carry.
 // A registry-typed requirement parameter value. Tuples become lists on the wire, scalars pass
 // through; `requirements_to_json` emits `params` ADDITIVELY, only when a requirement has any.
 export type RequirementParamValue =
@@ -2855,33 +2857,6 @@ export interface RecipeParts {
   time: string
 }
 
-export interface FeatureSuggestion {
-  name: string
-  description: string
-  recipe: string
-  recipe_parts: RecipeParts
-  validation_status: string      // DESIGN_CHECKED | NEEDS_EXTERNAL_VALIDATION
-  requirements: SuggestionRequirement[]
-  uses: string[]                 // the object_refs it binds
-  binding_quality: string
-  grain_table: string
-}
-
-// entity_label is the ENTITY the features are computed per ('account'); entity_ref is the COLUMN
-// that entity is bound to. An empty entity_label = an entity the catalog could not NAME, so no
-// heading is rendered for it; an empty entity_ref = no bound entity at all.
-export interface SuggestionGroup {
-  entity_ref: string
-  entity_label: string
-  suggestions: FeatureSuggestion[]
-}
-
-export interface SuggestionRejection {
-  name: string
-  reason: string
-  code: string
-}
-
 // WHAT THE PAGE DID NOT LOOK AT. Suggestions are grounded on the opened table plus the tables joined
 // DIRECTLY to it, bounded by a table cap and a column budget — walking the join graph transitively
 // has no resource bound on a real catalog, where almost everything reaches the customer/account hub.
@@ -2899,32 +2874,12 @@ export interface JoinNeighbourhood {
   limit_reason: string | null
 }
 
-export interface TableSuggestions {
-  catalog_source: string
-  table: string
-  // false = this catalog holds no such table. An unknown table and a table with no concepts both
-  // return zero suggestions, so this is what keeps the empty screen's DIAGNOSIS honest.
-  table_known: boolean
-  summary: { suggested: number; clean_ready: number; needs_review: number; entities: number }
-  groups: SuggestionGroup[]
-  rejections: SuggestionRejection[]
-  neighbourhood: JoinNeighbourhood
-}
-
-// An automatic page load takes the server's capped default (one hop). The route also accepts an
-// explicit `?max_hops=` for a deliberate, wider request — no caller passes it yet: choosing WHICH
-// deeper join path to follow is a governed act that wants its own picker UI, which is DEFERRED.
-export function getTableSuggestions(source: string, table: string): Promise<TableSuggestions> {
-  return request(
-    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}/suggestions`,
-  )
-}
-
-// ---- Release A v2: the per-table DISCOVERY contract (`?contract_version=2`) -------------------
-// The same read-only route, asked for its richer payload EXPLICITLY. v1 remains the server default
-// for the whole of Release A, so a client that wants v2 says so in the URL — it never sniffs for an
-// optional field on a v1 body, which would make "an older deployment" and "a suggestion with no
-// category" the same observation.
+// ---- the per-table DISCOVERY contract -------------------------------------------------------
+// The read-only suggestions route serves exactly ONE contract since the E4 cutover (2026-08-14):
+// v4, asked for EXPLICITLY in the URL. The v2/v3 shapes below are still declared because v4 IS
+// them plus the semantic block — they are the page's structure, no longer versions a client may
+// request. Asking for 1, 2 or 3 now earns the typed
+// SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION refusal naming 4.
 //
 // Everything below mirrors `overlay/upload/suggestion_contract.page_to_json` field-for-field. The
 // closed vocabularies are typed as unions because they ARE closed server-side; every renderer still
@@ -3263,32 +3218,11 @@ export const SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION = 'SUGGESTIONS_UNSUPPORTED
 // Ask for v2 EXPLICITLY. The version is a literal, not a probe: if this deployment does not serve
 // it the route answers 422 with the code above and the caller says so, rather than silently
 // rendering a v1 body with every discovery field missing.
-export function getTableSuggestionsV2(
-  source: string,
-  table: string,
-): Promise<FeatureSuggestionPageV2> {
-  return request(
-    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
-      + '/suggestions?contract_version=2',
-  )
-}
-
 // The BR-8 v3 page: the v2 page plus its declared version, an `execution` block on every hit and
-// the page-level readiness tally. v2 stays this frontend's DEFAULT until the BR-24 rollout gates
-// pass; callers opt into v3 deliberately, exactly as v2 was introduced.
+// the page-level readiness tally. Not requestable on its own any more — it is v4's base shape.
 export interface FeatureSuggestionPageV3 extends FeatureSuggestionPageV2 {
   contract_version: 3
   readiness_counts: Record<string, number>
-}
-
-export function getTableSuggestionsV3(
-  source: string,
-  table: string,
-): Promise<FeatureSuggestionPageV3> {
-  return request(
-    `/catalog/${encodeURIComponent(source)}/tables/${encodeURIComponent(table)}`
-      + '/suggestions?contract_version=3',
-  )
 }
 
 // ── SE-13 contract v4: the v3 page plus ONE addition — the `semantic` block ────────────────────

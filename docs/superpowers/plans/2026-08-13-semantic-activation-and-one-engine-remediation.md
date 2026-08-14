@@ -1255,6 +1255,90 @@ precedes the deletion, never follows it.
 updated; every suite green; the deployed cluster serves the engine with the env var absent;
 no orphaned persisted record references a deleted parser.
 
+> **ACCEPTED (2026-08-14) — THE LEGACY PATH IS GONE.** One commit. `FEATUREGEN_SEMANTIC_PLANNING`
+> appears NOWHERE in `src/` (nor in `deploy/` — the 20-backend.yaml line is DELETED, not flipped,
+> with a comment saying rollback is the previous image). What died: gate1's free-form `else` arm
+> and its `recommend_feature_sets_report` / `recommend_features` call sites; the `semantic_mode`
+> parameter and BOTH of the params only that generator consumed (`entity`, `objective`);
+> `_semantic_shadow_compare` and `semantic_shadow_metrics`; `RecipeRolloutConfig` +
+> `SEMANTIC_PLANNING_MODES` + the closed parser + `semantic_planning_gate` (a gate that decides one
+> promotion has nothing left to decide once it has happened); the route's mode resolution and the
+> `semantic_planning_mode` response key (DELETED, not frozen to a constant — a lever with one
+> position is a lie about what a deployment can choose); the `/features/*` generators' bodies
+> (routes stay and refuse typed 409 — a 404 would tell a client its address was wrong when the
+> address is right); and suggestion contract versions 1, 2 and 3 (route + v1 producer path +
+> Pydantic mirrors + the v1/v2/v3 frontend clients). `contract_version` now defaults to 4 and
+> 1/2/3 earn the same typed 422 as 99, naming `[4]`.
+>
+> **VERIFY-FIRST, and it earned its keep.** Two findings. (1) A PERSISTED record DOES replay
+> through the v2 serializer: `frontend/src/screens/SuggestedFeaturesScreen.serverCapture.json` is a
+> checked-in `page_to_json` body replayed by `SuggestionCard.capture.test.tsx` and re-derived by
+> `test_suggestion_contract.py::test_the_frontends_captured_server_body_is_still_the_body_the_
+> server_sends`. It survives because only the wire VERSIONS were retired: v4's body IS that shape,
+> so `page_to_json`/`page_to_json_v3`/`build_page_v2` are v4's producers, not v2's leftovers — and
+> deleting them would have been exactly the STOP condition. (2) The legacy per-table template pass
+> has a LIVE consumer with no built replacement: `columnSuggestions.ts` → `AssetDetailOverview`
+> renders per-column suggestion cards off `page.hits`, and the engine's semantic block is
+> TABLE-anchored with a different carrier. Retiring the pass would have blanked a shipped surface,
+> which is what the verify-first rule exists to prevent, so it is NOT deleted — see the deliberate
+> non-deletions below. Nothing else is orphaned: the `semantic_candidate_observation` rows keep
+> their reader (the audit drawer in `contract.py`), and no DB-persisted shape lost a parser.
+>
+> **B1's typed 422 re-verified post-deletion** on both surfaces, with the docstring saying why it
+> matters MORE now: `test_entity_only_scope_is_refused_typed` (considered-set) and
+> `test_refine_without_a_catalog_is_a_typed_422_not_an_empty_answer` (refine). While the mode
+> existed, an unrefused entity-only request would merely have been answered by the other engine;
+> the refusal is now the only thing between it and a page that reads "your catalog can build
+> nothing". SE-0's `ALL_TEMPLATES` gate1 pin is UPDATED IN THIS COMMIT per its own rule — it now
+> pins the new source (no `semantic_mode` parameter exists; the scoped branch is
+> `v2_recipe_candidates`; `recommend_feature_sets_report` is absent from the builder's source) and
+> says plainly which callers of `_template_candidates` remain. The frozen-config test became
+> `test_no_pipeline_mode_survives_the_cutover`, which asserts the absence of six names AND that the
+> env var's own string is absent from `recipe_rollout.py`.
+>
+> **DELIBERATELY NOT DELETED, with reasons.** (a) The legacy per-table template grounding pass
+> (`_template_candidates`, `suggest_features_for_table`, `build_page_v2`) — the verify-first finding
+> above; it is the asset-detail column dossier's only content source and a column-anchored engine
+> surface is not chartered. It is no longer reachable from the hypothesis route. (b) The `elif
+> catalog_source is not None:` template branch in `build_considered_set` and the emergency unscoped
+> route — reachable only WITHOUT a confirmed scope, which the scoped route always supplies; retiring
+> them means migrating 75 direct builder call sites across 14 test files onto scripted-engine
+> fixtures, which is its own charter, not a line in a cutover. (c) `feature_assist.py`'s
+> `recommend_features_report` / `recommend_feature_sets_report` / `refine_idea` / `feature_recipe`
+> — now unreferenced from `src/`, left standing because the enumerated cutover scope is the CALL
+> SITES and deleting the module's internals cascades through shared gauntlet helpers. Each is worth
+> its own follow-up; none of them can be reached by a user request any more.
+>
+> **ONE CONSEQUENCE WORTH NAMING, found by the test surgery.** The governed cross-catalog lens is
+> now unreachable over HTTP. The scoped route refuses `catalog_source: null`, and the legacy
+> unscoped route never passes `target_entity`, so `build_considered_set`'s `elif is_live:` branch
+> cannot be entered by any request. The lens, its planner and its fail-closed invariants stay fully
+> covered at the builder and govern layers — but the 3C.2a live cross-catalog feature has no
+> customer-visible entrypoint until a multi-catalog frozen context is chartered, which is the same
+> charter B1's 422 has been pointing at since Phase B. This is a REAL narrowing of what the product
+> can do, recorded here rather than discovered later from an empty screen.
+>
+> **THREE DEFECTS THE SURGERY SURFACED — open, not fixed here** (each is behaviour the mode used
+> to hide, now on the only path there is; all three are asserted-as-current with docstrings that
+> say so, never quietly accommodated). (1) **The Delivery-B formula shadow captures nothing on the
+> engine path.** `capture_ranked_shadow` resolves its private grounding context through
+> `cs.recipe_candidate_keys_by_recipe_id`, which ONLY the legacy `_template_candidates` branch
+> fills; the engine branch leaves it empty, so every capture resolves `CANDIDATE_MISSING` and
+> writes zero work items. `_revision_recipe_candidate_key` reads the same empty map for E4b
+> operand-role reattachment and is likely degraded identically. (2) **The ranker is still keyed on
+> the LEGACY template registry.** `_rank_signals` skips any id with no `Template`, so of 317 V2
+> recipes only the ~106 in both registries can ever be ranked — an eligible V2-only recipe is
+> dropped from `ranking`, from the initial view and from shadow-capture selection. (3) **B1's 422
+> fires AFTER the generation run and confirmed scope are minted** — an entity-only request still
+> writes a `feature_generation_run` and a `confirmed_generation_scope` row before being refused.
+> Cheap to move if the refusal was meant to precede the mint.
+>
+> **AND ONE BEHAVIOUR CHANGE, recorded rather than papered over.** The feature-360 view's
+> top-level `verification` is now `UNVERIFIED` where it was `DESIGN-CHECKED` (the contract row
+> itself still earns `DESIGN-CHECKED`). An engine recipe card carries its outstanding runtime data
+> checks — `GRAIN_IS_UNIQUE` — and the deleted free-form candidate simply declared none. The card
+> got MORE honest; the view's headline followed it.
+
 ## 7. Sequencing and dependencies
 
 ```

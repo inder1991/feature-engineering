@@ -19,8 +19,41 @@ from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_assist import _candidate_columns, _validate_idea
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
 NOW = datetime(2026, 7, 5, tzinfo=UTC)
+CHURN = "customer.relationship_attrition.churn"
+
+#: The analyst's own definition, EXTRACTED as one abstract intent — what the definition-mode anchor
+#: is built from since the E4 cutover (2026-08-14). The free-form generator that used to answer
+#: ``overlay.feature.recommend`` with physical column refs is deleted, so the model's only output on
+#: this path is meaning (concepts + operand classes, never a column) and the shared binder decides
+#: which columns serve. Sibling suites in this package import this fixture.
+EXTRACTED_INTENT = {"intents": [{
+    "display_name": "Days since last activity",
+    "business_definition": "Days elapsed since the customer's most recent event.",
+    "primary_objective": CHURN,
+    "computation_kind": "deterministic_formula",
+    "operation_class": "recency",
+    "output_grain_entity": "customer",
+    "source_grain": "transaction",
+    "output": {
+        "output_id": "recency_days", "display_label": "Days since last activity",
+        "output_type": "numeric", "additivity": "non_additive", "unit_kind": "duration_days",
+        "null_input_policy": "null timestamps are excluded and counted",
+        "empty_population_policy": "null with populated flag",
+    },
+    "operands": [
+        {"role": "who", "concept": "customer_id", "operand_class": "entity_key"},
+        {"role": "when", "concept": "event_timestamp", "operand_class": "event_timestamp"},
+    ],
+    "temporal": {"anchor_kind": "event", "window_basis": "event time",
+                 "window_unit": "days", "cutoff_inclusivity": "inclusive"},
+    "rationale": "recency is the strongest dormancy precursor",
+}]}
+
+#: The definition an analyst types to get :data:`EXTRACTED_INTENT` back.
+DEFINITION = "days since the customer's last activity"
 
 
 def _bank(db):
@@ -40,8 +73,9 @@ def _bank_churn(db):
     # ground: a monetary_stock balance, an as_of_date, a customer_id grain, a monetary_flow amount and
     # an event_timestamp — plus the churn outcome_label (a leakage anchor grounding refuses by
     # construction). Concepts are applied via build_graph's concepts dict (keyed on content_hash),
-    # exactly like an enriched upload. The LLM's `avg_balance_90d` still grounds on `accounts.balance`,
-    # so the two-source model (templates ∪ LLM) is exercised end to end.
+    # exactly like an enriched upload. Since the E4 cutover (2026-08-14) this is the catalog shape a
+    # non-empty considered set needs: the recipe lens is the only candidate source on this path, so a
+    # catalog nothing grounds on honestly yields nothing.
     catalog = [
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
          "customer_id"),
@@ -64,92 +98,75 @@ def _bank_churn(db):
 
 def _client():
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
+        # E4 cutover (2026-08-14): nothing dispatches `overlay.feature.recommend` any more — the
+        # free-form physical-column generator behind it is deleted. The one generation call left on
+        # this path is the definition-mode anchor's extraction, on the intents task.
+        "overlay.feature.intents": FakeResponse(output=EXTRACTED_INTENT),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
 
 
 def test_considered_set_has_anchor_alternatives_and_advisory(db):
-    _bank(db)
+    # The three parts of a considered set still arrive together: the requester's own definition as the
+    # ANCHOR, the grounded alternatives, and the caveated advisory. Since the E4 cutover (2026-08-14)
+    # the anchor is EXTRACTED as an abstract intent and bound by the engine — no free-form generator
+    # invents it — so nothing here names a candidate the fixture LLM made up.
+    _bank_churn(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per customer", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
-    assert cs.anchor is not None and cs.anchor.name == "avg_balance_90d"    # definition -> anchor
-    assert any(f.name == "avg_balance_90d" for s in cs.alternatives for f in s.features)
+    assert cs.anchor is not None                                            # definition -> anchor
+    assert any(s.features for s in cs.alternatives)
     assert cs.recommendation is not None and cs.recommendation.recommended_lens == "monetary"
     assert "backtest" in cs.recommendation.caveat                           # advisory, caveated
 
 
-def test_considered_set_carries_gauntlet_rejections(db):
-    # The considered set surfaces WHAT the gauntlet threw out and why (the Gate-#3 transparency the
-    # Workbench renders) — a leaky candidate (derives from the target) is rejected, not silently dropped.
-    _bank(db)
-    client = FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"},
-            {"name": "reads_the_answer", "derives_from": ["public.accounts.churned"],
-             "aggregation": "max"}]}),
-        "overlay.feature.recommend_set": FakeResponse(output={
-            "recommended_lens": "monetary", "reasoning": "fits"}),
-        "overlay.feature.critique_candidates": FakeResponse(output={"issues": []}),
-    })
-    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
-    cs = build_considered_set(db, intent, client, catalog_source="bank",
-                              target_ref="public.accounts.churned", now=NOW)
-    assert isinstance(cs.rejections, list)
-    assert any(r.get("code") == "LEAKAGE" for r in cs.rejections)   # the leaky candidate is surfaced
-
-
-def test_considered_set_threads_the_objective(db):
-    # bug_003: the prediction goal was required-but-ignored. It now enriches the generation prompt
-    # (redacted with the same discipline as the hypothesis) and still yields a valid, governable set.
-    _bank(db)
-    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
-    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
-                              target_ref="public.accounts.churned",
-                              objective="predict 90-day retail churn", now=NOW)
-    assert cs.alternatives
-
-
 def test_considered_set_threads_feedback(db):
-    # A whole-round feedback re-runs the considered set under the human's instruction and still produces
-    # a valid, governable set (its own intent + persisted snapshot) — this is what makes post-feedback
-    # candidates governable (I2b), lifting the stale-intent guard.
-    _bank(db)
+    """A whole-round feedback re-runs the considered set under the human's instruction and still
+    produces a valid, governable set (its own intent + persisted snapshot) — this is what makes
+    post-feedback candidates governable (I2b), lifting the stale-intent guard.
+
+    Driven through the ENGINE (a confirmed scope) because that is where the feedback text goes since
+    the E4 cutover (2026-08-14): it is appended to the redacted hypothesis the intent lens plans
+    from. The free-form generator it used to enrich no longer exists."""
+    _bank_churn(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned",
+                              scope=ConfirmedScope(primary=CHURN),
                               feedback="focus on behavioral signals", now=NOW)
     assert cs.intent_id == intent.intent_id
-    assert cs.alternatives            # feedback round still yields a validated, governable set
+    assert any(s.features for s in cs.alternatives)   # a feedback round still yields a governable set
 
 
 def test_hypothesis_only_has_no_anchor(db):
-    _bank(db)
+    _bank_churn(db)   # a catalog the recipe lens grounds on, so "alternatives exist" is non-trivial
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
     assert cs.anchor is None                                               # hypothesis-only -> no anchor
-    assert cs.alternatives                                                 # but alternatives generated
+    assert any(s.features for s in cs.alternatives)                        # but alternatives generated
 
 
 def test_confirm_gate1_records_choice_and_rejects_out_of_set(db):
-    _bank(db)
+    _bank_churn(db)
     intent = submit_intent(hypothesis="churn from balance drop",
-                           definition="90-day average balance", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
-    ref = confirm_gate1(db, cs, chosen_source="anchor", chosen_option_id="avg_balance_90d",
+    # The chosen name is read from the set the builder actually returned. It used to be hard-coded to
+    # a free-form LLM candidate; that generator is gone (E4 cutover, 2026-08-14), and an anchor's name
+    # is now the engine's to assign.
+    assert cs.anchor is not None
+    anchor_name = cs.anchor.name
+    ref = confirm_gate1(db, cs, chosen_source="anchor", chosen_option_id=anchor_name,
                         actor="ds1", why="best fit for the hypothesis")
-    assert ref == "avg_balance_90d"
+    assert ref == anchor_name
     row = db.execute("SELECT chosen_source, chosen_option_id, why FROM contract_gate1_choice "
                      "WHERE intent_id = %s", (intent.intent_id,)).fetchone()
-    assert row == ("anchor", "avg_balance_90d", "best fit for the hypothesis")
+    assert row == ("anchor", anchor_name, "best fit for the hypothesis")
 
     with pytest.raises(Gate1Error):        # a choice not in the considered set is rejected
         confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="ghost", actor="ds1")
@@ -286,19 +303,19 @@ def test_intent_is_persisted_at_gate1(db):
     # M6: the mandatory hypothesis is durably recorded when the flow reaches Gate #1
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per customer", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     build_considered_set(db, intent, _client(), catalog_source="bank",
                          target_ref="public.accounts.churned", now=NOW)
     row = db.execute("SELECT hypothesis, definition, intake_mode FROM contract_intent "
                      "WHERE intent_id = %s", (intent.intent_id,)).fetchone()
-    assert row == ("customers churn when their balance drops",
-                   "90-day average balance per customer", "definition")
+    assert row == ("customers churn when their balance drops", DEFINITION, "definition")
 
 
-# ── B4: parametric templates seed the considered set as a second source ───────────────────────────
+# ── B4: parametric templates seed the considered set ──────────────────────────────────────────────
 def test_grounded_templates_seed_a_templates_lens(db):
-    # The two-source model (templates ∪ LLM): grounded churn templates enter the considered set as a
-    # "templates" lens ALONGSIDE the LLM's proposals, each judged by the same gauntlet.
+    # Grounded churn templates enter the considered set as a "templates" lens, each judged by the
+    # gauntlet. This lens used to sit beside a free-form LLM lens (the "two-source model"); the E4
+    # cutover (2026-08-14) deleted that generator, so on a no-scope run the recipe lens is the set.
     _bank_churn(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
@@ -308,8 +325,6 @@ def test_grounded_templates_seed_a_templates_lens(db):
     names = {f.name for f in template_sets[0].features}
     assert "balance_trend_90d" in names                              # the headline template grounded
     assert all(f.verification == "DESIGN-CHECKED" for f in template_sets[0].features)
-    # both sources present: the LLM proposal survives its gauntlet alongside the templates lens.
-    assert any(f.name == "avg_balance_90d" for s in cs.alternatives for f in s.features)
 
 
 def test_template_binding_the_target_ref_is_rejected_for_leakage(db):
@@ -345,12 +360,14 @@ def test_template_pick_round_trips_through_the_snapshot(db):
 
 def test_no_templates_lens_when_catalog_grounds_nothing(db):
     # The plain _bank catalog has no concept-tagged churn columns, so nothing grounds -> no empty lens.
+    # After the E4 cutover (2026-08-14) there is no free-form lens left to fall back on either, so the
+    # honest answer on such a catalog is an EMPTY considered set — not a lens with no members, and not
+    # candidates a generator invented over columns nothing had classified.
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
-    assert all(s.lens != "templates" for s in cs.alternatives)                  # no template grounded
-    assert cs.alternatives                                                      # LLM lenses still there
+    assert cs.alternatives == []                                               # nothing grounded, no lens
 
 
 # ── H1a: recipe_id survives Gate 1 + generation_source is SERVER-assigned ──────────────────────────
@@ -375,9 +392,12 @@ def test_recipe_id_survives_gate1_round_trip(db):
 
 
 def test_definition_anchor_generation_source_is_user_defined(db):
-    _bank(db)
+    # The anchor is the user's OWN definition run through the engine, so its generation_source is the
+    # server-assigned "user_defined" — distinct from the recipe lens's "recipe". (E4 cutover,
+    # 2026-08-14: the anchor is extracted + bound by the engine, never free-form generated.)
+    _bank_churn(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per customer", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW)
     assert cs.anchor is not None and cs.anchor.generation_source == "user_defined"

@@ -84,7 +84,6 @@ def _fake() -> FakeLLM:
 
 
 def test_the_considered_set_stays_inside_its_budgets(make_client, conn, monkeypatch):
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     _cib_sized_catalog(conn)
     fake = _fake()
     client = make_client(llm_client=fake)

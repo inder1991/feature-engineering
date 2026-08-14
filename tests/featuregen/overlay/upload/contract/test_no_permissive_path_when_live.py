@@ -3,16 +3,23 @@
 ``find_cross_catalog_path`` — BOTH live bindings: the ``entity`` origin and the ``contract.author``
 import — is replaced with a function that RECORDS the call and RAISES. Live activation is genuinely
 enabled (flag + deployment id + a persisted PASS evaluation + an APPROVE decision), a cross-catalog
-catalog set is seeded (ops + rev + a VERIFIED bridge), and the FULL flag-on cross-catalog flow is
-driven over HTTP: considered-set (entity-scoped) → draft (the governed feature) → confirm. Every path
-either SUCCEEDS or FAILS CLOSED (drift → 409 regenerate) with the recorder provably never invoked —
-the structural proof that no flag-on cross-catalog path can touch the permissive implementation (its
-outright removal is 3C.2b). The recorder list matters: a savepoint-swallowed invocation would not
-surface as a 500, but it WOULD land in the list.
+catalog set is seeded (ops + rev + a VERIFIED bridge), and the flag-on cross-catalog request is
+driven over HTTP with the recorder provably never invoked. The recorder list matters: a
+savepoint-swallowed invocation would not surface as a 500, but it WOULD land in the list.
 
-Doubles as the §9 items 2 + 5 HTTP surface: the governed option rides the response JSON with
-``origin='governed_planner'`` / ``path_authority='governed_cross_catalog'`` + its plan envelope, and
-the drafted join path reconstructs the PERSISTED envelope's ``ordered_path`` exactly.
+What closes the permissive path CHANGED with the E4 cutover (2026-08-14), and to something
+stronger. These tests used to drive the whole entity-scoped flow — considered-set → draft → confirm
+— and prove each stage either succeeded or failed closed without reaching the permissive
+implementation. Now ``/contract/considered-set`` REFUSES the entity-only request outright: a
+confirmed scope with no ``catalog_source`` gets a typed 422 ``SEMANTIC_REQUIRES_CATALOG_SOURCE``,
+because the semantic engine plans over ONE frozen catalog context and the free-form generator that
+used to fill an entity-only page is deleted — an honest refusal replacing a silently empty page. So
+no flag-on cross-catalog generation runs AT ALL, which is a stronger closure than "it ran and did
+not take the permissive branch": there is no branch left to take.
+
+(The governed cross-catalog machinery itself is unchanged and still covered where it now lives —
+``test_h3_typed_governed_deps`` confirms over the server's real envelope→ordered_path rewrite, and
+``test_gate1_governed_lens`` covers the builder's lens.)
 """
 from __future__ import annotations
 
@@ -25,10 +32,7 @@ from tests.featuregen.api.test_contract_live_cross_catalog import (
     _approve,
     _flow_llm,
     _fresh_now,
-    _governed_scoped_body,
-    _inject_fixture_template,
 )
-from tests.featuregen.overlay.upload.planner.test_plan import _txn_template
 from tests.featuregen.overlay.upload.planner.test_shadow_capture import _cross_seed
 
 from featuregen.api.app import create_app
@@ -36,6 +40,19 @@ from featuregen.api.deps import get_conn, get_feature_gen_conn
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
+
+HYPOTHESIS = "customers churn when their balance drops"
+CHURN = "customer.relationship_attrition.churn"
+
+#: The entity-only cross-catalog request: a confirmed scope naming a target ENTITY and no
+#: ``catalog_source``. Owned here rather than imported, because the refusal it now provokes is this
+#: suite's subject and must not drift with another suite's fixture.
+_ENTITY_ONLY_BODY = {
+    "hypothesis": HYPOTHESIS, "objective": "predict churn",
+    "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                        "target_entity": "account"},
+}
+_REFUSAL = "SEMANTIC_REQUIRES_CATALOG_SOURCE"
 
 
 @pytest.fixture
@@ -81,70 +98,42 @@ def _enable_live(db, monkeypatch) -> None:
     _approve(db)
 
 
-# ── the full flag-on cross-catalog flow SUCCEEDS without ever touching the permissive path ────────────
-def test_full_flag_on_cross_catalog_flow_never_invokes_permissive_path(
+# ── the flag-on cross-catalog request is REFUSED before any generation runs ───────────────────────────
+def test_flag_on_cross_catalog_request_is_refused_and_never_reaches_the_permissive_path(
         client, db, monkeypatch, permissive_calls):
-    """§9 item 8 (+ items 2/5 HTTP surface) — considered-set → draft → confirm, all flag-on-approved,
-    all genuinely cross-catalog, all succeeding with ``find_cross_catalog_path`` provably not invoked."""
+    """§9 item 8 — the closure at its strongest form. Live activation is genuinely on and a
+    RESOLVABLE cross-catalog plan is seeded, so nothing about the environment is what stops the
+    request: the route itself refuses an entity-only scope with a typed 422
+    ``SEMANTIC_REQUIRES_CATALOG_SOURCE`` (E4 cutover, 2026-08-14). No generation dispatches, no
+    considered set is minted, and ``find_cross_catalog_path`` is provably never invoked — not
+    because a flag-on path avoided it, but because no flag-on cross-catalog path exists to run."""
     _enable_live(db, monkeypatch)
     _cross_seed(db)                   # ops + rev + a VERIFIED bridge → a resolvable cross-catalog plan
     _fresh_now(db, "ops", "rev")      # fresh as of the route's real wall clock
-    _inject_fixture_template(monkeypatch)
-    # H3 (I-2): the confirm-time governed-plan REBUILD (revalidate_governed_plan) reads the production
-    # ALL_TEMPLATES registry; inject the planner-fixture recipe there too so the governed confirm REBUILDS
-    # + revalidates (the production path). Without it the fixture recipe is not-rebuildable and the I-2
-    # fail-closed 409s — a governed confirm must never finalize on a plan it cannot re-verify.
-    monkeypatch.setattr("featuregen.overlay.upload.contract.governed_plan.ALL_TEMPLATES",
-                        (_txn_template(),))
 
-    # 1. considered-set (entity-scoped): the governed option surfaces with structured authority + the
-    #    compiled plan envelope riding the response JSON (§9 item 2).
-    res = client.post("/contract/considered-set", json=_governed_scoped_body(), headers=AUTH)
-    assert res.status_code == 200, res.text
-    body = res.json()
-    governed = [f for s in body["alternatives"] for f in s["features"] if f["name"] == "t_roll"]
-    assert len(governed) == 1
-    assert governed[0]["origin"] == "governed_planner"
-    assert governed[0]["path_authority"] == "governed_cross_catalog"
-    envelope = governed[0]["plan_envelope"]
-    assert envelope is not None and envelope["physical_plan_id"] and envelope["ordered_path"]
-    # the option genuinely spans >1 catalog — the whole point of a governed cross-catalog plan
-    assert len({cs for cs, _ref in (tuple(p) for p in governed[0]["derives_pairs"])}) > 1
-    assert permissive_calls == []
-
-    # 2. draft: the governed feature drafts EXACTLY the PERSISTED envelope's ordered_path (§9 item 5) —
-    #    reconstructed server-side from the recorded considered set, never recomputed permissively.
-    dr = client.post("/contract/draft", json={
-        "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "governed cross-catalog",
-        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
-    assert [s["segment"] for s in draft["join_path"]] == list(envelope["ordered_path"])
-    assert permissive_calls == []
-
-    # 3. confirm: the governing write completes — freshness rechecked against the SERVER-side envelope.
-    draft["intent_id"] = body["intent_id"]
-    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
-    assert cr.status_code == 200, cr.text
-    assert cr.json()["version"] == 1
-    assert permissive_calls == []     # the structural guarantee, end to end
+    res = client.post("/contract/considered-set", json=_ENTITY_ONLY_BODY, headers=AUTH)
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["code"] == _REFUSAL
+    # the refusal precedes every write: no intent, no considered set, nothing to draft from.
+    assert db.execute("SELECT count(*) FROM contract_considered").fetchone()[0] == 0
+    assert permissive_calls == []     # the structural guarantee
 
 
-# ── drift FAILS CLOSED (409 regenerate) without a permissive fallback ─────────────────────────────────
-def test_drifted_governed_plan_fails_closed_409_without_permissive_fallback(
+# ── the refusal is unconditional — drift cannot open a permissive fallback either ─────────────────────
+def test_a_drifted_cross_catalog_catalog_is_refused_the_same_way(
         client, db, monkeypatch, permissive_calls):
-    """§9 items 6 + 8 — the plan drifts BETWEEN considered-set and draft (the FK column's concept
-    changes, so the recomputed compiler-input fingerprint no longer matches the pinned stamp): the
-    draft is refused 409 (regenerate) and the permissive path is provably NOT the fallback."""
+    """§9 items 6 + 8 — the drift scenario, restated after the E4 cutover (2026-08-14).
+
+    This used to stage a plan that drifted BETWEEN considered-set and draft (the FK column's concept
+    flips, so the recomputed compiler-input fingerprint no longer matches the pinned stamp) and prove
+    the draft was refused 409 rather than falling back to the permissive path. That sequence needs an
+    entity-only considered set to drift FROM, and the route no longer mints one. The invariant it
+    protected survives in a stronger form: the refusal is a property of the REQUEST SHAPE, not of
+    catalog health, so a drifted catalog is refused identically — there is no state of the world in
+    which a flag-on cross-catalog request reaches generation and needs a fallback."""
     _enable_live(db, monkeypatch)
     _cross_seed(db)
     _fresh_now(db, "ops", "rev")
-    _inject_fixture_template(monkeypatch)
-    res = client.post("/contract/considered-set", json=_governed_scoped_body(), headers=AUTH)
-    assert res.status_code == 200, res.text
-    considered = res.json()
-    intent_id = considered["intent_id"]
 
     # drift ops (mirror test_draft_rebinding): the FK column's concept flips account_id → customer_id
     rows = [
@@ -154,10 +143,7 @@ def test_drifted_governed_plan_fails_closed_409_without_permissive_fallback(
     ]
     build_graph(db, "ops", [r for r, _ in rows], concepts={content_hash(r): c for r, c in rows})
 
-    dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "",
-        "expected_generation_run_id": considered["generation_run_id"]}, headers=AUTH)
-    assert dr.status_code == 409, dr.text
-    assert "regenerate" in dr.json()["detail"]
+    res = client.post("/contract/considered-set", json=_ENTITY_ONLY_BODY, headers=AUTH)
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["code"] == _REFUSAL
     assert permissive_calls == []     # fail-closed, never a permissive substitute path

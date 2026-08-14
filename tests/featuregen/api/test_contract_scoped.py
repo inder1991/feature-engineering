@@ -1,17 +1,22 @@
 """Phase-1B Task 7 — POST /contract/considered-set mints the run, persists the confirmed scope, scopes
-grounding and attaches a disposition lens.
+generation and attaches a disposition lens.
 
-Exercises the integration across ``gate1.build_considered_set`` (Part A: it exposes the grounded /
-rejected template ids) and the ``considered_set`` route (Part B: confirmed-scope path). The canonical
-linkage is proved end to end — the route mints ``generation_run_id``, persists the scope BEFORE the
-builder, and ``scope_for_run(run)`` reconstructs the governing scope by run id. ``broaden`` is the same
-path re-called with ``unscoped=true``, a NEW run, and ``supersedes_scope_id``. The no-scope path stays
-byte-identical to pre-1B.
+The canonical linkage is proved end to end — the route mints ``generation_run_id``, persists the scope
+BEFORE the builder, and ``scope_for_run(run)`` reconstructs the governing scope by run id. ``broaden``
+is the same path re-called with ``unscoped=true``, a NEW run, and ``supersedes_scope_id``. The
+no-scope emergency path stays byte-identical to pre-1B.
+
+The E4 cutover (2026-08-14) changed WHICH UNIVERSE this file is talking about. A request carrying a
+confirmed scope is served by the semantic engine, and the disposition lens folds the V2 recipe
+registry — the universe that was actually planned — rather than the legacy template registry. So the
+recipe ids named below are V2 ids, the in-scope counts are measured against ``V2_RECIPES``, and the
+"scoped grounds less than unscoped" signal is read off the scope's own eligible set instead of off two
+different pipelines' lens names. The one shape that has NO answer any more is the entity-only
+(cross-catalog) request: it is refused typed, before any planning happens at all.
 """
 from datetime import datetime
 
 import pytest
-
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -23,43 +28,51 @@ from featuregen.overlay.upload.contract.gate1 import (
 from featuregen.overlay.upload.contract.scope_records import scope_for_run
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.taxonomy.applicability import (
-    ConfirmedScope,
-    applicability_result,
-)
+from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
+from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
+from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 from featuregen.overlay.upload.taxonomy.recognition import APPLICABILITY_MAPPING_VERSION
 from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK
-from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 FLAG = "FEATUREGEN_INTENT_SCOPED_APPLICABILITY"
 CHURN = "customer.relationship_attrition.churn"
 HYPOTHESIS = "customers churn when their balance drops"
 TARGET = "public.accounts.churned"
-# A churn recipe that binds on the catalog below (eligible) + a credit/fraud recipe that is out of a
-# churn scope (out_of_scope). Mirrors tests/.../contract/test_gate1_scoped.py.
-CHURN_RECIPE = "balance_trend"
-CREDIT_RECIPE = "credit_utilisation"
+# A churn recipe that binds on the catalog below (eligible) + a credit and a fraud recipe that are out
+# of a churn scope (out_of_scope). All three are V2 registry ids — the disposition universe.
+CHURN_RECIPE = "balance_volatility"
+CREDIT_RECIPE = "days_past_due_max"
 FRAUD_RECIPE = "txn_velocity_spike"
 
 
 def _fake() -> FakeLLM:
-    """The generation tasks build_considered_set drives (no recognizer entry — recognition is a
-    separate API step). Mirrors test_gate1_scoped's client."""
+    """The generation tasks the builder still drives (no recognizer entry — recognition is a separate
+    API step). Only the ADVISORY set-recommendation pass is scripted: the free-form
+    ``overlay.feature.recommend`` generator was DELETED in the E4 cutover, and the intents task is left
+    unscripted on purpose — the intent lens fails soft, so the recipe half of the engine serves alone
+    and every assertion below stays deterministic."""
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
 
 
 def _bank_multi(conn) -> None:
-    """A TWO-family catalog: an ``accounts`` table the retail_churn recipes ground on, PLUS a
-    ``facilities`` table (a credit-limit grain) the credit recipes ground on. So a full (unscoped)
-    grounding surfaces BOTH families, while a churn-scoped grounding surfaces only the churn recipes —
-    the direct, non-trivial 'fewer template candidates' signal. Mirrors test_gate1_scoped's churn
-    catalog for the accounts half."""
+    """A TWO-family catalog: an ``accounts`` table the retail-churn recipes bind on, PLUS a
+    ``facilities`` table (a lending grain) the credit recipes bind on. A churn-scoped run therefore
+    plans only the churn family while an unscoped one plans both — the direct, non-trivial narrowing
+    signal.
+
+    Two shapes here are load-bearing for the E4 engine, and were not for the legacy grounding pass
+    that preceded it:
+
+    * ``accounts.account_id`` — the churn balance recipes are keyed per ACCOUNT, so a catalog with
+      only a customer key leaves every one of them REQUIRED_OPERAND_MISSING;
+    * exactly ONE as-of column and one monetary_stock column in the whole catalog. A second of
+      either is a genuine AMBIGUOUS_TIME_BINDING / AMBIGUOUS_MEASURE_BINDING, which the binder
+      refuses by design rather than guessing — so the facilities table carries its own
+      lending-specific facts (``dpd``, ``sicr_flag``) instead of a duplicate balance and as-of.
+    """
     from datetime import UTC, datetime
     # Watermark the catalog as fresh AS OF THE TEST RUN — the route grounds against the real wall clock
     # (datetime.now), so a hardcoded past date would rot the freshness gate once that date passes.
@@ -68,6 +81,7 @@ def _bank_multi(conn) -> None:
         # ── accounts → the retail_churn recipes ──
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
          "customer_id"),
+        (CanonicalRow("bank", "accounts", "account_id", "integer", entity="Account"), "account_id"),
         (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
                       currency="USD"), "monetary_stock"),
         (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
@@ -75,14 +89,13 @@ def _bank_multi(conn) -> None:
          "monetary_flow"),
         (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
         (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
-        # ── facilities → the credit-utilisation (limit) recipes: a NON-churn family, out of scope for a
-        #    churn narrowing but grounded under a full/unscoped run ──
+        # ── facilities → the lending recipes: a NON-churn family, out of scope under a churn
+        #    narrowing but planned under a full/unscoped run ──
         (CanonicalRow("bank", "facilities", "facility_id", "integer", is_grain=True, entity="Facility"),
          "facility_id"),
-        (CanonicalRow("bank", "facilities", "drawn", "numeric", additivity="semi_additive",
-                      currency="USD"), "monetary_stock"),
         (CanonicalRow("bank", "facilities", "credit_limit", "numeric", currency="USD"), "limit"),
-        (CanonicalRow("bank", "facilities", "asof2", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow("bank", "facilities", "dpd_days", "integer"), "dpd"),
+        (CanonicalRow("bank", "facilities", "sicr_ind", "boolean"), "sicr_flag"),
     ]
     rows = [r for r, _ in catalog]
     concepts = {content_hash(r): c for r, c in catalog}
@@ -93,8 +106,12 @@ def _bank_multi(conn) -> None:
         (now, now))
 
 
-def _templates_names(body: dict) -> set[str]:
-    return {f["name"] for s in body["alternatives"] if s["lens"] == "templates" for f in s["features"]}
+def _planned_ids(body: dict) -> set[str]:
+    """Every recipe the run actually planned — the in-scope half of the disposition fold. Post-cutover
+    this replaces "count the names in the templates lens": a scoped and an unscoped run are now served
+    by the SAME engine, so the honest narrowing signal is which recipes were considered at all, not
+    which lens name the response happened to carry."""
+    return {d["recipe_id"] for d in body["dispositions"] if d["relevance_tier"] is not None}
 
 
 def _disposition(body: dict, recipe_id: str) -> dict | None:
@@ -109,18 +126,22 @@ def _post(client, **extra) -> dict:
     return res.json()
 
 
-# ── scoped: mint run + persist scope BEFORE builder + narrowed grounding + disposition lens ───────────
+# ── scoped: mint run + persist scope BEFORE builder + narrowed planning + disposition lens ────────────
 def test_scoped_call_narrows_grounding_and_returns_dispositions(make_client, conn, monkeypatch):
-    monkeypatch.setenv(FLAG, "1")   # scoped grounding on → grounding narrows to the eligible subset
+    monkeypatch.setenv(FLAG, "1")
     _bank_multi(conn)
     client = make_client(_fake())
 
     scoped = _post(client, confirmed_scope={"primary": CHURN, "confirmation_source": "user_confirmed"})
-    # A no-scope call on the SAME catalog grounds the whole registry → the scoped run grounds fewer.
-    unscoped = _post(make_client(_fake()))
+    # A BROADENED run on the SAME catalog plans the whole registry → the churn-scoped run plans a
+    # strict subset of it. (Pre-cutover this compared the scoped response's templates lens with an
+    # unscoped legacy call's; those are now two different pipelines, so comparing them would prove
+    # nothing about narrowing. The scope's own planned set is the honest comparison.)
+    broadened = _post(make_client(_fake()),
+                      confirmed_scope={"unscoped": True, "confirmation_source": "user_broadened"})
 
-    assert len(_templates_names(scoped)) < len(_templates_names(unscoped)), (
-        "scoped grounding must surface fewer template candidates than the full registry")
+    assert _planned_ids(scoped) < _planned_ids(broadened), (
+        "a churn-scoped run must plan strictly fewer recipes than a broadened one")
 
     # The disposition lens: a churn recipe that bound is ELIGIBLE; credit/fraud recipes are OUT_OF_SCOPE.
     churn = _disposition(scoped, CHURN_RECIPE)
@@ -133,10 +154,11 @@ def test_scoped_call_narrows_grounding_and_returns_dispositions(make_client, con
         assert d["relevance_tier"] is None
         assert d["grounding"]["status"] == "not_evaluated"      # never a bare null downstream
 
-    # in_scope_count is APPLICABILITY-owned (not recognition).
-    expected = applicability_result(ConfirmedScope(primary=CHURN)).eligible_ids
+    # in_scope_count is APPLICABILITY-owned (not recognition) — over the V2 universe the engine
+    # actually planned, which is what the disposition lens folds after the cutover.
+    expected = v2_applicability_as_result(ConfirmedScope(primary=CHURN)).eligible_ids
     assert scoped["in_scope_count"] == len(expected)
-    assert scoped["in_scope_count"] < len(ALL_TEMPLATES)
+    assert scoped["in_scope_count"] < len(V2_RECIPES)
 
     # The scope was persisted BEFORE the builder: a parent row + a primary child exist for the minted run.
     run = scoped["generation_run_id"]
@@ -199,8 +221,9 @@ def test_broaden_supersedes_first_scope_and_full_grounds(make_client, conn, monk
         (broad_scope,)).fetchone()
     assert row == (first_scope, "unscoped")
 
-    # Broaden fails open to FULL grounding: every recipe is eligible-by-applicability (none out of scope).
-    assert broadened["in_scope_count"] == len(ALL_TEMPLATES)
+    # Broaden fails open to the FULL universe: every V2 recipe is eligible-by-applicability (none out
+    # of scope). The count is the planned registry's size, not the legacy template registry's.
+    assert broadened["in_scope_count"] == len(V2_RECIPES)
     assert not any(d["final_disposition"] == "out_of_scope" for d in broadened["dispositions"])
 
     # Both runs' scopes are retrievable by their own run id (supersession is lineage only).
@@ -290,106 +313,39 @@ def test_scoped_call_with_foreign_intent_id_is_404(make_client, conn):
     assert ok.json()["intent_id"] == alice_intent
 
 
-# ── 3B.3a shadow isolation: a shadow DB fault must never poison the request's transaction ─────────────
-def test_shadow_db_error_does_not_poison_request_transaction(make_client, conn, monkeypatch):
-    """Savepoint regression (task-5 review). The shadow planner runs on the REQUEST's connection; a
-    DB-level error inside it (statement timeout, schema drift, serialization failure) used to abort the
-    whole transaction — the swallowed exception let the route return 200, but the post-return commit
-    silently became a ROLLBACK and the just-persisted run/scope rows were gone. The savepoint must
-    confine the abort to the shadow call: the response stays 200 AND the request's writes survive."""
+# ── E4: the entity-only request is refused BEFORE anything can run on the request's connection ────────
+def test_entity_only_scope_is_refused_before_any_shadow_dispatch(make_client, conn, monkeypatch):
+    """The E4 cutover (2026-08-14) closed the entity-only (cross-catalog) shape at the route: with a
+    confirmed scope and no ``catalog_source`` the answer is a typed 422 SEMANTIC_REQUIRES_CATALOG_SOURCE,
+    because the semantic engine plans over ONE frozen catalog context and the free-form generator that
+    used to fill that page is deleted.
+
+    That refusal is what replaced two savepoint-isolation tests here (3B.3a). They proved that a DB
+    fault inside the log-only shadow planner could not poison the request's transaction and silently
+    turn its commit into a rollback — a real defect, and a real fix, but the shadow planner only ever
+    ran on the entity-scoped branch, which no request can now reach. Rather than keep two tests whose
+    subject is unreachable, this one asserts the property that now delivers the same guarantee: the
+    request is refused BEFORE any of that machinery is dispatched, so there is nothing to poison.
+    A ``run_shadow_planner`` that would explode on the request's connection is installed to prove it
+    is never called, and the connection is read afterwards to prove it is still usable.
+    """
     _bank_multi(conn)
 
-    def _exploding_shadow(shadow_conn, **_kwargs):
-        # A guaranteed DB error ON THE REQUEST'S CONNECTION — the poison the savepoint must contain.
+    def _exploding_shadow(shadow_conn, **_kwargs):   # pragma: no cover - reached only on regression
         shadow_conn.execute("SELECT * FROM a_table_that_does_not_exist")
 
     monkeypatch.setattr("featuregen.api.routes.contract.run_shadow_planner", _exploding_shadow)
-    client = make_client(_fake())
 
-    # ENTITY-scoped: catalog_source OMITTED + a confirmed target_entity → the shadow branch fires.
-    res = client.post("/contract/considered-set", json={
+    res = make_client(_fake()).post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
         "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
                             "target_entity": "customer"}}, headers=AUTH)
-    assert res.status_code == 200, res.text
-    body = res.json()
-    run, scope_id = body["generation_run_id"], body["scope_id"]
-    assert run and scope_id
+    assert res.status_code == 422, res.text
+    assert res.json()["detail"]["code"] == "SEMANTIC_REQUIRES_CATALOG_SOURCE"
 
-    # The transaction is still LIVE and the governing writes SURVIVED the shadow fault: the scope row
-    # the response advertises is really there (without the savepoint this read raises
-    # InFailedSqlTransaction — the poisoned txn that would have turned the commit into a rollback).
-    row = conn.execute(
-        "SELECT scope_id FROM confirmed_generation_scope WHERE generation_run_id = %s",
-        (run,)).fetchone()
-    assert row is not None and row[0] == scope_id
-
-
-# ── 3B.3a per-recipe savepoint: a DB error SWALLOWED inside run_shadow_planner must not poison the txn ─
-def test_shadow_internal_db_error_swallowed_by_planner_does_not_poison_transaction(
-        make_client, conn, monkeypatch):
-    """Savepoint-defeat regression (task-5 whole-branch review). run_shadow_planner isolates planner
-    failures per recipe with a try/except that SWALLOWS the exception and continues — so a DB-level
-    error inside plan_bindings aborts the psycopg transaction yet run_shadow_planner returns NORMALLY.
-    The route's OUTER savepoint then exits without an exception and its RELEASE SAVEPOINT raises
-    InFailedSqlTransaction on the aborted subtransaction, which the route's except also swallows: the
-    request returns 200 while the poisoned transaction turns the post-return commit into a silent
-    ROLLBACK — the advertised run/scope rows are LOST. The per-recipe savepoint inside
-    run_shadow_planner must trigger ROLLBACK TO SAVEPOINT on the failing recipe so the connection
-    stays usable and the request's writes survive a real commit."""
-    _bank_multi(conn)
-
-    def _exploding_discovery(disc_conn, *_args, **_kwargs):
-        # A guaranteed DB error INSIDE plan_bindings, on the request's connection — the path the
-        # sibling test above does NOT exercise (there run_shadow_planner itself raises).
-        disc_conn.execute("SELECT * FROM a_table_that_does_not_exist")
-
-    monkeypatch.setattr("featuregen.overlay.upload.planner.plan.discover_ingredient_candidates",
-                        _exploding_discovery)
-    client = make_client(_fake())
-
-    # ENTITY-scoped: catalog_source OMITTED + a confirmed target_entity → the shadow branch fires.
-    res = client.post("/contract/considered-set", json={
-        "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
-        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
-                            "target_entity": "customer"}}, headers=AUTH)
-    assert res.status_code == 200, res.text
-    body = res.json()
-    run, scope_id = body["generation_run_id"], body["scope_id"]
-    assert run and scope_id
-
-    # The governing scope row the response advertises survived a REAL commit (the exact step the bug
-    # corrupts: committing a poisoned transaction silently ROLLS BACK and the row is gone).
-    conn.commit()
-    try:
-        row = conn.execute(
-            "SELECT scope_id FROM confirmed_generation_scope WHERE generation_run_id = %s",
-            (run,)).fetchone()
-        assert row is not None and row[0] == scope_id
-    finally:
-        # This test COMMITTED (the point of the proof), so the suite's rollback isolation cannot undo
-        # it — restore the empty committed baseline ourselves (precedent: security/conftest truncates
-        # after its committing test). schema_migrations + the migration-seeded projection_checkpoints
-        # rows are the only committed baseline state; everything else app-level starts empty.
-        #
-        # session_replication_role='replica' suppresses USER triggers for this session, which the
-        # TRUNCATE below now requires: migration 1020 put a write-once guard on authoring_trace_event
-        # that raises "TRUNCATE not allowed". Without this the cleanup itself threw, the committed
-        # rows from this test survived into every later test in the session, and ~69 unrelated tests
-        # failed downstream on leftover state (duplicate graph_node keys, stale bank/core catalogs).
-        # That is a TEST-ONLY escape hatch on the suite's own connection: it never runs in
-        # application code, and the write-once guarantee it steps around is re-asserted for every
-        # other test by the trigger still being active outside this block.
-        conn.rollback()   # clear any in-flight (possibly aborted) txn so the cleanup can run
-        tables = [r[0] for r in conn.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
-            "AND tablename NOT IN ('schema_migrations', 'projection_checkpoints')").fetchall()]
-        conn.execute("SET session_replication_role = replica")
-        try:
-            conn.execute("TRUNCATE " + ", ".join(f'"{t}"' for t in tables) + " CASCADE")
-        finally:
-            conn.execute("RESET session_replication_role")
-        conn.commit()
+    # The connection is still usable: the shadow planner never ran, so nothing aborted the
+    # transaction (a poisoned txn raises InFailedSqlTransaction on the next statement).
+    assert conn.execute("SELECT 1").fetchone() == (1,)
 
 
 # ── Fix 5: every disposition stage carries the replay stamps (evaluation_version + evaluated_at) ───────
@@ -407,27 +363,12 @@ def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
             datetime.fromisoformat(s["evaluated_at"])   # ISO-8601, round-trippable for replay
 
 
-# ── 3B.3c (C8): the contract-compile kill-switch is read ONLY in the route and threaded through ───────
-def test_shadow_contract_compile_flag_is_threaded_from_env(make_client, conn, monkeypatch):
-    """FEATUREGEN_INTENT_CONTRACT_COMPILE is the compile pass's dedicated kill switch: read in the
-    route (the planner stays pure — no os.environ below the route), default OFF, passed verbatim as
-    run_shadow_planner(compile_contracts=...)."""
-    _bank_multi(conn)
-    captured: list[bool] = []
-
-    def _capture_shadow(_conn, **kwargs):
-        captured.append(kwargs["compile_contracts"])
-        return ()
-
-    monkeypatch.setattr("featuregen.api.routes.contract.run_shadow_planner", _capture_shadow)
-    client = make_client(_fake())
-    body = {"hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
-            "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
-                                "target_entity": "customer"}}
-    monkeypatch.delenv("FEATUREGEN_INTENT_CONTRACT_COMPILE", raising=False)
-    res = client.post("/contract/considered-set", json=body, headers=AUTH)
-    assert res.status_code == 200, res.text
-    monkeypatch.setenv("FEATUREGEN_INTENT_CONTRACT_COMPILE", "1")
-    res2 = client.post("/contract/considered-set", json=body, headers=AUTH)
-    assert res2.status_code == 200, res2.text
-    assert captured == [False, True]
+# ── 3B.3c (C8): the contract-compile kill-switch ──────────────────────────────────────────────────────
+# FEATUREGEN_INTENT_CONTRACT_COMPILE was the shadow compile pass's dedicated kill switch, read in the
+# route (the planner stays pure — no os.environ below the route) and passed verbatim to
+# run_shadow_planner(compile_contracts=...). Its test posted the ENTITY-scoped body, the only shape
+# that reaches the shadow planner, and observed which value the route threaded. The E4 cutover
+# (2026-08-14) refuses that shape with a typed 422 before the route gets there, so the switch has no
+# reachable consumer and no observable behaviour left to assert. The test is deleted rather than
+# rewritten around a call that cannot happen; the refusal that replaced it is asserted above, in
+# test_entity_only_scope_is_refused_before_any_shadow_dispatch.

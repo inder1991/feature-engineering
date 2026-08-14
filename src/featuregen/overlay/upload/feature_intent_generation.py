@@ -9,9 +9,9 @@ key is a NAMED refusal, an out-of-scope objective or an un-offered model spec is
 before anything binds. Provenance is OURS: whatever the model writes in
 ``generation_provenance`` is overwritten with the call's real prompt/schema/model/call refs.
 
-Cost discipline: nothing in the platform calls this yet. In `semantic_v1` it REPLACES the
-physical-column generation call (no net new spend); a sampled shadow comparison is a deliberate
-operator action, never a default — the plan's own rule and the standing spend-approval rule.
+Cost discipline: since the E4 cutover this REPLACES the physical-column generation call rather
+than adding to it — that call no longer exists — so the engine's intent round is no net new
+spend, and any comparison run is a deliberate operator action under the standing spend rule.
 """
 from __future__ import annotations
 

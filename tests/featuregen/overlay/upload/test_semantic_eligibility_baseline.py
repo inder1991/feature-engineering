@@ -20,14 +20,30 @@ from featuregen.overlay.upload.recipe_registry_v2 import (
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 
-def test_hypothesis_path_still_grounds_legacy_templates_today():
-    """MIGRATION BASELINE, not desired behavior: Gate-1's recipe lens defaults to the frozen
-    legacy Template registry. SE-7 cuts this over to atomic V2 recipes — when it does, THIS
-    test is updated in the same commit to pin the new source instead."""
-    from featuregen.overlay.upload.contract import gate1
+def test_the_hypothesis_path_grounds_the_v2_registry_not_legacy_templates():
+    """CUT OVER (E4, 2026-08-14) — this pin is updated in the cutover commit, per its own rule.
 
-    default = inspect.signature(gate1._template_candidates).parameters["templates"].default
-    assert default is ALL_TEMPLATES
+    The SE-0 baseline pinned Gate-1's recipe lens to the frozen legacy `Template` registry and
+    said: "SE-7 cuts this over to atomic V2 recipes — when it does, THIS test is updated in the
+    same commit to pin the new source instead." That commit is this one, so the pin now names
+    the new source and the two facts that make it the ONLY one:
+
+    1. the builder has no `semantic_mode` parameter left — there is no argument, env var or
+       branch by which a caller could ask for the legacy lens instead;
+    2. with a catalog and a confirmed scope (what every route request carries) the lens is
+       `recipe_planning_lens.v2_recipe_candidates` over `V2_RECIPES`.
+
+    `_template_candidates` still exists and still defaults to `ALL_TEMPLATES` — the per-table
+    suggestions page and the scope-less builder call remain its callers — so this asserts what
+    the HYPOTHESIS path does, which is the boundary SE-7 actually moved."""
+    import featuregen.overlay.upload.contract.gate1 as gate1_mod
+
+    assert "semantic_mode" not in inspect.signature(
+        gate1_mod.build_considered_set).parameters
+    source = inspect.getsource(gate1_mod.build_considered_set)
+    scoped = source[source.index("if catalog_source is not None and scope is not None:"):]
+    assert "v2_recipe_candidates" in scoped.split("elif catalog_source is not None:")[0]
+    assert "recommend_feature_sets_report" not in source     # the free-form generator is gone
 
 
 def test_v2_authority_floors_are_uniform_at_baseline():

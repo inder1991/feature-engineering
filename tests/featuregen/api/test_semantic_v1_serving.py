@@ -10,6 +10,7 @@ from __future__ import annotations
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.upload import semantic_projection
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -67,7 +68,6 @@ def test_semantic_v1_serves_the_recipe_lens_from_the_semantic_engine(
     """The one-engine payoff: under semantic_v1 the legacy template grounding never runs —
     the templates lens (when present) and the recipe rejections come from the V2 engine."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
 
     def boom(*a, **k):  # pragma: no cover - reached only on regression
         raise AssertionError("legacy template grounding must not run under semantic_v1")
@@ -77,7 +77,7 @@ def test_semantic_v1_serves_the_recipe_lens_from_the_semantic_engine(
     with caplog.at_level("INFO", logger="featuregen.overlay.upload.contract.gate1"):
         body = _post(make_client(llm_client=_fake()))
 
-    served = [r.message for r in caplog.records if r.message.startswith("semantic-v1 served:")]
+    served = [r.message for r in caplog.records if r.message.startswith("engine served:")]
     assert len(served) == 1
     # The V2 engine decided every recipe outcome: whatever bound was served, whatever did not
     # is a NAMED rejection — nothing silently dropped. On this catalog the V2 registry's
@@ -94,7 +94,6 @@ def test_semantic_v1_recipe_cards_carry_projected_provenance(make_client, conn, 
     """When a V2 candidate binds on this catalog, the card is recipe-sourced with role
     bindings projected from the binder's verdicts (measured authority, confirmation flags)."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=_fake()))
 
     template_sets = [s for s in body["alternatives"] if s["lens"] == "templates"]
@@ -115,7 +114,6 @@ def test_semantic_v1_dispositions_describe_the_v2_universe(make_client, conn, mo
     from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=_fake()))
 
     v2_ids = {r.recipe_id for r in V2_RECIPES}
@@ -130,16 +128,28 @@ def test_semantic_v1_dispositions_describe_the_v2_universe(make_client, conn, mo
     assert rows <= v2_ids
 
 
-def test_legacy_default_is_untouched_by_the_serving_branch(make_client, conn, monkeypatch):
-    """The frozen default: no env var → the semantic serving path must never run."""
-    _bank(conn)
+def test_the_serving_branch_runs_with_no_env_var_at_all(make_client, conn, monkeypatch):
+    """The INVERSE of the pin this replaces (E4 cutover, 2026-08-14).
 
-    def boom(*a, **k):  # pragma: no cover - reached only on regression
-        raise AssertionError("the projection must not run in legacy mode")
+    While the cutover was a mode, this test proved the frozen `legacy` default left the
+    projection unrun. There is no default to be frozen at any more — no env var, no mode, no
+    branch — so the honest pin is the opposite one: with a clean environment, a scoped request
+    over one catalog goes through the semantic projection. Asserted at the projection seam so a
+    regression that quietly reintroduced a second lens would fail here rather than pass by
+    producing a plausible-looking page from somewhere else."""
+    _bank(conn)
+    monkeypatch.delenv("FEATUREGEN_SEMANTIC_PLANNING", raising=False)
+    calls: list = []
+    real = semantic_projection.project_assembled_set
+
+    def counting(*a, **k):
+        calls.append(a)
+        return real(*a, **k)
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.semantic_projection.project_assembled_set", boom)
+        "featuregen.overlay.upload.semantic_projection.project_assembled_set", counting)
     _post(make_client(llm_client=_fake()))
+    assert calls, "the semantic projection is the only path there is"
 
 
 def _intent_payload() -> dict:
@@ -186,7 +196,6 @@ def test_semantic_v1_binds_llm_intents_through_the_same_engine(
     candidate beside the recipes — one engine, both origins."""
     fake = _fake_with_intents()
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     _post(make_client(llm_client=fake))
 
     rows = conn.execute(
@@ -213,7 +222,6 @@ def test_option_decision_rows_freeze_the_served_facts(make_client, conn, monkeyp
     from featuregen.overlay.upload.semantic_option_decision import load_frozen_option_facts
 
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=_fake_with_intents()))
 
     revision_id = conn.execute(
@@ -261,7 +269,6 @@ def test_draft_of_a_semantic_option_is_blocked_by_the_activation_policy(
     option (conceptual, all-proposed metadata, no plan, no verifiable snapshot) 409s at draft
     with EVERY blocker named and a next step per blocker. Nothing hides; nothing proceeds."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     body = _post(client)
 
@@ -295,7 +302,6 @@ def test_confirm_re_checks_activation_even_when_a_choice_was_recorded(
     same frozen decision row and blocks with the same typed shape — the governing write is
     never softer than the draft."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     body = _post(client)
     option = next(f for s_ in body["alternatives"] for f in s_["features"]
@@ -339,7 +345,6 @@ def test_the_free_form_generator_never_runs_under_semantic_v1(make_client, conn,
             "recommended_lens": "templates", "reasoning": "engine set"}),
     })
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     body = _post(make_client(llm_client=fake))
     served = [f for s_ in body["alternatives"] for f in s_["features"]]
     assert served, "the engine alone serves the considered set"
@@ -350,10 +355,15 @@ def test_the_free_form_generator_never_runs_under_semantic_v1(make_client, conn,
     assert {s_["lens"] for s_ in body["alternatives"]} <= {"engine", "actionable"}
 
 
-def test_entity_only_scope_is_refused_typed_under_semantic_v1(make_client, conn, monkeypatch):
-    """B1: no catalog_source under the mode = typed 422, never a silently empty page."""
+def test_entity_only_scope_is_refused_typed(make_client, conn, monkeypatch):
+    """B1, RE-VERIFIED AFTER THE E4 DELETION (2026-08-14): no catalog_source = typed 422, never
+    a silently empty page. This used to be conditional on the mode, and the mode is what made it
+    safe — with the free-form path still there, an unrefused entity-only request would simply
+    have been answered by the other engine. Now there is no other engine, so the refusal is the
+    ONLY thing standing between an entity-only request and an empty page that would read as
+    "your catalog can build nothing"."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
+    monkeypatch.delenv("FEATUREGEN_SEMANTIC_PLANNING", raising=False)
     res = make_client(llm_client=_fake()).post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn",
         "confirmed_scope": {"primary": CHURN, "secondary": [], "expansion": "exact"},
@@ -373,7 +383,6 @@ def test_definition_mode_anchor_is_extracted_through_the_engine(
             "recommended_lens": "templates", "reasoning": "engine set"}),
     })
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     res = make_client(llm_client=fake).post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS,
         "definition": "days since the customer's most recent transaction",
@@ -398,7 +407,6 @@ def test_unscoped_generation_accepts_intents_from_the_full_vocabulary(
             "recommended_lens": "templates", "reasoning": "engine set"}),
     })
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     res = make_client(llm_client=fake).post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
         "confirmed_scope": {"unscoped": True},
@@ -416,7 +424,6 @@ def test_the_intent_call_is_attributed_to_the_requesting_human(make_client, conn
     the fallback service identity — and its provenance carries the SCOPE's own hash as a
     distinct key from the catalog context hash."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     _post(make_client(llm_client=_fake_with_intents()))
 
     row = conn.execute(
@@ -434,7 +441,6 @@ def test_a_lagged_projection_refuses_before_any_provider_spend(
     from featuregen.intake.llm import FakeLLM
 
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     from featuregen.overlay.upload.feature_metadata_snapshot import (
         CatalogProjectionUnavailable,
     )
@@ -479,7 +485,6 @@ def test_a_confirmed_uoa_mismatch_is_actionable_with_the_rollup_resolution(
     ACCOUNT — the candidate lands in the ACTIONABLE section (never recommended), its decision
     row freezes the refusal, and drafting it names UOA_MISMATCH with the roll-up next step."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     res = client.post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
@@ -516,7 +521,6 @@ def test_a_confirmed_uoa_mismatch_is_actionable_with_the_rollup_resolution(
 
 def test_a_matching_uoa_changes_nothing(make_client, conn, monkeypatch):
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     res = client.post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
@@ -537,7 +541,6 @@ def test_a_uoa_changed_after_serving_blocks_the_old_draft_as_drift(
     UOA=account (a new run, a new frozen decision). Drafting an option served under the OLD
     UOA blocks with the regenerate blocker — the card answers a stale question."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     first = client.post("/contract/considered-set", json={
         "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
@@ -576,7 +579,6 @@ def test_the_decision_record_is_the_full_evidence_and_detail_serves_it_by_exact_
     the option-detail route serves it by the EXACT (revision, option) key — never
     newest-row-for-the-definition — with the linked observation joined by observation_id."""
     _bank(conn)
-    monkeypatch.setenv("FEATUREGEN_SEMANTIC_PLANNING", "semantic_v1")
     client = make_client(llm_client=_fake_with_intents())
     body = _post(client)
 

@@ -1,10 +1,16 @@
 """Phase-3C.2a Task 5 — the LIVE governed cross-catalog lens in ``build_considered_set``.
 
-On a flag-on-and-activation-approved entity-scoped run the governed PLANNER (not the LLM) is the
-authority for cross-catalog features: its resolved plans surface as options carrying a governed plan
-envelope + structured provenance, its unresolved plans surface as rejections, and every cross-catalog
-LLM alternative is rejected (it has no governed physical plan). With the flag off the whole branch is
-skipped — byte-identical to today.
+On a flag-on-and-activation-approved entity-scoped run the governed PLANNER is the authority for
+cross-catalog features: its resolved plans surface as options carrying a governed plan envelope +
+structured provenance, and its unresolved plans surface as rejections. With the flag off the whole
+branch is skipped — byte-identical to today.
+
+The E4 cutover (2026-08-14) settled the OTHER half of that guarantee by construction. The free-form
+generator that used to propose ungoverned cross-catalog candidates — the things
+``_reject_cross_catalog_llm`` and the cross-catalog anchor drop existed to catch — is deleted, so an
+entity-scoped run has no ungoverned source at all: no option and no anchor can arrive without a
+governed plan behind it. The filter itself is still covered as a pure function below; the
+integration tests now assert the stronger fact, that there is nothing left for it to remove.
 """
 from __future__ import annotations
 
@@ -25,7 +31,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
 )
 from featuregen.overlay.upload.contract.intake import submit_intent
-from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, SetsReport
+from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet
 from featuregen.overlay.upload.graph import build_graph
 
 
@@ -89,33 +95,30 @@ def test_reject_cross_catalog_llm_removes_multi_catalog_and_keeps_single():
                for r in rejections)
 
 
-# ── (d)/(e) integration: the filter is wired into build_considered_set's entity-scoped branch ─────────
-def test_build_considered_set_filters_cross_catalog_llm_when_live(db, monkeypatch):
-    cross = FeatureIdea("cross_feat", "", ["a", "b"], "sum", None,
-                        derives_pairs=(("ops", "public.t.a"), ("rev", "public.u.b")))
-    single = FeatureIdea("single_feat", "", ["a"], "sum", None,
-                         derives_pairs=(("ops", "public.t.a"),))
-    report = SetsReport(sets=[FeatureSet("monetary", [cross, single])], rejections=[])
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-                        lambda *a, **k: report)
+# ── (d)/(e) integration: an entity-scoped run has NO ungoverned option to filter ──────────────────────
+def test_no_ungoverned_option_can_reach_a_live_entity_scoped_run(db):
+    """The filter's guarantee, now structural. This test used to inject a cross-catalog and a
+    single-catalog candidate through the free-form generator and watch ``_reject_cross_catalog_llm``
+    remove the first. The E4 cutover (2026-08-14) deleted that generator, so there is no source of
+    ungoverned candidates on this branch at all — every lens on the returned set is one the governed
+    planner authored. That is what the filter was protecting, asserted at its stronger form."""
     intent = submit_intent(hypothesis="an entity-scoped hypothesis", actor="ds1")
-    # target_entity=None + templates=() isolates the FILTER (no governed-options lens runs here).
-    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
+    # target_entity=None + templates=() keeps the governed-options lens out, so anything present
+    # would have to have come from somewhere ungoverned.
+    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None,
                               is_live=True, target_entity=None, templates=(), now=_NOW)
-    names = {f.name for s in cs.alternatives for f in s.features}
-    assert "single_feat" in names and "cross_feat" not in names
-    assert any(r.get("name") == "cross_feat" and r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED
-               for r in cs.rejections)
+    assert cs.alternatives == []   # nothing ungoverned was even proposed
+    # …so there is nothing for the filter to reject either: the rejection is the trace of a candidate
+    # that WAS generated and then removed, and none can be generated here any more.
+    assert not any(r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in cs.rejections)
 
 
 # ── (b) integration: build_considered_set surfaces the governed option under the flag ─────────────────
-def test_build_considered_set_surfaces_governed_option_when_live(db, monkeypatch):
+def test_build_considered_set_surfaces_governed_option_when_live(db):
     _cross_seed(db)
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-                        lambda *a, **k: SetsReport(sets=[], rejections=[]))   # no LLM noise
     intent = submit_intent(hypothesis="roll transactions up to the account", actor="ds1")
     cs = build_considered_set(
-        db, intent, _recommend_set_client(), catalog_source=None, entity=None, is_live=True,
+        db, intent, _recommend_set_client(), catalog_source=None, is_live=True,
         target_entity="account", templates=(_txn_template(),), applicability=None, now=_NOW)
     governed = [f for s in cs.alternatives for f in s.features if f.origin == "governed_planner"]
     assert len(governed) == 1
@@ -125,41 +128,21 @@ def test_build_considered_set_surfaces_governed_option_when_live(db, monkeypatch
     assert all(s.lens != "governed" for s in cs.alternatives)
 
 
-# ── 3C.2a CRITICAL: a cross-catalog DEFINITION-MODE anchor is dropped when live (fail-closed) ──────────
-def test_build_considered_set_drops_cross_catalog_definition_anchor_when_live(db, monkeypatch):
-    # On a live entity-scoped run the definition anchor is generated over the WHOLE cross-catalog
-    # candidate pool (catalog_source is None), so it CAN span >1 catalog with NO governed physical plan.
-    # Such an anchor must never reach the customer-visible considered set / be choosable at Gate #1.
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-                        lambda *a, **k: SetsReport(sets=[], rejections=[]))   # isolate the anchor path
-    cross_anchor = FeatureIdea("cross_anchor", "", ["a", "b"], "sum", None,
-                               derives_pairs=(("ops", "public.t.a"), ("rev", "public.u.b")))
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_features",
-                        lambda *a, **k: [cross_anchor])
+# ── 3C.2a CRITICAL: no ungoverned DEFINITION-MODE anchor is customer-visible when live (fail-closed) ──
+def test_no_ungoverned_definition_anchor_on_a_live_entity_scoped_run(db):
+    """The anchor half of the fail-closed guarantee. An entity-scoped run has NO single catalog to
+    plan over, so a definition anchor built there could span >1 catalog with no governed physical
+    plan — it had to be dropped and surfaced as a rejection. Since the E4 cutover (2026-08-14) the
+    anchor comes from the engine's extraction, which needs a frozen catalog context: with no
+    ``catalog_source`` there is no context, so there is NO anchor to drop. Honest absence rather than
+    a free-form guess — and the customer-visible outcome the drop existed to produce."""
     intent = submit_intent(hypothesis="an entity-scoped hypothesis",
                            definition="a cross-catalog definition", actor="ds1")
-    # target_entity=None + templates=() isolates the anchor drop (no governed-options lens runs here).
-    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
+    # target_entity=None + templates=() keeps the governed-options lens out of the way.
+    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None,
                               is_live=True, target_entity=None, templates=(), now=_NOW)
-    assert cs.anchor is None    # the ungoverned cross-catalog anchor never becomes customer-visible
-    assert any(r.get("name") == "cross_anchor"
-               and r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in cs.rejections)
-
-
-# ── 3C.2a: a SINGLE-catalog definition anchor under is_live is preserved (no over-rejection) ───────────
-def test_build_considered_set_preserves_single_catalog_definition_anchor_when_live(db, monkeypatch):
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-                        lambda *a, **k: SetsReport(sets=[], rejections=[]))
-    single_anchor = FeatureIdea("single_anchor", "", ["a"], "sum", None,
-                                derives_pairs=(("ops", "public.t.a"),))
-    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_features",
-                        lambda *a, **k: [single_anchor])
-    intent = submit_intent(hypothesis="an entity-scoped hypothesis",
-                           definition="a single-catalog definition", actor="ds1")
-    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
-                              is_live=True, target_entity=None, templates=(), now=_NOW)
-    assert cs.anchor is not None and cs.anchor.name == "single_anchor"   # single-catalog anchor untouched
-    assert not any(r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in cs.rejections)
+    assert intent.intake_mode == "definition"   # the anchor path really was the one exercised
+    assert cs.anchor is None                    # no ungoverned anchor is choosable at Gate #1
 
 
 # ── (a) flag off → the governed branch never runs (byte-identical to today) ───────────────────────────
@@ -171,16 +154,10 @@ def test_flag_off_skips_the_governed_branch_entirely(db, monkeypatch):
 
     monkeypatch.setattr("featuregen.overlay.upload.contract.gate1._governed_cross_catalog_options", _boom)
     monkeypatch.setattr("featuregen.overlay.upload.contract.gate1._reject_cross_catalog_llm", _boom)
-    monkeypatch.setattr(
-        "featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
-        lambda *a, **k: SetsReport(
-            sets=[FeatureSet("monetary", [FeatureIdea("llm_feat", "", ["public.accounts.balance"],
-                                                      "avg", None,
-                                                      derives_pairs=(("bank", "public.accounts.balance"),))])],
-            rejections=[]))
     intent = submit_intent(hypothesis="an entity-scoped hypothesis", actor="ds1")
-    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
+    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None,
                               is_live=False, target_entity="account", now=_NOW)
-    # neither _boom fired (no plan_bindings, no filter) and no governed provenance leaked in
-    assert all(f.origin != "governed_planner" for s in cs.alternatives for f in s.features)
-    assert {f.name for s in cs.alternatives for f in s.features} == {"llm_feat"}
+    # Neither _boom fired: no plan_bindings compile, no cross-catalog filter. The set itself is empty
+    # — an entity-only run has no candidate source at all since the E4 cutover (2026-08-14) — so what
+    # this pins is the skip, proven by the booms that never raised.
+    assert cs.alternatives == []

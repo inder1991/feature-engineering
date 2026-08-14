@@ -1,11 +1,11 @@
 """The read-only suggested-features route, with per-table contract negotiation.
 
 ``GET /catalog/{catalog_source}/tables/{table}/suggestions`` exposes
-:func:`overlay.upload.suggestions.suggest_features_for_table` (v1) and
-:func:`overlay.upload.suggestions.suggest_features_page_v2` (v2): every template candidate this
-catalog can ground on the table, with the gauntlet's own statuses. NO hypothesis, NO intent, NO LLM
-— and no verb other than GET, because this surface WRITES NOTHING: there is deliberately no place
-here from which a suggestion could be accepted, dismissed or governed.
+:func:`overlay.upload.suggestions.suggest_features_page_v2` projected onto CONTRACT v4 — every
+candidate this catalog can ground on the table with the gauntlet's own statuses, plus the
+semantic engine's own verdicts for the same table. NO hypothesis, NO intent, NO LLM — and no
+verb other than GET, because this surface WRITES NOTHING: there is deliberately no place here
+from which a suggestion could be accepted, dismissed or governed.
 
 Gated by ``catalog:read`` (``require_catalog_read``), like its sibling ``/catalog/...`` reads.
 
@@ -28,13 +28,20 @@ cannot be suggested. The v2 response exposes ``read_scope_key`` — an opaque JC
 visibility CLASSES — for diagnostics and later cursor binding; it never echoes role claims and is
 never itself authorization.
 
-**Contract negotiation (freeze 0F-12).** ``contract_version`` defaults to 1 and is deliberately
-UNBOUNDED at the FastAPI layer: a ``le=2`` would make the framework reject an unsupported version
-before the handler ran, so the typed ``error_code`` below could never be emitted and the body would
-be FastAPI's list-``detail`` instead. The HANDLER validates membership and owns the refusal. A
+**Contract negotiation (freeze 0F-12).** ``contract_version`` is deliberately UNBOUNDED at the
+FastAPI layer: a ``le=4`` would make the framework reject an unsupported version before the
+handler ran, so the typed ``error_code`` below could never be emitted and the body would be
+FastAPI's list-``detail`` instead. The HANDLER validates membership and owns the refusal. A
 NON-INTEGER value is a different thing — a type failure caught before any handler code runs — and
 keeps FastAPI's native validation error, deliberately outside the typed contract, because faking a
 code we never produced would be worse than an honest framework error.
+
+**E4 cutover (2026-08-14): v4 is the ONLY contract.** Versions 1, 2 and 3 are DELETED, not
+deprecated — asking for one earns the same typed 422 as asking for 99, and the message names the
+set this deployment serves (``[4]``). Nothing is renumbered: v4 keeps its number and its shape, so
+a client that already speaks it needs no change, and a client that spoke v1/v2/v3 gets a refusal
+that tells it exactly what to ask for instead of a body it would silently mis-read. The default is
+v4 for the same reason — an omitted version must resolve to something this deployment can serve.
 
 **One snapshot.** The v2 page is a multi-statement read (resolve, neighbourhood, ground, context),
 and its counts, groups, neighbourhood metadata and revision ids must all describe ONE catalog state.
@@ -67,14 +74,10 @@ from featuregen.overlay.upload.feature_metadata_snapshot import (
 )
 from featuregen.overlay.upload.join_path import MAX_HOPS_CEILING, MAX_HOPS_DEFAULT
 from featuregen.overlay.upload.suggestion_contract import (
-    page_to_json,
     page_to_json_v3,
     unknown_table_page_v2,
 )
-from featuregen.overlay.upload.suggestions import (
-    suggest_features_for_table,
-    suggest_features_page_v2,
-)
+from featuregen.overlay.upload.suggestions import suggest_features_page_v2
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +95,8 @@ _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 # of the multi-query v2 assembly as well as the grounding pass.
 SUGGESTIONS_STATEMENT_TIMEOUT_MS = 30_000
 
-#: The contract versions this deployment serves. v1 stays the DEFAULT for the whole of Release A:
-#: the frontend must ask for v2 deliberately — and v3 (the BR-8 execution-truthfulness page) is
-#: explicit during its whole rollout too, until the BR-24 gates pass.
-SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (1, 2, 3, 4)
+#: The contract versions this deployment serves — exactly one, since the E4 cutover.
+SUPPORTED_CONTRACT_VERSIONS: tuple[int, ...] = (4,)
 
 #: Closed machine-readable error codes emitted by HANDLER-level checks, where the body shape is
 #: actually controllable. Framework validation errors are deliberately not in this vocabulary.
@@ -121,7 +122,7 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# ── v1 wire mirror ──────────────────────────────────────────────────────────────────────────────
+# ── shared wire mirrors ─────────────────────────────────────────────────────────────────────────
 class JoinNeighbourhoodResponse(_Model):
     """What the bounded join widening left out. A screen showing a SUBSET must say so."""
 
@@ -150,49 +151,6 @@ class RecipePartsResponse(_Model):
     grain: str
     window: str
     time: str
-
-
-class SuggestionCardV1Response(_Model):
-    name: str
-    description: str
-    grain_table: str | None
-    validation_status: str
-    requirements: list[RequirementResponse]
-    uses: list[str]
-    binding_quality: str
-    recipe: str
-    recipe_parts: RecipePartsResponse
-
-
-class SuggestionGroupV1Response(_Model):
-    entity_ref: str
-    entity_label: str
-    suggestions: list[SuggestionCardV1Response]
-
-
-class SuggestionRejectionV1Response(_Model):
-    name: str
-    reason: str
-    code: str
-
-
-class SuggestionSummaryV1Response(_Model):
-    suggested: int
-    clean_ready: int
-    needs_review: int
-    entities: int
-
-
-class TableSuggestionsV1Response(_Model):
-    """Today's payload, unchanged. ``table_known`` is a payload STATE, never an error."""
-
-    catalog_source: str
-    table: str
-    table_known: bool
-    summary: SuggestionSummaryV1Response
-    groups: list[SuggestionGroupV1Response]
-    rejections: list[SuggestionRejectionV1Response]
-    neighbourhood: JoinNeighbourhoodResponse
 
 
 # ── v2 wire mirror ──────────────────────────────────────────────────────────────────────────────
@@ -473,18 +431,66 @@ class FeatureSuggestionPageV3Response(FeatureSuggestionPageV2Response):
     output_selection_required_count: int
 
 
-#: Documentation-only: the handler returns plain dicts, so declaring these here publishes both
-#: contracts and the typed error in OpenAPI WITHOUT letting FastAPI re-serialize a v1 body through
-#: a model (which would put the legacy payload's byte stability at the mercy of a schema edit).
+class SemanticEngineVerdictV4Response(_Model):
+    role: str
+    status: str
+    selected_ref: str | None
+    reason_codes: list[str]
+    resolution: str
+
+
+class SemanticEngineCorroborationV4Response(_Model):
+    origin: str
+    source_definition_id: str
+
+
+class SemanticEngineEntryV4Response(_Model):
+    """One engine candidate anchored to this table. ``card`` is the SHARED option carrier (D4,
+    UI-05) — the same projected FeatureIdea the Workbench renders, serialized by gate1's own
+    function — so it is published as a free-form object rather than re-declared here, which
+    would be a second copy of the card model and could drift from the one that ships."""
+
+    card: dict[str, Any] | None
+    recipe_id: str
+    binding_state: str
+    readiness: str
+    review_current: bool
+    planning_request_hash: str
+    verdicts: list[SemanticEngineVerdictV4Response]
+    corroborations: list[SemanticEngineCorroborationV4Response]
+
+
+class SuggestionSemanticBlockV4Response(_Model):
+    """SE-13's parity block: the engine's own answer for this table, over the same frozen
+    context the hypothesis Workbench plans against."""
+
+    semantic_context_hash: str
+    table: str
+    ranked: list[SemanticEngineEntryV4Response]
+    actionable: list[SemanticEngineEntryV4Response]
+    order_basis: str
+
+
+class FeatureSuggestionPageV4Response(FeatureSuggestionPageV3Response):
+    """The ONLY contract this deployment serves: the v3 execution-truthfulness page plus the
+    engine's verdicts. ``contract_version`` is redeclared as 4 — the number is kept, never
+    renumbered, so a client already speaking v4 is unaffected by v1–v3's retirement."""
+
+    contract_version: int
+    semantic: SuggestionSemanticBlockV4Response
+
+
+#: Documentation-only: the handler returns plain dicts, so declaring these here publishes the
+#: contract and the typed error in OpenAPI WITHOUT letting FastAPI re-serialize the body through a
+#: model (which would put the payload's byte stability at the mercy of a schema edit).
 _RESPONSES: dict[int | str, dict[str, Any]] = {
-    200: {"model": (TableSuggestionsV1Response | FeatureSuggestionPageV2Response
-                    | FeatureSuggestionPageV3Response),
-          "description": "The v1 table payload (default), the v2 discovery page "
-                         "(`?contract_version=2`) or the v3 execution-truthfulness page "
-                         "(`?contract_version=3`)."},
+    200: {"model": FeatureSuggestionPageV4Response,
+          "description": "The v4 page: the execution-truthfulness page plus the semantic "
+                         "engine's own verdicts for this table."},
     422: {"model": SuggestionsErrorResponse,
-          "description": "An integer `contract_version` outside the supported set. A non-integer "
-                         "value keeps FastAPI's own validation error, whose `detail` is a list."},
+          "description": "An integer `contract_version` outside the supported set — including "
+                         "the retired 1, 2 and 3. A non-integer value keeps FastAPI's own "
+                         "validation error, whose `detail` is a list."},
 }
 
 
@@ -494,7 +500,7 @@ _RESPONSES: dict[int | str, dict[str, Any]] = {
 def table_suggestions(
     catalog_source: str, table: str, conn: _RRConn, identity: _Identity,
     max_hops: Annotated[int, Query(ge=1, le=MAX_HOPS_CEILING)] = MAX_HOPS_DEFAULT,
-    contract_version: Annotated[int, Query()] = 1,
+    contract_version: Annotated[int, Query()] = 4,
 ) -> Any:
     """This table's suggested features. A table with no suggestions returns the honest empty payload
     — that is a catalog-readiness fact, not a server error — and one this catalog does not hold is
@@ -508,19 +514,18 @@ def table_suggestions(
     WHICH deeper join path to follow is a governed, explicit act that wants its own picker; that UI
     is DEFERRED, and this parameter is the surface it will use.
 
-    ``contract_version`` selects the payload contract, and the refusal below is the FIRST thing the
-    handler does: an unsupported version must not ground a registry, bind a timeout or touch the
-    catalog."""
+    ``contract_version`` selects the payload contract — there is exactly one to select since the
+    E4 cutover — and the refusal below is the FIRST thing the handler does: an unsupported version
+    must not ground a registry, bind a timeout or touch the catalog."""
     if contract_version not in SUPPORTED_CONTRACT_VERSIONS:
         return JSONResponse(status_code=422, content={
             "detail": f"unsupported contract_version {contract_version}; this deployment serves "
                       f"{list(SUPPORTED_CONTRACT_VERSIONS)}",
             "error_code": SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION})
-    # Pre-live simplification (2026-08-11): v3 serves unconditionally — the rollback lever was a
-    # switch guarding a read surface with no production users. Version selection stays explicit
-    # via `contract_version`; the closed SUPPORTED set above is the only gate.
+    # E4 (2026-08-14): there is one contract left to serve, so the only gate above is membership
+    # in the closed SUPPORTED set — no rollback lever, no per-version branch.
     # SET LOCAL is transaction-scoped (the request connection owns the txn), so the bound dies with
-    # the request and covers every statement of the read — including the multi-query v2 assembly.
+    # the request and covers every statement of the read — including the multi-query assembly.
     # SET takes no bound parameters, so the literal is composed — the profiler's own precedent.
     conn.execute(sql.SQL("SET LOCAL statement_timeout = {}")
                  .format(sql.Literal(SUGGESTIONS_STATEMENT_TIMEOUT_MS)))
@@ -531,41 +536,27 @@ def table_suggestions(
     # opaque 500. Mapped to the same retryable 503 `contract.py` already uses — the mapping
     # `_governed_read`'s docstring promises — so the caller learns this is temporary and retryable.
     try:
-        if contract_version in (2, 3, 4):
-            page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
-                                            roles=identity.role_claims, max_hops=max_hops)
-            collection = page.collection
-            logger.info(
-                "suggestions v%s for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
-                contract_version, catalog_source, table, time.monotonic() - started,
-                collection.table_known, len(page.hits), max_hops,
-                dict(collection.omitted_counts))
-            if contract_version == 2:
-                return page_to_json(page)
-            body = page_to_json_v3(page)
-            if contract_version == 4:
-                # SE-13: v4 = v3 + the ENGINE's verdicts for this table — the same lens the
-                # hypothesis Workbench serves from, over the same frozen context, so the two
-                # surfaces cannot disagree about a binding's validity. v3 stays byte-frozen.
-                from featuregen.overlay.upload.suggestions import semantic_parity_block
+        page = suggest_features_page_v2(conn, catalog_source=catalog_source, table=table,
+                                        roles=identity.role_claims, max_hops=max_hops)
+        collection = page.collection
+        logger.info(
+            "suggestions v4 for %s.%s took %.3fs (known=%s, hits=%s, hops=%s, omitted=%s)",
+            catalog_source, table, time.monotonic() - started,
+            collection.table_known, len(page.hits), max_hops,
+            dict(collection.omitted_counts))
+        body = page_to_json_v3(page)
+        # SE-13: v4 = the execution-truthfulness page + the ENGINE's verdicts for this table —
+        # the same lens the hypothesis Workbench serves from, over the same frozen context, so
+        # the two surfaces cannot disagree about a binding's validity.
+        from featuregen.overlay.upload.suggestions import semantic_parity_block
 
-                body["contract_version"] = 4
-                body["semantic"] = semantic_parity_block(
-                    conn, catalog_source=catalog_source, table=table,
-                    roles=identity.role_claims)
-            return body
-        out = suggest_features_for_table(conn, catalog_source=catalog_source, table=table,
-                                         roles=identity.role_claims, max_hops=max_hops)
+        body["contract_version"] = 4
+        body["semantic"] = semantic_parity_block(
+            conn, catalog_source=catalog_source, table=table, roles=identity.role_claims)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
-    logger.info("suggestions for %s.%s took %.3fs (known=%s, suggested=%s, hops=%s, "
-                "neighbours=%s/%s)", catalog_source, table, time.monotonic() - started,
-                out["table_known"], out["summary"]["suggested"], max_hops,
-                out["neighbourhood"]["tables_considered"], out["neighbourhood"]["tables_available"])
-    return out
+    return body
 
 
-__all__ = ["FeatureSuggestionPageV2Response", "FeatureSuggestionPageV3Response",
-           "SuggestionsErrorResponse",
-           "TableSuggestionsV1Response", "router", "suggest_features_for_table",
+__all__ = ["FeatureSuggestionPageV4Response", "SuggestionsErrorResponse", "router",
            "suggest_features_page_v2", "table_suggestions", "unknown_table_page_v2"]

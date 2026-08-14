@@ -4,8 +4,20 @@ import type * as api from '../api'
 // section loads by default in tests that are not about suggestions — table known, nothing
 // suggested, no neighbours, Release A's `on_demand` read with no projection. Tests about the
 // section override it.
-export function suggestionsFixture(): api.FeatureSuggestionPageV2 {
+// E4: the route serves contract v4 only, so the fixture is a v4 page — the v2/v3 fields the
+// dossier reads are unchanged (v4 IS that page plus the declared version, the readiness tally and
+// the engine's semantic block), so no assertion about the dossier moved with it.
+export function suggestionsFixture(): api.FeatureSuggestionPageV4 {
   return {
+    contract_version: 4,
+    readiness_counts: {},
+    semantic: {
+      semantic_context_hash: 'ctx-test',
+      table: 'accounts',
+      ranked: [],
+      actionable: [],
+      order_basis: 'test',
+    },
     read_mode: 'on_demand',
     read_scope_key: 'scope-test',
     projection: null,

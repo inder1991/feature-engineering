@@ -2,8 +2,10 @@
 
 When ``FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1`` and a *narrowing* ``ApplicabilityResult`` is supplied
 for a hypothesis-mode intent, ``_template_candidates`` grounds only the applicability's eligible recipe
-subset (not the whole ``ALL_TEMPLATES`` registry). Everything else — the LLM alternatives, the anchor,
-the persisted snapshot — is unchanged, and the builder NEVER persists the scope (Task 7 owns that).
+subset (not the whole ``ALL_TEMPLATES`` registry). Everything else — the anchor, the persisted
+snapshot — is unchanged, and the builder NEVER persists the scope (Task 7 owns that). (The free-form
+LLM alternatives this suite used to compare against were deleted by the E4 cutover, 2026-08-14; the
+template lens under test here is unchanged by that cutover and still grounds real recipes.)
 
 Behaviour-neutral by default: flag OFF (or ``applicability=None``) grounds ``ALL_TEMPLATES`` exactly as
 today (byte-identical). Definition-mode bypasses scoping entirely. The narrowing is genuine only when
@@ -14,6 +16,7 @@ everything (fail-open asymmetry). See
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen.overlay.upload.contract.test_gate1 import DEFINITION, EXTRACTED_INTENT
 
 import featuregen.overlay.upload.contract.gate1 as gate1
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -45,7 +48,7 @@ def _legacy_scope_mode(monkeypatch):
 def _bank_churn(db):
     # A churn-shaped catalog carrying the concept-tagged columns the retail_churn templates ground on
     # (mirrors tests/.../contract/test_gate1.py::_bank_churn), so there is a non-trivial grounded
-    # "templates" lens and the LLM `avg_balance_90d` also grounds — the two-source model end to end.
+    # "templates" lens to narrow.
     catalog = [
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
          "customer_id"),
@@ -68,11 +71,11 @@ def _bank_churn(db):
 
 def _client() -> FakeLLM:
     """The generation tasks build_considered_set drives (no recognizer entry — recognition is now an
-    explicit API step, not in-flow)."""
+    explicit API step, not in-flow). Since the E4 cutover (2026-08-14) that is the definition-mode
+    anchor's extraction call and the set recommendation; the free-form ``overlay.feature.recommend``
+    generator is deleted and nothing dispatches it."""
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
+        "overlay.feature.intents": FakeResponse(output=EXTRACTED_INTENT),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
@@ -123,9 +126,9 @@ def test_flag_off_applicability_none_is_byte_neutral(db, monkeypatch):
 
     assert _shape(with_none) == _shape(plain)          # every lens + feature name identical
     assert _templates_lens(with_none) == _templates_lens(plain)
-    # a real templates lens grounded (so the comparison is non-trivial) and the LLM proposal survived.
+    # a real templates lens grounded, so the comparison is non-trivial. (It used to also assert the
+    # free-form LLM proposal survived; that generator is gone — E4 cutover, 2026-08-14.)
     assert any(lens == "templates" and names for lens, names in _shape(plain))
-    assert "avg_balance_90d" in {n for _lens, names in _shape(plain) for n in names}
     assert with_none.applicability is None             # nothing carried when none supplied
 
 
@@ -189,13 +192,14 @@ def test_definition_mode_bypasses_scoping(db, monkeypatch):
     result = applicability_result(ConfirmedScope(primary=CHURN))
     assert len(result.eligible_ids) < len(ALL_IDS)     # a narrowing that must NOT apply in definition mode
 
-    intent = submit_intent(hypothesis=HYPOTHESIS,
-                           definition="90-day average balance per customer", actor="ds1")
+    intent = submit_intent(hypothesis=HYPOTHESIS, definition=DEFINITION, actor="ds1")
     assert intent.intake_mode == "definition"
     cs = _build(db, _client(), intent, applicability=result)
 
     assert captured["ids"] == set(ALL_IDS)             # bypass — grounding unchanged vs ALL_TEMPLATES
-    assert cs.anchor is not None and cs.anchor.name == "avg_balance_90d"   # anchor still produced
+    # The anchor is still produced — extracted from the analyst's definition and bound by the engine
+    # since the E4 cutover (2026-08-14), so its NAME is the engine's to assign, not a fixture's.
+    assert cs.anchor is not None
     assert cs.applicability is result                  # carried through regardless of the bypass
 
 

@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 
 import psycopg
 import pytest
+from tests.featuregen.overlay.upload.contract.test_gate1 import DEFINITION, EXTRACTED_INTENT
 
 from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
 from featuregen.events.registry import event_registry
@@ -30,6 +31,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     considered_snapshot_lineage,
 )
 from featuregen.overlay.upload.contract.intake import submit_intent
+from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CATALOG_PROJECTION_UNAVAILABLE,
     CatalogProjectionUnavailable,
@@ -47,11 +49,26 @@ def _rr(db) -> None:
 
 
 def _bank(db) -> None:
-    build_graph(db, "bank", [
-        CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
-        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"),
-        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True),
-        CanonicalRow("bank", "accounts", "churned", "boolean")])
+    """A CONCEPT-TAGGED churn catalog (mirrors test_gate1._bank_churn).
+
+    The plain untagged catalog this suite used to build produced candidates only because the
+    free-form generator invented them over raw columns. That generator is deleted (E4 cutover,
+    2026-08-14), so a considered set now needs a catalog the recipe lens can actually ground on —
+    otherwise there are no candidate refs to snapshot, no options to resolve, and every assertion
+    below would be vacuously about an empty set."""
+    catalog = [
+        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True,
+                      entity="Customer"), "customer_id"),
+        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
+                      currency="USD"), "monetary_stock"),
+        (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow("bank", "accounts", "amount", "numeric", additivity="additive",
+                      currency="USD"), "monetary_flow"),
+        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
+    ]
+    build_graph(db, "bank", [r for r, _ in catalog],
+                concepts={content_hash(r): c for r, c in catalog})
     db.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
         "VALUES ('bank', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
@@ -60,9 +77,9 @@ def _bank(db) -> None:
 
 def _client() -> FakeLLM:
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-             "aggregation": "avg_90d"}]}),
+        # E4 cutover (2026-08-14): the anchor is EXTRACTED as one abstract intent and bound by the
+        # engine — `overlay.feature.recommend` is deleted and nothing dispatches it.
+        "overlay.feature.intents": FakeResponse(output=EXTRACTED_INTENT),
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "monetary", "reasoning": "monetary fits the balance-drop hypothesis"}),
     })
@@ -90,7 +107,7 @@ def test_considered_set_persists_snapshot_lineage_on_repeatable_read(db):
     _rr(db)
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per account", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     cs = build_considered_set(db, intent, _client(), catalog_source="bank",
                               target_ref="public.accounts.churned", now=NOW,
                               generation_run_id="fgr_test_1")
@@ -116,7 +133,7 @@ def test_considered_set_persists_snapshot_lineage_on_repeatable_read(db):
         (row[1], "public.accounts.balance")).fetchone()
     assert n_bal > 0
     # the considered set itself is unchanged by the snapshot (additive)
-    assert cs.anchor is not None and cs.anchor.name == "avg_balance_90d"
+    assert cs.anchor is not None
     revision = db.execute(
         "SELECT considered_revision_id, considered_content_hash "
         "FROM contract_considered WHERE intent_id = %s",
@@ -125,7 +142,7 @@ def test_considered_set_persists_snapshot_lineage_on_repeatable_read(db):
     assert revision == (cs.considered_revision_id, cs.considered_content_hash)
     public, revision_lineage, revision_id, revision_hash = _verified_considered_revision(
         db, intent.intent_id, "fgr_test_1")
-    assert public["anchor"]["name"] == "avg_balance_90d"
+    assert public["anchor"]["name"] == cs.anchor.name   # the served anchor round-trips through the seal
     assert revision_lineage == {
         "generation_run_id": "fgr_test_1",
         "snapshot_id": row[1],
@@ -139,7 +156,7 @@ def test_considered_revision_is_write_once_and_old_run_survives_regeneration(db)
     _bank(db)
     intent = submit_intent(
         hypothesis="customers churn when their balance drops",
-        definition="90-day average balance per account",
+        definition=DEFINITION,
         actor="ds1",
     )
     first = build_considered_set(
@@ -167,7 +184,7 @@ def test_considered_revision_is_write_once_and_old_run_survives_regeneration(db)
     ).fetchone()[0] == 2
     old_public, _lineage, old_id, old_hash = _verified_considered_revision(
         db, intent.intent_id, "fgr_revision_1")
-    assert old_public["anchor"]["name"] == "avg_balance_90d"
+    assert old_public["anchor"]["name"] == first.anchor.name   # the SUPERSEDED revision still serves
     assert (old_id, old_hash) == (
         first.considered_revision_id,
         first.considered_content_hash,
@@ -213,7 +230,7 @@ def test_considered_snapshot_lineage_reloads_server_value(db):
     _rr(db)
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops",
-                           definition="90-day average balance per account", actor="ds1")
+                           definition=DEFINITION, actor="ds1")
     build_considered_set(db, intent, _client(), catalog_source="bank",
                          target_ref="public.accounts.churned", now=NOW,
                          generation_run_id="fgr_reload")

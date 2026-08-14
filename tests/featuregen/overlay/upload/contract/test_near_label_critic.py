@@ -121,10 +121,8 @@ def _churn_catalog(db):
 
 def _gen_client():
     return FakeLLM(script={
-        "overlay.feature.recommend": FakeResponse(output={"features": [
-            {"name": "days_since_last_txn", "derives_from": ["public.accounts.event_ts"],
-             "aggregation": "recency_90d",
-             "description": "days since the customer's last transaction"}]}),
+        # E4 cutover (2026-08-14): `overlay.feature.recommend` is deleted, so the candidates the
+        # critic annotates here all come from the recipe lens grounding on _churn_catalog.
         "overlay.feature.recommend_set": FakeResponse(output={
             "recommended_lens": "temporal", "reasoning": "recency fits the inactivity hypothesis"}),
         NEAR_LABEL_TASK: FakeResponse(
@@ -157,7 +155,14 @@ def test_the_critic_annotates_unconditionally(db):
     assert ideas and all(f.near_label_verdict is not None for f in ideas)
 
 
-def test_flag_on_annotates_origin_blind_and_the_snapshot_round_trips(db, monkeypatch):
+def test_every_surviving_candidate_is_annotated_and_the_snapshot_round_trips(db, monkeypatch):
+    """Annotation, never removal — and the verdict survives the Gate-1 persist.
+
+    This test used to prove ORIGIN-BLINDNESS by naming the free-form LLM twin of a template
+    candidate and asserting both carried verdicts. The E4 cutover (2026-08-14) deleted the free-form
+    generator, so there is only one origin left on this path and that comparison has no second term.
+    What remains — and is what the control actually guarantees — is that EVERY surviving candidate is
+    annotated, that nothing was removed, and that the verdict round-trips through the snapshot."""
     monkeypatch.setenv("FEATUREGEN_NEAR_LABEL_CRITIC", "1")
     _churn_catalog(db)
     intent = _signed_intent(db)
@@ -165,11 +170,7 @@ def test_flag_on_annotates_origin_blind_and_the_snapshot_round_trips(db, monkeyp
                               target_ref="public.accounts.churned", now=NOW)
     ideas = [f for s in cs.alternatives for f in s.features]
     assert ideas
-    # ORIGIN-BLIND: the LLM-proposed near-label twin and the template candidates alike carry
-    # verdicts — the exact gap the owner's decision closed (same feature, same leakage, one flag).
-    llm_idea = next(f for f in ideas if f.name == "days_since_last_txn")
-    assert llm_idea.near_label_verdict == "too_close"
-    assert all(f.near_label_verdict is not None for f in ideas)
+    assert all(f.near_label_verdict == "too_close" for f in ideas)
     # FLAG-ONLY: nothing was removed relative to the flag-off build — annotation, never removal.
     # (Compare against a fresh flag-off build of the same catalog + hypothesis.)
     monkeypatch.delenv("FEATUREGEN_NEAR_LABEL_CRITIC")

@@ -9,9 +9,8 @@ import { NEEDS_VALIDATION, evidence, hit, label, operand, page, text }
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, getTableSuggestionsV2: vi.fn(), getTableSuggestionsV4: vi.fn() }
+  return { ...actual, getTableSuggestionsV4: vi.fn() }
 })
-const getTableSuggestionsV2 = vi.mocked(api.getTableSuggestionsV2)
 const getTableSuggestionsV4 = vi.mocked(api.getTableSuggestionsV4)
 
 const SOURCE = 'core_banking'
@@ -20,14 +19,9 @@ const TABLE = 'public.comp_fin_tran'
 const BASE_SESSION = getSession()
 
 beforeEach(() => {
-  getTableSuggestionsV2.mockReset()
+  // E4: one client, one contract. The step-down default that used to live here went with v2 —
+  // there is no older payload to fall back to, so every case resolves (or refuses) v4 directly.
   getTableSuggestionsV4.mockReset()
-  // Default: the older-backend answer — the screen steps down to v2, so every existing test
-  // keeps exercising the page exactly as before. v4-specific tests override per-case.
-  getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
-    422, 'unsupported contract_version 4; this deployment serves [1, 2, 3]', null,
-    api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
-  ))
   setSession({ user: 'dev', roles: ['data_owner'] })
 })
 afterEach(() => setSession(BASE_SESSION))
@@ -45,14 +39,14 @@ async function openDetail(name: string): Promise<HTMLElement> {
 describe('SuggestedFeaturesScreen', () => {
   // ── the contract it asks for ──────────────────────────────────────────────────────────────────
   it('asks for the v2 discovery contract explicitly, never by sniffing a v1 body', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     await screen.findByText('account_balance_trend_90d')
-    expect(getTableSuggestionsV2).toHaveBeenCalledWith(SOURCE, TABLE)
+    expect(getTableSuggestionsV4).toHaveBeenCalledWith(SOURCE, TABLE)
   })
 
   it('says the deployment does not serve the contract on the typed 422, not "broken"', async () => {
-    getTableSuggestionsV2.mockRejectedValue(new api.ApiError(
+    getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
       422, 'unsupported contract_version 2; this deployment serves [1]', null,
       api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
     ))
@@ -66,7 +60,7 @@ describe('SuggestedFeaturesScreen', () => {
   it('tolerates FastAPI’s native list-detail 422, which carries no error_code', async () => {
     // A NON-integer contract_version fails before the handler runs, so `detail` is a LIST and the
     // typed code is absent. It must degrade to the ordinary error path, never crash.
-    getTableSuggestionsV2.mockRejectedValue(new api.ApiError(
+    getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
       422, 'query.contract_version: Input should be a valid integer',
     ))
     renderScreen()
@@ -77,7 +71,7 @@ describe('SuggestedFeaturesScreen', () => {
   // ── the copy that was load-bearing wrong ──────────────────────────────────────────────────────
   it('counts design checked, never "clean & ready", and explains what design checked is not',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({
+      getTableSuggestionsV4.mockResolvedValue(page({
         summary: { suggested: 14, design_checked: 11, needs_external_validation: 3, groups: 3 },
       }))
       renderScreen()
@@ -99,7 +93,7 @@ describe('SuggestedFeaturesScreen', () => {
     // mechanism. The badge used to speak only when the news was good, so every card carried a
     // paragraph explaining what green did NOT mean. Naming the opposite state makes the axis
     // self-evident, and a label always on screen beats a sentence abandoned by the third card.
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     const checked = (await screen.findByText('account_balance_trend_90d')).closest('li')!
     const review = screen.getByText('customer_inflow_30d').closest('li')!
@@ -117,7 +111,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('names what is MISSING for an unsuggestable table, never an approval that is not a gate',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({
+      getTableSuggestionsV4.mockResolvedValue(page({
         summary: { suggested: 0, design_checked: 0, needs_external_validation: 0, groups: 0 },
         groups: [], rejections: [],
       }, []))
@@ -131,7 +125,7 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('distinguishes suggested from registered in the page copy and on the card badge', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     expect(await screen.findByText(/none of them is in the feature registry/i)).toBeInTheDocument()
     // The generation source moved off the card head into the detail's Classification section
@@ -144,7 +138,7 @@ describe('SuggestedFeaturesScreen', () => {
   // ── the compact card ──────────────────────────────────────────────────────────────────────────
   it('puts name, status, category, meaning, entity/grain, window/time and sources on the card',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       const card = await openDetail('account_balance_trend_90d')
       expect(within(card).getByRole('heading', { name: 'account_balance_trend_90d' }))
@@ -181,7 +175,7 @@ describe('SuggestedFeaturesScreen', () => {
       // by — "is this a duration feature or a ratio?" is the first question, not a footnote.
       // What stays in the detail is the family's ATTRIBUTION (who said so), which is the part
       // that was really too fine-grained for a card.
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       const card = (await screen.findByText('account_balance_trend_90d')).closest('li')!
       expect(within(card).getByText('Balance trend')).toBeInTheDocument()
@@ -192,7 +186,7 @@ describe('SuggestedFeaturesScreen', () => {
   it('lists the first domains and counts the rest rather than growing the card', async () => {
     const many = Array.from({ length: 5 }, (_u, i) =>
       label({ id: `d${i}`, display_name: `Domain ${i}` }))
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({ business_domains: many })]))
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({ business_domains: many })]))
     renderScreen()
     // The compact card no longer previews domains at all, so the old "first three + N more"
     // cap is satisfied by construction. The guarantee that matters -- the card cannot grow with
@@ -211,7 +205,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('renders an absent controlled vocabulary as "not supplied", never as an omitted section',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       const card = await openDetail('account_balance_trend_90d')
       expect(within(card).getByText('Business domains')).toBeInTheDocument()
@@ -222,7 +216,7 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('renders an unclassified recipe and an absent business value honestly', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       feature_category: null, discovery_disposition: 'unclassified', business_value: null,
     })]))
     renderScreen()
@@ -243,7 +237,7 @@ describe('SuggestedFeaturesScreen', () => {
     // Both cards say basis=template_authored. Only the mapping citation distinguishes a taxonomy
     // DERIVATION from a value an author wrote, so a badge that read `basis` would call both the
     // same thing.
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       groups: [{
         entity: label({ id: 'account', display_name: 'account' }),
         contextual_entity_terms: [],
@@ -269,7 +263,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('marks an AI-proposed value as proposed wherever it renders', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       use_cases: [label({
         id: 'attrition', display_name: 'Attrition', basis: 'llm_proposed',
         evidence: [evidence({ producer: 'llm', strength: 'proposed', producer_ref: null })],
@@ -284,7 +278,7 @@ describe('SuggestedFeaturesScreen', () => {
   // ── catalog terms are terms, not controlled labels ────────────────────────────────────────────
   it('shows unmapped catalog wording as catalog terms with authority, never as a business domain',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+      getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
         contextual_domain_terms: [text({ value: 'payments' })],
         contextual_entity_terms: [text({ value: 'counterparty' })],
       })]))
@@ -308,7 +302,7 @@ describe('SuggestedFeaturesScreen', () => {
   // ── limitations, visible without opening anything ─────────────────────────────────────────────
   it('shows missing unit, currency, temporal, grain, join and near-label without opening a drawer',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+      getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
         validation_status: 'NEEDS_EXTERNAL_VALIDATION',
         requirements: [
           { code: 'GRAIN_IS_UNIQUE', operand: [SOURCE, 'public.comp_fin_tran.acct_id'], detail: '' },
@@ -348,7 +342,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('says the same fact once: a requirement the server also raised as a code is not repeated',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       const card = await openDetail('customer_inflow_30d')
       expect(within(card).getAllByRole('listitem').length).toBeGreaterThanOrEqual(1)
@@ -361,7 +355,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('keeps review accountability visually and semantically apart from execution safety',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+      getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
         warnings: [
           { code: 'RELATIONSHIP_UNCONFIRMED', operand_refs: [], detail: 'x' },
           { code: 'RELATIONSHIP_SAFETY_UNPROVEN', operand_refs: [], detail: 'x' },
@@ -384,7 +378,7 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('never relies on colour alone: every limitation row names its class in words', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       warnings: [
         { code: 'SENSITIVE_INPUT', operand_refs: [], detail: 'x' },
         { code: 'PROFILE_PROPOSED', operand_refs: [], detail: 'x' },
@@ -404,7 +398,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('says so explicitly when a suggestion has no limitations at all', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     const card = await openDetail('account_balance_trend_90d')
     // Nothing to list means no limitation rows — the explicit "none recorded" chip lived in the
@@ -414,7 +408,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── the expanded detail ───────────────────────────────────────────────────────────────────────
   it('opens an accessible drawer with every operand, role, dataset and revision', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       operands: [
         operand(),
         operand({
@@ -476,7 +470,7 @@ describe('SuggestedFeaturesScreen', () => {
       // inputs, which is precisely the thing "every input column" promises not to do.
       const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
       try {
-        getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+        getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
           keywords: [text({ value: 'balance' }), text({ value: 'balance' })],
           authoring_notes: [text({ value: 'check the sign' }), text({ value: 'check the sign' })],
           operands: [
@@ -513,7 +507,7 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('renders the honest unavailable state for source datasets and unconsumed context', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     const card = await openDetail('account_balance_trend_90d')
     expect(within(card).getByText('profile unavailable')).toBeInTheDocument()
@@ -524,7 +518,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('reports what the page truncated or withheld instead of quietly shortening it', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       omitted_counts: { operands: 3, use_cases: 2, withheld_missing_trace: 1 },
     }))
     renderScreen()
@@ -539,7 +533,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── currentness ───────────────────────────────────────────────────────────────────────────────
   it('never invents a "current" badge from a null projection', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     const note = await screen.findByTestId('currentness')
     expect(note).toHaveTextContent(/no card claims to be current or stale/i)
@@ -560,7 +554,7 @@ describe('SuggestedFeaturesScreen', () => {
         stale_reason: 'an input table changed since it was built',
         omitted_counts: {},
       }
-      getTableSuggestionsV2.mockResolvedValue(page(
+      getTableSuggestionsV4.mockResolvedValue(page(
         {}, [{ ...hit(), projection }], { read_mode: 'projected', projection },
       ))
       renderScreen()
@@ -578,7 +572,7 @@ describe('SuggestedFeaturesScreen', () => {
   // ── read-only ─────────────────────────────────────────────────────────────────────────────────
   it('is strictly read-only: the only control is a disclosure, never accept/edit/dismiss',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       await screen.findByText('account_balance_trend_90d')
       expect(screen.queryByRole('button', { name: /accept/i })).not.toBeInTheDocument()
@@ -604,7 +598,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('renders the binding-quality signal as the real value, never a fabricated percentage',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page())
+      getTableSuggestionsV4.mockResolvedValue(page())
       renderScreen()
       expect((await screen.findAllByText(/binding exact/i)).length).toBe(2)
       expect(screen.queryByText(/%/)).not.toBeInTheDocument()
@@ -613,48 +607,48 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── read scope: identity is part of the request, not just the URL ─────────────────────────────
   it('clears results and refetches when the session’s visibility claims change', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     await screen.findByText('account_balance_trend_90d')
-    expect(getTableSuggestionsV2).toHaveBeenCalledTimes(1)
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(1)
 
     // The next read never resolves, so the ONLY way the old card could still be on screen is a
     // cache keyed on the URL — which is exactly what this surface forbids.
-    getTableSuggestionsV2.mockReturnValue(new Promise(() => {}))
+    getTableSuggestionsV4.mockReturnValue(new Promise(() => {}))
     await act(async () => {
       setSession({ user: 'dev', roles: ['data_owner', 'pii_reader'] })
     })
     expect(screen.queryByText('account_balance_trend_90d')).not.toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent(/reading what this catalog can build/i)
-    expect(getTableSuggestionsV2).toHaveBeenCalledTimes(2)
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(2)
   })
 
   it('clears results when the authenticated principal changes, not only the roles', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     await screen.findByText('account_balance_trend_90d')
-    getTableSuggestionsV2.mockReturnValue(new Promise(() => {}))
+    getTableSuggestionsV4.mockReturnValue(new Promise(() => {}))
     await act(async () => {
       setSession({ user: 'someone_else', roles: ['data_owner'] })
     })
     expect(screen.queryByText('account_balance_trend_90d')).not.toBeInTheDocument()
-    expect(getTableSuggestionsV2).toHaveBeenCalledTimes(2)
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(2)
   })
 
   it('does not refetch when the same claims are merely reordered', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     setSession({ user: 'dev', roles: ['data_owner', 'pii_reader'] })
     renderScreen()
     await screen.findByText('account_balance_trend_90d')
     await act(async () => {
       setSession({ user: 'dev', roles: ['pii_reader', 'data_owner'] })
     })
-    expect(getTableSuggestionsV2).toHaveBeenCalledTimes(1)
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(1)
   })
 
   // ── accessibility ─────────────────────────────────────────────────────────────────────────────
   it('reaches and operates the disclosure from the keyboard alone', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit()]))
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit()]))
     renderScreen()
     await screen.findByText('account_balance_trend_90d')
     const toggle = screen.getByRole('button', { name: /show full detail/i })
@@ -670,7 +664,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('gives every disclosure a distinct accessible name, and bounds it', async () => {
     const long = `q_${'x'.repeat(400)}`
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       groups: [{
         entity: label({ id: 'account', display_name: 'account' }),
         contextual_entity_terms: [],
@@ -693,7 +687,7 @@ describe('SuggestedFeaturesScreen', () => {
     // is announced on entry. An unbounded catalog display name would make it a 400-character
     // announcement.
     const long = `q_${'x'.repeat(400)}`
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({ display_name: long })]))
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({ display_name: long })]))
     renderScreen()
     const card = (await screen.findByText(long)).closest('li')!
     await userEvent.click(within(card).getByRole('button', { name: /show full detail/i }))
@@ -708,7 +702,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('nests the drawer’s sections UNDER the card heading, never beside it', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit()]))
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit()]))
     renderScreen()
     const card = await openDetail('account_balance_trend_90d')
     // group h2 → card h3 → drawer sections h4: one unbroken outline, so a screen-reader user
@@ -726,7 +720,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('bounds every tooltip while leaving the whole value readable in the detail', async () => {
     const wording = 'w'.repeat(500)
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       contextual_domain_terms: [text({ value: wording })],
       feature_category: label({ id: 'z'.repeat(300) }),
     })]))
@@ -740,7 +734,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('renders catalog and recipe prose as TEXT, never as markup', async () => {
     const hostile = '<img src=x onerror="alert(1)"> & <b>bold</b>'
-    getTableSuggestionsV2.mockResolvedValue(page({}, [hit({
+    getTableSuggestionsV4.mockResolvedValue(page({}, [hit({
       business_interpretation: text({ value: hostile, basis: 'template_authored' }),
     })]))
     renderScreen()
@@ -753,7 +747,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('gives the card a real heading and the group a level above it', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     expect(await screen.findByRole('heading', { level: 2, name: /account features/i }))
       .toBeInTheDocument()
@@ -763,7 +757,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── the states P4 already had, preserved ──────────────────────────────────────────────────────
   it('renders one group per entity: the heading is the entity, the suffix is its column', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     expect(await screen.findByRole('heading', { name: /account features/i })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: /customer features/i })).toBeInTheDocument()
@@ -772,7 +766,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('shows only the column for a group whose entity the catalog could not name', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       summary: { suggested: 1, design_checked: 1, needs_external_validation: 0, groups: 1 },
       groups: [{
         entity: null, contextual_entity_terms: [],
@@ -787,7 +781,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('renders no entity heading for a group with no grain ref at all', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       summary: { suggested: 1, design_checked: 1, needs_external_validation: 0, groups: 0 },
       groups: [{
         entity: null, contextual_entity_terms: [], grain_refs: [], suggestion_ids: ['sug-1'],
@@ -800,7 +794,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('says the table does not exist rather than diagnosing its columns', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       table_known: false,
       summary: { suggested: 0, design_checked: 0, needs_external_validation: 0, groups: 0 },
       groups: [], rejections: [],
@@ -818,7 +812,7 @@ describe('SuggestedFeaturesScreen', () => {
       template_id: `t${i}`, candidate_name: `blocked_${i}`,
       explanation: 'future-leakage risk: no point-in-time column', code: 'NO_POINT_IN_TIME',
     }))
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       summary: { suggested: 1, design_checked: 0, needs_external_validation: 1, groups: 1 },
       groups: [{
         entity: label({ id: 'account', display_name: 'account' }), contextual_entity_terms: [],
@@ -834,7 +828,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   it('treats zero design checked with cards present as the honest normal state, not an error',
     async () => {
-      getTableSuggestionsV2.mockResolvedValue(page({
+      getTableSuggestionsV4.mockResolvedValue(page({
         summary: { suggested: 8, design_checked: 0, needs_external_validation: 8, groups: 1 },
         groups: [{
           entity: label({ id: 'account', display_name: 'account' }), contextual_entity_terms: [],
@@ -850,7 +844,7 @@ describe('SuggestedFeaturesScreen', () => {
     })
 
   it('lists refusals that are not the as-of cause under "Not offered"', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       rejections: [{
         template_id: 'card_util', candidate_name: 'card_utilisation',
         code: 'NO_NUMERIC_MEASURE', explanation: 'no column carries a numeric measure concept',
@@ -863,7 +857,7 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── what the page did NOT look at ─────────────────────────────────────────────────────────────
   it('says how many joined tables it showed of how many exist when it truncated', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       neighbourhood: {
         tables_considered: 20, tables_available: 73, truncated: true, max_hops: 1,
         limit_reason: 'table_cap',
@@ -877,7 +871,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('names the column budget when that is the limit that bit, not the table count', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       neighbourhood: {
         tables_considered: 3, tables_available: 41, truncated: true, max_hops: 1,
         limit_reason: 'column_budget',
@@ -888,7 +882,7 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('states the hop limit even when nothing was truncated', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       neighbourhood: {
         tables_considered: 4, tables_available: 4, truncated: false, max_hops: 1,
         limit_reason: null,
@@ -905,7 +899,7 @@ describe('SuggestedFeaturesScreen', () => {
     // `neighbourhood: null` is an absent fact, not permission to drop the paragraph. Omitting it
     // would turn the empty state below back into "nothing else is buildable here" when the truth
     // is "we did not look" — the exact claim this note exists to prevent.
-    getTableSuggestionsV2.mockResolvedValue(page({ neighbourhood: null }))
+    getTableSuggestionsV4.mockResolvedValue(page({ neighbourhood: null }))
     renderScreen()
     const note = await screen.findByTestId('neighbourhood')
     expect(note).toHaveTextContent(/join neighbourhood was not reported/i)
@@ -913,14 +907,14 @@ describe('SuggestedFeaturesScreen', () => {
   })
 
   it('says so plainly when no confirmed join reaches another table', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+    getTableSuggestionsV4.mockResolvedValue(page())
     renderScreen()
     expect(await screen.findByTestId('neighbourhood'))
       .toHaveTextContent(/no confirmed join reaches another table/i)
   })
 
   it('takes the hop number from the payload rather than assuming one hop', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page({
+    getTableSuggestionsV4.mockResolvedValue(page({
       neighbourhood: {
         tables_considered: 9, tables_available: 9, truncated: false, max_hops: 2,
         limit_reason: null,
@@ -933,13 +927,13 @@ describe('SuggestedFeaturesScreen', () => {
 
   // ── failure surfaces ──────────────────────────────────────────────────────────────────────────
   it('surfaces a load failure honestly', async () => {
-    getTableSuggestionsV2.mockRejectedValue(new api.ApiError(500, 'grounding blew up'))
+    getTableSuggestionsV4.mockRejectedValue(new api.ApiError(500, 'grounding blew up'))
     renderScreen()
     expect(await screen.findByRole('alert')).toHaveTextContent(/grounding blew up/i)
   })
 
   it('names the missing permission on a 403 instead of a blank page or a raw error', async () => {
-    getTableSuggestionsV2.mockRejectedValue(
+    getTableSuggestionsV4.mockRejectedValue(
       new api.ApiError(403, 'requires permission catalog:read'))
     renderScreen()
     expect(await screen.findByText(/don’t have access to feature suggestions/i)).toBeInTheDocument()
@@ -975,12 +969,9 @@ describe('the planning-engine section (contract v4)', () => {
       corroborations: [],
     }],
   }
-  const v4 = () => ({
-    ...page(), contract_version: 4 as const, readiness_counts: {}, semantic: SEMANTIC,
-  }) as unknown as api.FeatureSuggestionPageV4
+  const v4 = () => ({ ...page(), semantic: SEMANTIC })
 
-  it('renders the engine verdicts when the deployment serves v4', async () => {
-    getTableSuggestionsV4.mockReset()
+  it('renders the engine verdicts the one contract always carries', async () => {
     getTableSuggestionsV4.mockResolvedValue(v4())
     renderScreen()
     const section = await screen.findByTestId('semantic-engine')
@@ -991,21 +982,21 @@ describe('the planning-engine section (contract v4)', () => {
     // The undecided recipe shows its NAMED action, never a low rank.
     expect(section).toHaveTextContent('Could be useful if…')
     expect(section).toHaveTextContent('a human confirms the economic role')
-    // v2 was never asked for: v4 answered.
-    expect(getTableSuggestionsV2).not.toHaveBeenCalled()
+    // ONE request: there is no second version to try.
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(1)
   })
 
-  it('steps down to the older page without the section when v4 is refused', async () => {
-    getTableSuggestionsV2.mockResolvedValue(page())
+  it('reports the refusal once — there is no older contract to step down to', async () => {
+    getTableSuggestionsV4.mockRejectedValue(new api.ApiError(
+      422, 'unsupported contract_version 4; this deployment serves []', null,
+      api.SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
+    ))
     renderScreen()
-    await screen.findByText('account_balance_trend_90d')
-    expect(screen.queryByTestId('semantic-engine')).not.toBeInTheDocument()
-    expect(getTableSuggestionsV4).toHaveBeenCalledWith(SOURCE, TABLE)
-    expect(getTableSuggestionsV2).toHaveBeenCalledWith(SOURCE, TABLE)
+    await screen.findByText(/does not serve the discovery contract/i)
+    expect(getTableSuggestionsV4).toHaveBeenCalledTimes(1)
   })
 
   it('hides the section entirely when the engine returned nothing for this table', async () => {
-    getTableSuggestionsV4.mockReset()
     getTableSuggestionsV4.mockResolvedValue({
       ...v4(), semantic: { ...SEMANTIC, ranked: [], actionable: [] },
     })

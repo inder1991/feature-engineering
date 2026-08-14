@@ -1,30 +1,20 @@
 """TASK 7 phase 1 — selection telemetry over HTTP: the north-star metric is a query from day zero.
 
 The report joins what was already durable (every Gate-1 choice row carries its considered snapshot
-+ the chosen option) — no new capture. ORIGIN rides every row (owner decision): recipe vs
-llm_freeform vs user_defined is the two-engine answer nobody could give before. Zero rounds is the
-honest zero report, never a 404.
++ the chosen option) — no new capture. ORIGIN rides every row (owner decision). The E4 cutover
+(2026-08-14) narrowed what the origins can BE: ``llm_freeform`` is gone with the free-form
+generator, so the live vocabulary is ``recipe`` (a registry recipe bound by the engine),
+``llm_intent`` (an abstract intent the model proposed and the SAME binder grounded) and
+``user_defined`` (the analyst's own definition through that same binder). The column still answers
+the question it was built for — which source the human actually picks — over the origins that
+still exist. Zero rounds is the honest zero report, never a 404.
 """
-from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
+from tests.featuregen.api._helpers import AUTH
 
-from featuregen.intake.llm import FakeLLM, FakeResponse
-
-
-def _fake() -> FakeLLM:
-    return FakeLLM(script={
-        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary"}),
-        "overlay.enrich.definition": FakeResponse(output={"definition": "a column"}),
-        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
-        "overlay.feature.recommend": FakeResponse(output={"features": [{
-            "name": "avg_balance_90d", "description": "avg balance",
-            "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d",
-            "grain_table": "accounts"}]}),
-        "overlay.feature.recommend_set": FakeResponse(output={
-            "recommended_lens": "monetary", "reasoning": "fits"}),
-        "overlay.contract.draft": FakeResponse(output={
-            "definition": "Average 90-day balance per account."}),
-        "overlay.contract.critique": FakeResponse(output={"findings": []}),
-    })
+# The governed round is built ONCE, in test_contract: a confirmed churn scope over a catalog whose
+# concepts are human-confirmed, and a hero recipe reviewed at its current revision. Reusing it here
+# keeps this file about the REPORT rather than about re-staging the workflow that produces a choice.
+from tests.featuregen.api.test_contract import HERO, _governed, _round
 
 
 def test_zero_rounds_is_the_honest_zero_report(client):
@@ -33,29 +23,30 @@ def test_zero_rounds_is_the_honest_zero_report(client):
     assert res.json() == {"rounds": 0, "by_origin": {}, "rows": []}
 
 
-def test_a_recorded_gate1_choice_lands_with_its_origin(make_client):
-    client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    cs = client.post("/contract/considered-set", json={
-        "hypothesis": "customers churn when their balance drops",
-        "definition": "90-day average balance per account",
-        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
-    assert cs.status_code == 200
-    intent_id = cs.json()["intent_id"]
+def test_a_recorded_gate1_choice_lands_with_its_origin(make_client, conn, monkeypatch):
+    """A real round: the human picks the engine's recipe card and the report attributes the
+    choice to ``recipe`` — with the recipe id on the row, which is exactly the join the
+    two-engine question used to need and now names the ONE engine's registry entry."""
+    client = _governed(make_client, conn, monkeypatch)
+    body, card = _round(client)
     dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "alternative",
-        "chosen_option_id": "avg_balance_90d", "why": "best fit"}, headers=AUTH)
-    assert dr.status_code == 200
+        "intent_id": body["intent_id"], "chosen_source": "alternative",
+        "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"],
+        "why": "best fit"}, headers=AUTH)
+    assert dr.status_code == 200, dr.text
 
     report = client.get("/contracts/selection-telemetry", headers=AUTH).json()
     assert report["rounds"] == 1
-    assert report["by_origin"]["llm_freeform"]["chosen"] == 1
-    picked = next(r for r in report["rows"] if r["feature_name"] == "avg_balance_90d"
-                  and r["generation_source"] == "llm_freeform")
+    assert report["by_origin"]["recipe"]["chosen"] == 1
+    picked = next(r for r in report["rows"] if r["feature_name"] == card["name"]
+                  and r["generation_source"] == "recipe")
     assert (picked["offered"], picked["chosen"]) == (1, 1)
-    assert picked["recipe_id"] is None
+    assert (picked["recipe_id"] or "").split("@")[0] == HERO
     # every offered-but-unchosen candidate is a row too — rate needs the denominator
     assert all(r["chosen"] <= r["offered"] for r in report["rows"])
+    # And the retired origin never appears: nothing can produce it any more.
+    assert "llm_freeform" not in report["by_origin"]
 
 
 def test_the_report_is_read_gated(client):

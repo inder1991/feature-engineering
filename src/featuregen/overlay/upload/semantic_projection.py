@@ -1,6 +1,6 @@
 """SE-7 — the enforced projection: assembled semantic candidates become Gate-1 candidates.
 
-Under ``semantic_v1`` the recipe lens is SERVED from the semantic engine — frozen context →
+The recipe lens is SERVED from the semantic engine — frozen context →
 capability binder → eligibility fold → assembly — and this module is the seam that turns an
 ``AssembledCandidateV1`` into the exact carriers Gate-1 already speaks (SE-10 step 6: reuse the
 ``FeatureIdea``/``RoleBinding``/``Requirement`` carriers; never a third role-binding structure).

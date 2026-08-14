@@ -110,15 +110,10 @@ data:
   # used. Rollback lever: FEATUREGEN_FEATURE_CONTEXT_VERSION below, NOT this switch — turning this
   # off drops to the thin v1 menu.
   FEATUREGEN_FEATURE_CONTEXT: "1"
-  # SE-7/SE-14 (semantic-eligibility program): the ONE rollout control — a closed three-value
-  # MODE, not a boolean. CUT OVER 2026-08-13 (user steer: pre-live, bring the functionality UP):
-  # semantic_v1 SERVES — the recipe lens comes from the semantic engine (frozen context ->
-  # capability binder -> eligibility fold -> assembly -> typed gauntlet), legacy template
-  # grounding does not run, dispositions describe the V2 universe, observations persist in the
-  # request transaction, and the direct /features/* generation routes refuse with a typed 409.
-  # One-env-var rollback (semantic_shadow / legacy) while live behavior stabilizes; the mode and
-  # the legacy path are DELETED once it holds.
-  FEATUREGEN_SEMANTIC_PLANNING: "semantic_v1"
+  # FEATUREGEN_SEMANTIC_PLANNING was here. E4 (2026-08-14) DELETED the variable rather than
+  # pinning it: the semantic engine is the only pipeline, so the backend now ignores the name
+  # entirely and a deployment that still set it would be describing a choice it does not have.
+  # Rollback is the previous IMAGE, not an env var.
   # Task 2 (router plan): tied grounding bindings follow the warmed LLM verdict instead of
   # alphabetical order. Flipped 2026-08-10 after the shadow phase: 20-verdict disagreement report
   # reviewed (9 disagreements, all SME-endorsed — aggregating recipes re-bind to fixed-AED amounts,

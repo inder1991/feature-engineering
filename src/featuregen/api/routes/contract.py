@@ -116,7 +116,6 @@ from featuregen.overlay.upload.recipe_formula_shadow import (
     declare_expected_run,
     recipe_formula_shadow_enabled,
 )
-from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -789,35 +788,27 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     )
     run_target_ref = (
         sealed_generation.target_ref if sealed_generation is not None else body.target_ref)
-    run_prediction_goal = (
-        sealed_generation.redacted_prediction_goal
-        if sealed_generation is not None else submitted_goal)
     run_feedback = (
         sealed_generation.redacted_feedback
         if sealed_generation is not None else submitted_feedback)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
-    # SE-7 part 4: the mode is resolved ONCE here (the builder never reads env). Under
-    # semantic_v1 the DISPOSITION universe is the V2 registry — the universe that was actually
-    # planned — while the legacy object still feeds the legacy machinery (shadow planner,
-    # scoped-grounding narrowing) untouched. In legacy/shadow the two are the same object.
-    semantic_mode = RecipeRolloutConfig.from_env().semantic_planning
-    # B1: under semantic_v1 an entity-only (cross-catalog) request is REFUSED typed — the
-    # semantic engine plans over one frozen catalog context; until a multi-catalog context is
-    # chartered, an honest refusal beats a silently empty page (the legacy free-form path that
-    # used to fill it no longer runs under the mode).
-    if semantic_mode == "semantic_v1" and body.catalog_source is None:
+    # B1: an entity-only (cross-catalog) request is REFUSED typed — the semantic engine plans
+    # over one frozen catalog context; until a multi-catalog context is chartered, an honest
+    # refusal beats a silently empty page (E4: the legacy free-form path that used to fill it is
+    # deleted, so there is no mode in which this request could be served).
+    if body.catalog_source is None:
         raise HTTPException(status_code=422, detail={
             "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
             "message": "semantic generation plans over ONE catalog; entity-only cross-catalog "
                        "scope is not yet supported — name a catalog_source",
         })
-    if semantic_mode == "semantic_v1":
-        from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
+    # SE-7 part 4: the DISPOSITION universe is the V2 registry — the universe that was actually
+    # planned. The legacy object still feeds the legacy machinery (shadow planner,
+    # scoped-grounding narrowing) untouched.
+    from featuregen.overlay.upload.recipe_planning_lens import v2_applicability_as_result
 
-        disposition_applicability = v2_applicability_as_result(scope)
-    else:
-        disposition_applicability = applicability
+    disposition_applicability = v2_applicability_as_result(scope)
     now = datetime.now(UTC)
     # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
     # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
@@ -829,17 +820,14 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # not proceed on a stale projected view — surfaced as 503 CATALOG_PROJECTION_UNAVAILABLE.
     try:
         cs = build_considered_set(
-            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-            roles=identity.role_claims, target_ref=run_target_ref, objective=run_prediction_goal,
+            conn, intent, client, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=run_target_ref,
             feedback=run_feedback, now=now, applicability=applicability,
             is_live=is_live, target_entity=scope.target_entity,
             generation_run_id=generation_run_id,
-            # SE-7 part 2: the semantic-planning mode, resolved HERE from the rollout config
-            # (the builder never reads env — same discipline as is_live) with the confirmed
-            # scope the V2 lens classifies against. In `legacy` (the frozen default) the
-            # builder ignores both — byte-identical.
+            # The confirmed scope the engine classifies against — with a catalog_source it is
+            # what makes the engine's lens run at all.
             scope=scope,
-            semantic_mode=semantic_mode,
             actor_envelope=identity)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
@@ -862,7 +850,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # keys — no newer semantic field silently leaks into the frozen old contract (pinned).
     if body.contract_version == 2:
         response["contract_version"] = 2
-        response["semantic_planning_mode"] = semantic_mode
+        # E4: `semantic_planning_mode` is GONE from the response, not frozen to "semantic_v1".
+        # It named which of three pipelines answered; there is one pipeline now, so the field
+        # could only ever repeat itself — and a constant that looks like a reading is worse than
+        # no reading. Clients that branched on it have nothing left to branch on.
         # Step 3's audit-drawer provenance: the immutable revision this response was minted
         # from — the address of GET /contract/considered-revisions/{id}/options/{option_id}.
         response["considered_revision_id"] = cs.considered_revision_id
@@ -1106,8 +1097,8 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
     # projection-lagged catalog aborts here → 503 (feature generation never proceeds on a stale view).
     try:
         cs = build_considered_set(
-            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+            conn, intent, client, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=body.target_ref,
             feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e

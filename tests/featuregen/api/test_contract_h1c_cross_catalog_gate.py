@@ -13,6 +13,14 @@ not a rebuild. The confirm-route tests follow the ``chosen_feature`` monkeypatch
 ``test_confirm_route_rechecks_freshness_and_maps_stale_to_409`` (real DB, real /contract/confirm route,
 real H1c gate): a genuine single-catalog draft records the Gate-1 choice, then the SERVER-reconstructed
 chosen feature is overridden to a MULTI-catalog candidate so the span gate fires.
+
+That genuine single-catalog draft is obtained differently since the E4 cutover (2026-08-14). The
+free-form generator that used to hand a deposits upload an ``avg_balance_90d`` anchor is deleted, so
+the only draftable option now comes from the ONE engine over a real ``catalog_source`` +
+``confirmed_scope`` with its activation blockers cleared through their real surfaces — the ritual
+``governed_ready_round`` (test_binding_confirmation) performs. Nothing about the H1c gate under test
+changed: the span is still computed from the SERVER-reconstructed chosen feature, and the multi-catalog
+candidate is still installed by overriding it.
 """
 from __future__ import annotations
 
@@ -21,8 +29,9 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
-from tests.featuregen.api.test_contract import _fake, _intent_id
+from tests.featuregen.api._helpers import AUTH
+from tests.featuregen.api.test_binding_confirmation import governed_ready_round, seal_for_real
+from tests.featuregen.api.test_e2e_walkthrough import _cib, _fake
 
 from featuregen.overlay.upload.contract.gate1 import DraftChoice
 from featuregen.overlay.upload.contract.govern import Contract
@@ -120,20 +129,30 @@ def _configure_valid_artifact(monkeypatch, tmp_path, **overrides) -> None:
     monkeypatch.setenv(ART, str(p))
 
 
-def _prepare_confirm_body(client) -> tuple[str, dict]:
-    """A genuine single-catalog draft (records the Gate-1 choice), returned as a confirm body whose
-    ``derives_pairs`` is REWRITTEN to the multi-catalog set — the confirm match-check compares the body's
-    pairs to the SERVER-reconstructed chosen feature's, so both must be the multi-catalog set."""
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    intent_id = _intent_id(client)
+def _single_catalog_draft(make_client, conn, monkeypatch) -> tuple[object, str, dict]:
+    """A genuine single-catalog draft over the ONE engine: seal for real, clear the hero candidate's
+    activation blockers through their real surfaces, draft it (which records the Gate-1 choice the
+    confirm route requires). Returns ``(client, intent_id, the draft response)``."""
+    seal_for_real(monkeypatch)
+    _cib(conn)
+    client = make_client(_fake())
+    body, card = governed_ready_round(client)
     dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "anchor",
-        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+        "intent_id": body["intent_id"], "chosen_option_id": card["name"],
+        "expected_generation_run_id": body["generation_run_id"], "why": ""}, headers=AUTH)
     assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
+    return client, body["intent_id"], dr.json()
+
+
+def _prepare_confirm_body(make_client, conn, monkeypatch) -> tuple[object, str, dict]:
+    """The single-catalog draft above, returned as a confirm body whose ``derives_pairs`` is REWRITTEN
+    to the multi-catalog set — the confirm match-check compares the body's pairs to the
+    SERVER-reconstructed chosen feature's, so both must be the multi-catalog set."""
+    client, intent_id, dr = _single_catalog_draft(make_client, conn, monkeypatch)
+    draft = dict(dr["draft"])
     draft["intent_id"] = intent_id
     draft["derives_pairs"] = [list(p) for p in MULTI]
-    return intent_id, draft
+    return client, intent_id, draft
 
 
 def _install_multi_chosen(monkeypatch, draft, *, envelope) -> None:
@@ -160,8 +179,7 @@ def test_multi_catalog_no_envelope_flag_off_refused_not_enabled(make_client, con
     join_path. Now it is refused ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``; no contract is authored; the
     permissive ``find_cross_catalog_path`` is provably never invoked."""
     monkeypatch.delenv(FLAG, raising=False)
-    client = make_client(_fake())
-    _, draft = _prepare_confirm_body(client)
+    client, _, draft = _prepare_confirm_body(make_client, conn, monkeypatch)
     calls = _permissive_recorder(monkeypatch)
     _install_multi_chosen(monkeypatch, draft, envelope=None)
     before = conn.execute("SELECT count(*) FROM contract").fetchone()[0]
@@ -182,8 +200,7 @@ def test_multi_catalog_no_envelope_flag_on_approved_still_refused(make_client, c
     monkeypatch.setenv(FLAG, "1")
     monkeypatch.setenv(DEP, "d1")
     _approve(conn)
-    client = make_client(_fake())
-    _, draft = _prepare_confirm_body(client)
+    client, _, draft = _prepare_confirm_body(make_client, conn, monkeypatch)
     calls = _permissive_recorder(monkeypatch)
     _install_multi_chosen(monkeypatch, draft, envelope=None)
 
@@ -201,8 +218,7 @@ def test_multi_catalog_with_envelope_but_not_live_refused(make_client, conn, mon
     monkeypatch.delenv(FLAG, raising=False)   # activation not live
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
-    client = make_client(_fake())
-    _, draft = _prepare_confirm_body(client)
+    client, _, draft = _prepare_confirm_body(make_client, conn, monkeypatch)
     calls = _permissive_recorder(monkeypatch)
     _install_multi_chosen(monkeypatch, draft, envelope=_multi_env())
 
@@ -235,8 +251,7 @@ def test_full_interlock_admits_and_authors_from_envelope_path(make_client, conn,
         return Contract(contract_id="c1", feature_id="f1", feature_name=draft.feature_name, version=1)
 
     monkeypatch.setattr("featuregen.api.routes.contract.confirm_contract", _spy_confirm)
-    client = make_client(_fake())
-    _, draft = _prepare_confirm_body(client)
+    client, _, draft = _prepare_confirm_body(make_client, conn, monkeypatch)
     calls = _permissive_recorder(monkeypatch)
     _install_multi_chosen(monkeypatch, draft, envelope=env)
 
@@ -261,8 +276,7 @@ def test_signed_artifact_absent_fails_closed_even_when_activation_holds(make_cli
     assert cross_catalog_grounding_enabled(conn) is False
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
-    client = make_client(_fake())
-    _, draft = _prepare_confirm_body(client)
+    client, _, draft = _prepare_confirm_body(make_client, conn, monkeypatch)
     calls = _permissive_recorder(monkeypatch)
     _install_multi_chosen(monkeypatch, draft, envelope=_multi_env())
 
@@ -275,17 +289,14 @@ def test_signed_artifact_absent_fails_closed_even_when_activation_holds(make_cli
 # ═══════════════ 6. single-catalog confirm is unaffected (no spurious rejection) ═══════════════
 def test_single_catalog_confirm_unaffected(make_client, conn, monkeypatch):
     """A single-catalog candidate confirms normally — the span gate does not fire (its inputs span ONE
-    catalog), so no ``CROSS_CATALOG_GROUNDING_NOT_ENABLED`` and no enablement query is consulted."""
+    catalog), so no ``CROSS_CATALOG_GROUNDING_NOT_ENABLED`` and no enablement query is consulted. The
+    positive control: nothing here is stubbed, so the engine-served candidate walks the real
+    draft → confirm path end to end."""
     monkeypatch.delenv(FLAG, raising=False)
-    client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    intent_id = _intent_id(client)
-    dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "anchor",
-        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
+    client, intent_id, dr = _single_catalog_draft(make_client, conn, monkeypatch)
+    draft = dict(dr["draft"])
     draft["intent_id"] = intent_id
+    draft["expected_binding_hash"] = dr["binding_hash"]
 
     cr = client.post("/contract/confirm", json=draft, headers=AUTH)
     assert cr.status_code == 200, cr.text   # no spurious H1c rejection on a single-catalog feature
@@ -369,14 +380,8 @@ def test_envelope_spanning_two_catalogs_trips_interlock_even_if_readset_single(
     monkeypatch.delenv(FLAG, raising=False)   # cross-catalog grounding NOT enabled
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
-    client = make_client(_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    intent_id = _intent_id(client)
-    dr = client.post("/contract/draft", json={
-        "intent_id": intent_id, "chosen_source": "anchor",
-        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
+    client, intent_id, dr = _single_catalog_draft(make_client, conn, monkeypatch)
+    draft = dict(dr["draft"])
     draft["intent_id"] = intent_id
     draft["derives_pairs"] = [list(p) for p in SINGLE_READSET]   # read-set is single-catalog
 

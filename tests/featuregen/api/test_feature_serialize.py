@@ -1,20 +1,24 @@
 """Slice 3A-iv Task 3: explicit v1/v2 FeatureIdea serializers.
 
 Flag-OFF (v1) output must be BYTE-IDENTICAL to the pre-Slice-3 dataclass serialization even when the
-new fields carry non-default values — the new fields must NOT leak (spec §8)."""
+new fields carry non-default values — the new fields must NOT leak (spec §8).
+
+These are pure serializer tests. The one route-level case that used to live here (a
+``POST /features/recommend`` round trip proving the rich fields reach the wire) was deleted in
+the E4 cutover (2026-08-14): that route no longer serves anything — it refuses unconditionally
+with 409 ``SEMANTIC_ENFORCED_USE_CONTRACT_PIPELINE`` because the free-form generator behind it
+is gone. The refusal itself is asserted in ``tests/featuregen/api/test_feature_assist.py``, and
+the serializer contract the deleted test really cared about is covered field-by-field below.
+"""
 from __future__ import annotations
 
 import json
-
-from fastapi.testclient import TestClient
-from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
 
 from featuregen.api.feature_serialize import (
     serialize_feature_idea,
     serialize_feature_idea_v1,
     serialize_feature_idea_v2,
 )
-from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.feature_assist import FeatureIdea, Requirement
 
 # The exact key order FastAPI's jsonable_encoder produced for the pre-Slice-3 dataclass (field order:
@@ -136,31 +140,3 @@ def test_grounding_reaches_v2_only_when_the_model_returned_some():
         {"column": "public.accounts.balance", "role": "measure", "why": "monetary, llm/proposed"}]
     v1 = serialize_feature_idea_v1(grounded)
     assert list(v1.keys()) == _PRE_SLICE3_KEYS and "grounding" not in v1
-
-
-def _recommend_fake() -> FakeLLM:
-    return FakeLLM(script={
-        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),
-        "overlay.enrich.definition": FakeResponse(output={"definition": "a business column"}),
-        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
-        "overlay.feature.recommend": FakeResponse(output={"features": [{
-            "name": "avg_balance", "description": "average balance per customer",
-            "derives_from": ["public.accounts.balance"],
-            "aggregation": "avg", "grain_table": "customers"}]}),
-    })
-
-
-def test_recommend_response_carries_the_rich_fields_unconditionally(make_client, monkeypatch):
-    """Pre-live simplification (2026-08-11): FEATUREGEN_FEATURE_CONTEXT retired — the rich
-    Slice-3 shape serves with or without env; deleting the retired var changes nothing."""
-    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
-    client: TestClient = make_client(llm_client=_recommend_fake())
-    upload_csv(client, "deposits", DEPOSITS_CSV)
-    res = client.post("/features/recommend",
-                      json={"objective": "predict churn", "catalog_source": "deposits"},
-                      headers=AUTH)
-    assert res.status_code == 200
-    proposals = res.json()["proposals"]
-    assert len(proposals) == 1
-    for marker in ("validation_status", "operation_kind", "measure_refs", "requirements"):
-        assert marker in proposals[0], marker

@@ -1,10 +1,18 @@
-"""P4 v1 Task 3 — the read-only suggestions route.
+"""The read-only suggestions route.
 
 `GET /catalog/{catalog_source}/tables/{table}/suggestions` exposes
-:func:`overlay.upload.suggestions.suggest_features_for_table` over HTTP. The route's own job is
-exactly three things, and each is tested here: the read GUARD, threading the caller's session roles
-as the READ SCOPE, and passing the engine's payload through unchanged. It is GET-only — v1 writes
-nothing, so there is no verb on this path that could govern or accept anything.
+:func:`overlay.upload.suggestions.suggest_features_page_v2`, projected onto CONTRACT v4, over
+HTTP. The route's own job is exactly three things, and each is tested here: the read GUARD,
+threading the caller's session roles as the READ SCOPE, and passing the engine's payload through
+unchanged. It is GET-only — this surface writes nothing, so there is no verb on this path that
+could govern or accept anything.
+
+E4 CUTOVER (2026-08-14): contract versions 1, 2 and 3 are DELETED. v4 is the only version this
+route serves and the default an omitted `contract_version` resolves to; 1/2/3 now earn the same
+typed 422 as 99, naming `[4]`. The per-version tests below were rewritten accordingly: the ones
+that asserted a v1/v2/v3 BODY are gone with those bodies, and the ones that asserted the ROUTE's
+own behaviour (guard, read scope, hop bound, timeout, GET-only, refusal) moved onto v4 — that
+behaviour never belonged to a version.
 
 The 200 runs the REAL engine over the REAL FTR fixture (`ftr_catalog`, imported from the Task-1
 suite) so the shape asserted here is the shape the engine actually produces, not one this test
@@ -50,14 +58,22 @@ def _h(roles: str = "feature_engineer", user: str = "u") -> dict:
 def _capture(seen: dict):
     """Stand in for the engine and record EVERY argument the route threads into it. A route that
     silently dropped `roles` — or that quietly widened the join neighbourhood past the page default
-    — would still return a perfectly well-shaped 200, so both are asserted at this seam."""
+    — would still return a perfectly well-shaped 200, so both are asserted at this seam.
+
+    Returns the real unknown-table PAGE object (never a hand-rolled dict): the route serializes
+    whatever comes back through `page_to_json_v3`, so a stub of the wrong type would fail as a
+    500 instead of asserting the seam."""
+    from featuregen.overlay.upload.join_path import MAX_HOPS_DEFAULT as _default
+    from featuregen.overlay.upload.suggestion_contract import unknown_table_page_v2
+    from featuregen.overlay.upload.suggestions import JoinNeighbourhood
+
     def _engine(conn, *, catalog_source, table, roles, max_hops):
         seen.update(catalog_source=catalog_source, table=table, roles=roles, max_hops=max_hops)
-        return {"catalog_source": catalog_source, "table": table, "table_known": False,
-                "summary": {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0},
-                "groups": [], "rejections": [],
-                "neighbourhood": {"tables_considered": 0, "tables_available": 0, "truncated": False,
-                                  "max_hops": max_hops, "limit_reason": None}}
+        return unknown_table_page_v2(
+            catalog_source=catalog_source, requested_table=table, roles=roles,
+            neighbourhood=JoinNeighbourhood(
+                tables=(), tables_considered=0, tables_available=0, truncated=False,
+                max_hops=_default if max_hops is None else max_hops, limit_reason=None))
     return _engine
 
 
@@ -74,22 +90,24 @@ def _overlay_env():
 
 
 def test_returns_the_engines_suggestions_for_the_table(client, ftr_catalog):  # noqa: F811
-    """The real payload over HTTP: the engine's counts, entity groups and cards, unchanged."""
+    """The real payload over HTTP with NO version asked for: the default resolves to v4 (the only
+    contract), and it carries the engine's counts, entity groups, cards and semantic block."""
     r = client.get(PATH, headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["catalog_source"] == SOURCE and body["table"] == TABLE
-    summary = body["summary"]
-    assert summary["suggested"] >= 1
-    assert summary["clean_ready"] + summary["needs_review"] == summary["suggested"]
-    assert summary["entities"] == len(body["groups"])
-    group = body["groups"][0]
-    assert group["entity_ref"] and group["entity_label"]
-    card = group["suggestions"][0]
-    assert card["name"] and card["description"]
-    assert card["validation_status"] in ("DESIGN_CHECKED", "NEEDS_EXTERNAL_VALIDATION")
-    assert card["recipe"] and card["recipe_parts"]["operation"]
-    assert card["uses"] and isinstance(card["requirements"], list)
+    assert body["contract_version"] == 4
+    collection = body["collection"]
+    assert collection["anchor_catalog_source"] == SOURCE
+    assert collection["anchor_table_ref"] == TABLE and collection["table_known"] is True
+    summary = collection["summary"]
+    assert summary["suggested"] == len(body["hits"]) >= 1
+    assert summary["design_checked"] + summary["needs_external_validation"] == summary["suggested"]
+    suggestion = body["hits"][0]["suggestion"]
+    assert suggestion["name"] and suggestion["display_name"]
+    assert suggestion["validation_status"] in ("DESIGN_CHECKED", "NEEDS_EXTERNAL_VALIDATION")
+    assert suggestion["recipe"] and suggestion["recipe_parts"]["operation"]
+    assert suggestion["operands"] and isinstance(suggestion["requirements"], list)
+    assert body["semantic"]["table"] == TABLE
 
 
 def test_read_scope_roles_come_from_the_session(client, monkeypatch):
@@ -98,7 +116,7 @@ def test_read_scope_roles_come_from_the_session(client, monkeypatch):
     never a request parameter. Captured at the seam, because a route that silently dropped `roles`
     would still return a perfectly well-shaped 200."""
     seen: dict = {}
-    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
+    monkeypatch.setattr(suggestions_route, "suggest_features_page_v2", _capture(seen))
     r = client.get("/catalog/src/tables/txns/suggestions",
                    headers=_h(roles="feature_engineer,pii_reader"))
     assert r.status_code == 200, r.text
@@ -119,7 +137,7 @@ def test_requires_the_read_permission(client):
 
 
 def test_the_route_is_get_only(client):
-    """v1 is strictly read-only — there is no verb on this path that could accept or govern."""
+    """Strictly read-only — there is no verb on this path that could accept or govern."""
     for method in ("post", "put", "delete"):
         r = getattr(client, method)(PATH, headers=_h())
         assert r.status_code == 405, f"{method} -> {r.status_code}"
@@ -132,11 +150,13 @@ def test_unknown_table_is_reported_as_unknown_not_as_an_empty_catalog(client, ft
     not exist. `table_known` is the fourth state that keeps that message honest."""
     r = client.get(f"/catalog/{SOURCE}/tables/no_such_table/suggestions", headers=_h())
     assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["table_known"] is False
-    assert body["summary"] == {"suggested": 0, "clean_ready": 0, "needs_review": 0, "entities": 0}
-    assert body["groups"] == [] and body["rejections"] == []
-    assert client.get(PATH, headers=_h()).json()["table_known"] is True
+    collection = r.json()["collection"]
+    assert collection["table_known"] is False
+    assert collection["summary"] == {"suggested": 0, "design_checked": 0,
+                                     "needs_external_validation": 0, "groups": 0}
+    assert collection["groups"] == [] and collection["rejections"] == []
+    assert r.json()["hits"] == []
+    assert client.get(PATH, headers=_h()).json()["collection"]["table_known"] is True
 
 
 def test_an_automatic_page_load_gets_the_capped_neighbourhood(client, monkeypatch):
@@ -144,7 +164,7 @@ def test_an_automatic_page_load_gets_the_capped_neighbourhood(client, monkeypatc
     capped default, never the transitive walk. Pinned at the seam, because the widening is invisible
     in the response shape."""
     seen: dict = {}
-    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
+    monkeypatch.setattr(suggestions_route, "suggest_features_page_v2", _capture(seen))
     assert client.get("/catalog/src/tables/txns/suggestions", headers=_h()).status_code == 200
     assert seen["max_hops"] == MAX_HOPS_DEFAULT == 1
 
@@ -155,7 +175,7 @@ def test_a_deliberate_request_may_expand_but_not_without_a_bound(client, monkeyp
     can talk the server back into an unbounded walk. The table cap and column budget apply either
     way, so expansion changes which tables are eligible, never how many are admitted."""
     seen: dict = {}
-    monkeypatch.setattr(suggestions_route, "suggest_features_for_table", _capture(seen))
+    monkeypatch.setattr(suggestions_route, "suggest_features_page_v2", _capture(seen))
     assert client.get("/catalog/src/tables/txns/suggestions?max_hops=2",
                       headers=_h()).status_code == 200
     assert seen["max_hops"] == 2
@@ -169,8 +189,9 @@ def test_the_neighbourhood_metadata_reaches_the_client(client, ftr_catalog):  # 
     """The screen may not silently show a subset, so what the widening left out travels on the
     payload — over HTTP, from the real engine, not just in-process."""
     body = client.get(PATH, headers=_h()).json()
-    assert body["neighbourhood"] == {"tables_considered": 0, "tables_available": 0,
-                                     "truncated": False, "max_hops": 1, "limit_reason": None}
+    assert body["collection"]["neighbourhood"] == {
+        "tables_considered": 0, "tables_available": 0,
+        "truncated": False, "max_hops": 1, "limit_reason": None}
 
 
 def test_the_read_runs_under_a_statement_timeout(client, conn):
@@ -184,46 +205,37 @@ def test_the_read_runs_under_a_statement_timeout(client, conn):
     assert conn.execute("SHOW statement_timeout").fetchone()[0] == "30s"
 
 
-# ── Task 2: per-table contract negotiation (freeze 0F-12) ───────────────────────────────────────
-def test_v1_is_the_default_and_the_explicit_v1_request_is_the_same_bytes(client, ftr_catalog):  # noqa: F811
-    """V1 stays the default for the whole of Release A: an existing client that never learned about
-    `contract_version` sees exactly what it saw before, and asking for v1 explicitly is the same
-    payload — not a re-rendering that happens to agree today."""
+# ── contract negotiation after the E4 cutover (freeze 0F-12, one version left) ─────────────────
+@pytest.mark.parametrize("retired", [1, 2, 3])
+def test_the_retired_contract_versions_are_refused_by_number(client, retired):
+    """v1, v2 and v3 are DELETED, not deprecated: asking for one earns the same typed 422 as
+    asking for 99, and the message names the set this deployment serves so a stale client learns
+    what to ask for instead of silently mis-reading a body it did not expect."""
+    r = client.get(f"{PATH}?contract_version={retired}", headers=_h())
+    assert r.status_code == 422, r.text
+    body = r.json()
+    assert body["error_code"] == "SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION"
+    assert "[4]" in body["detail"] and str(retired) in body["detail"]
+
+
+def test_v4_is_the_default_and_the_explicit_v4_request_is_the_same_bytes(client, ftr_catalog):  # noqa: F811
+    """An omitted version must resolve to something this deployment can serve, and asking for it
+    explicitly must be the SAME payload — not a re-rendering that happens to agree today."""
     implicit = client.get(PATH, headers=_h())
-    explicit = client.get(f"{PATH}?contract_version=1", headers=_h())
+    explicit = client.get(f"{PATH}?contract_version=4", headers=_h())
     assert implicit.status_code == explicit.status_code == 200
     assert implicit.json() == explicit.json()
-    assert set(implicit.json()) == {"catalog_source", "table", "table_known", "summary", "groups",
-                                    "rejections", "neighbourhood"}
 
 
-def test_v2_must_be_asked_for_deliberately(client, ftr_catalog):  # noqa: F811
-    """The frontend opts in; the server never upgrades a caller who did not ask. Release A serves
-    it on demand, so there is no projection to report and no search facets to fill."""
-    body = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
-    assert body["read_mode"] == "on_demand"
-    assert body["projection"] is None and body["facets"] == {} and body["next_cursor"] is None
-    assert body["read_scope_key"]
-    collection = body["collection"]
-    assert collection["anchor_catalog_source"] == SOURCE
-    assert collection["anchor_table_ref"] == TABLE and collection["table_known"] is True
-    assert collection["summary"]["suggested"] == len(body["hits"]) >= 1
-    assert "clean_ready" not in collection["summary"]        # the misleading V1 name is gone
-    suggestion = body["hits"][0]["suggestion"]
-    assert suggestion["schema_version"] == "feature-suggestion-v2"
-    assert suggestion["suggestion_id"] and suggestion["suggestion_revision_id"]
-    assert suggestion["generation_source"] == "recipe"
-
-
-def test_the_v2_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811
+def test_the_v4_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811
     """The OpenAPI model is not decoration: it is validated against the REAL body with unknown keys
     FORBIDDEN, so a field added to the contract without updating the published schema — or a schema
     field the body never sends — fails here rather than misleading a client."""
-    body = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
-    assert suggestions_route.FeatureSuggestionPageV2Response.model_validate(body)
+    body = client.get(PATH, headers=_h()).json()
+    assert suggestions_route.FeatureSuggestionPageV4Response.model_validate(body)
 
 
-def test_the_v2_body_validates_when_a_relationship_warning_is_on_it(
+def test_the_v4_body_validates_when_a_relationship_warning_is_on_it(
         client, conn, join_catalog):  # noqa: F811
     """THE SAME CHECK, OVER A CATALOG THAT HAS JOINS. `ftr_catalog` holds no join edges at all, so
     no relationship warning can reach the model above and the three relationship codes were
@@ -235,14 +247,14 @@ def test_the_v2_body_validates_when_a_relationship_warning_is_on_it(
     relationship) with no cardinality, so both `RELATIONSHIP_UNCONFIRMED` and
     `DIRECTIONAL_CARDINALITY_UNAVAILABLE` are on the page."""
     _join_edge(conn, fact_key=None, status=None, cardinality=None)
-    path = f"/catalog/{_JOIN_SOURCE}/tables/{_MEASURE_TABLE}/suggestions?contract_version=2"
+    path = f"/catalog/{_JOIN_SOURCE}/tables/{_MEASURE_TABLE}/suggestions"
     r = client.get(path, headers=_h())
     assert r.status_code == 200, r.text
     body = r.json()
     warnings = [w for hit in body["hits"] for w in hit["suggestion"]["warnings"]]
     codes = {w["code"] for w in warnings}
     assert {"RELATIONSHIP_UNCONFIRMED", "DIRECTIONAL_CARDINALITY_UNAVAILABLE"} <= codes, codes
-    assert suggestions_route.FeatureSuggestionPageV2Response.model_validate(body)
+    assert suggestions_route.FeatureSuggestionPageV4Response.model_validate(body)
     # ...and, said directly: every entry is a FLAT (catalog_source, ref) pair of strings, one arity
     # for every code on the page.
     for warning in warnings:
@@ -250,26 +262,15 @@ def test_the_v2_body_validates_when_a_relationship_warning_is_on_it(
             assert [type(part) for part in ref] == [str, str], warning
 
 
-def test_the_v1_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811
+def test_the_execution_truth_rides_on_every_hit(client, ftr_catalog):  # noqa: F811
+    """BR-8's execution block, inherited by v4 from the page shape v3 introduced. It is no longer
+    a VERSION a client can ask for, so what is pinned here is that it still travels — and that
+    the page-level tallies still add up to the per-hit facts."""
     body = client.get(PATH, headers=_h()).json()
-    assert suggestions_route.TableSuggestionsV1Response.model_validate(body)
-
-
-def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  # noqa: F811
-    """BR-8. Contract v3 must be asked for deliberately, and what it adds is exactly three things:
-    the page's own declared version, one `execution` block per hit, and the readiness tally. The
-    rest of the page is the v2 payload UNCHANGED — proven by deleting the additions and comparing
-    equal — so v3 can never drift into a re-rendering that happens to agree today."""
-    v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
-    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
-    assert v3["contract_version"] == 3
-    assert set(v3) - set(v2) == {"contract_version", "readiness_counts",
-                                 "output_selection_required_count"}
-
     tally: dict[str, int] = {}
     selection_required = 0
-    for hit in v3["hits"]:
-        block = hit["suggestion"].pop("execution")
+    for hit in body["hits"]:
+        block = hit["suggestion"]["execution"]
         state = block["execution_readiness"]
         tally[state] = tally.get(state, 0) + 1
         selection_required += bool(block["output_selection_required"])
@@ -286,26 +287,18 @@ def test_v3_is_the_v2_page_plus_additive_execution_truth(client, ftr_catalog):  
         assert block["output_selection_required"] == (len(block["v2_replacements"]) > 1)
         assert [r["recipe_id"] for r in block["replacement_readiness"]] \
             == block["v2_replacements"]
-    assert v3["readiness_counts"] == tally and sum(tally.values()) == len(v3["hits"])
-    assert v3["output_selection_required_count"] == selection_required
-
-    del v3["contract_version"], v3["readiness_counts"], v3["output_selection_required_count"]
-    assert v3 == v2
+    assert body["readiness_counts"] == tally and sum(tally.values()) == len(body["hits"])
+    assert body["output_selection_required_count"] == selection_required
 
 
-def test_v4_is_the_v3_page_plus_the_engines_verdicts(client, ftr_catalog):  # noqa: F811
-    """SE-13. Contract v4 must be asked for deliberately, and what it adds is exactly one thing:
-    the `semantic` block — the SAME engine the hypothesis Workbench serves from, run unscoped
-    over the same frozen context and anchored to this table. The v3 payload underneath is
-    UNCHANGED, proven by deleting the addition and comparing equal."""
-    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
+def test_v4_carries_the_engines_verdicts(client, ftr_catalog):  # noqa: F811
+    """SE-13. The `semantic` block — the SAME engine the hypothesis Workbench serves from, run
+    unscoped over the same frozen context and anchored to this table. The equality against a v3
+    body that used to prove it additive went with v3; what remains is every claim about the
+    block's own content, which is what a reader of this page actually depends on."""
     v4 = client.get(f"{PATH}?contract_version=4", headers=_h()).json()
     assert v4["contract_version"] == 4
-    assert set(v4) - set(v3) == {"semantic"}
-
-    semantic = v4.pop("semantic")
-    v4["contract_version"] = 3
-    assert v4 == v3                                           # v3 is byte-frozen under v4
+    semantic = v4["semantic"]
     assert semantic["semantic_context_hash"]
     assert semantic["table"] == TABLE
     assert "review_validity" in semantic["order_basis"] or semantic["order_basis"]
@@ -381,29 +374,10 @@ def test_the_cards_are_the_same_carrier(client, conn, ftr_catalog):  # noqa: F81
             "one candidate, one carrier — the page serves gate1's own serialization"
 
 
-def test_v3_carries_no_semantic_key_ever(client, ftr_catalog):  # noqa: F811
-    v3 = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
-    assert "semantic" not in v3
-
-
-def test_v2_carries_no_execution_key_ever(client, ftr_catalog):  # noqa: F811
-    """The frozen side of BR-8: v1 and v2 clients see not one new byte. The v1 default already has
-    its own byte-stability test above; this pins the v2 page."""
-    v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
-    assert "contract_version" not in v2 and "readiness_counts" not in v2
-    assert all("execution" not in hit["suggestion"] for hit in v2["hits"])
-
-
-def test_the_v3_body_matches_its_declared_response_model_exactly(client, ftr_catalog):  # noqa: F811
-    body = client.get(f"{PATH}?contract_version=3", headers=_h()).json()
-    assert suggestions_route.FeatureSuggestionPageV3Response.model_validate(body)
-
-
-def test_an_unknown_table_stays_a_200_payload_state_in_v2(client, ftr_catalog):  # noqa: F811
-    """The honesty rule survives the new contract: "this catalog does not hold that table" is data,
+def test_an_unknown_table_stays_a_200_payload_state(client, ftr_catalog):  # noqa: F811
+    """The honesty rule survives the cutover: "this catalog does not hold that table" is data,
     never an error, and the requested string is echoed verbatim."""
-    r = client.get(f"/catalog/{SOURCE}/tables/no_such_table/suggestions?contract_version=2",
-                   headers=_h())
+    r = client.get(f"/catalog/{SOURCE}/tables/no_such_table/suggestions", headers=_h())
     assert r.status_code == 200, r.text
     collection = r.json()["collection"]
     assert collection["table_known"] is False
@@ -442,8 +416,6 @@ def test_an_unsupported_version_does_no_work_at_all(client, monkeypatch):
     """The refusal is the FIRST thing the handler does: a rejected version must not ground a
     registry, bind a timeout or touch the catalog."""
     called: list = []
-    monkeypatch.setattr(suggestions_route, "suggest_features_for_table",
-                        lambda *a, **kw: called.append(a))
     monkeypatch.setattr(suggestions_route, "suggest_features_page_v2",
                         lambda *a, **kw: called.append(a))
     assert client.get("/catalog/src/tables/txns/suggestions?contract_version=7",
@@ -451,8 +423,8 @@ def test_an_unsupported_version_does_no_work_at_all(client, monkeypatch):
     assert called == []
 
 
-def test_the_v2_read_threads_the_sessions_own_read_scope(client, monkeypatch):
-    """Same load-bearing constraint as V1, at the new seam: the scope comes from the authenticated
+def test_the_page_read_threads_the_sessions_own_read_scope(client, monkeypatch):
+    """The load-bearing constraint at the page seam: the scope comes from the authenticated
     session's role claims — never a request parameter, and never a client-supplied scope key."""
     seen: dict = {}
 
@@ -463,7 +435,7 @@ def test_the_v2_read_threads_the_sessions_own_read_scope(client, monkeypatch):
             neighbourhood=_zero_neighbourhood())
 
     monkeypatch.setattr(suggestions_route, "suggest_features_page_v2", _engine)
-    r = client.get("/catalog/src/tables/txns/suggestions?contract_version=2",
+    r = client.get("/catalog/src/tables/txns/suggestions",
                    headers=_h(roles="feature_engineer,pii_reader"))
     assert r.status_code == 200, r.text
     assert seen["roles"] == ("feature_engineer", "pii_reader")
@@ -496,10 +468,10 @@ def test_the_read_runs_on_the_repeatable_read_connection(client):
     assert get_feature_gen_conn in set(_calls(route.dependant))
 
 
-def test_the_openapi_operation_publishes_both_contracts_and_the_typed_error(client):
+def test_the_openapi_operation_publishes_the_contract_and_the_typed_error(client):
     """OPENAPI SNAPSHOT. Three claims a client integrates against: the parameter exists and is
-    deliberately unbounded above (so the handler owns the refusal), the 200 advertises BOTH
-    payloads, and the 422 advertises the typed error body."""
+    deliberately unbounded above (so the handler owns the refusal), the 200 advertises the ONE
+    payload, and the 422 advertises the typed error body."""
     spec = client.get("/openapi.json").json()
     operation = spec["paths"]["/catalog/{catalog_source}/tables/{table}/suggestions"]["get"]
     parameters = {p["name"]: p for p in operation["parameters"]}
@@ -513,7 +485,7 @@ def test_the_openapi_operation_publishes_both_contracts_and_the_typed_error(clie
                 if p["in"] == "query"
                 and any(word in name for word in ("scope", "role", "tenant", "visib"))]
     version = parameters["contract_version"]["schema"]
-    assert version.get("default") == 1
+    assert version.get("default") == 4
     assert "maximum" not in version and "exclusiveMaximum" not in version
     assert parameters["max_hops"]["schema"]["maximum"] == MAX_HOPS_CEILING
 
@@ -523,35 +495,20 @@ def test_the_openapi_operation_publishes_both_contracts_and_the_typed_error(clie
     assert set(spec["components"]["schemas"]["SuggestionsErrorResponse"]["properties"]) == {
         "detail", "error_code"}
     published = json.dumps(operation["responses"]["200"])
-    assert "TableSuggestionsV1Response" in published
-    assert "FeatureSuggestionPageV2Response" in published
+    assert "FeatureSuggestionPageV4Response" in published
+    # The retired contracts are not published as servable payloads any more.
+    assert "TableSuggestionsV1Response" not in published
 
 
-def test_the_v2_route_is_still_get_only_and_still_gated(client):
+def test_the_route_is_still_get_only_and_still_gated(client):
     for method in ("post", "put", "delete"):
-        r = getattr(client, method)(f"{PATH}?contract_version=2", headers=_h())
+        r = getattr(client, method)(f"{PATH}?contract_version=4", headers=_h())
         assert r.status_code == 405, f"{method} -> {r.status_code}"
-    assert client.get(f"{PATH}?contract_version=2",
+    assert client.get(f"{PATH}?contract_version=4",
                       headers=_h(roles="access_admin")).status_code == 403
 
 
-def test_the_two_contracts_describe_the_same_read(client, ftr_catalog):  # noqa: F811
-    """The migration guarantee, end to end over HTTP: the V2 page carries every card the V1 payload
-    does, under the same names and the same counts."""
-    v1 = client.get(PATH, headers=_h()).json()
-    v2 = client.get(f"{PATH}?contract_version=2", headers=_h()).json()
-    assert v2["collection"]["summary"]["suggested"] == v1["summary"]["suggested"]
-    assert v2["collection"]["summary"]["design_checked"] == v1["summary"]["clean_ready"]
-    assert v2["collection"]["summary"]["groups"] == v1["summary"]["entities"]
-    assert {h["suggestion"]["name"] for h in v2["hits"]} == {
-        s["name"] for g in v1["groups"] for s in g["suggestions"]}
-    assert [r["code"] for r in v2["collection"]["rejections"]] == [
-        r["code"] for r in v1["rejections"]]
-
-
-@pytest.mark.parametrize("contract_version", [1, 2])
-def test_a_lagged_projection_is_a_retryable_503_not_an_opaque_500(client, monkeypatch,
-                                                                  contract_version):
+def test_a_lagged_projection_is_a_retryable_503_not_an_opaque_500(client, monkeypatch):
     """FROM THE LIVE CLUSTER (2026-08-09): the page showed "Could not load suggestions: Internal
     Server Error" while the backend logged CATALOG_PROJECTION_UNAVAILABLE.
 
@@ -563,19 +520,18 @@ def test_a_lagged_projection_is_a_retryable_503_not_an_opaque_500(client, monkey
 
     `contract.py` already maps this exception to a retryable 503 (the mapping `_governed_read`'s own
     docstring promises: "which the feature-gen route maps to a retryable 503"). This route reaches
-    the identical `_governed_read` and had no such mapping, so BOTH payload contracts are pinned
-    here — v1 and v2 run different engine entrypoints and would have to regress separately.
+    the identical `_governed_read` and had no such mapping. It used to be pinned for v1 AND v2,
+    which ran different engine entrypoints; after the E4 cutover there is one entrypoint left.
     """
     def _lagged(*a, **k):
         raise CatalogProjectionUnavailable(
             CATALOG_PROJECTION_UNAVAILABLE,
             "load-bearing projection 'overlay' is LAGGED: checkpoint 53 < event head 54")
 
-    target = ("suggest_features_page_v2" if contract_version == 2
-              else "suggest_features_for_table")
-    monkeypatch.setattr(f"featuregen.api.routes.suggestions.{target}", _lagged)
+    monkeypatch.setattr(
+        "featuregen.api.routes.suggestions.suggest_features_page_v2", _lagged)
 
-    r = client.get(PATH, params={"contract_version": contract_version}, headers=_h())
+    r = client.get(PATH, headers=_h())
     assert r.status_code == 503
     # The caller must be able to tell WHY, and that waiting is the fix.
     assert "LAGGED" in r.json()["detail"]

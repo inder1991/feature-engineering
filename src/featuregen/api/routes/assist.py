@@ -2,7 +2,6 @@
 separate explicit POST /features (suggestion-then-confirm, spec guardrail)."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
@@ -16,13 +15,7 @@ from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.feature_assist import (
     LeakageWarning,
     Recipe,
-    feature_context_enabled,
-    feature_recipe,
     leakage_check,
-    recommend_feature_sets_report,
-    recommend_features_report,
-    recommend_set,
-    refine_idea,
 )
 
 router = APIRouter()
@@ -51,10 +44,14 @@ class RefineIn(BaseModel):
     candidate: CandidateIn
     instruction: str = Field(min_length=1)
     catalog_source: str | None = None
-    entity: str | None = None
     target_ref: str | None = None
-    # The round's prediction goal. Optional; when present the model revises against the goal the
-    # candidate was generated for, not the instruction alone.
+    # ACCEPTED, NOT CONSUMED (E4, 2026-08-14). The engine's refine revises MEANING and the shared
+    # binder chooses columns from the frozen catalog context, so neither an entity hint nor the
+    # round's prediction goal has anywhere to enter. They stay on the request model because
+    # clients already send them and a removed field would look like a rejected request; they are
+    # documented as inert rather than quietly read, because a field that is threaded and ignored
+    # is the thing this codebase deletes on sight.
+    entity: str | None = None
     objective: str | None = None
 
 
@@ -68,21 +65,20 @@ class LeakageIn(BaseModel):
     target_ref: str
 
 
-def _compatibility_only_guard() -> None:
-    """SE-11 step 5 — the bypass audit's verdict on the direct feature routes: they skip typed
-    intent, confirmed scope, dispositions, and the semantic engine, so they are COMPATIBILITY-
-    ONLY. In enforced semantic mode no public endpoint may remain a bypass around eligibility —
-    the refusal is typed and points at the governed pipeline. In legacy/shadow they serve
-    unchanged, marked, so no client discovers the retirement by surprise at cutover."""
-    from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
+def _refuse_bypass() -> None:
+    """SE-11 step 5, made unconditional by the E4 cutover — the bypass audit's verdict on the
+    direct feature routes: they skip typed intent, confirmed scope, dispositions and the
+    semantic engine, so they were COMPATIBILITY-ONLY and are now closed. No public endpoint may
+    remain a bypass around eligibility, and there is no longer a mode in which one could serve.
 
-    if RecipeRolloutConfig.from_env().semantic_planning == "semantic_v1":
-        raise HTTPException(status_code=409, detail={
-            "code": "SEMANTIC_ENFORCED_USE_CONTRACT_PIPELINE",
-            "message": "direct feature routes are compatibility-only; use "
-                       "POST /contract/considered-set (typed intent + confirmed scope + "
-                       "semantic eligibility)",
-        })
+    The ROUTES stay — a 404 would tell a client it had the wrong address, when the truth is that
+    the address is right and the answer is "not this way any more". The refusal is typed and
+    names where the capability moved."""
+    raise HTTPException(status_code=409, detail={
+        "code": "SEMANTIC_ENFORCED_USE_CONTRACT_PIPELINE",
+        "message": "direct feature routes are retired; use POST /contract/considered-set "
+                   "(typed intent + confirmed scope + semantic eligibility)",
+    })
 
 
 @router.post("/features/recommend", dependencies=[Depends(require_feature_generate)])
@@ -92,24 +88,9 @@ def recommend(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict:
-    # The gauntlet's target-leakage gate runs only when target_ref is passed and its freshness gate
-    # only when `now` is; over HTTP we ALWAYS pass the server clock (and forward optional
-    # target_ref/entity) so those gates are ON — omitting them would silently downgrade safety
-    # (review root-cause A). `actor=identity` so every llm_call this round records is attributed
-    # to the HUMAN who asked, not the fallback service enrichment identity.
-    _compatibility_only_guard()
-    report = recommend_features_report(conn, body.objective, client,
-                                       catalog_source=body.catalog_source,
-                                       roles=identity.role_claims,
-                                       target_ref=body.target_ref, entity=body.entity,
-                                       feedback=body.feedback, now=datetime.now(UTC),
-                                       actor=identity)
-    # Rejections are shown to the human, never hidden: {"name", "reason", "code"} per candidate.
-    feature_context = feature_context_enabled()
-    return {"proposals": [serialize_feature_idea(i, feature_context=feature_context)
-                          for i in report.ideas],
-            "rejections": report.rejections,
-            "compatibility_only": True}
+    """RETIRED (E4). Free-form physical-column proposal was this route's whole content and that
+    generator no longer exists; the typed refusal names the pipeline that replaced it."""
+    _refuse_bypass()
 
 
 @router.post("/features/refine", dependencies=[Depends(require_feature_generate)])
@@ -123,32 +104,18 @@ def refine(
     the revision is data the reviewer acts on, not a server error. The revision stays a proposal;
     registration remains the separate explicit POST /features confirm.
 
-    B9: under semantic_v1 the revision goes through the ENGINE — the model revises the
-    MEANING (one audited intent call seeded with the candidate + the instruction), the shared
-    binder re-binds from scratch, the gauntlet re-validates. The revised card is a PREVIEW:
+    B9: the revision goes through the ENGINE — the model revises the MEANING (one audited intent
+    call seeded with the candidate + the instruction), the shared binder re-binds from scratch,
+    the gauntlet re-validates. This is the ONE direct feature route that survives E4's cutover,
+    because it is no longer a bypass: it plans through the same engine, over one frozen catalog
+    context, and refuses without one. The revised card is a PREVIEW:
     save-idea works on it; GOVERNING it requires a whole-round regenerate, which mints the
     fresh run + superseding revision the governed flow demands (SE-10 step 9)."""
-    from featuregen.overlay.upload.recipe_rollout import RecipeRolloutConfig
-
-    if RecipeRolloutConfig.from_env().semantic_planning == "semantic_v1":
-        if body.catalog_source is None:
-            raise HTTPException(status_code=422, detail={
-                "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
-                "message": "semantic refine plans over one catalog — name a catalog_source"})
-        return _refine_as_intent_revision(conn, body, client, identity)
-    _compatibility_only_guard()
-    revised, rejection = refine_idea(conn, body.candidate.model_dump(), body.instruction, client,
-                                     catalog_source=body.catalog_source,
-                                     roles=identity.role_claims, entity=body.entity,
-                                     target_ref=body.target_ref, now=datetime.now(UTC),
-                                     objective=body.objective, actor=identity)
-    feature_context = feature_context_enabled()
-    if revised is not None:
-        return {"revised": serialize_feature_idea(revised, feature_context=feature_context),
-                "compatibility_only": True}
-    rej = rejection or {}
-    return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))},
-            "compatibility_only": True}
+    if body.catalog_source is None:
+        raise HTTPException(status_code=422, detail={
+            "code": "SEMANTIC_REQUIRES_CATALOG_SOURCE",
+            "message": "semantic refine plans over one catalog — name a catalog_source"})
+    return _refine_as_intent_revision(conn, body, client, identity)
 
 
 def _refine_as_intent_revision(conn, body, client, identity) -> dict:
@@ -170,9 +137,8 @@ def _refine_as_intent_revision(conn, body, client, identity) -> dict:
         "intent (meaning only; a deterministic stage assigns physical data).\n"
         f"Current feature: {candidate.get('name', '')} — {candidate.get('description', '')}\n"
         f"Instruction: {body.instruction}")
-    from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
-
     from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 
     candidates, rejections = llm_intent_candidates(
         conn, client, context=context, scope_leaves=selectable_leaves(),
@@ -203,27 +169,9 @@ def recommend_sets(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict:
-    """One validated set per applicable strategy lens, plus the ADVISORY set recommendation (a
-    fit/coverage judgment, honestly caveated — never a performance claim) and the aggregated
-    gauntlet rejections. Same safety posture as /features/recommend: server clock always on."""
-    _compatibility_only_guard()
-    report = recommend_feature_sets_report(conn, body.objective, client,
-                                           catalog_source=body.catalog_source,
-                                           roles=identity.role_claims,
-                                           target_ref=body.target_ref, entity=body.entity,
-                                           feedback=body.feedback, now=datetime.now(UTC),
-                                           actor=identity)
-    feature_context = feature_context_enabled()
-    sets = [{"lens": s.lens,
-             "features": [serialize_feature_idea(f, feature_context=feature_context)
-                          for f in s.features]}
-            for s in report.sets]
-    # No recommendation over nothing: when every set came back empty there is nothing to advise on,
-    # and we do not spend an LLM call to say so.
-    recommendation = (recommend_set(conn, report.sets, body.objective, client, actor=identity)
-                      if any(s.features for s in report.sets) else None)
-    return {"sets": sets, "recommendation": recommendation, "rejections": report.rejections,
-            "compatibility_only": True}
+    """RETIRED (E4). The multi-lens free-form generator this served is deleted; the considered
+    set is now built by the semantic engine behind a confirmed scope."""
+    _refuse_bypass()
 
 
 @router.post("/features/recipe", dependencies=[Depends(require_feature_generate)])
@@ -233,10 +181,8 @@ def recipe(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> Recipe:
-    _compatibility_only_guard()
-    return feature_recipe(conn, body.query, client,
-                          catalog_source=body.catalog_source, roles=identity.role_claims,
-                          actor=identity)
+    """RETIRED (E4) — a free-form NL-to-recipe bypass around typed intent and eligibility."""
+    _refuse_bypass()
 
 
 @router.post("/features/leakage-check", dependencies=[Depends(require_feature_generate)])

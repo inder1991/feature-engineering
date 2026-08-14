@@ -4,7 +4,7 @@ import {
   type AssetIdentity,
   type FeatureSuggestionPageV2,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION,
-  getTableSuggestionsV2,
+  getTableSuggestionsV4,
 } from '../api'
 import { useIdentityKey } from '../session'
 
@@ -26,8 +26,14 @@ export type SuggestionsOutcome =
 const SCOPE_SEP = String.fromCharCode(0)
 
 // Lifted out of the recommendations section so the summary strip and the card read ONE fetch.
-// Two components each calling getTableSuggestionsV2 would double the request and could disagree
-// with each other on screen while one of them was still in flight.
+// Two components each calling the route would double the request and could disagree with each
+// other on screen while one of them was still in flight.
+//
+// E4 (2026-08-14): reads contract v4, the only one the route serves. The page shape this screen
+// consumes (`collection.summary`, `hits[].suggestion.operands`) is unchanged — v4 IS the v3/v2
+// page plus the semantic block — so the dossier reads exactly what it always read; only the
+// version it asks for moved. There is no step-down: a server that refuses v4 has no older
+// contract left to offer, and saying "unsupported" is the honest answer.
 export function useColumnSuggestions(source: string, identity: AssetIdentity | null) {
   // A table asset has `table` set too, but suggestions bind COLUMN operands, so the match set is
   // empty by construction. Gate on the anchor being a column: otherwise the table page pays for a
@@ -55,7 +61,7 @@ export function useColumnSuggestions(source: string, identity: AssetIdentity | n
       if (live) setResult({ key: requestKey, outcome: o })
     }
     settle({ kind: 'loading' })
-    getTableSuggestionsV2(source, table)
+    getTableSuggestionsV4(source, table)
       .then(body => settle({ kind: 'ok', page: body }))
       .catch((e: unknown) => {
         if (e instanceof ApiError && e.status === 403) settle({ kind: 'forbidden' })

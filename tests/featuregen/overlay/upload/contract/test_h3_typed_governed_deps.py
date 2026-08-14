@@ -12,31 +12,27 @@ hashes the RIGHT authoritative state — the bridge's VERIFIED sanction in ``ent
 realization's cardinality/authority in ``graph_edge`` (mirroring the ``joinedge:`` pattern). They RESOLVE
 at confirm (no poison → PROMOTABLE) and CHANGE on bridge-revocation / join-key drift (DETECTABLE).
 
-The headline proof drives the REAL route (considered-set → draft → confirm, the envelope→ordered_path
-rewrite), NOT an empty join_path.
+The headline proofs confirm over the SERVER's real ``envelope→ordered_path`` rewrite
+(``_envelope_join_path`` applied to the compiled plan), NOT an empty join_path — that non-vacuity is
+what makes the read-gate coverage real.
+
+They used to drive that rewrite over HTTP (considered-set → draft → confirm). The E4 cutover
+(2026-08-14) closed that door: ``/contract/considered-set`` now answers a confirmed scope with no
+``catalog_source`` — the entity-only shape every cross-catalog run has — with a typed 422
+``SEMANTIC_REQUIRES_CATALOG_SOURCE``, because the semantic engine plans over ONE frozen catalog
+context and the free-form path that used to fill an entity-only page is deleted. A governed
+cross-catalog considered set is therefore unreachable over HTTP, and these tests exercise the same
+transform one layer down, where it still lives.
 """
 from __future__ import annotations
 
 from dataclasses import replace
 
 import pytest
-from fastapi.testclient import TestClient
-from tests.featuregen.api._helpers import AUTH
-from tests.featuregen.api.test_contract_live_cross_catalog import (
-    DEP,
-    FLAG,
-    _approve,
-    _flow_llm,
-    _fresh_now,
-    _governed_scoped_body,
-    _inject_fixture_template,
-)
 from tests.featuregen.overlay.upload.contract.test_h3c_governed_lineage import _governed_draft
 from tests.featuregen.overlay.upload.planner.test_plan import _NOW, _txn_template
 from tests.featuregen.overlay.upload.planner.test_shadow_capture import _cross_seed
 
-from featuregen.api.app import create_app
-from featuregen.api.deps import get_conn, get_feature_gen_conn
 from featuregen.overlay.upload.catalog_realizations import derive_catalog_realizations
 from featuregen.overlay.upload.contract.author import ContractDraft, _envelope_join_path
 from featuregen.overlay.upload.contract.gate1 import _governed_cross_catalog_options
@@ -74,74 +70,42 @@ _HEALTHY_VERIFIED_ITEM_HASH = (
     "30ca22189daa8e95e577cb95376ad6ff3100aa34d6901490a40c8db1e4e664ce")
 
 
-@pytest.fixture
-def client(db, monkeypatch):
-    """A TestClient on the suite's rolled-back connection (mirrors test_no_permissive_path_when_live)."""
-    monkeypatch.setenv("FEATUREGEN_AUTH_STUB", "1")
-    # This governed-dependency suite isolates H3 behavior; recognition lineage is covered by
-    # Delivery 0 API tests and remains required by default in production.
-    monkeypatch.setenv("FEATUREGEN_SCOPE_EXECUTION_MODE", "legacy_unscoped")
-    app = create_app(llm_client=_flow_llm())
-
-    def _test_conn():
-        yield db
-
-    app.dependency_overrides[get_conn] = _test_conn
-    app.dependency_overrides[get_feature_gen_conn] = _test_conn
-    with TestClient(app) as c:
-        yield c
-
-
-def _enable_live(db, monkeypatch) -> None:
-    monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv(DEP, "d1")
-    _approve(db)
-
-
-def _inject_confirm_template(monkeypatch) -> None:
-    """The route's ``/contract/confirm`` rebuilds the pinned governed plan through
-    ``revalidate_governed_plan``, which falls back to the production ``ALL_TEMPLATES`` registry. In
-    production the recipe IS in that registry; the planner-fixture recipe (``t_roll``) is not, so — with
-    the I-2 fail-closed on a not-rebuildable plan — the confirm would 409. Inject the fixture recipe into
-    the registry the confirm-time rebuild reads, exactly as ``_inject_fixture_template`` does for the
-    considered-set stage, so the confirm REBUILDS + revalidates (the production path) and records the full
-    read-set lineage."""
-    monkeypatch.setattr("featuregen.overlay.upload.contract.governed_plan.ALL_TEMPLATES",
-                        (_txn_template(),))
-
-
 def _deps(db, contract_id):
     return {(r[0], r[1]) for r in db.execute(
         "SELECT catalog_source, logical_ref FROM contract_metadata_dependency WHERE contract_id = %s",
         (contract_id,)).fetchall()}
 
 
-# ══════════ HEADLINE — the FULL route: promotable (poison gone) + bridge-revocation downgrade ══════════
-def test_route_governed_confirm_is_promotable_and_bridge_revocation_downgrades(client, db, monkeypatch):
-    """Over the REAL route (considered-set → draft → confirm, the envelope→ordered_path rewrite): the
-    governed cross-catalog contract's bridge segment is recorded as a ``bridgefact:`` TYPED marker (NOT a
-    raw ``bfk_*`` graph_node), so at confirm the read gate RESOLVES it (no poison) — the contract is
-    PROMOTABLE. Rejecting the authoritative bridge lifecycle drifts the marker even when its stale
-    projection row survives → a promoted stamp HARD-downgrades."""
-    _enable_live(db, monkeypatch)
+def _governed_confirm(db):
+    """Plan the governed cross-catalog roll-up and confirm it over the SERVER's own
+    envelope→ordered_path rewrite — ``_envelope_join_path`` is the exact transform
+    ``routes/contract.py`` applies to the compiled plan before drafting, so the confirmed contract
+    records the same full read set an HTTP confirm would. Returns (contract_id, envelope)."""
     _cross_seed(db)                      # ops + rev + a VERIFIED bridge → a resolvable cross-catalog plan
-    _fresh_now(db, "ops", "rev")
-    _inject_fixture_template(monkeypatch)
-    _inject_confirm_template(monkeypatch)
+    ideas, rejections = _governed_cross_catalog_options(
+        db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
+        now=_NOW, templates=(_txn_template(),))
+    assert len(ideas) == 1, rejections
+    env = ideas[0].plan_envelope
+    draft = replace(_governed_draft(), join_path=tuple(_envelope_join_path(env.ordered_path)))
+    contract = confirm_contract(db, draft, actor="ds1", roles=(), now=_NOW,
+                                plan_envelope=env, templates=(_txn_template(),))
+    return contract.contract_id, env
 
-    res = client.post("/contract/considered-set", json=_governed_scoped_body(), headers=AUTH)
-    assert res.status_code == 200, res.text
-    body = res.json()
-    dr = client.post("/contract/draft", json={
-        "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "governed cross-catalog",
-        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
-    draft["intent_id"] = body["intent_id"]
-    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
-    assert cr.status_code == 200, cr.text
-    cid = cr.json()["contract_id"]
+
+# ══════════ HEADLINE — a governed confirm is promotable (poison gone) + bridge-revocation downgrades ═══
+def test_governed_confirm_is_promotable_and_bridge_revocation_downgrades(db):
+    """Over the server's real envelope→ordered_path rewrite: the governed cross-catalog contract's
+    bridge segment is recorded as a ``bridgefact:`` TYPED marker (NOT a raw ``bfk_*`` graph_node), so
+    at confirm the read gate RESOLVES it (no poison) — the contract is PROMOTABLE. Rejecting the
+    authoritative bridge lifecycle drifts the marker even when its stale projection row survives → a
+    promoted stamp HARD-downgrades.
+
+    Driven at the govern layer rather than over HTTP: since the E4 cutover (2026-08-14) an
+    entity-only considered set — the only shape a cross-catalog run has — is refused 422 at the
+    route, so there is no HTTP path to a governed cross-catalog draft. The transform under test is
+    unchanged; only the caller moved."""
+    cid, _env = _governed_confirm(db)
 
     # the bridge segment is a TYPED marker dep, NOT a raw bfk graph_node dep (the poison ref).
     deps = _deps(db, cid)
@@ -165,28 +129,13 @@ def test_route_governed_confirm_is_promotable_and_bridge_revocation_downgrades(c
     assert contract_read_status(db, cid) == _DOWNGRADED
 
 
-def test_route_governed_confirm_join_key_retype_downgrades(client, db, monkeypatch):
-    """Same REAL-route governed confirm: retyping a physical JOIN KEY the plan reads drifts its read-set
-    graph_node dep → a promoted stamp HARD-downgrades (the C-1 join-key coverage, now non-vacuous because
-    the confirm is over the route's real ordered_path, not an empty join_path)."""
-    _enable_live(db, monkeypatch)
-    _cross_seed(db)
-    _fresh_now(db, "ops", "rev")
-    _inject_fixture_template(monkeypatch)
-    _inject_confirm_template(monkeypatch)
-    res = client.post("/contract/considered-set", json=_governed_scoped_body(), headers=AUTH)
-    assert res.status_code == 200, res.text
-    body = res.json()
-    dr = client.post("/contract/draft", json={
-        "intent_id": body["intent_id"], "chosen_source": "alternative",
-        "chosen_option_id": "t_roll", "why": "",
-        "expected_generation_run_id": body["generation_run_id"]}, headers=AUTH)
-    assert dr.status_code == 200, dr.text
-    draft = dr.json()["draft"]
-    draft["intent_id"] = body["intent_id"]
-    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
-    assert cr.status_code == 200, cr.text
-    cid = cr.json()["contract_id"]
+def test_governed_confirm_join_key_retype_downgrades(db):
+    """Same governed confirm: retyping a physical JOIN KEY the plan reads drifts its read-set
+    graph_node dep → a promoted stamp HARD-downgrades (the C-1 join-key coverage, non-vacuous because
+    the confirm carries the server's real ordered_path, not an empty join_path). Driven at the govern
+    layer for the reason given above — the route refuses the entity-only request since the E4 cutover
+    (2026-08-14)."""
+    cid, _env = _governed_confirm(db)
 
     assert ("ops", "public.transactions.account_id") in _deps(db, cid)   # a recorded join key
     assert dependencies_drifted(db, cid) is False
@@ -200,25 +149,17 @@ def test_route_governed_confirm_join_key_retype_downgrades(client, db, monkeypat
 
 # ══════════ govern-level: the route rewrite records a bridgefact marker that RESOLVES then drifts ══════
 def test_govern_bridge_marker_resolves_at_confirm_then_drifts_on_revocation(db):
-    """The govern layer applied to the SERVER route rewrite (``_envelope_join_path`` on the compiled
-    ordered_path — the exact transform ``routes/contract.py`` applies): the confirmed governed contract's
-    bridge segment lands as a ``bridgefact:`` dep, ``dependencies_drifted`` is False at confirm (RESOLVES,
-    no poison), and authoritatively rejecting the bridge flips it True even if the projection remains."""
-    _cross_seed(db)
-    ideas, rej = _governed_cross_catalog_options(
-        db, target_entity="account", eligible_recipe_ids=frozenset({"t_roll"}), roles=(),
-        now=_NOW, templates=(_txn_template(),))
-    assert len(ideas) == 1, rej
-    env = ideas[0].plan_envelope
-    draft = replace(_governed_draft(), join_path=tuple(_envelope_join_path(env.ordered_path)))
-    c = confirm_contract(db, draft, actor="ds1", roles=(), now=_NOW,
-                         plan_envelope=env, templates=(_txn_template(),))
-    assert ("rev", "bridgefact:bfk_cap") in _deps(db, c.contract_id)   # TYPED marker recorded
-    assert dependencies_drifted(db, c.contract_id) is False            # RESOLVES at confirm (no poison)
+    """The EXACT marker, named. The headline above proves the read gate's promoted-stamp fold; this
+    pins the dependency row it folds over — ``rev``'s ``bridgefact:bfk_cap``, resolving at confirm
+    (no poison) and drifting when the bridge is authoritatively rejected even though its projection
+    row survives."""
+    cid, _env = _governed_confirm(db)
+    assert ("rev", "bridgefact:bfk_cap") in _deps(db, cid)   # TYPED marker recorded
+    assert dependencies_drifted(db, cid) is False            # RESOLVES at confirm (no poison)
     _draft_bridge(db, "bfk_cap", status="REJECTED")
     assert db.execute(
         "SELECT count(*) FROM entity_bridge_edge WHERE fact_key='bfk_cap'").fetchone()[0] == 1
-    assert dependencies_drifted(db, c.contract_id) is True             # revocation → drift
+    assert dependencies_drifted(db, cid) is True             # revocation → drift
 
 
 # ══════════ resolver unit tests — the bridge/realization signatures hash the RIGHT state ══════════════

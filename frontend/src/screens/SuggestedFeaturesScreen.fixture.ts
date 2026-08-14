@@ -159,12 +159,26 @@ export const NEEDS_VALIDATION = hit({
   })],
 })
 
+// E4: the route serves ONE contract, so the fixture builds a v4 page. The engine block is EMPTY
+// by default — the honest shape for a table the engine found nothing on — and the engine cases
+// override it, which keeps every page-level assertion below about the page and not the engine.
+export const EMPTY_SEMANTIC: api.SuggestionSemanticBlock = {
+  semantic_context_hash: 'ctx-fixture',
+  table: TABLE,
+  ranked: [],
+  actionable: [],
+  order_basis: 'fixture',
+}
+
 export function page(
   overCollection: Partial<api.SuggestionCollectionContextV2> = {},
   hits: api.FeatureSuggestionHit[] = [hit(), NEEDS_VALIDATION],
-  overPage: Partial<api.FeatureSuggestionPageV2> = {},
-): api.FeatureSuggestionPageV2 {
+  overPage: Partial<api.FeatureSuggestionPageV4> = {},
+): api.FeatureSuggestionPageV4 {
   return {
+    contract_version: 4,
+    readiness_counts: {},
+    semantic: EMPTY_SEMANTIC,
     read_mode: 'on_demand',
     read_scope_key: 'scope-abc',
     projection: null,

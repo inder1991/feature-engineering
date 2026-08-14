@@ -16,9 +16,10 @@ The hypothesis workflow's recipe source becomes the ATOMIC V2 registry, directly
   temporal contract (or its named blocker), the authored readiness, and the BR-23 review
   validity AT the recipe's current revision.
 
-What this module deliberately does NOT do (part 2, the gate1 wiring): project candidates into
-`FeatureIdea`, mint options, or touch the considered set. Nothing imports this module until the
-`FEATUREGEN_SEMANTIC_PLANNING` mode selects it — landing it is byte-identical to today.
+What this module deliberately does NOT do: project candidates into `FeatureIdea`, mint options,
+or touch the considered set — that is `semantic_projection` and the gate1 wiring. Since the E4
+cutover (2026-08-14) this lens is not selected by anything: it is the ONLY recipe lens the
+hypothesis path has, called unconditionally.
 
 The Tranche-1 per-recipe column load is GONE (SE-5 full): when a frozen context is supplied,
 binding runs through `bind_planning_request` — shortlists from the context's concept index,
@@ -139,9 +140,9 @@ def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
 
 
 def v2_applicability_as_result(scope: ConfirmedScope):
-    """The V2 classification in the LEGACY ``ApplicabilityResult`` carrier — so under
-    ``semantic_v1`` the disposition lens folds the universe that was actually planned (the V2
-    registry), not the legacy one, without growing a second disposition path. Reason codes use
+    """The V2 classification in the LEGACY ``ApplicabilityResult`` carrier — so the disposition
+    lens folds the universe that was actually planned (the V2 registry), not the legacy one,
+    without growing a second disposition path. Reason codes use
     the lens's own vocabulary (the placement is decided by authored objectives here, never by
     the legacy crosswalk)."""
     from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
