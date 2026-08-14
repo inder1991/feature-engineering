@@ -204,6 +204,10 @@ string matching.**
   is called in exactly two places, `suggestion_contract.py:1640` and `taxonomy/coverage.py:80`.
   **It is not called on the semantic engine's serving path at all**; `V2RecipeCandidateV1.readiness`
   carries the *authored literal* from the registry.
+  **Closed by A6 (2026-08-14):** the lens now folds, both former callers route through the one
+  `fold_definition_readiness`, and the authored literal is checked against the fold at import.
+  What remains for C3 is the *durable-write* re-fold in `assemble_current_activation_state`,
+  whose `effective_readiness` is still `frozen.readiness`.
 
 ### 0.3 The four activation codes that must flip
 
@@ -1038,6 +1042,83 @@ claiming `FORMULA_AUTHORABLE` that folds to `FORMULA_BLOCKED` is a `RecipeContra
 - `test_readiness_moves_when_an_expectation_is_registered` — the monotonicity `fold_readiness`
   promises, observed through the serving path.
 - Pin the **new** readiness distribution (the §0.2 counts will move; the number is evidence).
+
+> **ACCEPTED `PENDING-A6` (2026-08-14).** `fold_readiness` is now called on the serving path, and
+> the authored `readiness=` literal is an assertion the registry checks against it at import.
+>
+> **THE DISTRIBUTION DID NOT MOVE, AND THAT IS THE MEASUREMENT.** The task says *"the §0.2 counts
+> will move; the number is evidence"*. Measured: **295 `FORMULA_BLOCKED` / 19 `CONCEPTUAL_ONLY` /
+> 3 `FORMULA_AUTHORABLE` → 295 / 19 / 3.** Not merely the same totals — the same answer *recipe
+> for recipe*, all 317, with zero disagreements (`test_the_registry_readiness_distribution_is_pinned`
+> asserts the empty difference set, not just the counts). The registry has never drifted from its
+> own declarations, which is a real result about 317 hand-authored definitions and is the
+> opposite of what the plan expected. It also means the import-time law lands green rather than
+> as a migration.
+>
+> **What IS new at registry level is the blocker vocabulary, which nothing served before:**
+> `no_reviewed_formula_expectation` 295 · `model_feature_spec_owns_readiness` 8 (the governed
+> model outputs — BR-7A owns their states) · `gold_evaluation_unproven` 3 (the anchors, resting
+> at `FORMULA_AUTHORABLE`). Pinned in `EXPECTED_REGISTRY_BLOCKERS`.
+>
+> **The number that DOES move is the SERVED candidate's, and it moves per catalog.**
+> `posted_debit_amount` is the one recipe the registry authors `FORMULA_AUTHORABLE`; against a
+> catalog where not one operand binds it used to serve that literal anyway. It now serves
+> `FORMULA_BLOCKED` with `REQUIRED_OPERAND_MISSING` — **the first time a BR-5 operand verdict has
+> ever reached the readiness ladder.** That is the behaviour A6 bought, and it is asserted
+> directly (`test_a_candidate_that_did_not_bind_is_no_longer_served_its_authored_literal`).
+> Registering an expectation for a candidate whose operands still did not bind does **not** lift
+> it — monotonicity clears one blocker, it does not promote.
+>
+> **The three inputs the task left as `…`, decided and justified — `fold_definition_readiness`
+> states them ONCE so no surface can answer differently:**
+> (a) **`grammar_verdict="ok"`.** BR-6's `classify_formula_capability_v2` classifies a
+> *proposal*, and no proposal exists at serving time or at import. Reading A2's derivation as a
+> grammar verdict instead was **measured**: identical distribution, because all three registry
+> anchors derive — so it would have bought a third opinion and no new truth, and it would have
+> mapped eleven derivation refusal codes onto one grammar code that means something narrower.
+> C1/C2 is where a real verdict arrives.
+> (b) **`gold_validated=False`, `engine_verdict=None`.** No gold or engine gate has run.
+> `engine_verdict=None` rests the ladder at `FORMULA_VALIDATED`, the documented honest ceiling.
+> (c) **`governed_policy_blockers=()`** on the lens: nothing on this path measures unresolved
+> policy refs, and a fold input the caller cannot measure must stay empty rather than guess.
+>
+> **The refactor is the point, not a side effect.** `taxonomy.coverage.execution_readiness_of`
+> and `suggestion_contract._fold_v2_definition` each hand-assembled their own `ReadinessInputsV1`
+> — three call sites, three chances to diverge on questions no definition answers. Both now call
+> `fold_definition_readiness`; `test_one_fold_answers_for_every_surface` asserts the coverage
+> report and the fold agree for all 317, so a fourth opinion cannot appear quietly.
+>
+> **Deviations and judgements, each deliberate:**
+> (a) **`exceeds_fold` treats `RETIRED` as a terminal, not a rung.** `READINESS_LADDER` ends with
+> it, so a naive index comparison would read `RETIRED` as the *highest* state and let any
+> definition claim it. It compares only to itself, and an unranked literal fails closed. No
+> recipe is `RETIRED` today; the law is written for the first one that is.
+> (b) **`BLOCKER_OPERAND_NOT_BOUND` — a fail-closed fallback with no live caller.** Every
+> non-bound *required* path in today's binder attaches a BR-5 reason code, but the failure
+> direction matters: a dropped blocker PROMOTES a candidate up the ladder. A required operand
+> that did not bind always contributes a blocker, even if its verdict forgot to explain itself.
+> (c) **`readiness_blockers` is carried on the candidate and NOT persisted.** `semantic_option_decision`
+> has no column for it and D-8 reserves 1055/1066/1067 and nothing else; inventing a migration
+> here would spend a reservation this plan already assigned. The frozen fact stays the folded
+> `readiness` string, exactly as before.
+> (d) **`llm_intent_candidates` still hardcodes `readiness="CONCEPTUAL_ONLY"` and was not
+> touched.** There is no `RecipeDefinitionV2` behind an LLM intent to fold, and its docstring
+> already calls that the *structural readiness ceiling*. Folding a planning request through a
+> definition-shaped fold would be exactly the "claim a verdict nobody produced" this ladder
+> forbids.
+>
+> **Both mutants were run before the tests were trusted:** reverting the lens to
+> `readiness=recipe.readiness` fails the two serving-path cases; disabling the registry law fails
+> `test_the_authored_literal_can_never_exceed_the_fold` with `DID NOT RAISE`.
+>
+> 10 new cases in `tests/featuregen/overlay/upload/test_readiness_folds_not_asserts.py`.
+> Gates: full suite **11079 passed, 20 skipped** (11069/20 on `430140b2`); `-m eval` **73
+> passed**; ruff clean on all touched files. **mypy honesty:** `recipe_planning_lens.py` and `suggestion_contract.py` carry **14
+> pre-existing errors** (measured on `430140b2` by swapping HEAD's files back in: the identical
+> 14, at shifted lines). This commit adds none and fixes none — they belong to
+> `v2_applicability`'s optional scope fields and the LLM-intent branch's request/definition
+> union, neither of which A6 touches. `recipe_readiness.py`, `recipe_registry_v2.py` and
+> `taxonomy/coverage.py` are mypy clean.
 
 ---
 

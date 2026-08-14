@@ -13,8 +13,10 @@ The hypothesis workflow's recipe source becomes the ATOMIC V2 registry, directly
   candidate needs: the SE-1 planning request (one resolved variant) with its content hash, the
   shared binder's per-operand verdicts (the SAME `bind_v2_operands` tuple the suggestion and
   formula paths consume — never a second binding), the folded binding state, the compiled
-  temporal contract (or its named blocker), the authored readiness, and the BR-23 review
-  validity AT the recipe's current revision.
+  temporal contract (or its named blocker), BR-7's FOLDED readiness with its named blockers
+  (task A6 — never the definition's authored literal, which survives only as an assertion the
+  fold must not contradict at registry-validation time), and the BR-23 review validity AT the
+  recipe's current revision.
 
 What this module deliberately does NOT do: project candidates into `FeatureIdea`, mint options,
 or touch the considered set — that is `semantic_projection` and the gate1 wiring. Since the E4
@@ -46,6 +48,13 @@ from featuregen.overlay.upload.taxonomy.use_cases import descendants
 
 #: The candidate-level fold of per-operand verdicts (plan §6.7's semantic-binding axis).
 BINDING_STATES = ("bound", "ambiguous", "missing", "blocked")
+
+#: A6's fail-closed fallback: a REQUIRED operand that did not bind but whose verdict attached no
+#: BR-5 reason code. Unreachable on today's binder (every non-bound required path names a code),
+#: and kept because the dangerous direction is the silent one — a dropped blocker PROMOTES a
+#: candidate up the readiness ladder, and a fold must never do that because a verdict forgot to
+#: explain itself.
+BLOCKER_OPERAND_NOT_BOUND = "operand_not_bound"
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,12 +311,30 @@ def fold_binding_state(verdicts: tuple[OperandBindingVerdictV1, ...],
     return "bound"
 
 
+def binding_blockers(verdicts: tuple[OperandBindingVerdictV1, ...],
+                     definition) -> tuple[str, ...]:
+    """A6 — BR-5's own reason codes for the REQUIRED operands that did not bind, verbatim.
+
+    The severity law is :func:`fold_binding_state`'s, restated: an absent OPTIONAL operand
+    degrades the feature, it never blocks it, so only required roles contribute. Codes are
+    deduplicated in verdict order (the recipe's authored operand order), so the blocker list is
+    as deterministic as the candidate itself.
+    """
+    required = {op.role for op in definition.operands if op.required}
+    codes: list[str] = []
+    for verdict in verdicts:
+        if verdict.status == "bound" or verdict.role not in required:
+            continue
+        codes.extend(verdict.reason_codes or (BLOCKER_OPERAND_NOT_BOUND,))
+    return tuple(dict.fromkeys(codes))
+
+
 @dataclass(frozen=True, slots=True)
 class V2RecipeCandidateV1:
     """One eligible recipe, fully assembled for Gate-1: definition identity, planning request,
-    shared-binder verdicts, binding state, compiled temporal (or its blocker), authored
-    readiness, and revision-specific review validity. Everything a candidate card or an option
-    mint needs — computed once, carried whole."""
+    shared-binder verdicts, binding state, compiled temporal (or its blocker), FOLDED readiness,
+    and revision-specific review validity. Everything a candidate card or an option mint needs —
+    computed once, carried whole."""
 
     recipe_id: str
     relationship: str                    # "primary" | "supporting"
@@ -316,7 +343,14 @@ class V2RecipeCandidateV1:
     recipe_revision_hash: str
     verdicts: tuple[OperandBindingVerdictV1, ...]
     binding_state: str                   # BINDING_STATES
-    readiness: str                       # the authored RECIPE_READINESS value
+    # A6: BR-7's FOLD over this candidate's own measurements (the definition's declarations, its
+    # compiled temporal, its binding verdicts), never the definition's authored literal. The
+    # literal survives on `RecipeDefinitionV2` as an assertion the fold must not contradict,
+    # checked at registry-validation time.
+    readiness: str                       # READINESS_LADDER — folded
+    # The fold's own named blockers, carried beside the state so "why is it not ready?" is a
+    # list of facts some deterministic gate produced, not a shrug.
+    readiness_blockers: tuple[str, ...] = ()
     temporal_pit_text: str = ""          # compiled PIT clause text; "" when blocked
     temporal_blocker: str = ""           # the named reason compilation refused; "" when compiled
     review_current: bool = False
@@ -414,6 +448,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
     events_by_recipe = review_events_all(conn)
 
     candidates: list[V2RecipeCandidateV1] = []
+    from featuregen.overlay.upload.recipe_readiness import fold_definition_readiness
+
     for recipe, request, variant, is_primary in requests:
         verdicts, eligibility = bind_with_capabilities(conn, request, context, capabilities)
         revision_hash = canonical_recipe_v2_hash(recipe)
@@ -422,6 +458,14 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             recipe, by_role_at_revision(events_by_recipe.get(recipe.recipe_id, []),
                                         revision_hash))
         current, missing_roles = validity.current, validity.missing_roles
+        # A6: BR-7's fold, on the serving path at last — over the definition's declarations,
+        # this variant's compiled temporal, and the binder's verdicts for THIS catalog. The
+        # authored literal is no longer served: a recipe whose operands did not bind here says
+        # FORMULA_BLOCKED with the reasons, not FORMULA_AUTHORABLE because a registry said so.
+        folded = fold_definition_readiness(
+            recipe,
+            temporal_blockers=(temporal_blocker,) if temporal_blocker else (),
+            binding_blockers=binding_blockers(verdicts, recipe))
         candidates.append(V2RecipeCandidateV1(
             recipe_id=recipe.recipe_id,
             relationship=applicability.by_recipe[recipe.recipe_id],
@@ -430,7 +474,8 @@ def v2_recipe_candidates(conn, *, catalog_source: str, roles=(),
             recipe_revision_hash=revision_hash,
             verdicts=verdicts,
             binding_state=fold_binding_state(verdicts, recipe),
-            readiness=recipe.readiness,
+            readiness=folded.state,
+            readiness_blockers=folded.blockers,
             temporal_pit_text=pit_text,
             temporal_blocker=temporal_blocker,
             review_current=current,
@@ -512,7 +557,8 @@ def llm_intent_candidates(conn, client, *, context, scope_leaves,
 
 
 __all__ = [
-    "BINDING_STATES", "DatasetStoryV1", "V2ApplicabilityResult", "V2RecipeCandidateV1",
-    "fold_binding_state", "fold_dataset_story", "llm_intent_candidates", "v2_applicability",
-    "v2_applicability_as_result", "v2_recipe_candidates",
+    "BINDING_STATES", "BLOCKER_OPERAND_NOT_BOUND", "DatasetStoryV1", "V2ApplicabilityResult",
+    "V2RecipeCandidateV1", "binding_blockers", "fold_binding_state", "fold_dataset_story",
+    "llm_intent_candidates", "v2_applicability", "v2_applicability_as_result",
+    "v2_recipe_candidates",
 ]

@@ -68,7 +68,7 @@ from featuregen.overlay.upload.grounding_trace import (
 from featuregen.overlay.upload.join_path import JoinNeighbourhood, table_of_ref
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_classes
-from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
+from featuregen.overlay.upload.recipe_readiness import fold_definition_readiness
 from featuregen.overlay.upload.suggestion_identity import (
     UnresolvableRelationshipPath,
     build_read_scope,
@@ -1628,21 +1628,12 @@ def blocker_group_v3(code: str) -> str:
 
 def _fold_v2_definition(recipe, binding_ambiguity: bool):
     """One V2 definition through BR-7's REAL fold, with the engine's binding verdict mixed in.
-    The definition's declarations supply the inputs: its computation kind, whether its
-    expectation ref is actually in the reviewed registry (a pack may not claim review by
-    assertion), and the binding ambiguity this page observed."""
-    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
-        has_reviewed_expectation,
-    )
-
-    reviewed = (recipe.formula is not None
-                and has_reviewed_expectation(recipe.formula.expectation_ref))
-    return fold_readiness(ReadinessInputsV1(
-        computation_kind=recipe.computation_kind,
-        reviewed_expectation=reviewed,
-        grammar_verdict="ok",
-        binding_blockers=((BLOCKER_AMBIGUOUS_OPERAND_BINDING,) if binding_ambiguity else ()),
-    ))
+    The definition's declarations supply the inputs (A6: stated once in
+    ``fold_definition_readiness``, so this surface, the planning lens and the coverage report
+    cannot answer differently); the binding ambiguity is what THIS page measured."""
+    return fold_definition_readiness(
+        recipe,
+        binding_blockers=((BLOCKER_AMBIGUOUS_OPERAND_BINDING,) if binding_ambiguity else ()))
 
 
 def execution_block_v3(template_id: str | None, binding_quality: str) -> dict:

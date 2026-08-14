@@ -29,7 +29,7 @@ gold gate, and honestly so), and the legacy-debt counters (``legacy_inferred_lea
 """
 from __future__ import annotations
 
-from featuregen.overlay.upload.recipe_readiness import ReadinessInputsV1, fold_readiness
+from featuregen.overlay.upload.recipe_readiness import fold_definition_readiness
 from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY, selectable_leaves
 
@@ -65,21 +65,16 @@ def execution_readiness_of(recipe_id: str) -> str:
     """A V2 recipe's execution readiness, from the SAME machinery contract v3 renders (BR-7's
     fold over the definition's declarations) — never a parallel opinion. Conceptual patterns and
     model outputs fold to CONCEPTUAL_ONLY; deterministic recipes rest at FORMULA_BLOCKED until
-    their expectation is reviewed, then FORMULA_AUTHORABLE until the gold gate is proven."""
+    their expectation is reviewed, then FORMULA_AUTHORABLE until the gold gate is proven.
+
+    A6: the three definition-invariant inputs now come from ``fold_definition_readiness``, the
+    one place that states them — this call used to assemble its own ``ReadinessInputsV1``."""
     from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
 
     recipe = v2_recipe_by_id(recipe_id)
     if recipe is None:
         return "UNASSESSED"
-    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
-        has_reviewed_expectation,
-    )
-
-    reviewed = (recipe.formula is not None
-                and has_reviewed_expectation(recipe.formula.expectation_ref))
-    return fold_readiness(ReadinessInputsV1(
-        computation_kind=recipe.computation_kind,
-        reviewed_expectation=reviewed, grammar_verdict="ok")).state
+    return fold_definition_readiness(recipe).state
 
 
 def coverage_report() -> dict:

@@ -94,3 +94,64 @@ def fold_readiness(inputs: ReadinessInputsV1) -> RecipeReadinessV1:
         return RecipeReadinessV1("MATERIALIZATION_BLOCKED",
                                  blockers=(BLOCKER_ENGINE_UNSUPPORTED,))
     return RecipeReadinessV1("MATERIALIZATION_READY")
+
+
+def fold_definition_readiness(definition, *, temporal_blockers: tuple[str, ...] = (),
+                              binding_blockers: tuple[str, ...] = (),
+                              governed_policy_blockers: tuple[str, ...] = (),
+                              ) -> RecipeReadinessV1:
+    """Task A6 — the fold over ONE ``RecipeDefinitionV2``'s own declarations, plus whatever the
+    caller has actually MEASURED about this candidate.
+
+    Three of the fold's inputs cannot be measured from a definition, and before A6 every caller
+    that needed them assembled its own ``ReadinessInputsV1`` and answered the question its own
+    way. They are stated ONCE here, so the planning lens, contract v3's execution block and the
+    coverage report cannot disagree about how ready a recipe is:
+
+    * ``reviewed_expectation`` — the definition's own ``formula.expectation_ref`` asked of the
+      reviewed registry. A pack may not claim review by assertion.
+    * ``grammar_verdict="ok"`` — BR-6's ``classify_formula_capability_v2`` classifies a
+      PROPOSAL, and no proposal exists until authoring runs. Reading A2's derivation as a
+      grammar verdict was measured and is indistinguishable on the shipped registry (all three
+      registry anchors derive), so it would buy a third opinion and no new truth; C1/C2 is where
+      a real verdict arrives.
+    * ``gold_validated=False`` / ``engine_verdict=None`` — no gold or engine gate has run.
+      ``None`` rests the ladder at ``FORMULA_VALIDATED``, which is this ladder's DOCUMENTED
+      honest ceiling until C1, not a fudge.
+
+    Whatever the caller passes in ``temporal_blockers`` / ``binding_blockers`` /
+    ``governed_policy_blockers`` is a measurement it made — passed through verbatim, per BR-7.
+    """
+    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
+        has_reviewed_expectation,
+    )
+
+    formula = definition.formula
+    return fold_readiness(ReadinessInputsV1(
+        computation_kind=definition.computation_kind,
+        retired=definition.readiness == "RETIRED",
+        temporal_blockers=tuple(temporal_blockers),
+        binding_blockers=tuple(binding_blockers),
+        reviewed_expectation=(formula is not None
+                              and has_reviewed_expectation(formula.expectation_ref)),
+        grammar_verdict="ok",
+        gold_validated=False,
+        engine_verdict=None,
+        governed_policy_blockers=tuple(governed_policy_blockers)))
+
+
+def exceeds_fold(authored: str, folded: str) -> bool:
+    """Is an AUTHORED readiness literal a stronger claim than what the fold actually produced?
+
+    A6's registry law: the ``readiness=`` field on a definition is an assertion the fold must
+    not contradict, never the answer. ``RETIRED`` is a terminal, not a rung — it compares only
+    to itself. An unknown literal cannot be ranked and is therefore treated as exceeding, which
+    is the fail-closed direction.
+    """
+    if authored == folded:
+        return False
+    if "RETIRED" in (authored, folded):
+        return True
+    if authored not in READINESS_LADDER or folded not in READINESS_LADDER:
+        return True
+    return READINESS_LADDER.index(authored) > READINESS_LADDER.index(folded)

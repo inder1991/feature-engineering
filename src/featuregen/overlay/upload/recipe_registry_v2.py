@@ -158,7 +158,15 @@ PROBE_RECIPE = RecipeDefinitionV2(
 
 def validate_v2_registry(recipes: tuple[RecipeDefinitionV2, ...] = V2_RECIPES) -> None:
     """Import-time registry law. Individual definitions validated themselves at construction;
-    this checks the POPULATION: id uniqueness, explicit legacy replacement, no squatting."""
+    this checks the POPULATION: id uniqueness, explicit legacy replacement, no squatting — and
+    (A6) that no definition's authored ``readiness`` claims more than BR-7's fold produces from
+    that same definition. The literal is an ASSERTION the fold must not contradict, so a recipe
+    edited to say ``FORMULA_AUTHORABLE`` without a reviewed expectation fails at import rather
+    than serving a claim nothing measured."""
+    from featuregen.overlay.upload.recipe_readiness import (
+        exceeds_fold,
+        fold_definition_readiness,
+    )
     from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
     legacy_ids = {t.id for t in ALL_TEMPLATES}
@@ -167,6 +175,13 @@ def validate_v2_registry(recipes: tuple[RecipeDefinitionV2, ...] = V2_RECIPES) -
         if recipe.recipe_id in seen:
             raise RecipeContractError(f"duplicate V2 recipe id {recipe.recipe_id!r}")
         seen.add(recipe.recipe_id)
+        folded = fold_definition_readiness(recipe)
+        if exceeds_fold(recipe.readiness, folded.state):
+            raise RecipeContractError(
+                f"{recipe.recipe_id!r} authors readiness {recipe.readiness!r} but its own "
+                f"declarations fold to {folded.state!r} "
+                f"(blockers: {list(folded.blockers) or 'none'}) — the authored literal is an "
+                "assertion the fold must not contradict, never the answer")
         unknown = [rid for rid in recipe.replaces_legacy_ids if rid not in legacy_ids]
         if unknown:
             raise RecipeContractError(
