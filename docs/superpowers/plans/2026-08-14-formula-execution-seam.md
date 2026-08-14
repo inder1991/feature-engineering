@@ -143,10 +143,15 @@ string matching.**
   not a bug this plan resolves** — see §1 D-7.
 - **Latent defect, verified:** `semantic_option_decision.decision_facts_for_candidate` calls
   `has_reviewed_expectation(candidate.recipe_id)` (`:59`), passing a **recipe id** where an
-  **expectation ref** belongs. It happens to agree today because all three authorable recipes have
-  `expectation_ref == recipe_id` — but the probe recipe already breaks the identity
-  (`expectation_ref="probe:posted_debit_amount"` vs registry key `"posted_debit_amount"`,
-  `recipe_registry_v2.py:154`). `suggestion_contract.py:1639` does it correctly. Task A0.
+  **expectation ref** belongs. `suggestion_contract.py:1639` does it correctly. Task A0.
+  **Measured while executing A0 (correcting this bullet as authored):** the divergence is not a
+  probe-only curiosity — **295 of the 298 formula-bearing V2 recipes declare a ref that is not
+  their id** (`balance_slope` → `retail:balance_slope`), and 19 recipes carry no formula at all.
+  The three that agree are exactly the three registry anchors, which is why the defect stayed
+  invisible. The bite is forward-looking: every expectation A5 registers under a *pack-qualified*
+  ref would have been unreachable through the frozen fact. The probe recipe does **not**
+  discriminate the two behaviours (its id is unregistered too, so both readings answer `False`) —
+  A0's acceptance uses a real registry recipe instead.
 
 **Weld 2 — the frozen plan envelope never reaches compilation.**
 
@@ -371,12 +376,33 @@ without a `formula` (governed-model-output and conceptual recipes have none).
 **expectation ref**, never a recipe id.
 
 **Acceptance (tests):**
-- `test_a_recipe_whose_expectation_ref_differs_from_its_id_is_still_recognised` — build a candidate
-  over `PROBE_RECIPE` (`expectation_ref="probe:posted_debit_amount"`); today's code answers `True`
-  by looking up the *id* against a registry keyed by *ref*; after the fix the answer is driven by
-  the ref and the probe (unregistered ref) answers `False`.
+- `test_a_recipe_whose_expectation_ref_differs_from_its_id_is_recognised_by_its_ref` — a candidate
+  over a real registry recipe whose ref is pack-qualified (`balance_slope` →
+  `retail:balance_slope`), with the registry monkeypatched to hold that **ref**: today's
+  id-keyed read answers `False`, the fixed ref-keyed read answers `True`.
+- `test_a_registry_entry_spelling_the_recipe_id_is_not_a_reviewed_expectation` — the converse and
+  the sharper half: an entry keyed by *id* names no expectation, so it must not flip the fact.
+  Today's code answers `True` here. (These two replace the `PROBE_RECIPE` case as authored: the
+  probe's id is unregistered too, so it cannot tell the two readings apart.)
 - `test_a_recipe_with_no_formula_reference_is_not_reviewed` — a `conceptual_pattern` recipe.
 - Full backend suite + `pytest -m eval` green (the eval marker joins the gate here, per §8).
+
+> **ACCEPTED `b260fba8` (2026-08-14).** `semantic_option_decision.has_reviewed_formula_expectation(
+> recipe_id)` — a named public seam, not an inline expression, because A6 needs the same resolution
+> on the serving path: resolve the definition via `v2_recipe_by_id`, ask the registry with
+> `definition.formula.expectation_ref`, and answer `False` for a candidate the registry never
+> minted (LLM intents, user definitions) or a definition with no `formula` (conceptual patterns,
+> governed model outputs). `recipe_formula_expectations_v2`'s docstring now states the key law.
+> **Measured, and it corrects §0.2:** 295 of the 298 formula-bearing recipes declare a ref that is
+> not their id; only the three registry anchors agree, which is exactly why the wrong ask went
+> unnoticed. **Plan defect found and fixed above:** the authored `PROBE_RECIPE` acceptance case
+> does not discriminate (both readings answer `False` for it); the two `balance_slope` cases do,
+> in both directions, and were proved to fail against the pre-fix expression before landing.
+> Behaviour on today's registry is unchanged — a no-monkeypatch test pins that all three anchors
+> still answer `True`. 5 new tests in
+> `tests/featuregen/overlay/upload/test_semantic_option_decision_facts.py`.
+> Gates: full suite **10946 passed, 20 skipped** (baseline on `fa7bce3f` was 10941/20 green);
+> `-m eval` **73 passed**; ruff clean on all three touched files.
 
 ### Task A1 — the v2 expectation contract (2 days)
 

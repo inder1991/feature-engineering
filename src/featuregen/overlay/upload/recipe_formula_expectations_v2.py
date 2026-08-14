@@ -13,6 +13,12 @@ fails CI, which is the same freeze discipline the v1 manifest carries.
 Membership here is what BR-7's fold reads as ``reviewed_expectation`` for v2-shaped recipes —
 the same meaning the v1 registry carries for its two anchors, one gate for both generations
 (:func:`has_reviewed_expectation`).
+
+**The key is an EXPECTATION REF, never a recipe id.** ``FormulaReferenceV2.expectation_ref`` is
+the only thing that may be looked up here: 295 of the 317 registry recipes declare a ref that is
+not their own name (``retail:balance_slope`` for ``balance_slope``), and the three that agree do
+so by coincidence. A caller holding a recipe id resolves its definition first — see
+``semantic_option_decision.has_reviewed_formula_expectation``.
 """
 from __future__ import annotations
 

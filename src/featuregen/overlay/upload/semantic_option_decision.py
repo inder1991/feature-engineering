@@ -22,14 +22,32 @@ _GENERATION_SOURCE_BY_ORIGIN = {
 }
 
 
+def has_reviewed_formula_expectation(recipe_id: str) -> bool:
+    """A0 — the reviewed-expectation fact, asked the way the registry is keyed.
+
+    ``RECIPE_FORMULA_V2_EXPECTATIONS`` is keyed by EXPECTATION REF, and a recipe's ref is its
+    own name for only 3 of the 317 registry recipes (``retail:balance_slope`` vs
+    ``balance_slope`` is the shape the other 295 carry). Passing the recipe id agreed with the
+    contract only by that coincidence. A candidate the recipe registry never minted (an LLM
+    intent, a user definition) and a recipe that declares no formula (a conceptual pattern, a
+    governed model output) both have nothing to have reviewed — honestly ``False``, not an
+    error."""
+    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
+        has_reviewed_expectation,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    definition = v2_recipe_by_id(recipe_id)
+    if definition is None or definition.formula is None:
+        return False
+    return has_reviewed_expectation(definition.formula.expectation_ref)
+
+
 def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
                                  context_hash: str, *, uoa_entity: str | None = None,
                                  spine_ref: str | None = None) -> dict:
     """Assemble ONE candidate's frozen facts at serving time (gate1's semantic branch), where
     the candidate, its projection (`idea`), and its observation id are all in hand."""
-    from featuregen.overlay.upload.recipe_formula_expectations_v2 import (
-        has_reviewed_expectation,
-    )
     from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
 
     request = candidate.planning_request
@@ -56,7 +74,8 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
         "outstanding_requirement_codes": sorted(
             {req.code for req in idea.requirements}
             | {req.code for req in _candidate_validation(candidate).requirements}),
-        "has_reviewed_formula_expectation": has_reviewed_expectation(candidate.recipe_id),
+        "has_reviewed_formula_expectation": has_reviewed_formula_expectation(
+            candidate.recipe_id),
         "formula_expectation_revision": "",   # pinned when the formula seam mints one (Phase E)
         # B7: a REAL gate now — True iff the frozen-bindings plan folded (single-source, bound,
         # declared population, compiled temporal). The plan itself rides the story jsonb until
@@ -368,5 +387,5 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
 
 
 __all__ = ["assemble_current_activation_state", "decision_facts_for_candidate",
-           "load_frozen_option_facts", "load_option_decision_record",
-           "persist_option_decisions"]
+           "has_reviewed_formula_expectation", "load_frozen_option_facts",
+           "load_option_decision_record", "persist_option_decisions"]
