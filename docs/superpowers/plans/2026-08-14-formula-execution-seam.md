@@ -3250,6 +3250,62 @@ that does not exist", and refused to invent one inside a proof task. This succes
 > mypy clean on `govern.py` and the 2 errors in `contract.py:883` are pre-existing (measured by
 > HEAD-swap, identical line and codes) — none added.
 
+> **SUCCESSOR 4 — INCREMENT 2: THE ROUTE RESOLVES AND PASSES `contract_id`. ACCEPTED `<hash-2>`
+> (2026-08-15).** `api/routes/materialization_runs.py` gains `_contract_minted_from` and hands its
+> answer to `assemble_current_activation_state`. **E0's defect is closed**: the route that gates
+> materialization now reads the validation store under the contract the approved option actually
+> minted, so a recorded data check opens the gate it was always supposed to open.
+>
+> **THE RESOLUTION RULE IS STATED IN CODE, not left to be inferred: the HIGHEST version linked to
+> this option.** `confirm_contract` never rewrites a contract (1012), so a re-confirm appends a
+> version and both rows carry the link; the validation store is per-contract-version
+> (`feature_validation_requirement` and the 1009 stream are both keyed by `contract_id`), so the
+> newest linked version is the one whose requirements are actually owed. `version` is unique per
+> `feature_name` (0961) and the confirm route refuses a draft whose name is not the chosen option's,
+> so the ordering over one link is total; the trailing sort keys only make that explicit. **There is
+> no fallback.** `None` — an option nobody confirmed, or a contract governed before 1069 — is a real
+> answer, and C3's read fails closed on it.
+>
+> **E0's PINNED TEST FLIPPED, and it still asserts both directions on the SAME option with the SAME
+> recorded homework.** `test_the_route_cannot_close_the_named_homework` is now
+> `test_the_route_closes_the_named_homework_only_through_the_LINKED_contract`: with the link, `POST
+> /materialization-runs` **202**s the served exemplar — the candidate whose own eligibility fold
+> names eight outstanding codes including the unconditional `STATUS_POLICY_UNRESOLVED`; with the
+> link removed (through 1012's own documented teardown hatch, because a pre-1069 row cannot be
+> produced any other way), the identical option is refused **409** with exactly
+> `EXTERNAL_VALIDATION_OUTSTANDING`.
+>
+> **WHERE THE BOUNDARY NOW SITS, precisely.** Only contracts minted BEFORE migration 1069 (and
+> confirms that named no served decision row) carry NULL, and `contract` being WORM means no
+> backfill can ever reach them — the honest answer for those is "nobody recorded which option this
+> came from", and the gate stays shut. Every contract minted from here on carries the link.
+>
+> **What §0.5 item 4 can now honestly assert, and what has NOT changed.** Item 4 —
+> *"`POST /materialization-runs` accepts"* — is now proved on the SERVED exemplar, not only on the
+> C3-milestone-shaped `DESIGN_CHECKED` row, and E0's acceptance row is corrected where it said that
+> was unreachable. The rest of the walk is untouched: the compile half still runs on
+> `total_debit_amount_30d` because a v2 artifact is still a pair with no path into materialization
+> (A3's plan defect 2), and the gold hook and snapshot freshness are still the two named seeds.
+>
+> **Three mutants, each run and each caught:** (a) resolving by `feature_name` instead of the link
+> (2 failures — and it is not a near miss: the fixture's card name, governed `feature_name` and
+> `source_definition_id` are three different strings); (b) `_requirements_closed` returning `True`
+> before it consults the store (1 — the legacy leg accepts what it must refuse); (c) the resolver
+> taking the OLDEST linked version (1).
+>
+> **ONE EXISTING TEST DOUBLE WAS CORRECTED, not bypassed.** B4's two positive-control tests stub
+> `assemble_current_activation_state` to produce the ALLOWED state, and their stub was written to
+> the pre-C3 signature — so the route's new `contract_id` argument made the CALL fail rather than
+> the assertion. The stub now mirrors the real signature and threads the argument through to the
+> genuine assembler it wraps; nothing about what those tests assert changed. (The full suite caught
+> it, which is the point of running it: 2 failures, both `TypeError` at the double.)
+>
+> 2 further cases in `tests/featuregen/api/test_contract_option_link.py` (12 total there) and the
+> flipped walkthrough test.
+> Gates: full suite **11368 passed, 20 skipped** (11366/20 on `227de9c6` — the two new resolver
+> tests and nothing else moved); `-m eval` **73 passed**; ruff clean on all four touched files;
+> mypy **clean** on `materialization_runs.py` (no pre-existing errors in it).
+
 ---
 
 ## 7. Sequencing and dependencies

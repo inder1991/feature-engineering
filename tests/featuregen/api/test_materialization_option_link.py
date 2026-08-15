@@ -180,10 +180,14 @@ def test_an_allowed_option_mints_a_request_carrying_its_provenance(
     revision_id, option_id = _freeze_option(db, REVIEWED, key="allow")
     genuine = sod.assemble_current_activation_state
 
-    def _c_phase(conn, *, frozen, snapshot_id, intent_id=None):
+    def _c_phase(conn, *, frozen, snapshot_id, intent_id=None, contract_id=None):
+        # The stub MIRRORS the real signature, `contract_id` included (SUCCESSOR 4): the route now
+        # resolves the contract minted from the option and passes it, and a double that dropped the
+        # argument would fail the call rather than the assertion.
         import dataclasses
         return dataclasses.replace(
-            genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id),
+            genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id,
+                    contract_id=contract_id),
             effective_readiness="MATERIALIZATION_READY", formula_schema_supported=True,
             requirements_closed=True, execution_authority_evaluated=True,
             execution_floor_met=True, authoring_floor_met=True, review_current=True,
@@ -254,10 +258,14 @@ def test_the_option_key_is_part_of_the_requests_IDENTITY(client, admin_headers, 
     second = _freeze_option(db, REVIEWED, key="ident-b")
     genuine = sod.assemble_current_activation_state
 
-    def _c_phase(conn, *, frozen, snapshot_id, intent_id=None):
+    def _c_phase(conn, *, frozen, snapshot_id, intent_id=None, contract_id=None):
+        # The stub MIRRORS the real signature, `contract_id` included (SUCCESSOR 4): the route now
+        # resolves the contract minted from the option and passes it, and a double that dropped the
+        # argument would fail the call rather than the assertion.
         import dataclasses
         return dataclasses.replace(
-            genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id),
+            genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id,
+                    contract_id=contract_id),
             effective_readiness="MATERIALIZATION_READY", formula_schema_supported=True,
             requirements_closed=True, execution_authority_evaluated=True,
             execution_floor_met=True, authoring_floor_met=True, review_current=True,

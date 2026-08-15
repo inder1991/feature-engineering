@@ -177,6 +177,43 @@ def test_a_stated_pair_that_IS_real_is_accepted_at_the_table(conn):
     assert _link(conn, contract.contract_id) == (revision_id, option_id)
 
 
+# ── increment 2: the RESOLUTION along the link ───────────────────────────────────────────────────
+
+
+def test_the_resolution_takes_the_NEWEST_LINKED_version_and_ignores_unlinked_ones(conn):
+    """``_contract_minted_from``'s stated rule, pinned in the two directions that discriminate.
+
+    A re-confirm appends a version (1012 forbids rewriting the first), and the validation store is
+    per-contract-version, so the NEWEST linked row is the one whose requirements are actually owed —
+    an older version's answers would be a superseded contract's homework. And a contract for the
+    SAME feature with NO link is not the answer either: an implementation that resolved by feature
+    identity, or simply took the latest contract, would return the third row here.
+    """
+    from featuregen.api.routes.materialization_runs import _contract_minted_from
+
+    revision_id, option_id = _freeze_option(conn, REVIEWED, key="newest")
+    _bank(conn)
+    first = confirm_contract(conn, _draft(), actor="ds1", option_key=(revision_id, option_id))
+    second = confirm_contract(conn, _draft(), actor="ds1", option_key=(revision_id, option_id))
+    unlinked = confirm_contract(conn, _draft(), actor="ds1")
+    assert [first.version, second.version, unlinked.version] == [1, 2, 3]
+
+    resolved = _contract_minted_from(
+        conn, considered_revision_id=revision_id, option_id=option_id)
+    assert resolved == second.contract_id
+    assert resolved not in (first.contract_id, unlinked.contract_id)
+
+
+def test_an_option_that_never_reached_a_contract_resolves_to_None(conn):
+    """The fail-closed half. ``None`` is a real answer — ``requirements_closed`` reads it as "not
+    closed", which is the correct reading of "nobody recorded anything"."""
+    from featuregen.api.routes.materialization_runs import _contract_minted_from
+
+    revision_id, option_id = _freeze_option(conn, REVIEWED, key="never")
+    assert _contract_minted_from(
+        conn, considered_revision_id=revision_id, option_id=option_id) is None
+
+
 # ── the migration audit (CI is blind to legacy data) ─────────────────────────────────────────────
 
 

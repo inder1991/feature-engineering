@@ -51,17 +51,22 @@ WHAT IS SEEDED, EACH NAMED (the C3 milestone's vocabulary, deliberately)
   build in a real kedro+pyspark interpreter is E1's job and lives in the JVM gate — ``pyspark`` and
   ``kedro`` are not dependencies of this platform.
 
-A DEFECT THIS WALKTHROUGH FOUND, ASSERTED IN BOTH DIRECTIONS
-------------------------------------------------------------
-``api/routes/materialization_runs.py`` calls ``assemble_current_activation_state`` **without
-``contract_id``**, so C3's contract-keyed ``_requirements_closed`` read is dead on the one route
-that gates materialization: ``EXTERNAL_VALIDATION_OUTSTANDING`` can only clear through the
+A DEFECT THIS WALKTHROUGH FOUND — CLOSED BY SUCCESSOR 4, AND STILL ASSERTED IN BOTH DIRECTIONS
+-----------------------------------------------------------------------------------------------
+``api/routes/materialization_runs.py`` used to call ``assemble_current_activation_state`` **without
+``contract_id``**, so C3's contract-keyed ``_requirements_closed`` read was dead on the one route
+that gates materialization: ``EXTERNAL_VALIDATION_OUTSTANDING`` could only clear through the
 ``validation_status == "DESIGN_CHECKED"`` short-circuit (``activation_policy.py:195``). For the
 served exemplar — whose own eligibility fold names eight outstanding codes, ``STATUS_POLICY_
 UNRESOLVED`` among them *unconditionally*, because the recipe reads a governed status policy — no
-recorded data check can ever open the gate. :func:`test_the_route_cannot_close_the_named_homework`
-asserts both halves: the fold says ALLOWED when the contract is named, and the route says 409 for
-the same option because it never names one.
+recorded data check could ever open the gate.
+
+Migration **1069** gave the contract a recorded link to the option it was minted from, and the route
+resolves along it, so the gate now opens for evidence somebody actually recorded.
+:func:`test_the_route_closes_the_named_homework_only_through_the_LINKED_contract` keeps both halves
+under assertion: with the link, the route ACCEPTS the same option it used to refuse; without it — a
+contract governed before 1069, which is where the boundary now sits — the refusal is unchanged,
+because ``None`` still means fail closed.
 """
 from __future__ import annotations
 
@@ -183,14 +188,20 @@ def _record_the_reviews(conn, recipe_id: str) -> str:
     return revision_hash
 
 
-def _seed_the_recorded_data_checks(conn, codes) -> str:
+def _seed_the_recorded_data_checks(conn, codes, *, option: tuple[str, str] | None = None) -> str:
     """One governed contract carrying the candidate's own named homework, and a recorded
     ``EXTERNAL_PASSED`` result for every code — the real store, read back by C3's real
-    ``_requirements_closed``."""
+    ``_requirements_closed``.
+
+    ``option`` is the (considered_revision_id, option_id) this contract was minted FROM (migration
+    1069). ``None`` seeds the LEGACY shape — a contract governed before the link existed, which is
+    exactly where the boundary sits and what the second half of the route test pins."""
     conn.execute("INSERT INTO feature (feature_id, name, lifecycle_state) "
                  "VALUES ('feat-e0', 'feat-e0', 'governed') ON CONFLICT DO NOTHING")
-    conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version) "
-                 "VALUES ('contract-e0', 'feat-e0', 'feat-e0', 1)")
+    conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version, "
+                 "considered_revision_id, option_id) "
+                 "VALUES ('contract-e0', 'feat-e0', 'feat-e0', 1, %s, %s)",
+                 option if option is not None else (None, None))
     for index, code in enumerate(codes):
         conn.execute(
             "INSERT INTO feature_validation_requirement (requirement_id, contract_id, "
@@ -213,9 +224,10 @@ def _freeze_a_governed_option(conn, *, revision_id: str, generation_run_id: str,
     Why a second option row rather than the served one, and it is the ONE seeded thing that is not
     a floor: the served candidate's own eligibility fold names eight outstanding requirement codes
     (``STATUS_POLICY_UNRESOLVED`` among them, and that one fires unconditionally because the recipe
-    reads a governed status policy), and the ROUTE cannot close them — see
-    :func:`test_the_route_cannot_close_the_named_homework`, which asserts exactly that in both
-    directions. This row is the C3 milestone's shape: a ``DESIGN_CHECKED`` idea, which is the ONLY
+    reads a governed status policy), and closing them takes a contract minted from that option —
+    see :func:`test_the_route_closes_the_named_homework_only_through_the_LINKED_contract`, which
+    asserts exactly that in both directions. This row is the C3 milestone's shape: a
+    ``DESIGN_CHECKED`` idea, which is the ONLY
     state ``activation_policy.py:195`` lets through today. Everything else about it — the plan, the
     revision, the reviews, the floors — is the served run's own.
     """
@@ -408,15 +420,23 @@ def test_the_seam_walks_from_a_served_candidate_to_a_build_verified_run(
         "missing": frozen_refs - compiled_refs}
 
 
-def test_the_route_cannot_close_the_named_homework(make_client, conn, monkeypatch, tmp_path):
-    """THE DEFECT THIS WALKTHROUGH FOUND, asserted in both directions on ONE option.
+def test_the_route_closes_the_named_homework_only_through_the_LINKED_contract(
+        make_client, conn, monkeypatch, tmp_path):
+    """THE DEFECT THIS WALKTHROUGH FOUND, now CLOSED — and pinned in both directions on ONE option.
 
     C3 built ``_requirements_closed`` as a real contract-keyed read of the validation store, and
-    ``api/routes/materialization_runs.py`` calls ``assemble_current_activation_state`` without
-    ``contract_id`` — so on the one route that gates materialization the read is dead and
-    ``EXTERNAL_VALIDATION_OUTSTANDING`` can only clear through the ``DESIGN_CHECKED``
-    short-circuit. For a candidate whose own fold names outstanding codes, no recorded data check
-    can ever open the gate.
+    ``api/routes/materialization_runs.py`` had no contract to name, so on the one route that gates
+    materialization the read was dead: for a candidate whose own fold names outstanding codes, no
+    recorded data check could ever open the gate.
+
+    SUCCESSOR 4's migration 1069 records, at mint, the option a contract was minted from, and the
+    route resolves along that link. Both directions are asserted on the SAME option and the SAME
+    recorded homework, differing ONLY in whether the contract carries the link:
+
+    * LINKED → the route ACCEPTS (202). The recorded ``EXTERNAL_PASSED`` results are what open it.
+    * UNLINKED (a contract governed before 1069 — the legacy boundary, and 1012's WORM table means
+      it can never be backfilled) → the route still refuses 409 with exactly
+      ``EXTERNAL_VALIDATION_OUTSTANDING``. Nothing recorded is not the same as nothing owed.
     """
     _arm_shadow(conn, monkeypatch)
     _record_the_reviews(conn, EXEMPLAR)
@@ -443,8 +463,10 @@ def test_the_route_cannot_close_the_named_homework(make_client, conn, monkeypatc
         "the exemplar reads a governed status policy, so this code rides every candidate "
         "unconditionally — it is named homework, not a defect")
 
-    # The homework, RECORDED — real requirement rows and real recorded results.
-    contract_id = _seed_the_recorded_data_checks(conn, frozen.outstanding_requirement_codes)
+    # The homework, RECORDED — real requirement rows and real recorded results — on a contract that
+    # names the option it was minted from, exactly as `confirm_contract` now stamps it.
+    contract_id = _seed_the_recorded_data_checks(
+        conn, frozen.outstanding_requirement_codes, option=(revision_id, option_id))
 
     named = assemble_current_activation_state(
         conn, frozen=frozen, snapshot_id="snap-e0", contract_id=contract_id)
@@ -457,15 +479,34 @@ def test_the_route_cannot_close_the_named_homework(make_client, conn, monkeypatc
         frozen, unnamed, "execute_materialization").blockers} == {
         "EXTERNAL_VALIDATION_OUTSTANDING"}
 
-    # ...and the ROUTE takes the second reading, so the same option is refused.
+    # ...and the ROUTE now resolves the contract from the option key it already holds, so the
+    # recorded data checks reach the fold and the same option is ACCEPTED.
     _seed(conn)
     work_item_id = _seed_work_item(conn, COMPILED, "e0d")
-    response = make_client().post(_PATH, json=_body(
-        [work_item_id], key="e0-defect",
+    accepted = make_client().post(_PATH, json=_body(
+        [work_item_id], key="e0-linked",
         considered_revision_id=revision_id, option_id=option_id),
         headers={"X-User": "priya", "X-Roles": "platform-admin"})
-    assert response.status_code == 409, response.text
-    assert {b["code"] for b in response.json()["detail"]["blockers"]} == {
+    assert accepted.status_code == 202, accepted.text
+
+    # THE LEGACY BOUNDARY, and it is the whole remaining scope of the defect. Take the link away —
+    # a contract governed before 1069, which no backfill can reach because 1012 forbids the UPDATE —
+    # and the identical option, with the identical recorded passes, is refused again. The route
+    # resolves nothing, passes `contract_id=None`, and C3's read fails closed.
+    # (The un-linking uses the SAME escape hatch 1012's own comment blesses for test teardown — a
+    # pre-1069 row cannot be produced any other way once the columns exist, and producing it is the
+    # point: it is the shape every contract governed before this migration is in.)
+    conn.execute("ALTER TABLE contract DISABLE TRIGGER contract_no_mutation")
+    conn.execute("UPDATE contract SET considered_revision_id = NULL, option_id = NULL "
+                 "WHERE contract_id = %s", (contract_id,))
+    conn.execute("ALTER TABLE contract ENABLE TRIGGER contract_no_mutation")
+
+    refused = make_client().post(_PATH, json=_body(
+        [_seed_work_item(conn, COMPILED, "e0e")], key="e0-legacy",
+        considered_revision_id=revision_id, option_id=option_id),
+        headers={"X-User": "priya", "X-Roles": "platform-admin"})
+    assert refused.status_code == 409, refused.text
+    assert {b["code"] for b in refused.json()["detail"]["blockers"]} == {
         "EXTERNAL_VALIDATION_OUTSTANDING"}
 
 

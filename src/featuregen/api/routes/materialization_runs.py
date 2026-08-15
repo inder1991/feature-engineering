@@ -403,6 +403,42 @@ def _require_every_member_exists(conn: psycopg.Connection, members: tuple[str, .
 _MATERIALIZATION_ACTION = "execute_materialization"
 
 
+def _contract_minted_from(
+    conn: psycopg.Connection, *, considered_revision_id: str, option_id: str,
+) -> str | None:
+    """The governed contract this option produced — SUCCESSOR 4, the read half of migration 1069.
+
+    C3 made ``requirements_closed`` a real read of the CONTRACT-keyed validation store, and this
+    route had no contract to name, so it passed ``None`` and the read answered ``False`` on the one
+    route that gates materialization: ``EXTERNAL_VALIDATION_OUTSTANDING`` could only ever clear
+    through the ``DESIGN_CHECKED`` short-circuit. The missing piece was a RECORD, not a query;
+    1069 makes ``confirm_contract`` stamp the option key on the contract row it mints, and this is
+    the lookup along it.
+
+    **The rule, stated because a rule a reader has to infer is a rule that drifts: the HIGHEST
+    version linked to this option.** ``confirm_contract`` never rewrites a contract (1012 makes the
+    table WORM) — a re-confirm INSERTs a new version under the same feature identity — so an option
+    confirmed twice has two linked rows and the later one is the live governed definition. The
+    validation store is per-contract-version (``feature_validation_requirement`` and the 1009 event
+    stream are both keyed by ``contract_id``), so reading the newest version asks about the
+    requirements that are actually owed rather than a superseded version's answers. ``version`` is
+    unique per ``feature_name`` (0961) and the confirm route refuses a draft whose name is not the
+    chosen option's, so all rows on one link share a name and the ordering is total; the trailing
+    key only makes that explicit rather than implied.
+
+    **``None`` is a real answer and the caller must fail closed on it** — an option nobody confirmed,
+    or a contract governed before 1069 existed. There is NO fallback: resolving by ``feature_name``
+    would be a guess (a name is not identity, and a re-mint proves it), and inventing a contract
+    would put a passing verdict on evidence nobody recorded.
+    """
+    row = conn.execute(
+        "SELECT contract_id FROM contract "
+        "WHERE considered_revision_id = %s AND option_id = %s "
+        "ORDER BY version DESC, created_at DESC, contract_id DESC LIMIT 1",
+        (considered_revision_id, option_id)).fetchone()
+    return row[0] if row is not None else None
+
+
 def _require_the_option_allows_materialization(
     conn: psycopg.Connection, body: MaterializationRunIn, identity: IdentityEnvelope,
 ) -> dict[str, Any]:
@@ -417,6 +453,13 @@ def _require_the_option_allows_materialization(
     re-reads what is true NOW (is the review still valid, has a policy hash moved, do the operands
     still clear the execution floor). ``activation_decision`` folds them. A route that consulted
     only the frozen layer would let an approval outlive the thing it approved.
+
+    SUCCESSOR 4 — the current layer is also told WHICH CONTRACT to read the validation store under
+    (:func:`_contract_minted_from`, migration 1069). Before that link existed this route passed no
+    contract at all, so C3's ``requirements_closed`` answered ``False`` here forever and a recorded
+    data check could never open the gate. An option whose contract predates the link resolves to
+    ``None`` and still cannot — fail closed is the same answer it always gave, now for a reason that
+    names itself.
 
     **409, not 403.** Nothing here is a permission failure — the caller passed
     ``require_confirmer``. It is a conflict with a durable governed record: this option, right now,
@@ -453,7 +496,9 @@ def _require_the_option_allows_materialization(
                    f"{body.considered_revision_id!r}: a materialization request may only cite an "
                    f"option that was actually served, because that row IS the approval")
     current = assemble_current_activation_state(
-        conn, frozen=frozen, snapshot_id=frozen.snapshot_id or None)
+        conn, frozen=frozen, snapshot_id=frozen.snapshot_id or None,
+        contract_id=_contract_minted_from(
+            conn, considered_revision_id=body.considered_revision_id, option_id=body.option_id))
     decision = activation_decision(
         frozen, current, _MATERIALIZATION_ACTION, actor=identity.subject)
     blockers = [{"code": blocker.code, "next_step": blocker.next_step}
