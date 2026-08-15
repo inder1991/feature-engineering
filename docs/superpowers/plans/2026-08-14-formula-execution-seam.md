@@ -1621,7 +1621,7 @@ replacing the hardwired `False` (`:364`).
   execution floor returns `activation_decision(..., "execute_materialization").allowed is True`.
   **This is the §0.5 item 3 bar.**
 
-> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline (same context as C1/C2). **THE
+> **ACCEPTED `06b20dc3` (2026-08-15).** Landed inline (same context as C1/C2). **THE
 > MILESTONE PASSES**: `test_all_four_materialization_codes_can_clear_together` ends in
 > `activation_decision(..., "execute_materialization").allowed is True` with an EMPTY blocker
 > list — the §0.5 item 3 bar, over a real frozen row.
