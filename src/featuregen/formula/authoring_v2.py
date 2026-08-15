@@ -54,7 +54,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula._jcs import dumps as _jcs_dumps
@@ -97,10 +97,7 @@ from featuregen.formula.schema_v2 import (
 from featuregen.formula.trace import TraceEventKind, open_authoring_run
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import LLMClient
-from featuregen.overlay.upload.operational_facts import (
-    OperationalValue,
-    read_operational_value,
-)
+from featuregen.overlay.upload.operational_facts import read_operational_value
 
 if TYPE_CHECKING:
     # Deliberately TYPE_CHECKING-only, for the same reason v1 does it: a name that exists at
@@ -444,7 +441,28 @@ def _read_c1_facts_v2(conn, proposal: TypedFormulaProposalV2
     return facts_by_ref, tuple(failures)
 
 
-def _fact_text(value: OperationalValue | None) -> str:
+class GovernedRead(Protocol):
+    """The three axes of a governed read these two projections actually consult.
+
+    Structural on purpose: the LIVE reader hands them a
+    :class:`~featuregen.overlay.upload.operational_facts.OperationalValue`, and the frozen
+    snapshot reader (``recipe_authoring.FrozenRecipeReadContext.formula_facts_v2``) hands them a
+    ``FrozenOperationalValue`` — *"the immutable subset of OperationalValue consumed by formula
+    output policy"*, in its own words. One projection, both readers, no second definition of what
+    a fact is. Read-only members deliberately: both readers are FROZEN dataclasses, and a mutable
+    protocol attribute is invariant and would match neither."""
+
+    @property
+    def value(self) -> object | None: ...
+
+    @property
+    def status(self) -> str: ...
+
+    @property
+    def conflict_status(self) -> str | None: ...
+
+
+def _fact_text(value: GovernedRead | None) -> str:
     """One governed read as the plain string ``OperandFactsV2`` carries. A read that did not
     RESOLVE contributes ``""`` — the empty fact — rather than a raw value the C1 gates refused to
     serve; the hard-fail attribution beside it is what carries the reason."""
@@ -453,7 +471,7 @@ def _fact_text(value: OperationalValue | None) -> str:
     return str(value.value)
 
 
-def _hard_failure(value: OperationalValue | None, ref: str,
+def _hard_failure(value: GovernedRead | None, ref: str,
                   field: str) -> AuthorityFailure | None:
     """The typed attribution for a C1 read that failed CLOSED — the same three statuses v1 treats
     as fail-closed, imported from ``authoring`` so the two can never drift."""

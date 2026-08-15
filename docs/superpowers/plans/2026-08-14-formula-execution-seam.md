@@ -2384,6 +2384,70 @@ through Kedro on kind; publication is proven for that environment at those engin
 
 ---
 
+## 6.5 Successor: the replay-shaped v2 orchestrator
+
+**PROVENANCE.** This section is not part of the plan as written. It is the successor charter A3's
+acceptance row *recorded* (plan defect 1): *"Routing a v2 work item through the live worker needs a
+replay-shaped v2 orchestrator plus v2 siblings of `recipe_authoring.recipe_expectation_validator`,
+`recipe_authoring.recipe_tool_runner` and `FrozenRecipeReadContext.formula_facts` … That is its own
+task."* A4 increment 2 then made the live worker terminalize every v2 work item
+(`V2_AUTHORING_UNAVAILABLE`) so the absence could not become a false verdict, and E0 asserted that
+refusal as a **green tripwire** — *"the day someone writes the replay-shaped v2 orchestrator, E0
+goes RED and says why."* Four increments, each its own commit, each closing one of those.
+
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 1: THE v2 SEAMS. ACCEPTED `<inc1>`.** The three
+> things A3's defect 1 named, built as SIBLINGS with the v1 half left byte-frozen:
+> `FrozenRecipeReadContext.formula_facts_v2`, `recipe_expectation_validator_v2` and
+> `recipe_tool_runner_v2` (all in `formula/recipe_authoring.py`, beside their v1 originals).
+>
+> **The facts reader is keyed by `logical_ref`, and the test proves it through the REAL resolver.**
+> A3's defect 4 said a v1-keyed bundle "resolves every operand to empty facts and assembles a policy
+> out of nothing"; `test_the_v2_facts_bundle_is_keyed_by_ref_not_by_body_path` feeds both keyings to
+> `resolve_output_v2` and shows the path-keyed one returning a monetary output with **no currency at
+> all**. The reader also reads the SECOND operand (v1 has no such notion) and every grain key, and
+> returns `(facts_by_ref, authority_failures)` — a governed read that failed CLOSED is attributed,
+> never silently empty.
+>
+> **The slot→field mapping is IMPORTED from `authoring_v2`, not restated.** `_OPERAND_FACT_FIELDS`,
+> `_GRAIN_FIELD`, `_fact_text` and `_hard_failure` are the live v2 reader's; a frozen reader that
+> disagreed with the live one about what a fact IS would be a second authority. This needed one
+> additive type change in `authoring_v2`: the two projections now take a read-only `GovernedRead`
+> Protocol instead of the concrete `OperationalValue`, because both readers are FROZEN dataclasses
+> and a mutable protocol attribute is invariant and would match neither. No new mypy errors (the
+> four `ExprFacts` ones on the v1 method are pre-existing, measured by HEAD-swap).
+>
+> **The validator covers all twelve v2 expression keys** — the seven v1 preserves plus
+> `second_operand_ref`, `aggregation_argument`, `authority_refs`, `term_name`, `term_sign` — over
+> every body shape, with `offset_periods` added to the window comparison (v1's expected-policy
+> projection lists seven window keys and a shifted window would ride through unnamed). The
+> canonical expression paths come from `recipe_formula_contracts_v2`'s ONE vocabulary
+> (`EXPRESSION_PATHS_BY_FINAL_OPERATION` / `composite_expression_path`), never a second list, and a
+> degraded expectation is re-checked against the `operation_rule` table so it can never be
+> "preserved" by an equally degraded proposal (`EXPECTATION_SHAPE_INVALID`).
+> `test_the_v1_validator_still_refuses_a_v2_proposal_which_is_why_v2_needs_its_own` states the
+> reason the sibling exists rather than assuming it.
+>
+> **Two things the code said that the charter did not anticipate, both kept:**
+> (a) **`recipe_tool_runner_v2` was not optional.** `list_supported_operations` answers out of the
+> v1 `AggregateFunction` enum and `validate_draft_formula` runs `parse_proposal_v1` — under a v2 run
+> the first names a grammar the model is not authoring in and the second calls a *valid* v2 draft
+> `invalid`, teaching the model to abandon a correct proposal. Both are asserted, including the v1
+> runner's wrong answer for the same draft. The ref gate and the frozen-context read are v1's,
+> unchanged. The v2 verdict is stamped `operation_grammar_version`, not v1's
+> `capability_policy_version`: `capability_v2` declares no policy-version constant and a tool result
+> is not where to invent one.
+> (b) **A four-blank `authority_refs` block cannot be authored at all** —
+> `AuthorityRefsV2.__post_init__` refuses it (*"authority_refs with every ref blank is a lie — omit
+> the block instead"*), so the validator's `None`-vs-`{}` distinction is untestable through a parsed
+> proposal. The projection keeps the distinction anyway, because a stored expectation is a DICT that
+> nothing re-parses, and the test asserts the stronger law it found instead of the one it went
+> looking for.
+>
+> 35 new cases in `tests/featuregen/formula/test_recipe_authoring_v2.py`. Gates: full suite
+> **11226 passed, 20 skipped** (baseline on `8298f68e` was 11191/20 — the 35 new tests and nothing else moved); `-m eval` **73 passed**; ruff clean, no new mypy errors on the touched files.
+
+---
+
 ## 7. Sequencing and dependencies
 
 ```
