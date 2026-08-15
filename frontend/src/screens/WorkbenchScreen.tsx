@@ -372,6 +372,35 @@ const OK_SOLID_CHIP_STYLE = {
 // list. It lives in the decision rail, which is a grid column on desktop and a pinned bar under
 // 768px — both expressed in index.css, so the row list needs no sticky child any more.)
 
+// ── Slice 3: what a revised round does to the round already on screen ───────────────────────────
+//
+// THE POLICY, chosen and implemented: submitting a revision keeps the current results visible and
+// untouched until the new request SUCCEEDS. A failed revision therefore costs nothing — the run
+// the human was working in is still there, with their selections. The review permits the other
+// arm (clear at submit, with a warning) and forbids only silent invalidation.
+//
+// The other arm is ONE boolean: flip this to true and `generate` drops the round before awaiting.
+// The drawer's copy is derived from the same constant below, so the promise on screen and the
+// behaviour can never drift apart — which is the only way this switch is safe to flip.
+const CLEAR_RESULTS_AT_REVISE_SUBMIT: boolean = false
+
+// Said BEFORE the human submits, because the review's one hard rule here is that invalidation is
+// never silent. The replacement sentence is deliberately precise about what survives: a fresh
+// engine round replaces the generated candidates and the picks among them (their keys carry the
+// fetch sequence), while hand-written drafts and anything already registered are untouched. The
+// tool that KEEPS picks is whole-round feedback, so the copy names it rather than leaving the
+// human to discover the difference by losing a selection.
+const REVISE_SUBMIT_COPY = CLEAR_RESULTS_AT_REVISE_SUBMIT
+  ? 'Generating clears the results below straight away, and the new round replaces them when it '
+    + 'lands. If it fails, you will be left with no candidates on screen.'
+  : 'Generating leaves the results below on screen and unchanged until the new round lands. If '
+    + 'the request fails, nothing here changes.'
+const REVISE_REPLACE_COPY =
+  'When it lands it replaces this round: the generated candidates below, and any you have '
+  + 'selected but not yet registered, make way for the new ones. Definitions you wrote yourself '
+  + 'stay on the list, and features you already registered stay registered. To keep your picks '
+  + 'instead, use "Feedback on the whole round" below.'
+
 const EXAMPLE_GOAL = 'predict churn'
 
 // One definition per line. The newline-separated example teaches the batch shape at a glance.
@@ -1273,11 +1302,25 @@ export function WorkbenchScreen() {
   const [roundHypothesis, setRoundHypothesis] = useState('')
   const [roundObjective, setRoundObjective] = useState('')
   // Slice 1: the compact submitted brief replaces the intake form once a round's snapshot exists.
-  // `briefRevising` is the human's explicit re-open of the draft form (the Revise brief control) —
-  // the full drawer with its own cancel/replace policy is Slice 3. `roundToken` counts LANDED
-  // engine rounds and nothing else: it is the one signal the focus + announcement effect fires on,
-  // so a selection, a registration or an approved refine never re-announces a round.
+  //
+  // Slice 3 splits the two ways that form can be back on screen, because they are not the same
+  // event and must not behave the same way:
+  //
+  //   `reviseOpen`    — the human CLICKED Revise brief. The brief moves into a drawer over the
+  //                     still-live run. This is the only revise affordance anyone can choose.
+  //   `briefRevising` — the form was ALREADY open (first round, or an error retry) and a round
+  //                     landed while the caret was in it. Slice 1's protection: it stays exactly
+  //                     where it is. Moving it into a drawer would remount the field mid-keystroke
+  //                     and destroy the very revision the protection exists to keep.
+  //
+  // They are mutually exclusive by construction (see applyConsideredRound / recognize), so the
+  // screen never shows two competing ways to revise the same brief.
+  //
+  // `roundToken` counts LANDED engine rounds and nothing else: it is the one signal the focus +
+  // announcement effect fires on, so a selection, a registration or an approved refine never
+  // re-announces a round.
   const [briefRevising, setBriefRevising] = useState(false)
+  const [reviseOpen, setReviseOpen] = useState(false)
   const [roundToken, setRoundToken] = useState(0)
   const [liveMessage, setLiveMessage] = useState('')
   const [setFbInstruction, setSetFbInstruction] = useState('')
@@ -1323,6 +1366,8 @@ export function WorkbenchScreen() {
   selectedRef.current = selected
   const registeredRef = useRef(registered)
   registeredRef.current = registered
+  const reviseOpenRef = useRef(reviseOpen)
+  reviseOpenRef.current = reviseOpen
 
   // B10: derive the UOA proposal when a recognition lands (target + source known). A fetch
   // failure leaves the block absent — the confirmation is optional, absence is free.
@@ -1501,7 +1546,16 @@ export function WorkbenchScreen() {
   // brief has been submitted yet, the human asked to revise, or the run failed and the fastest
   // honest recovery is the form they already filled in (no snapshot describes a failed run, so
   // there is nothing to collapse to).
-  const formOpen = !briefSubmitted || briefRevising || phase === 'error'
+  // Slice 3: the drawer needs a LIVE run behind it — that is the whole point of it being a drawer
+  // rather than the page. A failed run has no results to preserve and no snapshot worth quoting,
+  // so `error` keeps Slice 1's inline retry form instead.
+  const reviseDrawerOpen = reviseOpen && briefSubmitted && phase !== 'error'
+  const formOpen = !briefSubmitted || briefRevising || reviseDrawerOpen || phase === 'error'
+  // Have the fields drifted from the brief the visible run was generated from? After a landed
+  // round they are equal by construction (the snapshot IS what was submitted), so this is true
+  // only when the human has typed something they have not generated yet.
+  const briefDiffersFromSnapshot = briefSubmitted
+    && (hypothesis.trim() !== roundHypothesis.trim() || goal.trim() !== roundObjective.trim())
   const stage = STAGE_COPY[phase]
   // What this run's options are made of, counted from the wire. Empty for legacy/free-form rounds
   // that carry no option-actions entries — then the strip does not render at all rather than
@@ -1529,6 +1583,16 @@ export function WorkbenchScreen() {
     if (!typing) stageHeadingRef.current?.focus()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roundToken])
+
+  // Slice 3: opening the drawer moves the caret into the first field it holds, so a keyboard user
+  // lands in the edit rather than being left on a control that has just disappeared. Fires on the
+  // OPEN transition only — never on a re-render, and never while a round is landing (that path
+  // goes through settleReviseSurfaces, which keeps the caret where it already is).
+  useEffect(() => {
+    if (!reviseDrawerOpen) return
+    document.getElementById('wb-hypothesis')?.focus()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviseDrawerOpen])
 
   function fail(err: unknown) {
     setNotice(
@@ -1570,6 +1634,36 @@ export function WorkbenchScreen() {
     setRoundHypothesis('')
     setRoundObjective('')
     setBriefRevising(false)
+    // No run left to revise: the drawer's whole premise (a live round behind it) is gone, so it
+    // closes and the draft shell takes over.
+    setReviseOpen(false)
+  }
+
+  // Slice 3, the Cancel arm: return to the current run unchanged. It writes NOTHING — not the
+  // fields, not the scope, not the round — so cancelling is always free. The human's in-progress
+  // text is deliberately kept (re-opening finds it, with the "these are your edits" note beside
+  // it); silently reverting their typing would be its own kind of invalidation.
+  function closeRevise() {
+    setReviseOpen(false)
+    // The trigger is UNMOUNTED while the drawer is open, so a ref would be null here. The
+    // house pattern (focus an element id after the next render) puts the caret back on the
+    // control the human opened the drawer from, instead of dropping it on <body>.
+    focusTarget.current = 'wb-revise-open'
+  }
+
+  // Slice 3: a round has landed and the brief on screen is authoritative again, so whichever
+  // revise surface is open closes — UNLESS the human is mid-keystroke in it, in which case
+  // closing would delete the revision they are writing (Slice 1's protection, now applied to
+  // both surfaces). The two are set as an either/or so a drawer's content is never handed to the
+  // inline form, or the reverse, which would remount the field under the caret.
+  function settleReviseSurfaces() {
+    const typing = briefTextFocused.current
+    if (reviseOpenRef.current) {
+      setReviseOpen(typing)
+      setBriefRevising(false)
+      return
+    }
+    setBriefRevising(typing)
   }
 
   // Resets both feedback channels: round counters, recorded strips, typed instructions, and
@@ -1704,11 +1798,10 @@ export function WorkbenchScreen() {
     // whole-round feedback reruns these even if the inputs are edited later.
     setRoundHypothesis(roundHyp)
     setRoundObjective(roundObj)
-    // The round landed: the submitted brief is authoritative again, so a draft form the human
-    // re-opened to revise closes — UNLESS their caret is in it, in which case collapsing would
-    // delete a revision they are in the middle of writing. It stays open with its "these results
-    // came from the submitted brief" banner, which is the honest read of that moment.
-    setBriefRevising(briefTextFocused.current)
+    // The round landed: the submitted brief is authoritative again, so whichever revise surface
+    // is open closes — UNLESS the caret is in it, in which case collapsing would delete a
+    // revision the human is in the middle of writing.
+    settleReviseSurfaces()
     setRoundToken(token => token + 1)
     if (resetFeedback) clearFeedback()
   }
@@ -1784,7 +1877,7 @@ export function WorkbenchScreen() {
       setRoundObjective(objective)
       // The snapshot is taken: from here the brief is what the RUN was submitted with, and a
       // re-opened draft form closes back down to it (unless the human is mid-keystroke in it).
-      setBriefRevising(briefTextFocused.current)
+      settleReviseSurfaces()
       setRecognition(rec)
       setRecognitionTransition(null)
       setScopePrimary(rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
@@ -1987,6 +2080,16 @@ export function WorkbenchScreen() {
     setNotice('')
     setScopeChanged(false)
     setGenerating(true)
+    // Slice 3, the chosen policy arm: NOTHING is dropped here. The round on screen — and the
+    // human's picks in it — survive until `applyConsideredRound` replaces them, so a failed
+    // revision costs nothing. The other arm lives entirely in this block: with the constant
+    // flipped, the round is cleared at submit and REVISE_SUBMIT_COPY has already said so.
+    if (CLEAR_RESULTS_AT_REVISE_SUBMIT && briefSubmitted) {
+      setGenerated(null)
+      setScreenedTarget(null)
+      clearSets()
+      clearFeedback()
+    }
     try {
       // The governed considered-set endpoint: same gauntlet-validated FeatureSet[] as
       // recommend-sets, returned as `alternatives`, plus a server-side intent_id that later
@@ -2000,10 +2103,18 @@ export function WorkbenchScreen() {
       applyConsideredRound(cs, seq, hypothesis.trim(), objective)
     } catch (err) {
       if (seq !== generateSeq.current) return
-      setGenerated(null)
-      setScreenedTarget(null)
-      clearSets()
-      clearFeedback()
+      // A FIRST generation has nothing to keep, so its failure clears the empty round it was
+      // building and the screen falls to its error shell. A REVISION does have something to
+      // keep: the policy stated in the drawer promises the visible run survives a failed
+      // request, and throwing away a human's candidates and selections because a provider
+      // timed out is exactly the invalidation this slice exists to prevent. The notice reports
+      // the failure; the run stays, with its picks.
+      if (!briefSubmitted || CLEAR_RESULTS_AT_REVISE_SUBMIT) {
+        setGenerated(null)
+        setScreenedTarget(null)
+        clearSets()
+        clearFeedback()
+      }
       fail(err)
     } finally {
       if (seq === generateSeq.current) setGenerating(false)
@@ -2523,7 +2634,11 @@ export function WorkbenchScreen() {
           that is the whole point. Editing the live hypothesis input beside results generated from
           different text was the review's Critical finding, and the only way back to the fields is
           the explicit Revise brief control. */}
-      {!formOpen && (
+      {/* Slice 3: the deck stays up while the drawer is open. The run's identity — the brief that
+          produced what is on screen — must remain readable beside a draft of its replacement, or
+          the human is editing one thing while reading another, which is the Critical finding this
+          workspace exists to close. */}
+      {(!formOpen || reviseDrawerOpen) && (
         <div className="panel run-deck">
           <article className="deck-card">
             <p className="micro-label">Your submitted brief</p>
@@ -2544,11 +2659,20 @@ export function WorkbenchScreen() {
             </div>
             <div className="deck-foot">
               <span className="micro-label">Submitted snapshot</span>
-              {/* Not a disclosure: this control is replaced by the form it opens (and by that
-                  form's "Keep submitted brief" cancel), so it never owns an expanded state. */}
-              <button type="button" className="btn" onClick={() => setBriefRevising(true)}>
-                Revise brief
-              </button>
+              {/* Slice 3: the ONE revise affordance. It opens the drawer; while the drawer is
+                  open the trigger is gone, so the screen never offers two ways into the same
+                  edit. Focus returns here when the drawer closes. */}
+              {!reviseDrawerOpen && (
+                <button
+                  type="button"
+                  className="btn"
+                  id="wb-revise-open"
+                  aria-haspopup="dialog"
+                  onClick={() => setReviseOpen(true)}
+                >
+                  Revise brief
+                </button>
+              )}
             </div>
           </article>
 
@@ -2605,25 +2729,87 @@ export function WorkbenchScreen() {
           has status regions whose identity tests and users rely on. */}
       <div aria-live="polite" className="visually-hidden">{liveMessage}</div>
 
+      {/* ── Slice 3: the revise drawer ──────────────────────────────────────────────────────────
+          The drawer is a SHELL around the brief form the draft state already renders — the same
+          fields, the same handlers, the same submit. That is deliberate: two copies of an intake
+          form is how the field a human edits stops being the field the engine reads. What the
+          drawer adds is the frame the review asks for — the snapshot it was populated from, the
+          policy stated BEFORE submission, and two explicit outcomes.
+
+          It is deliberately NOT `aria-modal`, and there is no backdrop. A human revises a brief
+          BECAUSE of what the results say, so making them dismiss the drawer to read the rows
+          they are reacting to would be the same "output out of reach" defect in a new place. The
+          run behind stays visible, readable and interactive — and the second path out of this
+          form ("Write definitions myself") opens its panel into a page nothing is covering. */}
       {formOpen && (
         <div
-          className="panel"
+          className={reviseDrawerOpen ? 'drawer' : 'panel'}
           id="wb-brief-form"
+          role={reviseDrawerOpen ? 'dialog' : undefined}
+          aria-labelledby={reviseDrawerOpen ? 'wb-revise-title' : undefined}
+          onKeyDown={reviseDrawerOpen
+            ? event => { if (event.key === 'Escape') closeRevise() }
+            : undefined}
           onFocusCapture={e => {
             const el = e.target as HTMLElement
             briefTextFocused.current = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
           }}
           onBlurCapture={() => { briefTextFocused.current = false }}
         >
-          {briefSubmitted && (
+          {reviseDrawerOpen && (
+            <header className="drawer-head">
+              <div>
+                <p className="micro-label">New draft from your submitted brief</p>
+                <h2 id="wb-revise-title" style={{ margin: 0 }}>Revise the brief</h2>
+              </div>
+              <button
+                type="button"
+                className="btn"
+                aria-label="Close revise brief"
+                onClick={closeRevise}
+              >
+                ×
+              </button>
+            </header>
+          )}
+          {reviseDrawerOpen && (
+            <div className="drawer-note">
+              {/* Populated FROM the snapshot: after a round lands the fields already hold exactly
+                  what was submitted. They diverge only when the human edits them — which must
+                  never be undone silently, so divergence is named and reversible instead. */}
+              {briefDiffersFromSnapshot ? (
+                <>
+                  <p>
+                    These fields hold your edits, not the brief this run was generated from. The
+                    submitted brief is quoted above and still describes the results below.
+                  </p>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      setHypothesis(roundHypothesis)
+                      setGoal(roundObjective)
+                    }}
+                  >
+                    Restore the submitted brief
+                  </button>
+                </>
+              ) : (
+                <p>Populated from the brief this run was generated from.</p>
+              )}
+            </div>
+          )}
+          {/* Slice 1's caret-protection banner. It belongs to the INLINE surface only: the drawer
+              says the same thing in its own note and its own actions, and showing both would be
+              the two-affordance problem in one panel. */}
+          {briefSubmitted && !reviseDrawerOpen && (
             <div className="brief-revising">
               <p className="hint" style={{ margin: 0 }}>
                 Revising the brief. The results below were generated for the submitted brief and are
                 unchanged until a new round lands.
               </p>
               {/* The review's rule: revising has two explicit outcomes and neither is silent. This
-                  is the Cancel arm — it returns to the run exactly as it was. The other arm is
-                  Generate, already in the form. (The populated drawer is Slice 3.) */}
+                  is the Cancel arm — it returns to the run exactly as it was. */}
               <button
                 type="button"
                 className="btn"
@@ -2711,7 +2897,13 @@ export function WorkbenchScreen() {
                     <circle cx="8" cy="8" r="6.2" />
                     <path d="M8 5v6M5 8h6" />
                   </PathGlyph>
-                  {generating ? 'Generating' : 'Generate candidate sets'}
+                  {/* Slice 3: the control names what it will actually do. Submitting from the
+                      drawer starts a REVISED round over a run that already exists; calling that
+                      "Generate candidate sets" hides the replacement from the click that causes
+                      it. */}
+                  {generating
+                    ? 'Generating'
+                    : reviseDrawerOpen ? 'Generate revised round' : 'Generate candidate sets'}
                 </span>
                 <span className="d">
                   Governed recipes and model intents planned over this catalog's confirmed meaning,
@@ -2738,6 +2930,22 @@ export function WorkbenchScreen() {
                 </span>
               </button>
             </div>
+            {/* ── The two explicit outcomes, and the policy stated BEFORE either ────────────────
+                Both sentences come from CLEAR_RESULTS_AT_REVISE_SUBMIT, so the promise the human
+                reads and the behaviour they get are the same constant. Neither outcome is
+                silent: Cancel writes nothing, Generate says what it replaces. */}
+            {reviseDrawerOpen && (
+              <div className="drawer-actions">
+                <p className="hint" data-role="revise-policy">
+                  {REVISE_SUBMIT_COPY} {REVISE_REPLACE_COPY}
+                </p>
+                <div className="decision-actions">
+                  <button type="button" className="btn" onClick={closeRevise}>
+                    Keep submitted brief
+                  </button>
+                </div>
+              </div>
+            )}
           </form>
         </div>
       )}

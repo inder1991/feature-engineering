@@ -814,8 +814,9 @@ describe('selection and registration', () => {
     await registerSelection(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
     // Second round returns a candidate with the same LLM-chosen name: it was never registered.
+    // (Slice 3: submitting from the revise drawer names what it does — a REVISED round.)
     await reviseBrief()
-    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate revised round/i }))
     const checkbox = await screen.findByRole('checkbox', { name: 'Select avg_balance' })
     expect(checkbox).not.toBeChecked()
     expect(screen.queryByText(/registered/i)).not.toBeInTheDocument()
@@ -842,19 +843,20 @@ describe('selection and registration', () => {
     await selectCandidate('avg_balance')
     await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
     // Confirm step: no new round and no scope edit can pull rows out from under the approval.
-    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
+    // (Slice 3: the form is in the revise drawer, so its submit names the revised round.)
+    expect(screen.getByRole('button', { name: /generate revised round/i })).toBeDisabled()
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
     expect(screen.getByLabelText('Target column')).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
     // Still locked while the batch is in flight.
-    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /generate revised round/i })).toBeDisabled()
     expect(screen.getByLabelText('Catalog source')).toBeDisabled()
     await act(async () => {
       pending.resolve('feat_60')
     })
     expect(await screen.findByText('feat_60')).toBeInTheDocument()
     // The lock releases with the batch.
-    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /generate revised round/i })).toBeEnabled()
     expect(screen.getByLabelText('Catalog source')).toBeEnabled()
   })
 
@@ -1432,7 +1434,7 @@ describe('whole-round feedback', () => {
     // the fresh generate's response is queued next and the stale feedback resolves afterward.
     contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([OTHER_IDEA])))
     await reviseBrief()
-    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate revised round/i }))
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     await act(async () => {
       pending.resolve(considered(singleSetRound([idea('stale_signal')])))
@@ -3775,5 +3777,278 @@ describe('Slice 2: the readiness ladder', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(screen.queryByRole('img', { name: /Readiness: / })).toBeNull()
     expect(document.querySelectorAll('.ladder')).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------- Slice 3: the revised-round drawer ----
+describe('Slice 3: the revise drawer', () => {
+  function drawer(): HTMLElement {
+    return screen.getByRole('dialog', { name: 'Revise the brief' })
+  }
+
+  async function openRevise() {
+    await userEvent.click(screen.getByRole('button', { name: 'Revise brief' }))
+  }
+
+  async function retypeHypothesis(text: string) {
+    const field = within(drawer()).getByLabelText('Hypothesis')
+    await userEvent.clear(field)
+    await userEvent.type(field, text)
+  }
+
+  const REVISED = 'dormant cards precede attrition'
+
+  it('opens populated from the submitted snapshot, with the run still on screen behind it', async () => {
+    await renderAndGenerate([IDEA], { source: 'deposits', target: 'public.labels.churned' })
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+
+    const panel = drawer()
+    expect(within(panel).getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
+    expect(within(panel).getByLabelText('Prediction goal')).toHaveValue('predict churn')
+    expect(within(panel).getByLabelText('Catalog source')).toHaveValue('deposits')
+    expect(within(panel).getByLabelText('Target column')).toHaveValue('public.labels.churned')
+    expect(within(panel).getByText('Populated from the brief this run was generated from.'))
+      .toBeInTheDocument()
+    // The run behind it is untouched and still says what produced it: a human editing a draft of
+    // the brief can read the brief the results actually came from at the same time.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('Your submitted brief')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    // Focus is in the first field, not left on a control that has just disappeared.
+    expect(within(panel).getByLabelText('Hypothesis')).toHaveFocus()
+  })
+
+  it('is the ONLY revise affordance while it is open', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+    // The trigger is gone (it is replaced by what it opened) and Slice 1's inline banner does
+    // not double up inside the drawer.
+    expect(screen.queryByRole('button', { name: 'Revise brief' })).toBeNull()
+    expect(screen.queryByText(/^Revising the brief\./)).toBeNull()
+    expect(screen.getAllByLabelText('Hypothesis')).toHaveLength(1)
+    // Two explicit outcomes, both inside the dialog, neither of them silent.
+    expect(within(drawer()).getByRole('button', { name: 'Keep submitted brief' }))
+      .toBeInTheDocument()
+    expect(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+      .toBeInTheDocument()
+  })
+
+  it('states the replacement policy BEFORE either outcome is taken', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+    const policy = within(drawer()).getByText(/Generating leaves the results below/)
+    // The chosen arm, said in full: keep the result until the new request succeeds.
+    expect(policy).toHaveTextContent(
+      'Generating leaves the results below on screen and unchanged until the new round lands. '
+      + 'If the request fails, nothing here changes.')
+    // and exactly what a landed round then replaces — no silent invalidation.
+    expect(policy).toHaveTextContent(
+      'When it lands it replaces this round: the generated candidates below, and any you have '
+      + 'selected but not yet registered, make way for the new ones.')
+    expect(policy).toHaveTextContent(
+      'Definitions you wrote yourself stay on the list, and features you already registered '
+      + 'stay registered.')
+    // The tool that KEEPS picks is named, so the difference is not discovered by losing one.
+    expect(policy).toHaveTextContent('use "Feedback on the whole round" below')
+  })
+
+  it('Cancel returns to the current run unchanged, and sends nothing', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await selectCandidate('avg_balance')
+    const callsBefore = contractConsideredSet.mock.calls.length
+
+    await openRevise()
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: 'Keep submitted brief' }))
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    // Candidates, picks and the brief that produced them: all exactly as they were.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('txn_count')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    expect(screen.queryByText(REVISED)).toBeNull()
+    // Cancel writes nothing and asks the engine for nothing.
+    expect(contractConsideredSet.mock.calls).toHaveLength(callsBefore)
+    // Focus goes back to the control it came from, never to <body>.
+    expect(screen.getByRole('button', { name: 'Revise brief' })).toHaveFocus()
+  })
+
+  it('Escape cancels exactly like the button', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+    await userEvent.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Revise brief' })).toHaveFocus()
+  })
+
+  it('keeps an in-progress edit through a cancel, names it as an edit, and can undo it', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: 'Keep submitted brief' }))
+
+    await openRevise()
+    // Cancelling did not silently revert their typing — that is its own kind of invalidation.
+    expect(within(drawer()).getByLabelText('Hypothesis')).toHaveValue(REVISED)
+    expect(within(drawer()).getByText(
+      /These fields hold your edits, not the brief this run was generated from/))
+      .toBeInTheDocument()
+    // and the way back to the submitted brief is one click, not retyping from the quote.
+    await userEvent.click(
+      within(drawer()).getByRole('button', { name: 'Restore the submitted brief' }))
+    expect(within(drawer()).getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
+    expect(within(drawer()).getByText('Populated from the brief this run was generated from.'))
+      .toBeInTheDocument()
+  })
+
+  it('a submitted revision keeps the previous results visible until the new round SUCCEEDS', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await selectCandidate('avg_balance')
+
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
+    await openRevise()
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+
+    // IN FLIGHT — the chosen policy arm: the round is still there, still picked, and the deck
+    // still attributes it to the brief that actually produced it.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    expect(screen.queryByText(REVISED)).toBeNull()
+
+    await act(async () => { pending.resolve(considered(singleSetRound([OTHER_IDEA]))) })
+
+    // LANDED — replaced, and only now does the deck quote the brief that produced THESE.
+    expect(await screen.findByText('txn_count')).toBeInTheDocument()
+    expect(screen.queryByText('avg_balance')).toBeNull()
+    expect(screen.getByText(REVISED)).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(contractConsideredSet).toHaveBeenLastCalledWith(REVISED, 'predict churn', {
+      catalogSource: undefined, targetRef: undefined,
+    })
+  })
+
+  it('a FAILED revision leaves the run, and its picks, exactly where they were', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await selectCandidate('avg_balance')
+
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    await openRevise()
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
+    // Exactly the promise the drawer made before the click. A provider outage must not cost the
+    // human their candidates and their selections.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    // and the drawer stays open on the edit, one click from a retry.
+    expect(within(drawer()).getByLabelText('Hypothesis')).toHaveValue(REVISED)
+  })
+
+  it('a revised round resets the active set, the narrowing and the picks it replaced', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    expect(await screen.findByText('Temporal set')).toBeInTheDocument()
+    // Work the view: switch off the engine's pick, narrow it, and select something.
+    await userEvent.click(screen.getByRole('button', { name: /Ratio set/ }))
+    await userEvent.type(screen.getByLabelText('Search this set'), 'balance_to')
+    await selectCandidate('balance_to_limit_ratio')
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+
+    contractConsideredSet.mockResolvedValue(considered(multiSetRound()))
+    await openRevise()
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+    expect(await screen.findByText(REVISED)).toBeInTheDocument()
+
+    // The new round is entered the way any round is: on the engine's advisory pick, unfiltered,
+    // with nothing selected. A view aimed at candidates that no longer exist is not carried over.
+    expect(screen.getByRole('button', { name: /Temporal set/ })).toHaveAttribute(
+      'aria-pressed', 'true')
+    expect(screen.getByLabelText('Search this set')).toHaveValue('')
+    expect(screen.getByText('0 selected')).toBeInTheDocument()
+    expect(screen.getByText(/Nothing is selected yet/)).toBeInTheDocument()
+    // "Scroll" on this screen is Slice 1's deliberate transition and nothing else: a revised
+    // round moves the caret to the stage heading, exactly as a first round does. There is no
+    // saved scroll offset to restore, and pretending to restore one would be a fiction.
+    expect(screen.getByRole('heading', { name: 'Compare and refine' })).toHaveFocus()
+  })
+
+  it('leaves definitions the human wrote themselves on the list, exactly as the copy said', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    // openDescribe goes through Revise brief, so the drawer is already open here — and the
+    // describe panel it opened is NOT behind a backdrop, which is why the drawer is not modal.
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'Revise the brief' })).toBeInTheDocument()
+
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([OTHER_IDEA])))
+    await retypeHypothesis(REVISED)
+    await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+    expect(await screen.findByText('txn_count')).toBeInTheDocument()
+
+    // The generated round was replaced; the human's own definition was not.
+    expect(screen.queryByText('avg_balance')).toBeNull()
+    expect(screen.getByText('total_spend_per_customer')).toBeInTheDocument()
+  })
+
+  it('a round landing while the caret is in the drawer keeps the drawer, and the typing', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
+    await openRevise()
+    await userEvent.click(within(drawer()).getByRole('button', { name: /Generate revised round/ }))
+    // The human goes back to the field and starts the NEXT revision while the round is in flight.
+    const field = within(drawer()).getByLabelText('Prediction goal')
+    act(() => { field.focus() })
+    await act(async () => { pending.resolve(considered(singleSetRound([OTHER_IDEA]))) })
+
+    // Slice 1's caret protection, applied to this surface: the drawer does not close under the
+    // caret and take a half-typed revision with it.
+    expect(screen.getByRole('dialog', { name: 'Revise the brief' })).toBeInTheDocument()
+    expect(within(drawer()).getByLabelText('Prediction goal')).toHaveFocus()
+    // and the round still landed behind it.
+    expect(screen.getByText('txn_count')).toBeInTheDocument()
+  })
+
+  it('a scope edit in the drawer voids the round, closes the drawer, and says so', async () => {
+    await renderAndGenerate([IDEA], { target: 'public.labels.churned' })
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openRevise()
+    await userEvent.type(within(drawer()).getByLabelText('Target column'), '2')
+
+    // The candidates that scope produced are gone, so the drawer's premise — a live run behind
+    // it — is gone too. The page hands itself back to the draft shell rather than leaving a
+    // dialog floating over nothing.
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByText('avg_balance')).toBeNull()
+    expect(screen.queryByText('Your submitted brief')).toBeNull()
+    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
+    expect(screen.getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
+  })
+
+  it('the draft shell has no drawer: there is no run to revise', () => {
+    render(<WorkbenchScreen />)
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Revise brief' })).toBeNull()
+    expect(screen.getByLabelText('Hypothesis')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeInTheDocument()
   })
 })
