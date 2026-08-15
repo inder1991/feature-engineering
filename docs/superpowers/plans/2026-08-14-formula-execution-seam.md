@@ -3135,6 +3135,44 @@ thing a deployment might configure into a thing this engine structurally cannot 
 > increment — the count is 14 above increment 1's because increment 3's harness tests were already
 > in the tree when this ran, so **the same run gates increment 3**.
 
+> **SUCCESSOR 3 — INCREMENT 3: THE VALIDATION HARNESS. ACCEPTED `<hash-3>` (2026-08-15).**
+> `scripts/thrift_smoke.py` — read-only, three metadata reads, nothing written.
+>
+> **IT IS THE PRODUCTION CODE PATH, WHICH IS THE ENTIRE POINT.** It builds a real
+> `MetastoreSession` and a real `SqlMetastoreAdapter` and asks L1's three questions, so the first
+> contact with a new endpoint exercises the same driver, the same validated back-quoted identifiers,
+> the same read-of-`privilege`-by-name and above all the same `FAULT_PATTERNS` classification that
+> the worker will. A beeline session proves a human can reach the endpoint; it cannot prove the
+> adapter can, and it reports "an error" where this reports WHICH typed outcome. It deliberately
+> does not exercise `SqlPublicationSwap` — that is a `CREATE OR REPLACE VIEW`, a real mutation, and
+> a smoke test should not be the thing that first performs it.
+>
+> **THE GUARDS ANSWER THE ONE FAILURE IT COULD PLAUSIBLY CAUSE**, which is not a wrong answer but
+> being aimed at the wrong cluster by an inherited shell environment. The five endpoint variables
+> are imported BY NAME from `queue_lane` rather than re-spelled, so the script cannot drift from
+> what the worker dials; **none has a default**; every missing one is named at once; and
+> `--confirm-endpoint HOST:PORT` must equal what the environment resolved to, checked **before any
+> connection is opened**. `--roles` is required and non-empty because `can_read` answers `False` for
+> an empty role list WITHOUT asking the engine, and printing that would be a verdict nothing
+> observed.
+>
+> **EXIT CODES ENCODE THE DISTINCTION THE ADAPTER IS BUILT ON.** `0` — every question produced a
+> typed outcome, **including READ SCOPE UNANSWERABLE**, because that is an answer ABOUT the endpoint
+> and exiting non-zero would train an operator to read the platform's most careful refusal as a
+> broken deployment. `2` — configuration refused, nothing contacted. `3` — UNREACHABLE or
+> UNRECOGNISED, the two outcomes that genuinely mean the endpoint is not usable yet.
+>
+> 14 tests in `tests/featuregen/materialize/test_thrift_smoke.py`, **every one with an injected fake
+> `connect`** — a suite for the script that makes first contact must itself never make contact, or
+> it passes and fails on whether a laptop happens to have a metastore. The refusals are pinned
+> harder than the happy path, including an assertion that a mismatched `--confirm-endpoint` left the
+> fake connection unopened.
+>
+> Gates: full suite **11356 passed, 20 skipped** (the same run that gated increment 2 — these
+> 14 tests were in the tree for it); `-m eval` **73 passed**; ruff clean on both new files; mypy
+> clean on `scripts/thrift_smoke.py` and no new errors in `src` (469 in 124 files, identical to the
+> baseline, and none in any file this successor touched).
+
 ---
 
 ## 7. Sequencing and dependencies

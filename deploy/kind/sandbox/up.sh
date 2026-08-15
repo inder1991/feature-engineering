@@ -104,7 +104,26 @@ Ready.
 The SQL endpoint is `spark-thrift:10000` inside the cluster (ClusterIP — never published to the
 host; it authenticates nobody).
 
-  It authenticates nobody and cannot answer L1's read-scope question: Spark rejects `SHOW GRANT`
-  by grammar, so `can_read` raises `MetastoreReadScopeUnanswerable` by design. See the manifest
-  header and the plan's §6.6b.
+  VERIFY IT THROUGH THE PRODUCTION CODE PATH, not beeline. Two things must be delivered first,
+  because the backend image carries NEITHER (`Dockerfile.backend` copies only `src/`, and PyHive is
+  not a dependency of this project — the control plane carries no engine client on purpose):
+
+    kubectl -n featuregen exec deploy/backend -- pip install "PyHive[hive]" thrift
+    kubectl -n featuregen cp scripts/thrift_smoke.py featuregen/$(kubectl -n featuregen get pod \
+      -l app=backend -o jsonpath='{.items[0].metadata.name}'):/tmp/thrift_smoke.py
+
+    kubectl -n featuregen exec deploy/backend -- env \
+      FEATUREGEN_MATERIALIZE_METASTORE_ENGINE=hive \
+      FEATUREGEN_MATERIALIZE_METASTORE_HOST=spark-thrift \
+      FEATUREGEN_MATERIALIZE_METASTORE_PORT=10000 \
+      FEATUREGEN_MATERIALIZE_METASTORE_AUTH=NONE \
+      FEATUREGEN_MATERIALIZE_METASTORE_PRINCIPAL=featuregen \
+      python /tmp/thrift_smoke.py --schema sandbox_feature --table smoke \
+        --roles featuregen --confirm-endpoint spark-thrift:10000
+
+  That script drives the SAME `materialize/metastore_sql.py` adapter the worker uses and prints one
+  typed outcome per question, so the first real contact with this endpoint happens through the exact
+  production code path. EXPECT L1's third question to report READ SCOPE UNANSWERABLE: this endpoint
+  is Spark, and Spark rejects `SHOW GRANT` by grammar. That is the designed answer, not a fault —
+  see the manifest header and the plan's §6.6b.
 EOF
