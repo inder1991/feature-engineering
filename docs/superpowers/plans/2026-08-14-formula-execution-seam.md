@@ -2708,7 +2708,7 @@ recorded unprepared, which is the correct posture rather than a gap. Both deploy
 so at the place an operator would otherwise set the variables.
 
 > **SUCCESSOR 2 (2026-08-15) — INCREMENT 1: THE `MetastoreMetadata` IMPLEMENTATION. ACCEPTED
-> `<hash>`.** `metastore_sql.SqlMetastoreAdapter` answers L1's three questions over one
+> `e170bcb5`.** `metastore_sql.SqlMetastoreAdapter` answers L1's three questions over one
 > `MetastoreSession` (a DB-API 2.0 connection, opened lazily, driver imported from a closed table
 > by engine name, `connect` injectable — which is how 47 tests prove every outcome without a
 > metastore, a JVM or a socket).
@@ -2760,7 +2760,7 @@ so at the place an operator would otherwise set the variables.
 > **73 passed**; ruff clean on all four touched files; mypy clean on both touched source files.
 
 > **SUCCESSOR 2 (2026-08-15) — INCREMENT 2: THE `PublicationSwap` IMPLEMENTATION. ACCEPTED
-> `<hash2>`.** `publish_sql.SqlPublicationSwap` performs G-3's pointer switch over the SAME
+> `63f5ab93`.** `publish_sql.SqlPublicationSwap` performs G-3's pointer switch over the SAME
 > session the metadata adapter uses — one transport, so L1's answers and the swap cannot come from
 > two clients seeing two worlds.
 >
@@ -2818,7 +2818,7 @@ so at the place an operator would otherwise set the variables.
 > the write, no read-back → 3 failed.
 
 > **SUCCESSOR 2 (2026-08-15) — INCREMENT 3: `lane_config_from_env` BUILDS BOTH, AND WHERE THE
-> BOUNDARY NOW SITS. ACCEPTED `<hash3>`.** The lane gained an EXECUTION block — eight variables,
+> BOUNDARY NOW SITS. ACCEPTED `ffd62f3c`.** The lane gained an EXECUTION block — eight variables,
 > **all of them or none** — from which it builds `SqlMetastoreAdapter` and `SqlPublicationSwap`
 > over ONE `MetastoreSession`, plus the `LocalClusterSubmitter` and §9's staging base that
 > `RunExecution` needs beside them.
