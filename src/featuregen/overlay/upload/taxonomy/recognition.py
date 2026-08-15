@@ -30,7 +30,7 @@ grounding. See ``docs/superpowers/plans/2026-07-09-phase1a-shadow-recognizer.md`
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -59,7 +59,13 @@ TAXONOMY_VERSION = "1.0.0"
 # can yield a different DISPOSITION under different validation rules, so a stored answer produced
 # under one validator may not be served as the answer under another. Bump it whenever what this
 # module ACCEPTS or REJECTS changes — the repair-seam plan's Tasks 2 and 4 both do exactly that.
-RECOGNITION_VALIDATOR_VERSION = "1"
+#
+# "2" — repair seam, Task 4: `partition_candidates` overturns all-or-nothing AFTER repair exhaustion,
+# so a body that used to end as TECHNICAL_FAILURE with no candidates can now end as a CLASSIFIED
+# scope over its surviving candidate. That is a different ANSWER to the same question, which is
+# exactly what this version exists to re-key. (Task 3 did NOT bump it: changing how a rejection is
+# reported is not changing what is accepted.)
+RECOGNITION_VALIDATOR_VERSION = "2"
 
 # The selectable LEAVES (terminal objectives). A primary MUST be one of these — the applicability layer
 # scopes on leaves, so a non-leaf selectable parent (e.g. "customer", "credit") would scope to zero recipes.
@@ -117,6 +123,47 @@ RECOGNITION_FAILURE_CODES: frozenset[str] = frozenset({
     TOO_MANY_CANDIDATES, STATUS_REQUIRES_A_CANDIDATE, CLASSIFIED_REQUIRES_ONE_PRIMARY,
 })
 
+#: The codes :func:`partition_candidates` treats as AGGREGATE — a property of the candidate SET, not
+#: of any one candidate — and therefore REFUSES the whole result on. Frozen by the 2026-08-15 review
+#: and deliberately enumerable: the whole risk of a partial-recovery rule is that somebody later
+#: "improves" it into laundering a cap violation, and moving a code out of this set is the shape that
+#: change would take.
+RECOGNITION_AGGREGATE_CODES: frozenset[str] = frozenset({
+    INVALID_STATUS, MALFORMED_CANDIDATE_LIST, TOO_MANY_CANDIDATES, DUPLICATE_CANDIDATE,
+    MULTIPLE_PRIMARY_CANDIDATES, TOO_MANY_SECONDARY_CANDIDATES, STATUS_REQUIRES_A_CANDIDATE,
+})
+
+#: The codes a SINGLE candidate can earn on its own, and which the partition may therefore DROP while
+#: the rest of the result survives. (``CLASSIFIED_REQUIRES_ONE_PRIMARY`` is in neither set: it is not
+#: a drop reason at all — see :func:`status_after_partition`, which downgrades the status rather than
+#: discarding anything.)
+RECOGNITION_CANDIDATE_LOCAL_CODES: frozenset[str] = frozenset({
+    MALFORMED_CANDIDATE, UNKNOWN_USE_CASE_ID, PRIMARY_NOT_A_LEAF_OBJECTIVE, INVALID_RELATIONSHIP,
+    INVALID_CONFIDENCE, MALFORMED_EVIDENCE_SPANS,
+})
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateDrop:
+    """One thing :func:`partition_candidates` discarded, and the closed code that says why.
+
+    ``index`` is the candidate's POSITION in the body the model returned — or ``None``, which means
+    the whole RESULT was refused rather than any candidate being at fault. That distinction is not
+    cosmetic: an aggregate defect (two primaries) is a property of the set, and blaming it on a
+    particular candidate would name a candidate that may be perfectly well formed. The live incident
+    is exactly that case.
+
+    ``reason_code`` is always one of :data:`RECOGNITION_FAILURE_CODES` — value-free, so it is safe in
+    an API payload and a UI string without any further scrubbing."""
+
+    index: int | None
+    reason_code: str
+
+    @property
+    def is_whole_result(self) -> bool:
+        """True when this drop refuses the RESULT (an aggregate rule), not a single candidate."""
+        return self.index is None
+
 
 def _reject(code: str, detail: str) -> AttestedSchemaValidationError:
     """Build the one exception shape this module raises: an ATTESTED failure whose wire reason is a
@@ -165,7 +212,14 @@ class RecognitionResult:
     Phase-2B adds the two optional, human-confirmable intent DIMENSIONS the recognizer PROPOSES —
     ``modelling_contexts`` (0+ regulatory framework/regime ids) and a single soft ``target_entity``
     (the prediction grain) — plus non-fatal per-dimension ``warnings``. They default empty so a
-    dimension-free recognition (and every Phase-1 caller) is unchanged."""
+    dimension-free recognition (and every Phase-1 caller) is unchanged.
+
+    ``dropped_candidates`` (repair seam, Task 4) records what a strict partial partition discarded.
+    It is deliberately NOT folded into ``warnings``: that field already carries the per-DIMENSION
+    codes the UI renders as *"we couldn't map part of what you described"*, which would misdescribe a
+    discarded candidate as a mis-mapped regime. Task 5 turns this into the ``recognition_quality``
+    contract; until then it is an in-memory fact of the value object — see ``scope_records``, which
+    has no column for it, so a result read back from storage carries ``()``."""
 
     status: RecognitionStatus
     candidates: tuple[UseCaseCandidate, ...]
@@ -178,6 +232,7 @@ class RecognitionResult:
     modelling_contexts: tuple[str, ...] = ()
     target_entity: str | None = None
     warnings: tuple[str, ...] = ()
+    dropped_candidates: tuple[CandidateDrop, ...] = ()
 
 
 def _validate_candidate(candidate: Any, index: int) -> str:
@@ -319,6 +374,116 @@ def normalize_dimensions(
     # A None/absent target_entity (no proposed grain) is clean — no warning.
 
     return tuple(contexts), target_entity, tuple(warnings)
+
+
+def _refused(code: str) -> tuple[tuple[Mapping[str, Any], ...], tuple[CandidateDrop, ...]]:
+    """An aggregate refusal: nothing survives, and the one drop names the RESULT (``index=None``)."""
+    return (), (CandidateDrop(index=None, reason_code=code),)
+
+
+def partition_candidates(
+    output: Mapping[str, Any],
+) -> tuple[tuple[Mapping[str, Any], ...], tuple[CandidateDrop, ...]]:
+    """Split a schema-valid but semantically invalid body into ``(kept, dropped)`` — the STRICT
+    partial partition frozen by the 2026-08-15 review (repair seam, Task 4).
+
+    This is :func:`normalize_dimensions`' non-fatal idiom applied to candidates, with one hard limit
+    the dimensions do not need. It NEVER raises; a caller gets a decision, not an exception.
+
+    **Candidate-LOCAL defects may be dropped** — an unknown id, a non-leaf primary, a confidence or
+    relationship outside its band, malformed evidence spans. One sloppy sibling does not cost a
+    correct answer.
+
+    **AGGREGATE defects refuse the WHOLE result** — a malformed status, a candidates list that is not
+    a list, more than three candidates, a duplicated id, more than one primary, more than two
+    secondaries, a candidate-bearing status carrying nothing. These are properties of the SET, so
+    "fixing" one by dropping a candidate would not be recovery: it would be the platform quietly
+    choosing which of the model's two primaries it preferred. **The live incident (two primaries) is
+    refused here, on purpose.** Task 3's repair is what rescues that case; this function is what
+    rescues the single-junk-sibling case, and it must never be widened into laundering a cap
+    violation.
+
+    Order is part of the contract. The aggregate rules run FIRST, over the RAW list, before any drop:
+    if candidate-local drops ran first, discarding the incident's placeholder candidate would leave
+    one primary and the cap violation would evaporate. The TOTAL cap runs before the per-relationship
+    caps so a four-candidate body is reported as what it is, rather than as whichever band happened
+    to overflow.
+
+    A refusal returns ``((), (CandidateDrop(index=None, …),))``. **No promotion, ever**: a kept
+    candidate is the model's own dict, unmodified — this function never rewrites a ``relationship``,
+    so a surviving secondary cannot become the primary a dropped one used to be. Deciding whether the
+    survivors still support the DECLARED status is :func:`status_after_partition`'s job, not this
+    one's."""
+    status = output.get("status")
+    if not isinstance(status, str) or status not in _STATUS_VALUES:
+        return _refused(INVALID_STATUS)
+
+    raw = output.get("candidates")
+    if raw is None:
+        raw = ()
+    if not isinstance(raw, (list, tuple)):
+        return _refused(MALFORMED_CANDIDATE_LIST)
+
+    if len(raw) > _MAX_CANDIDATES:
+        return _refused(TOO_MANY_CANDIDATES)
+
+    # The aggregate reads are deliberately tolerant of junk: a candidate that is not even an object,
+    # or whose id is unhashable, simply does not participate in the counts — it will be dropped
+    # candidate-locally below. A malformed sibling must not be able to SUPPRESS a cap check.
+    seen: set[str] = set()
+    n_primary = n_secondary = 0
+    for candidate in raw:
+        if not isinstance(candidate, Mapping):
+            continue
+        uid = candidate.get("use_case_id")
+        if isinstance(uid, str):
+            if uid in seen:
+                return _refused(DUPLICATE_CANDIDATE)
+            seen.add(uid)
+        relationship = candidate.get("relationship")
+        if relationship == "primary":
+            n_primary += 1
+        elif relationship == "secondary":
+            n_secondary += 1
+    if n_primary > _MAX_PRIMARY:
+        return _refused(MULTIPLE_PRIMARY_CANDIDATES)
+    if n_secondary > _MAX_SECONDARY:
+        return _refused(TOO_MANY_SECONDARY_CANDIDATES)
+    if status in _CANDIDATE_BEARING and not raw:
+        return _refused(STATUS_REQUIRES_A_CANDIDATE)
+
+    kept: list[Mapping[str, Any]] = []
+    dropped: list[CandidateDrop] = []
+    for index, candidate in enumerate(raw):
+        try:
+            _validate_candidate(candidate, index)
+        except AttestedSchemaValidationError as exc:
+            dropped.append(CandidateDrop(index=index, reason_code=str(exc.llm_safe_reason)))
+        else:
+            kept.append(candidate)
+    return tuple(kept), tuple(dropped)
+
+
+def status_after_partition(status: str, kept: Sequence[Mapping[str, Any]]) -> str:
+    """The status the SURVIVORS actually support — the frozen rule's *"``classified`` after partition
+    still requires exactly one primary"*.
+
+    A ``classified`` body whose single primary was dropped becomes ``ambiguous``: candidates survived,
+    but no objective is designated, which is precisely what ``ambiguous`` means here and what
+    ``scope_from_recognition`` already folds to a full-grounding, un-narrowed scope. The alternative
+    a reader will reach for — promoting a surviving secondary — is forbidden, and is why this returns
+    a STATUS rather than touching the candidates: nothing here can change what the model said any one
+    candidate was.
+
+    Every other declared status is returned unchanged. ``ambiguous`` is legal with or without a
+    primary, and an ``unscoped`` body that happened to carry candidates stays unscoped — the
+    partition's job is to stop losing answers, not to start inventing them."""
+    if status != RecognitionStatus.CLASSIFIED.value:
+        return status
+    n_primary = sum(1 for c in kept
+                    if isinstance(c, Mapping) and c.get("relationship") == "primary")
+    return (RecognitionStatus.CLASSIFIED.value if n_primary == _MAX_PRIMARY
+            else RecognitionStatus.AMBIGUOUS.value)
 
 
 def unscoped_result(

@@ -23,17 +23,23 @@ from featuregen.intake.llm import (
 from featuregen.intake.redaction import INPUT_KEY_REPAIR_ERRORS
 from featuregen.overlay.upload.contract.scope_records import (
     find_recognition_attempt,
+    load_recognition_attempt,
     record_recognition_attempt,
 )
 from featuregen.overlay.upload.enrich_llm import (
+    FAILURE_KIND_SCHEMA_INVALID,
     FAILURE_KIND_SEMANTIC_INVALID,
     AuditedStructuredResult,
     register_enrichment_schemas,
 )
 from featuregen.overlay.upload.taxonomy import recognizer as recognizer_module
+from featuregen.overlay.upload.taxonomy.applicability import scope_from_recognition
 from featuregen.overlay.upload.taxonomy.recognition import (
+    MALFORMED_EVIDENCE_SPANS,
     MULTIPLE_PRIMARY_CANDIDATES,
+    RECOGNITION_VALIDATOR_VERSION,
     TAXONOMY_VERSION,
+    CandidateDrop,
     RecognitionStatus,
     unscoped_result,
 )
@@ -247,7 +253,9 @@ def test_the_request_hash_covers_every_leg_of_the_contract(monkeypatch) -> None:
     monkeypatch.undo()
     assert _leg("recognizer", "TAXONOMY_VERSION", "9.9.9") != base
     monkeypatch.undo()
-    assert _leg("recognizer", "RECOGNITION_VALIDATOR_VERSION", "2") != base
+    # "99", not "2": Task 4 bumped the real validator version TO "2", and a leg test that patches in
+    # the value already there proves nothing.
+    assert _leg("recognizer", "RECOGNITION_VALIDATOR_VERSION", "99") != base
     monkeypatch.undo()
     assert _leg("recognizer", "APPLICABILITY_MAPPING_VERSION", "9.9.9") != base
     monkeypatch.undo()
@@ -537,3 +545,164 @@ def test_the_recognizer_is_a_reviewed_consumer_of_the_semantic_seam(db) -> None:
     recognizer's side of the contract is visible from the recognizer's own file."""
     source = Path(recognizer_module.__file__).read_text(encoding="utf-8")
     assert "validate_semantics=validate_recognition_output" in source
+
+
+# ── Task 4 (2026-08-15): the partition, folded into the recognizer ──────────────────────────────
+#
+# What can actually REACH the partition is narrower than the frozen rule's list, and deliberately
+# recorded here: since Task 1's frozen v2 enum, an unknown id, a non-leaf primary, an out-of-band
+# confidence/relationship and a non-string evidence span are all malformed STRUCTURE, so the seam
+# reports `schema_invalid` and exposes no body at all. A BLANK evidence span is the one
+# candidate-local defect the schema accepts and these rules reject — which is why it is the sibling
+# in the end-to-end cases below. The unit cases in test_recognition_contract.py cover the rest of
+# the rule directly, where the schema is not in the way.
+
+def _blank_span_sibling(use_case_id: str = DEPOSIT, *, relationship: str = "secondary"):
+    return _candidate(use_case_id, relationship=relationship, evidence_spans=("   ",))
+
+
+def _seam_spy(monkeypatch) -> list[Any]:
+    """Wrap — never replace — the real seam call, so a test can read the disposition the recognizer
+    actually received."""
+    seen: list[Any] = []
+    real = recognizer_module.drive_audited_structured_call
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        outcome = real(*args, **kwargs)
+        seen.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(recognizer_module, "drive_audited_structured_call", _spy)
+    return seen
+
+
+def test_a_junk_sibling_no_longer_costs_the_valid_answer(db) -> None:
+    """The done-bar, end to end, on the arm where repair FAILED. The model was asked twice and never
+    fixed its answer; the valid primary is still the user's scope, and the loss is named."""
+    body = {"status": "classified",
+            "candidates": [_candidate(CHURN, relationship="primary"), _blank_span_sibling()]}
+    client = _RecordingClient(_script(body))            # never repaired
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    assert len(client.requests) == 3                    # the repair budget WAS spent first
+    assert audited.result.status is RecognitionStatus.CLASSIFIED
+    assert [(c.use_case_id, c.relationship) for c in audited.result.candidates] == [
+        (CHURN, "primary")]
+    assert audited.result.dropped_candidates == (
+        CandidateDrop(index=1, reason_code=MALFORMED_EVIDENCE_SPANS),)
+    # The loss does NOT ride `warnings` — that field means "we couldn't map part of what you
+    # described", which is a different thing and is what the UI already renders it as.
+    assert audited.result.warnings == ()
+    assert scope_from_recognition(audited.result).primary == CHURN
+
+
+def test_the_live_incident_is_refused_by_the_aggregate_rule_not_rescued_by_partition(db) -> None:
+    """Two primaries, end to end, with repair failing. The partition REFUSES: choosing between the
+    model's two primaries is not recovery. This is the case Task 3's repair exists to rescue."""
+    client = _RecordingClient(_script(_DOUBLE_PRIMARY_BODY))
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    assert audited.result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert audited.result.candidates == ()
+    assert scope_from_recognition(audited.result).unscoped is True
+    # …and it is NOT laundered into a one-primary scope by dropping the other candidate.
+    assert CHURN not in [c.use_case_id for c in audited.result.candidates]
+
+
+def test_nothing_valid_survives_is_unchanged(db) -> None:
+    """Every candidate individually invalid: today's fail-open technical failure, untouched."""
+    body = {"status": "classified",
+            "candidates": [_blank_span_sibling(CHURN, relationship="primary"),
+                           _blank_span_sibling()]}
+    audited = recognize_with_audit(db, _RecordingClient(_script(body)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+
+    assert audited.result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert audited.result.candidates == ()
+    assert audited.result.dropped_candidates == ()      # nothing recovered → nothing to report yet
+
+
+def test_the_only_primary_being_invalid_does_not_promote_a_secondary(db) -> None:
+    """The surviving candidate keeps the relationship the MODEL gave it. `classified` is what is
+    given up — and a primary-less result grounds everything rather than narrowing on a guess."""
+    body = {"status": "classified",
+            "candidates": [_blank_span_sibling(CHURN, relationship="primary"),
+                           _candidate(DEPOSIT, relationship="secondary")]}
+    audited = recognize_with_audit(db, _RecordingClient(_script(body)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+
+    assert audited.result.status is RecognitionStatus.AMBIGUOUS
+    assert [(c.use_case_id, c.relationship) for c in audited.result.candidates] == [
+        (DEPOSIT, "secondary")]
+    assert audited.result.dropped_candidates == (
+        CandidateDrop(index=0, reason_code=MALFORMED_EVIDENCE_SPANS),)
+    scope = scope_from_recognition(audited.result)
+    assert scope.primary is None and scope.unscoped is True
+
+
+def test_only_the_semantic_arm_is_partitioned(db, monkeypatch) -> None:
+    """A SCHEMA-invalid body carries no exposed body by the seam's own design, so there is nothing
+    to partition and the disposition is unchanged. Asserted on the seam result the recognizer
+    received, so it cannot pass by coincidence of the outcome."""
+    seen = _seam_spy(monkeypatch)
+    invented = {"status": "classified",
+                "candidates": [_candidate("x", relationship="primary", evidence_spans=("x",))]}
+    audited = recognize_with_audit(db, _RecordingClient(_script(invented)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+
+    assert seen[0].failure_kind == FAILURE_KIND_SCHEMA_INVALID
+    assert seen[0].last_schema_valid_semantic_invalid_output is None
+    assert audited.result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert audited.result.dropped_candidates == ()
+
+
+def test_a_partitioned_result_is_not_persisted_with_its_drops_yet(db) -> None:
+    """Stated, not hidden. `intent_recognition_attempt` has no column for candidate loss, and Task 4
+    adds no migration — so a result READ BACK from storage carries no drops. The information is not
+    lost: `llm_call.raw_output` holds the exact body verbatim, the recognition row links to it via
+    `llm_call_ref` (Task 0), and the partition is a pure function of that body and the validator
+    version pinned in the request hash — so the drop set is recomputable from evidence. Task 5's
+    `recognition_quality` contract is where it becomes a served field, and it needs a migration this
+    task is not allowed to write."""
+    body = {"status": "classified",
+            "candidates": [_candidate(CHURN, relationship="primary"), _blank_span_sibling()]}
+    audited = recognize_with_audit(db, _RecordingClient(_script(body)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+    assert audited.result.dropped_candidates          # in memory: present
+
+    request_hash = "b4" * 32
+    recognition_id = record_recognition_attempt(
+        db, intent_id="intent_partition_drops", input_hash=request_hash, result=audited.result,
+        actor="ds1", input_content_hash="c9" * 32, recognition_request_hash=request_hash,
+        llm_call_ref=audited.llm_call_ref)
+    stored = load_recognition_attempt(db, recognition_id=recognition_id)
+
+    assert stored is not None
+    assert stored.result.status is RecognitionStatus.CLASSIFIED       # the OUTCOME persists…
+    assert [c.use_case_id for c in stored.result.candidates] == [CHURN]
+    assert stored.result.dropped_candidates == ()                     # …the drop record does not
+    # The evidence it is recomputable FROM is durable, and joined to this row.
+    assert stored.result is not audited.result
+    row = db.execute(
+        "SELECT llm_call_ref FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (recognition_id,)).fetchone()
+    assert row[0] == audited.llm_call_ref
+    raw = db.execute("SELECT raw_output FROM llm_call WHERE llm_call_ref = %s",
+                     (audited.llm_call_ref,)).fetchone()[0]
+    assert len(raw["output"]["candidates"]) == 2      # the body the partition ran on, verbatim
+
+
+def test_the_validator_version_moved_with_what_the_recognizer_accepts(monkeypatch) -> None:
+    """Task 4 changes the ANSWER a body can produce, so the stored answer to the same words under
+    the old rules is not the answer to this question. The request identity carries the validator
+    version, so it re-keys — which is the whole reason Task 0 put it in the hash."""
+    assert RECOGNITION_VALIDATOR_VERSION == "2"
+    material = recognition_request_material(input_content_hash="c" * 64)
+    assert material["semantic_validator_version"] == "2"
+
+    base = recognition_request_hash(input_content_hash="c" * 64)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.taxonomy.recognizer.RECOGNITION_VALIDATOR_VERSION", "1")
+    assert recognition_request_hash(input_content_hash="c" * 64) != base

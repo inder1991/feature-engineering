@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from featuregen.canonical import contract_hash_v1, jcs_sha256
@@ -38,6 +38,8 @@ from featuregen.intake.llm import DEFAULT_LLM_MODEL, LLMClient
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
+    FAILURE_KIND_SEMANTIC_INVALID,
+    AuditedStructuredResult,
     canonical_output_schema,
     current_enrichment_generation_settings,
     drive_audited_structured_call,
@@ -49,6 +51,8 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     RecognitionStatus,
     UseCaseCandidate,
     normalize_dimensions,
+    partition_candidates,
+    status_after_partition,
     unscoped_result,
     validate_recognition_output,
 )
@@ -188,6 +192,54 @@ def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> Recognit
     )
 
 
+def _partial_recovery(audited: AuditedStructuredResult, *, model: str) -> RecognitionResult | None:
+    """The strict partial partition, folded (repair seam, Task 4). Returns the recovered result, or
+    ``None`` to mean "nothing was recovered — take the caller's unchanged technical-failure path".
+
+    It fires on exactly ONE seam disposition: ``semantic_invalid`` — the body passed the registered
+    JSON Schema, failed this module's own rules, and could not be repaired within the §9.2 budget.
+    Every other failing arm (egress-blocked, provider-failed, schema-invalid, validator-fault,
+    audit-degraded) carries no body at all, by the seam's own design, and is untouched here.
+
+    The ``failure_kind`` check below is therefore DEFENCE IN DEPTH and not, today, load-bearing:
+    deleting it changes no test, because ``last_schema_valid_semantic_invalid_output`` is already
+    ``None`` everywhere else. It stays because a precondition this function needs should be stated
+    here rather than borrowed from another module's invariant — the seam's exposure rule is one
+    edit away from being wider than it is now.
+
+    Order of events, all of which have already happened: the model was ASKED to fix its answer
+    (Task 3) and did not. Only then is the last answer partitioned — never instead of the repair.
+
+    NEVER raises: recognition is fail-open, and a bug in the partition must degrade to today's
+    behaviour rather than to a 500 on the intake path."""
+    if audited.failure_kind != FAILURE_KIND_SEMANTIC_INVALID:
+        return None
+    body = audited.last_schema_valid_semantic_invalid_output
+    if not body:
+        return None
+    try:
+        kept, dropped = partition_candidates(body)
+        if not kept:
+            # An aggregate refusal, or every candidate individually invalid. Either way nothing
+            # survived, so the disposition is unchanged: a candidate-free TECHNICAL_FAILURE that
+            # fails OPEN to full grounding. Nothing is invented, and no scope narrows on a body the
+            # model never got right.
+            logger.info("recognition partition kept nothing (%d dropped); technical failure stands",
+                        len(dropped))
+            return None
+        partitioned = {**body, "candidates": list(kept),
+                       "status": status_after_partition(str(body["status"]), kept)}
+        # The floor again, now over the body the partition BUILT. If a partitioned result cannot pass
+        # the very validator that rejected its parent, the partition is wrong and we keep nothing —
+        # that is a platform bug, and the fail-open path is the honest place to land.
+        validate_recognition_output(partitioned)
+        result = _result_from_output(partitioned, model_id=model)
+    except Exception:
+        logger.exception("recognition partition raised; failing open to technical_failure")
+        return None
+    return replace(result, dropped_candidates=dropped)
+
+
 def _recognition_instruction(
     redacted_hypothesis: str,
     redacted_goal: str | None,
@@ -271,6 +323,14 @@ def recognize_with_audit(
 
     output = audited.output
     if not output:                              # egress block / provider failure / empty body
+        # Task 4: ONE arm of that "not output" is different in kind — the model answered, the answer
+        # was structurally well formed, and the repair budget was spent trying to fix a rule it kept
+        # breaking. The seam exposes that final body (and ONLY on that arm). Partition it: a valid
+        # candidate must not be lost to a sloppy sibling just because the model could not repair.
+        recovered = _partial_recovery(audited, model=model)
+        if recovered is not None:
+            return AuditedRecognition(recovered, audited.llm_call_ref, audited.provider_calls,
+                                      audited.usage)
         return AuditedRecognition(
             unscoped_result(
                 "recognition failed or egress-blocked",

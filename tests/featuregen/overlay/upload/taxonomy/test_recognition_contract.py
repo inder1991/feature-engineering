@@ -7,6 +7,7 @@ Exercises ``validate_recognition_output`` (the raw-dict ``validate_output`` call
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -24,6 +25,8 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     MALFORMED_EVIDENCE_SPANS,
     MULTIPLE_PRIMARY_CANDIDATES,
     PRIMARY_NOT_A_LEAF_OBJECTIVE,
+    RECOGNITION_AGGREGATE_CODES,
+    RECOGNITION_CANDIDATE_LOCAL_CODES,
     RECOGNITION_FAILURE_CODES,
     STATUS_REQUIRES_A_CANDIDATE,
     TAXONOMY_VERSION,
@@ -32,8 +35,11 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     UNKNOWN_MODELLING_CONTEXT,
     UNKNOWN_TARGET_ENTITY,
     UNKNOWN_USE_CASE_ID,
+    CandidateDrop,
     RecognitionStatus,
     normalize_dimensions,
+    partition_candidates,
+    status_after_partition,
     unscoped_result,
     validate_recognition_output,
 )
@@ -320,3 +326,211 @@ def test_the_total_cap_is_dominated_by_the_per_relationship_caps() -> None:
             _candidate(PRIMACY, relationship="secondary"),
             _candidate("customer.cross_sell", relationship="secondary")]))
     assert excinfo.value.llm_safe_reason == TOO_MANY_SECONDARY_CANDIDATES
+
+
+# ── Task 4 (2026-08-15): the STRICT partial partition ───────────────────────────────────────────
+#
+# One case per bullet of the rule the review FROZE. The two halves are not symmetrical and must not
+# be made so: a candidate-local defect is one candidate being wrong, and dropping it loses nothing
+# anyone said; an aggregate defect is the SET being wrong, and "fixing" it by dropping a candidate
+# would be the platform quietly picking which of the model's two primaries it preferred.
+
+def _kept_ids(kept) -> list[str]:
+    return [c["use_case_id"] for c in kept]
+
+
+# --- candidate-LOCAL defects MAY be dropped ------------------------------------------------------
+
+@pytest.mark.parametrize(("code", "sibling"), [
+    (UNKNOWN_USE_CASE_ID, _candidate("customer.not_a_real_leaf", relationship="secondary")),
+    (INVALID_CONFIDENCE, _candidate(DEPOSIT, relationship="secondary", confidence="very-high")),
+    (INVALID_RELATIONSHIP, _candidate(DEPOSIT, relationship="tertiary")),
+    (MALFORMED_EVIDENCE_SPANS, _candidate(DEPOSIT, relationship="secondary",
+                                          evidence_spans=("   ",))),
+    (MALFORMED_CANDIDATE, "not an object at all"),
+], ids=[UNKNOWN_USE_CASE_ID, INVALID_CONFIDENCE, INVALID_RELATIONSHIP, MALFORMED_EVIDENCE_SPANS,
+        MALFORMED_CANDIDATE])
+def test_a_candidate_local_defect_drops_only_that_candidate(code: str, sibling: Any) -> None:
+    kept, dropped = partition_candidates(
+        _classified([_candidate(CHURN, relationship="primary"), sibling]))
+
+    assert _kept_ids(kept) == [CHURN]                     # the correct answer survives its sibling
+    assert dropped == (CandidateDrop(index=1, reason_code=code),)
+    assert code in RECOGNITION_CANDIDATE_LOCAL_CODES
+
+
+def test_a_non_leaf_primary_is_a_candidate_local_drop() -> None:
+    """`financial_crime` is IN the taxonomy but is a domain parent — a primary that would scope to
+    zero recipes. Dropped on its own account; the valid secondary survives it."""
+    kept, dropped = partition_candidates(_classified([
+        _candidate("financial_crime", relationship="primary"),
+        _candidate(DEPOSIT, relationship="secondary")]))
+
+    assert _kept_ids(kept) == [DEPOSIT]
+    assert dropped == (CandidateDrop(index=0, reason_code=PRIMARY_NOT_A_LEAF_OBJECTIVE),)
+
+
+# --- AGGREGATE defects REFUSE the whole result ---------------------------------------------------
+
+@pytest.mark.parametrize(("code", "body"), [
+    (DUPLICATE_CANDIDATE, _classified([_candidate(CHURN, relationship="primary"),
+                                       _candidate(CHURN, relationship="secondary")])),
+    (TOO_MANY_CANDIDATES, _classified([
+        _candidate(CHURN, relationship="primary"),
+        _candidate(DEPOSIT, relationship="secondary"),
+        _candidate(PRIMACY, relationship="secondary"),
+        _candidate("customer.cross_sell", relationship="secondary")])),
+    (MULTIPLE_PRIMARY_CANDIDATES, _classified([_candidate(CHURN, relationship="primary"),
+                                               _candidate(DEPOSIT, relationship="primary")])),
+    (TOO_MANY_SECONDARY_CANDIDATES, _classified([
+        _candidate(CHURN, relationship="secondary"),
+        _candidate(DEPOSIT, relationship="secondary"),
+        _candidate(PRIMACY, relationship="secondary")])),
+    (STATUS_REQUIRES_A_CANDIDATE, _classified([])),
+    (INVALID_STATUS, {"status": "maybe", "candidates": []}),
+    (MALFORMED_CANDIDATE_LIST, {"status": "unscoped", "candidates": "nope"}),
+], ids=[DUPLICATE_CANDIDATE, TOO_MANY_CANDIDATES, MULTIPLE_PRIMARY_CANDIDATES,
+        TOO_MANY_SECONDARY_CANDIDATES, STATUS_REQUIRES_A_CANDIDATE, INVALID_STATUS,
+        MALFORMED_CANDIDATE_LIST])
+def test_an_aggregate_defect_refuses_the_whole_result(code: str, body: dict[str, Any]) -> None:
+    kept, dropped = partition_candidates(body)
+
+    assert kept == ()
+    # ONE drop, naming the RESULT — not the candidates. Blaming an aggregate defect on a particular
+    # candidate would name one that may be perfectly well formed.
+    assert dropped == (CandidateDrop(index=None, reason_code=code),)
+    assert dropped[0].is_whole_result
+    assert code in RECOGNITION_AGGREGATE_CODES
+
+
+def test_the_live_incident_is_refused_by_the_aggregate_rule_not_rescued_by_partition() -> None:
+    """THE case this whole rule exists to get right. The incident's body has one perfect candidate
+    and one placeholder — and dropping the placeholder as a candidate-local `UNKNOWN_USE_CASE_ID`
+    would leave exactly one primary and make the cap violation evaporate.
+
+    It must not. The model marked TWO candidates primary; which one it meant is not ours to decide.
+    Task 3's repair is what rescues this body; the partition refuses it."""
+    kept, dropped = partition_candidates({
+        "status": "classified",
+        "candidates": [
+            {"use_case_id": CHURN, "relationship": "primary", "confidence": "high",
+             "evidence_spans": ["predict churn in the next 90 days"], "rationale": ""},
+            {"use_case_id": "x", "relationship": "primary", "confidence": "high",
+             "evidence_spans": ["x"], "rationale": "placeholder"}],
+        "modelling_contexts": []})
+
+    assert kept == ()
+    assert dropped == (CandidateDrop(index=None, reason_code=MULTIPLE_PRIMARY_CANDIDATES),)
+    assert UNKNOWN_USE_CASE_ID not in {d.reason_code for d in dropped}
+
+
+def test_the_aggregate_rules_run_before_any_drop() -> None:
+    """The ordering, stated as its own fact rather than inferred from the incident: a body whose
+    cap violation involves a candidate that is ALSO locally invalid is still refused. Reverse the
+    order and this returns one kept candidate."""
+    kept, dropped = partition_candidates(_classified([
+        _candidate(CHURN, relationship="primary"),
+        _candidate(DEPOSIT, relationship="primary", confidence="very-high")]))
+    assert (kept, dropped) == ((), (CandidateDrop(index=None,
+                                                  reason_code=MULTIPLE_PRIMARY_CANDIDATES),))
+
+
+def test_a_malformed_sibling_cannot_suppress_a_cap_check() -> None:
+    """The aggregate counts skip junk rather than crashing on it — otherwise a non-object sibling
+    would be a way to smuggle a duplicate or a second primary past the caps."""
+    kept, dropped = partition_candidates(_classified([
+        _candidate(CHURN, relationship="primary"), 42, _candidate(DEPOSIT, relationship="primary")]))
+    assert (kept, dropped) == ((), (CandidateDrop(index=None,
+                                                  reason_code=MULTIPLE_PRIMARY_CANDIDATES),))
+
+
+# --- the post-partition status, and the promotion that must never happen -------------------------
+
+def test_classified_after_partition_still_requires_exactly_one_primary() -> None:
+    kept, _dropped = partition_candidates(_classified([
+        _candidate(CHURN, relationship="primary"),
+        _candidate(DEPOSIT, relationship="secondary", evidence_spans=("",))]))
+    assert status_after_partition("classified", kept) == "classified"
+
+    survivors_without_a_primary = [_candidate(DEPOSIT, relationship="secondary")]
+    assert status_after_partition("classified", survivors_without_a_primary) == "ambiguous"
+    # Other declared statuses are returned untouched — the partition stops losses, it does not
+    # start inventing.
+    assert status_after_partition("ambiguous", survivors_without_a_primary) == "ambiguous"
+    assert status_after_partition("unscoped", survivors_without_a_primary) == "unscoped"
+
+
+def test_the_only_primary_being_invalid_does_not_promote_a_secondary() -> None:
+    """The tempting wrong fix, forbidden. The surviving candidate keeps the relationship the MODEL
+    gave it; the result loses its `classified` claim instead. `scope_from_recognition` reads a
+    primary-less result as unscoped, so nothing narrows on a guess."""
+    body = _classified([_candidate("customer.not_a_real_leaf", relationship="primary"),
+                        _candidate(DEPOSIT, relationship="secondary")])
+    kept, dropped = partition_candidates(body)
+
+    assert _kept_ids(kept) == [DEPOSIT]
+    assert [c["relationship"] for c in kept] == ["secondary"]        # NOT promoted
+    assert dropped == (CandidateDrop(index=0, reason_code=UNKNOWN_USE_CASE_ID),)
+    assert status_after_partition("classified", kept) == "ambiguous"
+
+
+def test_nothing_valid_survives_is_unchanged() -> None:
+    """Every candidate individually invalid: nothing is kept, every loss is named, and the caller's
+    fail-open technical failure is what happens next (asserted end-to-end in test_recognizer.py)."""
+    kept, dropped = partition_candidates(_classified([
+        _candidate("customer.not_a_real_leaf", relationship="primary"),
+        _candidate(DEPOSIT, relationship="secondary", confidence="very-high")]))
+
+    assert kept == ()
+    assert dropped == (CandidateDrop(index=0, reason_code=UNKNOWN_USE_CASE_ID),
+                       CandidateDrop(index=1, reason_code=INVALID_CONFIDENCE))
+    assert not any(d.is_whole_result for d in dropped)   # NOT a refusal — each candidate failed
+
+
+# --- every drop carries a closed, value-free reason code ----------------------------------------
+
+def test_every_drop_carries_a_closed_value_free_reason_code() -> None:
+    """Sweep every body this module's tests know how to break, and hold each drop code to the same
+    rule the repair complaints obey — because Task 5 puts these codes in an API payload and a UI
+    string, where a leaked model value would have no further scrubbing between it and a screen."""
+    bodies: list[Any] = [b for _c, b in _REJECTIONS]
+    bodies += [_classified([_candidate(CHURN, relationship="primary"), s])
+               for s in (_candidate("customer.not_a_real_leaf", relationship="secondary"),
+                         _candidate(DEPOSIT, relationship="secondary", confidence="very-high"),
+                         "not an object at all", 42)]
+    seen: set[str] = set()
+    for body in bodies:
+        _kept, dropped = partition_candidates(body)
+        for drop in dropped:
+            assert drop.reason_code in RECOGNITION_FAILURE_CODES
+            assert _SEMANTIC_REPAIR_CODE.fullmatch(drop.reason_code)
+            assert _LEAKED not in drop.reason_code
+            seen.add(drop.reason_code)
+    # The sweep really did exercise both halves of the rule, rather than one of them twice.
+    assert seen & RECOGNITION_AGGREGATE_CODES
+    assert seen & RECOGNITION_CANDIDATE_LOCAL_CODES
+
+
+def test_the_two_code_sets_partition_the_vocabulary() -> None:
+    """No code may be BOTH droppable and refusing, and none may be neither by accident.
+    `CLASSIFIED_REQUIRES_ONE_PRIMARY` is the one deliberate exclusion: it is not a drop reason at
+    all — the status is downgraded instead, and nothing is discarded for it."""
+    assert not (RECOGNITION_AGGREGATE_CODES & RECOGNITION_CANDIDATE_LOCAL_CODES)
+    assert (RECOGNITION_FAILURE_CODES
+            - RECOGNITION_AGGREGATE_CODES
+            - RECOGNITION_CANDIDATE_LOCAL_CODES) == {CLASSIFIED_REQUIRES_ONE_PRIMARY}
+
+
+def test_partition_never_raises_and_never_mutates_its_input() -> None:
+    """Fail-open, and evidence-preserving: the body it is handed is the one the seam exposed and the
+    audit row stored. A kept candidate is the model's own object, unmodified."""
+    body = _classified([_candidate(CHURN, relationship="primary"),
+                        _candidate(DEPOSIT, relationship="secondary", evidence_spans=("",))])
+    before = json.dumps(body, sort_keys=True)
+    kept, _dropped = partition_candidates(body)
+    assert json.dumps(body, sort_keys=True) == before
+    assert kept[0] is body["candidates"][0]
+
+    for junk in (None, [], "string", {"status": None}, {"candidates": {}},
+                 {"status": "classified", "candidates": [None]}):
+        assert isinstance(partition_candidates(junk if isinstance(junk, dict) else {}), tuple)

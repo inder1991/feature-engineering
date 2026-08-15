@@ -50,7 +50,7 @@ served **917 unscoped candidates** (306 of 317 recipes).
 |---|---|---|
 | B1 | **Task 3 was unbuildable.** After repair exhaustion the wrapper returns `output=None` on BOTH the discard and failed paths, so the recognizer has no body left to partition. Modifying `recognition.py` alone cannot work | **[R5 — line numbers corrected]** at Task 2's start `enrich_llm.py:2170` (audit-degraded discard), `:2177` (STATUS_FAILED); `recognizer.py:172-184` |
 | B2 | **Re-running the same objective returns a NEW http result over an OLD stored row.** Persistence is unique on `(intent_id, input_hash)`, and `input_hash` covers only redacted user input + redaction policy — not prompt, schema, taxonomy, validator or model. The endpoint calls the provider again, then `ON CONFLICT DO NOTHING` returns the OLD recognition id. After this fix ships, resubmitting the incident could display "Churn" while the returned id still points at the `technical_failure` row | `contract.py:1173-1202`, `scope_records.py:94-117,145-172,490-545` |
-| B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` |
+| B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` — **[R6]** confirmed live as of Task 4: a partial recovery IS scored `technical_failure`. Conservative (the gate under-reports, never falsely green) and integrity-clean, but it now measures a platform that no longer exists |
 | B4 | **Revision 1 created schema v2 and never activated it.** `_OUTPUT_SCHEMA_VERSION = 1` is hardcoded; `register_enrichment_schemas()` uses a MUTABLE `register_schema` that overwrites an existing version, so a dynamically-derived enum could mean different things on different deployments | `recognizer.py:55`, `enrich_llm.py:1902-1918`, `documents/registry.py:29-49` |
 | B4b | **[R4 — found in Task 1]** B4 understates it: activation is not the constant at all. The recognizer's dispatch does not pass `schema_version=`, and the seam defaults it to `1` — so a constant-only bump makes the request identity, and only the request identity, claim v2 | `recognizer.py:232-238`, `enrich_llm.py:2019-2029` |
 
@@ -455,7 +455,11 @@ Consumes Task 2's exposed post-repair body (B1).
 
 **The rule, frozen [R2]:**
 - **Candidate-local defects may be dropped**: unknown id, non-leaf primary, bad confidence/relationship
-  band, malformed evidence spans.
+  band, malformed evidence spans. **[R6 — found in Task 4]** In the LIVE path all of these except a
+  **blank evidence span** are now malformed STRUCTURE under Task 1's frozen enum, so the seam reports
+  `schema_invalid` and exposes no body and the partition never sees them. The rule is implemented in
+  full anyway (it is what a v3 schema or a replayed v1-era body would meet), but "partition rescues
+  the single-junk-sibling case" is narrower today than this line reads.
 - **Aggregate defects refuse the whole result**: duplicate ids, more than three candidates, multiple
   primaries, status incompatible with candidates, malformed status. **[R6 — found in Task 3]** "more
   than three candidates" is unreachable through `validate_recognition_output` (the 1-primary +
@@ -472,6 +476,97 @@ cap violation.
 **Acceptance:** one case per bullet above, plus
 `test_the_only_primary_being_invalid_does_not_promote_a_secondary`;
 `test_nothing_valid_survives_is_unchanged`; the normalized result and its drop codes persist.
+
+> **TASK 4 (2026-08-15) — ACCEPTED `PENDING`.** `recognition.partition_candidates(output) ->
+> (kept, dropped)` sits beside `normalize_dimensions` and never raises, exactly as that idiom does.
+> `recognizer._partial_recovery` folds it, on the ONE seam disposition that carries a body
+> (`semantic_invalid`), AFTER the repair budget has been spent — never instead of it. Survivors →
+> `CLASSIFIED`/`AMBIGUOUS`; nothing survives → today's fail-open `TECHNICAL_FAILURE`, byte-identical.
+>
+> **The frozen rule, implemented literally, with ORDER as part of the contract.** Aggregate rules run
+> FIRST, over the RAW list, before any drop — and that ordering is the whole rule, not an
+> implementation detail: run the candidate-local drops first and discarding the incident's
+> placeholder would leave one primary and the cap violation would evaporate. Mutant (drop-then-count):
+> **14 tests fail**, led by `test_the_live_incident_is_refused_by_the_aggregate_rule_not_rescued_by_
+> partition` in both its unit and end-to-end forms. The TOTAL cap runs before the per-relationship
+> caps so a four-candidate body reports what it is; that is also what makes `TOO_MANY_CANDIDATES`
+> reachable at all (the [R6] defect found in Task 3). Aggregate counts skip junk siblings rather than
+> crashing on them, so a non-object candidate cannot SUPPRESS a cap check —
+> `test_a_malformed_sibling_cannot_suppress_a_cap_check`.
+>
+> **No promotion, structurally.** `partition_candidates` returns the model's own candidate dicts,
+> unmodified (`kept[0] is body["candidates"][0]`, asserted), so it has no way to rewrite a
+> `relationship`. What gives way instead is the STATUS: `status_after_partition` downgrades
+> `classified` to `ambiguous` when the survivors carry no single primary, and
+> `scope_from_recognition` already reads a primary-less result as unscoped — so the user gets full
+> grounding, never a scope narrowed onto a guess. Mutant (promote a survivor): 3 tests fail.
+>
+> **The live incident is REFUSED, asserted twice** — once at the unit level on the verbatim §0 body
+> (`MULTIPLE_PRIMARY_CANDIDATES`, and explicitly NOT `UNKNOWN_USE_CASE_ID`), once end-to-end with
+> repair failing (`TECHNICAL_FAILURE`, `scope.unscoped is True`). Mutant (delete the multiple-primary
+> refusal): 4 tests fail. Task 3's repair is what rescues that body; this rule is what stops the
+> platform choosing between the model's two primaries and calling it recovery.
+>
+> **Drops are recorded on a NEW field, and the reason is the review's.** `RecognitionResult.dropped_
+> candidates: tuple[CandidateDrop, ...]`, where `CandidateDrop(index: int | None, reason_code: str)`
+> and `index=None` means the RESULT was refused rather than a candidate being at fault — an aggregate
+> defect belongs to the SET, and pinning it on a particular candidate would name one that may be
+> perfectly well formed. It is deliberately NOT `warnings`: that field carries per-DIMENSION codes the
+> UI already renders as *"we couldn't map part of what you described"*, which would misdescribe a
+> discarded candidate as a mis-mapped regime. Mutant (fold drops into `warnings`): 3 tests fail.
+> Two enumerable sets, `RECOGNITION_AGGREGATE_CODES` and `RECOGNITION_CANDIDATE_LOCAL_CODES`,
+> partition the vocabulary with one deliberate exclusion (`CLASSIFIED_REQUIRES_ONE_PRIMARY` is not a
+> drop reason at all) — asserted, because "somebody later moves a code between these sets" is exactly
+> the shape the laundering regression would take.
+>
+> **What "persist" means here, stated plainly rather than claimed.** `intent_recognition_attempt` has
+> no column for candidate loss and Task 4 **adds no migration**, so a result read back from storage
+> carries `dropped_candidates == ()` — and the endpoint serves the STORED row by Task 0's invariant,
+> so **the drops are not on the wire yet**. `test_a_partitioned_result_is_not_persisted_with_its_
+> drops_yet` asserts that loss rather than hiding it. The information is not destroyed: `llm_call.
+> raw_output` holds the partitioned body verbatim, the recognition row joins to it via `llm_call_ref`
+> (Task 0), and the partition is a pure function of that body and the validator version pinned inside
+> `recognition_request_hash` — so the drop set is recomputable from durable evidence, which is why the
+> in-memory field is honest and forward-compatible rather than a hole. **[R6] Task 5 therefore needs a
+> migration its text does not mention:** `recognition_quality` cannot be served without a column (or a
+> re-derivation at read time), and the plan currently reads as if it were an API-shape change only.
+>
+> **`RECOGNITION_VALIDATOR_VERSION` 1 → 2.** Task 4 changes what the recognizer ACCEPTS — a body that
+> ended as a candidate-free `TECHNICAL_FAILURE` can now end as a `CLASSIFIED` scope — which is a
+> different ANSWER to the same question, so Task 0's request identity must re-key it. (Task 3 did not
+> bump it: how a rejection is reported is not what is accepted. Task 0's own leg test had to move off
+> the literal `"2"`, which was now the real value and proved nothing.)
+>
+> **Plan defects found and corrected. [R6] The frozen rule's candidate-local list is, in the LIVE
+> path, almost entirely unreachable — and this is the most important thing Task 4 learned.** Since
+> Task 1's frozen v2 enum, an unknown id, a non-leaf primary, an out-of-band confidence or
+> relationship, a non-string evidence span and a non-object candidate are all malformed STRUCTURE:
+> the seam reports `schema_invalid` and, by its own Task 2 design, exposes **no body at all**, so
+> partition never runs. Verified one defect at a time against the committed schema. The ONE
+> candidate-local defect that passes the schema and fails these rules is a **blank/whitespace evidence
+> span**, which is why it is the sibling in every end-to-end case. The unit cases cover the rest of the
+> frozen rule directly, where the schema is not in the way, and the rule stays worth implementing in
+> full — it is the contract a v3 schema, a relaxed enum, or the evaluator replaying v1-era bodies
+> would meet. But "partition rescues the single-junk-sibling case" is, today, narrower than the plan's
+> prose implies, and a reader who assumes otherwise will mis-scope Task 6's repair-rate expectations.
+> **[R6] A second, smaller one:** `_partial_recovery`'s `failure_kind` guard is DEFENSE IN DEPTH, not
+> load-bearing — the mutant that deletes it survives all 311 taxonomy tests, because the seam already
+> withholds a body on every other arm. It stays because a precondition a caller states for itself does
+> not depend on a remote invariant staying true, and Task 5 reads `failure_kind` regardless.
+>
+> **[R6] B3 gets worse before Task 6 fixes it, and it is worth writing down:** `recognition_release_
+> eval._record_attempt` scores from `llm_call.raw_output` with the all-or-nothing validator, so a
+> partially-recovered recognition is scored as a **technical failure** while the platform served a
+> CLASSIFIED scope. The direction is conservative (the gate under-reports success, it does not turn
+> falsely green) and the integrity re-verification still passes because both sides agree the raw body
+> is invalid — but the release gate now measures a platform that no longer exists.
+>
+> 19 new test functions → **29 test cases** (12 functions / 22 cases in
+> `…/taxonomy/test_recognition_contract.py`, two of them parametrized ×5 and ×7; 7 end-to-end in
+> `…/taxonomy/test_recognizer.py`). Task 0's request-hash leg test moved off the literal `"2"`.
+> Gates: full suite **11529 passed, 20 skipped** (+29 on Task 3's 11500/20 — exactly the cases
+> added); `-m eval` **73 passed**; ruff clean on every touched file; mypy clean on both touched src
+> files (no new errors — no other src file changed). No migration.
 
 ### Task 5 — the API and UI say which of five things happened (1 day)
 
@@ -491,6 +586,13 @@ recognition_quality:
 remaining scope"* and **keeps the surviving scope** (revision 1's "showing all buildable recipes" was
 wrong here); repair-exhausted offers broadening; genuine unscoped, ambiguous-without-primary, and
 clean each say their own thing.
+
+**[R6 — found in Task 4] This task needs a MIGRATION the text above does not mention.**
+`intent_recognition_attempt` has no column for candidate loss, and the endpoint serves the STORED row
+(Task 0's B2 invariant), so `dropped_candidate_count`/`drop_reason_codes` cannot reach the API from
+Task 4's in-memory `RecognitionResult.dropped_candidates` alone. Either add the column, or re-derive
+the partition at read time from `llm_call.raw_output` via `llm_call_ref` — it is a pure function of
+that body and the validator version, so both are honest; neither is free.
 
 **Acceptance:** a Vitest case per disposition; the honest-absence law asserted on the two that are
 not absence.
