@@ -1943,7 +1943,7 @@ are deleted in this commit, and `test_the_chain_can_never_append_PUBLISHED` is r
 > outcome, never as a skipped step. What D3 *builds* is the governed half: migration 1055's record,
 > the ordering, and the seam's contract.
 
-> **ACCEPTED `PENDING-D3` (2026-08-15).** G-3 lands, and **`PublishStepMissing` is gone with its
+> **ACCEPTED `5e99ef24` (2026-08-15).** G-3 lands, and **`PublishStepMissing` is gone with its
 > whole cause** — the class, the lane's `except` branch, D0's `_PUBLISH_STEP_REGISTERED` guard, its
 > autouse fixture, `test_chain._attest_capability`'s try/finally, D0's guard test and D1's
 > `test_the_lane_classifies_PublishStepMissing_instead_of_crashing`. The guard did not outlive its
