@@ -84,6 +84,7 @@ __all__ = [
     "FindingClass",
     "FindingSeverity",
     "MetastoreMetadata",
+    "MetastoreTableUnknown",
     "ValidationFinding",
     "ValidationLevel",
     "ValidationReportV1",
@@ -451,6 +452,20 @@ class ClusterUnreachable(Exception):
     ONLY exception L1 converts into ``status="error"``. Anything else propagates: catching bare
     ``Exception`` would turn a defect in this module into "the cluster was unreachable", which is an
     invented verdict of exactly the kind §11.2 forbids.
+    """
+
+
+class MetastoreTableUnknown(Exception):
+    """The environment ANSWERED, and its answer is that this table does not exist.
+
+    The opposite of :class:`ClusterUnreachable` in the one way that matters: something was
+    observed. :meth:`MetastoreMetadata.describe_table` already has a word for it (``None``), but
+    ``list_partitions`` and ``can_read`` do not — an adapter that returned an empty listing for a
+    table that is not there would say "this table has no partitions", which is a governed claim
+    about a table nothing looked at (``runprep``'s own words: *"'this table has no partitions' and
+    'the metastore did not answer' are the same empty list"*). So the adapter raises this, and
+    :func:`run_l1` reports it as the ``COLUMN_ABSENT`` "the table does not exist" finding it
+    already files for a ``describe_table`` that answered ``None``.
     """
 
 
@@ -1117,9 +1132,12 @@ def run_l1(
 
     Raises:
         ValueError: ``irs`` is empty, the IRs disagree about the spine, or no snapshot names it.
-        Exception: anything the metastore adapter raises that is not
-            :class:`ClusterUnreachable` — a defect in the adapter is not a verdict about the
+        Exception: anything the metastore adapter raises that is not :class:`ClusterUnreachable` or
+            :class:`MetastoreTableUnknown` — a defect in the adapter is not a verdict about the
             cluster, and converting one into the other is how an invented verdict gets recorded.
+            The two that ARE handled are the two the seam gives a MEANING: the environment could not
+            be asked (``status="error"``, no findings) and the environment says the table is not
+            there (one ``COLUMN_ABSENT``, and none of its partitions then reported absent).
     """
     spine = _spine_of(irs)
     spine_table = _spine_table(snapshots)
@@ -1139,20 +1157,31 @@ def run_l1(
         # Finding locations spell schema.table FOLDED (Hive-canonical, the read-set key) for the
         # read/column/type findings below, and in the snapshot requirement's OWN spelling for
         # PARTITION_ABSENT — intentional: two observed casings have no single observed spelling.
-        denied: set[tuple[str, str]] = set()
+        # `unchecked` is `denied` plus the tables the environment says are not there. Both are
+        # tables whose partitions must NOT then be checked, for the same reason: a table nobody may
+        # read and a table that does not exist were each observed ONCE, and reporting their
+        # partitions absent would invent a second fault out of the first one.
+        unchecked: set[tuple[str, str]] = set()
         for (schema, table), columns in _read_set(irs, spine, spine_table).items():
-            if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):
-                denied.add((schema, table))
-                findings.append(ValidationFinding(
-                    code=ValidationFindingCode.READ_DENIED, location=f"{schema}.{table}",
-                    expected=f"readable by {len(tuple(roles))} role(s)", observed="denied",
-                    count=1))
-                # No column checks for a denied table: a schema nobody may read is not a schema
-                # that was observed, and reporting its columns absent would invent a second fault
-                # out of the first one.
-                continue
-            observed = metastore.describe_table(schema=schema, table=table)
+            try:
+                if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):
+                    unchecked.add((schema, table))
+                    findings.append(ValidationFinding(
+                        code=ValidationFindingCode.READ_DENIED, location=f"{schema}.{table}",
+                        expected=f"readable by {len(tuple(roles))} role(s)", observed="denied",
+                        count=1))
+                    # No column checks for a denied table: a schema nobody may read is not a schema
+                    # that was observed, and reporting its columns absent would invent a second
+                    # fault out of the first one.
+                    continue
+                observed = metastore.describe_table(schema=schema, table=table)
+            except MetastoreTableUnknown:
+                # The adapter's typed word for what `describe_table` spells `None`. Reached when
+                # `can_read` or the description is asked about a table the environment says is not
+                # there, and folded into the SAME finding so one absence is one fault.
+                observed = None
             if observed is None:
+                unchecked.add((schema, table))
                 findings.append(ValidationFinding(
                     code=ValidationFindingCode.COLUMN_ABSENT, location=f"{schema}.{table}",
                     expected=f"{len(columns)} column(s)", observed="the table does not exist",
@@ -1183,11 +1212,11 @@ def run_l1(
             if snapshot.partition_specs is None:
                 continue
             physical = (snapshot.requirement.schema, snapshot.requirement.table)
-            # `denied` and `live` are keyed by the FOLDED pair (the read-set loop's keys), so a
+            # `unchecked` and `live` are keyed by the FOLDED pair (the read-set loop's keys), so a
             # requirement spelling the same table in another case still hits the denial and the
             # cached partition listing; the finding below keeps the requirement's own spelling.
             folded = (_fold(physical[0]), _fold(physical[1]))
-            if folded in denied:
+            if folded in unchecked:
                 continue
             if folded not in live:
                 live[folded] = {

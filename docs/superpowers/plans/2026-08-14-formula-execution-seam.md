@@ -2647,6 +2647,117 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > test and nothing else moved); `-m eval` **73 passed**; ruff clean; no new
 > mypy errors.
 
+---
+
+## 6.6 SUCCESSOR 2 (2026-08-15): the two deployment adapters
+
+**PROVENANCE.** D1's acceptance row: *"No `MetastoreMetadata` implementation exists anywhere in
+`src/` … so `lane_config_from_env` produces `metastore=None` and every deployed run is honestly
+unprepared."* D3's: *"the publish step's cluster half cannot be written in `src/` (the package is
+render-only, never imports pyspark). It is `publish.PublicationSwap`, a Protocol the deployment
+supplies."* E2 named writing both as its remaining engineering. This section is that work.
+
+### The placement decision, argued from the codebase's own laws
+
+**The brief's premise was WRONG in a way worth recording, and verifying it is what decided the
+design.** It said to reuse capture's transport — *"`inventory.MetastoreInventoryAdapter` … HOW does
+it reach the metastore today?"* It does not reach one. `MetastoreInventoryAdapter.capture` takes a
+`conn: MetastoreTableMetadata`, which is **itself a Protocol with no implementation anywhere**
+(`docs/architecture/2026-08-04-physical-table-configuration.md:53` already recorded this: *"its
+`MetastoreTableMetadata` is a Protocol with **no implementation**"*). So capture's adapter is a
+second seam, not a vehicle, and there was no existing transport to inherit.
+
+**What the deployment actually has, verified in the manifests.** `deploy/kind/sandbox/40-spark.yaml`
+deploys one Spark pod driven by `kubectl exec` — **no Service, no thrift server** — whose metastore
+client talks JDBC straight to `postgres:5432/metastore`; `deploy/kind/sandbox/up.sh` bootstraps
+Hive's own DDL into that database. `deploy/kind/Dockerfile.backend` installs pyspark into
+`/opt/kedro-venv` and **deliberately no JVM** (*"this makes the image able to PROVE a project
+builds, not to RUN one"*). So the worker pod can reach the metastore's **backing database** and
+cannot start a SparkSession.
+
+**Three candidates, and why the winner wins.** (a) *Read the HMS backing database over psycopg* —
+reachable today, and rejected: reaching the metastore's storage is not reaching the metastore, it
+cannot answer read scope at all, and a pointer switch written as hand-rolled `TBLS`/`SDS` UPDATEs is
+exactly the *"separate metadata write and pointer flip"* `PublicationSwap`'s docstring says the
+attestation would then be evidence about neither of. (b) *Subprocess into a pyspark interpreter*,
+the vehicle `run_l0`'s probe and `LocalClusterSubmitter` already use — sound in principle, and it
+needs a JVM in the control-plane pod, which `Dockerfile.backend` refuses on purpose. (c) **A DB-API
+2.0 cursor to the engine's own SQL endpoint** — HiveServer2 or the Spark Thrift Server — which is
+what landed. It imports no `pyspark` (the render-only law holds trivially), needs no JVM, is
+constructible from env strings alone, is faked in the default suite at the `connect` seam, and it
+performs the swap as **the engine's own atomic metastore operation**, which is the act §10.3's probe
+attests. It is also the platform's existing vehicle for a Hive-dialect engine:
+`data_agent.connection.open_connection` already does exactly this (DB-API 2.0, lazily imported
+driver named by a closed table, injectable `connect`). `DataSourceConnectionV1` itself is **not**
+reused, and the reason is written into the module: that object authorizes a governed SOURCE read and
+carries a schema allowlist and a secret reference, while the metastore endpoint is a deployment fact.
+
+**So the implementations live in `src/`** — `materialize/metastore_sql.py` and
+`materialize/publish_sql.py` — beside `submit.LocalClusterSubmitter`, which is the precedent
+exactly: an implementation whose imports are the standard library, needing an address from the
+environment rather than an engine. Nothing moved to `deploy/`, which ships YAML and Dockerfiles, has
+no Python package and is not on the image's import path; putting an adapter there would have needed
+a dotted-path-from-env plugin loader this codebase has nowhere, in the process that talks to the
+governed cluster.
+
+**AND THE HONEST CONSEQUENCE, which E2 must not discover later: the kind cluster cannot satisfy this
+today.** There is no SQL endpoint in front of the sandbox metastore. E2's remaining deployment work
+is therefore a thrift endpoint (`start-thriftserver.sh` in the spark pod plus a Service) in addition
+to the inventory — and until there is one, the eight execution variables stay unset and every run is
+recorded unprepared, which is the correct posture rather than a gap. Both deployment files now say
+so at the place an operator would otherwise set the variables.
+
+> **SUCCESSOR 2 (2026-08-15) — INCREMENT 1: THE `MetastoreMetadata` IMPLEMENTATION. ACCEPTED
+> `<hash>`.** `metastore_sql.SqlMetastoreAdapter` answers L1's three questions over one
+> `MetastoreSession` (a DB-API 2.0 connection, opened lazily, driver imported from a closed table
+> by engine name, `connect` injectable — which is how 47 tests prove every outcome without a
+> metastore, a JVM or a socket).
+>
+> **EVERY AMBIGUITY IS TYPED, AND `()` IS NEVER ONE OF THEM.** `runprep` already names the hazard —
+> *"'this table has no partitions' and 'the metastore did not answer' are the same empty list"* — so
+> every driver error is classified against a closed, ordered, documented table into
+> `MetastoreFault`, and the routing is: `UNREACHABLE` → `ClusterUnreachable` (L1's `status="error"`,
+> zero findings) · `TABLE_UNKNOWN` → the new `validation.MetastoreTableUnknown` · a denial of a
+> question the seam has no verdict slot for → `MetastoreAnswerRefused` (L1 was told these roles MAY
+> read it, so a refusal afterwards is the environment contradicting itself) · **`UNRECOGNISED` is a
+> MEMBER of the vocabulary and it RAISES**, carrying the statement and the driver's own words,
+> because a message table is incomplete by construction and folding an unknown message into its
+> nearest neighbour is how a wrong world gets validated. The ONE empty listing the adapter may
+> produce is the one the engine positively stated (*"is not a partitioned table"*), and the
+> ordering — denials classified BEFORE absences — is pinned by a test, because engines phrase a
+> denial as an absence.
+>
+> **`can_read` REFUSES TO GUESS, and that is a real deployment constraint rather than a nicety.** It
+> reads `SHOW GRANT ROLE … ON TABLE …` and takes the privilege **by column name** (Hive prints ten
+> columns; a positional read answers with whatever column sat there). An endpoint with no
+> authorization model raises `MetastoreReadScopeUnanswerable`: `True` would be the
+> unconfigured-allowlist-reads-as-everything defect `data_agent.connection` refuses by name, and
+> `False` would be a denial nobody issued that fails every L1 in the deployment. **So an endpoint
+> without SQL-standard authorization cannot pass L1 with this adapter** — recorded here rather than
+> discovered on the cluster.
+>
+> **ONE CHANGE TO `run_l1`, and it is what makes the typed absence consumable.** L1 calls
+> `can_read`/`describe_table` on every read-set table and then lists partitions per snapshot. An
+> adapter that RAISES on an unknown table would have destroyed the report the operator needs, so
+> `run_l1` now catches `MetastoreTableUnknown` and files the `COLUMN_ABSENT` "the table does not
+> exist" finding it already had for `describe_table is None` — and both now skip that table's
+> partition checks, which is `READ_DENIED`'s existing rule (*"reporting its columns absent would
+> invent a second fault out of the first one"*) applied to the other observation that ends a
+> table's checks. No existing test covered a wholly absent table; the new one asserts exactly one
+> finding.
+>
+> **Identifiers are validated, never escaped** — no dialect binds an identifier as a parameter, so
+> quoting a hostile one would be a defence that depends on the quoting being right. Five hostile
+> spellings are refused before a statement exists.
+>
+> **Mutant proof, both run:** (a) an adapter that answers `()` for every fault — the exact "empty
+> means unreachable" defect — fails **six** tests (connect failure, unreachable, unknown table,
+> denial, unrecognised, denial-before-absence); (b) `can_read` returning `True` when the endpoint
+> has no authorization model fails its test. Both reverted; `git diff` confirmed clean between.
+>
+> Gates: full suite **11300 passed, 20 skipped** (baseline on `799bcf98` was 11252/20 — the 47 new
+> `test_metastore_sql.py` cases and the one new L1 case, and nothing else moved); `-m eval`
+> **73 passed**; ruff clean on all four touched files; mypy clean on both touched source files.
 
 ---
 

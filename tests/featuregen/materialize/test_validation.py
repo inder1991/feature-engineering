@@ -58,6 +58,7 @@ from featuregen.materialize.validation import (
     FindingClass,
     FindingSeverity,
     MetastoreMetadata,
+    MetastoreTableUnknown,
     ValidationFinding,
     ValidationLevel,
     ValidationReportV1,
@@ -1280,6 +1281,31 @@ def test_a_DEFECT_in_the_metastore_adapter_is_not_reported_as_unreachable(prepar
     environment.raising(ValueError("the adapter built a malformed query"))
     with pytest.raises(ValueError, match="malformed"):
         _l1(prepared, irs=compiled)
+
+
+def test_a_table_the_environment_says_is_NOT_THERE_is_ONE_finding_not_two(prepared, compiled):
+    """SUCCESSOR 2: `MetastoreTableUnknown` is the adapter's typed word for what `describe_table`
+    spells `None`, and both land on ONE `COLUMN_ABSENT` — the table's partitions are NOT then
+    reported absent as well.
+
+    The rule is `READ_DENIED`'s, applied to the other observation that ends a table's checks: a
+    table nobody may read and a table that is not there were each observed ONCE, and a
+    `PARTITION_ABSENT` on top would invent a second fault out of the first. It also matters for the
+    real adapter specifically: `list_partitions` RAISES on an unknown table (it must not answer
+    `()`, which would mean "this table has none"), so without this fold the report a run's operator
+    needs would be replaced by an exception out of L1.
+    """
+    _snapshots, environment = prepared
+    environment.raising(MetastoreTableUnknown("the engine says banking.transactions is not there"))
+
+    report = _l1(prepared, irs=compiled)
+
+    assert report.status is ValidationStatus.FAILED
+    codes = {f.code for f in report.findings}
+    assert codes == {ValidationFindingCode.COLUMN_ABSENT}, \
+        "an absent table produced something other than exactly the absence"
+    assert all(f.observed == "the table does not exist" for f in report.findings)
+    assert may_regenerate(report) is False
 
 
 def test_L1_reports_the_hashes_the_RENDERED_identity_states(prepared, compiled) -> None:
