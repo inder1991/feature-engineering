@@ -227,6 +227,25 @@ policy moves, the state flips to *"Verification stale — formula or dependency 
 what changed**. The platform does **not** silently re-run: spending compute is the user's decision,
 and a quietly-refreshed pass would hide the fact that the thing verified is no longer the thing built.
 
+#### Two facts checked before writing this, both of which constrain the build
+
+**There is no state today between "code generated" and "run submitted."** The run lifecycle
+(`control_plane.py:142-149`) is one continuous sequence — `PREPARED → SUBMITTED → COMPUTED →
+VALIDATED → PUBLISHED | REFUSED`. A run that is prepared proceeds. So this is **not a UI relabel**:
+the seam has to exist in the control plane. Verification is therefore modelled as **its own request
+kind against a sealed generation**, not as a materialization run that stops early — a run that
+halts before submission is indistinguishable from one that failed, and `Generated — not verified`
+must never read as a failure.
+
+**A verification vocabulary already exists, and must not be duplicated.**
+`governance/attributes.py:14` defines `VERIFICATION_STAMPS = ("DESIGN-CHECKED", "DATA-CHECKED",
+"USEFULNESS-CHECKED")`, ordered, with `predicates.py:15` gating on rank. The new result **feeds that
+ladder** — a passing sandbox verification is what earns `DATA-CHECKED` — rather than introducing a
+parallel notion. Two disagreeing definitions of "verified" in one platform is exactly the class of
+defect this plan exists to remove. Note what the ladder already knows and the six UI states do not:
+`USEFULNESS-CHECKED` is a further rung, so **"Verification passed" means the code is correct, never
+that the feature is useful.** The UI must not let the tick imply the second.
+
 #### Two notes
 
 - **Verification is execution**, so it needs everything P6 enumerates — `business_dt`, live Hive
