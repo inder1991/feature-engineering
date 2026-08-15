@@ -3195,7 +3195,7 @@ called `assemble_current_activation_state` **without `contract_id`**, so C3's co
 (`activation_policy.py:195`). The row said naming a contract "needs an option → contract resolution
 that does not exist", and refused to invent one inside a proof task. This successor builds it.
 
-> **SUCCESSOR 4 — INCREMENT 1: THE LINK, RECORDED AT MINT. ACCEPTED `<hash-1>` (2026-08-15).**
+> **SUCCESSOR 4 — INCREMENT 1: THE LINK, RECORDED AT MINT. ACCEPTED `227de9c6` (2026-08-15).**
 > Migration **1069** (`contract_option_link.sql`) adds `considered_revision_id` + `option_id` to
 > `contract` — nullable, composite FK to `semantic_option_decision (considered_revision_id,
 > option_id)` against 1063's own `semantic_option_decision_option_uq`, a named CHECK for the
@@ -3250,7 +3250,7 @@ that does not exist", and refused to invent one inside a proof task. This succes
 > mypy clean on `govern.py` and the 2 errors in `contract.py:883` are pre-existing (measured by
 > HEAD-swap, identical line and codes) — none added.
 
-> **SUCCESSOR 4 — INCREMENT 2: THE ROUTE RESOLVES AND PASSES `contract_id`. ACCEPTED `<hash-2>`
+> **SUCCESSOR 4 — INCREMENT 2: THE ROUTE RESOLVES AND PASSES `contract_id`. ACCEPTED `a57491c2`
 > (2026-08-15).** `api/routes/materialization_runs.py` gains `_contract_minted_from` and hands its
 > answer to `assemble_current_activation_state`. **E0's defect is closed**: the route that gates
 > materialization now reads the validation store under the contract the approved option actually
