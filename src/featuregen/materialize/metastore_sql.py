@@ -40,11 +40,16 @@ gets validated. The four outcomes and where each lands:
   :class:`MetastoreAnswerRefused`. It propagates: L1 asked ``can_read`` FIRST and was told yes, so a
   listing that is then denied is the environment contradicting itself, not a finding about a
   feature.
-* ``READ_SCOPE_UNANSWERABLE`` → :class:`MetastoreReadScopeUnanswerable`. An engine with no
+* ``READ_SCOPE_UNANSWERABLE`` →
+  :class:`~featuregen.materialize.validation.MetastoreReadScopeUnanswerable`. An engine with no
   authorization model cannot say whether a role may read a table, and the two lies available —
   ``True`` ("everything is readable", the unconfigured-allowlist-means-everything defect
   ``data_agent`` refuses by name) and ``False`` (a denial nobody issued) — are both worse than a
-  deployment being told its endpoint cannot answer L1's third question.
+  deployment being told its endpoint cannot answer L1's third question. **This adapter's behaviour
+  is unchanged by SUCCESSOR 5's declared posture**: it raises here whatever a deployment declared,
+  and what the raise MEANS for a run is L1's decision, made from the operator's declaration rather
+  than from anything the endpoint said. An adapter that returned ``True`` because a variable was set
+  would be the same lie with a permission slip.
 
 **Identifiers are validated, never escaped.** No DDL or ``SHOW`` statement can take an identifier as
 a bound parameter, so every identifier this module interpolates is checked against a strict pattern
@@ -60,7 +65,11 @@ from enum import StrEnum
 from typing import Any, Protocol
 from urllib.parse import unquote
 
-from featuregen.materialize.validation import ClusterUnreachable, MetastoreTableUnknown
+from featuregen.materialize.validation import (
+    ClusterUnreachable,
+    MetastoreReadScopeUnanswerable,
+    MetastoreTableUnknown,
+)
 
 __all__ = [
     "FAULT_PATTERNS",
@@ -220,15 +229,6 @@ class MetastoreAnswerRefused(Exception):
     Not a finding and not ``ClusterUnreachable``: L1 asks ``can_read`` first, so a listing that is
     then denied is the environment contradicting its own answer, and turning that into a
     ``PARTITION_ABSENT`` would report a governed fact about a table nothing observed.
-    """
-
-
-class MetastoreReadScopeUnanswerable(Exception):
-    """The endpoint has no authorization model, so *may these roles read it* has no answer here.
-
-    Deliberately not a ``bool``. ``True`` would be the unconfigured-allowlist-reads-as-everything
-    defect ``data_agent.connection`` refuses by name; ``False`` would be a denial nobody issued and
-    would fail every L1 in the deployment with a governed ``READ_DENIED`` about nothing.
     """
 
 

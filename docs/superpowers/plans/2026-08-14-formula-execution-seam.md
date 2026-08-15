@@ -3308,6 +3308,93 @@ that does not exist", and refused to invent one inside a proof task. This succes
 
 ---
 
+## 6.6d SUCCESSOR 5 (2026-08-15): the DECLARED read-scope posture
+
+**PROVENANCE, AND THE ONE THING THIS SECTION CHANGES ABOUT THE PLAN'S STORY.** SUCCESSOR 3 closed
+E2's endpoint and, in closing it, recorded a blocker it could not close: *"the swap REQUIRES Spark
+(only Spark parses ``parquet.`<path>```), `can_read` REQUIRES an authorization model (only Hive's
+`Driver` has one), and no single engine here has both … **L1 does not pass against the sandbox
+endpoint**"*, adding that §0.5 item 7 *"is closable only if L1's read-scope question is satisfied
+some other way, which is a governance decision this plan does not take"*.
+
+**THE USER TOOK THAT DECISION ON 2026-08-15, and it is option (a): a deployment may EXPLICITLY
+DECLARE that it has no authorization model.** Under that declaration — and only under it — L1's
+third question folds to an ACCEPTED outcome instead of failing the run. So the framing "STRUCTURAL
+blocker, not closable on kind" is superseded by **"resolved by declared posture"**: the engine
+constraint is unchanged and still true, and what changed is that the platform now has a governed way
+for an operator to state it and accept its consequence. Everywhere else — every deployment that does
+not declare — behaviour is byte-for-byte what SUCCESSOR 2 built, which the tests assert at the
+default rather than assume.
+
+> **SUCCESSOR 5 — INCREMENT 1: THE DECLARATION AND THE FOLD. ACCEPTED `<increment 1>`
+> (2026-08-15).**
+>
+> **WHERE THE DECLARATION LIVES, argued against the alternative it was measured against.**
+> `FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL` is a SEPARATE, independently-optional
+> variable — **not a ninth member of the all-eight-or-none EXECUTION block** — and it is a member of
+> `MATERIALIZATION_ENV_VARS`, so the CI documentation test covers it in `.env.example` and
+> `20-backend.yaml`. The eight are ONE choice (*here is the engine, and here is how a run reaches
+> it*) and all-or-none holds because each is useless without the others; this is not part of reaching
+> the engine, it is an ACCEPTANCE of a risk. Folding it in would have made it MANDATORY for every
+> deployment that executes runs at all — including production, where the only correct value is the
+> one that accepts nothing — and a required field whose safe value every operator must type is a
+> default in disguise. Worse, the half-configured refusal NAMES the missing variables, so the fastest
+> way to silence it would have been to set the one the error had just mentioned. Kept separate, both
+> laws stand: the block is still exactly eight and still all-or-none (a test states seven plus the
+> declaration and asserts the refusal names the missing eighth and **never** the declaration), and
+> the declaration is still never a default, because its absence is the STRICT posture rather than an
+> incomplete one.
+>
+> **ONE COUPLING IS ENFORCED, because a standing acceptance is the one that outlives its reason.**
+> The declaration set with NO execution block is a `ValueError` naming it: it is a statement about
+> the authorization model of an endpoint nobody configured, and an acceptance nothing is using is
+> exactly the one that survives into the deployment where it is not true.
+>
+> **THE FOLD IS IN L1, NOT IN THE ADAPTER, and that is the load-bearing placement.**
+> `SqlMetastoreAdapter.can_read` still raises `MetastoreReadScopeUnanswerable` whatever a deployment
+> declared — an adapter that answered `True` because a variable was set would be the
+> unconfigured-allowlist-reads-as-everything lie with a permission slip. What the declaration changes
+> is what the raise MEANS to `run_l1`, which is the layer that decides what an observation means for
+> a run. `run_l1` gained `read_scope: ReadScopeDeclaration = ENGINE_ANSWERS`; `RunExecution` and
+> `MaterializationLaneConfig` carry it with the same default, so **every construction that predates
+> this parameter is unchanged**, and SUCCESSOR 2's tests did not move.
+>
+> **THE ACCEPTANCE IS A TYPED, RECORDED FINDING — `READ_SCOPE_UNVERIFIED`, severity `WARNING`, one
+> per table**, filed with `observed="this deployment declares no authorization model"`. It is the
+> platform's FIRST `WARNING`-severity finding, and a test reads `validation.py`'s AST to pin that
+> there is exactly one emitter and which code it files. `ValidationReportV1`'s invariant moved from
+> *"`passed` carries zero findings"* to *"`passed` carries no ERROR finding"* (and `failed` now
+> requires at least one ERROR finding, so a report holding only warnings cannot be recorded as a
+> failure) — the same rule it always meant, restated in severities now that not every finding is a
+> condition under which the run cannot be trusted. **No migration:** 1034's physical CHECK constrains
+> `error` alone, so a passing report carrying a warning was always legal in the database.
+>
+> **THE DECLARATION COVERS EXACTLY ONE OUTCOME, and six tests hold that line.** A denial the engine
+> actually issued is still `READ_DENIED`; `ClusterUnreachable` is still `status="error"`;
+> `MetastoreTableUnknown` is still `COLUMN_ABSENT`; a `RuntimeError` and a `ValueError` out of the
+> adapter still propagate; and a declared deployment whose engine DOES answer records nothing at all
+> — the warning marks the runs that were accepted, so a run that was verified must not carry it.
+> The other two questions are still asked of an accepted table (a fold that skipped the table would
+> have been a far larger acceptance than the operator made).
+>
+> **Three mutants, each run and each caught, then reverted:** (a) inferring the declaration from the
+> endpoint (`METASTORE_HOST == "spark-thrift"`) — **11 failures**, including the one that says the
+> posture is never inferred from the engine or the host; (b) the fold also catching
+> `ClusterUnreachable`/`MetastoreTableUnknown` — 2; (c) dropping the `raise` on the undeclared path
+> — 2, both on the byte-identical-undeclared-behaviour tests.
+>
+> Files: `codes.py`, `validation.py`, `metastore_sql.py` (`MetastoreReadScopeUnanswerable` MOVED to
+> `validation.py` beside `ClusterUnreachable`/`MetastoreTableUnknown` — its two siblings — and
+> re-exported under the same name, which is what lets `run_l1` fold on it without an import cycle),
+> `compile/chain.py`, `queue_lane.py`, `.env.example`, `20-backend.yaml`, `25-worker.yaml`.
+> Gates: full suite **11402 passed, 20 skipped** (baseline `0a914ec4` was 11368/20 — the 34 new
+> cases are 13 in `test_validation.py`, 19 in `test_queue_lane.py` and the 2 parametrized rows the
+> new variable adds to the deployment-file documentation test, and nothing else moved); `-m eval` **73 passed**; ruff clean on every touched
+> file; mypy clean on all five touched source modules; both manifests re-parsed with
+> `yaml.safe_load_all`.
+
+---
+
 ## 7. Sequencing and dependencies
 
 ```

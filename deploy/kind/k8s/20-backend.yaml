@@ -256,6 +256,11 @@ data:
   #   needs an engine with an authorization model, and on kind there is none. Note the tension is
   #   structural, because the publication swap (`SELECT … FROM parquet.`<path>``) is Spark-only
   #   syntax that a real HiveServer2 could not execute — see §6.6's SUCCESSOR 3 block.
+  #     WHAT TO DO ABOUT IT ON KIND: the LAST variable in this file
+  #   (FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL) is the operator's declaration that
+  #   this is so, and it is what makes L1 accept the unanswerable read scope instead of failing the
+  #   run. Read its block before setting it: it is not part of the eight, and production never sets
+  #   it.
   #   §9's staging root BASE. `staging_root_for` derives <base>/<generation_id> under it, and the
   #   rendered project writes its immutable versioned output at <staging_root>/published/<table> —
   #   which is exactly where the swap then points readers. Must be a path the SPARK side can write
@@ -267,6 +272,27 @@ data:
   #   one — pointing this at it would fail every submission deep inside the launcher.
   # FEATUREGEN_MATERIALIZE_SUBMIT_PYTHON: "/opt/kedro-venv/bin/python"
   # FEATUREGEN_MATERIALIZE_SUBMIT_TIMEOUT_SECONDS: "3600"
+  #
+  # ── THE DECLARED READ-SCOPE POSTURE: a NINTH variable, and NOT a member of the eight ────────────
+  # **A REAL DEPLOYMENT MUST NEVER SET THIS.** It is an operator's written statement that the engine
+  # behind the endpoint above has NO AUTHORIZATION MODEL AT ALL — true of this sandbox's Spark
+  # Thrift Server by grammar, and of nothing anyone runs a bank on. The user's decision of
+  # 2026-08-15 created it so that the kind sandbox can execute a run at all; it is the answer to the
+  # blocker written three settings above, and it changes nothing else anywhere.
+  #
+  # WHAT SETTING IT ACCEPTS, exactly: L1 stops asking the engine to prove that the authorized roles
+  # may read the tables this run reads, because this engine cannot answer that question. It does NOT
+  # relax anything else — an unreachable metastore, an unknown table, a refused answer and an
+  # unclassified driver error all still fail the run, declared or not.
+  #
+  # IT IS NEVER SILENT AND NEVER RETROACTIVE. Each accepted table is recorded as a
+  # READ_SCOPE_UNVERIFIED warning on that run's own L1 validation report, GET
+  # /materialization-runs/{id} says so in plain language, and the run screen shows it — so a run
+  # that proceeded this way can be told apart from one whose read scope was verified for as long as
+  # the control plane exists. Unset (the default, and anything that is not 1/true/yes/on) is the
+  # strict posture, which is why this is NOT one of the eight: no deployment is ever forced to state
+  # a value here, and a production ConfigMap that simply never mentions it is already correct.
+  # FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL: "0"
 ---
 apiVersion: apps/v1
 kind: Deployment

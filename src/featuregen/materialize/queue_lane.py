@@ -127,7 +127,7 @@ from featuregen.materialize.spine import (
     SpineSourceDeclarationV1,
 )
 from featuregen.materialize.submit import LocalClusterSubmitter, PipelineSubmitter
-from featuregen.materialize.validation import MetastoreMetadata
+from featuregen.materialize.validation import MetastoreMetadata, ReadScopeDeclaration
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.queue import (
     MaterializationQueueClaim,
@@ -237,6 +237,32 @@ _EXECUTION_ENV_VARS = (
     _METASTORE_ENGINE_ENV, _METASTORE_HOST_ENV, _METASTORE_PORT_ENV, _METASTORE_AUTH_ENV,
     _METASTORE_PRINCIPAL_ENV, _STAGING_BASE_ENV, _SUBMIT_PYTHON_ENV, _SUBMIT_TIMEOUT_ENV)
 
+# ── the DECLARED READ-SCOPE POSTURE (user decision, 2026-08-15) ──────────────────────────────────
+#
+#: **A deployment's statement that its engine has NO AUTHORIZATION MODEL.** Set it, and L1 accepts
+#: the one outcome ``can_read`` cannot answer — recording a ``READ_SCOPE_UNVERIFIED`` warning on the
+#: run's own validation report — instead of failing the run closed. Unset, absent, or anything
+#: outside the truthy set, and every deployment behaves exactly as it did before this variable
+#: existed. **Production must never set it**; ``.env.example`` and both deployment manifests say so
+#: at the line an operator would edit.
+#:
+#: **WHY IT IS NOT A NINTH MEMBER OF THE EXECUTION BLOCK, argued rather than assumed.** The eight
+#: above are ONE choice — *here is the engine, and here is how a run reaches it* — and all-or-none
+#: holds because ``RunExecution`` refuses a half seam: each of the eight is useless without the
+#: others. This is not part of reaching the engine. It is an ACCEPTANCE of a risk, and folding it
+#: into the block would make it MANDATORY for every deployment that executes runs at all — including
+#: production, where the only correct value is the one that accepts nothing. A required field whose
+#: safe value every operator must type is a default in disguise, and worse: the half-configured
+#: refusal NAMES the missing variables, so the fastest way to silence it would be to set the one the
+#: error just mentioned. Keeping it separate leaves both laws standing — the block is still exactly
+#: eight and still all-or-none, and this one is still never a default, because its absence is the
+#: strict posture rather than an incomplete one.
+#:
+#: It is a member of :data:`MATERIALIZATION_ENV_VARS` all the same, so the CI test that every lane
+#: variable is documented in ``.env.example`` and ``deploy/kind/k8s/20-backend.yaml`` covers it: a
+#: variable this consequential must not be discoverable only by reading this module.
+_DECLARE_NO_AUTHORIZATION_MODEL_ENV = "FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL"
+
 #: **THE KILL SWITCH.** One env gate for the whole of materialization, default OFF — see
 #: :func:`materialization_enabled`.
 MATERIALIZATION_FLAG = "FEATUREGEN_MATERIALIZE_ENABLED"
@@ -246,7 +272,7 @@ MATERIALIZATION_FLAG = "FEATUREGEN_MATERIALIZE_ENABLED"
 #: here without telling the two files a deployer actually edits fails CI rather than a deployment.
 MATERIALIZATION_ENV_VARS = (
     MATERIALIZATION_FLAG, _PROJECT_ROOT_ENV, _INVENTORY_ENV, _L0_PYTHON_ENV, _L0_TIMEOUT_ENV,
-    *_EXECUTION_ENV_VARS)
+    *_EXECUTION_ENV_VARS, _DECLARE_NO_AUTHORIZATION_MODEL_ENV)
 
 #: Failures that are DETERMINISTIC: the same job, the same catalog and the same configuration would
 #: produce them again, so the request is failed and the message dead-lettered instead of retried
@@ -633,6 +659,12 @@ class MaterializationLaneConfig:
     swap: PublicationSwap | None = None
     #: §9's staging root base, under which ``staging_root_for`` derives a per-generation path.
     staging_base: str | None = None
+    #: The deployment's declaration about its engine's AUTHORIZATION MODEL — L1's third question.
+    #: Defaulted to the strict posture, which is what every deployment that says nothing gets: an
+    #: unanswerable read scope fails the run closed. It is NOT ``None``-able like the four seams
+    #: above, because there is no such thing as an undeclared-and-therefore-unknown posture here:
+    #: saying nothing IS the declaration that the engine is expected to answer.
+    read_scope: ReadScopeDeclaration = ReadScopeDeclaration.ENGINE_ANSWERS
 
     def execution_for(self, job: MaterializationJobV1) -> RunExecution | None:
         """The chain's G-2 seam, or ``None`` when this deployment and this job cannot execute a run.
@@ -646,7 +678,8 @@ class MaterializationLaneConfig:
                 or self.staging_base is None or job.business_dt is None):
             return None
         return RunExecution(metastore=self.metastore, submitter=self.submitter, swap=self.swap,
-                            business_dt=job.business_dt, staging_base=self.staging_base)
+                            business_dt=job.business_dt, staging_base=self.staging_base,
+                            read_scope=self.read_scope)
 
     @property
     def lease_seconds(self) -> float:
@@ -708,7 +741,16 @@ def _execution_from_env() -> dict[str, Any]:
     sessions could answer from two worlds.
     """
     stated = {name: os.environ.get(name, "").strip() for name in _EXECUTION_ENV_VARS}
+    declared = _declares_no_authorization_model()
     if not any(stated.values()):
+        if declared:
+            raise ValueError(
+                f"{_DECLARE_NO_AUTHORIZATION_MODEL_ENV} is set and this deployment configures no "
+                f"EXECUTION block: the declaration is a statement about the authorization model of "
+                f"an endpoint ({', '.join(_EXECUTION_ENV_VARS[:5])}) that nobody configured, so it "
+                f"accepts a risk no run of this deployment can take. Configure the endpoint, or "
+                f"unset the declaration — a standing acceptance nothing is using is exactly the "
+                f"one that survives into the deployment where it is not true")
         return {}
     missing = [name for name, value in stated.items() if not value]
     if missing:
@@ -734,7 +776,28 @@ def _execution_from_env() -> dict[str, Any]:
             python_executable=stated[_SUBMIT_PYTHON_ENV],
             timeout_seconds=_positive_float(stated[_SUBMIT_TIMEOUT_ENV], _SUBMIT_TIMEOUT_ENV)),
         "staging_base": stated[_STAGING_BASE_ENV],
+        "read_scope": (ReadScopeDeclaration.NO_AUTHORIZATION_MODEL if declared
+                       else ReadScopeDeclaration.ENGINE_ANSWERS),
     }
+
+
+def _declares_no_authorization_model() -> bool:
+    """Whether this deployment DECLARES that its engine has no authorization model.
+
+    **Read from the environment and from nothing else.** Not from the metastore engine's name, not
+    from what the endpoint answered, not from the text of a failure: the whole content of the
+    declaration is that a HUMAN accepted running without a verified read scope, and a platform that
+    inferred it would be accepting on their behalf. The kind sandbox's Spark Thrift Server would be
+    the obvious thing to infer it from — it rejects ``SHOW GRANT`` by grammar and can never answer —
+    and inferring it there is exactly how a production Spark deployment, or one whose metastore is
+    merely misconfigured, would silently acquire the same acceptance.
+
+    The truthy set is :func:`materialization_enabled`'s, for its reason: two spellings of one
+    switch are two switches. Anything unrecognised is the STRICT posture, which for this variable
+    is the safe side of every ambiguity.
+    """
+    return (os.environ.get(_DECLARE_NO_AUTHORIZATION_MODEL_ENV, "").strip().lower()
+            in {"1", "true", "yes", "on"})
 
 
 def _whole_number(raw: str, variable: str) -> int:

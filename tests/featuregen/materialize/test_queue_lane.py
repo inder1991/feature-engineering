@@ -79,7 +79,11 @@ from featuregen.materialize.request_store import (
     record_request,
 )
 from featuregen.materialize.runprep import PARTITION_VALUE_FORMS
-from featuregen.materialize.validation import ValidationFinding, ValidationStatus
+from featuregen.materialize.validation import (
+    ReadScopeDeclaration,
+    ValidationFinding,
+    ValidationStatus,
+)
 from featuregen.runtime.observability import counters
 from featuregen.runtime.queue import (
     MATERIALIZATION_QUEUE_HANDLERS,
@@ -865,6 +869,106 @@ def test_a_configured_deployment_gets_BOTH_adapters_over_ONE_session(monkeypatch
     execution = config.execution_for(_job("req", (), business_dt=_BUSINESS_DT))
     assert execution is not None and execution.metastore is config.metastore
     assert execution.swap is config.swap and execution.staging_base == "/warehouse/staging"
+
+
+# ── SUCCESSOR 5: the DECLARED read-scope posture (the user's decision, 2026-08-15) ───────────────
+
+_DECLARATION = "FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL"
+
+
+def _executing_env(monkeypatch, tmp_path) -> None:
+    _compile_env(monkeypatch, tmp_path)
+    for name, value in _EXECUTION_ENV.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(_DECLARATION, raising=False)
+
+
+def test_a_deployment_that_says_NOTHING_gets_the_STRICT_read_scope_posture(monkeypatch, tmp_path):
+    """The default is not a value anyone types. The whole execution block is set — including
+    `METASTORE_HOST=spark-thrift`, the endpoint that provably cannot answer `SHOW GRANT` — and the
+    posture is still strict, because an acceptance is an operator's statement and nothing else."""
+    _executing_env(monkeypatch, tmp_path)
+
+    config = lane_config_from_env()
+
+    assert config.read_scope is ReadScopeDeclaration.ENGINE_ANSWERS
+    execution = config.execution_for(_job("req", (), business_dt=_BUSINESS_DT))
+    assert execution is not None
+    assert execution.read_scope is ReadScopeDeclaration.ENGINE_ANSWERS
+
+
+@pytest.mark.parametrize("engine", ["hive"])
+def test_the_declaration_is_NEVER_inferred_from_the_engine_or_the_endpoint(
+        monkeypatch, tmp_path, engine) -> None:
+    """The trivially-wrong implementation this test exists to kill: reading the posture off the
+    engine name (or the host, or the auth mechanism). `hive` covers HiveServer2 — which HAS an
+    authorization model — and the Spark Thrift Server, which cannot have one; the same string
+    therefore cannot decide the question, and neither can the sandbox's hostname, which a real
+    deployment is free to reuse."""
+    _executing_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_METASTORE_ENGINE", engine)
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_METASTORE_HOST", "spark-thrift")
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_METASTORE_AUTH", "NONE")
+
+    assert lane_config_from_env().read_scope is ReadScopeDeclaration.ENGINE_ANSWERS
+
+
+@pytest.mark.parametrize("stated", ["1", "true", "TRUE", "yes", "on", " on "])
+def test_a_DECLARING_deployment_carries_the_posture_to_the_chain(monkeypatch, tmp_path, stated):
+    """The truthy set is `materialization_enabled`'s, verbatim: two spellings of one switch are
+    two switches, and the second is the one nobody flips."""
+    _executing_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(_DECLARATION, stated)
+
+    config = lane_config_from_env()
+
+    assert config.read_scope is ReadScopeDeclaration.NO_AUTHORIZATION_MODEL
+    execution = config.execution_for(_job("req", (), business_dt=_BUSINESS_DT))
+    assert execution is not None
+    assert execution.read_scope is ReadScopeDeclaration.NO_AUTHORIZATION_MODEL
+
+
+@pytest.mark.parametrize("stated", ["0", "", "  ", "false", "no", "off", "maybe", "2", "declared"])
+def test_anything_that_is_not_the_truthy_set_is_the_STRICT_posture(monkeypatch, tmp_path, stated):
+    """A typo, a truncated write and a deliberate `0` all mean the same thing, and it is the safe
+    side of the ambiguity — which is the opposite of how a value like this usually degrades."""
+    _executing_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(_DECLARATION, stated)
+
+    assert lane_config_from_env().read_scope is ReadScopeDeclaration.ENGINE_ANSWERS
+
+
+def test_the_declaration_is_NOT_a_member_of_the_all_or_none_block(monkeypatch, tmp_path) -> None:
+    """Both laws at once. The block is still exactly EIGHT — a deployment that states seven of them
+    plus the declaration is refused, and the refusal names the missing eighth and never the
+    declaration, because the declaration is not one of the things that were half-stated."""
+    _compile_env(monkeypatch, tmp_path)
+    for name, value in _EXECUTION_ENV.items():
+        if name != "FEATUREGEN_MATERIALIZE_SUBMIT_TIMEOUT_SECONDS":
+            monkeypatch.setenv(name, value)
+    monkeypatch.setenv(_DECLARATION, "1")
+
+    with pytest.raises(ValueError) as raised:
+        lane_config_from_env()
+
+    message = str(raised.value)
+    assert "half configured" in message
+    assert "FEATUREGEN_MATERIALIZE_SUBMIT_TIMEOUT_SECONDS" in message
+    assert _DECLARATION not in message, \
+        "the refusal invites an operator to set the declaration to make it go away"
+
+
+def test_a_declaration_with_NO_endpoint_at_all_is_REFUSED(monkeypatch, tmp_path) -> None:
+    """A standing acceptance nothing is using is exactly the one that survives into the deployment
+    where it is not true. There is no endpoint here to have an authorization model, so the
+    statement is about nothing and the lane says so by name."""
+    _compile_env(monkeypatch, tmp_path)
+    monkeypatch.setenv(_DECLARATION, "1")
+
+    with pytest.raises(ValueError) as raised:
+        lane_config_from_env()
+
+    assert _DECLARATION in str(raised.value)
 
 
 def test_a_configured_deployment_still_needs_the_JOB_to_declare_a_business_date(

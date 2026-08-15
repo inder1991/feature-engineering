@@ -177,6 +177,15 @@ class ValidationFindingCode(StrEnum):
     COLUMN_TYPE_MISMATCH = "COLUMN_TYPE_MISMATCH"
     PARTITION_ABSENT = "PARTITION_ABSENT"
     READ_DENIED = "READ_DENIED"
+    #: L1's third question was NOT ANSWERED, and this deployment declared in advance that its engine
+    #: has no authorization model to answer it (``FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_``
+    #: ``MODEL``, user decision 2026-08-15). The ONE finding this platform emits at
+    #: :attr:`~featuregen.materialize.validation.FindingSeverity.WARNING`: it does not stop the run —
+    #: that is what the declaration accepts — and it is recorded so that a run which proceeded on an
+    #: unverified read scope is distinguishable, forever, from one whose read scope the engine
+    #: actually answered. Without the declaration an unanswerable read scope is not this code: it is
+    #: ``MetastoreReadScopeUnanswerable``, and it still fails the run closed.
+    READ_SCOPE_UNVERIFIED = "READ_SCOPE_UNVERIFIED"
 
     #: Anything unrecognized → ``FindingClass.UNCLASSIFIED``, which FAILS CLOSED.
     UNKNOWN_FINDING = "UNKNOWN_FINDING"

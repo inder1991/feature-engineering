@@ -84,7 +84,9 @@ __all__ = [
     "FindingClass",
     "FindingSeverity",
     "MetastoreMetadata",
+    "MetastoreReadScopeUnanswerable",
     "MetastoreTableUnknown",
+    "ReadScopeDeclaration",
     "ValidationFinding",
     "ValidationLevel",
     "ValidationReportV1",
@@ -145,13 +147,51 @@ class FindingSeverity(StrEnum):
     """How a finding reads on its own.
 
     Not a fifth failure vocabulary: §14's four closed enums are the *codes*, and severity is not a
-    code. Every L0 and L1 finding this slice emits is ``ERROR`` — each describes a condition under
-    which the run cannot be trusted to produce correct output — and a test pins that. ``WARNING``
-    belongs to L2's on-demand sample execution, which is not in this slice.
+    code. Every finding's DEFAULT severity is ``ERROR`` — each code describes a condition under
+    which the run cannot be trusted to produce correct output — and a test pins that.
+
+    **``WARNING`` HAS EXACTLY ONE EMITTER, and it is not a softened error.**
+    :data:`~featuregen.materialize.codes.ValidationFindingCode.READ_SCOPE_UNVERIFIED` is filed at
+    ``WARNING`` by :func:`run_l1` when, and only when, the deployment DECLARED that its engine has
+    no authorization model (:class:`ReadScopeDeclaration`). It is the one observation this platform
+    records beside a pass: the operator already accepted the condition in advance, so the run
+    continues — and it must still be visible forever, which a severity that stopped the run could
+    not express and a log line would not preserve. Everything else remains ``ERROR``, and an
+    unanswerable read scope with NO declaration is not a finding at all: it raises.
     """
 
     ERROR = "error"
     WARNING = "warning"
+
+
+class ReadScopeDeclaration(StrEnum):
+    """What a DEPLOYMENT states about its engine's authorization model — L1's third question.
+
+    ``can_read`` refuses to guess (``metastore_sql.MetastoreReadScopeUnanswerable``): an endpoint
+    with no authorization model can answer neither ``True`` ("everything is readable") nor ``False``
+    ("a denial nobody issued"). That leaves the question with the only party that can answer it —
+    the operator who deployed the endpoint — and this is the shape of their answer.
+
+    **``ENGINE_ANSWERS`` IS THE DEFAULT AND IT IS NEVER INFERRED.** Every caller that does not pass
+    one gets it, and under it an unanswerable read scope propagates exactly as it did before this
+    type existed: the run fails closed. A real deployment whose metastore is unreachable, whose
+    principal is wrong, or whose driver is broken therefore cannot slide into the accepted branch —
+    those are different faults with different types, and none of them reaches this decision.
+
+    **``NO_AUTHORIZATION_MODEL`` IS AN OPERATOR'S STATEMENT, NOT AN OBSERVATION.** It is read from
+    one environment variable that a human sets on purpose
+    (``FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL``); it is never derived from the engine
+    name, from the endpoint's capabilities or from the text of the failure. Deriving it from any of
+    those would mean the platform decides for itself that authorization does not apply — which is
+    the whole of what an operator is being asked to accept. Under it, and only for the ONE outcome
+    "this endpoint has no authorization model", L1 records a
+    :data:`~featuregen.materialize.codes.ValidationFindingCode.READ_SCOPE_UNVERIFIED` warning and
+    carries on. The user's decision of 2026-08-15, and the sandbox it exists for is the kind Spark
+    Thrift Server, which rejects ``SHOW GRANT`` by grammar and can never answer.
+    """
+
+    ENGINE_ANSWERS = "engine_answers"
+    NO_AUTHORIZATION_MODEL = "no_authorization_model"
 
 
 #: Code → class, TOTAL over :class:`ValidationFindingCode` and pinned by a ``==`` test.
@@ -190,6 +230,16 @@ FINDING_CLASSES: Mapping[ValidationFindingCode, FindingClass] = {
     ValidationFindingCode.COLUMN_TYPE_MISMATCH: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.READ_DENIED: FindingClass.GOVERNED_FACT_MISMATCH,
     ValidationFindingCode.PARTITION_ABSENT: FindingClass.ENVIRONMENT_OR_DATA,
+    # ENVIRONMENT_OR_DATA, and the two plausible alternatives are both wrong. It is not a
+    # GOVERNED_FACT_MISMATCH: nothing the catalog attests was contradicted — the engine was ASKED
+    # about read scope and had no authorization model to answer with, which is a fact about the
+    # deployment rather than a disagreement about a governed column, and routing it there would
+    # block regeneration over a condition regeneration cannot change. It is not UNCLASSIFIED
+    # either: that class is for a code nobody declared, and this one is declared, argued and
+    # accepted by an operator's own statement. What is left is exactly this class's own sentence —
+    # *the environment is not in the state the run needs, and the operator acts* — with the
+    # operator's act being the declaration itself.
+    ValidationFindingCode.READ_SCOPE_UNVERIFIED: FindingClass.ENVIRONMENT_OR_DATA,
     ValidationFindingCode.UNKNOWN_FINDING: FindingClass.UNCLASSIFIED,
 }
 
@@ -286,9 +336,22 @@ class ValidationReportV1:
 
     * ``error`` carries **zero** findings — a validation that could not run observed nothing, and a
       findings list under ``error`` is a fabricated observation (the migration's own CHECK);
-    * ``passed`` carries zero findings — every finding this slice emits is a condition under which
-      the run cannot be trusted, so a pass with findings is a contradiction;
-    * ``failed`` carries at least one — a verdict with no evidence behind it is not a verdict.
+    * ``passed`` carries no ``ERROR`` finding — every ``ERROR`` finding is a condition under which
+      the run cannot be trusted, so a pass listing one is two verdicts at once;
+    * ``failed`` carries at least one ``ERROR`` finding — a verdict with no evidence behind it is
+      not a verdict, and a report whose only observations are warnings has not failed.
+
+    **THE SECOND AND THIRD ARE STATED IN SEVERITIES SINCE SUCCESSOR 5 (2026-08-15), and the earlier
+    spelling — "``passed`` carries ZERO findings" — was the same rule under the assumption that
+    every finding is an ``ERROR``.** That assumption ended when a deployment gained the right to
+    DECLARE that its engine has no authorization model (:class:`ReadScopeDeclaration`): the
+    ``READ_SCOPE_UNVERIFIED`` warning L1 then files is not a condition under which the run cannot be
+    trusted — the operator accepted it in advance — but it must ride the run's own evidence forever,
+    and a passing report is the only record of what L1 checked. Migration 1034's physical CHECK is
+    unchanged and still satisfied: it constrains ``error`` alone, so no migration is required for a
+    passing report to carry a warning. ``failed`` gained the ``ERROR`` qualifier in the same breath,
+    because without it a report holding only warnings could be recorded as a failure and route an
+    accepted condition to somebody as a defect.
 
     ``run_id`` is ``None`` for L0, which validates the project before any run exists. It is never
     blank: absent and "present but empty" are different claims, and only one of them is true.
@@ -327,15 +390,19 @@ class ValidationReportV1:
                 f"a report with status 'error' carries {len(self.findings)} finding(s): a "
                 f"validation that could not run has not found nothing, it has found nothing OUT, "
                 f"and anything it listed would be an observation nobody made")
-        if self.status is ValidationStatus.PASSED and self.findings:
+        blocking = [f for f in self.findings if f.severity is FindingSeverity.ERROR]
+        if self.status is ValidationStatus.PASSED and blocking:
             raise ValueError(
-                f"a report with status 'passed' carries {len(self.findings)} finding(s): every L0 "
-                f"and L1 finding is a condition under which the run cannot be trusted, so a pass "
-                f"that lists one is two verdicts at once")
-        if self.status is ValidationStatus.FAILED and not self.findings:
+                f"a report with status 'passed' carries {len(blocking)} ERROR finding(s): an "
+                f"ERROR finding is a condition under which the run cannot be trusted, so a pass "
+                f"that lists one is two verdicts at once (a WARNING is permitted and is the one "
+                f"way an accepted, declared condition rides a passing report)")
+        if self.status is ValidationStatus.FAILED and not blocking:
             raise ValueError(
-                "a report with status 'failed' carries no findings: a failure with nothing to show "
-                "cannot be routed to anybody, which is the whole purpose of a classification")
+                f"a report with status 'failed' carries no ERROR findings ({len(self.findings)} "
+                f"finding(s) in total): a failure with nothing to show cannot be routed to "
+                f"anybody, which is the whole purpose of a classification, and a report whose only "
+                f"observations are warnings has not failed")
 
     def findings_payload(self) -> list[dict[str, Any]]:
         return [finding.payload() for finding in self.findings]
@@ -466,6 +533,30 @@ class MetastoreTableUnknown(Exception):
     'the metastore did not answer' are the same empty list"*). So the adapter raises this, and
     :func:`run_l1` reports it as the ``COLUMN_ABSENT`` "the table does not exist" finding it
     already files for a ``describe_table`` that answered ``None``.
+    """
+
+
+class MetastoreReadScopeUnanswerable(Exception):
+    """The endpoint has no authorization model, so *may these roles read it* has no answer here.
+
+    Deliberately not a ``bool``. ``True`` would be the unconfigured-allowlist-reads-as-everything
+    defect ``data_agent.connection`` refuses by name; ``False`` would be a denial nobody issued and
+    would fail every L1 in the deployment with a governed ``READ_DENIED`` about nothing.
+
+    **The third member of this module's typed-non-answer family**, beside
+    :class:`ClusterUnreachable` (*the environment could not be asked*) and
+    :class:`MetastoreTableUnknown` (*the environment says it is not there*), and it lives here for
+    their reason: :func:`run_l1` is what gives each of them a MEANING, and
+    ``metastore_sql`` — which raises this one — already imports the other two from here. It is
+    re-exported from ``metastore_sql`` under the same name, where it was defined until SUCCESSOR 5
+    (2026-08-15) moved it to break the import cycle a fold in ``run_l1`` would otherwise need.
+
+    **What L1 does with it depends on ONE thing and nothing else**: whether the deployment declared
+    :attr:`ReadScopeDeclaration.NO_AUTHORIZATION_MODEL`. Undeclared, it propagates and the run fails
+    closed. Declared, and ONLY for this exception, L1 files a ``READ_SCOPE_UNVERIFIED`` warning and
+    carries on — every other metastore fault (unreachable, unknown table, refused answer, a driver
+    error nobody classified) is untouched by the declaration, because the declaration is a statement
+    about an authorization model and not a blanket permission to proceed on silence.
     """
 
 
@@ -1108,6 +1199,7 @@ def run_l1(
     run_id: str,
     report_id: str,
     clock: Callable[[], str],
+    read_scope: ReadScopeDeclaration = ReadScopeDeclaration.ENGINE_ANSWERS,
 ) -> ValidationReportV1:
     """L1 (§11.2): metastore METADATA only, over every IR, every expression and the spine.
 
@@ -1125,6 +1217,17 @@ def run_l1(
     :func:`~featuregen.materialize.runprep.prepare_run`'s reason: a report cannot be filed against
     one environment while the checks were run against another's declarations.
 
+    ``read_scope`` is the DEPLOYMENT's declaration about its engine's authorization model, and it
+    defaults to :attr:`ReadScopeDeclaration.ENGINE_ANSWERS` — the posture every caller had before
+    this parameter existed, under which an unanswerable read scope propagates and the run fails
+    closed. Under :attr:`ReadScopeDeclaration.NO_AUTHORIZATION_MODEL` the ONE outcome
+    :class:`MetastoreReadScopeUnanswerable` names is folded into a ``READ_SCOPE_UNVERIFIED``
+    WARNING and the table's other two questions are still asked: the endpoint could not answer
+    whether these roles may read it, and it answered everything else. Nothing else about the fold
+    is conditional — an unreachable metastore, an unknown table, a refused answer and an
+    unclassified driver error all behave identically under both declarations, because the operator
+    accepted an absent authorization model and not an absent answer.
+
     Returns:
         A report. ``status="error"`` with **zero** findings when the cluster could not be asked —
         including findings already collected, since a validation that could not complete reports
@@ -1132,12 +1235,16 @@ def run_l1(
 
     Raises:
         ValueError: ``irs`` is empty, the IRs disagree about the spine, or no snapshot names it.
-        Exception: anything the metastore adapter raises that is not :class:`ClusterUnreachable` or
-            :class:`MetastoreTableUnknown` — a defect in the adapter is not a verdict about the
-            cluster, and converting one into the other is how an invented verdict gets recorded.
-            The two that ARE handled are the two the seam gives a MEANING: the environment could not
-            be asked (``status="error"``, no findings) and the environment says the table is not
-            there (one ``COLUMN_ABSENT``, and none of its partitions then reported absent).
+        Exception: anything the metastore adapter raises that is not :class:`ClusterUnreachable`,
+            :class:`MetastoreTableUnknown` or — under a declaration and only then —
+            :class:`MetastoreReadScopeUnanswerable`. A defect in the adapter is not a verdict about
+            the cluster, and converting one into the other is how an invented verdict gets recorded.
+            The ones that ARE handled are the ones the seam gives a MEANING: the environment could
+            not be asked (``status="error"``, no findings), the environment says the table is not
+            there (one ``COLUMN_ABSENT``, and none of its partitions then reported absent), and the
+            environment has no authorization model while the deployment declared exactly that (one
+            ``READ_SCOPE_UNVERIFIED`` warning, and the table's other checks continue). Without the
+            declaration the third is not handled at all and this function raises it.
     """
     spine = _spine_of(irs)
     spine_table = _spine_table(snapshots)
@@ -1164,7 +1271,28 @@ def run_l1(
         unchecked: set[tuple[str, str]] = set()
         for (schema, table), columns in _read_set(irs, spine, spine_table).items():
             try:
-                if not metastore.can_read(schema=schema, table=table, roles=tuple(roles)):
+                # `denied` is what STOPS a table's remaining checks, and only an engine's own "no"
+                # sets it. An unanswered question never does: no role was refused anything, and
+                # recording a denial nobody issued is the lie `can_read` refuses to tell.
+                denied = False
+                try:
+                    denied = not metastore.can_read(schema=schema, table=table, roles=tuple(roles))
+                except MetastoreReadScopeUnanswerable:
+                    # The endpoint has no authorization model. UNDECLARED this re-raises and the
+                    # run fails closed, which is the whole of the behaviour before SUCCESSOR 5 and
+                    # is unchanged for every deployment that has not declared. DECLARED, the
+                    # operator has already accepted an unverified read scope for this deployment,
+                    # so the acceptance is RECORDED — never merely logged — and the table's other
+                    # two questions are asked, because the endpoint can answer those.
+                    if read_scope is not ReadScopeDeclaration.NO_AUTHORIZATION_MODEL:
+                        raise
+                    findings.append(ValidationFinding(
+                        code=ValidationFindingCode.READ_SCOPE_UNVERIFIED,
+                        location=f"{schema}.{table}",
+                        expected=f"an engine answer for {len(tuple(roles))} role(s)",
+                        observed="this deployment declares no authorization model",
+                        count=1, severity=FindingSeverity.WARNING))
+                if denied:
                     unchecked.add((schema, table))
                     findings.append(ValidationFinding(
                         code=ValidationFindingCode.READ_DENIED, location=f"{schema}.{table}",
@@ -1235,5 +1363,9 @@ def run_l1(
     except ClusterUnreachable:
         return report(ValidationStatus.ERROR, ())
 
-    return report(ValidationStatus.FAILED if findings else ValidationStatus.PASSED,
+    # The verdict is over the ERROR findings, not over the list's length: a report whose only
+    # observation is an accepted, declared absence has found nothing the run cannot be trusted
+    # under, and calling that a failure would refuse the very run the declaration exists to allow.
+    blocking = any(finding.severity is FindingSeverity.ERROR for finding in findings)
+    return report(ValidationStatus.FAILED if blocking else ValidationStatus.PASSED,
                   tuple(findings))

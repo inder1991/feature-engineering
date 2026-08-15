@@ -103,14 +103,20 @@ spec:
           # (`Dockerfile.backend` says so and explains why), which is why this pod DIALS the endpoint
           # and cannot be one.
           #
-          # THE REMAINING BLOCKER IS L1's THIRD QUESTION, and it is a property of the engine.
+          # L1's THIRD QUESTION IS A PROPERTY OF THE ENGINE, AND THE OPERATOR ANSWERS IT.
           # `can_read` asks `SHOW GRANT ROLE … ON TABLE …`; Spark's grammar rejects `SHOW GRANT` as
           # an unsupported Hive native command and never consults an authorization plugin, so the
           # adapter raises `MetastoreReadScopeUnanswerable` rather than guessing `True` or `False`.
-          # No configuration changes that. Until an engine with an authorization model is available,
-          # a run this pod drives reaches PREPARE_RUN and stops there — with the block unset it is
-          # recorded RUN_FAILED naming the seams that were not configured, which is an honest
-          # outcome rather than a crash and the one an operator should expect.
+          # No configuration changes THAT — the adapter still raises. What a deployment may do,
+          # since the user's decision of 2026-08-15, is DECLARE that this is the case:
+          # `FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL` (documented in full in
+          # `20-backend.yaml`, inherited here through the same `envFrom`, and NOT one of the eight)
+          # makes L1 accept that one unanswerable question and record a READ_SCOPE_UNVERIFIED
+          # warning per table on the run's own validation report. **A real deployment must never set
+          # it**; on kind it is what lets a run get past L1 at all. With it unset — the default — a
+          # run this pod drives against this endpoint still fails at L1, and with the whole block
+          # unset it is recorded RUN_FAILED at PREPARE_RUN naming the seams that were not
+          # configured, which is an honest outcome rather than a crash.
           #
           # `FEATUREGEN_MATERIALIZE_PROJECT_ROOT` IS ABOUT THIS POD'S DISK, not the backend's.
           # 20-backend.yaml documents it under the backend because that is where the whole block is

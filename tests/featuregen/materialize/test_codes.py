@@ -52,6 +52,9 @@ def test_finding_codes_are_exactly_the_spec_set():
         "PROJECT_DOES_NOT_BUILD", "PROJECT_HASH_MISMATCH", "PIPELINE_NOT_CONSTRUCTIBLE",
         "ENGINE_VERSION_MISMATCH",
         "COLUMN_ABSENT", "COLUMN_TYPE_MISMATCH", "PARTITION_ABSENT", "READ_DENIED",
+        # SUCCESSOR 5 (2026-08-15): L1's third question was not answered and the deployment had
+        # DECLARED that its engine cannot answer it. The only member ever emitted as a WARNING.
+        "READ_SCOPE_UNVERIFIED",
         "UNKNOWN_FINDING"}
 
 

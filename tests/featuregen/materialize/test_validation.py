@@ -58,7 +58,9 @@ from featuregen.materialize.validation import (
     FindingClass,
     FindingSeverity,
     MetastoreMetadata,
+    MetastoreReadScopeUnanswerable,
     MetastoreTableUnknown,
+    ReadScopeDeclaration,
     ValidationFinding,
     ValidationLevel,
     ValidationReportV1,
@@ -83,9 +85,10 @@ T1 = "2026-07-28T09:00:05+00:00"
 
 def _finding(code: ValidationFindingCode, *, location: str = "banking.transactions",
              expected: str | None = None, observed: str | None = None,
-             count: int = 1) -> ValidationFinding:
+             count: int = 1,
+             severity: FindingSeverity = FindingSeverity.ERROR) -> ValidationFinding:
     return ValidationFinding(code=code, location=location, expected=expected, observed=observed,
-                             count=count)
+                             count=count, severity=severity)
 
 
 def _report(status: ValidationStatus, findings: tuple[ValidationFinding, ...] = (), *,
@@ -303,6 +306,33 @@ def test_a_FAILED_report_with_no_findings_is_UNCONSTRUCTIBLE() -> None:
         _report(ValidationStatus.FAILED)
 
 
+def test_a_PASSED_report_MAY_carry_a_WARNING_and_that_is_the_only_thing_it_may_carry() -> None:
+    """SUCCESSOR 5's one relaxation, and its exact width.
+
+    A warning is an observation the reader must see beside a pass; an ERROR is a condition under
+    which the run cannot be trusted. The first is now constructible on a `passed` report and the
+    second is still not — the invariant moved from "how many findings" to "which severities",
+    which is what it always meant.
+    """
+    warned = _finding(ValidationFindingCode.READ_SCOPE_UNVERIFIED,
+                      severity=FindingSeverity.WARNING)
+    report = _report(ValidationStatus.PASSED, (warned,))
+    assert report.findings == (warned,)
+
+    with pytest.raises(ValueError, match="passed"):
+        _report(ValidationStatus.PASSED,
+                (warned, _finding(ValidationFindingCode.PARTITION_ABSENT)))
+
+
+def test_a_FAILED_report_whose_ONLY_findings_are_WARNINGS_is_UNCONSTRUCTIBLE() -> None:
+    """The other half of the same move. Without it, a report holding an accepted, declared
+    condition could be recorded as a failure and route that acceptance to somebody as a defect."""
+    with pytest.raises(ValueError, match="failed"):
+        _report(ValidationStatus.FAILED,
+                (_finding(ValidationFindingCode.READ_SCOPE_UNVERIFIED,
+                          severity=FindingSeverity.WARNING),))
+
+
 def test_the_report_fields_are_the_ones_section_11_names() -> None:
     assert [f.name for f in dataclasses.fields(ValidationReportV1)] == [
         "report_id", "generation_id", "run_id", "generated_project_hash", "group_plan_hash",
@@ -342,14 +372,42 @@ def test_severity_is_closed() -> None:
     assert {severity.value for severity in FindingSeverity} == {"error", "warning"}
 
 
-def test_every_L0_and_L1_finding_this_slice_can_emit_is_an_ERROR() -> None:
-    """``WARNING`` is L2's (§11.2, on demand), and this pins the claim rather than asserting it.
+def test_every_findings_DEFAULT_severity_is_ERROR() -> None:
+    """A finding nobody assigned a severity is a condition under which the run cannot be trusted.
 
-    Every L0/L1 code describes a condition under which the run cannot be trusted to produce correct
-    output, so a warning-severity one would be a finding the operator is invited to ignore.
+    Asserted against the DATACLASS's own default (no ``severity=`` argument reaches the
+    constructor), because that default is what a new emitter inherits by writing nothing.
     """
-    assert all(_finding(code).severity is FindingSeverity.ERROR
-               for code in ValidationFindingCode)
+    assert all(
+        ValidationFinding(code=code, location="banking.transactions", expected=None,
+                          observed=None, count=1).severity is FindingSeverity.ERROR
+        for code in ValidationFindingCode)
+
+
+def test_exactly_ONE_code_is_ever_emitted_as_a_WARNING_and_L1_is_the_only_emitter() -> None:
+    """``WARNING`` had no production emitter until SUCCESSOR 5, and it has exactly one now.
+
+    Read off the source rather than asserted as prose: a second ``FindingSeverity.WARNING`` in the
+    package — a softened error, an "informational" absence — is a red test, because the whole
+    weight of the severity is that a passing report may carry it.
+    """
+    source = inspect.getsource(validation)
+    emitted = [line.strip() for line in source.splitlines()
+               if "FindingSeverity.WARNING" in line and not line.strip().startswith("#")]
+    assert len(emitted) == 1, emitted
+    filed = ast.parse(source)
+    warning_calls = [
+        node for node in ast.walk(filed)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ValidationFinding"
+        # The literal `severity=FindingSeverity.WARNING`, not `_finding_from_payload`'s
+        # `severity=FindingSeverity(payload["severity"])`, which re-reads a stored one.
+        and any(keyword.arg == "severity" and isinstance(keyword.value, ast.Attribute)
+                and keyword.value.attr == FindingSeverity.WARNING.name
+                for keyword in node.keywords)]
+    assert len(warning_calls) == 1
+    (code_argument,) = [keyword.value for keyword in warning_calls[0].keywords
+                        if keyword.arg == "code"]
+    assert code_argument.attr == ValidationFindingCode.READ_SCOPE_UNVERIFIED.name
 
 
 # ── L0: parsing is not building ──────────────────────────────────────────────────────────────────
@@ -1100,11 +1158,15 @@ def _rendered() -> RenderedArtifactIdentity:
     return RenderedArtifactIdentity(compilation=_identity(), generated_project_hash=PROJECT_HASH)
 
 
-def _l1(prepared, *, irs, roles=ROLES, snapshots=None) -> ValidationReportV1:
+def _l1(prepared, *, irs, roles=ROLES, snapshots=None, read_scope=None) -> ValidationReportV1:
     resolved, environment = prepared
+    # `read_scope=None` means "pass nothing", which is the call every caller makes and is what
+    # keeps the default a real default rather than a value this helper supplies.
+    declaration = {} if read_scope is None else {"read_scope": read_scope}
     return run_l1(_rendered(), resolved if snapshots is None else snapshots, irs=irs,
                   inventory=INVENTORY, metastore=environment, roles=roles,
-                  generation_id=GEN, run_id=RUN, report_id="rep-l1", clock=_clock())
+                  generation_id=GEN, run_id=RUN, report_id="rep-l1", clock=_clock(),
+                  **declaration)
 
 
 def test_an_environment_that_agrees_with_the_catalog_PASSES_L1(prepared, compiled) -> None:
@@ -1312,6 +1374,171 @@ def test_L1_reports_the_hashes_the_RENDERED_identity_states(prepared, compiled) 
     report = _l1(prepared, irs=compiled)
     assert report.generated_project_hash == PROJECT_HASH
     assert report.group_plan_hash == PLAN_HASH
+
+
+# ── SUCCESSOR 5: the DECLARED read-scope posture (the user's decision, 2026-08-15) ───────────────
+#
+# `can_read` refuses to guess when the endpoint has no authorization model, which is structurally
+# true of the kind sandbox's Spark Thrift Server: it rejects `SHOW GRANT` by grammar. A deployment
+# may now DECLARE that this is so, and under that declaration — and nothing else — L1 accepts the
+# one unanswerable question and records the acceptance. The tests below hold both halves: the
+# declared path accepts exactly that outcome and nothing near it, and the undeclared path is
+# untouched.
+
+
+def _cannot_answer_read_scope(environment, error=None):
+    """Make ``can_read`` — and only ``can_read`` — unanswerable, as the real adapter does.
+
+    An instance attribute shadowing the method, the same device
+    ``test_two_casings_of_one_table_are_ONE_read_and_ONE_finding`` uses. ``_Environment.raising``
+    would make all THREE questions fail, which would prove nothing about a fold whose whole claim
+    is that the other two are still asked.
+    """
+    def unanswerable(*, schema: str, table: str, roles):
+        raise error if error is not None else MetastoreReadScopeUnanswerable(
+            f"the endpoint answered SHOW GRANT ... ON TABLE {schema}.{table} with "
+            f"'Operation not allowed: SHOW GRANT': it has no authorization model")
+    environment.can_read = unanswerable
+    return environment
+
+
+def test_an_unanswerable_read_scope_FAILS_CLOSED_when_nothing_was_declared(prepared, compiled):
+    """SUCCESSOR 2's posture, unchanged and asserted at the default rather than assumed.
+
+    No `read_scope=` argument at all — this is the call every caller made before the parameter
+    existed — and the exception must still leave `run_l1` rather than become a report.
+    """
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment)
+
+    with pytest.raises(MetastoreReadScopeUnanswerable):
+        _l1(prepared, irs=compiled)
+
+
+def test_the_STRICT_declaration_is_the_same_failure_as_saying_nothing(prepared, compiled) -> None:
+    """`ENGINE_ANSWERS` stated explicitly and `ENGINE_ANSWERS` by default are one posture."""
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment)
+
+    with pytest.raises(MetastoreReadScopeUnanswerable):
+        _l1(prepared, irs=compiled, read_scope=ReadScopeDeclaration.ENGINE_ANSWERS)
+
+
+def test_a_DECLARED_deployment_ACCEPTS_the_unanswerable_read_scope_and_L1_PASSES(
+        prepared, compiled) -> None:
+    """The decision, in one test: the run proceeds, and the acceptance is RECORDED.
+
+    A pass carrying findings is new (`ValidationReportV1` used to refuse it outright), and it is
+    the point: the report is the run's own evidence of what L1 checked, so the one question the
+    engine could not answer has to be legible there rather than in a log line nobody keeps.
+    """
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment)
+
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert report.status is ValidationStatus.PASSED
+    assert {f.code for f in report.findings} == {ValidationFindingCode.READ_SCOPE_UNVERIFIED}
+    assert all(f.severity is FindingSeverity.WARNING for f in report.findings)
+    assert all(f.observed == "this deployment declares no authorization model"
+               for f in report.findings)
+    # Per TABLE, like every other L1 read-set finding — the read set here is the two feature
+    # tables' one table plus the spine's, and a single summary finding would lose which.
+    assert {f.location for f in report.findings} == {"banking.transactions", "banking.customers"}
+    assert may_regenerate(report) is True, \
+        "an accepted, declared absence must not block regeneration: rebuilding changes nothing"
+
+
+def test_the_declaration_does_not_stop_L1_asking_the_other_two_questions(prepared, compiled):
+    """The endpoint could not answer read scope. It answered everything else, and L1 still asks.
+
+    A fold that treated the unanswerable question as "skip this table" would silently stop
+    checking columns, types and partitions for every table in the deployment — a much larger
+    acceptance than the one the operator made.
+    """
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment)
+    environment.drop_column("banking.transactions", "merchant_id")
+
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert report.status is ValidationStatus.FAILED, \
+        "the accepted read scope swallowed a real column absence"
+    absent = [f for f in report.findings if f.code is ValidationFindingCode.COLUMN_ABSENT]
+    assert [f.location for f in absent] == ["banking.transactions.merchant_id"]
+    assert any(f.code is ValidationFindingCode.READ_SCOPE_UNVERIFIED for f in report.findings)
+    assert "banking.transactions" in environment.described, \
+        "the table's columns were never described"
+
+
+def test_a_DENIAL_is_still_a_denial_under_the_declaration(prepared, compiled) -> None:
+    """The declaration covers "there is no authorization model", not "there is one and it said no".
+
+    An engine that ANSWERED `False` denied the read, and accepting that would be the platform
+    overriding a control that exists rather than one that does not.
+    """
+    _snapshots, environment = prepared
+    environment.deny("banking.transactions")
+
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert report.status is ValidationStatus.FAILED
+    assert {f.code for f in report.findings} == {ValidationFindingCode.READ_DENIED}
+    assert may_regenerate(report) is False
+
+
+def test_the_declaration_does_not_swallow_an_UNREACHABLE_metastore(prepared, compiled) -> None:
+    """A real deployment whose endpoint is down must not read as one that has no authorization
+    model. `ClusterUnreachable` keeps its own meaning: nothing was observed, so nothing is
+    reported and the run does not proceed on a passing report."""
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment, ClusterUnreachable("the metastore did not answer"))
+
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert (report.status, report.findings) == (ValidationStatus.ERROR, ())
+
+
+def test_the_declaration_does_not_swallow_an_UNKNOWN_table(prepared, compiled) -> None:
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(
+        environment, MetastoreTableUnknown("the engine says banking.transactions is not there"))
+
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert report.status is ValidationStatus.FAILED
+    assert {f.code for f in report.findings} == {ValidationFindingCode.COLUMN_ABSENT}
+
+
+@pytest.mark.parametrize("error", [
+    RuntimeError("the driver blew up in a way nobody classified"),
+    ValueError("the engine printed a partition this module cannot parse"),
+])
+def test_the_declaration_does_not_swallow_any_OTHER_metastore_fault(prepared, compiled, error):
+    """The declaration is about ONE outcome. Everything else propagates exactly as it did — a
+    defect in the adapter is not a verdict about the cluster, and a declaration that turned every
+    exception into a pass would be a global `except Exception` wearing a governance label."""
+    _snapshots, environment = prepared
+    _cannot_answer_read_scope(environment, error)
+
+    with pytest.raises(type(error)):
+        _l1(prepared, irs=compiled,
+            read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+
+def test_a_declared_deployment_whose_engine_ANSWERS_records_nothing(prepared, compiled) -> None:
+    """The declaration is not a stamp on every run: it changes what happens when the question
+    cannot be answered, and this engine answers. A report that carried the warning anyway would
+    make the two situations indistinguishable, which is the thing the warning exists to prevent."""
+    report = _l1(prepared, irs=compiled,
+                 read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL)
+
+    assert (report.status, report.findings) == (ValidationStatus.PASSED, ())
 
 
 def test_the_environment_given_to_L0_reaches_the_interpreter_that_imports_the_project(tmp_path):

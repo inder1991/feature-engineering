@@ -175,6 +175,7 @@ from featuregen.materialize.spine import SpineSourceDeclarationV1
 from featuregen.materialize.submit import PipelineSubmitter, SubmissionOutcome
 from featuregen.materialize.validation import (
     MetastoreMetadata,
+    ReadScopeDeclaration,
     ValidationLevel,
     ValidationReportV1,
     ValidationStatus,
@@ -339,6 +340,14 @@ class RunExecution:
     (``MaterializationJobV1.business_dt``) and reaches this object at the lane boundary.
     ``staging_base`` is the deployment's, exactly as ``project_root`` is — ``staging_root_for``
     derives the per-generation path under it so no caller can forget the scoping.
+
+    ``read_scope`` is the deployment's declaration about its engine's AUTHORIZATION MODEL, and it
+    is the one field here with a default — deliberately, and the opposite way round from the other
+    five. Those five are useless without each other, so ``None`` for any of them means no execution
+    at all; this one has a safe value that must be what a caller who says nothing gets, because
+    every existing construction of this object predates it and none of them accepted anything.
+    :attr:`~featuregen.materialize.validation.ReadScopeDeclaration.ENGINE_ANSWERS` is that value: L1
+    fails closed on an unanswerable read scope exactly as it did before the field existed.
     """
 
     metastore: MetastoreMetadata
@@ -346,6 +355,7 @@ class RunExecution:
     swap: PublicationSwap
     business_dt: str
     staging_base: str
+    read_scope: ReadScopeDeclaration = ReadScopeDeclaration.ENGINE_ANSWERS
 
     def __post_init__(self) -> None:
         if not isinstance(self.business_dt, str) or not self.business_dt.strip():
@@ -358,6 +368,12 @@ class RunExecution:
                 f"the staging base is blank ({self.staging_base!r}): §9's staging root is derived "
                 f"under it per generation, and a blank base would stage every generation of every "
                 f"group at one path")
+        if not isinstance(self.read_scope, ReadScopeDeclaration):
+            raise TypeError(
+                f"read_scope must be a ReadScopeDeclaration, got "
+                f"{type(self.read_scope).__name__}: a truthy string here would read as a "
+                f"declaration nobody made, and this is the field that decides whether an "
+                f"unverified read scope stops a run")
 
 
 @dataclass(frozen=True, slots=True)
@@ -930,7 +946,8 @@ def _execute_the_run(
     l1 = run_l1(
         project.identity, prepared.snapshots, irs=authorized.irs, inventory=inventory,
         metastore=execution.metastore, roles=roles, generation_id=generation_id, run_id=run_id,
-        report_id=_l1_report_id(request.request_id), clock=clock)
+        report_id=_l1_report_id(request.request_id), clock=clock,
+        read_scope=execution.read_scope)
     if l1.status is not ValidationStatus.PASSED:
         return _RunAttempt.failed_at(
             ChainStage.VALIDATE_L1, _l1_detail(l1), l1_report=l1,
