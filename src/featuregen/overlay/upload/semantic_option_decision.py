@@ -374,6 +374,49 @@ def _latest_confirmed_uoa(conn, intent_id: str) -> str | None:
     return row[0] if row is not None else None
 
 
+def _formula_schema_supported(recipe_id: str) -> bool:
+    """C2 — can the selected engine run this recipe's REVIEWED formula expectation?
+
+    The reviewed object production can resolve is the CAPTURE BLUEPRINT
+    (``recipe_formula_shadow.capture_blueprint_for`` — the same object a review event's hash
+    covers, chosen by the recipe's own declared schema version). Its expressions carry exactly
+    the engine-relevant demands; the pinned ``gold_v2`` fixture stays the TEST-side proof (it
+    lives under ``tests/`` and a deployed backend has no tests tree — the plan's "parse the
+    pinned fixture here" was not buildable). Every failure path — unreviewed, no bindable
+    blueprint, unknown engine, any error — is ``False``, the dataclass's fail-closed posture.
+    """
+    try:
+        from featuregen.formula.capability_v2 import classify_demands_for_engine
+        from featuregen.formula.schema_v2 import WindowBasisV2
+        from featuregen.materialize.engine_capability import engine_capability_for
+        from featuregen.overlay.upload.recipe_formula_contracts_v2 import (
+            RecipeFormulaExpectationBlueprintV2,
+        )
+        from featuregen.overlay.upload.recipe_formula_shadow import capture_blueprint_for
+
+        if not has_reviewed_formula_expectation(recipe_id):
+            return False
+        capture = capture_blueprint_for(recipe_id)
+        if capture is None:
+            return False
+        blueprint = capture.blueprint
+        if isinstance(blueprint, RecipeFormulaExpectationBlueprintV2):
+            demands = {expr.aggregation.value for expr in blueprint.expressions}
+            uses_offset = any(expr.window.offset_periods > 0
+                              for expr in blueprint.expressions)
+            uses_future = any(expr.window.basis is WindowBasisV2.FUTURE_HORIZON
+                              for expr in blueprint.expressions)
+        else:                                 # a reviewed v1 blueprint: v1 has neither fork
+            demands = {expr.aggregation.value for expr in blueprint.expressions}
+            uses_offset = False
+            uses_future = False
+        return classify_demands_for_engine(
+            demands, uses_window_offset=uses_offset, uses_future_horizon=uses_future,
+            engine=engine_capability_for("kedro-pyspark")) == "ok"
+    except Exception:                         # unresolvable → unsupported, fail closed
+        return False
+
+
 def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                                       snapshot_id: str | None,
                                       intent_id: str | None = None):
@@ -477,7 +520,13 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         # every recipe today, schema unsupported, execution authority unevaluated).
         effective_readiness=frozen.readiness,
         formula_expectation_revision=frozen.formula_expectation_revision,
-        formula_schema_supported=False,
+        # C2 — a real read: the reviewed expectation's demands against the selected engine's
+        # advertisement. Only a recipe has a reviewed expectation to ask about; every other
+        # source keeps the fail-closed default.
+        formula_schema_supported=(
+            _formula_schema_supported(frozen.source_definition_id)
+            if frozen.generation_source == "recipe" and frozen.source_definition_id
+            else False),
         requirements_closed=False,
         execution_authority_evaluated=execution_evaluated,
         execution_floor_met=execution_now,

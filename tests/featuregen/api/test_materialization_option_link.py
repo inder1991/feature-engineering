@@ -52,13 +52,17 @@ MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REV
                         R.EXECUTION_AUTHORITY_UNEVALUATED, R.EXECUTION_AUTHORITY_UNMET}
 
 #: What a BOUND option with a frozen plan actually blocks on today, MEASURED rather than assumed:
-#: readiness is not `MATERIALIZATION_READY` (C3), the engine advertises no formula capability (C1/
-#: C2), and the execution floor is evaluated — the frozen plan gives it a read set — but not met,
-#: because the fixture's refs resolve to no governed authority. `EXECUTION_AUTHORITY_UNEVALUATED`
-#: is its *if* arm and therefore absent here, and `EXTERNAL_VALIDATION_OUTSTANDING` short-circuits
-#: on the `DESIGN_CHECKED` idea — the same exact-intersection reasoning A5's acceptance row records.
-BLOCKING_TODAY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_SCHEMA_UNSUPPORTED,
-                  R.EXECUTION_AUTHORITY_UNMET}
+#: readiness is not `MATERIALIZATION_READY` (C3), and the execution floor is evaluated — the
+#: frozen plan gives it a read set — but not met, because the fixture's refs resolve to no
+#: governed authority. `EXECUTION_AUTHORITY_UNEVALUATED` is its *if* arm and therefore absent
+#: here, and `EXTERNAL_VALIDATION_OUTSTANDING` short-circuits on the `DESIGN_CHECKED` idea — the
+#: same exact-intersection reasoning A5's acceptance row records. `FORMULA_SCHEMA_UNSUPPORTED`
+#: fell at C2 for THIS (reviewed) exemplar: the engine registry advertises its one demand.
+BLOCKING_TODAY = {R.READINESS_NOT_MATERIALIZATION_READY, R.EXECUTION_AUTHORITY_UNMET}
+#: An unreviewed recipe carries two MORE codes, coupled by design: no review means no reviewed
+#: demands for C2 to compare, so `FORMULA_SCHEMA_UNSUPPORTED` stays exactly as long as
+#: `FORMULA_NOT_REVIEWED` does.
+UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_SCHEMA_UNSUPPORTED}
 
 
 @pytest.fixture(autouse=True)
@@ -141,11 +145,12 @@ def test_a_blocked_option_cannot_be_materialized(client, admin_headers, db, work
     assert db.execute("SELECT count(*) FROM materialization_request").fetchone()[0] == 0
 
 
-def test_the_unreviewed_option_carries_one_MORE_code_than_the_reviewed_one(
+def test_the_unreviewed_option_carries_the_two_coupled_extra_codes(
         client, admin_headers, db, work_items):
     """The discriminator, and the proof this suite measures the registry rather than the fixture.
     ``posted_debit_amount`` has a reviewed v2 expectation (A5) and ``balance_slope`` does not; the
-    two rows are otherwise identical, and exactly one code differs."""
+    two rows are otherwise identical. Since C2 the registry difference moves TWO coupled codes:
+    review itself, and the schema-support question that only a reviewed expectation can answer."""
     reviewed = _freeze_option(db, REVIEWED, key="disc-a")
     unreviewed = _freeze_option(db, UNREVIEWED, key="disc-b")
 
@@ -156,7 +161,7 @@ def test_the_unreviewed_option_carries_one_MORE_code_than_the_reviewed_one(
         return {b["code"] for b in response.json()["detail"]["blockers"]}
 
     assert _codes(reviewed) & MATERIALIZATION_ONLY == BLOCKING_TODAY
-    assert _codes(unreviewed) & MATERIALIZATION_ONLY == BLOCKING_TODAY | {R.FORMULA_NOT_REVIEWED}
+    assert _codes(unreviewed) & MATERIALIZATION_ONLY == BLOCKING_TODAY | UNREVIEWED_EXTRA
 
 
 def test_an_allowed_option_mints_a_request_carrying_its_provenance(

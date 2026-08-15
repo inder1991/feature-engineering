@@ -42,6 +42,33 @@ class EngineCapabilityV1:
     supports_future_horizon: bool = False
 
 
+def classify_demands_for_engine(
+    aggregations: frozenset[str] | set[str],
+    *,
+    uses_window_offset: bool,
+    uses_future_horizon: bool,
+    engine: EngineCapabilityV1 | None,
+) -> CapabilityVerdictV2:
+    """The engine arm over a formula's DEMANDS, stated once for its two carriers (C2).
+
+    A proposal (authoring output) and a reviewed expectation blueprint (activation input) make
+    the same three claims on an engine — which aggregates, whether windows shift, whether a
+    horizon points forward — and this is the one place those claims are compared to an
+    advertisement. ``engine=None`` here means the caller NAMED an engine nothing advertises:
+    ``unsupported_engine``, fail closed. (A caller with no engine selected at all skips the arm —
+    that is :func:`classify_formula_capability_v2`'s ``engine=None``, a different question.)
+    """
+    if engine is None:
+        return "unsupported_engine"
+    if not set(aggregations) <= engine.supported_aggregations:
+        return "unsupported_engine"
+    if uses_window_offset and not engine.supports_window_offset:
+        return "unsupported_engine"
+    if uses_future_horizon and not engine.supports_future_horizon:
+        return "unsupported_engine"
+    return "ok"
+
+
 def classify_formula_capability_v2(
     proposal: TypedFormulaProposalV2,
     engine: EngineCapabilityV1 | None = None,
@@ -60,14 +87,11 @@ def classify_formula_capability_v2(
     if not used <= {member.value for member in AggregateFunctionV2}:
         return "unsupported_capability"
     if engine is not None:
-        if not used <= engine.supported_aggregations:
-            return "unsupported_engine"
-        uses_offset = any(expr.window.offset_periods > 0
-                          for expr in body_expressions_v2(proposal.body))
-        if uses_offset and not engine.supports_window_offset:
-            return "unsupported_engine"
-        uses_future = any(expr.window.basis.value == "future_horizon"
-                          for expr in body_expressions_v2(proposal.body))
-        if uses_future and not engine.supports_future_horizon:
-            return "unsupported_engine"
+        return classify_demands_for_engine(
+            used,
+            uses_window_offset=any(expr.window.offset_periods > 0
+                                   for expr in body_expressions_v2(proposal.body)),
+            uses_future_horizon=any(expr.window.basis.value == "future_horizon"
+                                    for expr in body_expressions_v2(proposal.body)),
+            engine=engine)
     return "ok"

@@ -63,11 +63,17 @@ _GOLD_V2 = Path(__file__).resolve().parents[2] / "formula" / "gold_v2"
 MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REVIEWED,
                         R.FORMULA_SCHEMA_UNSUPPORTED, R.EXTERNAL_VALIDATION_OUTSTANDING,
                         R.EXECUTION_AUTHORITY_UNEVALUATED, R.EXECUTION_AUTHORITY_UNMET}
-#: §0.3's other three codes, still blocking after A5. ``EXTERNAL_VALIDATION_OUTSTANDING`` is
-#: absent from both rows because this fixture's idea is ``DESIGN_CHECKED`` (its rule short-
+#: What still blocks the reviewed exemplar after A5 **and C2**. ``EXTERNAL_VALIDATION_OUTSTANDING``
+#: is absent from both rows because this fixture's idea is ``DESIGN_CHECKED`` (its rule short-
 #: circuits on that); ``EXECUTION_AUTHORITY_UNMET`` is the *elif* arm of the code that does fire.
-STILL_BLOCKING = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_SCHEMA_UNSUPPORTED,
-                  R.EXECUTION_AUTHORITY_UNEVALUATED}
+#: ``FORMULA_SCHEMA_UNSUPPORTED`` fell at C2: the engine registry advertises the exemplar's one
+#: demand (``sum``, no offset, no horizon), so the second of §0.3's four codes is gone — for the
+#: REVIEWED row only.
+STILL_BLOCKING = {R.READINESS_NOT_MATERIALIZATION_READY, R.EXECUTION_AUTHORITY_UNEVALUATED}
+#: The unreviewed discriminator carries TWO more codes, coupled by design: an unreviewed recipe
+#: has no reviewed demands for C2 to compare, so ``FORMULA_SCHEMA_UNSUPPORTED`` stays exactly as
+#: long as ``FORMULA_NOT_REVIEWED`` does. Review is the gate that opens the capability question.
+UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_SCHEMA_UNSUPPORTED}
 
 
 def _candidate(recipe_id: str) -> V2RecipeCandidateV1:
@@ -123,7 +129,7 @@ def test_a_recipe_with_no_registered_expectation_still_carries_FORMULA_NOT_REVIE
     still there, so the test above is measuring the registry and not the fixture."""
     codes, reviewed = _blocker_codes(conn, UNREVIEWED)
     assert reviewed is False
-    assert codes & MATERIALIZATION_ONLY == STILL_BLOCKING | {R.FORMULA_NOT_REVIEWED}
+    assert codes & MATERIALIZATION_ONLY == STILL_BLOCKING | UNREVIEWED_EXTRA
 
 
 def test_the_v2_registry_pins_reviewed_fixtures():

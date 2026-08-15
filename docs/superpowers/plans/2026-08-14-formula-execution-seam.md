@@ -1562,6 +1562,48 @@ returns `False` — the dataclass's existing fail-closed posture, unchanged.
   survives. **The refusal must remain reachable**; a capability seam that can only say yes is not one.
 - `test_an_unparseable_pinned_fixture_fails_closed`
 
+> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline (same subagent-outage context as C1).
+>
+> **THE PLAN'S MECHANISM WAS NOT BUILDABLE, and the correction is recorded here rather than
+> silently substituted.** §C2 says: parse the recipe's pinned `gold_v2` proposal via
+> `parse_versioned` at activation time. The pinned fixture lives under
+> `tests/featuregen/formula/gold_v2/` — a deployed backend HAS no tests tree, so production can
+> never parse it. What production CAN resolve is the CAPTURE BLUEPRINT
+> (`recipe_formula_shadow.capture_blueprint_for` — the exact object a review event's hash covers
+> since A5, chosen by the recipe's own declared schema version), and its expressions carry
+> precisely the engine-relevant demands: aggregations, `window.offset_periods`, `window.basis`.
+> The fixture parse remains the TEST-side proof it already was (the pin test parses under
+> `parse_versioned` and hash-compares). `_formula_schema_supported(recipe_id)`:
+> reviewed → capture → demands → `classify_demands_for_engine(...,
+> engine=engine_capability_for("kedro-pyspark")) == "ok"`; every failure path (unreviewed, no
+> bindable blueprint, unknown engine, any raise) is `False` — the dataclass posture, unchanged.
+>
+> **One engine arm, two carriers.** `classify_demands_for_engine` is factored out of
+> `classify_formula_capability_v2`'s engine arm (the proposal path delegates to it, behavior
+> identical); the blueprint path asks the same three questions of the same advertisement. A
+> reviewed **v1** blueprint answers through the SAME resolver — `merchant_mcc_diversity`'s
+> `count_distinct` is advertised and v1 windows have neither fork, so the platform's one
+> executable formula generation honestly reads as supported (D-7's grain disagreement is a
+> different question and stays open).
+>
+> **The exact-intersection tests moved, and the movement is the evidence.**
+> `FORMULA_SCHEMA_UNSUPPORTED` fell for the reviewed exemplar — the second of §0.3's four codes
+> to fall, exactly as the phase ordering predicted. The unreviewed discriminator now carries TWO
+> coupled extra codes (`FORMULA_NOT_REVIEWED` + `FORMULA_SCHEMA_UNSUPPORTED`): an unreviewed
+> recipe has no reviewed demands to compare, so review is the gate that opens the capability
+> question. A5's and B4's intersections restated accordingly; `BLOCKING_TODAY` for the bound
+> exemplar is now `{READINESS_NOT_MATERIALIZATION_READY, EXECUTION_AUTHORITY_UNMET}`.
+>
+> **The refusal stays reachable through the REAL seam:** the exemplar's own derived blueprint
+> with one window shifted back a period (`offset_periods=1`) folds `formula_schema_supported`
+> back to False. Mutant proof: rewiring the assembler to the old hardwired `False` fails the two
+> real-row intersection tests; restored green.
+>
+> 6 cases in `tests/featuregen/overlay/upload/test_engine_capability_activation.py`.
+> Gates: full suite **11141 passed, 20 skipped** (11136/20 after C1); `-m eval` **73 passed**; ruff clean on the five touched
+> files; `capability_v2.py` mypy clean; `semantic_option_decision.py` carries **1 pre-existing**
+> mypy error (`:443` union-attr, measured identical on the HEAD copy by swap) — none added.
+
 ### Task C3 — effective readiness and requirements are folded, not asserted (1 day)
 
 **Modify:** `assemble_current_activation_state` — `effective_readiness` becomes a **re-fold** at the
