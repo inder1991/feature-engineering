@@ -2012,7 +2012,7 @@ choice here.
 UI law (`ui-honest-absence-never-fabricate`) asserted on the empty state;
 `test_a_request_that_was_never_accepted_is_legible`.
 
-> **ACCEPTED `PENDING-D4` (2026-08-15).** The greenfield claim is re-verified: `grep -rn
+> **ACCEPTED `5bb19265` (2026-08-15).** The greenfield claim is re-verified: `grep -rn
 > 'materialization' frontend/src/` found two unrelated string literals and no screen, no `api.ts`
 > function and no type. So this is new UI.
 >
