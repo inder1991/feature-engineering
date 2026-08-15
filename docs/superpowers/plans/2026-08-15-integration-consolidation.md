@@ -164,6 +164,49 @@ lifecycle still permits publication with a failed one.
 APIs the UI needs, named: create build request · get request + attempts · retry · cancel ·
 confirm/split a proposed group · get output profile.
 
+### R4-8 — the as-of snapshot window shape · **the single largest coverage unlock**
+
+**Measured:** of 317 recipes, **90 can derive a formula blueprint automatically today**. The largest
+single refusal is `WINDOW_NOT_EVENT_ANCHORED` at **102 recipes** — one third of the registry, blocked
+by one missing window shape.
+
+**What those 102 actually declare** (probed on `balance_slope`, representative of the group):
+
+```
+anchor_kind             = 'as_of'          ← the blocker
+event_time_role         = ''               ← empty: there is no event to anchor to
+business_effective_role = 'as_of_date'
+window_basis            = 'trailing', unit 'days'
+snapshot_policy         = "latest-known end-of-day snapshot at or before each day's cutoff"
+```
+
+The grammar offers exactly three bases — `trailing`, `calendar_period`, `future_horizon` — and **all
+three anchor on an event time**. These recipes are not asking "which events fell inside a window".
+They are asking **"what was the state on each of the last N days, taking the latest snapshot known at
+or before each day's cutoff"**. That is a different read, not a different parameter.
+
+**Two halves, and the second is smaller than it looks:**
+
+1. **Grammar + derivation.** A fourth basis (an as-of series) on `WindowPolicyV2`, carrying the
+   snapshot policy the recipes already state in prose, plus the derivation arm that maps
+   `anchor_kind='as_of'` onto it. Recipes whose snapshot policy is absent or ambiguous keep refusing
+   **by name** — this widens the grammar, it does not guess a temporal meaning.
+2. **Rendering.** The renderer already knows as-of snapshot selection: `LatestAvailableAsOf`,
+   `PartitionMappedSnapshot` and `CurrentSnapshot` exist and are rendered for the **spine**. What does
+   not exist is expressing it as an **operand window**. This is extending a proven read pattern to a
+   second position, not inventing one.
+
+**Why it is NOT before the vertical slice.** Unlocking 102 blueprints before one feature has ever
+executed would repeat the error revision 3 made: widening ahead of proof. A derived blueprint that
+cannot run is not progress. **This is the first thing after S4/R4-7, and it is worth more than
+anything else on the widening list.**
+
+**Acceptance:** the 102 drop to a named residue, and the count is reported — not asserted; a recipe
+with an absent or ambiguous snapshot policy still refuses by name; the rendered as-of series is
+**executed** through `fake_spark` and produces the expected per-day values (the C1 discipline: an
+operation may not be advertised until it has run); the engine capability advertisement moves only if
+the renderer genuinely emits it.
+
 ### Then
 One-hop governed joins (directional cardinality, duplicate and null join keys, SCD2 overlap refusal,
 PIT dimension selection, population preservation, fan-out allocation, row-count inflation validation)
@@ -185,7 +228,9 @@ invokes a retired endpoint**. A route-existence check alone passes while the UI 
 ## 3. Sequencing
 
 ```
-R4-0 ⟨decides the pilot⟩ ─► R4-1 ─► R4-2 ─► R4-3 ─► R4-4 ─► R4-5 ─► R4-6 ─► R4-7 ─► widen
+R4-0 ⟨decides the pilot⟩ ─► R4-1 ─► R4-2 ─► R4-3 ─► R4-4 ─► R4-5 ─► R4-6 ─► R4-7
+                                                                        │
+                                            R4-8 ⟨as-of window: 90 → ~192 derivable⟩ ◄─┘ then widen
         │
         └─ parallel: recognition correctness · leakage wording · retired-control removal · ruff
 ```
