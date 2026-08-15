@@ -326,6 +326,13 @@ def recognize_with_audit(
     try:
         audited = drive_audited_structured_call(
             conn, client, task=RECOGNIZER_TASK, prompt_id=PROMPT_ID,
+            # Repair seam, Task 6: the PROMPT version is threaded too, for the same reason Task 1
+            # had to thread the schema version — the seam defaults it to 1, so every recognition
+            # audit row claimed prompt v1 while `PROMPT_VERSION` has been "3" since feedback
+            # recognition landed. That was not a cosmetic lie: the release evaluator stamps
+            # `int(PROMPT_VERSION)` on its run and then compares it to `llm_call.prompt_version`,
+            # so the 100-case gate failed closed on its FIRST attempt, against every model.
+            prompt_version=int(PROMPT_VERSION),
             schema_id=_OUTPUT_SCHEMA_ID, schema_version=_OUTPUT_SCHEMA_VERSION,
             catalog_metadata={}, instruction=instruction, actor=actor,
             dispatch_audit=dispatch_audit,

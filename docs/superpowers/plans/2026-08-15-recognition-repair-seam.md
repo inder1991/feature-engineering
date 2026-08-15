@@ -50,7 +50,7 @@ served **917 unscoped candidates** (306 of 317 recipes).
 |---|---|---|
 | B1 | **Task 3 was unbuildable.** After repair exhaustion the wrapper returns `output=None` on BOTH the discard and failed paths, so the recognizer has no body left to partition. Modifying `recognition.py` alone cannot work | **[R5 — line numbers corrected]** at Task 2's start `enrich_llm.py:2170` (audit-degraded discard), `:2177` (STATUS_FAILED); `recognizer.py:172-184` |
 | B2 | **Re-running the same objective returns a NEW http result over an OLD stored row.** Persistence is unique on `(intent_id, input_hash)`, and `input_hash` covers only redacted user input + redaction policy — not prompt, schema, taxonomy, validator or model. The endpoint calls the provider again, then `ON CONFLICT DO NOTHING` returns the OLD recognition id. After this fix ships, resubmitting the incident could display "Churn" while the returned id still points at the `technical_failure` row | `contract.py:1173-1202`, `scope_records.py:94-117,145-172,490-545` |
-| B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` — **[R6]** confirmed live as of Task 4: a partial recovery IS scored `technical_failure`. Conservative (the gate under-reports, never falsely green) and integrity-clean, but it now measures a platform that no longer exists |
+| B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` — **[R6]** confirmed live as of Task 4: a partial recovery IS scored `technical_failure`. Conservative (the gate under-reports, never falsely green) and integrity-clean, but it now measures a platform that no longer exists. **[R7 — understated]** It would not have certified anything: the gate could not COMPLETE. Three independent blockers, all fixed in Task 6 — `main` asked for an LLM client nothing in that process registers; the run stamped prompt v3 while every recognition `llm_call` recorded prompt v1 (the dispatch never threaded it — Task 1's [R4] defect, left behind in the same call); and the v1 pin above. The second and third both trip the evaluator's own frozen-contract check on the FIRST attempt, after paying for it |
 | B4 | **Revision 1 created schema v2 and never activated it.** `_OUTPUT_SCHEMA_VERSION = 1` is hardcoded; `register_enrichment_schemas()` uses a MUTABLE `register_schema` that overwrites an existing version, so a dynamically-derived enum could mean different things on different deployments | `recognizer.py:55`, `enrich_llm.py:1902-1918`, `documents/registry.py:29-49` |
 | B4b | **[R4 — found in Task 1]** B4 understates it: activation is not the constant at all. The recognizer's dispatch does not pass `schema_version=`, and the seam defaults it to `1` — so a constant-only bump makes the request identity, and only the request identity, claim v2 | `recognizer.py:232-238`, `enrich_llm.py:2019-2029` |
 
@@ -691,9 +691,130 @@ not absence.
 ### Task 6 — evaluation and rollout (2 days)
 
 **[R2]** Version the evaluator with the contract; evaluate the **exact served, normalized result**
-linked by `llm_call_ref`, retaining raw output separately for audit. Re-run the 100-case real-provider
+linked by `llm_call_ref`, retaining raw output separately for audit. Run the 100-case real-provider
 gate, applicability recall, false-narrowing, stability and cost gates, plus repair-rate — and replay
 the live incident.
+
+**[R7 — corrected]** The word was *"Re-run"*. There is nothing to re-run: the gate has never been
+runnable under the current code, and the engineering half of this task is mostly the three separate
+reasons why — see the acceptance below. The operator half (actually spending ~110-330 provider calls)
+is unstarted and needs explicit approval.
+
+> **TASK 6, ENGINEERING HALF (2026-08-15) — ACCEPTED `<pending>`.** The evaluator is
+> `recognition-release-evaluator-v2`: it scores the **served, normalized result** the platform handed
+> its caller, re-derives that result from the immutable `llm_call` row rather than trusting the
+> attempt, refuses a run recorded under a contract it was not written for, and reports two new
+> numbers (applicability recall, repair rate). **The 100-case real-provider gate was NOT run** — that
+> is live spend and needs the user's explicit approval, which has not been given.
+>
+> **[R7] THE GATE WAS UNRUNNABLE — three independent reasons, none of them in the plan.** B3 said the
+> evaluator would "certify a different contract". It is worse than that: under the current code the
+> command cannot complete at all.
+> 1. **`main` asks for a client nobody registers.** `current_llm_client()` fail-closes unless
+>    `register_llm_client(...)` ran, and only `featuregen worker` does that — so
+>    `python -m …recognition_release_eval run` died with *"no LLMClient registered"* before reaching
+>    the provider. Fixed: `_provider_client()` builds the adapter from the environment and fails
+>    closed with the env vars named, BEFORE the run row is written.
+> 2. **The run stamps `int(PROMPT_VERSION)` = 3; every recognition `llm_call` recorded prompt
+>    version 1.** `recognize_with_audit` never threaded `prompt_version=` and the seam defaults it to
+>    1 — the SAME defect Task 1 found for `schema_version` ([R4]), in the same call, left behind.
+>    `evaluate_persisted_run` compares those tuples, so the gate would have raised *"recognition
+>    attempt differs from the frozen provider contract"* on its FIRST attempt, after paying for it,
+>    against every model. Fixed at the source: the audit row now records the prompt version that was
+>    actually used.
+> 3. **The evaluator was pinned to schema v1 while the recognizer dispatched v2** (B3's own point) —
+>    the same comparison, the same first-attempt refusal.
+> `test_the_recorded_evidence_matches_the_frozen_provider_contract` is the "is it runnable?" proof
+> **without running it**: a FAKE_TEST run, then the evaluator's own contract comparison over every
+> attempt's real `llm_call` row. Mutant (un-thread `prompt_version`): it fails, naming both tuples.
+>
+> **B3 closed, and the acceptance met.** `_record_attempt` scores `AuditedRecognition` — the platform's
+> own disposition — instead of re-running the all-or-nothing validator over `raw_output`. A partial
+> recovery is therefore scored as one (`test_a_partial_recovery_is_scored_as_a_partial_recovery_not_a_
+> technical_failure`: `technical_failure=False`, `status=classified`, disposition
+> `partially_recovered`, one drop named). Mutant (restore the raw-output scoring): that test fails.
+> `raw_output` is untouched and stays exactly where it was — the audit of what the PROVIDER said, a
+> different question from what the USER got.
+>
+> **The re-derivation, and why it is not a fork.** `_project_served` recomputes the served result from
+> the audit row alone (final body + repair ledger) by calling the recognizer's OWN
+> `_partial_recovery` / `_result_from_output` — imported under their private names, deliberately.
+> A second implementation of "what would we have served?" is precisely the drift that produced B3.
+> Proved the only way that means anything:
+> `test_the_served_result_is_re_derivable_from_the_audit_row` runs the real recognizer over four
+> bodies (clean, partial recovery, two-primaries, the incident's invented id) and asserts the
+> re-derivation equals **what the platform actually served**, not a second opinion about it. Mutant
+> (drop the partition arm): the partial-recovery row fails.
+>
+> **A metric whose meaning was wrong, corrected.** `false_narrowing` was initialised `True` and only
+> cleared when the body validated — so every technical failure was ALSO counted as a false narrowing,
+> double-charging it and inflating the one-sided Wilson bound. A fail-open result narrows nothing
+> (`in_scope_recipes` returns every recipe), so it is not a narrowing; technical failure, abstention
+> and false narrowing are now three axes that count what they say. The gate is no weaker:
+> `technical == 0` is still required (`test_a_technical_failure_still_fails_the_run`).
+>
+> **Repair rate — measured, deliberately NOT gated.** `repair_rate`, `attempts_with_repair`,
+> `repair_turns_total`, `repaired`, `partially_recovered` and `dropped_candidates_total` are reported;
+> `passed` is unchanged. What repair rate is acceptable is an operator's judgement about cost and
+> model choice, and this plan has not made it — inventing a threshold here would be resolving a
+> governance decision by writing a constant. Counted from the LEDGER on `class == "repair"`, never
+> `provider_calls - 1`: a truncation retry is not a correction (`test_a_retry_is_not_counted_as_a_
+> repair`). **What the number will actually measure, given Task 4's [R6]:** since the frozen v2 enum,
+> the model's likely first-turn errors (an invented id, a non-leaf primary, an out-of-band band) are
+> malformed STRUCTURE — they still spend repair turns, so they DO land in the repair rate, but they
+> reach the seam as `schema_invalid` and expose no body, so `partially_recovered` stays near zero in
+> practice. A reader who expects the repair rate and the partial-recovery count to move together will
+> be wrong: the first measures how often the model's first answer was rejected, the second only the
+> narrow case of a blank evidence span (or a v3 schema, or replayed v1-era bodies).
+>
+> **`applicability_recall`** (expected-relevant recipes retained / total, over the 100 primary
+> observations only — the stability repeats would silently reweight whichever cases are repeated) is
+> reported and not gated either: `false_narrowings == 0` and `recall == 1.0` are the same statement
+> counted differently, and a second gate saying the same thing only looks like more evidence.
+>
+> **A judgement call, recorded rather than taken.** `evaluate_persisted_run` scores only a
+> REAL_PROVIDER run, so its body has never had a test — the same gap every existing metric already
+> had. The arithmetic was therefore SPLIT into `_score_report`, a pure function over already-verified
+> rows, and exercised against hand-built ones. What was **rejected**: moving the FAKE_TEST refusal to
+> the artifact-write boundary so the whole path could be tested. It would have made a `passed: True`
+> dict obtainable from fake evidence — and "a fake run can never produce a provider-qualified
+> artifact" is the rule that makes every number in the report mean anything. A successor who wants
+> end-to-end coverage should add a REAL_PROVIDER run against a recorded-cassette adapter, not relax
+> the boundary.
+>
+> **THE OPERATOR COMMAND (unrun), and what it costs.** Also in `--help`, where the person spending
+> the money is looking:
+> ```
+> FEATUREGEN_DSN=<dsn> FEATUREGEN_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=<key> \
+>   FEATUREGEN_LLM_MODEL=<model> \
+>   uv run python -m featuregen.overlay.upload.taxonomy.recognition_release_eval run \
+>     --stability-case-count 10 --repeat-count 1 --token-budget 2000000 --cost-budget 500
+> ```
+> Arithmetic, in PHYSICAL provider requests: logical recognitions = 100 corpus cases + (stability
+> cases × repeats) = **110** at the defaults. Each logical recognition costs `1 + repair turns
+> (budget 2) + retry turns (budget 2)`. So **floor 110** (every case right first time), **expected
+> 110 + 2 × repair-rate × 110**, **ceiling 330** if every case exhausts its repair budget — and 550
+> only if retries also fire on every case, which needs a provider fault rather than a model one. The
+> pre-repair-seam expectation was a flat 110, so the incident's own body going from 1 call to 3 is
+> the shape of the change: **this gate can now cost up to 3× what it used to.** `evaluate` re-scores
+> a stored run and costs nothing.
+>
+> **Recorded for a successor, not fixed here.** (a) The evaluator's report body is only reachable on
+> a REAL_PROVIDER run (above). (b) `recognition_eval_attempt` has no column for the disposition or
+> the repair count; both ride inside the `recognition_json` jsonb the evaluator owns, which needed no
+> migration — a successor wanting to query dispositions across runs will want columns. (c) The four
+> anchor objectives of `TARGET_GOLD` are still the 2026-08 pre-registered matrix; the incident's own
+> objective (`customer.relationship_attrition.churn`) is NOT in the release denominator, so the
+> incident is replayed as a FIXTURE case rather than a gold one — adding it would break the corpus
+> hash and the 25-per-objective invariant, which is a corpus decision, not an evaluator one.
+> (d) `gold_recognition`'s labels remain **authored, pending expert review** (its own warning); every
+> number this gate produces is only as trustworthy as they are.
+>
+> 16 new test cases (13 functions, one parametrized ×4) in
+> `tests/featuregen/overlay/upload/taxonomy/test_recognition_release_eval.py`. Gates: full suite
+> **11573 passed, 20 skipped** (+16 on Task 5's 11557/20 — exactly the cases added); `-m eval`
+> **73 passed**; ruff clean on every touched file; mypy clean on both touched src files. No migration.
+> **No provider call of any kind was made.**
 
 ## 2. Risks
 
