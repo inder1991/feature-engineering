@@ -260,10 +260,11 @@ def _clock():
 def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
          spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0, execution=None,
          **kwargs) -> CompiledGroup:
-    """``execution=None`` is the DEFAULT here for the same reason it is the deployed default: no
-    `MetastoreMetadata` implementation exists in `src/`, so an unprepared run is what a real
-    deployment produces. The G-2 tests hand it a fake; every other test is asserting about a chain
-    that terminates before G-2 is reachable at all."""
+    """``execution=None`` is the DEFAULT here for the same reason it is the deployed default: a
+    deployment that states no EXECUTION block produces an unprepared run, and that is still what
+    the kind cluster is. The G-2 tests hand it a fake (and `test_queue_lane` hands the LANE the real
+    adapters over a faked driver); every other test is asserting about a chain that terminates
+    before G-2 is reachable at all."""
     return compile_feature_group(
         db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
@@ -1370,10 +1371,11 @@ def test_a_submission_that_never_STARTED_is_not_reported_as_one_that_failed(
 
 def test_a_PROVEN_capability_without_an_execution_seam_is_an_UNPREPARED_run(
         catalog, monkeypatch, l0_passes, tmp_path) -> None:
-    """`execution=None` is the deployed posture — no `MetastoreMetadata` exists in `src/` — and it
-    is an OUTCOME, never a skipped stage: the run stops at `PREPARE_RUN` and says which four things
-    the deployment did not configure. It must NOT be reported as a publication refusal (publication
-    capability is PROVEN here) and it must not claim a publish either."""
+    """`execution=None` is the posture of any deployment that states no EXECUTION block — still the
+    kind cluster's, which has no SQL endpoint in front of its metastore — and it is an OUTCOME,
+    never a skipped stage: the run stops at `PREPARE_RUN` and says which four things the deployment
+    did not configure. It must NOT be reported as a publication refusal (publication capability is
+    PROVEN here) and it must not claim a publish either."""
     request_id = _request(catalog, request_id="req-unprepared")
     work_items = [_authored(catalog, monkeypatch, suffix="unprepared")]
     _attest_capability(catalog)

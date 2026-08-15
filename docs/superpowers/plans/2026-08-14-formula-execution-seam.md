@@ -2817,6 +2817,65 @@ so at the place an operator would otherwise set the variables.
 > clean on both touched source modules. Mutant proof: (a) drop-then-create → 4 failed; (b) trust
 > the write, no read-back → 3 failed.
 
+> **SUCCESSOR 2 (2026-08-15) — INCREMENT 3: `lane_config_from_env` BUILDS BOTH, AND WHERE THE
+> BOUNDARY NOW SITS. ACCEPTED `<hash3>`.** The lane gained an EXECUTION block — eight variables,
+> **all of them or none** — from which it builds `SqlMetastoreAdapter` and `SqlPublicationSwap`
+> over ONE `MetastoreSession`, plus the `LocalClusterSubmitter` and §9's staging base that
+> `RunExecution` needs beside them.
+>
+> `FEATUREGEN_MATERIALIZE_METASTORE_ENGINE` · `_METASTORE_HOST` · `_METASTORE_PORT` ·
+> `_METASTORE_AUTH` · `_METASTORE_PRINCIPAL` · `_STAGING_BASE` · `_SUBMIT_PYTHON` ·
+> `_SUBMIT_TIMEOUT_SECONDS`, all appended to `MATERIALIZATION_ENV_VARS` — so the existing CI test
+> that every lane variable is documented in **both** `.env.example` and
+> `deploy/kind/k8s/20-backend.yaml` now covers them, and drift fails CI rather than a deployment.
+>
+> **EIGHT VARIABLES AND NOT ONE DSN, deliberately.** `data_agent/connection.py` states the rule this
+> follows: *"A field that could hold a secret eventually holds one, and then it is in a log, a JSON
+> column, an error message or an LLM prompt."* A connection string has a password slot; none of
+> these eight can hold a credential.
+>
+> **UNSET IS STILL AN OUTCOME, AND HALF-SET IS NEITHER.** No variable set → all four seams stay
+> `None`, `execution_for` returns `None`, and the run is recorded `RUN_FAILED` at `PREPARE_RUN`
+> naming what was not configured — `l0=None`'s rule two stages later, unchanged. Some set → a
+> refusal naming **every** missing variable, because `RunExecution` would refuse the half anyway
+> ("ALL FIVE or `None`") and a deployment that stated a host and no staging base has not chosen a
+> posture. The business date stays the JOB's: a fully configured lane still yields `execution=None`
+> for a trigger that asked for a compilation and not a run.
+>
+> **WHERE THE BOUNDARY NOW SITS — the D-phase line moves, and only half of it.** *In the code* it
+> has moved all the way: `test_a_lane_with_the_REAL_adapters_carries_a_run_PAST_prepare_run` drives
+> the production lane over the production chain with the REAL adapters — the real
+> `SHOW PARTITIONS`/`SHOW TABLES`/`DESCRIBE`/`SHOW GRANT` statements, the real parsing, the real
+> single `CREATE OR REPLACE VIEW` and its read-back — with **only the DB-API driver faked** (and the
+> submitter, which is `l0_gate.py`'s job because submitting for real launches Spark). It reaches
+> `ChainStage.PUBLISH`, lifecycle `COMMITTED`, on one connection.
+>
+> *On the cluster it has not moved yet, and the reason is now a DIFFERENT one.* D1's sentence
+> — "no `MetastoreMetadata` implementation exists anywhere in `src/`" — is retired. What replaces
+> it: **the kind cluster has no SQL endpoint in front of its metastore.** `sandbox/40-spark.yaml`
+> deploys a `kubectl exec`-driven Spark pod with no Service and no thrift server (its metastore
+> client talks JDBC straight to `postgres:5432/metastore`), and `Dockerfile.backend` gives the
+> worker pyspark with **no JVM** on purpose, so the worker can neither dial an endpoint nor be one.
+> E2's remaining deployment work is therefore **two** things, not one: Task 0's inventory, and a
+> thrift endpoint (`start-thriftserver.sh` in the spark pod + a Service). A third is now stated as
+> well: **L1 cannot pass against an endpoint with no SQL-standard authorization**, because
+> `can_read` refuses to guess. Until all three are closed the eight variables stay unset and every
+> deployed run is honestly unprepared — which both deployment files now say, at the exact place an
+> operator would otherwise set them.
+>
+> **Six stale honesty claims corrected in the same commit**, each of which had become false the
+> moment increment 1 landed: `l0_gate.py`'s section header, `test_chain.py`'s `_run` docstring and
+> the UNPREPARED test's, `test_seam_walkthrough.py`'s `_config`, `test_queue_lane.py`'s `_config`,
+> and `docs/DEFERRED-WORK.md:488`'s "No implementation exists in `src/`" row. They now name the
+> posture (a deployment that states no execution block) rather than an absence that has been filled.
+>
+> 7 new cases in `test_queue_lane.py` (and 16 new parametrized rows in the deployment-file
+> documentation test, two per new variable). Gates: full suite **11340 passed, 20 skipped**
+> (11300/20 after increment 1; the same run gated increment 2, which was in the tree with it);
+> `-m eval` **73 passed**; ruff clean on all touched files; **no new mypy errors** — 469 in 124
+> files, identical to `799bcf98`'s, measured by archiving that commit's `src` and running the same
+> config against it, and none in any file this successor touched.
+
 ---
 
 ## 7. Sequencing and dependencies

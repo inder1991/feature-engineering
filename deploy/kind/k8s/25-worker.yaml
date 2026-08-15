@@ -86,6 +86,22 @@ spec:
           # `deployment/backend` and `deployment/worker` after the edit. A pod started before the
           # change keeps the old environment for its whole life.
           #
+          # THE EXECUTION BLOCK IS THIS POD'S TOO, and more so than the rest. The eight
+          # `FEATUREGEN_MATERIALIZE_METASTORE_*` / `_STAGING_BASE` / `_SUBMIT_*` settings (added by
+          # the formula-execution seam's SUCCESSOR 2) name a metastore endpoint THIS pod dials, an
+          # interpreter THIS pod launches, and a staging path THIS pod's submission writes under.
+          # They are documented in full in `20-backend.yaml` because that is where the ConfigMap
+          # lives; they are inherited here through the same `envFrom`, and the same rule applies —
+          # DO NOT mirror them into `env:` below.
+          #
+          # NOT SATISFIABLE ON THIS CLUSTER TODAY, and the block is unset for that reason rather
+          # than by oversight: there is no SQL endpoint in front of the sandbox metastore
+          # (`sandbox/40-spark.yaml` deploys a `kubectl exec`-driven pod with no Service and no
+          # thrift server), and this image has pyspark but NO JVM (`Dockerfile.backend` says so and
+          # explains why). With the block unset, every run this pod drives is recorded RUN_FAILED at
+          # PREPARE_RUN naming the four seams that were not configured — an honest outcome, not a
+          # crash, and the one an operator should expect until E2 stands a thrift endpoint up.
+          #
           # `FEATUREGEN_MATERIALIZE_PROJECT_ROOT` IS ABOUT THIS POD'S DISK, not the backend's.
           # 20-backend.yaml documents it under the backend because that is where the whole block is
           # written, but the sealed project trees are written HERE, by this container, and no volume

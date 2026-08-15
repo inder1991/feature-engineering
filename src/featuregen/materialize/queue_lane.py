@@ -104,7 +104,13 @@ from featuregen.materialize.contract import (
     ContractOverrides,
 )
 from featuregen.materialize.inventory import ClusterInventoryV1, load_inventory
+from featuregen.materialize.metastore_sql import (
+    MetastoreEndpoint,
+    MetastoreSession,
+    SqlMetastoreAdapter,
+)
 from featuregen.materialize.publish import PublicationSwap, PublishMechanism
+from featuregen.materialize.publish_sql import SqlPublicationSwap
 from featuregen.materialize.request_store import (
     MaterializationRequestV1,
     RequestLifecycle,
@@ -120,7 +126,7 @@ from featuregen.materialize.spine import (
     SnapshotPolicyKind,
     SpineSourceDeclarationV1,
 )
-from featuregen.materialize.submit import PipelineSubmitter
+from featuregen.materialize.submit import LocalClusterSubmitter, PipelineSubmitter
 from featuregen.materialize.validation import MetastoreMetadata
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.queue import (
@@ -208,6 +214,29 @@ _INVENTORY_ENV = "FEATUREGEN_MATERIALIZE_INVENTORY"
 _L0_PYTHON_ENV = "FEATUREGEN_MATERIALIZE_L0_PYTHON"
 _L0_TIMEOUT_ENV = "FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS"
 
+# ── G-2/G-3: the EXECUTION block, all of it or none of it ────────────────────────────────────────
+#
+# Five values reach the metastore endpoint and three describe the run's execution. They are eight
+# separate variables rather than one connection string on purpose, and the reason is
+# ``data_agent.connection``'s: *"A field that could hold a secret eventually holds one, and then it
+# is in a log, a JSON column, an error message or an LLM prompt."* A DSN has a password slot; these
+# do not. The credential, when the mechanism needs one, is resolved at the point of use.
+_METASTORE_ENGINE_ENV = "FEATUREGEN_MATERIALIZE_METASTORE_ENGINE"
+_METASTORE_HOST_ENV = "FEATUREGEN_MATERIALIZE_METASTORE_HOST"
+_METASTORE_PORT_ENV = "FEATUREGEN_MATERIALIZE_METASTORE_PORT"
+_METASTORE_AUTH_ENV = "FEATUREGEN_MATERIALIZE_METASTORE_AUTH"
+_METASTORE_PRINCIPAL_ENV = "FEATUREGEN_MATERIALIZE_METASTORE_PRINCIPAL"
+_STAGING_BASE_ENV = "FEATUREGEN_MATERIALIZE_STAGING_BASE"
+_SUBMIT_PYTHON_ENV = "FEATUREGEN_MATERIALIZE_SUBMIT_PYTHON"
+_SUBMIT_TIMEOUT_ENV = "FEATUREGEN_MATERIALIZE_SUBMIT_TIMEOUT_SECONDS"
+
+#: The execution block, in the order an operator reads them. ALL of them or NONE of them: a
+#: deployment that stated half of these has not chosen a posture, it has made a mistake, and
+#: ``RunExecution`` would refuse the half anyway (``execution_for``'s "ALL FIVE or ``None``").
+_EXECUTION_ENV_VARS = (
+    _METASTORE_ENGINE_ENV, _METASTORE_HOST_ENV, _METASTORE_PORT_ENV, _METASTORE_AUTH_ENV,
+    _METASTORE_PRINCIPAL_ENV, _STAGING_BASE_ENV, _SUBMIT_PYTHON_ENV, _SUBMIT_TIMEOUT_ENV)
+
 #: **THE KILL SWITCH.** One env gate for the whole of materialization, default OFF — see
 #: :func:`materialization_enabled`.
 MATERIALIZATION_FLAG = "FEATUREGEN_MATERIALIZE_ENABLED"
@@ -216,7 +245,8 @@ MATERIALIZATION_FLAG = "FEATUREGEN_MATERIALIZE_ENABLED"
 #: documented in ``.env.example`` and ``deploy/kind/k8s/20-backend.yaml``, so a sixth variable added
 #: here without telling the two files a deployer actually edits fails CI rather than a deployment.
 MATERIALIZATION_ENV_VARS = (
-    MATERIALIZATION_FLAG, _PROJECT_ROOT_ENV, _INVENTORY_ENV, _L0_PYTHON_ENV, _L0_TIMEOUT_ENV)
+    MATERIALIZATION_FLAG, _PROJECT_ROOT_ENV, _INVENTORY_ENV, _L0_PYTHON_ENV, _L0_TIMEOUT_ENV,
+    *_EXECUTION_ENV_VARS)
 
 #: Failures that are DETERMINISTIC: the same job, the same catalog and the same configuration would
 #: produce them again, so the request is failed and the message dead-lettered instead of retried
@@ -576,9 +606,13 @@ class MaterializationLaneConfig:
     :class:`~featuregen.materialize.compile.chain.RunExecution` at the chain, because a deployment
     supplies them one at a time while the chain must be handed either a complete seam or ``None``:
     :meth:`execution_for` is the ONE place that fold happens, so no caller can assemble a half one.
-    Neither adapter can come from the environment — they are objects, not strings — so every
-    deployment configured by :func:`lane_config_from_env` today has ``metastore=None`` and every run
-    it drives is honestly unprepared.
+
+    **SUCCESSOR 2 moved the boundary.** These four used to be unfillable from a deployment — the
+    adapters are objects, not strings, and no implementation of either seam existed — so
+    :func:`lane_config_from_env` produced ``metastore=None`` and every deployed run was honestly
+    unprepared. It now builds all four from the eight-variable EXECUTION block
+    (:func:`_execution_from_env`) when a deployment states it, and still produces ``None`` when it
+    does not: unset remains an outcome, and the run it drives is still recorded as unprepared.
     """
 
     inventory: ClusterInventoryV1
@@ -587,15 +621,15 @@ class MaterializationLaneConfig:
     assemble_nodes: NodeAssembler = _wired_assembler
     clock: Callable[[], str] = _utc_now_iso
     compile_budget_seconds: float = COMPILE_BUDGET_SECONDS
-    #: G-2's metastore seam — partitions, columns and read scope, metadata only. No implementation
-    #: exists in ``src/`` yet (``inventory.MetastoreInventoryAdapter`` answers capture's questions,
-    #: not L1's), so this is ``None`` in every deployment today.
+    #: G-2's metastore seam — partitions, columns and read scope, metadata only.
+    #: ``metastore_sql.SqlMetastoreAdapter`` is the implementation a configured deployment gets;
+    #: ``inventory.MetastoreInventoryAdapter`` is a different seam (capture's three questions).
     metastore: MetastoreMetadata | None = None
     #: G-2's submitter. ``LocalClusterSubmitter`` is the one implementation (``submit.py:169``).
     submitter: PipelineSubmitter | None = None
     #: G-3's publish seam: the metastore write and the reader-visible pointer switch, the one act
-    #: §10.3's probe proves. No implementation exists in ``src/`` — writing it is the same operator
-    #: precondition as the metastore adapter above.
+    #: §10.3's probe proves. ``publish_sql.SqlPublicationSwap`` is the implementation, and it shares
+    #: the metastore adapter's session — one transport, so the two cannot see two worlds.
     swap: PublicationSwap | None = None
     #: §9's staging root base, under which ``staging_root_for`` derives a per-generation path.
     staging_base: str | None = None
@@ -648,13 +682,67 @@ def lane_config_from_env() -> MaterializationLaneConfig:
             f"{_L0_TIMEOUT_ENV} is set and {_L0_PYTHON_ENV} is not: a bound on a build proof that "
             f"cannot be attempted is half a configuration, and the half that is missing is the one "
             f"that decides whether any run of this deployment is ever proven to build")
+    execution = _execution_from_env()
     return MaterializationLaneConfig(
         inventory=load_inventory(inventory_path),
         project_root=project_root,
         l0=None if not python_executable else L0Interpreter(
             python_executable=python_executable,
             timeout_seconds=_positive_float(timeout, _L0_TIMEOUT_ENV)),
+        **execution,
     )
+
+
+def _execution_from_env() -> dict[str, Any]:
+    """G-2/G-3's seams from the environment — all of them, or an honestly unconfigured deployment.
+
+    **Unset is an OUTCOME and not a missing setting**, which is ``l0=None``'s rule two stages later
+    (``RunExecution``: *"``execution=None`` is a POSTURE"*): the returned mapping is empty, every
+    seam stays ``None``, and every run this lane drives is recorded as honestly unprepared at
+    ``PREPARE_RUN``. Half-set is neither, so it raises and names the variables that are missing —
+    a deployment that stated a metastore host and no staging base has not chosen a posture.
+
+    The two adapters share ONE :class:`~featuregen.materialize.metastore_sql.MetastoreSession`.
+    That is the whole reason they are built here together rather than in two places: L1 asks the
+    environment which partitions exist and the swap then makes a generation visible in it, and two
+    sessions could answer from two worlds.
+    """
+    stated = {name: os.environ.get(name, "").strip() for name in _EXECUTION_ENV_VARS}
+    if not any(stated.values()):
+        return {}
+    missing = [name for name, value in stated.items() if not value]
+    if missing:
+        raise ValueError(
+            f"the materialization EXECUTION block is half configured: {', '.join(missing)} "
+            f"{'is' if len(missing) == 1 else 'are'} unset while "
+            f"{', '.join(name for name, value in stated.items() if value)} "
+            f"{'is' if len(missing) == len(stated) - 1 else 'are'} set. All eight or none: "
+            f"`RunExecution` refuses a half-configured seam, and a deployment that cannot execute "
+            f"a run says so by setting none of them — every run is then recorded as unprepared, "
+            f"which is an outcome rather than a failure")
+
+    session = MetastoreSession(MetastoreEndpoint(
+        engine=stated[_METASTORE_ENGINE_ENV],
+        host=stated[_METASTORE_HOST_ENV],
+        port=_whole_number(stated[_METASTORE_PORT_ENV], _METASTORE_PORT_ENV),
+        auth_mechanism=stated[_METASTORE_AUTH_ENV],
+        principal=stated[_METASTORE_PRINCIPAL_ENV]))
+    return {
+        "metastore": SqlMetastoreAdapter(session),
+        "swap": SqlPublicationSwap(session),
+        "submitter": LocalClusterSubmitter(
+            python_executable=stated[_SUBMIT_PYTHON_ENV],
+            timeout_seconds=_positive_float(stated[_SUBMIT_TIMEOUT_ENV], _SUBMIT_TIMEOUT_ENV)),
+        "staging_base": stated[_STAGING_BASE_ENV],
+    }
+
+
+def _whole_number(raw: str, variable: str) -> int:
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{variable} is {raw!r}, which is not a port number") from exc
 
 
 def _positive_float(raw: str, variable: str) -> float:

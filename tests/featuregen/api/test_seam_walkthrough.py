@@ -235,10 +235,10 @@ def _freeze_a_governed_option(conn, *, revision_id: str, generation_run_id: str,
 
 
 def _config(tmp_path, assembly) -> MaterializationLaneConfig:
-    """The DEPLOYMENT's half of the lane configuration. G-2's three seams are ``None`` because that
-    is what ``lane_config_from_env`` produces in every deployment: no ``MetastoreMetadata``
-    implementation exists in ``src/`` at all (D1's acceptance row), so a lane-driven run is honestly
-    unprepared after L0 — which is exactly §0.5's item-4/item-5 line, and E1's starting point."""
+    """The DEPLOYMENT's half of the lane configuration. G-2's seams are ``None`` because that is what
+    ``lane_config_from_env`` produces for a deployment that states no EXECUTION block — still the
+    kind cluster's posture, since nothing there serves SQL in front of the sandbox metastore — so a
+    lane-driven run is honestly unprepared after L0, which is exactly §0.5's item-4/item-5 line."""
     from tests.featuregen.materialize.test_chain import _L0, _clock
 
     return MaterializationLaneConfig(

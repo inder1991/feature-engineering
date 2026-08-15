@@ -199,6 +199,55 @@ data:
   #   READY at the sandbox/gate precedent of 900 — but note what it buys: the lease becomes 600 + 900
   #   = 1500s, and for that whole window one compile holds the single-threaded worker tick.
   # FEATUREGEN_MATERIALIZE_L0_TIMEOUT_SECONDS: "900"
+  #
+  # ── THE EXECUTION BLOCK (G-2/G-3): eight variables, ALL of them or NONE ─────────────────────────
+  # Everything above compiles, renders, seals and PROVES A BUILD. None of it executes a run. These
+  # eight are what `lane_config_from_env` turns into the metastore adapter, the publication swap,
+  # the submitter and §9's staging base; with none of them set, the lane produces `metastore=None`
+  # and every run is recorded RUN_FAILED at PREPARE_RUN, naming what the deployment did not
+  # configure. **That is an OUTCOME, not a fault**, and it is the correct posture for this cluster
+  # today — see NOT READY below. Setting SOME of them is neither posture: the lane refuses at the
+  # first claimed job and names the ones that are missing.
+  #
+  # WHY EIGHT VARIABLES AND NOT ONE DSN: a connection string has a password slot, and
+  # `data_agent/connection.py` states the rule this follows — "a field that could hold a secret
+  # eventually holds one, and then it is in a log, a JSON column, an error message or an LLM
+  # prompt". None of these eight can hold a credential.
+  #
+  #   which SQL dialect the endpoint speaks. Closed vocabulary; `hive` is the only member, and it
+  #   covers HiveServer2 and the Spark Thrift Server (both speak the same protocol).
+  # FEATUREGEN_MATERIALIZE_METASTORE_ENGINE: "hive"
+  #   host and port of that endpoint. **NOT READY on this cluster, and this is E2's real remaining
+  #   blocker beside the inventory: no such endpoint exists here.** `deploy/kind/sandbox/40-spark.yaml`
+  #   deploys a Spark pod driven by `kubectl exec` with NO Service and NO thrift server — its
+  #   metastore client talks JDBC straight to `postgres:5432/metastore`. The worker pod cannot use
+  #   that: reaching the metastore's BACKING DATABASE is not reaching the metastore, and the pointer
+  #   switch must be the ENGINE's own atomic operation (§10.3 attests what the cluster does). Nor can
+  #   the worker run Spark itself — `Dockerfile.backend` installs pyspark WITHOUT a JVM, deliberately.
+  #   So E2 needs a thrift endpoint in front of the sandbox metastore (start-thriftserver.sh in the
+  #   spark pod + a Service), and until there is one these stay unset and every run is unprepared.
+  # FEATUREGEN_MATERIALIZE_METASTORE_HOST: "spark-thrift"
+  # FEATUREGEN_MATERIALIZE_METASTORE_PORT: "10000"
+  #   how the client authenticates (NONE / LDAP / KERBEROS / CUSTOM …), passed to the driver
+  #   upper-cased, and the account the metadata reads AND THE SWAP run as. The principal is
+  #   evidence, not decoration: two metadata reads under two principals are not interchangeable.
+  # FEATUREGEN_MATERIALIZE_METASTORE_AUTH: "NONE"
+  # FEATUREGEN_MATERIALIZE_METASTORE_PRINCIPAL: "featuregen"
+  #   ALSO REQUIRED FOR L1 TO PASS: the endpoint must be able to answer *may these roles read this
+  #   table*, which it does through SQL-standard authorization (`SHOW GRANT ROLE … ON TABLE …`). An
+  #   endpoint with no authorization model raises rather than answering — neither `True` ("everything
+  #   is readable") nor `False` (a denial nobody issued) is a lie this platform will tell.
+  #   §9's staging root BASE. `staging_root_for` derives <base>/<generation_id> under it, and the
+  #   rendered project writes its immutable versioned output at <staging_root>/published/<table> —
+  #   which is exactly where the swap then points readers. Must be a path the SPARK side can write
+  #   and the metastore can read: on this cluster that is the shared `/warehouse` PVC.
+  # FEATUREGEN_MATERIALIZE_STAGING_BASE: "/warehouse/staging"
+  #   the interpreter that RUNS the artifact, and its bound in seconds. Distinct from L0_PYTHON on
+  #   purpose: L0 proves a project imports and builds its pipeline (no JVM needed), while this one
+  #   starts Spark. /opt/kedro-venv has pyspark and NO Java, so it can prove a build and cannot run
+  #   one — pointing this at it would fail every submission deep inside the launcher.
+  # FEATUREGEN_MATERIALIZE_SUBMIT_PYTHON: "/opt/kedro-venv/bin/python"
+  # FEATUREGEN_MATERIALIZE_SUBMIT_TIMEOUT_SECONDS: "3600"
 ---
 apiVersion: apps/v1
 kind: Deployment

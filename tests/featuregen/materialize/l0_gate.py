@@ -467,13 +467,14 @@ def test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session(
 # The project is compiled, rendered, sealed and materialized by the production chain; `run_l0` is
 # the real one against a real kedro+pyspark interpreter; `LocalClusterSubmitter` is the production
 # submitter and it really launches the rendered pipeline in that interpreter.
-# `_G2Metastore` and `_Swap` are fakes DEFINED IN THE TESTS, and they are the honest vehicle here
-# for a reason that is recorded in D1's and D3's acceptance rows: **no `MetastoreMetadata` and no
-# `PublicationSwap` implementation exists anywhere in `src/`** — `lane_config_from_env` produces
-# `metastore=None` and every deployed run is honestly unprepared. Writing those adapters is E2's
-# deployment work against a real cluster; what this gate proves is that the CHAIN composes through
-# their seams and publishes, on an artifact whose build is genuinely verified. Neither fake is
-# importable from `src/`, and nothing here makes the platform claim a cluster it has not met.
+# `_G2Metastore` and `_Swap` are fakes DEFINED IN THE TESTS, and they stay fakes here even though
+# SUCCESSOR 2 has since written the real adapters (`metastore_sql.SqlMetastoreAdapter`,
+# `publish_sql.SqlPublicationSwap`, both exercised over a faked DB-API driver in the default suite).
+# The reason is this gate's own subject: it proves the chain composes and publishes on an artifact
+# whose BUILD is genuinely verified by a real kedro+pyspark interpreter. Pointing the real adapters
+# at a real metastore is a different proof needing a different environment — a live SQL endpoint —
+# and E2's operator runbook owns it. Neither fake is importable from `src/`, and nothing here makes
+# the platform claim a cluster it has not met.
 
 
 def test_the_chain_SUBMITS_the_rendered_project_into_a_REAL_kedro_session(
