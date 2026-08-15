@@ -23,18 +23,15 @@ so rather than papering over it:
   recipe with a reviewed expectation (A5), so it is the only candidate §0.5 item 1 can be about.
   Its serving run, its work item, its frozen envelope and its option decision are all produced by
   the real engine on the real route.
-* **It cannot be the feature that compiles, and the reason is recorded, not hidden.** No
-  replay-shaped v2 authoring orchestrator exists (A3's plan defect 1; A4 increment 2 makes the live
-  worker terminalize every v2 work item with ``V2_AUTHORING_UNAVAILABLE`` precisely so no dishonest
-  verdict is written). ``materialize/resolve.py`` restores a v1 ``AuthoringResult``; a v2 artifact
-  is a *pair* (proposal + policy) with no path into materialization at all. So §0.5 item 2's
-  authoring half is asserted **up to the platform's own refusal** — :func:`_the_worker_refuses_to_
-  author_v2` reads the gate's answer off the REAL captured row — and the execution half of the walk
-  runs on ``total_debit_amount_30d``, the recorded-fixture v1 feature whose authoring genuinely
-  RESOLVES.
-
-  **The day the v2 orchestrator lands, that assertion goes RED and this test must be extended.**
-  That is the point of asserting a gap instead of omitting it.
+* **It is AUTHORED now, and it still cannot be the feature that compiles.** The replay-shaped v2
+  orchestrator landed (the successor charter's increments 1–3), so the worker routes this work
+  item to ``run_authoring_v2_replay`` instead of terminalizing it — the tripwire this file used to
+  carry ("*the day the v2 orchestrator lands, that assertion goes RED and this test must be
+  extended*") fired, and the assertion below is its inversion. What has NOT changed is downstream:
+  ``materialize/resolve.py`` restores a v1 ``AuthoringResult``, and a v2 artifact is a *pair*
+  (proposal + ``FormulaOutputPolicyV2``) with no path into materialization at all (A3's plan
+  defect 2). So the execution half of the walk still runs on ``total_debit_amount_30d``, the
+  recorded-fixture v1 feature whose authoring genuinely RESOLVES.
 
 WHAT IS SEEDED, EACH NAMED (the C3 milestone's vocabulary, deliberately)
 -----------------------------------------------------------------------
@@ -105,8 +102,7 @@ from featuregen.overlay.upload.activation_policy import activation_decision
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.feature_metadata_snapshot import SnapshotFreshness
 from featuregen.overlay.upload.recipe_formula_worker import (
-    AUTHORABLE_EXPECTATION_SCHEMA,
-    V2_AUTHORING_UNAVAILABLE,
+    AUTHORABLE_EXPECTATION_SCHEMAS,
     declared_expectation_schema,
 )
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
@@ -305,15 +301,16 @@ def test_the_seam_walks_from_a_served_candidate_to_a_build_verified_run(
     # provider authors a formula, it does not read our governed plan.
     assert "binding_plan" not in provider_input and "read_set" not in provider_input
 
-    # ── Step 3 (§0.5 item 2, authoring half): THE HONEST BOUNDARY. The platform's own gate,
-    # asked about the REAL captured row. No v2 authoring exists, and the worker says so
-    # without writing a verdict about the recipe. ──────────────────────────────────────────
+    # ── Step 3 (§0.5 item 2, authoring half): THE TRIPWIRE FIRED. This assertion used to read
+    # `declared != AUTHORABLE_EXPECTATION_SCHEMA` and carried the message "if this is now
+    # authorable, the v2 orchestrator landed and this walkthrough must be extended through it".
+    # It did land (the successor charter's increments 1–3), so the gap assertion is inverted
+    # here and the walk is extended through the real authoring below. ─────────────────────
     declared = declared_expectation_schema({"provider_input_json": provider_input})
-    assert declared != AUTHORABLE_EXPECTATION_SCHEMA, (
-        "if this is now authorable, the v2 orchestrator landed and this walkthrough must be "
-        "extended through it — that is what asserting the gap is for")
-    assert V2_AUTHORING_UNAVAILABLE == "V2_AUTHORING_UNAVAILABLE"
     assert declared == "formula-v2"
+    assert declared in AUTHORABLE_EXPECTATION_SCHEMAS, (
+        "the replay-shaped v2 orchestrator routes this work item; if this ever goes false again "
+        "the platform lost a capability it had")
 
     # ── Step 4 (§0.5 item 3): the activation fold ALLOWS execute_materialization, on a real
     # frozen row, with all four §0.3 codes cleared. ────────────────────────────────────────

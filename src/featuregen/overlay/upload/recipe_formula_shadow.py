@@ -29,6 +29,7 @@ from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
 from featuregen.formula.frozen_configuration import (
     freeze_current_configuration,
+    freeze_current_configuration_v2,
     frozen_configuration_json,
 )
 from featuregen.formula.recipe_egress import (
@@ -1113,10 +1114,19 @@ def _capture_selected_entry(
             prediction_goal=sealed_input.redacted_prediction_goal,
             expectation=expectation,
         )
-        configuration = freeze_current_configuration(
-            generation_settings=current_formula_generation_settings(),
-            author_instruction=AUTHOR_INSTRUCTION,
-            author_prompt_id=AUTHOR_PROMPT_ID,
+        # The frozen configuration is the GENERATION's, because the worker verifies it as that
+        # generation's: a v2 work item frozen under the v1 author identity would drift at the
+        # first dispatch, and authoring it as v1 would audit a v2 run under a prompt no v2 run
+        # uses. A v1 capture is untouched — same call, same bytes, same sealed work items.
+        configuration = (
+            freeze_current_configuration_v2(
+                generation_settings=current_formula_generation_settings())
+            if isinstance(expectation, BoundRecipeFormulaExpectationV2)
+            else freeze_current_configuration(
+                generation_settings=current_formula_generation_settings(),
+                author_instruction=AUTHOR_INSTRUCTION,
+                author_prompt_id=AUTHOR_PROMPT_ID,
+            )
         )
     except RecipeFormulaPreflightError as exc:
         write_observation(

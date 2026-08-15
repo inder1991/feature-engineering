@@ -2523,6 +2523,62 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > **11245 passed, 20 skipped** (11226/20 after increment 1 — the 19
 > new tests and nothing else moved); `-m eval` **73 passed**; ruff + mypy clean on both touched source files.
 
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 3: THE WORKER ROUTES BY DECLARED SCHEMA.
+> ACCEPTED `<inc3>`.** `recipe_formula_worker` now authors BOTH generations and the work item's own
+> declaration chooses. `formula-v1` → `run_authoring`, `verify_frozen_configuration`,
+> `recipe_expectation_validator`, `recipe_tool_runner`, `formula_facts`. `formula-v2` →
+> `run_authoring_v2_replay`, `verify_frozen_configuration_v2`, `recipe_expectation_validator_v2`,
+> `recipe_tool_runner_v2`, `formula_facts_v2`. Five seams, paired: a v2 proposal validated by the
+> v1 validator, or resolved over a body-path-keyed bundle, would produce a confident verdict out of
+> the wrong evidence.
+>
+> **`V2_AUTHORING_UNAVAILABLE` IS DELETED, cause and code together** — the same discipline D3
+> applied when it deleted D0's guards. A4 increment 2 introduced it because *"nothing has yet built
+> the replay-shaped v2 orchestrator this worker would need"*; that sentence is now false, and a
+> guard kept past its cause refuses work the platform can do.
+> **`EXPECTATION_SCHEMA_UNKNOWN` stays and is not the same statement**: a declaration this build has
+> never heard of terminalizes before any evaluation, `authoring_axis="NOT_RUN"` (never
+> `UNSUPPORTED`, which is a capability verdict about a proposal that in this arm does not exist).
+> A4 increment 2's parametrized test keeps its v1-unknown half and loses its v2 half; four
+> replacement cases assert the routing.
+>
+> **THE CAPTURE SIDE HAD TO CHANGE TOO, and the charter did not name it — reproduced, not
+> inferred.** `recipe_formula_shadow._capture_selected_entry` froze `freeze_current_configuration`
+> **unconditionally**, so every captured v2 work item carried a **v1** frozen configuration. With
+> the worker verifying the v2 configuration, every one of them would have terminalized
+> `configuration_axis="DRIFTED"` — the routing would have looked wired and authored nothing. The
+> capture now freezes the generation's own configuration; a v1 capture is the same call with the
+> same bytes, so live work items are untouched.
+>
+> **BOTH RECORDED FORWARD GAPS ARE CLOSED, and they were REACHABLE the moment the routing landed.**
+> `_formula_refs` and `build_formula_authority_envelope` each collected `operand_ref` and
+> `event_time_ref` only. Without the widening a `date_diff_avg`-shaped v2 body's SECOND column
+> would reach neither the frozen read context (so the tool runner would refuse to read it and the
+> facts reader would resolve it to nothing) nor concept authority (so a formula-bearing column
+> would never be verified at all). `build_formula_authority_envelope` reads it through `getattr`
+> because the v1 bound type has no such field — every v1 expectation answers `None` and its
+> envelope is byte-identical.
+>
+> **MUTANT PROOF.** Restricting `AUTHORABLE_EXPECTATION_SCHEMAS` back to `{"formula-v1"}` — the
+> worker still terminalizing — fails **four** tests: the routing test (`KeyError: 'facts_reader'`,
+> the orchestrator never called), the seams test, the frozen-configuration test, and **E0's walk**,
+> which is what the tripwire was for.
+>
+> **E0's tripwire is INVERTED here, minimally, and walked for real in increment 4.** The assertion
+> that read `declared != AUTHORABLE_EXPECTATION_SCHEMA` ("*if this is now authorable, the v2
+> orchestrator landed and this walkthrough must be extended through it*") now reads
+> `declared in AUTHORABLE_EXPECTATION_SCHEMAS`, and the module docstring's "no replay-shaped v2
+> authoring orchestrator exists" paragraph is corrected in the same commit rather than left
+> standing as a false statement inside a green test.
+>
+> 8 new cases in `tests/featuregen/overlay/upload/test_recipe_formula_worker.py` (16 in the file);
+> the v2 work item its `_seed_work` writes now carries a REAL twelve-key v2 expectation, not a v1
+> one with a version key bolted on. Gates: full suite **11251 passed, 20 skipped** (11245/20 after increment 2 —
+> A4 increment 2's two-case parametrization is replaced by eight); `-m eval` **73 passed**;
+> ruff clean; no new mypy errors (the 29 in `recipe_formula_authority` are pre-existing, measured
+> by HEAD-swap).
+
+
 ---
 
 ## 7. Sequencing and dependencies

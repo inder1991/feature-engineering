@@ -74,6 +74,11 @@ def build_formula_authority_envelope(
         for ref in (
             expression.operand_ref,
             expression.event_time_ref,
+            # A v2 expression's SECOND operand is a formula-bearing role like any other — a
+            # `date_diff_avg` computes over two columns and both must clear concept authority.
+            # `getattr` because the v1 bound type has no such field: every v1 expectation answers
+            # `None` here and its envelope is byte-identical (A4 increment 3's forward gap).
+            getattr(expression, "second_operand_ref", None),
         )
         if ref is not None
     } | set(expectation.grain_key_refs)

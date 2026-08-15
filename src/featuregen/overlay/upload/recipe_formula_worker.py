@@ -1,18 +1,28 @@
 """Dedicated fenced worker for durable recipe-formula shadow work.
 
-**This worker authors FORMULA-V1 AND ONLY FORMULA-V1.** ``run_authoring`` here is
-``formula/replay_authoring``'s orchestrator — the checkpoint/replay one with the frozen
-configuration, the v1 expectation validator, the v1 tool runner and ``formula_facts`` returning
-v1 ``ExprFacts`` keyed by body path. A3 landed ``run_authoring_v2`` as a SIBLING of the *other*,
-non-production ``formula/authoring.run_authoring``; nothing has yet built the replay-shaped v2
-orchestrator this worker would need.
+**This worker authors BOTH expectation generations, and the work item's own declaration chooses.**
+Each generation has a complete, separate chain and they share nothing but this file:
 
-So a v2 work item is stopped at the door (task A4, increment 2). Letting one through would have
-it parsed by ``parse_proposal_v1`` and validated by the v1 expectation validator, and the run
-would terminalize ``invalid_formula → REJECTED`` — **a durable, dishonest verdict about a recipe
-the platform simply cannot author yet.** The terminal below states the truth instead: authoring
-never ran, nothing was dispatched, and the reason is a missing platform capability, not a
-property of the formula.
+* ``formula-v1`` (the UNDECLARED shape — absence IS the v1 declaration, see ``recipe_egress``) →
+  ``replay_authoring.run_authoring``, ``verify_frozen_configuration``,
+  ``recipe_expectation_validator``, ``recipe_tool_runner``, ``formula_facts``. **Byte-frozen**:
+  live work items were sealed against exactly these bytes.
+* ``formula-v2`` → ``replay_authoring_v2.run_authoring_v2_replay``,
+  ``verify_frozen_configuration_v2``, ``recipe_expectation_validator_v2``,
+  ``recipe_tool_runner_v2``, ``formula_facts_v2``.
+
+**A4 increment 2's ``V2_AUTHORING_UNAVAILABLE`` terminal is GONE, and its cause with it.** It
+existed because A3 could only sibling the *non-production* ``formula/authoring.run_authoring``, so
+a v2 work item reaching this worker would have been parsed by ``parse_proposal_v1`` and
+terminalized ``invalid_formula → REJECTED`` — a durable, dishonest verdict about a recipe the
+platform could not author at all. The replay-shaped v2 orchestrator is what removes that risk;
+keeping the guard afterwards would refuse work the platform can now do (the same discipline D3
+applied when it deleted D0's guards).
+
+``EXPECTATION_SCHEMA_UNKNOWN`` stays, and it is not the same statement: a declaration THIS BUILD
+has never heard of is a fact about us, never about the recipe, and it terminalizes before any
+evaluation with ``authoring_axis="NOT_RUN"`` — not ``UNSUPPORTED``, which is a capability verdict
+about a proposal that in this arm does not exist.
 """
 from __future__ import annotations
 
@@ -38,11 +48,14 @@ from featuregen.formula.frozen_configuration import (
     ConfigurationDrifted,
     load_frozen_configuration_json,
     verify_frozen_configuration,
+    verify_frozen_configuration_v2,
 )
 from featuregen.formula.recipe_authoring import (
     FrozenRecipeReadContext,
     recipe_expectation_validator,
+    recipe_expectation_validator_v2,
     recipe_tool_runner,
+    recipe_tool_runner_v2,
 )
 from featuregen.formula.recipe_egress import (
     FORMULA_EXPECTATION_SCHEMA_V2,
@@ -50,6 +63,7 @@ from featuregen.formula.recipe_egress import (
     validate_recipe_provider_payload,
 )
 from featuregen.formula.replay_authoring import run_authoring
+from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.identity.current_principal import (
     PrincipalResolutionStatus,
@@ -76,12 +90,13 @@ from featuregen.runtime.queue import (
     renew_recipe_formula_shadow,
 )
 
-#: The one expectation generation this worker can author. A work item declaring anything else is
-#: terminalized without authoring, by the codes below.
-AUTHORABLE_EXPECTATION_SCHEMA = "formula-v1"
-#: The platform cannot author formula-v2 yet — a statement about US, never about the recipe.
-V2_AUTHORING_UNAVAILABLE = "V2_AUTHORING_UNAVAILABLE"
-#: A declaration this build has never heard of. Also not a verdict about the recipe.
+#: The generation a payload that DECLARES nothing is: the v1 shape carries no version key and never
+#: did, and every work item written before A4 is exactly that shape.
+DEFAULT_EXPECTATION_SCHEMA = "formula-v1"
+#: The expectation generations this worker can author, each through its own complete chain.
+AUTHORABLE_EXPECTATION_SCHEMAS = frozenset(
+    {DEFAULT_EXPECTATION_SCHEMA, FORMULA_EXPECTATION_SCHEMA_V2})
+#: A declaration this build has never heard of. A statement about US, never about the recipe.
 EXPECTATION_SCHEMA_UNKNOWN = "EXPECTATION_SCHEMA_UNKNOWN"
 
 
@@ -103,7 +118,7 @@ def declared_expectation_schema(row: Mapping[str, Any]) -> str:
                    if isinstance(provider_input, Mapping) else None)
     declared = (expectation.get("formula_schema_version")
                 if isinstance(expectation, Mapping) else None)
-    return AUTHORABLE_EXPECTATION_SCHEMA if declared is None else str(declared)
+    return DEFAULT_EXPECTATION_SCHEMA if declared is None else str(declared)
 
 
 def _plain(value: Any) -> Any:
@@ -121,9 +136,16 @@ def _plain(value: Any) -> Any:
 
 
 def _formula_refs(expectation: dict) -> frozenset[str]:
+    """Every ref the frozen read context must serve for this expectation.
+
+    ``second_operand_ref`` is a v2 key and a v1 expectation never carries it, so this stays
+    byte-identical for v1 — but a v2 body that HAS one (``date_diff_avg``,
+    ``effective_at_cutoff``) needs its second column's governed facts as much as its first, and
+    without it the tool runner would refuse to read it and the facts reader would resolve it to
+    nothing (the forward gap A4 increment 3 recorded, now reachable and closed)."""
     refs = set(expectation.get("grain_key_refs") or ())
     for expression in expectation.get("expressions") or ():
-        for key in ("operand_ref", "event_time_ref"):
+        for key in ("operand_ref", "second_operand_ref", "event_time_ref"):
             ref = expression.get(key)
             if isinstance(ref, str):
                 refs.add(ref)
@@ -244,7 +266,7 @@ def process_recipe_formula_shadow_once(
                 "already_completed", row["work_item_id"], existing[0])
 
         declared_schema = declared_expectation_schema(row)
-        if declared_schema != AUTHORABLE_EXPECTATION_SCHEMA:
+        if declared_schema not in AUTHORABLE_EXPECTATION_SCHEMAS:
             # Every axis stays NOT_EVALUATED, exactly like the integrity terminal: we stopped
             # before evaluating anything. authoring_axis is NOT_RUN, not UNSUPPORTED — the
             # latter is a capability verdict about a PROPOSAL, and no proposal exists.
@@ -255,11 +277,9 @@ def process_recipe_formula_shadow_once(
                 "configuration_axis": "NOT_EVALUATED",
                 "delivery_axis": "NOT_DISPATCHED",
                 "authoring_axis": "NOT_RUN",
-                "technical_axis": (
-                    V2_AUTHORING_UNAVAILABLE
-                    if declared_schema == FORMULA_EXPECTATION_SCHEMA_V2
-                    else EXPECTATION_SCHEMA_UNKNOWN),
+                "technical_axis": EXPECTATION_SCHEMA_UNKNOWN,
             })
+        authors_v2 = declared_schema == FORMULA_EXPECTATION_SCHEMA_V2
 
         frozen_identity = row["request_identity_json"]
         principal = resolve_current_principal(
@@ -327,12 +347,22 @@ def process_recipe_formula_shadow_once(
         try:
             configuration = load_frozen_configuration_json(
                 row["frozen_configuration_json"])
-            verify_frozen_configuration(
-                configuration,
-                generation_settings=current_formula_generation_settings(),
-                author_instruction=AUTHOR_INSTRUCTION,
-                author_prompt_id=AUTHOR_PROMPT_ID,
-            )
+            # The ENVELOPE is generation-neutral (``load_…`` only re-hashes stored bytes); the
+            # MATERIAL inside it is not. A v2 work item frozen under the v1 author identity is
+            # DRIFT, and verifying it as v1 would author a v2 formula under a prompt no v2 run
+            # uses — A3 made the two identities distinct for exactly this.
+            if authors_v2:
+                verify_frozen_configuration_v2(
+                    configuration,
+                    generation_settings=current_formula_generation_settings(),
+                )
+            else:
+                verify_frozen_configuration(
+                    configuration,
+                    generation_settings=current_formula_generation_settings(),
+                    author_instruction=AUTHOR_INSTRUCTION,
+                    author_prompt_id=AUTHOR_PROMPT_ID,
+                )
         except ConfigurationDrifted:
             return _terminalize(conn, claim, row, axes={
                 "authorization_axis": "AUTHORIZED_CURRENT",
@@ -419,27 +449,50 @@ def process_recipe_formula_shadow_once(
             if not renewed:
                 raise LeaseFenceLost("formula queue lease fence changed")
 
-        result = run_authoring(
-            conn,
-            intent,
-            client,
-            critic,
-            roles=principal.principal.role_claims,
-            actor=principal.principal,
-            frozen_configuration=configuration,
-            proposal_validator=recipe_expectation_validator(expectation),
-            tool_runner=recipe_tool_runner(
-                _formula_refs(expectation), frozen_context=frozen_reads),
-            authoring_run_id=deterministic_run_id,
-            facts_reader=frozen_reads.formula_facts,
-            critic_metadata_loader=frozen_reads.get_column_metadata,
-            progress_callback=renew_lease,
-            lease_fence=LeaseFence(
-                queue_id=claim.id,
-                lease_owner=claim.lease_owner,
-                lease_fence=claim.lease_fence,
-            ),
+        fence = LeaseFence(
+            queue_id=claim.id,
+            lease_owner=claim.lease_owner,
+            lease_fence=claim.lease_fence,
         )
+        if authors_v2:
+            # Every seam is the v2 one, and the pairing is the point: a v2 proposal validated by
+            # the v1 validator, or resolved over a body-path-keyed fact bundle, would produce a
+            # confident verdict out of the wrong evidence.
+            result = run_authoring_v2_replay(
+                conn,
+                intent,
+                client,
+                critic,
+                roles=principal.principal.role_claims,
+                actor=principal.principal,
+                frozen_configuration=configuration,
+                proposal_validator=recipe_expectation_validator_v2(expectation),
+                tool_runner=recipe_tool_runner_v2(
+                    _formula_refs(expectation), frozen_context=frozen_reads),
+                authoring_run_id=deterministic_run_id,
+                facts_reader=frozen_reads.formula_facts_v2,
+                critic_metadata_loader=frozen_reads.get_column_metadata,
+                progress_callback=renew_lease,
+                lease_fence=fence,
+            )
+        else:
+            result = run_authoring(
+                conn,
+                intent,
+                client,
+                critic,
+                roles=principal.principal.role_claims,
+                actor=principal.principal,
+                frozen_configuration=configuration,
+                proposal_validator=recipe_expectation_validator(expectation),
+                tool_runner=recipe_tool_runner(
+                    _formula_refs(expectation), frozen_context=frozen_reads),
+                authoring_run_id=deterministic_run_id,
+                facts_reader=frozen_reads.formula_facts,
+                critic_metadata_loader=frozen_reads.get_column_metadata,
+                progress_callback=renew_lease,
+                lease_fence=fence,
+            )
         result_json = _plain(result)
         if not formula_dispatches_reconciled(conn, deterministic_run_id):
             dispatch_count = _dispatch_count(conn, deterministic_run_id)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -23,6 +24,38 @@ from featuregen.overlay.upload.recipe_formula_worker import (
     process_recipe_formula_shadow_once,
 )
 from featuregen.runtime.queue import enqueue_checked
+
+
+_V2_WINDOW = {
+    "event_time_role": "clock", "length_parameter": "window_days", "basis": "trailing",
+    "unit": "day", "start_inclusive": "inclusive", "end_inclusive": "exclusive",
+    "timezone": "UTC", "empty_window": "null", "null_input": "ignore", "offset_periods": 0,
+}
+
+#: The plain projection of a bound ``BoundRecipeFormulaExpectationV2`` — what a captured v2 work
+#: item actually carries on ``provider_input_json.formula_expectation`` (A4 increment 1's arm).
+_V2_EXPECTATION = {
+    "formula_schema_version": "formula-v2",
+    "final_operation": "identity",
+    "grain_entity": "customer",
+    "grain_key_refs": ["ftr::public.tx.customer_id"],
+    "expressions": [{
+        "expression_path": "body.expr",
+        "aggregation": "count_distinct",
+        "operand_ref": "ftr::public.tx.merchant_category",
+        "second_operand_ref": None,
+        "source_relation_ref": "ftr::public.tx",
+        "event_time_ref": "ftr::public.tx.tran_date",
+        "window_length": 90,
+        "window": dict(_V2_WINDOW),
+        "aggregation_argument": None,
+        "authority_refs": None,
+        "term_name": "",
+        "term_sign": 0,
+    }],
+    "decimal": {"precision": 18, "scale": 6, "rounding": "half_even", "overflow": "error"},
+    "policy_version": 1,
+}
 
 
 def _seed_work(db, suffix: str = "1", *, declared_schema: str | None = None):
@@ -108,7 +141,11 @@ def _seed_work(db, suffix: str = "1", *, declared_schema: str | None = None):
             "overflow": "error",
         },
     }
-    if declared_schema is not None:
+    if declared_schema == "formula-v2":
+        # A real v2 payload, not a v1 one with a version key bolted on: the worker hands this
+        # dict straight to `recipe_expectation_validator_v2`.
+        expectation = deepcopy(_V2_EXPECTATION)
+    elif declared_schema is not None:
         expectation["formula_schema_version"] = declared_schema
     work_item_id = f"work-worker-{suffix}"
     write_work_item(
@@ -182,7 +219,7 @@ class _AuthoringResult:
     authoring_run_id: str
 
 
-def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str) -> None:
+def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str):
     monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker._current_read_scope_hash",
@@ -209,46 +246,57 @@ def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str) -> None:
         "featuregen.overlay.upload.recipe_formula_worker.validate_recipe_provider_payload",
         lambda value: None,
     )
+    frozen = SimpleNamespace(
+        formula_facts=lambda proposal: ({}, {}),
+        formula_facts_v2=lambda proposal: ({}, ()),
+        get_column_metadata=lambda ref: {"found": True, "logical_ref": ref},
+    )
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.FrozenRecipeReadContext.load",
-        lambda *args: SimpleNamespace(
-            formula_facts=lambda proposal: ({}, {}),
-            get_column_metadata=lambda ref: {"found": True, "logical_ref": ref},
-        ),
+        lambda *args: frozen,
+    )
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.renew_recipe_formula_shadow",
         lambda *args, **kwargs: True,
     )
+    return frozen
 
 
 def _authoring_run_id(work_item_id: str) -> str:
     return "far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24]
 
 
-@pytest.mark.parametrize(("declared", "expected_code"), [
-    ("formula-v2", "V2_AUTHORING_UNAVAILABLE"),
-    ("formula-v7", "EXPECTATION_SCHEMA_UNKNOWN"),
-])
-def test_a_work_item_this_worker_cannot_author_never_reaches_the_v1_orchestrator(
-    db, monkeypatch, declared, expected_code
+@pytest.mark.parametrize("declared", ["formula-v7", "formula-v1.5", "2", ""])
+def test_an_unknown_expectation_declaration_never_reaches_any_orchestrator(
+    db, monkeypatch, declared
 ) -> None:
-    """A4 increment 2. The live worker is v1-only (``replay_authoring.run_authoring``), and A3
-    could not wire a replay-shaped v2 sibling into it. Without this gate, widening the capture
-    population would hand a v2 work item to ``parse_proposal_v1`` and the run would record
-    ``invalid_formula → REJECTED`` — a durable, dishonest verdict about a recipe the platform
-    cannot author at all. The terminal here says that, and says nothing about the recipe.
-    """
-    work_item_id, run_id = _seed_work(db, f"schema-{declared}", declared_schema=declared)
-    called = False
+    """The half of A4 increment 2's gate whose cause is still real. A declaration THIS BUILD has
+    never heard of is a fact about US: authoring never ran, nothing was dispatched, and no verdict
+    about the recipe was written anywhere. ``authoring_axis`` is NOT_RUN rather than UNSUPPORTED,
+    because UNSUPPORTED is a capability verdict about a proposal and here none exists.
 
-    def _run(*args, **kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("the v1 orchestrator must never see a non-v1 work item")
+    (The ``formula-v2`` case that used to sit in this parametrization is gone with its cause: the
+    replay-shaped v2 orchestrator landed, and the test below asserts the routing that replaced it.)
+    """
+    work_item_id, run_id = _seed_work(db, f"schema-{declared or 'blank'}",
+                                      declared_schema=declared)
+    reached = []
+
+    def _never(name):
+        def _run(*args, **kwargs):
+            reached.append(name)
+            raise AssertionError(f"the {name} orchestrator must never see an unknown declaration")
+        return _run
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _never("v1"))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay",
+        _never("v2"))
     # Everything downstream of the gate is left REAL: if the gate were absent the run would
     # proceed, not be saved by a stub.
     outcome = process_recipe_formula_shadow_once(
@@ -258,7 +306,7 @@ def test_a_work_item_this_worker_cannot_author_never_reaches_the_v1_orchestrator
     )
     assert outcome.status == "completed"
     assert outcome.work_item_id == work_item_id
-    assert not called
+    assert reached == []
     row = db.execute(
         "SELECT capture_axis,authorization_axis,authority_axis,drift_axis,configuration_axis,"
         "delivery_axis,authoring_axis,technical_axis,authoring_run_id,authoring_result_json "
@@ -266,14 +314,178 @@ def test_a_work_item_this_worker_cannot_author_never_reaches_the_v1_orchestrator
         (run_id,),
     ).fetchone()
     assert row == ("CAPTURED", "NOT_EVALUATED", "NOT_EVALUATED", "NOT_EVALUATED",
-                   "NOT_EVALUATED", "NOT_DISPATCHED", "NOT_RUN", expected_code, None, None)
-    # No verdict about the recipe was written anywhere, and nothing was dispatched.
+                   "NOT_EVALUATED", "NOT_DISPATCHED", "NOT_RUN",
+                   "EXPECTATION_SCHEMA_UNKNOWN", None, None)
     assert db.execute("SELECT count(*) FROM llm_dispatch").fetchone()[0] == 0
-    # The run still reconciles — an unauthorable work item is an OUTCOME, not a hole.
     assert db.execute(
         "SELECT status FROM recipe_formula_shadow_run_manifest WHERE generation_run_id=%s",
         (run_id,),
     ).fetchone()[0] == "COMPLETE"
+
+
+def test_a_declared_v2_work_item_is_authored_by_the_REPLAY_SHAPED_v2_orchestrator(
+    db, monkeypatch, _dsn
+) -> None:
+    """THE ROUTING. A4 increment 2 terminalized this work item ``V2_AUTHORING_UNAVAILABLE``
+    because no replay-shaped v2 orchestrator existed; it does now, so the guard is gone and the
+    item is authored.
+
+    Every seam handed over is asserted to be the **v2** one — a v2 proposal validated by the v1
+    validator, or resolved over a body-path-keyed bundle, would produce a confident verdict out of
+    the wrong evidence. The v1 orchestrator is monkeypatched to RAISE, so no stub can hide a
+    mis-route."""
+    work_item_id, run_id = _seed_work(db, "v2-routed", declared_schema="formula-v2")
+    frozen = _prepare_dispatch_ready(monkeypatch, "v2-routed", _dsn)
+    received: dict = {}
+
+    def _v1(*args, **kwargs):
+        raise AssertionError("a formula-v2 work item must never reach the v1 orchestrator")
+
+    def _v2(*args, **kwargs):
+        received.update(kwargs)
+        kwargs["progress_callback"]()
+        return _AuthoringResult("RESOLVED", "ok", _authoring_run_id(work_item_id))
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _v1)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _v2)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True)
+
+    outcome = process_recipe_formula_shadow_once(
+        db,
+        owner="worker-1",
+        author_client=object(),
+        critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
+    )
+    assert outcome.status == "completed", db.execute(
+        "SELECT last_error FROM queue WHERE message_id='formula-test-v2-routed'").fetchone()
+    assert received["facts_reader"] is frozen.formula_facts_v2, (
+        "v1's bundle is keyed by body path and would resolve every v2 operand to empty facts")
+    assert received["critic_metadata_loader"] is frozen.get_column_metadata
+    assert received["authoring_run_id"] == _authoring_run_id(work_item_id)
+    assert received["lease_fence"] is not None
+    assert db.execute(
+        "SELECT delivery_axis,authoring_axis,technical_axis "
+        "FROM recipe_formula_shadow_observation WHERE generation_run_id=%s",
+        (run_id,),
+    ).fetchone() == ("DISPATCHED_AUDITED", "RESOLVED", "OK")
+
+
+def test_the_v2_route_uses_the_v2_validator_and_the_v2_tools(db, monkeypatch, _dsn) -> None:
+    """The two remaining seams, proved by BEHAVIOUR rather than by identity: the validator that
+    arrives understands a v2 proposal (v1's answers ``FINAL_OPERATION_NOT_PRESERVED`` to anything
+    that is not a ``UnaryBody``), and the tool runner answers ``list_supported_operations`` in the
+    v2 grammar (v1's answers out of the v1 enum)."""
+    from featuregen.formula.schema_v2 import AggregateFunctionV2
+
+    _seed_work(db, "v2-seams", declared_schema="formula-v2")
+    _prepare_dispatch_ready(monkeypatch, "v2-seams", _dsn)
+    received: dict = {}
+
+    def _v2(*args, **kwargs):
+        received.update(kwargs)
+        return _AuthoringResult("RESOLVED", "ok", "far_seams")
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _v2)
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True)
+    process_recipe_formula_shadow_once(
+        db, owner="worker-1", author_client=object(), critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT))
+
+    answer = received["tool_runner"](object(), "list_supported_operations", {})
+    assert {item["name"] for item in answer["aggregate_functions"]} == {
+        fn.value for fn in AggregateFunctionV2}
+
+    from featuregen.formula.parse_v2 import parse_proposal_v2
+
+    proposal = parse_proposal_v2({
+        "formula_schema_version": 2, "operation_grammar_version": 1,
+        "canonicalization_version": 1,
+        "grain": {"entity": "customer", "keys": ["ftr::public.tx.customer_id"]},
+        "body": {"final_operation": "identity", "expr": {
+            "aggregation": "count_distinct", "operand": "ftr::public.tx.merchant_category",
+            "source_relation": {"table_ref": "ftr::public.tx"}, "filter": None,
+            "window": {"event_time_ref": "ftr::public.tx.tran_date", "basis": "trailing",
+                       "length": 90, "unit": "day", "start_inclusive": "inclusive",
+                       "end_inclusive": "exclusive", "timezone": "UTC", "empty_window": "null",
+                       "null_input": "ignore", "offset_periods": 0},
+            "aggregation_argument": None, "second_operand": None, "authority_refs": None}},
+        "parameters": [], "expected_output": None, "allocation_policy_ref": "",
+        "decimal": {"precision": 18, "scale": 6, "rounding": "half_even", "overflow": "error"}})
+    # The proposal PRESERVES the seeded v2 expectation exactly, so the v2 validator passes it —
+    # something v1's validator structurally cannot do for any v2 body.
+    assert received["proposal_validator"](proposal) == ()
+
+    from featuregen.formula.recipe_authoring import recipe_expectation_validator
+
+    assert recipe_expectation_validator(_V2_EXPECTATION)(proposal) == (
+        "FINAL_OPERATION_NOT_PRESERVED",), "which is why the sibling exists"
+
+
+def test_a_v2_work_item_verifies_the_V2_frozen_configuration(db, monkeypatch, _dsn) -> None:
+    """A v2 work item frozen under the v1 author identity is DRIFT, and the worker must ask the v2
+    question. Asserted by which verifier is called, and by the v1 one being poisoned."""
+    _seed_work(db, "v2-config", declared_schema="formula-v2")
+    _prepare_dispatch_ready(monkeypatch, "v2-config", _dsn)
+    asked: list[str] = []
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        lambda *a, **k: asked.append("v1"))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
+        lambda *a, **k: asked.append("v2"))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay",
+        lambda *a, **k: _AuthoringResult("RESOLVED", "ok", "far_config"))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
+        lambda *args: True)
+    process_recipe_formula_shadow_once(
+        db, owner="worker-1", author_client=object(), critic_client=object(),
+        identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT))
+    assert asked == ["v2"]
+
+
+def test_a_second_operand_reaches_the_frozen_read_context(db, monkeypatch, _dsn) -> None:
+    """The forward gap A4 increment 3 recorded, now REACHABLE and closed. A two-operand v2 body
+    (``date_diff_avg``-shaped) needs its second column's governed facts as much as its first;
+    without this the tool runner would refuse to read it and the facts reader would resolve it to
+    nothing."""
+    from featuregen.overlay.upload.recipe_formula_worker import _formula_refs
+
+    two_operand = {
+        "final_operation": "identity",
+        "grain_entity": "customer",
+        "grain_key_refs": ["ftr::public.tx.customer_id"],
+        "expressions": [{
+            "aggregation": "date_diff_avg",
+            "operand_ref": "ftr::public.tx.opened_dt",
+            "second_operand_ref": "ftr::public.tx.closed_dt",
+            "source_relation_ref": "ftr::public.tx",
+            "event_time_ref": "ftr::public.tx.tran_date",
+            "window_length": 90,
+        }],
+    }
+    assert _formula_refs(two_operand) == frozenset({
+        "ftr::public.tx.customer_id", "ftr::public.tx.opened_dt",
+        "ftr::public.tx.closed_dt", "ftr::public.tx.tran_date"})
+
+    # ...and the SAME widening leaves every v1 expectation byte-identical, because a v1 bound
+    # expectation has no such key at all.
+    _work_item_id, _run_id = _seed_work(db, "v1-refs-unchanged")
+    row = db.execute(
+        "SELECT provider_input_json FROM recipe_formula_shadow_work_item "
+        "WHERE work_item_id='work-worker-v1-refs-unchanged'").fetchone()[0]
+    assert _formula_refs(row["formula_expectation"]) == frozenset({
+        "ftr::public.tx.customer_id", "ftr::public.tx.merchant_category",
+        "ftr::public.tx.tran_date"})
 
 
 def test_a_v1_work_item_declaring_nothing_is_still_authored(db, monkeypatch, _dsn) -> None:
