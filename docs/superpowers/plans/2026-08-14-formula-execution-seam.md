@@ -1873,7 +1873,7 @@ column, hands every reading — including the ones that looked bad — to the as
 > to extend, and a copy here would be a third that drifts. A test monkeypatches the renderer's set
 > and asserts the driver follows.
 
-> **ACCEPTED `PENDING-D2` (2026-08-15).** `src/featuregen/materialize/probe.py` — the live driver,
+> **ACCEPTED `a962934f` (2026-08-15).** `src/featuregen/materialize/probe.py` — the live driver,
 > `PublicationTarget` (the cluster seam) and nothing else. **NO LIVE PROBE WAS RUN**: nothing in
 > this task touched `kubectl`, a cluster or a subprocess, and running it against kind stays an
 > OPERATOR ACTION requiring an explicit go (cluster spend + a durable governance record).
@@ -1933,6 +1933,60 @@ are deleted in this commit, and `test_the_chain_can_never_append_PUBLISHED` is r
 - `test_publication_without_a_matching_attestation_is_still_refused` — the refusal must survive.
 - `test_the_pointer_swap_is_recorded_before_it_is_claimed`
 - `test_the_terminal_cannot_be_retracted` — migration 1044's ordering trigger, exercised.
+
+> **PLAN CORRECTION (D3, verified).** "The metastore write … and the pointer swap" cannot be
+> *written* here: there is no cluster-write seam anywhere in `src/`, and there must not be one —
+> the package invariant is *"this package is render-only. It never imports `pyspark`"*. So the
+> publish step's cluster half is a Protocol, `publish.PublicationSwap`, in exactly the posture D1
+> gave `MetastoreMetadata`: the deployment supplies it, **no implementation exists in `src/`**, and
+> `swap=None` on the lane config means this deployment cannot publish — recorded as the run's
+> outcome, never as a skipped step. What D3 *builds* is the governed half: migration 1055's record,
+> the ordering, and the seam's contract.
+
+> **ACCEPTED `PENDING-D3` (2026-08-15).** G-3 lands, and **`PublishStepMissing` is gone with its
+> whole cause** — the class, the lane's `except` branch, D0's `_PUBLISH_STEP_REGISTERED` guard, its
+> autouse fixture, `test_chain._attest_capability`'s try/finally, D0's guard test and D1's
+> `test_the_lane_classifies_PublishStepMissing_instead_of_crashing`. The guard did not outlive its
+> cause, which was the point of recording it as temporary in three places.
+>
+> **Migration 1055 — a FILE, applied to no cluster.** Verified free on every ref before writing
+> (`git log --all --diff-filter=A -- 'src/featuregen/db/migrations/1055*'` is empty), and reserved
+> for exactly this since Phase G's T1. Append-only in the 1034/1044 style, plus 1044's ordering
+> argument applied **per GROUP**: publication is atomic per group (§10.1), so two groups publish
+> independently while a stale publisher inside one group is refused at INSERT. **No `is_current`
+> column** — the newest `seq` is what holds, because a mutable current-pointer is a record that can
+> be rewritten, and this is the only record that says a feature was ever readable. Audited against a
+> POPULATED seeded legacy shape (the standing lesson): 11 cases in
+> `tests/featuregen/db/test_migration_1055.py`, including re-application over populated rows, the
+> per-group ordering, the three mutation guards (UPDATE/DELETE/**TRUNCATE**, which needs its own
+> STATEMENT-level trigger), the real FK, the closed mechanism vocabulary, and that the append-only
+> trigger is **1034's own function OID** rather than a copy.
+>
+> **THE ORDER IS THE DESIGN, and the plan did not state it.** `publish_generation` RECORDS the
+> pointer, then performs the swap; the chain appends `PUBLISHED` after both. Only one of the two
+> writes can be rolled back, so the order decides what a failure leaves: a swap that fails rolls the
+> record back with it and the plane has claimed nothing, while swap-then-record can leave a cluster
+> whose readers see a generation the plane has no row for — and an append-only plane has no repair
+> path for the row it did not write. A record refused by 1055's ordering trigger means the swap
+> never happens, so a stale publisher cannot overwrite a pointer that moved past it. The irreducible
+> residue is stated in the function's own docstring: the cluster takes no part in the transaction,
+> the window is one statement wide, it fails closed, and closing it properly needs a two-phase
+> metastore protocol no probe has attested.
+>
+> **THE REFUSAL SURVIVED.** `test_publication_without_a_matching_attestation_is_still_refused` runs
+> with the seam FULLY configured and an attestation probed on other engine versions: the chain
+> declines rather than cannot, `swap.calls == []`, and no revision row exists. A publish step is not
+> permission to publish — `select_publisher` still decides.
+>
+> **The AST guard was replaced, not deleted.** `_PERMITTED_EVENT_KINDS` is now
+> `{PUBLICATION_REFUSED, PUBLISHED, RUN_FAILED}` as an EQUALITY in one place, read by both the
+> per-module test and the src-wide sweep, so a fourth member is a deliberate edit to one line.
+> `test_the_chain_appends_PUBLISHED_only_after_a_proven_selection_and_a_passed_gate` keeps the four
+> AST routes (attribute, string — `MaterializationRunEvent` COERCES `event_kind`, so
+> `event_kind="PUBLISHED"` is the same write — subscript/call/`getattr`) and adds the behavioural
+> conjunction.
+> Gates: full suite **11182 passed, 20 skipped** (11165/20 after D2); `-m eval` **73 passed**;
+> ruff + mypy clean on every touched file.
 
 ### Task D4 — the surface says what happened (1½ days)
 

@@ -8,10 +8,11 @@ and the failure would surface as an ``ImportError`` in whichever module happened
 first. This file may import ``identity`` freely; ``compile/__init__.py`` stays free of imports.
 
 WHAT THIS CHAIN COVERS. Phase G §4 stages the programme. G-1 is stages 1 through SEAL plus §11.2's
-**L0**; **G-2 — ``prepare_run`` → ``run_l1`` → ``submit`` — is composed here as of task D1** and
-runs only on a build that PASSED L0 under a PROVEN publication capability. Publication is G-3 and
-does not exist: a run that executes to completion raises :class:`PublishStepMissing` and rolls its
-whole record back, which is why D0 refuses the passing attestation that is that path's only door.
+**L0**; **G-2 — ``prepare_run`` → ``run_l1`` → ``submit`` — is composed here as of task D1**, and
+**G-3 — the publish step — as of task D3**. Both run only on a build that PASSED L0 under a PROVEN
+publication capability. There is no longer any state in which a completed run has nowhere to go:
+``PublishStepMissing`` and the writer-side guard that kept an operator from reaching it are both
+deleted, because their entire cause was the absence this task closed.
 
 WHY G-2 CANNOT RUN WITHOUT A PROVEN CAPABILITY, which is not an ordering preference.
 ``prepare_run`` requires a ``capability_attestation_id`` and ``sandbox_execution_hash`` refuses a
@@ -53,11 +54,16 @@ recorded as the same ``error`` report rather than as a fourth vocabulary word me
 A skipped gate that left ``PUBLICATION_REFUSED`` behind would be indistinguishable from a passed
 one, on a plane that can never retract it.
 
-**This module must never append** ``RunEventKind.PUBLISHED`` (plan §3.5). The plane is append-only,
-with a partial unique index admitting one terminal event per run and migration 1044's BEFORE-INSERT
+**WHEN THIS MODULE MAY APPEND** ``RunEventKind.PUBLISHED`` — and the answer is a conjunction, not a
+branch. Only when the build PASSED L0, publication capability was PROVEN for this exact environment
+at these exact engine versions, the run was prepared, L1 passed against the live metastore, the
+pipeline ran to completion, AND the pointer was recorded and swapped. The plane is append-only, with
+a partial unique index admitting one terminal event per run and migration 1044's BEFORE-INSERT
 ordering trigger refusing anything after it — so a publication claim, once written, can never be
-retracted by any code path that exists. A test reads this module's AST and asserts that
-``PUBLICATION_REFUSED`` and ``RUN_FAILED`` are the only two event kinds it names.
+retracted by any code path that exists, which is exactly why it is the last thing this module does
+and why every one of those seven conditions is a stage with its own recorded outcome.
+``test_the_chain_appends_PUBLISHED_only_after_a_proven_selection_and_a_passed_gate`` is the guard
+that replaced the AST test which used to forbid the kind outright.
 
 WHY ``RUN_FAILED`` AND NOT ``GATES_FAILED``, against the two kinds' documented meanings.
 ``GATES_FAILED`` is "a §9 gate failed — the group is rejected and the previous partition stays
@@ -138,7 +144,14 @@ from featuregen.materialize.ir import (
     ir_hash,
 )
 from featuregen.materialize.physical_types import PhysicalType, resolve_physical_type
-from featuregen.materialize.publish import PublisherSelection, PublishMechanism, select_publisher
+from featuregen.materialize.publish import (
+    ActiveRevision,
+    PublicationSwap,
+    PublisherSelection,
+    PublishMechanism,
+    publish_generation,
+    select_publisher,
+)
 from featuregen.materialize.render.project import (
     ProjectDatasets,
     RenderedNode,
@@ -179,7 +192,6 @@ __all__ = [
     "L0Interpreter",
     "NodeAssembler",
     "NodeAssemblyInputs",
-    "PublishStepMissing",
     "RunExecution",
     "compile_feature_group",
 ]
@@ -201,30 +213,11 @@ __all__ = [
 #: The increment convention above governs a run that is still open, which in G-1 never happens.
 FIRST_RUN_EVENT_SEQ = 0
 
-
-class PublishStepMissing(RuntimeError):
-    """A run EXECUTED under a proved mechanism, and there is no publish step to honour it.
-
-    Exported and named so a queue lane can classify it and fail the request with a reason, because
-    its trigger is a legitimate operational act rather than a code change: ``record_attestation``
-    is callable today, so ingesting one passing probe result for the target environment flips every
-    run of this chain from the truthful ``CAPABILITY_UNPROVEN`` terminal into this state. **D0
-    closed that door at the writer** — ``record_attestation`` now refuses a PASSING result while
-    this class still exists — so between D1 and G-3 no operator can reach this raise at all, and
-    only a test that flips the guard on purpose can.
-
-    It is raised at the END of G-2 rather than before rendering, because until a run has been
-    prepared, validated and submitted there is a truer thing to say about it than "the publish step
-    is missing": an unprepared run stops at :attr:`ChainStage.PREPARE_RUN`, a failed submission at
-    :attr:`ChainStage.SUBMIT`, and each records its own reason. This raise is what is left when
-    every other stage succeeded, and it rolls the whole transaction back rather than committing a
-    record whose terminal nobody can write.
-
-    It is a ``RuntimeError`` rather than a governed refusal because it is a statement about the
-    PLATFORM, not about the feature: §14's closed vocabulary has no member for "the step that would
-    have acted on this verdict has not been built", and inventing one would tell an operator the
-    catalog refused their feature.
-    """
+#: The terminals that leave the request ``committed`` rather than ``failed`` — the two whose
+#: evidence is ON the plane. Read as a set rather than spelled at the fold, so a third terminal
+#: added without deciding which side it falls on fails the test that names this membership.
+#: ``PUBLICATION_REFUSED`` is here for the reason §0.0 states: it is G-1's SUCCESS terminal.
+_COMMITTING_TERMINALS = frozenset({RunEventKind.PUBLICATION_REFUSED, RunEventKind.PUBLISHED})
 
 
 class ChainStage(StrEnum):
@@ -271,9 +264,12 @@ class ChainStage(StrEnum):
     #: §11.2's L1 — metastore METADATA over every IR, every expression, the spine and the exact
     #: partitions preparation resolved. G-2.
     VALIDATE_L1 = "run_l1"
-    #: §11.1's submission — the rendered project run with EXACTLY the prepared parameters. G-2, and
-    #: the last stage that exists: what follows a completed submission is G-3's publish step.
+    #: §11.1's submission — the rendered project run with EXACTLY the prepared parameters. G-2.
     SUBMIT = "submit"
+    #: §3.5's publish step — the metastore write, migration 1055's active-revision record and the
+    #: reader-visible pointer swap. G-3, and the ONE stage whose verdict is neither a refusal nor a
+    #: report: a run that reaches it and returns has PUBLISHED, and the plane can never retract it.
+    PUBLISH = "publish_generation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +343,7 @@ class RunExecution:
 
     metastore: MetastoreMetadata
     submitter: PipelineSubmitter
+    swap: PublicationSwap
     business_dt: str
     staging_base: str
 
@@ -445,6 +442,10 @@ class CompiledGroup:
     #: §7's identity of the execution that was prepared, ``None`` when none was. It is the value
     #: that ties a plane record to the parameters the pipeline was actually given.
     sandbox_execution_hash: str | None = None
+    #: Migration 1055's pointer, present exactly on a run that PUBLISHED. ``None`` means *"not
+    #: published"* — never "published, target unknown" — and any surface reporting it must say so
+    #: rather than invent a table name.
+    active_revision: ActiveRevision | None = None
 
 
 def compile_feature_group(
@@ -538,8 +539,6 @@ def compile_feature_group(
             verdicts.
         featuregen.materialize.admission.FeatureNamePlanError: two members normalize to one Hive
             identifier, or a name cannot be one at all. A plan error, not a §14 code.
-        PublishStepMissing: G-2 executed to completion under a proved mechanism and there is no
-            publish step to honour it (plan §3.5). The whole record rolls back with it.
     """
     request = _claim(conn, request_id)
     if request.lifecycle_state.is_terminal():
@@ -751,7 +750,7 @@ def _commit(
                     conn, staging, request=request, project=project, authorized=authorized,
                     spine_input=spine_input, selection=selection, inventory=inventory,
                     execution=execution, roles=roles, generation_id=generation_id, run_id=run_id,
-                    clock=clock)
+                    plan=plan, binding=binding, clock=clock)
                 if attempt.l1_report is not None:
                     record_validation_report(conn, attempt.l1_report)
             else:
@@ -763,7 +762,7 @@ def _commit(
             moved = advance_lifecycle(
                 conn, request_id=request.request_id,
                 to_state=(RequestLifecycle.COMMITTED
-                          if attempt.terminal is RunEventKind.PUBLICATION_REFUSED
+                          if attempt.terminal in _COMMITTING_TERMINALS
                           else RequestLifecycle.FAILED))
             _publish_tree(staging, root)
     except BaseException:
@@ -781,7 +780,8 @@ def _commit(
         group_plan_hash=group_plan_hash(plan),
         generated_project_hash=project.identity.generated_project_hash, project_root=str(root),
         validation_report=report, l1_report=attempt.l1_report, submission=attempt.submission,
-        sandbox_execution_hash=attempt.sandbox_execution_hash)
+        sandbox_execution_hash=attempt.sandbox_execution_hash,
+        active_revision=attempt.active_revision)
 
 
 @dataclass(frozen=True, slots=True)
@@ -802,6 +802,7 @@ class _RunAttempt:
     l1_report: ValidationReportV1 | None = None
     submission: SubmissionOutcome | None = None
     sandbox_execution_hash: str | None = None
+    active_revision: ActiveRevision | None = None
 
     @classmethod
     def build_unproven(cls, report: ValidationReportV1, *,
@@ -828,6 +829,23 @@ class _RunAttempt:
                    detail=f"{refusal.code.value}: {refusal.detail}", refusal=refusal)
 
     @classmethod
+    def published(cls, revision: ActiveRevision, *, l1_report: ValidationReportV1,
+                  submission: SubmissionOutcome, sandbox_execution_hash: str) -> _RunAttempt:
+        """The terminal G-1 was forbidden to write and G-3 earns — with the evidence attached.
+
+        The detail names the object a reader can now query, the generation behind it and the
+        attestation the swap rested on, because those are the three things an operator asks first
+        and the only ones the plane can never re-derive once later probes are ingested.
+        """
+        return cls(stopped_at=ChainStage.PUBLISH, terminal=RunEventKind.PUBLISHED,
+                   detail=(f"published {revision.published_object} at generation "
+                           f"{revision.generation_id} (revision seq {revision.seq}, "
+                           f"{revision.mechanism.value} under attestation "
+                           f"{revision.capability_attestation_id})"),
+                   l1_report=l1_report, submission=submission,
+                   sandbox_execution_hash=sandbox_execution_hash, active_revision=revision)
+
+    @classmethod
     def failed_at(cls, stage: ChainStage, detail: str, *,
                   refusal: MaterializationRefused | None = None,
                   l1_report: ValidationReportV1 | None = None,
@@ -852,6 +870,8 @@ def _execute_the_run(
     roles: Sequence[str],
     generation_id: str,
     run_id: str,
+    plan: FeatureGroupPlanV1,
+    binding: GroupContractBinding,
     clock: Callable[[], str],
 ) -> _RunAttempt:
     """G-2: §11.1's ``prepare_run`` → §11.2's L1 → §11.1's submission, in that order and no other.
@@ -875,11 +895,10 @@ def _execute_the_run(
     ``bridge_predicate_values`` (``render/project.py:1296``), which only a bridged artifact wires,
     and no bridged artifact can reach the submission below.
 
-    ``conn`` is threaded but unused today: G-3's publish step writes from inside this ladder, and a
-    stage that had to be re-plumbed to reach the database would be a second place the ordering is
-    described.
+    ``binding.physical_target`` is the name the swap makes resolve — read from the binding rather
+    than re-derived, because §10.1 wrote that name once for this logical group and a second
+    derivation here would be a second answer to a question that has one.
     """
-    del conn  # G-3's publish step is the first writer here.
     if execution is None:
         return _RunAttempt.failed_at(
             ChainStage.PREPARE_RUN,
@@ -923,13 +942,17 @@ def _execute_the_run(
             ChainStage.SUBMIT, _submission_detail(submitted), l1_report=l1, submission=submitted,
             sandbox_execution_hash=prepared.sandbox_execution_hash)
 
-    raise PublishStepMissing(
-        f"the run for generation {generation_id} executed to completion under proven capability "
-        f"{selection.capability_attestation_id} for {selection.environment_id!r}, and this chain "
-        f"has no publish step to honour it: the metastore write, the active-revision record and "
-        f"the pointer swap are all G-3 (plan §3.5, DEFERRED-WORK A.26). Recording a terminal this "
-        f"run did not reach would be a claim the append-only plane could never retract, so the "
-        f"whole record — generation, artifact, both reports and the tree — rolls back instead")
+    # G-3. The pointer is RECORDED before the swap is performed and the swap before the terminal is
+    # appended, so nothing claims a publication that has not already been written down — see
+    # `publish_generation` for why the other order is the one that can produce an unauditable table.
+    revision = publish_generation(
+        conn, execution.swap, selection=selection, group_plan=plan, generation_id=generation_id,
+        run_id=run_id, published_object=binding.physical_target,
+        staging_root=str(prepared.parameters["staging_root"]),
+        revision_id=_revision_id(request.request_id), activated_at=clock())
+    return _RunAttempt.published(
+        revision, l1_report=l1, submission=submitted,
+        sandbox_execution_hash=prepared.sandbox_execution_hash)
 
 
 def _l1_detail(report: ValidationReportV1) -> str:
@@ -1240,6 +1263,14 @@ def _report_id(request_id: str) -> str:
     verdict for one generation instead of colliding, which on an append-only table with no repair
     path is the difference between a loud failure and two build proofs nobody can order."""
     return _derived_id("l0rep", purpose="l0_validation_report", material=request_id)
+
+
+def _revision_id(request_id: str) -> str:
+    """Migration 1055's primary key, DERIVED for ``_report_id``'s reason: a re-entry that reached
+    the write with a random id would append a SECOND pointer for one swap instead of colliding, and
+    on an append-only table with no repair path that is the difference between a loud failure and
+    two rows claiming to be what a reader is seeing."""
+    return _derived_id("frev", purpose="feature_active_revision", material=request_id)
 
 
 def _l1_report_id(request_id: str) -> str:

@@ -135,53 +135,7 @@ def _published_columns(plan) -> list[str]:
     return [column.name for column in expected_schema(plan)]
 
 
-@pytest.fixture(autouse=True)
-def _the_publish_step_exists(monkeypatch) -> None:
-    """**TEMPORARY — G-3 deletes this fixture with the guard it disarms.**
-
-    Most of this module tests §10.3's selection algebra, which needs PASSING attestations in the
-    table. `record_attestation` refuses to write one while G-3's publish step does not exist (plan
-    §0.4), so these tests state plainly that they are building that state on purpose — which is
-    exactly the difference the guard exists to draw between a test and an operator.
-    `test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists` turns it back
-    off, which is what makes this fixture safe to have.
-    """
-    monkeypatch.setattr(publish_module, "_PUBLISH_STEP_REGISTERED", True)
-
-
 # ══ 1. the back door that must not exist ═════════════════════════════════════════════════════════
-
-
-def test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists(
-        db, monkeypatch) -> None:
-    """§0.4's landmine, disarmed at the writer. **DELETED BY G-3, with the guard.**
-
-    Ingesting a probe result is a legitimate operational act — no code change, no deploy — and the
-    moment one PASSING result exists for a live environment, `select_publisher` returns a selection
-    and `compile/chain.py` has nothing to honour it with: every run of that environment turns from
-    the truthful `CAPABILITY_UNPROVEN` terminal into a `PublishStepMissing` platform error. So the
-    refusal is at the WRITER, where the operator is, and it names G-3 rather than blaming the probe.
-
-    A FAILING result still records, and that half is not incidental: it is the only evidence that
-    tells `PUBLISH_MECHANISM_UNSUPPORTED` apart from `CAPABILITY_UNPROVEN`, and a guard that
-    swallowed it would erase the distinction while claiming to protect it.
-    """
-    monkeypatch.setattr(publish_module, "_PUBLISH_STEP_REGISTERED", False)
-
-    with pytest.raises(RuntimeError, match="G-3's publish step does not exist"):
-        record_attestation(db, _result(_schema_evolution_run()))
-    assert read_attestations(db, environment_id=ENV,
-                            mechanism=PublishMechanism.VERSIONED_POINTER) == ()
-
-    torn = _clean_swap()
-    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
-    failing = _result(torn, probe_id="probe-failed")
-    assert not failing.passed
-    recorded = record_attestation(db, failing)
-
-    assert recorded.attestation_id == "probe-failed"
-    assert [a.attestation_id for a in read_attestations(
-        db, environment_id=ENV, mechanism=PublishMechanism.VERSIONED_POINTER)] == ["probe-failed"]
 
 
 def test_record_attestation_accepts_ONLY_a_probe_result() -> None:
@@ -756,12 +710,20 @@ def test_select_publisher_refuses_a_raw_mechanism_or_a_loose_version_mapping(db)
                          published_schema=None)
 
 
-def test_the_module_writes_only_the_attestation_table_and_only_by_INSERT() -> None:
-    """The plane is append-only. A publication path that learned to UPDATE would be able to turn a
-    failed attestation into a passing one without any probe running at all."""
+def test_the_module_writes_only_by_INSERT() -> None:
+    """The plane is append-only, and this module writes TWO of its tables since G-3 —
+    `publication_capability_attestation` and migration 1055's `feature_active_revision`. A
+    publication path that learned to UPDATE could turn a failed attestation into a passing one
+    without any probe running, or move a group's active-revision pointer without a run.
+
+    Deliberately a substring scan over the WHOLE source rather than over the SQL literals: a
+    statement assembled from fragments would evade a literal-only check, and the cost of the crude
+    form is only that prose here must not use the three words either.
+    """
     source = inspect.getsource(publish_module).upper()
     for forbidden in ("UPDATE ", "DELETE ", "TRUNCATE "):
         assert forbidden not in source, forbidden
+    assert source.count("INSERT INTO ") == 2
 
 
 def test_engine_versions_comparison_is_EXACT_and_not_an_ordering() -> None:

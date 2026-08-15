@@ -66,7 +66,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.canonical import materialize_hash
@@ -75,14 +75,20 @@ from featuregen.materialize.group_plan import FeatureGroupPlanV1, expected_schem
 from featuregen.materialize.inventory import EngineVersions
 
 __all__ = [
+    "ActiveRevision",
     "ProbeObservation",
     "ProbeResult",
     "PublicationCapabilityAttestation",
+    "PublicationSwap",
     "PublishMechanism",
     "PublisherSelection",
     "adds_feature_for",
     "assess_probe_observations",
+    "next_revision_seq",
+    "publish_generation",
+    "read_active_revision",
     "read_attestations",
+    "record_active_revision",
     "record_attestation",
     "select_publisher",
 ]
@@ -115,22 +121,6 @@ def _text(value: object, *, field: str, why: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} is blank ({value!r}): {why}")
     return value
-
-
-#: **TEMPORARY — G-3 DELETES THIS, together with the guard in :func:`record_attestation`.**
-#:
-#: Whether the publish step that would ACT on a proven capability exists. Until it does,
-#: ``compile/chain.py`` raises ``PublishStepMissing`` the moment ``select_publisher`` returns a
-#: selection, so ingesting one PASSING probe result for a live environment converts every
-#: materialization run of that environment from the truthful ``CAPABILITY_UNPROVEN`` terminal into
-#: a platform error — and ingesting a probe result is a legitimate operational act, not a code
-#: change (plan §0.4).
-#:
-#: It is a module constant rather than a parameter deliberately: a parameter would be a way for the
-#: caller to state that the platform has a publish step, which is not the caller's fact to state.
-#: The tests that deliberately construct the state this guard exists to prevent flip it, which is
-#: the difference between "a test built the landmine on purpose" and "an operator stepped on it".
-_PUBLISH_STEP_REGISTERED = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,22 +434,15 @@ def record_attestation(
     Returns:
         The attestation as recorded, under ``probe_result.probe_id``.
 
-    **A PASSING result is refused while G-3's publish step does not exist** (plan §0.4, and
-    ``_PUBLISH_STEP_REGISTERED``'s own note). Not because the evidence is doubted — it is refused
-    precisely because it would be BELIEVED: ``select_publisher`` would return a selection, and
-    ``compile/chain.py`` has no step to honour one, so every subsequent run of that environment
-    would fail as a platform error instead of terminating on its truthful refusal. A capability
-    record that makes the platform crash is not a capability record. A FAILING result is still
-    ingested, because nothing acts on it and it is the only evidence that distinguishes
-    ``PUBLISH_MECHANISM_UNSUPPORTED`` from ``CAPABILITY_UNPROVEN``.
+    D0's guard is GONE, with its cause. Between D0 and G-3 this function refused a PASSING result,
+    because recording one made ``select_publisher`` return a selection that ``compile/chain.py`` had
+    no publish step to honour — every run of that environment turned from its truthful refusal into
+    a platform error. G-3 built the step, so the refusal has nothing left to protect and keeping it
+    would be a guard against the platform working.
 
     Raises:
         TypeError: ``probe_result`` is not a :class:`ProbeResult` — a duck-typed stand-in would be
             a way to supply the verdict directly, which is the whole thing this refuses.
-        RuntimeError: the probe PASSED and G-3's publish step is not registered. A ``RuntimeError``
-            for ``PublishStepMissing``'s reason: this is a statement about the PLATFORM, and §14's
-            closed vocabulary has no member for "the step that would act on this has not been
-            built". **Deleted by G-3.**
         psycopg.errors.UniqueViolation: this probe has already been ingested. One probe is one
             piece of evidence and cannot support two attestations.
     """
@@ -468,16 +451,6 @@ def record_attestation(
             f"record_attestation ingests a ProbeResult, got {type(probe_result).__name__}: §10.3 "
             f"says an attestation may be created ONLY by ingesting a probe result, and accepting "
             f"anything shaped like one would restore the `passed=True` back door it removed")
-    if probe_result.passed and not _PUBLISH_STEP_REGISTERED:
-        raise RuntimeError(
-            f"probe {probe_result.probe_id!r} PASSED for environment "
-            f"{probe_result.environment_id!r} and mechanism {probe_result.mechanism.value}, and "
-            f"G-3's publish step does not exist: recording it would make select_publisher return a "
-            f"selection that compile/chain.py has no metastore write, active-revision record or "
-            f"pointer swap to honour, so every materialization run of that environment would raise "
-            f"PublishStepMissing instead of terminating on its truthful CAPABILITY_UNPROVEN "
-            f"refusal. Keep the evidence and ingest it once G-3 lands; a FAILING probe result is "
-            f"still recorded today, because nothing acts on one")
     attestation = PublicationCapabilityAttestation(
         attestation_id=probe_result.probe_id,
         environment_id=probe_result.environment_id,
@@ -724,3 +697,198 @@ def select_publisher(
         capability_attestation_id=chosen.attestation_id,
         engine_versions=engine_versions,
         adds_feature=adds_feature)
+
+
+# ── G-3: the publish step ────────────────────────────────────────────────────────────────────────
+
+
+@runtime_checkable
+class PublicationSwap(Protocol):
+    """The metastore write and the reader-visible pointer switch — the act §10.3's probe PROVES.
+
+    One method, deliberately. §10.3's probe demonstrates that *one* operation makes a whole new
+    generation visible atomically; a seam with a separate "write the metadata" and "flip the
+    pointer" would be two operations, and the attestation would be evidence about neither.
+
+    It is a Protocol and not an implementation for the reason ``src/`` imports no ``pyspark``
+    anywhere: the control plane does not acquire the artifact's engines. The deployment supplies it
+    (``chain.RunExecution.swap``), and ``None`` there means this deployment cannot publish — which
+    the chain records as the run's outcome, never as a skipped step.
+
+    ``columns`` is the plan's ``expected_schema`` in the plan's own order, because §10.3 step 5's
+    schema-evolution question is about exactly this list. ``staging_root`` is where §9's gates left
+    the assembled output; the swap makes THAT the published state and computes nothing.
+    """
+
+    def swap(self, *, published_object: str, generation_id: str, columns: Sequence[str],
+             staging_root: str) -> None:
+        """Make ``generation_id``'s staged output the reader-visible state of ``published_object``."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRevision:
+    """Migration 1055's row: which generation a reader of one group is CURRENTLY seeing.
+
+    Append-only and per-GROUP ordered, because publication is atomic per group (§10.1) and a
+    feature-scoped pointer would let two columns of one table be visible at two generations. There
+    is no ``is_current`` flag: the newest ``seq`` for a group is what holds now, and a mutable
+    current-pointer column is a record that can be rewritten.
+
+    ``published_object`` is COPIED from the binding at swap time rather than joined, because this
+    row is a claim about what was made visible and a later rebinding must not restate history.
+    ``capability_attestation_id`` is on the row so an auditor can answer "on what evidence was this
+    swap performed?" from the pointer itself — a reconstruction from "whichever attestation was
+    newest" would move as later probes are ingested.
+
+    ``recorded_at`` is the DATABASE's stamp; ``activated_at`` is the caller's instant, matching
+    ``materialization_run_event.occurred_at``. The plane mints no timestamps.
+    """
+
+    revision_id: str
+    logical_group_name: str
+    generation_id: str
+    run_id: str
+    published_object: str
+    capability_attestation_id: str
+    mechanism: PublishMechanism
+    seq: int
+    activated_at: str
+    recorded_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for field, value in (("revision_id", self.revision_id),
+                             ("logical_group_name", self.logical_group_name),
+                             ("generation_id", self.generation_id),
+                             ("run_id", self.run_id),
+                             ("published_object", self.published_object),
+                             ("capability_attestation_id", self.capability_attestation_id),
+                             ("activated_at", self.activated_at)):
+            _text(value, field=field,
+                  why="an active revision names the exact state a reader is seeing, and a blank "
+                      "field names a state nobody could find")
+        if not isinstance(self.mechanism, PublishMechanism):
+            object.__setattr__(self, "mechanism", PublishMechanism(self.mechanism))
+        if not isinstance(self.seq, int) or isinstance(self.seq, bool) or self.seq < 0:
+            raise ValueError(
+                f"active revision {self.revision_id!r} has seq {self.seq!r}: the sequence is what "
+                f"orders a group's publications, and a value that is not a whole number orders "
+                f"nothing")
+
+
+def read_active_revision(conn: DbConn, logical_group_name: str) -> ActiveRevision | None:
+    """The revision a reader of this group is seeing NOW, or ``None`` when it has never published.
+
+    The newest ``seq``, read through the ``(logical_group_name, seq DESC)`` index. ``None`` is the
+    ordinary answer for a group whose runs all terminated ``PUBLICATION_REFUSED`` — it means *"not
+    published yet"*, never *"published, target unknown"*, and any surface reporting it must say so
+    rather than inventing a table name.
+    """
+    row = conn.execute(
+        "SELECT revision_id, logical_group_name, generation_id, run_id, published_object, "
+        "capability_attestation_id, publication_mechanism, seq, activated_at, recorded_at "
+        "FROM feature_active_revision WHERE logical_group_name = %s ORDER BY seq DESC LIMIT 1",
+        (logical_group_name,)).fetchone()
+    return None if row is None else ActiveRevision(*row)
+
+
+def next_revision_seq(conn: DbConn, logical_group_name: str) -> int:
+    """The ``seq`` the next publication of this group must carry.
+
+    Read-then-write, and that is safe here for the reason ``append_run_event``'s caller-supplied seq
+    is safe: migration 1055's BEFORE-INSERT trigger refuses any value that does not strictly extend
+    the group, so two publishers that both computed the same next value cannot both win — the loser
+    raises and its whole transaction rolls back. Computing it inside the INSERT would hide that
+    check behind a value the database chose for itself.
+    """
+    row = conn.execute(
+        "SELECT max(seq) FROM feature_active_revision WHERE logical_group_name = %s",
+        (logical_group_name,)).fetchone()
+    return 0 if row is None or row[0] is None else int(row[0]) + 1
+
+
+def record_active_revision(conn: DbConn, revision: ActiveRevision) -> ActiveRevision:
+    """Write migration 1055's pointer — INSERT only, because the table is append-only.
+
+    Raises:
+        psycopg.errors.RaiseException: ``seq`` does not extend the group — a stale publisher writing
+            after a newer one, or two writers for one swap. Both leave the table unable to say what
+            a reader sees, and the append-only guards make that unrepairable.
+        psycopg.errors.UniqueViolation: this revision id was already recorded. One swap is one
+            pointer.
+    """
+    if not isinstance(revision, ActiveRevision):
+        raise TypeError(
+            f"record_active_revision writes an ActiveRevision, got {type(revision).__name__}: the "
+            f"row is the only durable statement that a feature was ever readable, and a duck-typed "
+            f"stand-in would be a way to write one without its own validation")
+    inserted = conn.execute(
+        "INSERT INTO feature_active_revision (revision_id, logical_group_name, generation_id, "
+        "run_id, published_object, capability_attestation_id, publication_mechanism, seq, "
+        "activated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING recorded_at",
+        (revision.revision_id, revision.logical_group_name, revision.generation_id,
+         revision.run_id, revision.published_object, revision.capability_attestation_id,
+         revision.mechanism.value, revision.seq, revision.activated_at)).fetchone()
+    return replace(revision, recorded_at=inserted[0] if inserted is not None else None)
+
+
+def publish_generation(
+    conn: DbConn,
+    swap: PublicationSwap,
+    *,
+    selection: PublisherSelection,
+    group_plan: FeatureGroupPlanV1,
+    generation_id: str,
+    run_id: str,
+    published_object: str,
+    staging_root: str,
+    revision_id: str,
+    activated_at: str,
+) -> ActiveRevision:
+    """G-3's publish step: RECORD the pointer, then PERFORM the swap. In that order, and not the
+    other.
+
+    **THE ORDER IS THE WHOLE DESIGN.** Both writes are inside the chain's one transaction, and only
+    one of them can be rolled back:
+
+    * *Record, then swap.* A swap that fails rolls the record back with it, the terminal event is
+      never appended, and the plane has claimed nothing. A record that fails — 1055's ordering
+      trigger firing because a newer revision already exists — means the swap never happens, so a
+      stale publisher cannot overwrite a pointer that moved past it.
+    * *Swap, then record.* A record that then failed would leave a cluster whose readers are seeing
+      a generation the plane has no row for, and the append-only plane has no repair path for the
+      row it did not write. That is the one ordering that can produce a published table nobody can
+      audit.
+
+    The irreducible residue is stated plainly: the cluster takes no part in the transaction, so a
+    swap that SUCCEEDED and was then rolled back by a later failure leaves readers on a generation
+    whose pointer row is gone. That window is one statement wide (the terminal append), it fails
+    closed — the request lands non-terminal and the reconciler reads real plane evidence — and
+    closing it properly needs a two-phase protocol against the metastore, which no probe has
+    attested and §10.3 forbids assuming.
+
+    ``selection`` is required and typed: a publish step that took a bare ``PublishMechanism`` would
+    publish on a mechanism nobody probed, which is the whole thing §10.3's shapes exist to prevent.
+
+    Returns:
+        The recorded :class:`ActiveRevision`, carrying the database's own ``recorded_at``.
+    """
+    if not isinstance(selection, PublisherSelection):
+        raise TypeError(
+            f"publish_generation needs a PublisherSelection, got {type(selection).__name__}: §10.3 "
+            f"says publication rests on evidence that this mechanism was probed and passed on the "
+            f"versions the environment runs now, and a bare mechanism is a name anybody can spell")
+    columns = tuple(column.name for column in expected_schema(group_plan))
+    revision = record_active_revision(conn, ActiveRevision(
+        revision_id=revision_id,
+        logical_group_name=group_plan.logical_group_name,
+        generation_id=generation_id,
+        run_id=run_id,
+        published_object=published_object,
+        capability_attestation_id=selection.capability_attestation_id,
+        mechanism=selection.mechanism,
+        seq=next_revision_seq(conn, group_plan.logical_group_name),
+        activated_at=activated_at))
+    swap.swap(published_object=published_object, generation_id=generation_id, columns=columns,
+              staging_root=staging_root)
+    return revision

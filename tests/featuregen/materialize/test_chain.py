@@ -18,10 +18,13 @@ drive this chain, and ``build_graph`` DELETEs the source's whole graph, so they 
 be called. :func:`_seed` therefore calls the first and then adds the second's spine tables and
 governed facts THROUGH ``test_ir``'s own helpers — a union of two definitions, never a third.
 
-**The truthfulness test is the load-bearing one.** ``test_the_chain_can_never_append_PUBLISHED``
-reads the module's AST, not its behaviour, because a behavioural test only proves that today's
-paths do not lie. Plan §3.5: the plane is append-only with a one-terminal index, so a false
-publication claim can never be retracted.
+**The truthfulness test is the load-bearing one.**
+``test_the_chain_appends_PUBLISHED_only_after_a_proven_selection_and_a_passed_gate`` replaced G-1's
+``test_the_chain_can_never_append_PUBLISHED`` when G-3 landed, and it kept both halves: the AST
+equality over the permitted event kinds (a behavioural test only proves that TODAY's paths do not
+lie, and the hazard is a path added later) plus the behavioural conjunction that says what the third
+member costs. Plan §3.5: the plane is append-only with a one-terminal index, so a false publication
+claim can never be retracted.
 """
 from __future__ import annotations
 
@@ -65,7 +68,6 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
 from tests.featuregen.materialize.test_wiring import CRM_PHYSICAL, CROSS_CATALOG_DECLARATION
 
 from featuregen.materialize import control_plane
-from featuregen.materialize import publish as publish_module
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import (
@@ -107,6 +109,8 @@ from featuregen.materialize.publish import (
     ProbeObservation,
     PublishMechanism,
     assess_probe_observations,
+    read_active_revision,
+    record_active_revision,
     record_attestation,
 )
 from featuregen.materialize.render.project import PIPELINE_NAME, REQUIRED_RUN_PARAMETERS
@@ -127,6 +131,12 @@ from featuregen.materialize.validation import (
     read_validation_reports,
 )
 from featuregen.overlay.upload.bridge_realization import ExecutionTier
+
+#: The ONLY event kinds `chain.py` may name. G-1 permitted two; G-3 added `PUBLISHED`, and the set
+#: is an EQUALITY rather than an absence check so every future widening is a deliberate edit HERE
+#: rather than a path somebody added elsewhere. The plane is append-only with a one-terminal index,
+#: so a member named by mistake is a claim nothing can retract.
+_PERMITTED_EVENT_KINDS = {"PUBLICATION_REFUSED", "PUBLISHED", "RUN_FAILED"}
 
 _FEATURE = "total_debit_amount_30d"
 _GROUP = "cif_daily"
@@ -1023,32 +1033,34 @@ def _code_strings(tree: ast.AST) -> set[str]:
             and id(node) not in docstrings}
 
 
-def test_the_chain_can_never_append_PUBLISHED() -> None:
-    """THE test that stops a future well-meaning change from lying.
+def test_the_chain_appends_PUBLISHED_only_after_a_proven_selection_and_a_passed_gate(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """G-1's `test_the_chain_can_never_append_PUBLISHED`, replaced rather than deleted — the AST half
+    still runs, because the hazard it guarded (a path added later that claims a publication the
+    plane can never retract) did not go away when the claim became possible. What changed is the
+    permitted SET, and the change is one deliberate edit to one line here.
 
-    Read off the AST rather than the behaviour: a behavioural assertion only proves that today's
-    paths do not claim publication, and the whole hazard (plan §3.5) is a path added later.
+    The behavioural half is the conjunction that member costs. Every one of these is necessary, and
+    the tests above already pin each on its own: L0 passed, the capability was PROVEN for this
+    environment at these versions, the run was prepared, L1 passed against the live metastore, the
+    pipeline completed, and the pointer was recorded before the terminal was appended. Here they are
+    asserted TOGETHER, because a conjunction is what "only after" means.
 
     It closes FOUR routes to the same unretractable write, not one. The attribute route is the
     obvious one. The STRING route is the likeliest "quick fix" and is the same write —
     `MaterializationRunEvent.__post_init__` COERCES `event_kind` (`control_plane.py:238`), so
     `event_kind="PUBLISHED"` produces the real terminal member and a guard that only inspected
-    attribute access would stay green while the plane recorded a lie. Subscript, call and `getattr`
-    are the three ways to reach a member through a name the AST cannot resolve.
-
-    Task 6 widened the permitted set by exactly ONE — `RUN_FAILED`, the terminal a run whose build
-    was not proven ends on. The assertion stays an EQUALITY over the whole set rather than a
-    "`PUBLISHED` is absent" check, so every future widening is a deliberate edit here.
+    attribute access would stay green. Subscript, call and `getattr` are the three ways to reach a
+    member through a name the AST cannot resolve.
     """
     tree = ast.parse(inspect.getsource(chain))
     members = {member.name for member in RunEventKind}
-    permitted = {"PUBLICATION_REFUSED", "RUN_FAILED"}
 
     attributes = {node.attr for node in ast.walk(tree)
                   if isinstance(node, ast.Attribute) and _is_run_event_kind(node.value)}
-    assert attributes == permitted
+    assert attributes == _PERMITTED_EVENT_KINDS
 
-    assert _code_strings(tree) & members <= permitted
+    assert _code_strings(tree) & members <= _PERMITTED_EVENT_KINDS
 
     indirect = [
         ast.dump(node) for node in ast.walk(tree)
@@ -1057,6 +1069,19 @@ def test_the_chain_can_never_append_PUBLISHED() -> None:
         or (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "getattr" and node.args and _is_run_event_kind(node.args[0]))]
     assert indirect == []
+
+    request_id = _request(catalog, request_id="req-published")
+    work_items = [_authored(catalog, monkeypatch, suffix="published")]
+    _attest_capability(catalog)
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, execution=_execution())
+
+    assert outcome.stopped_at is ChainStage.PUBLISH
+    assert outcome.terminal_event is RunEventKind.PUBLISHED
+    assert outcome.validation_report.status is ValidationStatus.PASSED
+    assert outcome.l1_report.status is ValidationStatus.PASSED
+    assert outcome.submission.completed
+    assert outcome.active_revision is not None
 
 
 def _calls_append_run_event(tree: ast.AST) -> bool:
@@ -1105,7 +1130,7 @@ def test_only_the_chain_may_append_a_RUN_EVENT_anywhere_in_src() -> None:
     """
     source_root = pathlib.Path(chain.__file__).parent.parent.parent   # src/featuregen
     definition = pathlib.Path(control_plane.__file__).resolve()       # where it is DECLARED
-    permitted = {"PUBLICATION_REFUSED", "RUN_FAILED"}
+    permitted = _PERMITTED_EVENT_KINDS
     members = {member.name for member in RunEventKind}
 
     callers = {}
@@ -1125,10 +1150,11 @@ def test_only_the_chain_may_append_a_RUN_EVENT_anywhere_in_src() -> None:
         assert _code_strings(tree) & members <= permitted, name
 
 
-def test_no_path_records_a_published_generation(ready, catalog) -> None:
-    """The behavioural half. `published_generation_ids` is what §10.1's "current plan" derivation
-    reads, so a generation that appeared there would become a group's current plan on the strength
-    of a publication that never happened."""
+def test_a_run_that_did_not_publish_records_no_published_generation(ready, catalog) -> None:
+    """`published_generation_ids` is what §10.1's "current plan" derivation reads, so a generation
+    that appeared there would become a group's current plan on the strength of a publication that
+    never happened. The `ready` fixture has no attestation and no execution seam, which is the
+    deployed shape — so this stays the ordinary case rather than the only one."""
     request_id, work_items, root = ready
 
     _run(catalog, request_id, work_items, root)
@@ -1206,35 +1232,53 @@ class _Submitter:
         return self._outcome
 
 
-def _execution(metastore=None, submitter=None, *, business_dt=_BUSINESS_DT, staging_base="/staging"):
+class _Swap:
+    """G-3's publish seam: the metastore write and the reader-visible pointer switch, recorded.
+
+    One method, because §10.3's probe demonstrates that ONE operation makes a whole generation
+    visible atomically — a seam with a separate metadata write and pointer flip would be two
+    operations and the attestation would be evidence about neither."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self._error = error
+        self.calls: list[dict] = []
+
+    def swap(self, *, published_object, generation_id, columns, staging_root) -> None:
+        self.calls.append({"published_object": published_object, "generation_id": generation_id,
+                           "columns": tuple(columns), "staging_root": staging_root})
+        if self._error is not None:
+            raise self._error
+
+
+def _execution(metastore=None, submitter=None, swap=None, *, business_dt=_BUSINESS_DT,
+               staging_base="/staging"):
     return chain.RunExecution(
         metastore=metastore or _G2Metastore(INVENTORY),
         submitter=submitter or _Submitter(),
+        swap=swap or _Swap(),
         business_dt=business_dt, staging_base=staging_base)
 
 
 def test_a_passed_L0_advances_to_prepare_run(catalog, monkeypatch, l0_passes, tmp_path) -> None:
     """The composition itself: a build-verified project under a PROVEN capability is prepared,
-    validated against the environment and submitted — in that order, and each stage reached.
-
-    The chain then raises `PublishStepMissing`, because a completed run is exactly the state G-3
-    exists for and there is nothing else true to say about it. That the raise happens INSIDE the
-    commit transaction is the point of the last assertion: nothing is left behind."""
+    validated against the environment, submitted and published — in that order, and each stage
+    reached. The ORDER is the design, not a preference: preparation resolves the exact partitions,
+    L1 checks THOSE still exist, and submission comes last because it is the only step that spends
+    cluster time."""
     request_id = _request(catalog, request_id="req-g2")
     work_items = [_authored(catalog, monkeypatch, suffix="g2")]
     _attest_capability(catalog)
-    metastore, submitter = _G2Metastore(INVENTORY), _Submitter()
+    metastore, submitter, swap = _G2Metastore(INVENTORY), _Submitter(), _Swap()
 
-    with pytest.raises(chain.PublishStepMissing, match="no publish step"):
-        _run(catalog, request_id, work_items, tmp_path,
-             execution=_execution(metastore, submitter))
+    outcome = _run(catalog, request_id, work_items, tmp_path,
+                   execution=_execution(metastore, submitter, swap))
 
     assert metastore.described, "L1 never asked the environment about a table"
     assert metastore.read_checks, "L1 never asked whether these roles may read"
     assert len(submitter.calls) == 1, "the prepared run was never submitted"
-    assert not list(tmp_path.iterdir()), "the raise rolled back the record but left a tree"
-    assert catalog.execute(
-        "SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
+    assert len(swap.calls) == 1, "the pointer was never swapped"
+    assert outcome.stopped_at is ChainStage.PUBLISH
+    assert swap.calls[0]["staging_root"] == submitter.calls[0][1]["staging_root"]
 
 
 def test_a_failed_L0_never_prepares(catalog, monkeypatch, tmp_path) -> None:
@@ -1270,8 +1314,7 @@ def test_the_prepared_parameters_are_exactly_REQUIRED_RUN_PARAMETERS(
     _attest_capability(catalog)
     submitter = _Submitter()
 
-    with pytest.raises(chain.PublishStepMissing):
-        _run(catalog, request_id, work_items, tmp_path, execution=_execution(submitter=submitter))
+    _run(catalog, request_id, work_items, tmp_path, execution=_execution(submitter=submitter))
 
     _root, parameters = submitter.calls[0]
     assert set(parameters) == set(REQUIRED_RUN_PARAMETERS)
@@ -1347,6 +1390,111 @@ def test_a_PROVEN_capability_without_an_execution_seam_is_an_UNPREPARED_run(
     assert published_generation_ids(catalog) == frozenset()
 
 
+# ── G-3: the publish step (D3) ───────────────────────────────────────────────────────────────────
+
+
+def test_a_published_run_folds_to_RunStatus_PUBLISHED(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The terminal G-1 was forbidden to write. `run_status` folds the plane's events and is the
+    only place a run's status comes from — there is no second status stored anywhere — so this is
+    what a reader of `GET /materialization-runs/{id}` will be told."""
+    request_id = _request(catalog, request_id="req-folds")
+    work_items = [_authored(catalog, monkeypatch, suffix="folds")]
+    _attest_capability(catalog)
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, execution=_execution())
+
+    assert run_status(catalog, outcome.run_id) is RunStatus.PUBLISHED
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
+    assert published_generation_ids(catalog) == frozenset({outcome.generation_id})
+    detail = read_run_events(catalog, outcome.run_id)[-1].detail
+    assert outcome.active_revision.published_object in detail
+    assert outcome.active_revision.capability_attestation_id in detail
+
+
+def test_publication_without_a_matching_attestation_is_still_refused(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """THE REFUSAL MUST SURVIVE G-3. A publish step is not permission to publish: `select_publisher`
+    still decides, and with an attestation probed on OTHER engine versions the answer is
+    `CAPABILITY_UNPROVEN` — drift is unproven rather than failed, because nobody demonstrated a
+    failure on the new versions either. The seam is fully configured, so nothing was swapped because
+    the chain DECLINED, not because it could not."""
+    request_id = _request(catalog, request_id="req-drifted")
+    work_items = [_authored(catalog, monkeypatch, suffix="drifted")]
+    _attest_capability(catalog)
+    drifted = dataclasses.replace(
+        INVENTORY, engine_versions=dataclasses.replace(INVENTORY.engine_versions, spark="3.9.9"))
+    swap = _Swap()
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, inventory=drifted,
+                   execution=_execution(swap=swap))
+
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+    assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
+    assert swap.calls == [], "the publish step ran on evidence select_publisher rejected"
+    assert read_active_revision(catalog, outcome.logical_group_name) is None
+    assert published_generation_ids(catalog) == frozenset()
+
+
+def test_the_pointer_swap_is_recorded_before_it_is_claimed(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """Both directions of the ordering, because only one of the two writes can be rolled back.
+
+    A swap that FAILS must leave no claim: the record rolls back with it, no terminal is appended,
+    and the plane has said nothing. The other order — swap first, record after — is the one that can
+    leave a cluster whose readers see a generation the plane has no row for, and the append-only
+    plane has no repair path for the row it did not write.
+    """
+    request_id = _request(catalog, request_id="req-swapfails")
+    work_items = [_authored(catalog, monkeypatch, suffix="swapfails")]
+    _attest_capability(catalog)
+    swap = _Swap(RuntimeError("the metastore refused ALTER TABLE"))
+
+    with pytest.raises(RuntimeError, match="metastore refused"):
+        _run(catalog, request_id, work_items, tmp_path, execution=_execution(swap=swap))
+
+    assert swap.calls, "the record was written and the swap was never attempted"
+    assert read_active_revision(catalog, _GROUP) is None
+    assert catalog.execute(
+        "SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
+    assert catalog.execute(
+        "SELECT count(*) FROM feature_active_revision").fetchone()[0] == 0
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_terminal_cannot_be_retracted(catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """Migration 1044's ordering trigger, exercised against the terminal that matters most.
+
+    A publication claim is the one record whose falseness could not be repaired, so the database —
+    not a convention in a writer — refuses everything after it. `PUBLISHED` is in 1044's terminal
+    list, so a later event for that run raises at INSERT, and 1055's own trigger says the same about
+    a second pointer for the group at a `seq` that does not extend it.
+    """
+    request_id = _request(catalog, request_id="req-terminal")
+    work_items = [_authored(catalog, monkeypatch, suffix="terminal")]
+    _attest_capability(catalog)
+
+    outcome = _run(catalog, request_id, work_items, tmp_path, execution=_execution())
+    revision = outcome.active_revision
+
+    # Each attempt runs in its OWN savepoint (`conn.transaction()` nested inside the fixture's
+    # transaction is a SAVEPOINT), so a refused write rolls back only itself — a bare rollback here
+    # would discard the generation row the second assertion needs and prove nothing.
+    with pytest.raises(psycopg.errors.RaiseException, match="already recorded a terminal event"), \
+            catalog.transaction():
+        control_plane.append_run_event(catalog, control_plane.MaterializationRunEvent(
+            run_id=outcome.run_id, seq=FIRST_RUN_EVENT_SEQ + 1,
+            generation_id=outcome.generation_id, event_kind=RunEventKind.RUN_FAILED,
+            occurred_at=_clock(), detail="a retraction nobody may write"))
+
+    with pytest.raises(psycopg.errors.RaiseException, match="does not extend group"), \
+            catalog.transaction():
+        record_active_revision(catalog, dataclasses.replace(
+            revision, revision_id="frev_second", recorded_at=None))
+
+    assert read_active_revision(catalog, _GROUP).revision_id == revision.revision_id
+
+
 def test_an_UNPROVEN_capability_still_terminates_PUBLICATION_REFUSED_and_prepares_nothing(
         catalog, monkeypatch, l0_passes, tmp_path) -> None:
     """G-1's terminal survives D1 unchanged, and the seam being fully configured is what proves the
@@ -1371,13 +1519,7 @@ def test_an_UNPROVEN_capability_still_terminates_PUBLICATION_REFUSED_and_prepare
 def _attest_capability(db) -> None:
     """A PASSING attestation that also covers schema evolution, for this environment, mechanism and
     engine versions — ingested through the only door there is (`record_attestation` accepts nothing
-    but a probe result, and every field of that result is derived from the observations).
-
-    It flips `publish._PUBLISH_STEP_REGISTERED` for the write, because D0's guard refuses a passing
-    attestation while G-3's publish step does not exist. That is the point of the guard and not a
-    way around it: building the landmine on purpose is what these tests are FOR, and an operator
-    doing it by accident is what the guard stops. **G-3 deletes the flip with the guard.**
-    """
+    but a probe result, and every field of that result is derived from the observations)."""
     observations = tuple(
         ProbeObservation(reader_id=f"reader-{index}", observed_at=f"2026-08-03T10:00:0{index}+00:00",
                          generation_id=generation, column_names=columns, row_count=7,
@@ -1392,12 +1534,7 @@ def _attest_capability(db) -> None:
         engine_versions=INVENTORY.engine_versions,
         completed_at="2026-08-03T10:00:09+00:00")
     assert result.passed and result.covers_schema_evolution, result
-    registered = publish_module._PUBLISH_STEP_REGISTERED
-    publish_module._PUBLISH_STEP_REGISTERED = True
-    try:
-        record_attestation(db, result)
-    finally:
-        publish_module._PUBLISH_STEP_REGISTERED = registered
+    record_attestation(db, result)
 
 
 # ── one test per refusing stage: it stops THERE, records the code, leaves nothing behind ─────────

@@ -37,6 +37,7 @@ from tests.featuregen.materialize.test_chain import (
     _inject_l0,
     _seed,
     _Submitter,
+    _Swap,
 )
 from tests.featuregen.materialize.test_inventory import _document, _write
 from tests.featuregen.materialize.test_ir import DECLARATION, INVENTORY
@@ -100,7 +101,7 @@ def _job(request_id: str, work_item_ids, *, business_dt=None) -> Materialization
         contract_overrides=None, business_dt=business_dt)
 
 
-def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None,
+def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None, swap=None,
             staging_base=None) -> MaterializationLaneConfig:
     """The DEPLOYMENT's half of the configuration — what the handler resolves at the boundary.
 
@@ -110,7 +111,8 @@ def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None,
     is honestly unprepared, which is the outcome the chain records."""
     return MaterializationLaneConfig(
         inventory=INVENTORY, project_root=str(tmp_path), l0=l0, assemble_nodes=assemble_nodes,
-        clock=_clock, metastore=metastore, submitter=submitter, staging_base=staging_base)
+        clock=_clock, metastore=metastore, submitter=submitter, swap=swap,
+        staging_base=staging_base)
 
 
 @pytest.fixture
@@ -383,32 +385,34 @@ def test_a_PROVEN_capability_this_deployment_cannot_EXECUTE_is_run_failed_not_pu
         catalog, read_request(catalog, request_id=request.request_id).run_id)[-1].detail
 
 
-def test_the_lane_classifies_PublishStepMissing_instead_of_crashing(
-        catalog, monkeypatch, l0_passes, tmp_path) -> None:
-    """The landmine's other end. With G-2 fully configured, a run that EXECUTES under a proven
-    capability reaches the one state G-3 exists for and the chain raises — a statement about the
-    PLATFORM, so it must not crash into the generic error path. The request fails, the reason is
-    durable on the queue row, and the message is dead-lettered rather than retried: an operator
-    ingesting an attestation is not a transient fault, and no retry can change it.
+def test_a_fully_configured_lane_PUBLISHES(catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The landmine's other end, and what replaced it. D0's guard and D1's
+    `test_the_lane_classifies_PublishStepMissing_instead_of_crashing` both existed only because a
+    run that EXECUTED under a proven capability had nowhere to go; G-3 built the step, so both are
+    deleted here and this is the case they were standing in for.
 
-    **DELETED BY D3**, with `PublishStepMissing` itself."""
-    request = _recorded(catalog, request_id="req-lane-executes")
-    work_items = [_authored(catalog, monkeypatch, suffix="laneexecutes")]
+    The lane writes no lifecycle of its own on this path — the chain recorded the terminal — and the
+    queue row is `done` because the message was processed."""
+    request = _recorded(catalog, request_id="req-lane-publishes")
+    work_items = [_authored(catalog, monkeypatch, suffix="lanepublishes")]
     enqueue_materialization(catalog, request, job=_job(
         request.request_id, work_items, business_dt=_BUSINESS_DT))
     _attest_capability(catalog)
+    swap = _Swap()
 
     outcome = _drain(catalog, _config(
-        tmp_path, metastore=_G2Metastore(INVENTORY), submitter=_Submitter(),
+        tmp_path, metastore=_G2Metastore(INVENTORY), submitter=_Submitter(), swap=swap,
         staging_base="/staging"))
 
-    assert outcome.status == "publish_step_missing"
+    assert outcome.status == "completed"
+    assert outcome.stopped_at == ChainStage.PUBLISH.value
     assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
-        RequestLifecycle.FAILED
-    status, error, _, _ = _queue_row(catalog, request.request_id)
-    assert status == "dead"
-    assert "publish step" in error
-    assert not list(pathlib.Path(tmp_path).iterdir())
+        RequestLifecycle.COMMITTED
+    status, _error, _, _ = _queue_row(catalog, request.request_id)
+    assert status == "done"
+    assert len(swap.calls) == 1
+    assert read_run_events(catalog, read_request(
+        catalog, request_id=request.request_id).run_id)[-1].event_kind.value == "PUBLISHED"
 
 
 def test_a_governed_refusal_fails_the_request_and_leaves_no_half_state(

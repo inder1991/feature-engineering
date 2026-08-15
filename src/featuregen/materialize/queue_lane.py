@@ -67,11 +67,6 @@ would be a retry that could never succeed — the redelivery would read a live c
 :func:`_retryable` expires this worker's lease, and the next delivery adopts it. That, plus adoption,
 is what makes "retryable" a true word in this lane rather than a label on a dead end.
 
-**PublishStepMissing is classified, not crashed.** It is a statement about the PLATFORM — an
-operator ingesting one passing probe attestation flips every run of this chain into it — so it fails
-the request with the exception's own text on the queue row's ``last_error`` and dead-letters the
-message rather than retrying a state no retry can change.
-
 **AND NONE OF IT RUNS UNLESS THE DEPLOYMENT SAYS SO.** :func:`materialization_enabled` (T9) is the
 switch, default OFF, read by the worker stage before the claim. Off, this lane costs a deployment
 nothing at all — not a query, not a counter, not a log line. See that function for why the switch
@@ -96,7 +91,6 @@ from featuregen.materialize.compile.chain import (
     CompiledGroup,
     L0Interpreter,
     NodeAssembler,
-    PublishStepMissing,
     RunExecution,
     compile_feature_group,
 )
@@ -110,7 +104,7 @@ from featuregen.materialize.contract import (
     ContractOverrides,
 )
 from featuregen.materialize.inventory import ClusterInventoryV1, load_inventory
-from featuregen.materialize.publish import PublishMechanism
+from featuregen.materialize.publish import PublicationSwap, PublishMechanism
 from featuregen.materialize.request_store import (
     MaterializationRequestV1,
     RequestLifecycle,
@@ -575,7 +569,8 @@ class MaterializationLaneConfig:
     interpreter that could not be launched would, and the run terminates ``RUN_FAILED``. It is what
     a deployment with no kedro environment honestly is.
 
-    **``metastore``/``submitter``/``staging_base`` are G-2's half of the same posture** and follow
+    **``metastore``/``submitter``/``swap``/``staging_base`` are G-2 and G-3's half of the same
+    posture** and follow
     the same rule: ``None`` is an OUTCOME — an unprepared run, terminating ``RUN_FAILED`` at
     ``ChainStage.PREPARE_RUN`` — never a skipped stage. They are separate fields here and one frozen
     :class:`~featuregen.materialize.compile.chain.RunExecution` at the chain, because a deployment
@@ -598,21 +593,25 @@ class MaterializationLaneConfig:
     metastore: MetastoreMetadata | None = None
     #: G-2's submitter. ``LocalClusterSubmitter`` is the one implementation (``submit.py:169``).
     submitter: PipelineSubmitter | None = None
+    #: G-3's publish seam: the metastore write and the reader-visible pointer switch, the one act
+    #: §10.3's probe proves. No implementation exists in ``src/`` — writing it is the same operator
+    #: precondition as the metastore adapter above.
+    swap: PublicationSwap | None = None
     #: §9's staging root base, under which ``staging_root_for`` derives a per-generation path.
     staging_base: str | None = None
 
     def execution_for(self, job: MaterializationJobV1) -> RunExecution | None:
         """The chain's G-2 seam, or ``None`` when this deployment and this job cannot execute a run.
 
-        Four values, three from the deployment and one — the business date — from the JOB, because a
+        Five values, four from the deployment and one — the business date — from the JOB, because a
         business date is a per-run declaration and a deployment-wide one would run every group at
-        whatever date the worker was configured with. ALL FOUR or ``None``: a half-configured seam
+        whatever date the worker was configured with. ALL FIVE or ``None``: a half-configured seam
         has no honest partial behaviour, and ``RunExecution`` would refuse it anyway.
         """
-        if (self.metastore is None or self.submitter is None or self.staging_base is None
-                or job.business_dt is None):
+        if (self.metastore is None or self.submitter is None or self.swap is None
+                or self.staging_base is None or job.business_dt is None):
             return None
-        return RunExecution(metastore=self.metastore, submitter=self.submitter,
+        return RunExecution(metastore=self.metastore, submitter=self.submitter, swap=self.swap,
                             business_dt=job.business_dt, staging_base=self.staging_base)
 
     @property
@@ -771,9 +770,6 @@ def process_materialization_once(
             clock=resolved.clock,
             contract_overrides=job.contract_overrides,
         )
-    except PublishStepMissing as exc:
-        return _deterministic_failure(conn, claim, request_id, accepted=accepted,
-                                      status="publish_step_missing", error=str(exc))
     except _DETERMINISTIC as exc:
         return _deterministic_failure(conn, claim, request_id, accepted=accepted,
                                       status="failed", error=f"{type(exc).__name__}: {exc}")
