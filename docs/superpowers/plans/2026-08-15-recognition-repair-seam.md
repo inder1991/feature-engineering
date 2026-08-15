@@ -377,7 +377,7 @@ the false docstring at `recognition.py:8`.
 above as turn 1, clean body as turn 2 → CLASSIFIED on `customer.relationship_attrition.churn`);
 `test_a_body_that_stays_invalid_after_repair_reaches_task_4`; `test_repair_is_recorded_on_the_llm_call`.
 
-> **TASK 3 (2026-08-15) — ACCEPTED `PENDING`.** `recognize_with_audit` now passes
+> **TASK 3 (2026-08-15) — ACCEPTED `e4477259`.** `recognize_with_audit` now passes
 > `validate_semantics=validate_recognition_output`, and the recognizer is the ONE reviewed line added
 > to Task 2's `_SEMANTIC_SEAM_CONSUMERS` allow-list. The post-call `validate_recognition_output` stays
 > as the FLOOR, re-commented to say what it now is: not the check (the same rules ran inside the loop
