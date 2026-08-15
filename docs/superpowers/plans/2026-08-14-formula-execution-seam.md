@@ -1513,7 +1513,7 @@ test asserts the two agree exhaustively.
 - `test_window_offset_and_future_horizon_advertisements_match_the_renderer`
 - `test_no_engine_capability_is_asserted_by_hand` — the constant is built, not typed (AST/structural).
 
-> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline by the main session after six consecutive
+> **ACCEPTED `945be26e` (2026-08-15).** Landed inline by the main session after six consecutive
 > subagent API connection drops (three on one agent, three on its fresh replacement — none produced
 > any file change; the worktree was verified untouched between every attempt).
 >
