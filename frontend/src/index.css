@@ -1721,6 +1721,265 @@ section > h2:first-child {
   color: var(--ink);
 }
 
+/* ------------------------------------------------------- Slice 2: the decision workspace
+   Two columns in ONE document flow. The rail is a grid CELL that sticks inside its own
+   column, so it can never paint over candidate text — the review's accessibility constraint,
+   which a `position: fixed` rail would violate by construction. Existing tokens only. */
+
+.work-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+  gap: 20px;
+  align-items: start;
+}
+
+.work-main {
+  min-width: 0;
+}
+
+.decision-rail {
+  position: sticky;
+  /* clears the app header; the rail scrolls with the page until it reaches this offset */
+  top: 62px;
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  margin-top: 32px;
+}
+
+.decision-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  margin: 0;
+}
+
+/* the tray, once it holds something: an accent hairline so the consequence reads as live */
+.decision-card[data-tray] {
+  border-color: var(--accent-line);
+}
+
+.decision-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.decision-head h3 {
+  margin: 0;
+}
+
+.decision-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.decision-actions .btn {
+  flex: 1 1 auto;
+  justify-content: center;
+}
+
+/* ------------------------------------------------------- Slice 2: narrowing the active set
+   Search + facet chips over metadata already on the wire. No sort control and no score: the
+   order stays the engine's, and these controls only hide rows. */
+
+.result-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface-2);
+}
+
+.toolbar-search {
+  flex: 1 1 260px;
+  margin: 0;
+}
+
+.facet-group {
+  display: grid;
+  gap: 5px;
+}
+
+.facet-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.facet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease-out-quart);
+}
+
+.facet-chip:hover {
+  border-color: var(--line-strong);
+}
+
+.facet-chip[aria-pressed='true'] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-weight: 600;
+}
+
+.facet-n {
+  color: var(--ink-faint);
+}
+
+.facet-chip[aria-pressed='true'] .facet-n {
+  color: var(--accent-deep);
+}
+
+.toolbar-count {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+/* the recorded feedback rounds, behind a count-bearing summary */
+.round-history {
+  margin-top: 10px;
+  font-size: 12.5px;
+}
+
+.round-history > summary {
+  cursor: pointer;
+  color: var(--ink-soft);
+}
+
+.round-history > summary:hover {
+  color: var(--ink);
+}
+
+/* ------------------------------------------------------- Slice 2: the readiness ladder
+   Inside the decision-record drawer only — readiness is not on the considered-set wire.
+   Colour is never the only carrier: each rung is a word, and the ladder has an aria-label. */
+
+.ladder {
+  display: flex;
+  gap: 0;
+  margin: 4px 0 0;
+}
+
+.rung {
+  flex: 1;
+  padding: 4px 3px;
+  border-top: 2px solid var(--line);
+  color: var(--ink-faint);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  text-align: center;
+}
+
+.rung[data-state='done'] {
+  border-top-color: var(--ok);
+  color: var(--ok);
+}
+
+.rung[data-state='here'] {
+  border-top-color: var(--warn);
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* exactly what would be computed: terms, not prose */
+.plan-grid {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.plan-grid dt {
+  color: var(--ink-faint);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.plan-grid dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------- Slice 2: narrow screens (320-767px)
+   The grid collapses to one column and the rail returns to the document immediately after the
+   list. Only the TRAY pins to the bottom edge, and only when it holds something — and the page
+   gains padding equal to its height so the last candidate row is never hidden behind it. */
+
+@media (max-width: 767px) {
+  .work-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .decision-rail {
+    position: static;
+    margin-top: 16px;
+  }
+
+  .decision-card[data-tray] {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 20;
+    border-radius: 0;
+    border-left: 0;
+    border-right: 0;
+    border-bottom: 0;
+    /* capped so the reserved space below can be guaranteed to match it */
+    max-height: 40vh;
+    overflow-y: auto;
+    box-shadow: 0 -6px 20px oklch(0.25 0.025 225 / 0.10);
+  }
+
+  /* Room for the pinned tray, reserved by CONSTRUCTION rather than by a guessed pixel height:
+     the bar can never exceed 40vh, so 40vh of padding can never be too little, and the last
+     candidate row is provably never hidden behind it (the review's narrow-screen constraint).
+     The flag is mirrored onto the layout so this needs no :has() — the padding exists only
+     while a tray is actually pinned, and vanishes with the selection. */
+  .work-layout[data-tray] {
+    padding-bottom: calc(40vh + 20px);
+  }
+
+  .result-toolbar {
+    gap: 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .facet-chip {
+    transition: none;
+  }
+}
+
 /* ---------------------------------------------------------------- workbench feedback (appended)
    Phase 3: the whole-round feedback panel (regenerate under guidance, pins kept) and the
    per-candidate refine box with its recorded revision diff. Existing tokens only; composes the

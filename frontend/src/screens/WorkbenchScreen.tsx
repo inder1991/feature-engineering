@@ -368,12 +368,9 @@ const HELP_STYLE = { fontSize: 12 } as const
 const OK_SOLID_CHIP_STYLE = {
   background: 'var(--ok-solid)', borderColor: 'transparent', color: 'var(--chip-ink)',
 } as const
-// Sticky-feel selection tray: the last row of the candidate list, pinned while the list scrolls.
-const TRAY_STYLE = {
-  position: 'sticky', bottom: 0, zIndex: 1, background: 'var(--surface)',
-  borderBottomLeftRadius: 'var(--radius-panel)', borderBottomRightRadius: 'var(--radius-panel)',
-  flexWrap: 'wrap', gap: 12,
-} as const
+// (Slice 2 retired TRAY_STYLE: the selection tray is no longer the last row of the candidate
+// list. It lives in the decision rail, which is a grid column on desktop and a pinned bar under
+// 768px — both expressed in index.css, so the row list needs no sticky child any more.)
 
 const EXAMPLE_GOAL = 'predict churn'
 
@@ -852,6 +849,179 @@ function operationGroup(c: Candidate): string {
   return OPERATION_GROUPS[klass] ?? 'Conceptual patterns'
 }
 
+// ── Slice 2: narrowing the active set, never scoring it ─────────────────────────────────────────
+//
+// Every axis is metadata the SERVER already sent for THIS round: the per-option `binding_state`
+// and the `blocked_actions` codes that ride with it, and the per-candidate `validation_status`.
+// The client computes no quality score and no ranking of its own — "Recommended" stays the
+// backend's advisory pick, with its caveat, beside the sets. These controls only HIDE rows: they
+// never reorder them, and nothing here says one candidate is better than another.
+//
+// An axis whose value is unknown for a candidate is `null`, and a null never matches a filter on
+// that axis. That is the honest arm rather than the convenient one: a free-form idea carries no
+// binding state, and "did not come back review-not-current" is not the same claim as "reviewed".
+const FACET_ORDER = ['binding', 'validation', 'review', 'tray'] as const
+type FacetAxis = (typeof FACET_ORDER)[number]
+
+const FACET_LEGEND: Record<FacetAxis, string> = {
+  binding: 'Operand binding',
+  validation: 'Design checks',
+  review: 'Recipe review',
+  tray: 'Your tray',
+}
+
+// What each facet is COUNTED FROM, said on the page. A filter whose provenance is invisible is
+// indistinguishable from a filter the UI made up.
+const FACET_SOURCE: Record<FacetAxis, string> = {
+  binding: 'the binding state the engine returned per option',
+  validation: 'the design-check status the engine returned per candidate',
+  review: 'the engine’s own RECIPE_REVIEW_NOT_CURRENT blocker',
+  tray: 'your current selection',
+}
+
+function facetOptionLabel(axis: FacetAxis, key: string): string {
+  if (axis === 'binding') return BINDING_STATE_LABEL[key] ?? humanizeCode(key)
+  if (axis === 'validation') {
+    if (key === 'DESIGN_CHECKED') return 'Design-checked'
+    if (key === 'NEEDS_EXTERNAL_VALIDATION') return 'Needs data checks'
+    return humanizeCode(key)
+  }
+  if (axis === 'review') return 'Review not current'
+  return 'Selected'
+}
+
+// One candidate's filterable values plus its search corpus. Computed once per render pass per
+// candidate; `null` on an axis means "this round said nothing about that here".
+interface CandidateFacts {
+  search: string
+  binding: string | null
+  validation: string | null
+  review: string | null
+  tray: string | null
+}
+
+function candidateFacts(
+  c: Candidate,
+  entry: OptionActionsEntry | undefined,
+  isSelected: boolean,
+): CandidateFacts {
+  const words = c.kind === 'generated'
+    ? [c.idea.name, c.idea.description, c.idea.rationale, c.idea.aggregation ?? '',
+      c.idea.grain_table ?? '', c.idea.recipe_id ?? '',
+      ...c.idea.derives_from, ...c.idea.derives_pairs.map(pair => pair[1])]
+    : [c.name, c.description, c.recipe.aggregation ?? '', c.recipe.grain_table ?? '',
+      ...c.recipe.derives_from]
+  // Review currency is its own axis and is only knowable for recipe-origin cards, exactly as the
+  // row badge reads it — the same derivation, so a chip and a badge can never disagree.
+  const reviewNotCurrent = c.kind === 'generated'
+    && c.idea.generation_source === 'recipe'
+    && (entry?.blocked_actions.create_contract ?? [])
+      .some(blocker => blocker.code === 'RECIPE_REVIEW_NOT_CURRENT')
+  return {
+    search: words.join(' ').toLowerCase(),
+    binding: entry?.binding_state ?? null,
+    validation: (c.kind === 'generated' ? c.idea.validation_status : undefined) ?? null,
+    review: reviewNotCurrent ? 'not_current' : null,
+    tray: isSelected ? 'selected' : null,
+  }
+}
+
+// Filter tokens are `axis:value`. Within one axis the chosen values are ORed (two binding states
+// mean "either"); across axes they are ANDed (a binding state AND a design-check status).
+function tokensByAxis(tokens: string[]): Map<FacetAxis, string[]> {
+  const byAxis = new Map<FacetAxis, string[]>()
+  for (const token of tokens) {
+    const cut = token.indexOf(':')
+    if (cut < 0) continue
+    const axis = token.slice(0, cut) as FacetAxis
+    if (!FACET_ORDER.includes(axis)) continue
+    byAxis.set(axis, [...(byAxis.get(axis) ?? []), token.slice(cut + 1)])
+  }
+  return byAxis
+}
+
+function matchesAxes(
+  facts: CandidateFacts,
+  byAxis: Map<FacetAxis, string[]>,
+  skip?: FacetAxis,
+): boolean {
+  for (const [axis, values] of byAxis) {
+    if (axis === skip) continue
+    const value = facts[axis]
+    if (value === null || !values.includes(value)) return false
+  }
+  return true
+}
+
+interface FacetOption { token: string; label: string; count: number }
+interface FacetGroup { axis: FacetAxis; legend: string; source: string; options: FacetOption[] }
+
+// Facet options come from the values THIS active set actually carries — no authored menu, so an
+// axis nobody measured simply has no controls. Each count is taken over the candidates that pass
+// every OTHER axis, so the number on a chip is exactly what clicking it leaves on screen.
+// A token the human has already chosen always keeps its control (even at count 0) — a filter you
+// cannot see is a filter you cannot switch off.
+function buildFacets(
+  facts: CandidateFacts[],
+  tokens: string[],
+  query: string,
+): FacetGroup[] {
+  const byAxis = tokensByAxis(tokens)
+  const groups: FacetGroup[] = []
+  for (const axis of FACET_ORDER) {
+    const counts = new Map<string, number>()
+    for (const value of tokens
+      .filter(token => token.startsWith(`${axis}:`))
+      .map(token => token.slice(axis.length + 1))) {
+      counts.set(value, 0)
+    }
+    for (const item of facts) {
+      const value = item[axis]
+      if (value === null) continue
+      if (query !== '' && !item.search.includes(query)) continue
+      if (!matchesAxes(item, byAxis, axis)) continue
+      counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+    if (counts.size === 0) continue
+    const options = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({
+        token: `${axis}:${value}`, label: facetOptionLabel(axis, value), count,
+      }))
+    groups.push({ axis, legend: FACET_LEGEND[axis], source: FACET_SOURCE[axis], options })
+  }
+  return groups
+}
+
+// ── Slice 2: the readiness ladder, from the STORED record's closed vocabulary ───────────────────
+//
+// BR-7's RECIPE_READINESS is an ordered ladder, so the record's `readiness` locates a definition
+// on it exactly — no interpolation, no client-side scoring. It is deliberately NOT rendered on
+// every row: readiness is not on the considered-set wire, only on the on-demand decision record,
+// and inventing a rung for 900 rows from data nobody sent is the defect this codebase forbids.
+//
+// "Design check" is a rung of its own and is never the top one: a design-checked definition is
+// still not a computed, back-tested feature.
+const READINESS_LADDER: { key: string; label: string }[] = [
+  { key: 'CONCEPTUAL_ONLY', label: 'Conceptual' },
+  { key: 'FORMULA_BLOCKED', label: 'Formula blocked' },
+  { key: 'FORMULA_AUTHORABLE', label: 'Formula authorable' },
+  { key: 'FORMULA_VALIDATED', label: 'Formula validated' },
+  { key: 'MATERIALIZATION_BLOCKED', label: 'Materialization blocked' },
+  { key: 'MATERIALIZATION_READY', label: 'Materialization ready' },
+]
+
+// What each rung MEANS for the human, in the split this codebase enforces: nobody has decided
+// yet / a data check is owed / structurally unsuitable — never a bare failure word.
+const READINESS_MEANING: Record<string, string> = {
+  CONCEPTUAL_ONLY: 'A pattern, with no executable definition authored yet.',
+  FORMULA_BLOCKED: 'A formula cannot be authored until a named prerequisite is settled.',
+  FORMULA_AUTHORABLE: 'A formula can be authored; nobody has authored one yet.',
+  FORMULA_VALIDATED: 'The authored formula passed its checks.',
+  MATERIALIZATION_BLOCKED: 'The formula stands; something named blocks computing it.',
+  MATERIALIZATION_READY: 'Everything needed to compute this exists.',
+  RETIRED: 'Withdrawn from the library; it will not be planned again.',
+}
 
 // D3 — the drawer body: everything rendered here is the STORED record verbatim; nothing is
 // recomputed at read time. Sections: frozen roles + measured authorities, the losing
@@ -868,8 +1038,64 @@ function AuditDrawerBody({ record }: { record: OptionDecisionRecord }) {
   const story = (record.dataset_story ?? {}) as Record<string, unknown>
   const plan = (story.binding_plan ?? null) as Record<string, unknown> | null
   const families = record.evidence.validation?.families ?? []
+  // The ladder rung this record's readiness names. An unknown value from a newer backend (or
+  // RETIRED, which is off the ladder) draws NO ladder — it renders as its own stated fact below.
+  const rungIndex = READINESS_LADDER.findIndex(rung => rung.key === record.readiness)
+  // Only the rows the story actually carries. A key the backend did not send is absent, never
+  // filled with a plausible default — this pane is what WOULD be computed, so a guess here is
+  // the most expensive kind of guess on the screen.
+  const planRows: [string, string][] = plan
+    ? ([
+      ['Reads', plan.source_table],
+      ['Population', plan.population_ref],
+      ['Window', plan.window === undefined || plan.window === null
+        ? null : `${String(plan.window)} days`],
+      ['Point in time', plan.pit],
+    ] as [string, unknown][])
+      .filter((row): row is [string, string] =>
+        row[1] !== null && row[1] !== undefined && String(row[1]) !== '')
+      .map(([term, value]) => [term, String(value)])
+    : []
   return (
     <div style={{ display: 'grid', gap: 10 }}>
+      {/* ── Readiness ─────────────────────────────────────────────────────────────────────────
+          "Design-checked" and "can actually be computed" are different claims, and the platform
+          stores them as different fields. Collapsing them is how a proposal starts reading like a
+          deployable feature, so they get separate rungs and the blocker keeps its own sentence. */}
+      <section aria-label="readiness">
+        <h4 style={{ margin: '0 0 4px' }}>How far this definition has been taken</h4>
+        {rungIndex >= 0 ? (
+          <div
+            className="ladder"
+            role="img"
+            aria-label={`Readiness: ${READINESS_LADDER[rungIndex].label.toLowerCase()}, `
+              + `rung ${rungIndex + 1} of ${READINESS_LADDER.length}`}
+          >
+            {READINESS_LADDER.map((rung, i) => (
+              <span
+                key={rung.key}
+                className="rung"
+                data-state={i < rungIndex ? 'done' : i === rungIndex ? 'here' : 'todo'}
+              >
+                {rung.label}
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p style={{ margin: 0 }}>
+            Readiness reported as <span className="mono">{record.readiness}</span>.
+          </p>
+        )}
+        <p style={{ margin: '6px 0 0' }}>
+          {READINESS_MEANING[record.readiness]
+            ?? 'This readiness state is not one this screen has copy for; it is shown as the '
+              + 'engine reported it.'}{' '}
+          Readiness is separate from the design check
+          {record.validation_status === 'NEEDS_EXTERNAL_VALIDATION'
+            ? ', which is still owed data checks here'
+            : ''}, and neither is a claim about predictive value.
+        </p>
+      </section>
       <section aria-label="frozen roles">
         <h4 style={{ margin: '0 0 4px' }}>Bound roles (frozen at serving)</h4>
         <ul style={{ margin: 0, paddingLeft: 16 }}>
@@ -899,17 +1125,20 @@ function AuditDrawerBody({ record }: { record: OptionDecisionRecord }) {
           </ul>
         </section>
       )}
-      {plan && (
+      {planRows.length > 0 && (
+        // The frozen plan the engine already produced, as terms rather than prose: a reviewer
+        // approving a definition should be able to read the read-set and the point-in-time rule
+        // without leaving the page.
         <section aria-label="plan summary">
-          <h4 style={{ margin: '0 0 4px' }}>Frozen plan</h4>
-          <p style={{ margin: 0 }}>
-            Reads <span className="mono">{String(plan.source_table ?? '')}</span>
-            {plan.window ? <> over {String(plan.window)} days</> : null}
-            {plan.population_ref
-              ? <>; population <span className="mono">{String(plan.population_ref)}</span></>
-              : null}
-            {plan.pit ? <>; point-in-time: {String(plan.pit)}</> : null}
-          </p>
+          <h4 style={{ margin: '0 0 4px' }}>Exactly what would be computed</h4>
+          <dl className="plan-grid">
+            {planRows.map(([term, value]) => (
+              <Fragment key={term}>
+                <dt>{term}</dt>
+                <dd>{value}</dd>
+              </Fragment>
+            ))}
+          </dl>
         </section>
       )}
       {families.length > 0 && (
@@ -974,6 +1203,11 @@ export function WorkbenchScreen() {
   const [rejectionsOpen, setRejectionsOpen] = useState(false)
   // Which set's features the one detail list shows (multi-set rounds only).
   const [activeLens, setActiveLens] = useState<string | null>(null)
+  // Slice 2: narrowing WITHIN the active set. Both are pure view state — they hide rows and
+  // nothing else. Selection, registration and governance all read `allCandidates`, so a filtered
+  // row keeps its pick and a hidden pick is still counted (and said) in the decision rail.
+  const [candidateQuery, setCandidateQuery] = useState('')
+  const [filterTokens, setFilterTokens] = useState<string[]>([])
   const [drafts, setDrafts] = useState<DraftCandidate[]>([])
   // GLOBAL selection across set views: candidate key -> the lens it was picked from (null for
   // drafts and flat-list picks). Keys carry the fetch sequence, so cleared rounds stay inert.
@@ -1149,11 +1383,38 @@ export function WorkbenchScreen() {
     ? (generated ?? []).filter(c => c.kept === true || c.lenses.includes(activeLens))
     : generated ?? []
   const listCandidates: Candidate[] = [...visibleGenerated, ...drafts]
+  // Slice 2: search + facets narrow WITHIN the active set. The facts come from the wire (per
+  // option `binding_state` and its blocker codes, per candidate `validation_status`) plus the
+  // human's own tray; the client adds no score and no reordering. `readiness` is NOT here on
+  // purpose: it is not on the considered-set response — only on the on-demand decision record —
+  // so a readiness facet over this list would be counting a field nobody sent.
+  const activeQuery = candidateQuery.trim().toLowerCase()
+  const listFacts = new Map<string, CandidateFacts>()
+  for (const c of listCandidates) {
+    const entry = c.kind === 'generated' && c.idea.option_id
+      ? optionActions[c.idea.option_id]
+      : undefined
+    listFacts.set(c.key, candidateFacts(c, entry, c.key in selected))
+  }
+  const activeAxes = tokensByAxis(filterTokens)
+  const facetGroups = buildFacets([...listFacts.values()], filterTokens, activeQuery)
+  const filteredList = listCandidates.filter(c => {
+    const facts = listFacts.get(c.key)!
+    if (activeQuery !== '' && !facts.search.includes(activeQuery)) return false
+    return matchesAxes(facts, activeAxes)
+  })
+  const narrowing = activeQuery !== '' || filterTokens.length > 0
+  // Picks the current narrowing hides. Selection is global by design, so the rail must say when
+  // its count includes rows the list is not showing — a consequence you cannot see is the exact
+  // thing the decision rail exists to prevent.
+  const hiddenSelectedCount = narrowing
+    ? listCandidates.filter(c => c.key in selected && !filteredList.includes(c)).length
+    : 0
   // D3 1b: group the browsing list by each candidate's TYPED operation class. Only when at
   // least two REAL groups exist (else the flat list stays byte-identical); order = first
   // appearance, so the engine's ranking still decides what leads.
   const groupOrder: string[] = []
-  for (const c of listCandidates) {
+  for (const c of filteredList) {
     const g = operationGroup(c)
     if (!groupOrder.includes(g)) groupOrder.push(g)
   }
@@ -1161,13 +1422,13 @@ export function WorkbenchScreen() {
   if (groupOrder.length > 1) {
     for (const g of groupOrder) {
       let first = true
-      for (const c of listCandidates.filter(x => operationGroup(x) === g)) {
+      for (const c of filteredList.filter(x => operationGroup(x) === g)) {
         groupedList.push({ heading: first ? g : null, candidate: c })
         first = false
       }
     }
   } else {
-    for (const c of listCandidates) groupedList.push({ heading: null, candidate: c })
+    for (const c of filteredList) groupedList.push({ heading: null, candidate: c })
   }
   // One definition per non-empty line: the button label and its gating read this directly.
   const draftLines = describeText.split('\n').map(line => line.trim()).filter(Boolean)
@@ -1186,6 +1447,11 @@ export function WorkbenchScreen() {
   // from — governing it would 422 or silently mint a contract from the pre-refine data. None govern.
   const governableCount = selectedCandidates.filter(
     c => c.kind === 'generated' && !c.kept && (refines[c.key]?.appliedRound ?? null) === null).length
+  // Per-item outcomes for the rail, counted over the round rather than over the visible list:
+  // a row that scrolled away, or that the current filter hides, still had its write attempted.
+  const settledRows = allCandidates.filter(
+    c => registered[c.key] !== undefined || governed[c.key] !== undefined).length
+  const failedRows = allCandidates.filter(c => errors[c.key] !== undefined).length
   // Distinct set origins of the current picks, for the tray's mix note.
   const originLenses = [...new Set(
     selectedCandidates
@@ -1274,7 +1540,17 @@ export function WorkbenchScreen() {
     )
   }
 
+  // Slice 2: the search box and the facet chips are scoped to ONE round's active set. A new
+  // round replaces that set, so carrying a filter across would hide fresh candidates behind a
+  // control the human aimed at candidates that no longer exist. Cleared with every path that
+  // replaces or voids the round.
+  function clearResultView() {
+    setCandidateQuery('')
+    setFilterTokens([])
+  }
+
   function clearSets() {
+    clearResultView()
     setSetLenses([])
     setRecommendation(null)
     setActiveLens(null)
@@ -1408,6 +1684,7 @@ export function WorkbenchScreen() {
         : null)
     setRejections(cs.rejections)
     setRejectionsOpen(false)
+    clearResultView()
     setScreenedTarget(target.trim() || null)
     setConfirmingBatch(false)
     setConfirmingGovern(false)
@@ -1828,6 +2105,7 @@ export function WorkbenchScreen() {
           : null)
       setRejections(round.rejections)
       setRejectionsOpen(false)
+      clearResultView()
       setConfirmingBatch(false)
       setConfirmingGovern(false)
       setSetFbRounds(r => r + 1)
@@ -2164,6 +2442,25 @@ export function WorkbenchScreen() {
     : originLenses.length === 1 && originLenses[0] !== undefined
       ? `from the ${lensLabel(originLenses[0])} set`
       : null
+  // Which of the current picks the server will also sign into contracts, in words. Governability
+  // is the SERVER's verdict (an open intent + a fresh, unrefined generated candidate); the rail
+  // reports it and never re-derives it. Every arm names what CAN still happen, because "cannot be
+  // governed" is a fact about this round's snapshot, not a judgement on the candidate.
+  const governabilityNote = intentId === null
+    ? 'No governing intent is open for this round, so these can be registered but not signed '
+      + 'into contracts.'
+    : governableCount === 0
+      ? 'None of these can be governed from this round: a pick kept from an earlier round, a '
+        + "revised candidate, or your own draft sits outside this round's governable snapshot. "
+        + 'Registering still works.'
+      : governableCount === selectedCount
+        ? selectedCount === 1
+          ? 'It can also be governed into a signed contract.'
+          : `All ${selectedCount} can also be governed into signed contracts.`
+        : `${governableCount} of ${selectedCount} can also be governed into signed contracts; `
+          + 'the rest came from an earlier round, a revision, or your own drafts, and can only '
+          + 'be registered.'
+
   const mixNote = multiSet && selectedCount > 0
     ? keptPicked > 0
       ? lensNote !== null
@@ -2898,620 +3195,782 @@ export function WorkbenchScreen() {
         </>
       )}
 
+      {/* ── Slice 2: the decision workspace ───────────────────────────────────────────────────
+          Two columns in ONE document flow: the work, and the rail that says what the work will
+          cost. The rail is a grid CELL, not an overlay — it sticks within its own column, so it
+          can never cover a candidate's text (the review's accessibility constraint). Below
+          768px the grid collapses to one column, the rail returns to the document immediately
+          after the list, and only its tray pins to the bottom edge — with page padding under
+          the list so the last row is never hidden behind it. */}
       {allCandidates.length > 0 && (
-        <>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginTop: 32 }}>
-            <h2>{multiSet ? 'Proposed feature sets' : 'Proposed features'}</h2>
-            <span className="micro-label tabular-nums">
-              {multiSet && generated !== null ? (
-                <>
-                  <span style={{ color: 'var(--accent)' }}>{setLenses.length}</span> sets ·{' '}
-                  <span style={{ color: 'var(--accent)' }}>{generated.length}</span>{' '}
-                  {generated.length === 1 ? 'feature' : 'features'}
-                </>
-              ) : (
-                <>
-                  <span style={{ color: 'var(--accent)' }}>{listCandidates.length}</span>{' '}
-                  {listCandidates.length === 1 ? 'candidate' : 'candidates'}
-                </>
-              )}
-            </span>
-          </div>
-          <p className="hint" style={{ marginTop: 4 }}>
-            <strong style={{ color: 'var(--ink)' }}>
-              Nothing below enters the catalog without your approval.
-            </strong>
-            {hasGenerated &&
-              ' Design-checked: structurally safe against leakage, staleness, and double-counting. Predictive value is proven later by backtests.'}
-          </p>
-          {screenedTarget && (
-            <p className="hint" style={{ marginTop: 4 }}>
-              Screened against <span className="mono">{screenedTarget}</span>: leaky candidates
-              were rejected before reaching you.
-            </p>
-          )}
-          {rejections.length > 0 && (
-            <RejectionsPanel
-              rejections={rejections}
-              open={rejectionsOpen}
-              onToggle={() => setRejectionsOpen(open => !open)}
-            />
-          )}
-          {/* ── What this run's options are made of ─────────────────────────────────────────────
-              A count is not a queue. Every number here is tallied from the `binding_state` the
-              server put on each option of THIS run — nothing is authored, nothing is carried over
-              from another run, and the strip simply does not render when the response carried no
-              option-actions entries to count. Each state says what it MEANS, because "ambiguous"
-              on its own reads as a failure when it is confirmation work nobody has done yet. */}
-          {composition.length > 0 && (
-            <div className="panel composition" id="wb-composition">
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
-                <h3 style={{ margin: 0 }}>What this run returned</h3>
-                <span className="micro-label tabular-nums">
-                  <span style={{ color: 'var(--accent)' }}>{optionEntries.length}</span>{' '}
-                  {optionEntries.length === 1 ? 'option' : 'options'}
-                </span>
-              </div>
-              <p className="hint" style={{ marginTop: 4 }}>
-                Counted from the binding state the engine returned for each option
-                {allCandidates.length !== optionEntries.length
-                  && ` (${allCandidates.length} ${allCandidates.length === 1
-                    ? 'candidate is' : 'candidates are'} on the list below)`}
-                .
-              </p>
-              <div
-                className="comp-bar"
-                role="img"
-                aria-label={composition
-                  .map(row => `${row.count} ${row.label.toLowerCase()}`).join(', ')}
-              >
-                {composition.map(row => (
-                  <span
-                    key={row.state}
-                    className="comp-seg"
-                    data-state={row.state}
-                    style={{ width: `${(row.count / optionEntries.length) * 100}%` }}
-                  />
-                ))}
-              </div>
-              <ul className="comp-key">
-                {composition.map(row => (
-                  <li key={row.state}>
-                    <span className="comp-dot" data-state={row.state} aria-hidden="true" />
-                    <span className="comp-n tabular-nums">{row.count}</span>
-                    <span>
-                      <strong>{row.label}</strong>
-                      {row.meaning !== null && <> — {row.meaning}</>}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {multiSet && generated !== null && (
-            <>
-              <div className="sets">
-                {setLenses.map(lens => {
-                  const feats = generated.filter(c => c.lenses.includes(lens))
-                  const inTray = feats.filter(
-                    c => c.key in selected || registered[c.key] !== undefined).length
-                  const isActive = lens === activeLens
-                  const thesis = LENS_THESES[lens]
-                  return (
-                    <div key={lens} className="set-card" data-active={isActive || undefined}>
-                      <button
-                        type="button"
-                        className="set-card-view"
-                        aria-pressed={isActive}
-                        onClick={() => setActiveLens(lens)}
-                      >
-                        <span className="set-lens">
-                          Lens · {lensLabel(lens)}
-                          {recommendation?.recommended_lens === lens && (
-                            <span className="badge recommended">Recommended</span>
-                          )}
-                        </span>
-                        <span className="set-name">{lensLabel(lens)} set</span>
-                        {thesis !== undefined && <span className="set-thesis">{thesis}</span>}
-                        <span className="set-meta tabular-nums">
-                          {feats.length} {feats.length === 1 ? 'feature' : 'features'} · all
-                          design-checked
-                          {inTray > 0 ? ` · ${inTray} in your tray` : ''}
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        className="btn set-take"
-                        aria-label={`Take this set (${lensLabel(lens)})`}
-                        onClick={() => takeSet(lens)}
-                      >
-                        Take this set
-                      </button>
-                    </div>
-                  )
-                })}
-              </div>
-              {recommendation !== null && (
-                <div className="advice">
-                  <p>
-                    <strong>
-                      Engine's pick: {lensLabel(recommendation.recommended_lens)}.
-                    </strong>{' '}
-                    {recommendation.reasoning}
-                  </p>
-                  <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
-                </div>
-              )}
-            </>
-          )}
-          <ul className="rows">
-            {groupedList.map(({ heading, candidate: c }) => {
-              const reg = registered[c.key]
-              const gov = governed[c.key]
-              const error = errors[c.key]
-              const rawName = c.kind === 'generated' ? c.idea.name : c.name
-              const displayName = rawName.trim() || 'unnamed draft'
-              const sameNameVariants = c.kind === 'generated'
-                ? (generated ?? []).filter(other => other.idea.name === c.idea.name).length
-                : 0
-              const variantContext = c.kind === 'generated' && sameNameVariants > 1
-                ? c.kept
-                  ? 'earlier round'
-                  : `${c.lenses[0] ?? 'unscoped'}; ${generationSourceLabel(c.idea)}`
-                : null
-              // A4: the SERVER decides selectability. A card with an option-actions entry is
-              // selectable only when create_contract is allowed; its first blocker's next
-              // step becomes the disabled control's tooltip. Cards without an entry
-              // (legacy/free-form, pre-B1) keep today's rule — the draft fold still gates.
-              const actionsEntry = c.kind === 'generated' && c.idea.option_id
-                ? optionActions[c.idea.option_id]
-                : undefined
-              const canSelect = actionsEntry
-                ? actionsEntry.allowed_actions.includes('create_contract')
-                : c.kind === 'generated' || c.name.trim() !== ''
-              const blockedTitle = actionsEntry && !canSelect
-                ? actionsEntry.blocked_actions.create_contract?.[0]?.next_step
-                  ?? 'not yet actionable'
-                : undefined
-              const description = c.kind === 'generated' ? c.idea.description : c.description
-              // D3 §UI-04 "can it be built": the SERVER's own verdict — plannable when
-              // create_contract is allowed; else the first blocker's named next step.
-              const buildability = actionsEntry
-                ? (actionsEntry.allowed_actions.includes('create_contract')
-                  ? 'Plannable — a governed contract is available'
-                  : actionsEntry.blocked_actions.create_contract?.[0]?.next_step ?? null)
-                : null
-              // Review currency is its OWN axis (never folded into one green badge): derived
-              // from the server's blocker codes, shown only for recipe-origin cards.
-              const reviewNotCurrent = c.kind === 'generated'
-                && c.idea.generation_source === 'recipe'
-                && (actionsEntry?.blocked_actions.create_contract ?? [])
-                  .some(b => b.code === 'RECIPE_REVIEW_NOT_CURRENT')
-              const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
-              const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
-              const derives = c.kind === 'generated'
-                ? fmtPairs(c.idea.derives_pairs)
-                : c.recipe.derives_from.map(ref => `${c.snapshotSource}:${ref}`).join(', ') || 'none'
-              const refine = refines[c.key] ?? EMPTY_REFINE
-              const refineExhausted = refine.rounds >= FEEDBACK_ROUNDS
-              return (
-                <Fragment key={c.key}>
-                {heading !== null && (
-                  <li aria-hidden={false} role="presentation" className="row-group-heading"
-                      style={{ listStyle: 'none', paddingTop: 10 }}>
-                    <h4 style={{ margin: 0, fontSize: 13, color: 'var(--ink-soft)',
-                                 textTransform: 'uppercase', letterSpacing: 0.4 }}>
-                      {heading}
-                    </h4>
-                  </li>
+        // `data-tray` is mirrored here so the narrow-screen stylesheet can reserve room for the
+        // pinned tray with a plain attribute selector — no :has(), and the reservation exists
+        // only while there is something to pin.
+        <div className="work-layout" data-tray={selectedCount > 0 || undefined}>
+          <div className="work-main">
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginTop: 32 }}>
+              <h2>{multiSet ? 'Proposed feature sets' : 'Proposed features'}</h2>
+              <span className="micro-label tabular-nums">
+                {multiSet && generated !== null ? (
+                  <>
+                    <span style={{ color: 'var(--accent)' }}>{setLenses.length}</span> sets ·{' '}
+                    <span style={{ color: 'var(--accent)' }}>{generated.length}</span>{' '}
+                    {generated.length === 1 ? 'feature' : 'features'}
+                  </>
+                ) : (
+                  <>
+                    <span style={{ color: 'var(--accent)' }}>{listCandidates.length}</span>{' '}
+                    {listCandidates.length === 1 ? 'candidate' : 'candidates'}
+                  </>
                 )}
-                <li
-                  className="row"
-                  id={`wb-row-${c.key}`}
-                  tabIndex={-1}
-                  style={{ alignItems: 'flex-start' }}
+              </span>
+            </div>
+            <p className="hint" style={{ marginTop: 4 }}>
+              <strong style={{ color: 'var(--ink)' }}>
+                Nothing below enters the catalog without your approval.
+              </strong>
+              {hasGenerated &&
+                ' Design-checked: structurally safe against leakage, staleness, and double-counting. Predictive value is proven later by backtests.'}
+            </p>
+            {screenedTarget && (
+              <p className="hint" style={{ marginTop: 4 }}>
+                Screened against <span className="mono">{screenedTarget}</span>: leaky candidates
+                were rejected before reaching you.
+              </p>
+            )}
+            {rejections.length > 0 && (
+              <RejectionsPanel
+                rejections={rejections}
+                open={rejectionsOpen}
+                onToggle={() => setRejectionsOpen(open => !open)}
+              />
+            )}
+            {/* ── What this run's options are made of ─────────────────────────────────────────────
+                A count is not a queue. Every number here is tallied from the `binding_state` the
+                server put on each option of THIS run — nothing is authored, nothing is carried over
+                from another run, and the strip simply does not render when the response carried no
+                option-actions entries to count. Each state says what it MEANS, because "ambiguous"
+                on its own reads as a failure when it is confirmation work nobody has done yet. */}
+            {composition.length > 0 && (
+              <div className="panel composition" id="wb-composition">
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+                  <h3 style={{ margin: 0 }}>What this run returned</h3>
+                  <span className="micro-label tabular-nums">
+                    <span style={{ color: 'var(--accent)' }}>{optionEntries.length}</span>{' '}
+                    {optionEntries.length === 1 ? 'option' : 'options'}
+                  </span>
+                </div>
+                <p className="hint" style={{ marginTop: 4 }}>
+                  Counted from the binding state the engine returned for each option
+                  {allCandidates.length !== optionEntries.length
+                    && ` (${allCandidates.length} ${allCandidates.length === 1
+                      ? 'candidate is' : 'candidates are'} on the list below)`}
+                  .
+                </p>
+                <div
+                  className="comp-bar"
+                  role="img"
+                  aria-label={composition
+                    .map(row => `${row.count} ${row.label.toLowerCase()}`).join(', ')}
                 >
-                  {reg || gov ? (
-                    <CheckGlyph />
-                  ) : (
-                    <input
-                      type="checkbox"
-                      aria-label={`Select ${displayName}${variantContext ? ` (${variantContext})` : ''}`}
-                      title={blockedTitle}
-                      checked={c.key in selected}
-                      disabled={batchBusy || !canSelect}
-                      onChange={() => toggleSelect(
-                        // A kept row belongs to no current set: selecting it never stamps the
-                        // viewed lens; its neutral origin drives the tray mix note.
-                        c.key,
-                        c.kind === 'generated' && multiSet && c.kept !== true
-                          ? activeLens
-                          : null)}
-                      style={{ width: 18, height: 18, margin: 10, flex: 'none' }}
+                  {composition.map(row => (
+                    <span
+                      key={row.state}
+                      className="comp-seg"
+                      data-state={row.state}
+                      style={{ width: `${(row.count / optionEntries.length) * 100}%` }}
                     />
-                  )}
-                  <div style={{ display: 'grid', gap: 8, flex: 1, minWidth: 0, padding: '6px 0' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-                      <span className={c.kind === 'draft' ? 'mono' : undefined} style={{ fontWeight: 600 }}>
-                        {displayName}
+                  ))}
+                </div>
+                <ul className="comp-key">
+                  {composition.map(row => (
+                    <li key={row.state}>
+                      <span className="comp-dot" data-state={row.state} aria-hidden="true" />
+                      <span className="comp-n tabular-nums">{row.count}</span>
+                      <span>
+                        <strong>{row.label}</strong>
+                        {row.meaning !== null && <> — {row.meaning}</>}
                       </span>
-                      <span className="badge proposal">
-                        {c.kind === 'generated' ? 'Proposal' : 'Draft'}
-                      </span>
-                      {c.kind === 'generated' && (
-                        <span className="badge">{generationSourceLabel(c.idea)}</span>
-                      )}
-                      {c.kind === 'generated' && c.idea.candidate_status && (
-                        <span className="badge">{c.idea.candidate_status}</span>
-                      )}
-                      {/* Honest stamp — SE-12: the tri-state decides the chip. A candidate the
-                          backend marked NEEDS_EXTERNAL_VALIDATION must never wear the green
-                          "design-checked" badge; it wears the amber checks-outstanding one, with
-                          the count. Drafts skip the gauntlet, so they carry no stamp. */}
-                      {c.kind === 'generated'
-                        && c.idea.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
-                        <span className="badge stale">
-                          needs data checks{c.idea.requirements?.length
-                            ? ` (${c.idea.requirements.length})` : ''}
-                        </span>
-                      )}
-                      {c.kind === 'generated' && c.idea.verification
-                        && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
-                        <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
-                      )}
-                      {reviewNotCurrent && (
-                        <span className="badge stale">review not current</span>
-                      )}
-                      {/* Pinned through a whole-round regeneration. Registered rows skip the
-                          chip: Registered is already their mark. */}
-                      {c.kind === 'generated' && c.kept === true && !reg && !gov && (
-                        <span className="badge">Kept</span>
-                      )}
-                      {/* The human approved an engine revision in round n. */}
-                      {c.kind === 'generated' && refine.appliedRound !== null && (
-                        <span className="badge revised">Revised · R{refine.appliedRound}</span>
-                      )}
-                      {/* Task 3 near-label critic: FLAG-ONLY. Only too_close renders — a warning
-                          the human weighs, never a removal. no_finding is not a clearance (no
-                          chip); abstain is honest absence. */}
-                      {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close' && (
-                        <span className="badge stale">⚠ near label</span>
-                      )}
-                    </div>
-                    <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
-                    {buildability && (
-                      <p style={{ color: 'var(--ink-soft)', fontSize: 13 }} role="note">
-                        {buildability}
-                      </p>
-                    )}
-                    {c.kind === 'generated' && c.idea.rationale && (
-                      <p style={{ color: 'var(--ink-soft)' }}>
-                        {c.idea.generation_source === 'llm_intent'
-                          ? "Model's rationale: " : 'Why: '}
-                        {c.idea.rationale}
-                      </p>
-                    )}
-                    {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close'
-                      && c.idea.near_label_rationale && (
-                      <p style={{ color: 'var(--ink-soft)' }} role="note">
-                        Near-label check: {c.idea.near_label_rationale}
-                      </p>
-                    )}
-                    {/* SE-12 "Inputs and why": one row per typed operand role — the binding
-                        the engine actually chose, its MEASURED authority, and whether Gate-1
-                        confirmation is outstanding. Only engine/recipe candidates carry these;
-                        an LLM free-form idea keeps its untyped derives list below. */}
-                    {c.kind === 'generated' && (c.idea.input_role_bindings?.length ?? 0) > 0 && (
-                      <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2, margin: 0,
-                          paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
-                        {c.idea.input_role_bindings!.map(binding => (
-                          <li key={binding.role}>
-                            <span style={{ fontWeight: 600 }}>{binding.role}</span>
-                            {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
-                            {binding.authority && <> · {binding.authority}</>}
-                            {binding.confirmation_required && (
-                              // UI-06: straight to the asset field-decision screen, focused
-                              // on THIS field. Returning regenerates a fresh run — the card
-                              // never self-approves its own metadata.
-                              <a
-                                className="badge stale"
-                                style={{ marginLeft: 6 }}
-                                href={binding.ref
-                                  ? `#asset?source=${encodeURIComponent(binding.ref[0])}`
-                                    + `&object_ref=${encodeURIComponent(binding.ref[1])}`
-                                  : '#governance'}
-                              >
-                                needs confirmation →
-                              </a>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {/* SE-12: the outstanding checks, task-first — what somebody DOES, with the
-                        backend's own prose (which names the semantic origin) as the fine print. */}
-                    {c.kind === 'generated' && (c.idea.requirements?.length ?? 0) > 0 && (
-                      <ul aria-label="outstanding checks" style={{ display: 'grid', gap: 2,
-                          margin: 0, paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
-                        {c.idea.requirements!.map(req => (
-                          <li key={`${req.code}:${req.operand[1]}`}>
-                            {requirementTask(req.code)}
-                            {' — '}<span className="mono">{req.operand[1]}</span>
-                            {req.detail && (
-                              <span style={{ display: 'block', fontSize: 12 }}>{req.detail}</span>
-                            )}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                    {/* Task 4b emission policy: the untaken parameterisations, named on the
-                        card — chosen value in brackets. Server populates only under its flag. */}
-                    {c.kind === 'generated' && c.idea.param_alternatives && (
-                      <p style={{ color: 'var(--ink-soft)' }}>
-                        Also available — {c.idea.param_alternatives}
-                      </p>
-                    )}
-                    {/* D3 (UI-02): the audit drawer — the STORED decision record on demand,
-                        by exact (revision, option) key. Only options with decision rows
-                        (engine candidates on a v2 revision) offer it. */}
-                    {c.kind === 'generated' && c.idea.option_id
-                      && consideredRevisionId
-                      && optionActions[c.idea.option_id] && (
-                      <div>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {multiSet && generated !== null && (
+              <>
+                <div className="sets">
+                  {setLenses.map(lens => {
+                    const feats = generated.filter(c => c.lenses.includes(lens))
+                    const inTray = feats.filter(
+                      c => c.key in selected || registered[c.key] !== undefined).length
+                    const isActive = lens === activeLens
+                    const thesis = LENS_THESES[lens]
+                    return (
+                      <div key={lens} className="set-card" data-active={isActive || undefined}>
                         <button
                           type="button"
-                          className="btn"
-                          aria-expanded={auditOpenFor === c.idea.option_id}
-                          onClick={() => void toggleAudit(c.idea.option_id!)}
+                          className="set-card-view"
+                          aria-pressed={isActive}
+                          onClick={() => setActiveLens(lens)}
                         >
-                          {auditOpenFor === c.idea.option_id
-                            ? 'Hide decision record' : 'Decision record'}
+                          <span className="set-lens">
+                            Lens · {lensLabel(lens)}
+                            {recommendation?.recommended_lens === lens && (
+                              <span className="badge recommended">Recommended</span>
+                            )}
+                          </span>
+                          <span className="set-name">{lensLabel(lens)} set</span>
+                          {thesis !== undefined && <span className="set-thesis">{thesis}</span>}
+                          <span className="set-meta tabular-nums">
+                            {feats.length} {feats.length === 1 ? 'feature' : 'features'} · all
+                            design-checked
+                            {inTray > 0 ? ` · ${inTray} in your tray` : ''}
+                          </span>
                         </button>
-                        {auditOpenFor === c.idea.option_id && (
-                          <div aria-label="decision record" className="audit-drawer"
-                               style={{ marginTop: 8, padding: 12, fontSize: 13,
-                                        border: '1px solid var(--line)', borderRadius: 6 }}>
-                            {auditError && <p role="alert">{auditError}</p>}
-                            {!auditError && !auditDetail && <p>Loading the stored record…</p>}
-                            {auditDetail?.decision_record ? (
-                              <AuditDrawerBody record={auditDetail.decision_record} />
-                            ) : auditDetail && !auditError ? (
-                              <p className="hint">
-                                No stored decision record — this option predates the
-                                decision store. Nothing is recomputed in its place.
-                              </p>
-                            ) : null}
-                          </div>
+                        <button
+                          type="button"
+                          className="btn set-take"
+                          aria-label={`Take this set (${lensLabel(lens)})`}
+                          onClick={() => takeSet(lens)}
+                        >
+                          Take this set
+                        </button>
+                      </div>
+                    )
+                  })}
+                </div>
+                {recommendation !== null && (
+                  <div className="advice">
+                    <p>
+                      <strong>
+                        Engine's pick: {lensLabel(recommendation.recommended_lens)}.
+                      </strong>{' '}
+                      {recommendation.reasoning}
+                    </p>
+                    <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
+                  </div>
+                )}
+              </>
+            )}
+            {/* ── Whole-round feedback, where the comparison happens ────────────────────────────
+                Slice 2 moves this ABOVE the candidate list. It used to sit after every row, so on
+                the reviewed run the one control that changes the whole round was hundreds of rows
+                below the recommendation it disagrees with. Only an engine round can regenerate
+                under guidance, so a drafts-only list still offers no panel. */}
+            {hasGenerated && (
+              <form className="setfb" onSubmit={sendSetFeedback}>
+                <div className="field">
+                  <label htmlFor="wb-setfb">Feedback on the whole round</label>
+                  <div className="setfb-row">
+                    <input
+                      id="wb-setfb"
+                      value={setFbInstruction}
+                      onChange={e => setSetFbInstruction(e.target.value)}
+                      disabled={setFbBusy || setFbExhausted || feedbackLocked
+                        || recognition !== null}
+                      placeholder="e.g. more behavioral signals, fewer balance aggregates"
+                    />
+                    <button
+                      type="submit"
+                      className="btn btn--primary"
+                      disabled={setFbBusy || setFbExhausted || feedbackLocked || generating
+                        || recognition !== null
+                        || !setFbInstruction.trim()}
+                    >
+                      {setFbBusy
+                        ? 'Regenerating…'
+                        : `Regenerate with feedback · round ${Math.min(setFbRounds + 1, FEEDBACK_ROUNDS)} of ${FEEDBACK_ROUNDS}`}
+                    </button>
+                  </div>
+                </div>
+                {setFbExhausted ? (
+                  <p className="hint" role="status">
+                    Rounds exhausted. Approve, edit by hand, or restate the goal.
+                  </p>
+                ) : (
+                  <p className="hint">
+                    Applies to all sets: approved and selected features are kept; the rest
+                    regenerate under your guidance. Recorded under your name. 3 rounds, then it
+                    is back in your hands.
+                  </p>
+                )}
+                {/* The recorded rounds go behind a COUNT-BEARING disclosure — "2 of 3 rounds
+                    recorded" is a fact the human can act on; a bare chevron is not. Nothing is
+                    dropped: every strip is still there, verbatim, one click away. */}
+                {setFbRecords.length > 0 && (
+                  <details className="round-history">
+                    <summary className="tabular-nums">
+                      {setFbRecords.length} of {FEEDBACK_ROUNDS} rounds recorded — what you
+                      asked, and what each round kept
+                    </summary>
+                    <div className="setfb-records" role="status">
+                      {setFbRecords.map(r => (
+                        <p key={r.round} className="setfb-record">
+                          {`Set feedback round ${r.round} of ${FEEDBACK_ROUNDS} · recorded · from user:${r.user} · "${r.instruction}" · kept ${r.kept} selected, replaced ${r.replaced}`}
+                        </p>
+                      ))}
+                    </div>
+                  </details>
+                )}
+              </form>
+            )}
+            {/* ── Narrowing the active set ──────────────────────────────────────────────────────
+                Search and facets over metadata the engine already sent. There is no score and no
+                re-ranking here: the order is still the engine's, and these controls only hide
+                rows. Every chip carries the count it would leave, and every group says what its
+                values were counted from. */}
+            <div className="result-toolbar" role="search" aria-label="Narrow this set">
+              <div className="field toolbar-search">
+                <label htmlFor="wb-candidate-search">Search this set</label>
+                <input
+                  id="wb-candidate-search"
+                  type="search"
+                  value={candidateQuery}
+                  onChange={e => setCandidateQuery(e.target.value)}
+                  placeholder="name, description, or a column it derives from"
+                />
+              </div>
+              {facetGroups.map(group => (
+                <div
+                  key={group.axis}
+                  className="facet-group"
+                  role="group"
+                  aria-label={`${group.legend} — counted from ${group.source}`}
+                >
+                  <span className="micro-label">{group.legend}</span>
+                  <div className="facet-chips">
+                    {group.options.map(option => {
+                      const on = filterTokens.includes(option.token)
+                      return (
+                        <button
+                          key={option.token}
+                          type="button"
+                          className="facet-chip"
+                          aria-pressed={on}
+                          onClick={() => setFilterTokens(tokens => on
+                            ? tokens.filter(t => t !== option.token)
+                            : [...tokens, option.token])}
+                        >
+                          {option.label}{' '}
+                          <span className="tabular-nums facet-n">{option.count}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              ))}
+              {/* Deliberately NOT a live region: this number changes on every keystroke, and a
+                  polite announcement per character is noise, not access. It is plain text in
+                  reading order, immediately before the list it describes. */}
+              <p className="toolbar-count tabular-nums">
+                Showing {filteredList.length} of {listCandidates.length}{' '}
+                {listCandidates.length === 1 ? 'candidate' : 'candidates'}
+                {multiSet && activeLens !== null ? ` in the ${lensLabel(activeLens)} set` : ''}.
+                {narrowing && (
+                  <>
+                    {' '}
+                    <button
+                      type="button"
+                      className="btn"
+                      onClick={clearResultView}
+                    >
+                      Clear search and filters
+                    </button>
+                  </>
+                )}
+              </p>
+            </div>
+            <ul className="rows">
+              {groupedList.map(({ heading, candidate: c }) => {
+                const reg = registered[c.key]
+                const gov = governed[c.key]
+                const error = errors[c.key]
+                const rawName = c.kind === 'generated' ? c.idea.name : c.name
+                const displayName = rawName.trim() || 'unnamed draft'
+                const sameNameVariants = c.kind === 'generated'
+                  ? (generated ?? []).filter(other => other.idea.name === c.idea.name).length
+                  : 0
+                const variantContext = c.kind === 'generated' && sameNameVariants > 1
+                  ? c.kept
+                    ? 'earlier round'
+                    : `${c.lenses[0] ?? 'unscoped'}; ${generationSourceLabel(c.idea)}`
+                  : null
+                // A4: the SERVER decides selectability. A card with an option-actions entry is
+                // selectable only when create_contract is allowed; its first blocker's next
+                // step becomes the disabled control's tooltip. Cards without an entry
+                // (legacy/free-form, pre-B1) keep today's rule — the draft fold still gates.
+                const actionsEntry = c.kind === 'generated' && c.idea.option_id
+                  ? optionActions[c.idea.option_id]
+                  : undefined
+                const canSelect = actionsEntry
+                  ? actionsEntry.allowed_actions.includes('create_contract')
+                  : c.kind === 'generated' || c.name.trim() !== ''
+                const blockedTitle = actionsEntry && !canSelect
+                  ? actionsEntry.blocked_actions.create_contract?.[0]?.next_step
+                    ?? 'not yet actionable'
+                  : undefined
+                const description = c.kind === 'generated' ? c.idea.description : c.description
+                // D3 §UI-04 "can it be built": the SERVER's own verdict — plannable when
+                // create_contract is allowed; else the first blocker's named next step.
+                const buildability = actionsEntry
+                  ? (actionsEntry.allowed_actions.includes('create_contract')
+                    ? 'Plannable — a governed contract is available'
+                    : actionsEntry.blocked_actions.create_contract?.[0]?.next_step ?? null)
+                  : null
+                // Review currency is its OWN axis (never folded into one green badge): derived
+                // from the server's blocker codes, shown only for recipe-origin cards.
+                const reviewNotCurrent = c.kind === 'generated'
+                  && c.idea.generation_source === 'recipe'
+                  && (actionsEntry?.blocked_actions.create_contract ?? [])
+                    .some(b => b.code === 'RECIPE_REVIEW_NOT_CURRENT')
+                const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
+                const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
+                const derives = c.kind === 'generated'
+                  ? fmtPairs(c.idea.derives_pairs)
+                  : c.recipe.derives_from.map(ref => `${c.snapshotSource}:${ref}`).join(', ') || 'none'
+                const refine = refines[c.key] ?? EMPTY_REFINE
+                const refineExhausted = refine.rounds >= FEEDBACK_ROUNDS
+                return (
+                  <Fragment key={c.key}>
+                  {heading !== null && (
+                    <li aria-hidden={false} role="presentation" className="row-group-heading"
+                        style={{ listStyle: 'none', paddingTop: 10 }}>
+                      <h4 style={{ margin: 0, fontSize: 13, color: 'var(--ink-soft)',
+                                   textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                        {heading}
+                      </h4>
+                    </li>
+                  )}
+                  <li
+                    className="row"
+                    id={`wb-row-${c.key}`}
+                    tabIndex={-1}
+                    style={{ alignItems: 'flex-start' }}
+                  >
+                    {reg || gov ? (
+                      <CheckGlyph />
+                    ) : (
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${displayName}${variantContext ? ` (${variantContext})` : ''}`}
+                        title={blockedTitle}
+                        checked={c.key in selected}
+                        disabled={batchBusy || !canSelect}
+                        onChange={() => toggleSelect(
+                          // A kept row belongs to no current set: selecting it never stamps the
+                          // viewed lens; its neutral origin drives the tray mix note.
+                          c.key,
+                          c.kind === 'generated' && multiSet && c.kept !== true
+                            ? activeLens
+                            : null)}
+                        style={{ width: 18, height: 18, margin: 10, flex: 'none' }}
+                      />
+                    )}
+                    <div style={{ display: 'grid', gap: 8, flex: 1, minWidth: 0, padding: '6px 0' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                        <span className={c.kind === 'draft' ? 'mono' : undefined} style={{ fontWeight: 600 }}>
+                          {displayName}
+                        </span>
+                        <span className="badge proposal">
+                          {c.kind === 'generated' ? 'Proposal' : 'Draft'}
+                        </span>
+                        {c.kind === 'generated' && (
+                          <span className="badge">{generationSourceLabel(c.idea)}</span>
+                        )}
+                        {c.kind === 'generated' && c.idea.candidate_status && (
+                          <span className="badge">{c.idea.candidate_status}</span>
+                        )}
+                        {/* Honest stamp — SE-12: the tri-state decides the chip. A candidate the
+                            backend marked NEEDS_EXTERNAL_VALIDATION must never wear the green
+                            "design-checked" badge; it wears the amber checks-outstanding one, with
+                            the count. Drafts skip the gauntlet, so they carry no stamp. */}
+                        {c.kind === 'generated'
+                          && c.idea.validation_status === 'NEEDS_EXTERNAL_VALIDATION' && (
+                          <span className="badge stale">
+                            needs data checks{c.idea.requirements?.length
+                              ? ` (${c.idea.requirements.length})` : ''}
+                          </span>
+                        )}
+                        {c.kind === 'generated' && c.idea.verification
+                          && c.idea.validation_status !== 'NEEDS_EXTERNAL_VALIDATION' && (
+                          <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
+                        )}
+                        {reviewNotCurrent && (
+                          <span className="badge stale">review not current</span>
+                        )}
+                        {/* Pinned through a whole-round regeneration. Registered rows skip the
+                            chip: Registered is already their mark. */}
+                        {c.kind === 'generated' && c.kept === true && !reg && !gov && (
+                          <span className="badge">Kept</span>
+                        )}
+                        {/* The human approved an engine revision in round n. */}
+                        {c.kind === 'generated' && refine.appliedRound !== null && (
+                          <span className="badge revised">Revised · R{refine.appliedRound}</span>
+                        )}
+                        {/* Task 3 near-label critic: FLAG-ONLY. Only too_close renders — a warning
+                            the human weighs, never a removal. no_finding is not a clearance (no
+                            chip); abstain is honest absence. */}
+                        {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close' && (
+                          <span className="badge stale">⚠ near label</span>
                         )}
                       </div>
-                    )}
-                    {/* Exploring mode's honest asymmetry, stated on the card (intake spec
-                        default): with no declared target the leakage screens cannot run for an
-                        LLM-origin candidate. Presentation only — never a removal. */}
-                    {c.kind === 'generated'
-                      && intakeReading?.target_provenance === 'exploring'
-                      && screenedTarget === null
-                      && (c.idea.generation_source ?? 'llm_freeform') === 'llm_freeform' && (
-                      <p className="hint" role="note">
-                        No target declared — leakage unchecked. Declare a target to screen this
-                        candidate.
-                      </p>
-                    )}
-                    <dl className="kv">
-                      <div>
-                        <dt>derives from</dt>
-                        <dd className="mono">{derives}</dd>
-                      </div>
-                      {aggregation && (
-                        <div>
-                          <dt>aggregation</dt>
-                          <dd>{aggregation}</dd>
-                        </div>
+                      <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
+                      {buildability && (
+                        <p style={{ color: 'var(--ink-soft)', fontSize: 13 }} role="note">
+                          {buildability}
+                        </p>
                       )}
-                      {grain && (
-                        <div>
-                          <dt>grain</dt>
-                          <dd>{grain}</dd>
-                        </div>
+                      {c.kind === 'generated' && c.idea.rationale && (
+                        <p style={{ color: 'var(--ink-soft)' }}>
+                          {c.idea.generation_source === 'llm_intent'
+                            ? "Model's rationale: " : 'Why: '}
+                          {c.idea.rationale}
+                        </p>
                       )}
-                      {c.kind === 'draft' && (
-                        <div>
-                          <dt>drafted against</dt>
-                          <dd className="mono">{c.snapshotSource}</dd>
-                        </div>
+                      {c.kind === 'generated' && c.idea.near_label_verdict === 'too_close'
+                        && c.idea.near_label_rationale && (
+                        <p style={{ color: 'var(--ink-soft)' }} role="note">
+                          Near-label check: {c.idea.near_label_rationale}
+                        </p>
                       )}
-                    </dl>
-                    {c.kind === 'draft' && !reg && (
-                      <div className="field" style={{ maxWidth: 380 }}>
-                        <label htmlFor={`wb-name-${c.key}`}>Name</label>
-                        <input
-                          id={`wb-name-${c.key}`}
-                          className="mono"
-                          value={c.name}
-                          onChange={e => renameDraft(c.key, e.target.value)}
-                          placeholder="feature_name"
-                        />
-                        {!c.name.trim() && (
-                          <p className="hint">Name this draft to select it for registration.</p>
-                        )}
-                      </div>
-                    )}
-                    {c.kind === 'draft' && <JoinPathDetails steps={c.recipe.join_path} />}
-                    {error && (
-                      <p className="error" role="alert">
-                        {error}
-                      </p>
-                    )}
-                    {/* Per-candidate feedback: generated rows only (a draft is the human's own
-                        definition, revised by editing its line), never on registered or governed
-                        rows (a minted contract is finalized; feedback would diverge from it). */}
-                    {c.kind === 'generated' && !reg && !gov && (
-                      <>
+                      {/* SE-12 "Inputs and why": one row per typed operand role — the binding
+                          the engine actually chose, its MEASURED authority, and whether Gate-1
+                          confirmation is outstanding. Only engine/recipe candidates carry these;
+                          an LLM free-form idea keeps its untyped derives list below. */}
+                      {c.kind === 'generated' && (c.idea.input_role_bindings?.length ?? 0) > 0 && (
+                        <ul aria-label="typed inputs" style={{ display: 'grid', gap: 2, margin: 0,
+                            paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
+                          {c.idea.input_role_bindings!.map(binding => (
+                            <li key={binding.role}>
+                              <span style={{ fontWeight: 600 }}>{binding.role}</span>
+                              {binding.ref && <> — <span className="mono">{binding.ref[1]}</span></>}
+                              {binding.authority && <> · {binding.authority}</>}
+                              {binding.confirmation_required && (
+                                // UI-06: straight to the asset field-decision screen, focused
+                                // on THIS field. Returning regenerates a fresh run — the card
+                                // never self-approves its own metadata.
+                                <a
+                                  className="badge stale"
+                                  style={{ marginLeft: 6 }}
+                                  href={binding.ref
+                                    ? `#asset?source=${encodeURIComponent(binding.ref[0])}`
+                                      + `&object_ref=${encodeURIComponent(binding.ref[1])}`
+                                    : '#governance'}
+                                >
+                                  needs confirmation →
+                                </a>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {/* SE-12: the outstanding checks, task-first — what somebody DOES, with the
+                          backend's own prose (which names the semantic origin) as the fine print. */}
+                      {c.kind === 'generated' && (c.idea.requirements?.length ?? 0) > 0 && (
+                        <ul aria-label="outstanding checks" style={{ display: 'grid', gap: 2,
+                            margin: 0, paddingLeft: 16, color: 'var(--ink-soft)', fontSize: 13 }}>
+                          {c.idea.requirements!.map(req => (
+                            <li key={`${req.code}:${req.operand[1]}`}>
+                              {requirementTask(req.code)}
+                              {' — '}<span className="mono">{req.operand[1]}</span>
+                              {req.detail && (
+                                <span style={{ display: 'block', fontSize: 12 }}>{req.detail}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {/* Task 4b emission policy: the untaken parameterisations, named on the
+                          card — chosen value in brackets. Server populates only under its flag. */}
+                      {c.kind === 'generated' && c.idea.param_alternatives && (
+                        <p style={{ color: 'var(--ink-soft)' }}>
+                          Also available — {c.idea.param_alternatives}
+                        </p>
+                      )}
+                      {/* D3 (UI-02): the audit drawer — the STORED decision record on demand,
+                          by exact (revision, option) key. Only options with decision rows
+                          (engine candidates on a v2 revision) offer it. */}
+                      {c.kind === 'generated' && c.idea.option_id
+                        && consideredRevisionId
+                        && optionActions[c.idea.option_id] && (
                         <div>
                           <button
                             type="button"
                             className="btn"
-                            aria-expanded={refine.open}
-                            aria-controls={`wb-refine-${c.key}`}
-                            disabled={feedbackLocked}
-                            onClick={() => toggleRefine(c.key)}
+                            aria-expanded={auditOpenFor === c.idea.option_id}
+                            onClick={() => void toggleAudit(c.idea.option_id!)}
                           >
-                            Give feedback
+                            {auditOpenFor === c.idea.option_id
+                              ? 'Hide decision record' : 'Decision record'}
                           </button>
+                          {auditOpenFor === c.idea.option_id && (
+                            <div aria-label="decision record" className="audit-drawer"
+                                 style={{ marginTop: 8, padding: 12, fontSize: 13,
+                                          border: '1px solid var(--line)', borderRadius: 6 }}>
+                              {auditError && <p role="alert">{auditError}</p>}
+                              {!auditError && !auditDetail && <p>Loading the stored record…</p>}
+                              {auditDetail?.decision_record ? (
+                                <AuditDrawerBody record={auditDetail.decision_record} />
+                              ) : auditDetail && !auditError ? (
+                                <p className="hint">
+                                  No stored decision record — this option predates the
+                                  decision store. Nothing is recomputed in its place.
+                                </p>
+                              ) : null}
+                            </div>
+                          )}
                         </div>
-                        {refine.open && (
-                          <form
-                            id={`wb-refine-${c.key}`}
-                            className="refine-box"
-                            onSubmit={e => {
-                              e.preventDefault()
-                              void sendRefine(c)
-                            }}
-                          >
-                            <div className="field">
-                              <label htmlFor={`wb-refine-input-${c.key}`}>
-                                What should change
-                              </label>
-                              <input
-                                id={`wb-refine-input-${c.key}`}
-                                value={refine.instruction}
-                                onChange={e => {
-                                  const value = e.target.value
-                                  patchRefine(c.key, prev => ({ ...prev, instruction: value }))
-                                }}
-                                disabled={refine.busy || refineExhausted || feedbackLocked}
-                                placeholder="e.g. use a 30 day window"
-                              />
-                              <p className="hint" style={HELP_STYLE}>
-                                Your feedback runs the engine once, re-checks safety, and is
-                                recorded under your name. 3 rounds per candidate, then it is
-                                back in your hands.
-                              </p>
-                            </div>
-                            <button
-                              type="submit"
-                              className="btn btn--primary"
-                              disabled={refine.busy || refineExhausted || feedbackLocked
-                                || !refine.instruction.trim()}
-                            >
-                              {refine.busy
-                                ? 'Requesting revision…'
-                                : refineExhausted
-                                  ? 'Rounds exhausted'
-                                  : `Send feedback for one revision · round ${refine.rounds + 1} of ${FEEDBACK_ROUNDS}`}
-                            </button>
-                          </form>
-                        )}
-                        {refine.error && (
-                          <p className="error" role="alert">
-                            {refine.error}
-                          </p>
-                        )}
-                        {refine.rejection && (
-                          <p className="error" role="alert">
-                            The safety gauntlet rejected this revision:{' '}
-                            {refine.rejection.reason} ({rejectLabel(refine.rejection.code)}).
-                            The round is consumed; the candidate is unchanged.
-                          </p>
-                        )}
-                        {refine.pending && (
-                          <div className="revision" role="status">
-                            <div className="rev-meta">
-                              <span className="badge revised">
-                                Revision · round {refine.pendingRound} of {FEEDBACK_ROUNDS}
-                              </span>
-                              <span className="rev-who">
-                                {`recorded · from user:${getSession().user} · "${refine.pendingInstruction}"`}
-                              </span>
-                            </div>
-                            <div className="diff">
-                              <DiffLine
-                                label="name"
-                                before={c.idea.name}
-                                after={refine.pending.name}
-                              />
-                              <DiffLine
-                                label="description"
-                                before={c.idea.description}
-                                after={refine.pending.description}
-                              />
-                              <DiffLine
-                                label="aggregation"
-                                before={c.idea.aggregation ?? 'none'}
-                                after={refine.pending.aggregation ?? 'none'}
-                              />
-                              <DiffLine
-                                label="derives"
-                                before={fmtPairs(c.idea.derives_pairs)}
-                                after={fmtPairs(refine.pending.derives_pairs)}
-                              />
-                            </div>
-                            <p className="recheck">Re-checked after revision</p>
-                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
-                              {/* Inert while the tray is confirming or a batch is in flight:
-                                  the spec being written must not change under the approval. */}
-                              <button
-                                type="button"
-                                className="btn btn--primary"
-                                disabled={feedbackLocked}
-                                onClick={() => approveRevision(c.key)}
-                              >
-                                Approve revision
-                              </button>
-                              <button
-                                type="button"
-                                className="btn"
-                                disabled={feedbackLocked}
-                                onClick={() => revertRevision(c.key)}
-                              >
-                                Revert to original
-                              </button>
-                            </div>
+                      )}
+                      {/* Exploring mode's honest asymmetry, stated on the card (intake spec
+                          default): with no declared target the leakage screens cannot run for an
+                          LLM-origin candidate. Presentation only — never a removal. */}
+                      {c.kind === 'generated'
+                        && intakeReading?.target_provenance === 'exploring'
+                        && screenedTarget === null
+                        && (c.idea.generation_source ?? 'llm_freeform') === 'llm_freeform' && (
+                        <p className="hint" role="note">
+                          No target declared — leakage unchecked. Declare a target to screen this
+                          candidate.
+                        </p>
+                      )}
+                      <dl className="kv">
+                        <div>
+                          <dt>derives from</dt>
+                          <dd className="mono">{derives}</dd>
+                        </div>
+                        {aggregation && (
+                          <div>
+                            <dt>aggregation</dt>
+                            <dd>{aggregation}</dd>
                           </div>
                         )}
-                      </>
-                    )}
-                    {reg && (
-                      <p
-                        style={{
-                          color: 'var(--ok)', fontWeight: 500,
-                          display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
-                        }}
-                      >
-                        <span>
-                          Registered <span className="mono">{reg.id}</span>
-                        </span>
-                        {reg.freshness && (reg.freshness.fresh ? (
-                          <span className="badge" style={OK_SOLID_CHIP_STYLE}>fresh</span>
-                        ) : (
-                          <span className="badge stale">
-                            stale: {reg.freshness.stale_sources.join(', ')}
+                        {grain && (
+                          <div>
+                            <dt>grain</dt>
+                            <dd>{grain}</dd>
+                          </div>
+                        )}
+                        {c.kind === 'draft' && (
+                          <div>
+                            <dt>drafted against</dt>
+                            <dd className="mono">{c.snapshotSource}</dd>
+                          </div>
+                        )}
+                      </dl>
+                      {c.kind === 'draft' && !reg && (
+                        <div className="field" style={{ maxWidth: 380 }}>
+                          <label htmlFor={`wb-name-${c.key}`}>Name</label>
+                          <input
+                            id={`wb-name-${c.key}`}
+                            className="mono"
+                            value={c.name}
+                            onChange={e => renameDraft(c.key, e.target.value)}
+                            placeholder="feature_name"
+                          />
+                          {!c.name.trim() && (
+                            <p className="hint">Name this draft to select it for registration.</p>
+                          )}
+                        </div>
+                      )}
+                      {c.kind === 'draft' && <JoinPathDetails steps={c.recipe.join_path} />}
+                      {error && (
+                        <p className="error" role="alert">
+                          {error}
+                        </p>
+                      )}
+                      {/* Per-candidate feedback: generated rows only (a draft is the human's own
+                          definition, revised by editing its line), never on registered or governed
+                          rows (a minted contract is finalized; feedback would diverge from it). */}
+                      {c.kind === 'generated' && !reg && !gov && (
+                        <>
+                          <div>
+                            <button
+                              type="button"
+                              className="btn"
+                              aria-expanded={refine.open}
+                              aria-controls={`wb-refine-${c.key}`}
+                              disabled={feedbackLocked}
+                              onClick={() => toggleRefine(c.key)}
+                            >
+                              Give feedback
+                            </button>
+                          </div>
+                          {refine.open && (
+                            <form
+                              id={`wb-refine-${c.key}`}
+                              className="refine-box"
+                              onSubmit={e => {
+                                e.preventDefault()
+                                void sendRefine(c)
+                              }}
+                            >
+                              <div className="field">
+                                <label htmlFor={`wb-refine-input-${c.key}`}>
+                                  What should change
+                                </label>
+                                <input
+                                  id={`wb-refine-input-${c.key}`}
+                                  value={refine.instruction}
+                                  onChange={e => {
+                                    const value = e.target.value
+                                    patchRefine(c.key, prev => ({ ...prev, instruction: value }))
+                                  }}
+                                  disabled={refine.busy || refineExhausted || feedbackLocked}
+                                  placeholder="e.g. use a 30 day window"
+                                />
+                                <p className="hint" style={HELP_STYLE}>
+                                  Your feedback runs the engine once, re-checks safety, and is
+                                  recorded under your name. 3 rounds per candidate, then it is
+                                  back in your hands.
+                                </p>
+                              </div>
+                              <button
+                                type="submit"
+                                className="btn btn--primary"
+                                disabled={refine.busy || refineExhausted || feedbackLocked
+                                  || !refine.instruction.trim()}
+                              >
+                                {refine.busy
+                                  ? 'Requesting revision…'
+                                  : refineExhausted
+                                    ? 'Rounds exhausted'
+                                    : `Send feedback for one revision · round ${refine.rounds + 1} of ${FEEDBACK_ROUNDS}`}
+                              </button>
+                            </form>
+                          )}
+                          {refine.error && (
+                            <p className="error" role="alert">
+                              {refine.error}
+                            </p>
+                          )}
+                          {refine.rejection && (
+                            <p className="error" role="alert">
+                              The safety gauntlet rejected this revision:{' '}
+                              {refine.rejection.reason} ({rejectLabel(refine.rejection.code)}).
+                              The round is consumed; the candidate is unchanged.
+                            </p>
+                          )}
+                          {refine.pending && (
+                            <div className="revision" role="status">
+                              <div className="rev-meta">
+                                <span className="badge revised">
+                                  Revision · round {refine.pendingRound} of {FEEDBACK_ROUNDS}
+                                </span>
+                                <span className="rev-who">
+                                  {`recorded · from user:${getSession().user} · "${refine.pendingInstruction}"`}
+                                </span>
+                              </div>
+                              <div className="diff">
+                                <DiffLine
+                                  label="name"
+                                  before={c.idea.name}
+                                  after={refine.pending.name}
+                                />
+                                <DiffLine
+                                  label="description"
+                                  before={c.idea.description}
+                                  after={refine.pending.description}
+                                />
+                                <DiffLine
+                                  label="aggregation"
+                                  before={c.idea.aggregation ?? 'none'}
+                                  after={refine.pending.aggregation ?? 'none'}
+                                />
+                                <DiffLine
+                                  label="derives"
+                                  before={fmtPairs(c.idea.derives_pairs)}
+                                  after={fmtPairs(refine.pending.derives_pairs)}
+                                />
+                              </div>
+                              <p className="recheck">Re-checked after revision</p>
+                              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                                {/* Inert while the tray is confirming or a batch is in flight:
+                                    the spec being written must not change under the approval. */}
+                                <button
+                                  type="button"
+                                  className="btn btn--primary"
+                                  disabled={feedbackLocked}
+                                  onClick={() => approveRevision(c.key)}
+                                >
+                                  Approve revision
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn"
+                                  disabled={feedbackLocked}
+                                  onClick={() => revertRevision(c.key)}
+                                >
+                                  Revert to original
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+                      {reg && (
+                        <p
+                          style={{
+                            color: 'var(--ok)', fontWeight: 500,
+                            display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+                          }}
+                        >
+                          <span>
+                            Registered <span className="mono">{reg.id}</span>
                           </span>
-                        ))}
-                      </p>
-                    )}
-                    {/* Governed mark, parallel to the registered one: a minted, versioned,
-                        design-checked contract. Its own state, so no checkbox and no feedback. */}
-                    {gov && (
-                      <p style={{ color: 'var(--ok)', fontWeight: 500 }}>
-                        Governed <span className="mono">{gov.contractId}</span> v{gov.version}
-                        {' · DESIGN-CHECKED'}
-                      </p>
-                    )}
-                  </div>
-                </li>
-                </Fragment>
-              )
-            })}
-            {selectedCount > 0 && (
-              <li className="row" style={TRAY_STYLE}>
-                {confirmingBatch ? (
-                  <>
-                    <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
-                      This saves the selected candidates as IDEAS — browsable sketches recorded
-                      under your name with their lineage. An idea is not a governed feature and
-                      can never feed a model; governing happens through a contract.
-                    </p>
+                          {reg.freshness && (reg.freshness.fresh ? (
+                            <span className="badge" style={OK_SOLID_CHIP_STYLE}>fresh</span>
+                          ) : (
+                            <span className="badge stale">
+                              stale: {reg.freshness.stale_sources.join(', ')}
+                            </span>
+                          ))}
+                        </p>
+                      )}
+                      {/* Governed mark, parallel to the registered one: a minted, versioned,
+                          design-checked contract. Its own state, so no checkbox and no feedback. */}
+                      {gov && (
+                        <p style={{ color: 'var(--ok)', fontWeight: 500 }}>
+                          Governed <span className="mono">{gov.contractId}</span> v{gov.version}
+                          {' · DESIGN-CHECKED'}
+                        </p>
+                      )}
+                    </div>
+                  </li>
+                  </Fragment>
+                )
+              })}
+            </ul>
+            {/* The list can be narrowed to nothing. That is a fact about the FILTER, never about
+                the round: the counts above still stand, and the way back is one click. */}
+            {groupedList.length === 0 && (
+              <p className="empty" role="status">
+                No candidate in this set matches the current search and filters.{' '}
+                {listCandidates.length} {listCandidates.length === 1 ? 'candidate is' : 'candidates are'}{' '}
+                here with them cleared.
+              </p>
+            )}
+          </div>
+
+          {/* ── The decision rail ─────────────────────────────────────────────────────────────
+              What the next click will actually write, kept beside the comparison instead of at
+              the end of the list. Nothing here is new governance: the same two confirmation
+              arms, the same server-decided governability, the same per-item outcomes. */}
+          <aside className="decision-rail" aria-label="Your decision">
+            <div className="panel decision-card" data-tray={selectedCount > 0 || undefined}>
+              <div className="decision-head">
+                <h3>Your decision tray</h3>
+                <span className="micro-label tabular-nums">
+                  {selectedCount} selected
+                </span>
+              </div>
+              {confirmingBatch ? (
+                <>
+                  <p style={{ fontWeight: 500 }}>
+                    This saves the selected candidates as IDEAS — browsable sketches recorded
+                    under your name with their lineage. An idea is not a governed feature and
+                    can never feed a model; governing happens through a contract.
+                  </p>
+                  <div className="decision-actions">
                     <button
                       type="button"
                       className="btn btn--proposal-confirm"
@@ -3528,13 +3987,15 @@ export function WorkbenchScreen() {
                     >
                       Cancel
                     </button>
-                  </>
-                ) : confirmingGovern ? (
-                  <>
-                    <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
-                      Governing runs the safety gauntlet and mints a signed contract per feature —
-                      a design check, not a proof it predicts well.
-                    </p>
+                  </div>
+                </>
+              ) : confirmingGovern ? (
+                <>
+                  <p style={{ fontWeight: 500 }}>
+                    Governing runs the safety gauntlet and mints a signed contract per feature —
+                    a design check, not a proof it predicts well.
+                  </p>
+                  <div className="decision-actions">
                     <button
                       type="button"
                       className="btn btn--primary"
@@ -3551,18 +4012,43 @@ export function WorkbenchScreen() {
                     >
                       Cancel
                     </button>
-                  </>
-                ) : (
-                  <>
-                    <span className="tabular-nums" style={{ fontWeight: 600 }}>
-                      {selectedCount} selected
-                    </span>
-                    {mixNote !== null && <span className="hint">{mixNote}</span>}
-                    <span style={{ flex: '1 1 auto' }} aria-hidden="true" />
-                    {/* Govern the generated picks into signed contracts through the two-gate flow.
-                        Shown only when a governing intent exists (from the last considered-set
-                        call — generate or feedback) and at least one selected candidate is a
-                        fresh generated one (governable). */}
+                  </div>
+                </>
+              ) : selectedCount === 0 ? (
+                // Honest absence: an empty tray states the structure of the decision and the
+                // fact that nothing has been written, rather than showing a dead button.
+                <p className="hint">
+                  Nothing is selected yet. Tick candidates in any set, or take a whole set —
+                  selection is reversible right up to your confirmation.
+                </p>
+              ) : (
+                <>
+                  {/* Where the picks came from, and the picks the current narrowing hides. */}
+                  {mixNote !== null && <p className="hint">{mixNote}</p>}
+                  {hiddenSelectedCount > 0 && (
+                    <p className="hint" role="status">
+                      {hiddenSelectedCount} of them{' '}
+                      {hiddenSelectedCount === 1 ? 'is' : 'are'} hidden by the current search and
+                      filters. They stay selected and will still be written.
+                    </p>
+                  )}
+                  {/* What "Approve and register" WRITES — said before the click, not after. */}
+                  <p className="hint">
+                    Approve and register writes {selectedCount}{' '}
+                    {selectedCount === 1
+                      ? 'definition with its lineage'
+                      : 'definitions with their lineage'}, under your name. It records what to
+                    compute; it computes nothing and proves nothing about predictive value.
+                  </p>
+                  {/* Governability is the SERVER's decision, so the rail reports it and never
+                      re-derives it. Saying which selections cannot be governed — and that the
+                      rest still can — is the difference between a warning and a dead end. */}
+                  <p className="hint">{governabilityNote}</p>
+                  <div className="decision-actions">
+                    {/* Govern the generated picks into signed contracts through the two-gate
+                        flow. Shown only when a governing intent exists (from the last
+                        considered-set call — generate or feedback) and at least one selected
+                        candidate is a fresh generated one (governable). */}
                     {intentId !== null && governableCount > 0 && (
                       <button
                         type="button"
@@ -3580,62 +4066,32 @@ export function WorkbenchScreen() {
                       Approve and register {selectedCount}{' '}
                       {selectedCount === 1 ? 'feature' : 'features'}
                     </button>
-                  </>
-                )}
-              </li>
-            )}
-          </ul>
-          {/* Whole-round feedback: only an engine round can regenerate under guidance, so a
-              drafts-only list offers no panel. */}
-          {hasGenerated && (
-            <form className="setfb" onSubmit={sendSetFeedback}>
-              {setFbRecords.length > 0 && (
-                <div className="setfb-records" role="status">
-                  {setFbRecords.map(r => (
-                    <p key={r.round} className="setfb-record">
-                      {`Set feedback round ${r.round} of ${FEEDBACK_ROUNDS} · recorded · from user:${r.user} · "${r.instruction}" · kept ${r.kept} selected, replaced ${r.replaced}`}
-                    </p>
-                  ))}
-                </div>
+                  </div>
+                </>
               )}
-              <div className="field">
-                <label htmlFor="wb-setfb">Feedback on the whole round</label>
-                <div className="setfb-row">
-                  <input
-                    id="wb-setfb"
-                    value={setFbInstruction}
-                    onChange={e => setSetFbInstruction(e.target.value)}
-                    disabled={setFbBusy || setFbExhausted || feedbackLocked
-                      || recognition !== null}
-                    placeholder="e.g. more behavioral signals, fewer balance aggregates"
-                  />
-                  <button
-                    type="submit"
-                    className="btn btn--primary"
-                    disabled={setFbBusy || setFbExhausted || feedbackLocked || generating
-                      || recognition !== null
-                      || !setFbInstruction.trim()}
-                  >
-                    {setFbBusy
-                      ? 'Regenerating…'
-                      : `Regenerate with feedback · round ${Math.min(setFbRounds + 1, FEEDBACK_ROUNDS)} of ${FEEDBACK_ROUNDS}`}
-                  </button>
-                </div>
-              </div>
-              {setFbExhausted ? (
-                <p className="hint" role="status">
-                  Rounds exhausted. Approve, edit by hand, or restate the goal.
-                </p>
-              ) : (
-                <p className="hint">
-                  Applies to all sets: approved and selected features are kept; the rest
-                  regenerate under your guidance. Recorded under your name. 3 rounds, then it
-                  is back in your hands.
+              {/* Per-item outcomes, counted. A partial batch shows BOTH numbers: hiding the
+                  successes to lead with the failures is as dishonest as the reverse. Each
+                  outcome also stays on its own row, which is where it can be acted on. */}
+              {(settledRows > 0 || failedRows > 0) && (
+                <p className="hint tabular-nums" role="status">
+                  {settledRows > 0 && (
+                    <>{settledRows} of this round&apos;s candidates{' '}
+                      {settledRows === 1 ? 'is' : 'are'} saved or governed.</>
+                  )}
+                  {failedRows > 0 && (
+                    <> {failedRows} could not be written — each one says why on its own row.</>
+                  )}
                 </p>
               )}
-            </form>
-          )}
-        </>
+            </div>
+            {/* The concept also drew a "What is known" card here (target screened / design
+                checked / predictive value unknown). It is NOT built: all three claims are
+                already stated above the list, and content rule 4 of the review is precisely
+                that guidance must not be repeated in a second place with different words. The
+                rail carries the DECISION — count, origins, consequence, governability,
+                outcomes — and nothing that is already on screen. */}
+          </aside>
+        </div>
       )}
 
       {/* Phase 1B disposition lens: only when a SCOPED response carried dispositions and the

@@ -154,6 +154,33 @@ function multiSetRound(rejections: api.Rejection[] = []): api.FeatureSetsResult 
   }
 }
 
+// ONE typed factory for recognition responses. `RecognitionResp` grows required fields over time
+// — the repair seam (Task 5) made `recognition_quality` and `ambiguity_note` mandatory — and this
+// file had four hand-written copies of the shape, so a single contract change broke three
+// unrelated fixtures at once. Overrides layer on top of the minimum classified answer.
+//
+// The default quality is `null`, which is the HONEST legacy state (an attempt whose quality was
+// never recorded), not an invented `clean`: a fixture must not claim the platform observed
+// something it did not. Tests about the five dispositions pass their own quality explicitly.
+function recognitionResp(over: Partial<api.RecognitionResp> = {}): api.RecognitionResp {
+  return {
+    intent_id: 'int_1',
+    recognition_id: 'rec_1',
+    status: 'classified',
+    unscoped: false,
+    candidates: [{
+      use_case_id: 'churn', display_name: 'Customer churn',
+      relationship: 'primary', confidence: 'high', evidence_spans: [],
+    }],
+    modelling_contexts: [],
+    target_entity: null,
+    warnings: [],
+    recognition_quality: null,
+    ambiguity_note: null,
+    ...over,
+  }
+}
+
 function recipeWith(joinPath: api.JoinStep[]): api.Recipe {
   return {
     intent: 'total spend per customer', grain_table: 'customers',
@@ -1976,8 +2003,7 @@ describe('govern', () => {
 // ------------------------------------------------------ Phase 1B: Gate #1 confirmation + lens ----
 describe('Gate #1 scope confirmation', () => {
   // A classified recognition with a primary + one secondary, each carrying an evidence span.
-  const RECOGNITION: api.RecognitionResp = {
-    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+  const RECOGNITION: api.RecognitionResp = recognitionResp({
     candidates: [
       {
         use_case_id: 'churn', display_name: 'Customer churn',
@@ -1989,8 +2015,8 @@ describe('Gate #1 scope confirmation', () => {
       },
     ],
     // Phase-2B SOFT dimensions the recognizer proposed — surfaced for confirm/override at Gate #1.
-    modelling_contexts: ['ifrs9'], target_entity: 'customer', warnings: [],
-  }
+    modelling_contexts: ['ifrs9'], target_entity: 'customer',
+  })
 
   // A scoped considered-set response: one eligible recipe + one out-of-scope recipe for the lens.
   function scopedConsidered(): api.ConsideredSetResp {
@@ -2358,18 +2384,17 @@ describe('Gate #1 recognition quality', () => {
     }
   }
 
+  // This suite is ABOUT the five dispositions, so unlike the shared factory its default is a
+  // recorded `clean` — every test here either asserts that arm or overrides it explicitly.
   function recognition(over: Partial<api.RecognitionResp> = {}): api.RecognitionResp {
-    return {
-      intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+    return recognitionResp({
       candidates: [candidate('churn', 'Customer churn', 'primary')],
-      modelling_contexts: [], target_entity: null, warnings: [],
       recognition_quality: {
         disposition: 'clean', repair_attempts: 0, dropped_candidate_count: 0,
         drop_reason_codes: [],
       },
-      ambiguity_note: null,
       ...over,
-    }
+    })
   }
 
   function quality(over: Partial<api.RecognitionQuality>): api.RecognitionQuality {
@@ -2633,14 +2658,7 @@ describe('Phase 2A ranking', () => {
 
   // A minimal classified recognition so the confirm flow (VITE_INTENT_CONFIRMATION_UI) can mint the
   // scoped considered-set that carries the per-recipe SOFT-dimension signal warnings.
-  const REC: api.RecognitionResp = {
-    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
-    candidates: [{
-      use_case_id: 'churn', display_name: 'Customer churn',
-      relationship: 'primary', confidence: 'high', evidence_spans: [],
-    }],
-    modelling_contexts: [], target_entity: null, warnings: [],
-  }
+  const REC: api.RecognitionResp = recognitionResp()
 
   it('flags ON: a per-recipe SOFT-dimension warning renders its mapped text on the ranked row', async () => {
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
@@ -2664,14 +2682,7 @@ describe('Phase 2A ranking', () => {
 
 // ------------------------------------------------- Intake build: the target confirm block ----
 describe('Intake target confirmation', () => {
-  const RECOGNITION: api.RecognitionResp = {
-    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
-    candidates: [{
-      use_case_id: 'churn', display_name: 'Customer churn',
-      relationship: 'primary', confidence: 'high', evidence_spans: [],
-    }],
-    modelling_contexts: [], target_entity: null, warnings: [],
-  }
+  const RECOGNITION: api.RecognitionResp = recognitionResp()
 
   const TICKET: api.IntakeTicket = {
     target_column: 'public.labels.churned', target_window_days: 90,
@@ -3269,15 +3280,12 @@ describe('post-submit workspace shell', () => {
 
   it('scope review owns the shell, and the output card says what is not there yet', async () => {
     vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
-    contractRecognitions.mockResolvedValue({
-      intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+    contractRecognitions.mockResolvedValue(recognitionResp({
       candidates: [{
         use_case_id: 'customer.churn', display_name: 'Customer churn',
         relationship: 'primary', confidence: 'high', evidence_spans: ['churn'],
       }],
-      modelling_contexts: [], target_entity: null, warnings: [],
-      recognition_quality: null, ambiguity_note: null,
-    })
+    }))
     const { container } = render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
@@ -3287,5 +3295,485 @@ describe('post-submit workspace shell', () => {
     expect(screen.getByRole('heading', { name: 'Confirm scope' })).toBeInTheDocument()
     expect(screen.getByText('No candidates yet')).toBeInTheDocument()
     expect(screen.getByText('The run waits on your scope confirmation.')).toBeInTheDocument()
+  })
+})
+
+// ------------------------------------------------------------ Slice 2: the decision workspace ----
+describe('Slice 2: the decision workspace', () => {
+  // A round with enough shape to exercise every axis the wire actually carries: two sets, a
+  // per-option binding state on each option, one candidate the backend marked as owing data
+  // checks, and one recipe whose review the backend says is not current.
+  const ACCEL: api.FeatureIdea = {
+    option_id: 'opt_accel', name: 'txn_acceleration_30d',
+    description: 'compares transaction count in the last 30 days with the prior 30',
+    derives_from: ['public.transactions.id'], aggregation: 'ratio', grain_table: 'customers',
+    derives_pairs: [['cib', 'public.transactions.id']],
+    verification: 'DESIGN-CHECKED', critic_note: '', rationale: '',
+    generation_source: 'recipe', recipe_id: 'accel_recipe',
+    validation_status: 'DESIGN_CHECKED',
+  }
+  const RECENCY: api.FeatureIdea = {
+    option_id: 'opt_recency', name: 'days_since_last_txn',
+    description: 'distance from the cutoff to the most recent eligible transaction',
+    derives_from: ['public.transactions.ts'], aggregation: 'recency', grain_table: 'customers',
+    derives_pairs: [['cib', 'public.transactions.ts']],
+    verification: 'DESIGN-CHECKED', critic_note: '', rationale: '',
+    generation_source: 'recipe', recipe_id: 'recency_recipe',
+    validation_status: 'NEEDS_EXTERNAL_VALIDATION',
+  }
+  const DEBIT_RATIO: api.FeatureIdea = {
+    option_id: 'opt_ratio', name: 'debit_to_credit_ratio_30d',
+    description: 'normalises debit activity by the credit transaction count',
+    derives_from: ['public.transactions.amount'], aggregation: 'ratio', grain_table: 'customers',
+    derives_pairs: [['cib', 'public.transactions.amount']],
+    verification: 'DESIGN-CHECKED', critic_note: '', rationale: '',
+    generation_source: 'recipe', recipe_id: 'ratio_recipe',
+    validation_status: 'DESIGN_CHECKED',
+  }
+
+  const REFUSALS: api.Rejection[] = [
+    { name: 'balance_slope_90d', code: 'STALE', reason: 'deposits last loaded 14 days ago' },
+    { name: 'salary_band_flag', code: 'PROTECTED_CHARACTERISTIC',
+      reason: 'derives from a protected attribute' },
+    { name: 'branch_visits_30d', code: 'STALE', reason: 'branch feed has no arrival guarantee' },
+  ]
+
+  function workspaceRound(over: Partial<api.ConsideredSetResp> = {}): api.ConsideredSetResp {
+    return {
+      intent_id: 'int_1', anchor: null,
+      alternatives: [
+        { lens: 'temporal', features: [ACCEL, RECENCY] },
+        { lens: 'ratio', features: [DEBIT_RATIO] },
+      ],
+      recommendation: {
+        recommended_lens: 'temporal',
+        reasoning: 'recency signals move earliest for a churn horizon',
+        caveat: CAVEAT,
+      },
+      rejections: REFUSALS,
+      contract_version: 2,
+      considered_revision_id: 'crv_ws',
+      recommended_options: [
+        {
+          option_id: 'opt_accel', name: null, recipe_id: 'accel_recipe',
+          binding_state: 'bound',
+          allowed_actions: ['save_idea', 'create_contract'], blocked_actions: {},
+        },
+        {
+          option_id: 'opt_recency', name: null, recipe_id: 'recency_recipe',
+          binding_state: 'ambiguous',
+          allowed_actions: ['save_idea'],
+          blocked_actions: {
+            create_contract: [{
+              code: 'RECIPE_REVIEW_NOT_CURRENT',
+              next_step: 'Ask a steward to re-review this recipe',
+            }],
+          },
+        },
+      ],
+      actionable_options: [{
+        option_id: 'opt_ratio', name: null, recipe_id: 'ratio_recipe',
+        binding_state: 'bound',
+        allowed_actions: ['save_idea', 'create_contract'], blocked_actions: {},
+      }],
+      ...over,
+    }
+  }
+
+  async function renderWorkspace(over: Partial<api.ConsideredSetResp> = {}) {
+    contractConsideredSet.mockResolvedValue(workspaceRound(over))
+    await renderAndGenerateRaw()
+    expect(await screen.findByText('txn_acceleration_30d')).toBeInTheDocument()
+  }
+
+  function rail(): HTMLElement {
+    return screen.getByRole('complementary', { name: 'Your decision' })
+  }
+
+  function rowList(): HTMLElement {
+    return document.querySelector('ul.rows') as HTMLElement
+  }
+
+  function follows(first: Element, second: Element): boolean {
+    return Boolean(
+      first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING)
+  }
+
+  it('puts whole-round feedback ABOVE the candidate list, next to the recommendation', async () => {
+    await renderWorkspace()
+    const feedback = screen.getByLabelText('Feedback on the whole round')
+    const recommendation = screen.getByText(/Engine's pick: Temporal/)
+    // The recommendation, then the feedback that disagrees with it, then the rows. On the
+    // reviewed run this control sat after hundreds of rows, which is the finding being fixed.
+    expect(follows(recommendation, feedback)).toBe(true)
+    expect(follows(feedback, rowList())).toBe(true)
+  })
+
+  it('keeps the decision rail in normal document order, never over the candidate text', async () => {
+    await renderWorkspace()
+    const aside = rail()
+    const list = rowList()
+    // Neither contains the other: the rail is a SIBLING grid cell, so its sticky behaviour is
+    // confined to its own column and can never paint across a row.
+    expect(aside.contains(list)).toBe(false)
+    expect(list.contains(aside)).toBe(false)
+    expect(aside.closest('.work-layout')).not.toBeNull()
+    expect(follows(list, aside)).toBe(true)
+    // No inline positioning: the layout lives in the stylesheet, and nothing here escapes flow.
+    expect(aside.getAttribute('style')).toBeNull()
+  })
+
+  it('states the selection count, the source sets, and what approving will WRITE', async () => {
+    await renderWorkspace()
+    // Empty tray: the structure of the decision, and honest absence — never a dead button.
+    expect(within(rail()).getByText(/Nothing is selected yet/)).toBeInTheDocument()
+    expect(within(rail()).queryByRole('button', { name: /approve and register/i })).toBeNull()
+
+    await selectCandidate('txn_acceleration_30d')
+    expect(within(rail()).getByText('1 selected')).toBeInTheDocument()
+    expect(within(rail()).getByText(
+      /Approve and register writes 1 definition with its lineage, under your name/,
+    )).toBeInTheDocument()
+    // The consequence is stated in the app's own vocabulary and claims nothing about value.
+    expect(within(rail()).getByText(/computes nothing and proves nothing about predictive value/))
+      .toBeInTheDocument()
+    // Governability is the SERVER's verdict, reported.
+    expect(within(rail()).getByText('It can also be governed into a signed contract.'))
+      .toBeInTheDocument()
+    expect(within(rail()).getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+
+    // Picking across sets names the mix, so the tray says where the picks came from.
+    await userEvent.click(screen.getByRole('button', { name: /Ratio set/ }))
+    await selectCandidate('debit_to_credit_ratio_30d')
+    expect(within(rail()).getByText('2 selected')).toBeInTheDocument()
+    expect(within(rail()).getByText(/mixed from 2 sets/)).toBeInTheDocument()
+    expect(within(rail()).getByText(
+      /Approve and register writes 2 definitions with their lineage/)).toBeInTheDocument()
+  })
+
+  it('names which selections cannot be governed, and that registering still works', async () => {
+    await renderWorkspace()
+    await selectCandidate('txn_acceleration_30d')
+    // A whole-round regeneration PINS the selected candidate: it survives as a kept row from an
+    // earlier round, which is outside the new round's governable snapshot by construction.
+    contractConsideredSet.mockResolvedValue(workspaceRound())
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'fewer balance aggregates')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Regenerate with feedback · round 1 of 3' }))
+    expect(await screen.findByText('Kept')).toBeInTheDocument()
+
+    expect(within(rail()).getByText(/None of these can be governed from this round/))
+      .toBeInTheDocument()
+    // Never a dead end: the arm that still works is named in the same sentence.
+    expect(within(rail()).getByText(/Registering still works/)).toBeInTheDocument()
+    expect(within(rail()).queryByRole('button', { name: /^Govern/ })).toBeNull()
+    expect(within(rail()).getByRole('button', { name: 'Approve and register 1 feature' }))
+      .toBeInTheDocument()
+
+    // Adding a FRESH pick from the new round makes the split explicit — never one flat verdict.
+    await userEvent.click(screen.getByRole('checkbox', {
+      name: 'Select txn_acceleration_30d (temporal; Recipe · accel_recipe)',
+    }))
+    expect(within(rail()).getByText(
+      /1 of 2 can also be governed into signed contracts; the rest came from an earlier round/,
+    )).toBeInTheDocument()
+    expect(within(rail()).getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+  })
+
+  it('searches WITHIN the active set only, and leaves the sets and their counts alone', async () => {
+    await renderWorkspace()
+    // The active set is the engine's advisory pick; the other set's candidate is not on the list.
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.queryByText('debit_to_credit_ratio_30d')).toBeNull()
+
+    await userEvent.type(screen.getByLabelText('Search this set'), 'cutoff')
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getByText(/Showing 1 of 2 candidates in the Temporal set\./))
+      .toBeInTheDocument()
+    // The SETS are untouched: a search is not a claim about the round.
+    expect(screen.getByText(/2 features · all design-checked/)).toBeInTheDocument()
+    expect(screen.getByText(/1 feature · all design-checked/)).toBeInTheDocument()
+    // and searching cannot reach into the set the human is not looking at.
+    expect(screen.queryByText('debit_to_credit_ratio_30d')).toBeNull()
+  })
+
+  it('searches the description and the derived columns, not only the name', async () => {
+    await renderWorkspace()
+    await userEvent.type(screen.getByLabelText('Search this set'), 'transactions.ts')
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+  })
+
+  it('narrows by each wire-stated facet, and every chip count is what it leaves', async () => {
+    await renderWorkspace()
+    // Binding state: straight off the per-option `binding_state`.
+    await userEvent.click(screen.getByRole('button', { name: 'Ambiguous 1' }))
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+    expect(screen.getByText(/Showing 1 of 2 candidates/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Ambiguous 1' }))
+
+    // Design checks: straight off the per-candidate `validation_status`. A candidate that owes
+    // data checks is filterable as exactly that — never as a failure.
+    await userEvent.click(screen.getByRole('button', { name: 'Needs data checks 1' }))
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Needs data checks 1' }))
+
+    await userEvent.click(screen.getByRole('button', { name: 'Design-checked 1' }))
+    expect(screen.getByText('txn_acceleration_30d')).toBeInTheDocument()
+    expect(screen.queryByText('days_since_last_txn')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Design-checked 1' }))
+
+    // Review currency: the engine's own RECIPE_REVIEW_NOT_CURRENT blocker, and the same
+    // derivation the row badge uses, so a chip and a badge can never disagree.
+    await userEvent.click(screen.getByRole('button', { name: 'Review not current 1' }))
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getByText('review not current')).toBeInTheDocument()
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+  })
+
+  it('ANDs across axes and ORs within one, and says what each axis was counted from', async () => {
+    await renderWorkspace()
+    // Two values in ONE axis mean "either": both rows survive.
+    await userEvent.click(screen.getByRole('button', { name: 'Bound 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Ambiguous 1' }))
+    expect(screen.getByText('txn_acceleration_30d')).toBeInTheDocument()
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    // Adding a DIFFERENT axis narrows further.
+    await userEvent.click(screen.getByRole('button', { name: 'Needs data checks 1' }))
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    // Provenance is on the page: a filter whose source is invisible is indistinguishable from
+    // one the UI invented.
+    expect(screen.getByRole('group', {
+      name: 'Operand binding — counted from the binding state the engine returned per option',
+    })).toBeInTheDocument()
+    expect(screen.getByRole('group', {
+      name: 'Design checks — counted from the design-check status the engine returned per candidate',
+    })).toBeInTheDocument()
+  })
+
+  it('offers no facet for a state the round did not report', async () => {
+    // No option-actions sections at all: the binding and review axes have nothing to count, so
+    // they render no controls rather than an authored menu of empty states.
+    await renderWorkspace({
+      recommended_options: undefined, actionable_options: undefined, contract_version: undefined,
+    })
+    expect(screen.queryByRole('group', { name: /Operand binding/ })).toBeNull()
+    expect(screen.queryByRole('group', { name: /Recipe review/ })).toBeNull()
+    // The design-check axis still has values, so it still has controls.
+    expect(screen.getByRole('group', { name: /Design checks/ })).toBeInTheDocument()
+  })
+
+  it('keeps a hidden pick selected and SAYS it is hidden', async () => {
+    await renderWorkspace()
+    await selectCandidate('txn_acceleration_30d')
+    await userEvent.type(screen.getByLabelText('Search this set'), 'cutoff')
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+    // The consequence never silently shrinks with the list.
+    expect(within(rail()).getByText('1 selected')).toBeInTheDocument()
+    expect(within(rail()).getByText(
+      /1 of them is hidden by the current search and filters\. They stay selected/,
+    )).toBeInTheDocument()
+    expect(within(rail()).getByRole('button', { name: 'Approve and register 1 feature' }))
+      .toBeInTheDocument()
+  })
+
+  it('narrowing to nothing is a fact about the filter, not about the round', async () => {
+    await renderWorkspace()
+    await userEvent.type(screen.getByLabelText('Search this set'), 'zzzz')
+    expect(screen.getByText(/No candidate in this set matches the current search and filters/))
+      .toBeInTheDocument()
+    // The honest counterfactual, and the way back.
+    expect(screen.getByText(/2 candidates are here with them cleared/)).toBeInTheDocument()
+    expect(screen.getByText(/Showing 0 of 2 candidates/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Clear search and filters' }))
+    expect(screen.getByText('txn_acceleration_30d')).toBeInTheDocument()
+    expect(screen.getByLabelText('Search this set')).toHaveValue('')
+  })
+
+  it('drops the narrowing when a new round replaces the set it was aimed at', async () => {
+    await renderWorkspace()
+    await userEvent.type(screen.getByLabelText('Search this set'), 'cutoff')
+    await userEvent.click(screen.getByRole('button', { name: 'Needs data checks 1' }))
+    expect(screen.queryByText('txn_acceleration_30d')).toBeNull()
+
+    contractConsideredSet.mockResolvedValue(workspaceRound())
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Regenerate with feedback · round 1 of 3' }))
+    expect(await screen.findByText(/1 of 3 rounds recorded/)).toBeInTheDocument()
+    // A filter aimed at candidates that no longer exist would hide fresh ones behind a control
+    // the human cannot connect to anything on screen.
+    expect(screen.getByLabelText('Search this set')).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Needs data checks 1' }))
+      .toHaveAttribute('aria-pressed', 'false')
+    expect(screen.getByText('txn_acceleration_30d')).toBeInTheDocument()
+  })
+
+  it('adds no quality score, and keeps the backend caveat beside the backend recommendation', async () => {
+    await renderWorkspace()
+    expect(screen.getByText(/Engine's pick: Temporal/)).toBeInTheDocument()
+    expect(screen.getByText(`Caveat: ${CAVEAT}`)).toBeInTheDocument()
+    // Nothing on this screen ranks or scores: the toolbar only hides rows.
+    expect(screen.queryByRole('button', { name: /sort/i })).toBeNull()
+    expect(screen.queryByRole('combobox', { name: /sort/i })).toBeNull()
+    expect(screen.queryByText(/score/i)).toBeNull()
+    expect(screen.queryByText(/quality/i)).toBeNull()
+    expect(screen.queryByText(/best match/i)).toBeNull()
+  })
+
+  it('refusals keep their named reasons behind a counted summary, never a bare number', async () => {
+    await renderWorkspace()
+    expect(screen.getByText('3 rejected')).toBeInTheDocument()
+    // The summary is count-bearing AND reason-bearing before anything is expanded.
+    expect(screen.getByText(/stale source 2 · protected characteristic 1/)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Show' }))
+    // Each refusal names itself, its rule, and the engine's own sentence about it.
+    expect(screen.getByText('balance_slope_90d')).toBeInTheDocument()
+    expect(screen.getByText('deposits last loaded 14 days ago')).toBeInTheDocument()
+    expect(screen.getByText('derives from a protected attribute')).toBeInTheDocument()
+    expect(screen.getByText('branch feed has no arrival guarantee')).toBeInTheDocument()
+  })
+
+  it('puts the recorded feedback rounds behind a count-bearing summary, losing none', async () => {
+    await renderWorkspace()
+    expect(screen.queryByText(/rounds recorded/)).toBeNull()   // nothing recorded yet, no disclosure
+    contractConsideredSet.mockResolvedValue(workspaceRound())
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'fewer balance aggregates')
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Regenerate with feedback · round 1 of 3' }))
+    const summary = await screen.findByText(/1 of 3 rounds recorded/)
+    expect(summary).toBeInTheDocument()
+    // The strip itself is still there, verbatim, attributed and countable.
+    expect(screen.getByText(
+      'Set feedback round 1 of 3 · recorded · from user:dev · "fewer balance aggregates" · '
+      + 'kept 0 selected, replaced 3',
+    )).toBeInTheDocument()
+  })
+
+  it('counts what was written beside what failed, and hides neither', async () => {
+    registerFeature.mockResolvedValueOnce('feat_01')
+    registerFeature.mockRejectedValueOnce(new api.ApiError(409, 'a feature by that name exists'))
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderWorkspace()
+    await selectCandidate('txn_acceleration_30d')
+    await userEvent.click(screen.getByRole('button', { name: /Ratio set/ }))
+    await selectCandidate('debit_to_credit_ratio_30d')
+    await registerSelection(2)
+    // The successes are NOT hidden behind the failure, and the failure keeps its own row.
+    expect(await within(rail()).findByText(
+      /1 of this round's candidates is saved or governed\./)).toBeInTheDocument()
+    expect(within(rail()).getByText(
+      /1 could not be written — each one says why on its own row\./)).toBeInTheDocument()
+    expect(screen.getByText('a feature by that name exists')).toBeInTheDocument()
+  })
+})
+
+// ------------------------------------------- Slice 2: readiness and the frozen plan, on record ----
+describe('Slice 2: the readiness ladder', () => {
+  function withRecord(optionId: string): api.ConsideredSetResp {
+    const cs = considered(singleSetRound([idea('audited_feature')]))
+    return {
+      ...cs,
+      contract_version: 2,
+      considered_revision_id: 'crv_ladder',
+      recommended_options: [{
+        option_id: optionId, name: null, recipe_id: 'recipe:x', binding_state: 'bound',
+        allowed_actions: ['save_idea', 'create_contract'], blocked_actions: {},
+      }],
+    }
+  }
+
+  function record(over: Partial<api.OptionDecisionRecord> = {}): api.OptionDecisionRecord {
+    return {
+      decision_id: 'sod_1', source_definition_id: 'complaint_count@window=90',
+      generation_source: 'recipe', planning_request_hash: 'prh_abcdef1234567890',
+      binding_state: 'bound', readiness: 'FORMULA_BLOCKED', review_current: true,
+      validation_status: 'NEEDS_EXTERNAL_VALIDATION',
+      dataset_story: {
+        binding_plan: {
+          source_table: 'public.transactions', window: 90,
+          population_ref: 'public.customers', pit: 'last event strictly <= as_of',
+        },
+      },
+      evidence: { verdicts: [], eligibility_audit: [] },
+      decision_manifest: { authority_matrix_hash: 'amh_1234567890abcdef' },
+      observation_id: null, context_hash: 'ctx_abcdef1234567890',
+      recorded_at: '2026-08-15 00:00:00+00',
+      ...over,
+    }
+  }
+
+  async function openRecord(over: Partial<api.OptionDecisionRecord> = {}) {
+    const cs = considered(singleSetRound([idea('audited_feature')]))
+    const optionId = cs.alternatives[0].features[0].option_id!
+    contractConsideredSet.mockResolvedValueOnce(withRecord(optionId))
+    contractOptionDetail.mockResolvedValue({
+      considered_revision_id: 'crv_ladder', considered_content_hash: 'h',
+      generation_run_id: 'run_1', option_id: optionId, option: {},
+      decision_record: record(over),
+    })
+    await renderAndGenerateRaw()
+    await userEvent.click(await screen.findByRole('button', { name: 'Decision record' }))
+  }
+
+  it('locates the definition on the STORED readiness ladder and names the rung', async () => {
+    await openRecord()
+    expect(await screen.findByRole('img', {
+      name: 'Readiness: formula blocked, rung 2 of 6',
+    })).toBeInTheDocument()
+    expect(screen.getByText(
+      /A formula cannot be authored until a named prerequisite is settled/)).toBeInTheDocument()
+    // Readiness and the design check are separate claims, and NEITHER is predictive value.
+    expect(screen.getByText(/Readiness is separate from the design check/)).toBeInTheDocument()
+    expect(screen.getByText(/neither is a claim about predictive value/)).toBeInTheDocument()
+  })
+
+  it('reads out exactly what would be computed, and only the terms the record carries', async () => {
+    await openRecord()
+    expect(await screen.findByText('Exactly what would be computed')).toBeInTheDocument()
+    expect(screen.getByText('Reads')).toBeInTheDocument()
+    expect(screen.getByText('public.transactions')).toBeInTheDocument()
+    expect(screen.getByText('Population')).toBeInTheDocument()
+    expect(screen.getByText('90 days')).toBeInTheDocument()
+    expect(screen.getByText('last event strictly <= as_of')).toBeInTheDocument()
+  })
+
+  it('omits a plan term the record does not carry rather than filling in a default', async () => {
+    await openRecord({
+      dataset_story: { binding_plan: { source_table: 'public.transactions' } },
+    })
+    expect(await screen.findByText('Reads')).toBeInTheDocument()
+    expect(screen.queryByText('Window')).toBeNull()
+    expect(screen.queryByText('Point in time')).toBeNull()
+    expect(screen.queryByText('Population')).toBeNull()
+  })
+
+  it('draws no ladder for a readiness that is not on it, and states the value instead', async () => {
+    await openRecord({ readiness: 'RETIRED' })
+    expect(await screen.findByText(/Readiness reported as/)).toBeInTheDocument()
+    expect(screen.getByText('RETIRED')).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: /Readiness: / })).toBeNull()
+    expect(screen.getByText(/Withdrawn from the library/)).toBeInTheDocument()
+  })
+
+  it('a readiness this client has no copy for renders as itself, never as an invented rung', async () => {
+    await openRecord({ readiness: 'QUARANTINED_BY_POLICY' })
+    expect(await screen.findByText('QUARANTINED_BY_POLICY')).toBeInTheDocument()
+    expect(screen.getByText(/not one this screen has copy for/)).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: /Readiness: / })).toBeNull()
+  })
+
+  it('does not draw a readiness ladder on the rows: it is not on the considered-set wire', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: /Readiness: / })).toBeNull()
+    expect(document.querySelectorAll('.ladder')).toHaveLength(0)
   })
 })
