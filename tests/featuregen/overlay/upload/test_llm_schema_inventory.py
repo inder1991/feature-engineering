@@ -183,7 +183,11 @@ def test_the_scan_sees_the_known_call_sites():
         ("overlay_contract", 1),                      # contract author/refine
         ("concept_critique", 1), ("concept_revision", 1),   # concept critic
         ("bridge_identifier_critique", 1),            # bridge critic
-        ("use_case_recognition", 1),                  # recognizer
+        # The recognizer dispatches the FROZEN v2 contract (2026-08-15 repair seam, Task 1) — the
+        # version arrives as the module constant `_OUTPUT_SCHEMA_VERSION`, which the scan resolves.
+        # This row is the gate that makes activation real: had the constant been bumped without the
+        # call site threading it (the seam defaults to 1), the scan would still see v1 here.
+        ("use_case_recognition", 2),                  # recognizer
         # the output_schema_id= widening: the semantic-binding SELECT resolves its schema from
         # the registry (LLMRequest kwarg — the previously unscanned site).
         ("overlay_semantic_bindings_select", 1),

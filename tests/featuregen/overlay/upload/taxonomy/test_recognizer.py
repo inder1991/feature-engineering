@@ -18,11 +18,17 @@ from featuregen.intake.llm import (
     FakeLLM,
     FakeResponse,
 )
+from featuregen.overlay.upload.contract.scope_records import (
+    find_recognition_attempt,
+    record_recognition_attempt,
+)
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
     RecognitionStatus,
+    unscoped_result,
 )
 from featuregen.overlay.upload.taxonomy.recognizer import (
+    _OUTPUT_SCHEMA_VERSION,
     RECOGNITION_REQUEST_CONTRACT,
     RECOGNITION_REQUEST_VERSION,
     RECOGNIZER_TASK,
@@ -91,8 +97,10 @@ def test_classified_output_maps_to_classified_result(db) -> None:
 
 
 def test_unknown_use_case_id_fails_open_never_invalid(db) -> None:
-    # An unknown id is structurally valid (passes the JSON schema) but fails the closed-taxonomy
-    # semantic post-pass (validate_recognition_output) -> fail-open. Never an invalid id, never raises.
+    # Since Task 1 an unknown id fails the SCHEMA (v2's closed enum), so it exhausts the seam's
+    # repair budget and arrives here as an empty body; before that it passed the schema and died in
+    # the closed-taxonomy post-pass. Either way the recognizer folds it open — never an invalid id,
+    # never a raise. (`test_an_invented_id_now_reaches_the_seam_as_doubt…` pins the new route.)
     output = {
         "status": "classified",
         "candidates": [_candidate("customer.not_a_real_leaf", relationship="primary")],
@@ -261,3 +269,96 @@ def test_the_request_contract_version_is_registered() -> None:
     the hash happening to work."""
     assert contract_owner(RECOGNITION_REQUEST_CONTRACT, RECOGNITION_REQUEST_VERSION) == (
         "featuregen.overlay.upload.taxonomy.recognizer")
+
+
+# ── Task 1 (2026-08-15): the frozen output contract, ACTIVATED ──────────────────────────────────
+
+
+class _RecordingClient:
+    """An LLMClient that remembers the request it was handed. The dispatched schema version is not
+    observable any other way — and it is the whole question here."""
+
+    def __init__(self, inner: FakeLLM) -> None:
+        self._inner = inner
+        self.requests: list[Any] = []
+
+    def call(self, request: Any) -> Any:
+        self.requests.append(request)
+        return self._inner.call(request)
+
+
+def test_the_dispatched_call_is_held_to_the_frozen_v2_contract(db) -> None:
+    """Activation is a CALL-SITE fact, not a constant. ``drive_audited_structured_call`` defaults
+    ``schema_version=1``, so bumping ``_OUTPUT_SCHEMA_VERSION`` alone would have left every real
+    dispatch enforced against v1 while the request identity, the audit row and the release gate all
+    claimed v2 — the exact class of drift Task 0 built the identity hash to stop."""
+    client = _RecordingClient(_fake({
+        "status": "classified",
+        "candidates": [_candidate(CHURN, relationship="primary")],
+    }))
+    result = recognize(db, client, redacted_hypothesis="will this customer leave?")
+
+    assert result.status is RecognitionStatus.CLASSIFIED
+    assert client.requests, "the recognizer never dispatched"
+    request = client.requests[0]
+    assert request.output_schema_version == _OUTPUT_SCHEMA_VERSION == 2
+    enum = (request.output_schema["properties"]["candidates"]["items"]["properties"]
+            ["use_case_id"]["enum"])
+    assert len(enum) == 88 and CHURN in enum
+    # The platform's own outcome is not on the wire for the model to claim.
+    assert request.output_schema["properties"]["status"]["enum"] == [
+        "classified", "ambiguous", "unscoped"]
+
+
+def test_an_invented_id_now_reaches_the_seam_as_doubt_not_as_a_silent_failure(db) -> None:
+    """The live incident's value, end to end. Under v1 the body validated and the invented id died
+    in a post-call pass the seam never saw — ``repair_attempts: []``, one provider call, and the
+    correct sibling discarded with it. Under v2 it is malformed STRUCTURE, so the seam re-prompts
+    within its bounded budget. The disposition is still fail-open (Tasks 2-4 make the recovery
+    honest); what changed is that the model is now ASKED to fix it."""
+    client = _RecordingClient(_fake({
+        "status": "classified",
+        "candidates": [_candidate("x", relationship="primary", evidence_spans=("x",),
+                                  rationale="placeholder")],
+    }))
+    result = recognize(db, client, redacted_hypothesis="predict churn in the next 90 days")
+
+    assert result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert result.candidates == ()
+    assert len(client.requests) == 3, "the repair budget (2) was not spent on the invalid id"
+    # And the re-prompt names the FIELD, never the value — this text is audited and re-egressed.
+    repairs = client.requests[-1].inputs["_repair_errors"]     # accumulated, one per failed attempt
+    assert set(repairs) == {"$.candidates[0].use_case_id: failed 'enum'"}
+    assert not any("placeholder" in str(r) or "'x'" in str(r) for r in repairs)
+
+
+def test_a_v1_answer_is_not_reused_as_the_answer_to_the_v2_question(db, monkeypatch) -> None:
+    """The Task 0 interaction, proved rather than discovered. The schema enters the request identity
+    by CONTENT and by version, so activating v2 re-keys every objective — which is correct: a
+    different contract is a different question, and the stored v1 answer (produced under a schema
+    that could not even refuse ``"x"``) is not its answer."""
+    sealed = "a1" * 32
+    v2_hash = recognition_request_hash(input_content_hash=sealed)
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.taxonomy.recognizer._OUTPUT_SCHEMA_VERSION", 1)
+    v1_hash = recognition_request_hash(input_content_hash=sealed)
+    assert v1_hash != v2_hash
+
+    # The stored v1 answer stays exactly where it is — found by its OWN identity, never by the new
+    # one. (The re-run therefore asks the provider again, which is the point.)
+    stored = record_recognition_attempt(
+        db, intent_id="intent_schema_v2", input_hash=v1_hash, result=unscoped_result(
+            "nothing in scope", model_id=_MODEL, prompt_version=PROMPT_VERSION),
+        actor="ds1", input_content_hash=sealed, recognition_request_hash=v1_hash)
+    found = find_recognition_attempt(
+        db, intent_id="intent_schema_v2", recognition_request_hash=v1_hash)
+    assert found is not None and found.recognition_id == stored
+    assert find_recognition_attempt(
+        db, intent_id="intent_schema_v2", recognition_request_hash=v2_hash) is None
+
+    # And the SEALED-INPUT identity is untouched by the schema flip: the lineage trigger and
+    # `load_recognition_input` join on it, so a legacy row's own identity cannot move underneath it.
+    assert recognition_request_material(input_content_hash=sealed)["input_content_hash"] == sealed
+    monkeypatch.undo()
+    assert recognition_request_material(input_content_hash=sealed)["input_content_hash"] == sealed

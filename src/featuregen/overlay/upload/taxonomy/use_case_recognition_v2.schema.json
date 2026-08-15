@@ -1,0 +1,169 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "ambiguity_note": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "candidates": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "confidence": {
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ],
+            "type": "string"
+          },
+          "evidence_spans": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rationale": {
+            "type": "string"
+          },
+          "relationship": {
+            "enum": [
+              "primary",
+              "secondary"
+            ],
+            "type": "string"
+          },
+          "use_case_id": {
+            "enum": [
+              "aml_cft.correspondent",
+              "aml_cft.kyc",
+              "aml_cft.mule_account",
+              "aml_cft.sanctions",
+              "aml_cft.screening",
+              "aml_cft.structuring",
+              "aml_cft.suspicious_transaction_monitoring",
+              "aml_cft.tbml",
+              "asset_management.mandate_compliance",
+              "asset_management.performance",
+              "asset_management.redemption.aum_stability",
+              "asset_management.redemption.fund_flows",
+              "asset_management.redemption.fund_liquidity",
+              "corporate_trade.receivables_finance",
+              "corporate_trade.supply_chain_finance",
+              "corporate_trade.trade_finance",
+              "corporate_trade.working_capital",
+              "counterparty_risk.exposure_monitoring",
+              "counterparty_risk.margin_call_risk",
+              "counterparty_risk.settlement_exposure",
+              "credit.collections.hardship",
+              "credit.collections.recoveries",
+              "credit.collections.self_cure",
+              "credit.collections.workout",
+              "credit.early_warning",
+              "credit.monitoring.credit_mitigation",
+              "credit.monitoring.limit_management",
+              "credit.monitoring.obligor",
+              "credit.underwriting.affordability",
+              "credit.underwriting.seasoning",
+              "credit.underwriting.sme",
+              "customer.campaign",
+              "customer.clv",
+              "customer.cross_sell.next_best_action",
+              "customer.cross_sell.share_of_wallet",
+              "customer.cross_sell.whitespace",
+              "customer.engagement",
+              "customer.overdraft_propensity",
+              "customer.relationship_attrition.churn",
+              "customer.relationship_attrition.deposit_attrition",
+              "customer.relationship_attrition.primacy_loss",
+              "customer.segmentation",
+              "esg.climate.physical",
+              "esg.climate.transition",
+              "esg.scoring",
+              "fraud.account_takeover",
+              "fraud.app_scam",
+              "fraud.card_fraud",
+              "fraud.merchant_fraud",
+              "fraud.synthetic_id",
+              "fraud.transaction_fraud_detection",
+              "insurance.actuarial.claims_cost_modelling",
+              "insurance.bancassurance",
+              "insurance.claims.claims_fraud",
+              "insurance.lapse.persistency",
+              "insurance.lapse.surrender",
+              "insurance.reinsurance",
+              "insurance.underwriting.mortality_morbidity_risk_assessment",
+              "islamic.banking",
+              "islamic.sharia_compliance",
+              "markets.market_risk.basis_risk",
+              "markets.market_risk.portfolio",
+              "operations.manual_review_optimisation",
+              "operations.process_cost_forecasting",
+              "operations.workload_forecasting",
+              "payments.behaviour",
+              "payments.cross_border",
+              "payments.merchant.interchange",
+              "payments.operations",
+              "portfolio_risk.concentration",
+              "pricing.credit_risk_based_pricing",
+              "pricing.deposit_rate_optimisation",
+              "pricing.fee_pricing",
+              "pricing.relationship_pricing",
+              "profitability.margin_forecasting",
+              "securities_services.custody.corporate_actions",
+              "securities_services.custody.holdings_dynamics",
+              "securities_services.custody.settlement_failure_risk",
+              "securities_services.fund_administration",
+              "securities_services.securities_lending",
+              "treasury_alm.cash_management",
+              "treasury_alm.deposit_runoff_forecasting",
+              "treasury_alm.deposit_stability",
+              "treasury_alm.irrbb.basis_risk",
+              "treasury_alm.liquidity",
+              "treasury_alm.net_interest_margin",
+              "wealth.asset_outflow",
+              "wealth.client_attrition"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "use_case_id",
+          "relationship",
+          "confidence",
+          "evidence_spans",
+          "rationale"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "modelling_contexts": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "status": {
+      "enum": [
+        "classified",
+        "ambiguous",
+        "unscoped"
+      ],
+      "type": "string"
+    },
+    "target_entity": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "status",
+    "candidates"
+  ],
+  "type": "object"
+}

@@ -67,6 +67,9 @@ from featuregen.overlay.upload.enrich_batch import (
     validate_batch_results,
 )
 from featuregen.overlay.upload.sanitize import sanitize_definition
+from featuregen.overlay.upload.taxonomy.recognition_schema import (
+    USE_CASE_RECOGNITION_V2_SCHEMA,
+)
 from featuregen.security.audit import record_security_event
 
 logger = logging.getLogger(__name__)
@@ -1449,6 +1452,9 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                         "properties": {"issues": {"type": "array"}}},
     # Intent-recognition (Phase-1A): the closed-shape recognition body. Structure only — the closed-
     # taxonomy semantics (id in registry, primary is a leaf) are a post-pass in recognizer.recognize.
+    # SUPERSEDED by v2 below and BYTE-FROZEN: no dispatch requests v1 any more, but it is the
+    # contract every legacy llm_call/recognition row was produced under, so it neither changes nor
+    # goes away. (`test_v1_is_byte_frozen` pins these exact bytes.)
     ("use_case_recognition", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {
@@ -1471,6 +1477,20 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "target_entity": {"type": ["string", "null"]},
             "ambiguity_note": {"type": ["string", "null"]}},
         "required": ["status", "candidates"]},
+    # v2 (2026-08-15 repair seam, Task 1) — the version the recognizer DISPATCHES today. v1 stays
+    # registered and byte-frozen above: it is the contract every legacy `llm_call`/recognition row
+    # was produced under, and rewriting it would relabel history. What changed, and why:
+    #   * `use_case_id` carries the closed 88-leaf `enum`, so an invented id (the live incident's
+    #     literal `"x"`) is now a SCHEMA failure the audited seam can drive bounded repair from,
+    #     instead of a structurally-valid body that only a post-call pass rejects — too late, and
+    #     outside the repair loop.
+    #   * `status` loses `technical_failure`: that is the PLATFORM's outcome for a provider failure
+    #     or an exhausted budget, never a classification the model performs.
+    # The body is FROZEN, REVIEWED, COMMITTED BYTES (`taxonomy/use_case_recognition_v2.schema.json`,
+    # pinned by sha256) rather than a comprehension over `selectable_leaves()`: `register_schema`
+    # upserts, so a derived enum would let one version number mean different things on two
+    # deployments. Taxonomy growth therefore requires a v3 — never an edit here.
+    ("use_case_recognition", 2): USE_CASE_RECOGNITION_V2_SCHEMA,
     # Identifier-link semantic critic. Namespace and population are deliberately separate outputs:
     # neither field carries uniqueness/cardinality/operational eligibility, which remain deterministic.
     ("bridge_identifier_critique", 1): {

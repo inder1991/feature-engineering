@@ -73,6 +73,10 @@ where = ["src"]
 # The strict proposal JSON Schema is runtime data loaded from disk by
 # featuregen.formula.parse — without this the wheel ships no shape gate.
 "featuregen.formula" = ["*.schema.json"]
+# The FROZEN use-case recognition output contract (v2), loaded from disk and digest-checked at
+# import by featuregen.overlay.upload.taxonomy.recognition_schema — without this the wheel cannot
+# import the enrichment seam at all.
+"featuregen.overlay.upload.taxonomy" = ["*.schema.json"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

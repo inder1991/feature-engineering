@@ -62,7 +62,12 @@ logger = logging.getLogger(__name__)
 # prompt id so the recognizer reads as one coherent (task, prompt, schema) unit in the llm_call store.
 RECOGNIZER_TASK = "use_case_recognition"
 _OUTPUT_SCHEMA_ID = "use_case_recognition"
-_OUTPUT_SCHEMA_VERSION = 1
+# v2 (2026-08-15 repair seam, Task 1): the frozen contract whose `use_case_id` carries the closed
+# 88-leaf enum and whose `status` no longer offers the platform-internal `technical_failure`. This
+# constant is BOTH the version dispatched (threaded to the audited seam below — its default is 1, so
+# the constant alone activates nothing) and a leg of the request identity: a recognition answered
+# under v1 is not an answer to the v2 question, and is deliberately not reused across the change.
+_OUTPUT_SCHEMA_VERSION = 2
 
 # The serialized identity of ONE recognition request (Task 0 of the recognition repair seam). Owned
 # here because this module is where the (task, prompt, schema, validator, model) unit is assembled.
@@ -231,7 +236,8 @@ def recognize_with_audit(
     try:
         audited = drive_audited_structured_call(
             conn, client, task=RECOGNIZER_TASK, prompt_id=PROMPT_ID,
-            schema_id=_OUTPUT_SCHEMA_ID, catalog_metadata={}, instruction=instruction, actor=actor,
+            schema_id=_OUTPUT_SCHEMA_ID, schema_version=_OUTPUT_SCHEMA_VERSION,
+            catalog_metadata={}, instruction=instruction, actor=actor,
             dispatch_audit=dispatch_audit,
             run_id=audit_run_id or ENRICHMENT_RUN_ID,
             record_egress_block=audit_run_id is not None,

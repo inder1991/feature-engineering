@@ -52,6 +52,7 @@ served **917 unscoped candidates** (306 of 317 recipes).
 | B2 | **Re-running the same objective returns a NEW http result over an OLD stored row.** Persistence is unique on `(intent_id, input_hash)`, and `input_hash` covers only redacted user input + redaction policy — not prompt, schema, taxonomy, validator or model. The endpoint calls the provider again, then `ON CONFLICT DO NOTHING` returns the OLD recognition id. After this fix ships, resubmitting the incident could display "Churn" while the returned id still points at the `technical_failure` row | `contract.py:1173-1202`, `scope_records.py:94-117,145-172,490-545` |
 | B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` |
 | B4 | **Revision 1 created schema v2 and never activated it.** `_OUTPUT_SCHEMA_VERSION = 1` is hardcoded; `register_enrichment_schemas()` uses a MUTABLE `register_schema` that overwrites an existing version, so a dynamically-derived enum could mean different things on different deployments | `recognizer.py:55`, `enrich_llm.py:1902-1918`, `documents/registry.py:29-49` |
+| B4b | **[R4 — found in Task 1]** B4 understates it: activation is not the constant at all. The recognizer's dispatch does not pass `schema_version=`, and the seam defaults it to `1` — so a constant-only bump makes the request identity, and only the request identity, claim v2 | `recognizer.py:232-238`, `enrich_llm.py:2019-2029` |
 
 **Measured, not assumed [R2]:** 88 selectable leaves / 123 taxonomy nodes; the projected v2 schema is
 ~3.6 KB and passes the repository's provider-compatibility check. **The enum is therefore mandatory
@@ -181,12 +182,90 @@ version means the same thing on every deployment given the mutable registry (B4)
 **Also:** remove model-returnable `technical_failure` from the provider schema — it is an internal
 platform outcome, never an LLM classification.
 
-**Modify:** `_OUTPUT_SCHEMA_VERSION = 2`; the schema inventory test; the evaluator (Task 6).
+**Modify:** `_OUTPUT_SCHEMA_VERSION = 2` **and the dispatch call site** — **[R4 — corrected]**
+`recognize_with_audit` never passed `schema_version=` to `drive_audited_structured_call`, whose
+signature defaults it to `1`. The constant alone activates NOTHING: it would have left every real
+dispatch enforced against v1 while the request-identity hash claimed v2. Also the schema inventory
+test; the evaluator is Task 6's (B3) and is deliberately NOT touched here.
 
 **Acceptance:** `test_v1_is_byte_frozen`; `test_v2_bytes_match_their_pinned_hash`;
 `test_the_leaf_list_equals_the_registry_at_generation_time` (drift fails CI, loudly, rather than
 silently changing meaning); `test_an_invalid_id_fails_at_the_schema_layer`;
-`test_technical_failure_is_not_a_provider_status`.
+`test_technical_failure_is_not_a_provider_status`; **[R4]** a test that the DISPATCHED request
+carries the v2 contract, and one that the same user text hashes differently under v1 and v2.
+
+> **TASK 1 (2026-08-15) — ACCEPTED `PENDING`.** `("use_case_recognition", 2)` is registered from
+> **committed bytes** — `src/featuregen/overlay/upload/taxonomy/use_case_recognition_v2.schema.json`
+> (5 624 bytes, 88 ids), generated once by
+> `python -m featuregen.overlay.upload.taxonomy.recognition_schema`, reviewed as a diff, and pinned
+> by `V2_SCHEMA_SHA256` in `recognition_schema.py`. The digest is checked **at import**, so a build
+> whose contract file is not the reviewed one cannot even import the enrichment seam, let alone
+> dispatch under its version number. v1 stays registered and byte-frozen (`_V1_CANONICAL_SHA256`);
+> nothing requests it any more, but it is the contract every legacy `llm_call`/recognition row was
+> produced under. **Regenerating is deliberately not a maintenance chore: taxonomy growth requires a
+> v3**, and the drift test says so in its failure message.
+>
+> **The plan's "Modify: `_OUTPUT_SCHEMA_VERSION = 2`" was not activation — defect [R4], corrected
+> above.** `recognize_with_audit` never passed `schema_version=` to `drive_audited_structured_call`,
+> whose signature defaults it to 1. Proved before it was fixed: with the constant bumped and the call
+> site untouched, the recorded `LLMRequest` carried `output_schema_version=1` (`assert 1 == 2`) and
+> the `"x"` body produced ONE provider call with zero repairs. The identity hash reads the constant,
+> so the constant-only state would have had the request identity, the audit row and the release gate
+> disagreeing about which contract answered the question. Note what would NOT have caught this: the
+> schema inventory gate resolves the version from the CALL SITE, so it would have kept asserting
+> `("use_case_recognition", 1)` — truthfully. The dispatch test is the check; the inventory row is a
+> consequence.
+>
+> **Every acceptance test was watched failing first.** v1-frozen: adding `maxLength` to v1's
+> `use_case_id` → the frozen-digest message. v2 pin: appending one id to the JSON → the import-time
+> refusal, naming both digests and the regeneration command. Drift: adding a real leaf to
+> `use_cases.py` → *"the selectable taxonomy has moved … (added: ['customer.relationship_attrition.
+> proof_leaf']) … Author v3"*. Invalid id + `technical_failure`: with the v2 row removed from
+> `_SCHEMAS`, both fail on the missing jsonschema cause — each asserts the failing KEYWORD and PATH
+> (`enum` at `$.candidates[0].use_case_id`, `enum` at `$.status`) so neither can pass on an
+> unregistered-version error instead.
+>
+> **What Task 1 changes on its own, stated plainly.** An invented id is now malformed STRUCTURE, so
+> the audited seam re-prompts it inside its existing budget: the live incident's body now costs 3
+> provider calls instead of 1 and the model is ASKED to fix it (`test_an_invented_id_now_reaches_the_
+> seam_as_doubt_not_as_a_silent_failure`). The disposition is still `TECHNICAL_FAILURE` — Tasks 2-4
+> make the recovery honest — and the repair complaint is value-free by construction:
+> `["$.candidates[0].use_case_id: failed 'enum'"]`, never `'x'` or `"placeholder"`.
+>
+> **Request identity (Task 0 interaction), proved not discovered.** The same sealed input hashes
+> differently under v1 and v2 (against the un-flipped constant the test fails on
+> `assert 'feb8570…' != 'feb8570…'` — one hash, two contracts), and a stored v1 answer is found by
+> its own request hash and NOT by the v2 one — so activating v2 re-asks every objective rather than serving an answer produced under a
+> schema that could not refuse `"x"`. `input_content_hash` is unchanged by the flip, so the
+> sealed-input lineage legacy rows are joined on cannot move underneath them.
+>
+> **B4's premise is incomplete (recorded, not acted on).** `DocumentSchemaRegistry` already ships an
+> immutable path — `register_immutable_schema`, fail-closed on drift, used by `formula/author.py` and
+> `formula/critic.py`. Switching `register_enrichment_schemas`' uniform loop to it was REJECTED here:
+> any enrichment schema whose stored body has drifted from code on an existing database would then
+> raise at bootstrap and take every enrichment call down with it — a blast radius far beyond
+> recognition, for a hazard the committed bytes + import digest + CI pin already close. A successor
+> may narrow it to this one pair.
+>
+> **Two further findings, neither in scope, both real.** (a) The recognizer does not thread
+> `prompt_version` either, so `llm_call` rows record `prompt_version=1` while `PROMPT_VERSION` is
+> `"3"` and `recognition_release_eval` stamps `int(PROMPT_VERSION)` = 3 — the audit row and the
+> evaluation run disagree today. (b) The evaluator remains pinned to `SCHEMA_VERSION = 1` (B3, Task
+> 6): it now certifies a contract the platform no longer dispatches. It does not fail closed on that
+> — a v2-valid body is a strict subset of v1-valid, so the `-m eval` gate still passes — but the
+> stamp is a lie until Task 6 versions it with the contract.
+>
+> **No migration, no manual registration step.** `_require_schema` self-registers the enrichment set
+> on a miss, so a fresh database or a first deploy of this image registers v2 on the first
+> recognition; the loop keeps registering v1 alongside it. Packaging: the frozen JSON is added to
+> `[tool.setuptools.package-data]` — without it a wheel would ship no contract file and the import
+> digest check would fail closed on start-up.
+>
+> 8 new tests (5 in `tests/featuregen/overlay/upload/taxonomy/test_recognition_schema.py`, 3 in
+> `…/test_recognizer.py`); the inventory row moved to v2. Gates: full suite **11448 passed, 20
+> skipped** (+8 on Task 0's 11440/20 — exactly the tests added); `-m eval` **73 passed**; ruff clean
+> on every touched file; mypy unchanged (the same 4 pre-existing `enrich_llm.py` errors, confirmed by
+> HEAD-swap; `recognition_schema.py` is clean).
 
 ### Task 2 — governed validator composition, with a failure contract (1 day)
 
