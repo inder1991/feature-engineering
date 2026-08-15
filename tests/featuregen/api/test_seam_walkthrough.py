@@ -312,6 +312,31 @@ def test_the_seam_walks_from_a_served_candidate_to_a_build_verified_run(
         "the replay-shaped v2 orchestrator routes this work item; if this ever goes false again "
         "the platform lost a capability it had")
 
+    authored = _author_the_captured_v2_work_item(conn, _work_item_id, provider_input)
+    assert authored["stages"] == [
+        "AUTHOR_TURN_0", "AUTHOR_PROPOSAL_PARSED", "EXPECTATION_VALIDATED",
+        "CRITIC_COMPLETED", "OUTPUT_POLICY_RESOLVED", "TERMINAL"]
+    result = authored["result"]
+    assert result.candidate_proposal is not None, (
+        "a v2 formula was AUTHORED against the reviewed expectation — the step that used to be "
+        "asserted as the platform's own refusal")
+    assert result.candidate_proposal.body.expr.operand == "posting_bank::public.txns.txn_amt"
+    assert result.candidate_proposal_hash and len(result.candidate_proposal_hash) == 64
+    assert result.structural_status == "ok" and result.capability_status == "ok"
+    assert result.technical_status == "ok" and result.critic_status == "clean"
+    # THE HONEST OUTCOME, followed rather than forced. `posting_bank::public.txns.txn_amt` carries
+    # no GOVERNED `logical_representation` in this catalog, so §C cannot certify the output type
+    # (`external_type_required` is literally `not facts.logical_type`) and the run is
+    # NEEDS_REVIEW / external_requirement. That is the platform being right: the formula is
+    # authored and structurally sound, and its output type still needs a check outside the catalog.
+    assert result.authoring_disposition == "NEEDS_REVIEW"
+    assert result.output_status == "external_requirement"
+    assert result.output_requirements == ("EXTERNAL_TYPE_VALIDATION_REQUIRED",)
+    assert result.authority_failures == (), "no governed read failed CLOSED — none was refused"
+    assert result.candidate_output is None, (
+        "the v2 artifact is a PAIR and an unresolved output carries no policy — half a pair "
+        "would launder a guess into authority")
+
     # ── Step 4 (§0.5 item 3): the activation fold ALLOWS execute_materialization, on a real
     # frozen row, with all four §0.3 codes cleared. ────────────────────────────────────────
     monkeypatch.setattr(semantic_option_decision, "_gold_evaluation_recorded",
@@ -442,6 +467,157 @@ def test_the_route_cannot_close_the_named_homework(make_client, conn, monkeypatc
     assert response.status_code == 409, response.text
     assert {b["code"] for b in response.json()["detail"]["blockers"]} == {
         "EXTERNAL_VALIDATION_OUTSTANDING"}
+
+
+def _v2_proposal_preserving(expectation: dict) -> dict:
+    """The recorded fixture: the proposal a compliant author WOULD emit, derived from the
+    expectation the provider was actually given — never hand-written, so it cannot silently drift
+    from what the reviewed blueprint bound."""
+    expression = expectation["expressions"][0]
+    window = expression["window"]
+    return {
+        "formula_schema_version": 2,
+        "operation_grammar_version": 1,
+        "canonicalization_version": 1,
+        "grain": {"entity": expectation["grain_entity"],
+                  "keys": list(expectation["grain_key_refs"])},
+        "body": {
+            "final_operation": expectation["final_operation"],
+            "expr": {
+                "aggregation": expression["aggregation"],
+                "operand": expression["operand_ref"],
+                "second_operand": expression["second_operand_ref"],
+                "aggregation_argument": expression["aggregation_argument"],
+                "authority_refs": expression["authority_refs"],
+                "source_relation": {"table_ref": expression["source_relation_ref"]},
+                "filter": None,
+                "window": {
+                    "event_time_ref": expression["event_time_ref"],
+                    "length": expression["window_length"],
+                    **{key: window[key] for key in (
+                        "basis", "unit", "start_inclusive", "end_inclusive", "timezone",
+                        "empty_window", "null_input", "offset_periods")},
+                },
+            },
+        },
+        "parameters": [],
+        "decimal": dict(expectation["decimal"]),
+        "expected_output": None,
+        "allocation_policy_ref": "",
+    }
+
+
+def _author_the_captured_v2_work_item(conn, work_item_id: str, provider_input: dict) -> dict:
+    """§0.5 item 2's AUTHORING half, for real — the replay-shaped v2 orchestrator over the REAL
+    captured row, with only the provider recorded.
+
+    Every governed check the worker makes before it authors is made HERE, against the row the
+    capture actually wrote, and each would refuse rather than pass quietly:
+
+    * the frozen provider payload is re-validated against the fail-close egress whitelist;
+    * the frozen **v2** configuration is rebuilt from its stored bytes and re-verified against
+      current settings (a v1-frozen configuration raises ``ConfigurationDrifted`` here);
+    * the authority envelope is re-resolved against live concept evidence;
+    * the read scope is recomputed from the snapshot and compared to the hash sealed at capture;
+    * the frozen read context is loaded out of the real metadata snapshot, for exactly the refs
+      ``_formula_refs`` derives from the payload.
+
+    **What this does NOT exercise, and why.** It calls ``run_authoring_v2_replay`` directly rather
+    than ``process_recipe_formula_shadow_once``: the worker's remaining plumbing is the queue lease
+    and the durable audit store, and both need a COMMITTED queue row on a second connection (the
+    fenced trace writes run on their own DSN connection and cannot see this test's open
+    transaction). Those are ``test_fenced_replay_integration``'s subject, not this walk's. The
+    ROUTING — that a ``formula-v2`` row selects exactly these five seams and never the v1 ones — is
+    asserted in ``test_recipe_formula_worker`` with the v1 orchestrator poisoned to raise.
+    """
+    import hashlib
+
+    from tests.featuregen._helpers import make_actor
+
+    from featuregen.formula.audited import current_formula_generation_settings
+    from featuregen.formula.author import AUTHOR_TASK
+    from featuregen.formula.critic import CRITIC_TASK
+    from featuregen.formula.frozen_configuration import (
+        load_frozen_configuration_json,
+        verify_frozen_configuration_v2,
+    )
+    from featuregen.formula.recipe_authoring import (
+        FrozenRecipeReadContext,
+        recipe_expectation_validator_v2,
+        recipe_tool_runner_v2,
+    )
+    from featuregen.formula.recipe_egress import validate_recipe_provider_payload
+    from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
+    from featuregen.formula.turns import AuthoringIntent
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.recipe_formula_authority import (
+        verify_formula_authority_envelope,
+    )
+    from featuregen.overlay.upload.recipe_formula_shadow import RECIPE_FORMULA_SHADOW_HANDLER
+    from featuregen.overlay.upload.recipe_formula_worker import (
+        _current_read_scope_hash,
+        _formula_refs,
+    )
+
+    row = conn.execute(
+        "SELECT metadata_snapshot_id, request_identity_json, request_read_scope_hash, "
+        "binding_envelope_json, frozen_configuration_json, recipe_id "
+        "FROM recipe_formula_shadow_work_item WHERE work_item_id = %s",
+        (work_item_id,)).fetchone()
+    snapshot_id, identity, frozen_scope_hash, envelope, configuration_json, recipe_id = row
+
+    # The outbox pointer the capture wrote is the worker's real trigger; the relay is its own
+    # machine, so the pointer is ASSERTED rather than driven.
+    pointer = conn.execute(
+        "SELECT topic, payload FROM outbox WHERE message_id = %s",
+        (f"formula-shadow:{work_item_id}",)).fetchone()
+    assert pointer is not None and pointer[1] == {"work_item_id": work_item_id}
+    assert RECIPE_FORMULA_SHADOW_HANDLER == "recipe_formula_shadow.author.v1"
+
+    roles = tuple(identity["role_claims"])
+    assert _current_read_scope_hash(conn, snapshot_id, roles) == frozen_scope_hash, (
+        "the read scope the worker recomputes must equal the one sealed at capture — see the "
+        "SE-2 correction in `_current_read_scope_hash`")
+    assert verify_formula_authority_envelope(conn, envelope) is None
+    validate_recipe_provider_payload(provider_input)
+    configuration = load_frozen_configuration_json(configuration_json)
+    verify_frozen_configuration_v2(
+        configuration, generation_settings=current_formula_generation_settings())
+
+    expectation = provider_input["formula_expectation"]
+    refs = _formula_refs(expectation)
+    frozen_reads = FrozenRecipeReadContext.load(conn, snapshot_id, refs)
+    client = FakeLLM(script={
+        AUTHOR_TASK: FakeResponse(output={
+            "turn_type": "final_proposal",
+            "final_proposal": _v2_proposal_preserving(expectation)}),
+        CRITIC_TASK: FakeResponse(output={"findings": []})})
+
+    result = run_authoring_v2_replay(
+        conn,
+        AuthoringIntent(
+            name=recipe_id,
+            hypothesis=provider_input["hypothesis"],
+            target_entity=provider_input["target_entity"],
+            target_grain_keys=tuple(expectation["grain_key_refs"]),
+            recipe_authoring_context=provider_input),
+        client,
+        client,
+        roles=roles,
+        actor=make_actor(subject=str(identity["subject"]), roles=roles),
+        frozen_configuration=configuration,
+        proposal_validator=recipe_expectation_validator_v2(expectation),
+        tool_runner=recipe_tool_runner_v2(refs, frozen_context=frozen_reads),
+        authoring_run_id="far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24],
+        facts_reader=frozen_reads.formula_facts_v2,
+        critic_metadata_loader=frozen_reads.get_column_metadata,
+    )
+    return {
+        "result": result,
+        "stages": [stage for (stage,) in conn.execute(
+            "SELECT stage FROM formula_authoring_trace_event WHERE authoring_run_id = %s "
+            "ORDER BY seq", (result.authoring_run_id,)).fetchall()],
+    }
 
 
 def _author_the_compiled_feature(conn, monkeypatch, work_item_id: str) -> None:

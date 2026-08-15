@@ -2086,6 +2086,12 @@ the lane compiles → `run_l0` **passed** → the compiled read set **equals the
 Modelled on the parent plan's Task E0 (`bd43964d`), which is the precedent for a walkthrough gate
 that runs in CI.
 
+> **SUPERSEDED 2026-08-15 by the successor charter's increment 4 — kept because it was TRUE when
+> written and its reasoning is what got the orchestrator built.** The replay-shaped v2 orchestrator
+> now exists, so "→ authored (recorded-fixture) result →" IS a step of this walk; everything below
+> about `materialize/resolve.py` and the v2 PAIR is still exactly true, which is why the exemplar
+> still cannot be the recipe that COMPILES.
+>
 > **PLAN CORRECTION (E0, verified). "→ authored (recorded-fixture) result →" cannot be a step of
 > this walk, and the reason is already recorded twice in this document.** A3's plan defect 1 says
 > the live authoring worker is `replay_authoring.run_authoring` and that routing a v2 work item
@@ -2145,6 +2151,11 @@ that runs in CI.
 > orchestrator landed and this walkthrough must be extended through it"*. The day someone writes
 > the replay-shaped v2 orchestrator, E0 goes RED and says why. An omitted step would have said
 > nothing.
+>
+> **⟵ THAT DAY WAS 2026-08-15, AND THE TRIPWIRE DID ITS JOB.** The successor charter's increment 3
+> made the worker route a v2 work item to `run_authoring_v2_replay`, this assertion went RED with
+> its own message, and increment 4 extended the walk through the real authoring. The gap assertion
+> is now its inversion (`declared in AUTHORABLE_EXPECTATION_SCHEMAS`).
 >
 > **MUTANT PROOF, THREE, EACH RUN AND EACH CAUGHT.** (a) `divergence = None` in `ir.compile_ir` —
 > the envelope check disabled — makes `test_a_narrowed_envelope_breaks_the_walk_INSIDE_the_lane`
@@ -2577,6 +2588,64 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > A4 increment 2's two-case parametrization is replaced by eight); `-m eval` **73 passed**;
 > ruff clean; no new mypy errors (the 29 in `recipe_formula_authority` are pre-existing, measured
 > by HEAD-swap).
+
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 4: E0'S TRIPWIRE FLIPS, AND THE WALK AUTHORS.
+> ACCEPTED `<inc4>`.** `test_seam_walkthrough.py`'s §0.5 item-2 step is no longer *"the platform's
+> own refusal"* — the exemplar's captured v2 work item is **authored**, and every governed check
+> the worker makes before it authors is made against the row the capture actually wrote: the
+> egress whitelist re-validates the frozen payload, the **v2** frozen configuration is rebuilt
+> from its stored bytes and re-verified, the authority envelope is re-resolved, the read scope is
+> recomputed and compared to the hash sealed at capture, and the frozen read context is loaded out
+> of the real metadata snapshot for exactly the refs `_formula_refs` derives.
+>
+> **THE OUTCOME IS FOLLOWED, NOT FORCED: `NEEDS_REVIEW` / `external_requirement`.**
+> `posting_bank::public.txns.txn_amt` carries no GOVERNED `logical_representation` in this catalog,
+> and `external_type_required` is literally `not facts.logical_type`, so §C cannot certify the
+> output type. The formula is authored, structurally sound, capability-ok, critic-clean — and its
+> output type still needs a check outside the catalog. `candidate_output is None` because the v2
+> artifact is a PAIR and half a pair would launder a guess into authority. Nothing was tuned to
+> make this RESOLVED.
+>
+> **A REAL DEFECT, FOUND ONLY BY WALKING THE STEP, AND IT MADE THE ENTIRE AUTHORING PATH INERT.**
+> `recipe_formula_worker._current_read_scope_hash` re-hashed **every** snapshot item, while
+> `gate1` seals `request_read_scope_hash` over the CANDIDATES' `(catalog_source, object_ref)`
+> pairs. SE-2 seals one extra item per catalog run — the frozen Layer-A context's identity PIN,
+> whose `graph_ref` is a read-scope KEY (`context:<…>`), not a catalog object. **Measured, not
+> inferred:** frozen `56724882…`, recomputed `f3a41b58…`, and recomputing over the same rows minus
+> the context pin gives `56724882…` exactly. So on any run that seals a semantic context — which
+> is the live path — the worker's re-check could NEVER pass and EVERY formula-shadow work item, of
+> BOTH generations, terminalized `AUTHORIZATION_SCOPE_CHANGED` with `authoring_axis="NOT_RUN"`. The
+> subsystem looked wired and authored nothing. Fixed by excluding the `generation_semantic_context`
+> item kind, which verifies nothing away: that pin has its own D6 freshness comparator and is
+> checked by the `compare_snapshot_to_current` call a few lines further down the same worker.
+>
+> **MUTANT PROOF, and the first attempt at it failed usefully.** Restoring the unfiltered query
+> fails E0's walk (*"the read scope the worker recomputes must equal the one sealed at capture"*)
+> AND the unit test that pins the hash. The first mutant run passed — because the string
+> replacement had silently missed — which is exactly why the second asserts its target exists
+> before mutating. Recorded rather than quietly re-run.
+>
+> **WHAT THE WALK DELIBERATELY DOES NOT DRIVE, and why.** The authoring is driven through
+> `run_authoring_v2_replay` with the worker's own seams rather than through
+> `process_recipe_formula_shadow_once`: the remaining worker plumbing is the queue LEASE and the
+> DURABLE AUDIT STORE, and both need a COMMITTED queue row on a second connection — the fenced
+> trace writes run on their own DSN connection and physically cannot see this test's open
+> transaction. That is `test_fenced_replay_integration`'s subject. The capture's outbox pointer is
+> ASSERTED (topic, payload) rather than relayed, and the ROUTING — that a `formula-v2` row selects
+> exactly these five seams and never the v1 ones — is proved in `test_recipe_formula_worker` with
+> the v1 orchestrator poisoned to raise.
+>
+> **NO ACTIVATION OR READINESS SURFACE MOVED**, and that was checked rather than assumed: steps 4–6
+> of the walk (the activation fold, `POST /materialization-runs` **202**, the lane compile, `run_l0`
+> PASSED, the read-set set-equality) pass **unedited**. A v2 authored artifact still has no path
+> into materialization — `materialize/resolve.py` restores a v1 `AuthoringResult` and there is no
+> `TypedFormulaV2` (A3's plan defect 2) — so `formula_expectation_revision` does not begin minting
+> and no §0.3 code changed. The execution half still runs on `total_debit_amount_30d`.
+>
+> 1 new case in `test_recipe_formula_worker.py` (the read-scope defect, in isolation) and E0's own
+> walk extended. Gates: full suite **11252 passed, 20 skipped** (11251/20 after increment 3 — the one new
+> test and nothing else moved); `-m eval` **73 passed**; ruff clean; no new
+> mypy errors.
 
 
 ---

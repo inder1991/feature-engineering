@@ -153,11 +153,36 @@ def _formula_refs(expectation: dict) -> frozenset[str]:
 
 
 def _current_read_scope_hash(conn, snapshot_id: str, roles) -> str:
+    """Recompute the CATALOG read scope this snapshot pins, to compare with the hash frozen at
+    capture (``gate1``'s ``canonical_hash({"refs": …, "roles": …})`` over the candidates'
+    ``(catalog_source, object_ref)`` pairs).
+
+    ``generation_semantic_context`` items are EXCLUDED, and that is a correction, not a loophole.
+    SE-2 seals one such item per catalog run — an identity PIN for the frozen Layer-A context,
+    whose ``graph_ref`` is a read-scope KEY (``context:<…>``) and not a catalog object at all. It
+    was never in the population ``gate1`` hashed, so including it here made the comparison
+    unsatisfiable: on any run that seals a semantic context — which is the live path — this hash
+    could never equal the frozen one and EVERY work item terminalized
+    ``AUTHORIZATION_SCOPE_CHANGED`` without authoring anything.
+
+    Nothing is unverified as a result: the context pin has its own freshness comparator
+    (``compare_generation_context_item``, D6's dispatch) and is checked by the
+    ``compare_snapshot_to_current`` call a few lines below this one.
+
+    ``IS DISTINCT FROM`` rather than ``<>`` is defence in depth only: ``item_kind`` is NOT NULL
+    today, so the exclusion is total either way, and the test that pins that constraint is where
+    the assumption is written down.
+    """
+    from featuregen.overlay.upload.generation_semantic_context import (
+        GENERATION_CONTEXT_ITEM_KIND,
+    )
+
     refs = conn.execute(
         "SELECT DISTINCT catalog_source,graph_ref "
         "FROM catalog_metadata_snapshot_item WHERE snapshot_id=%s "
+        "AND item_kind IS DISTINCT FROM %s "
         "ORDER BY catalog_source,graph_ref",
-        (snapshot_id,),
+        (snapshot_id, GENERATION_CONTEXT_ITEM_KIND),
     ).fetchall()
     return canonical_hash({
         "refs": [[source, ref] for source, ref in refs],

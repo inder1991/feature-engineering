@@ -25,7 +25,6 @@ from featuregen.overlay.upload.recipe_formula_worker import (
 )
 from featuregen.runtime.queue import enqueue_checked
 
-
 _V2_WINDOW = {
     "event_time_role": "clock", "length_parameter": "window_days", "basis": "trailing",
     "unit": "day", "start_inclusive": "inclusive", "end_inclusive": "exclusive",
@@ -877,3 +876,62 @@ def test_incomplete_prior_dispatch_is_not_automatically_reissued(
         "PRIOR_DISPATCH_UNRECONCILED",
         "RECOVERY_REQUIRES_RECONCILIATION",
     )
+
+
+def test_the_read_scope_recomputation_excludes_the_semantic_context_pin(db) -> None:
+    """THE DEFECT E0's authored step found, in isolation.
+
+    ``gate1`` seals ``request_read_scope_hash`` over the CANDIDATES' ``(catalog_source,
+    object_ref)`` pairs. SE-2 then seals one extra snapshot item per catalog run — the frozen
+    Layer-A context's identity PIN, whose ``graph_ref`` is a read-scope key (``context:<…>``),
+    not a catalog object. The worker re-hashed **every** snapshot item, so on any run carrying a
+    semantic context — which is the live path — the two could never be equal and EVERY formula
+    shadow work item terminalized ``AUTHORIZATION_SCOPE_CHANGED`` without authoring anything.
+
+    Nothing is unverified by the exclusion: the pin has its own freshness comparator and is
+    checked by ``compare_snapshot_to_current`` a few lines later in the same worker.
+    """
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.recipe_formula_worker import _current_read_scope_hash
+
+    snapshot_id = "snap-read-scope"
+    db.execute(
+        "INSERT INTO contract_intent (intent_id,hypothesis,intake_mode,redacted_hypothesis) "
+        "VALUES ('intent-read-scope','h','hypothesis','h')")
+    db.execute(
+        "INSERT INTO feature_generation_run (generation_run_id,intent_id,actor) "
+        "VALUES ('run-read-scope','intent-read-scope','{}'::jsonb)")
+    rows = [
+        ("bank", "public.txns.txn_amt", "column_field", "h1"),
+        ("bank", "public.txns.event_ts", "column_field", "h2"),
+        ("bank", "context:bank|public.txns", "generation_semantic_context", "h3"),
+        ("bank", "public.txns.acct_id", "column_field", "h4"),
+    ]
+    for source, graph_ref, item_kind, item_hash in rows:
+        db.execute(
+            "INSERT INTO catalog_metadata_snapshot_item "
+            "(snapshot_id, catalog_source, graph_ref, item_kind, field_or_fact_type, item_hash) "
+            "VALUES (%s, %s, %s, %s, 'unit', %s)",
+            (snapshot_id, source, graph_ref, item_kind, item_hash))
+    # The header is written AFTER the items: the store seals an item set the moment its header
+    # exists, which is the same discipline the real snapshot builder follows.
+    db.execute(
+        "INSERT INTO catalog_metadata_snapshot (snapshot_id, generation_run_id, "
+        "read_scope_hash, isolation_level, content_hash) "
+        "VALUES (%s, 'run-read-scope', 'rs', 'repeatable read', 'ch')",
+        (snapshot_id,))
+
+    expected = canonical_hash({
+        "refs": [["bank", "public.txns.acct_id"], ["bank", "public.txns.event_ts"],
+                 ["bank", "public.txns.txn_amt"]],
+        "roles": ["platform_admin"],
+    })
+    assert _current_read_scope_hash(db, snapshot_id, ("platform_admin",)) == expected
+
+    # ``item_kind`` is NOT NULL, so the exclusion is total and no row can slip past it as a NULL.
+    # The worker still spells the filter ``IS DISTINCT FROM``; that is defence in depth, and this
+    # is where the assumption behind it is written down.
+    assert db.execute(
+        "SELECT is_nullable FROM information_schema.columns "
+        "WHERE table_name = 'catalog_metadata_snapshot_item' AND column_name = 'item_kind'"
+    ).fetchone()[0] == "NO"
