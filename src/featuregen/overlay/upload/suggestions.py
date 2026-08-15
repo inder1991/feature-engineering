@@ -327,9 +327,21 @@ def semantic_parity_block(conn, *, catalog_source: str, table: str, roles=()) ->
         conn, catalog_source=catalog_source, roles=roles,
         scope=ConfirmedScope(primary=None, unscoped=True), context=context)
 
+    # The caller's spelling is resolved by the SAME function the deterministic half resolves it
+    # with (:func:`_resolve_table`), and for the same reason: a deep link carries the
+    # schema-qualified `object_ref` (`public.txns`) while the engine's key is the bare table name.
+    # Anchoring on the raw parameter matched only the bare spelling, so a schema-qualified caller
+    # got an EMPTY engine block beside a populated `hits` list — the two surfaces disagreeing about
+    # one table, which is exactly what SE-13 exists to make impossible, and disagreeing SILENTLY,
+    # which this codebase treats as worse than refusing. `None` (no such table for this caller)
+    # anchors nothing, which is the same answer `table_known: false` gives on the other half.
+    resolved = _resolve_table(conn, catalog_source, table, roles=roles)
+
     def _on_table(candidate) -> bool:
+        if resolved is None:
+            return False
         return any(
-            verdict.selected_ref and verdict.selected_ref.split(".")[-2] == table
+            verdict.selected_ref and verdict.selected_ref.split(".")[-2] == resolved
             for verdict in candidate.verdicts if verdict.status == "bound")
 
     anchored = [c for c in candidates if _on_table(c)]

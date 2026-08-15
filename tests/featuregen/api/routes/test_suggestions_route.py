@@ -315,6 +315,46 @@ def test_v4_carries_the_engines_verdicts(client, ftr_catalog):  # noqa: F811
                    for v in entry["verdicts"] if v["status"] == "bound")
 
 
+def test_both_table_spellings_reach_the_same_engine_block(client, ftr_catalog):  # noqa: F811
+    """The deep link carries the schema-qualified `object_ref` (`public.comp_fin_tran`) while the
+    engine's own key is the bare table name, and `_resolve_table` has always accepted BOTH for the
+    deterministic half.
+
+    The engine block did not: it anchored on the raw parameter, so a schema-qualified caller got a
+    populated `hits` list beside an EMPTY `semantic` block — the two surfaces of one page
+    disagreeing about one table, and disagreeing SILENTLY, which reads as "the engine found
+    nothing here" rather than "you spelled the table differently". Found on the deployed cluster
+    (2026-08-15): `bo_cib_customer` answered 23 ranked / 854 actionable where
+    `public.bo_cib_customer` answered 0 / 0 with 9 hits on both.
+
+    Both spellings now resolve through the SAME function, so the answers are identical entry for
+    entry — which is the SE-13 guarantee stated over the caller's spelling instead of assuming it.
+    """
+    bare = client.get(f"{PATH}?contract_version=4", headers=_h()).json()
+    qualified = client.get(
+        f"/catalog/{SOURCE}/tables/public.{TABLE}/suggestions?contract_version=4",
+        headers=_h()).json()
+
+    assert bare["semantic"]["ranked"] + bare["semantic"]["actionable"], (
+        "the fixture's engine block is non-empty to compare against")
+    for lens in ("ranked", "actionable"):
+        assert ([e["recipe_id"] for e in qualified["semantic"][lens]]
+                == [e["recipe_id"] for e in bare["semantic"][lens]]), lens
+    # The deterministic half agreed on both spellings all along — that pre-existing agreement is
+    # what made the engine block's silence a DEFECT rather than a different question being asked.
+    assert len(qualified["hits"]) == len(bare["hits"])
+
+
+def test_an_unknown_table_anchors_nothing_rather_than_everything(client, ftr_catalog):  # noqa: F811
+    """The resolver's `None` (no such table FOR THIS CALLER) must anchor nothing. The failure to
+    avoid is a spelling nobody can resolve quietly matching every candidate in the catalog."""
+    body = client.get(
+        f"/catalog/{SOURCE}/tables/no_such_table/suggestions?contract_version=4",
+        headers=_h()).json()
+    assert body["semantic"]["ranked"] == []
+    assert body["semantic"]["actionable"] == []
+
+
 def test_the_page_and_the_workbench_agree_on_binding_validity(
         client, conn, ftr_catalog):  # noqa: F811
     """The SE-13 acceptance, pinned: the deterministic page and the hypothesis Workbench run ONE
