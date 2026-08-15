@@ -2406,7 +2406,7 @@ task."* A4 increment 2 then made the live worker terminalize every v2 work item
 refusal as a **green tripwire** — *"the day someone writes the replay-shaped v2 orchestrator, E0
 goes RED and says why."* Four increments, each its own commit, each closing one of those.
 
-> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 1: THE v2 SEAMS. ACCEPTED `<inc1>`.** The three
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 1: THE v2 SEAMS. ACCEPTED `ff526276`.** The three
 > things A3's defect 1 named, built as SIBLINGS with the v1 half left byte-frozen:
 > `FrozenRecipeReadContext.formula_facts_v2`, `recipe_expectation_validator_v2` and
 > `recipe_tool_runner_v2` (all in `formula/recipe_authoring.py`, beside their v1 originals).
@@ -2459,7 +2459,7 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > nothing else moved); `-m eval` **73 passed**; ruff clean, no new mypy errors on the touched files.
 
 
-> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 2: `run_authoring_v2_replay`. ACCEPTED `<inc2>`.
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 2: `run_authoring_v2_replay`. ACCEPTED `877e587a`.
 > SHIPPED, UNVERIFIED AGAINST A LIVE PROVIDER.** `formula/replay_authoring_v2.py` — the
 > replay-shaped sibling of the orchestrator production actually runs, carrying every seam A3's
 > defect 1 enumerated: checkpoint/replay, frozen configuration, proposal validator, tool runner,
@@ -2535,7 +2535,7 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > new tests and nothing else moved); `-m eval` **73 passed**; ruff + mypy clean on both touched source files.
 
 > **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 3: THE WORKER ROUTES BY DECLARED SCHEMA.
-> ACCEPTED `<inc3>`.** `recipe_formula_worker` now authors BOTH generations and the work item's own
+> ACCEPTED `e03392d8`.** `recipe_formula_worker` now authors BOTH generations and the work item's own
 > declaration chooses. `formula-v1` → `run_authoring`, `verify_frozen_configuration`,
 > `recipe_expectation_validator`, `recipe_tool_runner`, `formula_facts`. `formula-v2` →
 > `run_authoring_v2_replay`, `verify_frozen_configuration_v2`, `recipe_expectation_validator_v2`,
@@ -2590,7 +2590,7 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > by HEAD-swap).
 
 > **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 4: E0'S TRIPWIRE FLIPS, AND THE WALK AUTHORS.
-> ACCEPTED `<inc4>`.** `test_seam_walkthrough.py`'s §0.5 item-2 step is no longer *"the platform's
+> ACCEPTED `33abd6c9`.** `test_seam_walkthrough.py`'s §0.5 item-2 step is no longer *"the platform's
 > own refusal"* — the exemplar's captured v2 work item is **authored**, and every governed check
 > the worker makes before it authors is made against the row the capture actually wrote: the
 > egress whitelist re-validates the frozen payload, the **v2** frozen configuration is rebuilt
