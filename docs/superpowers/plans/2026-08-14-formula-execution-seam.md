@@ -1562,7 +1562,7 @@ returns `False` — the dataclass's existing fail-closed posture, unchanged.
   survives. **The refusal must remain reachable**; a capability seam that can only say yes is not one.
 - `test_an_unparseable_pinned_fixture_fails_closed`
 
-> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline (same subagent-outage context as C1).
+> **ACCEPTED `593c7148` (2026-08-15).** Landed inline (same subagent-outage context as C1).
 >
 > **THE PLAN'S MECHANISM WAS NOT BUILDABLE, and the correction is recorded here rather than
 > silently substituted.** §C2 says: parse the recipe's pinned `gold_v2` proposal via
