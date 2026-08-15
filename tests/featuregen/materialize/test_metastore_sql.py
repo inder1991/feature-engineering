@@ -449,6 +449,41 @@ def test_an_endpoint_with_NO_AUTHORIZATION_MODEL_answers_neither_TRUE_nor_FALSE(
     assert "SQL-standard authorization" in str(raised.value)
 
 
+def test_SPARKS_OWN_REJECTION_of_SHOW_GRANT_is_the_typed_unanswerable_not_an_unknown() -> None:
+    """The kind sandbox's endpoint is a Spark Thrift Server, and this is the message it ACTUALLY
+    returns — Spark's grammar carries a rule named ``unsupportedHiveNativeCommands`` whose members
+    include ``SHOW GRANT``, so it parses the statement only to reject it.
+
+    Before this pattern existed the message classified as ``UNRECOGNISED`` and RAISED, which meant
+    the one condition this module has a designed answer for arrived at the operator as an unknown
+    fault. Pinned with the engine's verbatim wording, error class and all.
+    """
+    adapter, _engine = _adapter({"SHOW GRANT": _DriverError(
+        "org.apache.spark.sql.catalyst.parser.ParseException: "
+        "[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT.(line 1, pos 0)")})
+
+    with pytest.raises(MetastoreReadScopeUnanswerable):
+        adapter.can_read(schema="banking", table="transactions", roles=["feature_engineer"])
+
+
+def test_the_SPARK_pattern_is_NARROW_and_does_not_swallow_other_refusals() -> None:
+    """``Operation not allowed:`` is Spark's generic phrase — it prefixes TRUNCATE-on-external-table
+    and ALTER TABLE SET SERDE refusals too. Matching it alone would report those as *the endpoint
+    has no authorization model*, which is the over-broad-pattern failure the table's own ordering
+    comment warns about. So the pattern includes ``show grant``, and a different refusal must NOT
+    reach ``READ_SCOPE_UNANSWERABLE``.
+    """
+    adapter, _engine = _adapter({"SHOW PARTITIONS": _DriverError(
+        "[_LEGACY_ERROR_TEMP_0035] Operation not allowed: TRUNCATE TABLE on external tables.")})
+
+    with pytest.raises(MetastoreFaultError) as raised:
+        adapter.list_partitions(schema="banking", table="transactions")
+
+    assert raised.value.fault is MetastoreFault.UNRECOGNISED, (
+        "an unrelated Spark refusal must stay UNRECOGNISED and raise, not be read as an answer "
+        "about read scope")
+
+
 def test_an_UNREACHABLE_read_scope_check_is_ClusterUnreachable() -> None:
     adapter, _engine = _adapter({"SHOW GRANT": _DriverError("Session is closed")})
 

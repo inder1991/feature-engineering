@@ -82,9 +82,29 @@ else
   exit 1
 fi
 
+echo "==> applying the Thrift/SQL endpoint"
+# AFTER the schema init and the Derby check, and the order is load-bearing: this server opens its
+# metastore connection while it starts, so applying it against an uninitialised `metastore` database
+# gives a pod that comes up and then fails every statement. It is a SECOND deployment on the SAME
+# image and the SAME spark-defaults ConfigMap — one engine, one catalog. See the manifest header for
+# why it is `spark-submit` and not `sbin/start-thriftserver.sh` (which the pyspark distribution does
+# not ship) and for what its authorization posture is and is not.
+kubectl apply -f "$HERE/41-spark-thrift.yaml"
+kubectl -n "$NS" rollout restart deploy/spark-thrift
+# Longer than deploy/spark's 180s: this one is not a `sleep infinity` shell — readiness means a JVM
+# started, the Hive client initialised, the metastore answered and the port bound.
+kubectl -n "$NS" rollout status deploy/spark-thrift --timeout=300s
+
 cat <<'EOF'
 
 Ready.
   kubectl -n featuregen exec -it deploy/spark -- python
   Tables land in `sandbox_feature`; the catalog is shared via Postgres, files on the warehouse PVC.
+
+The SQL endpoint is `spark-thrift:10000` inside the cluster (ClusterIP — never published to the
+host; it authenticates nobody).
+
+  It authenticates nobody and cannot answer L1's read-scope question: Spark rejects `SHOW GRANT`
+  by grammar, so `can_read` raises `MetastoreReadScopeUnanswerable` by design. See the manifest
+  header and the plan's §6.6b.
 EOF

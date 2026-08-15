@@ -171,7 +171,21 @@ FAULT_PATTERNS: tuple[tuple[MetastoreFault, tuple[str, ...]], ...] = (
     (MetastoreFault.READ_SCOPE_UNANSWERABLE, (
         "show grant is not supported", "authorization is not enabled",
         "current authorizer does not support", "not supported in current authorizer",
-        "unsupported command", "grant is not supported")),
+        "unsupported command", "grant is not supported",
+        # SPARK'S OWN PHRASING, and it is the one the kind sandbox actually produces. Spark's SQL
+        # grammar has a rule named `unsupportedHiveNativeCommands` whose members include
+        # `SHOW GRANT`; it parses the statement only to reject it, as
+        # `[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT`. Without this entry that
+        # message classifies as UNRECOGNISED and RAISES, so a deployment against a Spark Thrift
+        # Server would report an unknown fault for the one condition this module has a designed,
+        # typed answer for (`MetastoreReadScopeUnanswerable`).
+        #
+        # DELIBERATELY NARROW — "show grant" is part of the pattern. Spark uses the bare phrase
+        # "Operation not allowed:" for unrelated refusals too (TRUNCATE on an external table,
+        # ALTER TABLE SET SERDE), and matching it alone would classify those as a read-scope
+        # answer, which is precisely the over-broad-pattern failure this table's ordering comment
+        # warns about.
+        "operation not allowed: show grant")),
     (MetastoreFault.PERMISSION_DENIED, (
         "permission denied", "not authorized", "no privilege", "does not have privilege",
         "insufficient privileges", "access denied", "hiveaccesscontrolexception")),

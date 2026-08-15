@@ -1,0 +1,233 @@
+# The sandbox metastore's SQL endpoint — E2's second deployment blocker.
+#
+# WHAT THIS IS FOR. `materialize/metastore_sql.py` and `materialize/publish_sql.py` speak DB-API 2.0
+# to a Hive-protocol endpoint: L1's three questions (`SHOW PARTITIONS`, `SHOW TABLES … LIKE`,
+# `DESCRIBE`, `SHOW GRANT`) and G-3's pointer switch (one `CREATE OR REPLACE VIEW` plus a
+# `SHOW CREATE TABLE` read-back). `40-spark.yaml` deploys a Spark pod with NO Service and NO
+# endpoint — it is driven by `kubectl exec` — so the worker pod could not dial anything. This adds
+# the endpoint, in front of the SAME metastore.
+#
+# ── WHY A SPARK THRIFT SERVER AND NOT A HiveServer2 ──────────────────────────────────────────────
+#
+# Not a preference — `publish_sql.py:134` decides it. The swap is
+#
+#     CREATE OR REPLACE VIEW `db`.`tbl` AS SELECT … FROM parquet.`/warehouse/staging/…`
+#
+# and `parquet.`<path>`` is Spark SQL's path-as-relation syntax. Hive has no such construct, so a
+# real HiveServer2 would fail the one statement the whole publication step exists to perform. The
+# endpoint therefore MUST be Spark. (It is also moot here: the image carries no HiveServer2. Its
+# only Hive server jar is `hive-service-rpc`, which is the wire protocol — `TCLIService` — and not
+# the server. Hive's own `hive-service` is absent, as is any Hive distribution.)
+#
+# ── WHY `spark-submit` AND NOT `sbin/start-thriftserver.sh` ─────────────────────────────────────
+#
+# **`start-thriftserver.sh` DOES NOT EXIST IN THIS IMAGE, and every prior note in this repo that
+# named it was wrong.** `Dockerfile.spark` installs Spark from the PyPI `pyspark` distribution, and
+# that distribution ships exactly four scripts in `sbin/` — `spark-config.sh`, `spark-daemon.sh`,
+# `start-history-server.sh`, `stop-history-server.sh`. Verified by listing an installed pyspark's
+# `sbin/` directly; there is no thrift script to run. What the missing script would have done is
+# spelled out here instead: it is a `spark-submit` of one class, and `bin/spark-submit` IS shipped
+# (pip installs the `bin/` scripts onto PATH — `/usr/local/bin/spark-submit` in this image).
+#
+# `spark-internal` is spark-submit's own token for "the application class is already on the
+# classpath, there is no jar to stage" — the same value `start-thriftserver.sh` passes.
+#
+# WHAT MAKES IT START, argued from the image rather than hoped for:
+#   * the class `org.apache.spark.sql.hive.thriftserver.HiveThriftServer2` is in
+#     `pyspark/jars/spark-hive-thriftserver_*.jar`, which the pyspark distribution bundles, and
+#     `Dockerfile.spark` now ASSERTS its presence at build time — a missing jar fails `docker build`
+#     rather than a pod at 03:00;
+#   * `openjdk-17-jre-headless` is installed and on PATH, and Spark 3.5 supports Java 17;
+#   * `SPARK_CONF_DIR=/opt/spark/conf` with the shared `spark-defaults` ConfigMap is the same
+#     mechanism `40-spark.yaml` documents as load-bearing for pip-installed pyspark;
+#   * it runs in the FOREGROUND (`spark-submit`, not `spark-daemon.sh submit`), so the container's
+#     PID 1 is the server and a crash is a pod restart rather than a healthy pod with nothing in it.
+#
+# ── ONE METASTORE, ONE CONFIG, NO SECOND COPY ───────────────────────────────────────────────────
+#
+# This Deployment mounts the SAME `spark-defaults` ConfigMap `40-spark.yaml` defines. The JDBC
+# coordinates for `postgres:5432/metastore` are therefore not restated anywhere — a second copy is
+# how two "engines" end up seeing two catalogs, which is the exact failure that file's Derby
+# paragraph is about. Only the settings that are specific to BEING an endpoint are passed here, on
+# the command line.
+#
+# `spark.hadoop.` PREFIX, AGAIN. `hive.server2.*` are Hive properties. Spark forwards only
+# `spark.hadoop.*` into the Hadoop/Hive conf that `HiveThriftServer2` reads, so a bare
+# `--conf hive.server2.thrift.port=…` is accepted and then ignored — the same trap the ConfigMap
+# already documents for `javax.jdo.*`.
+#
+# ── AUTHENTICATION AND AUTHORIZATION: WHAT IS REAL HERE, STATED PLAINLY ─────────────────────────
+#
+# **SQL-STANDARD AUTHORIZATION CANNOT BE ENABLED ON A SPARK THRIFT SERVER. NOT "is not configured
+# here" — CANNOT.** Spark's SQL grammar carries a rule literally named
+# `unsupportedHiveNativeCommands`, and `GRANT`, `REVOKE` and `SHOW GRANT` are members of it: Spark
+# parses them only in order to reject them, with
+# `[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT`. Spark never routes through Hive's
+# `Driver`, so Hive's authorization plugin is never consulted even though the
+# `…authorization.plugin.sqlstd` classes sit on the classpath in `hive-exec`. There is no
+# configuration that changes this, in this image or any other.
+#
+# THE CONSEQUENCE FOR L1, which is a real posture and not a gap: `can_read` asks
+# `SHOW GRANT ROLE … ON TABLE …`, this endpoint refuses the question, and the adapter raises
+# `MetastoreReadScopeUnanswerable` — by design, because `True` ("everything is readable") and
+# `False` (a denial nobody issued) are both lies. **So L1 cannot pass against this sandbox
+# endpoint.** That is not closed by any manifest; it needs an engine with an authorization model.
+# Recorded in the plan's §6.6 SUCCESSOR 3 block rather than left to be discovered on the cluster.
+#
+# AUTHENTICATION is a different axis, and Spark's thrift server does support it — the forked Hive
+# service layer inside `spark-hive-thriftserver` ships `HiveAuthFactory` with LDAP, CUSTOM, PAM and
+# Kerberos providers. **None of them can run in THIS image**, and each reason was checked, not
+# assumed: CUSTOM needs a compiled `PasswdAuthenticationProvider` and the image has a JRE with no
+# `javac`; LDAP needs a directory server and this cluster runs postgres/backend/worker/frontend and
+# nothing else; KERBEROS needs a KDC and keytabs that do not exist; PAM needs native JPAM libraries
+# that are not installed. `NONE` is therefore not a convenience default chosen over a stronger one —
+# it is the only mode the image can run, and saying otherwise in this file would be a posture
+# nobody could deploy.
+#
+# WHAT ACTUALLY BOUNDS ACCESS HERE, then: the Service is `ClusterIP`, so the endpoint is reachable
+# only from inside the cluster and is never published to the host; and this whole file is opt-in
+# (`up.sh`), outside `k8s/`, so `deploy.sh` never applies it. A `NetworkPolicy` is deliberately NOT
+# shipped: `deploy.sh` creates the kind cluster with no CNI configuration, which means kindnet, and
+# **kindnet does not implement NetworkPolicy** — the object would be accepted by the API server,
+# enforce nothing, and read in review as a control that exists. An unenforced policy is worse than
+# an absent one.
+#
+# THIS ENDPOINT IS A SANDBOX FACILITY. It authenticates nobody. It must never be the shape a real
+# cluster's endpoint is copied from, and the capability attestation earned against it is
+# environment-scoped for exactly the reasons `40-spark.yaml` already gives about HDFS atomicity.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-thrift
+  namespace: featuregen
+spec:
+  replicas: 1
+  # RECREATE, NOT ROLLING. Two thrift servers would hold two SparkSessions writing one warehouse
+  # PVC (ReadWriteOnce, and both pods land on kind's single node), and a rolling update would run
+  # exactly that overlap on every restart. The endpoint is a sandbox facility; a few seconds of
+  # downtime on redeploy is the right trade against two engines sharing a catalog mid-swap.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: spark-thrift }
+  template:
+    metadata:
+      labels: { app: spark-thrift }
+    spec:
+      containers:
+        - name: spark-thrift
+          # THE SAME IMAGE AS `40-spark.yaml`. One engine, one Spark version, one Hive client
+          # version — the attestation is keyed on the `hive`/`spark`/`metastore` triple, so an
+          # endpoint on a different build would attest a different environment than the one that
+          # runs the pipeline.
+          image: featuregen-spark:local
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/spark-submit"]
+          args:
+            - "--class"
+            - "org.apache.spark.sql.hive.thriftserver.HiveThriftServer2"
+            - "--name"
+            - "featuregen-sandbox-thrift"
+            # LOCAL MODE, and two threads deliberately: the server itself occupies a thread while a
+            # statement runs, and `local[1]` deadlocks the first query behind the driver.
+            - "--master"
+            - "local[2]"
+            # 0.0.0.0, and this is load-bearing. HiveServer2's default bind host resolves via the
+            # local hostname, and this pod sets SPARK_LOCAL_IP=127.0.0.1 (inherited from the
+            # sandbox's spark-defaults) — binding to loopback would leave the Service with a
+            # healthy endpoint that refuses every connection from outside the pod.
+            - "--conf"
+            - "spark.hadoop.hive.server2.thrift.bind.host=0.0.0.0"
+            - "--conf"
+            - "spark.hadoop.hive.server2.thrift.port=10000"
+            # The wire protocol the DB-API driver speaks. `binary` is PyHive's transport and the
+            # default; stated rather than inherited so a driver default change is not a silent
+            # protocol change.
+            - "--conf"
+            - "spark.hadoop.hive.server2.transport.mode=binary"
+            # NONE is the ONLY mode this image can run — see the header for the four reasons, each
+            # checked. It authenticates nobody: any username is accepted with no credential.
+            - "--conf"
+            - "spark.hadoop.hive.server2.authentication=NONE"
+            # doAs OFF. With it on, HiveServer2 tries to impersonate the connecting user against
+            # the filesystem; there are no such users in this container and every read would fail
+            # on a proxy-user check that means nothing in a sandbox with one identity.
+            - "--conf"
+            - "spark.hadoop.hive.server2.enable.doAs=false"
+            # SEPARATE SESSIONS, ON PURPOSE. `singleSession=true` would make every client share one
+            # SparkSession and therefore one temporary-view namespace. The publication swap's
+            # read-back (`SHOW CREATE TABLE` after `CREATE OR REPLACE VIEW`) is precisely a check
+            # that the object landed in the SHARED metastore rather than a session-local catalog —
+            # `up.sh` records that failure twice — so sessions must not be able to see each other's
+            # session-local objects and mistake one for the other.
+            - "--conf"
+            - "spark.sql.hive.thriftServer.singleSession=false"
+            - "spark-internal"
+          env:
+            - { name: SPARK_LOCAL_IP, value: "127.0.0.1" }
+            # JAVA_HOME deliberately unset — the image's OpenJDK 17 is on PATH, and a hardcoded
+            # `/opt/java/openjdk` (the `apache/spark` layout) points at nothing here. Same reasoning
+            # as `40-spark.yaml`, and the same opaque failure if it is added.
+            - { name: WAREHOUSE_DIR, value: "/warehouse" }
+            # REQUIRED, for the same reason `40-spark.yaml` gives at length: pip-installed pyspark
+            # reads its configuration from inside site-packages, not `/opt/spark/conf`. Without
+            # this the mounted spark-defaults.conf is never read and the server silently attaches
+            # to an embedded Derby metastore — it would answer `SHOW TABLES` cheerfully, about a
+            # catalog nothing else can see.
+            - { name: SPARK_CONF_DIR, value: "/opt/spark/conf" }
+          ports:
+            - { name: thrift, containerPort: 10000 }
+          volumeMounts:
+            # The SAME warehouse PVC as `40-spark.yaml`. The endpoint must read what the submitted
+            # run wrote: §9's staging base lives here, and the swap points a view at a path under
+            # it. An endpoint with its own volume would resolve every published location to nothing.
+            - { name: warehouse, mountPath: /warehouse }
+            - { name: sparkconf, mountPath: /opt/spark/conf/spark-defaults.conf, subPath: spark-defaults.conf }
+          # TCP READINESS, NOT AN EXEC PROBE. The question a probe can honestly answer here is
+          # "is the thrift port accepting connections" — whether the METASTORE behind it answers is
+          # what `thrift_smoke.py` asks through the production adapter, and folding that into a
+          # readiness probe would restart the pod for a Postgres hiccup.
+          readinessProbe:
+            tcpSocket: { port: 10000 }
+            # Spark's JVM start, Hive client init and metastore connection take well over the
+            # default 10s on a cold kind node; a tighter delay reports NotReady before the server
+            # has bound and adds a pointless restart to every deploy.
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: { port: 10000 }
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 3
+          resources:
+            # Higher floor than the exec-driven pod: this JVM is resident and holds a SparkSession
+            # for the life of the pod rather than for one spark-submit.
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits:   { cpu: "2",    memory: "4Gi" }
+      volumes:
+        - name: warehouse
+          persistentVolumeClaim:
+            claimName: spark-warehouse
+        - name: sparkconf
+          configMap:
+            name: spark-defaults
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-thrift
+  namespace: featuregen
+spec:
+  # ClusterIP, NOT NodePort. The endpoint authenticates nobody (see the header), so the one real
+  # boundary it has is that it is unreachable from outside the cluster. A NodePort would publish an
+  # unauthenticated SQL endpoint onto the host.
+  type: ClusterIP
+  selector: { app: spark-thrift }
+  ports:
+    # THE NAME AND PORT ARE THE CONTRACT. `FEATUREGEN_MATERIALIZE_METASTORE_HOST` is `spark-thrift`
+    # and `_PORT` is `10000` in `.env.example` and `deploy/kind/k8s/20-backend.yaml`; those values
+    # are this Service's DNS name and this port. Renaming either without editing both files is a
+    # worker that dead-letters every claimed job on a name that does not resolve.
+    - { name: thrift, port: 10000, targetPort: 10000 }

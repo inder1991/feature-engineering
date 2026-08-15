@@ -217,26 +217,45 @@ data:
   #   which SQL dialect the endpoint speaks. Closed vocabulary; `hive` is the only member, and it
   #   covers HiveServer2 and the Spark Thrift Server (both speak the same protocol).
   # FEATUREGEN_MATERIALIZE_METASTORE_ENGINE: "hive"
-  #   host and port of that endpoint. **NOT READY on this cluster, and this is E2's real remaining
-  #   blocker beside the inventory: no such endpoint exists here.** `deploy/kind/sandbox/40-spark.yaml`
-  #   deploys a Spark pod driven by `kubectl exec` with NO Service and NO thrift server — its
-  #   metastore client talks JDBC straight to `postgres:5432/metastore`. The worker pod cannot use
-  #   that: reaching the metastore's BACKING DATABASE is not reaching the metastore, and the pointer
-  #   switch must be the ENGINE's own atomic operation (§10.3 attests what the cluster does). Nor can
-  #   the worker run Spark itself — `Dockerfile.backend` installs pyspark WITHOUT a JVM, deliberately.
-  #   So E2 needs a thrift endpoint in front of the sandbox metastore (start-thriftserver.sh in the
-  #   spark pod + a Service), and until there is one these stay unset and every run is unprepared.
+  #   host and port of that endpoint. **AN ENDPOINT NOW EXISTS FOR THE SANDBOX** —
+  #   `deploy/kind/sandbox/41-spark-thrift.yaml` deploys a Spark Thrift Server as a Deployment plus a
+  #   ClusterIP Service named `spark-thrift` on port 10000, in front of the SAME
+  #   `postgres:5432/metastore` catalog and on the SAME image as `40-spark.yaml`. **The values below
+  #   ARE that Service's DNS name and port** — they are copy-paste correct against it, and renaming
+  #   either without editing the manifest is a worker that dead-letters on a name that does not
+  #   resolve. It is OPT-IN (`bash deploy/kind/sandbox/up.sh`), outside `k8s/`, so `deploy.sh` never
+  #   applies it; on a cluster where it has not been applied these stay unset and every run is
+  #   honestly unprepared.
+  #     Why the endpoint is needed at all, and why the worker cannot be one: reaching the metastore's
+  #   BACKING DATABASE is not reaching the metastore, and the pointer switch must be the ENGINE's own
+  #   atomic operation (§10.3 attests what the cluster does); and `Dockerfile.backend` installs
+  #   pyspark WITHOUT a JVM, deliberately, so the worker can neither dial an endpoint nor be one.
+  #     CORRECTION (verified): every earlier note here said the endpoint would be
+  #   `start-thriftserver.sh` in the spark pod. **That script does not exist in this image.** The
+  #   PyPI pyspark distribution ships four scripts in `sbin/` and no thrift one — verified against
+  #   pyspark 3.5.3's own sdist — so the manifest `spark-submit`s the thriftserver class directly.
   # FEATUREGEN_MATERIALIZE_METASTORE_HOST: "spark-thrift"
   # FEATUREGEN_MATERIALIZE_METASTORE_PORT: "10000"
   #   how the client authenticates (NONE / LDAP / KERBEROS / CUSTOM …), passed to the driver
   #   upper-cased, and the account the metadata reads AND THE SWAP run as. The principal is
   #   evidence, not decoration: two metadata reads under two principals are not interchangeable.
+  #   `NONE` matches the sandbox endpoint, where it is not a lax choice but the ONLY runnable mode:
+  #   CUSTOM needs a compiled provider class and the image has a JRE with no `javac`, LDAP needs a
+  #   directory server, KERBEROS a KDC, PAM native libraries — none of which exist here. A real
+  #   cluster must set this to what its endpoint actually enforces.
   # FEATUREGEN_MATERIALIZE_METASTORE_AUTH: "NONE"
   # FEATUREGEN_MATERIALIZE_METASTORE_PRINCIPAL: "featuregen"
-  #   ALSO REQUIRED FOR L1 TO PASS: the endpoint must be able to answer *may these roles read this
-  #   table*, which it does through SQL-standard authorization (`SHOW GRANT ROLE … ON TABLE …`). An
-  #   endpoint with no authorization model raises rather than answering — neither `True` ("everything
-  #   is readable") nor `False` (a denial nobody issued) is a lie this platform will tell.
+  #   **AND THE ONE THING THE SANDBOX ENDPOINT STILL CANNOT DO — read this before expecting L1 to
+  #   pass.** L1's third question is *may these roles read this table*, asked as
+  #   `SHOW GRANT ROLE … ON TABLE …`, which needs SQL-standard authorization. **A Spark Thrift Server
+  #   can never answer it.** Spark's grammar has a rule named `unsupportedHiveNativeCommands` whose
+  #   members include `SHOW GRANT`; it parses the statement only to reject it, and it never routes
+  #   through Hive's authorization plugin. So the adapter raises `MetastoreReadScopeUnanswerable` —
+  #   neither `True` ("everything is readable") nor `False` (a denial nobody issued) is a lie this
+  #   platform will tell. This is NOT closed by any manifest and NOT a defect in the endpoint: it
+  #   needs an engine with an authorization model, and on kind there is none. Note the tension is
+  #   structural, because the publication swap (`SELECT … FROM parquet.`<path>``) is Spark-only
+  #   syntax that a real HiveServer2 could not execute — see §6.6's SUCCESSOR 3 block.
   #   §9's staging root BASE. `staging_root_for` derives <base>/<generation_id> under it, and the
   #   rendered project writes its immutable versioned output at <staging_root>/published/<table> —
   #   which is exactly where the swap then points readers. Must be a path the SPARK side can write

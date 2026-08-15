@@ -37,9 +37,18 @@ RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirnam
  && curl -fsSL -o "$SPARK_JARS/postgresql-${PG_JDBC_VERSION}.jar" \
       "https://repo1.maven.org/maven2/org/postgresql/postgresql/${PG_JDBC_VERSION}/postgresql-${PG_JDBC_VERSION}.jar"
 
-# Hive metastore support is not in the base pyspark wheel's jar set; without these the
-# `spark.sql.catalogImplementation=hive` setting falls back to in-memory and every table vanishes
-# with the session — silently, which is the failure mode this sandbox exists to avoid.
+# Re-fetch of the Hive client jars, kept as a belt-and-braces pin.
+#
+# CORRECTION (SUCCESSOR 3, verified): the comment that used to sit here said Hive metastore support
+# "is not in the base pyspark wheel's jar set" and that without this step the catalog silently falls
+# back to in-memory. **That is false.** The pyspark 3.5.3 distribution already bundles all four —
+# `hive-metastore-2.3.9.jar`, `hive-exec-2.3.9-core.jar`, `hive-common-2.3.9.jar`,
+# `hive-serde-2.3.9.jar` — under the SAME names this loop writes. Verified by listing the members of
+# `pyspark-3.5.3.tar.gz` (the 3.5.x line publishes an sdist, not a wheel). The real cause of the
+# silent-Derby symptom is the one `40-spark.yaml` documents: `SPARK_CONF_DIR`, without which the
+# mounted spark-defaults.conf is never read at all. This step is therefore redundant rather than
+# load-bearing, and it is kept (not deleted) only because it pins the exact versions if a future
+# pyspark bump changes what is bundled — which is also why it still ends `|| true`.
 RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),"jars"))')" \
  && for c in hive-metastore/2.3.9 hive-exec/2.3.9 hive-common/2.3.9 hive-serde/2.3.9; do \
       n="${c%%/*}"; v="${c##*/}"; \
@@ -48,5 +57,24 @@ RUN SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirnam
       || curl -fsSL -o "$SPARK_JARS/${n}-${v}.jar" \
         "https://repo1.maven.org/maven2/org/apache/hive/${n}/${v}/${n}-${v}.jar"; \
     done || true
+
+# THE ENDPOINT'S PRECONDITION, ASSERTED AT BUILD TIME — see deploy/kind/sandbox/41-spark-thrift.yaml.
+#
+# That manifest starts a Spark Thrift Server by `spark-submit`-ing one class, because the PyPI
+# distribution ships NO `sbin/start-thriftserver.sh` (its `sbin/` holds exactly four scripts:
+# spark-config.sh, spark-daemon.sh, start-history-server.sh, stop-history-server.sh — verified
+# against pyspark 3.5.3's own sdist). Everything that invocation needs is checked HERE so a missing
+# piece fails `docker build` on the operator's laptop, rather than becoming a CrashLoopBackOff whose
+# cause is a stack trace inside a JVM launcher.
+#
+# Both halves are asserted because they fail differently: a missing `spark-submit` is a container
+# that exits instantly, while a missing thriftserver jar is a launcher that starts and then dies on
+# ClassNotFoundException — the second is the one nobody diagnoses quickly.
+RUN command -v spark-submit >/dev/null \
+      || { echo "FATAL: spark-submit is not on PATH; 41-spark-thrift.yaml cannot start" >&2; exit 1; } \
+ && SPARK_JARS="$(python -c 'import pyspark,os;print(os.path.join(os.path.dirname(pyspark.__file__),"jars"))')" \
+ && ls "$SPARK_JARS"/spark-hive-thriftserver_*.jar >/dev/null 2>&1 \
+      || { echo "FATAL: no spark-hive-thriftserver jar in $SPARK_JARS — the Thrift endpoint's class" \
+                "org.apache.spark.sql.hive.thriftserver.HiveThriftServer2 would not resolve" >&2; exit 1; }
 
 WORKDIR /work

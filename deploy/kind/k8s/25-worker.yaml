@@ -94,13 +94,23 @@ spec:
           # lives; they are inherited here through the same `envFrom`, and the same rule applies —
           # DO NOT mirror them into `env:` below.
           #
-          # NOT SATISFIABLE ON THIS CLUSTER TODAY, and the block is unset for that reason rather
-          # than by oversight: there is no SQL endpoint in front of the sandbox metastore
-          # (`sandbox/40-spark.yaml` deploys a `kubectl exec`-driven pod with no Service and no
-          # thrift server), and this image has pyspark but NO JVM (`Dockerfile.backend` says so and
-          # explains why). With the block unset, every run this pod drives is recorded RUN_FAILED at
-          # PREPARE_RUN naming the four seams that were not configured — an honest outcome, not a
-          # crash, and the one an operator should expect until E2 stands a thrift endpoint up.
+          # AN ENDPOINT NOW EXISTS FOR THE SANDBOX, and one blocker remains that no manifest closes.
+          # `sandbox/41-spark-thrift.yaml` (SUCCESSOR 3) stands up a Spark Thrift Server as a
+          # ClusterIP Service `spark-thrift:10000`, on the SAME image and in front of the SAME
+          # `postgres:5432/metastore` catalog as `40-spark.yaml`. It is opt-in — `deploy.sh` does not
+          # apply it, `bash deploy/kind/sandbox/up.sh` does — so on a cluster where nobody ran that
+          # script the block stays correctly unset. This image still has pyspark and NO JVM
+          # (`Dockerfile.backend` says so and explains why), which is why this pod DIALS the endpoint
+          # and cannot be one.
+          #
+          # THE REMAINING BLOCKER IS L1's THIRD QUESTION, and it is a property of the engine.
+          # `can_read` asks `SHOW GRANT ROLE … ON TABLE …`; Spark's grammar rejects `SHOW GRANT` as
+          # an unsupported Hive native command and never consults an authorization plugin, so the
+          # adapter raises `MetastoreReadScopeUnanswerable` rather than guessing `True` or `False`.
+          # No configuration changes that. Until an engine with an authorization model is available,
+          # a run this pod drives reaches PREPARE_RUN and stops there — with the block unset it is
+          # recorded RUN_FAILED naming the seams that were not configured, which is an honest
+          # outcome rather than a crash and the one an operator should expect.
           #
           # `FEATUREGEN_MATERIALIZE_PROJECT_ROOT` IS ABOUT THIS POD'S DISK, not the backend's.
           # 20-backend.yaml documents it under the backend because that is where the whole block is

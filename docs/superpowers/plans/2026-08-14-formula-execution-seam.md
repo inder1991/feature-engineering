@@ -2707,6 +2707,14 @@ to the inventory — and until there is one, the eight execution variables stay 
 recorded unprepared, which is the correct posture rather than a gap. Both deployment files now say
 so at the place an operator would otherwise set the variables.
 
+> **SUPERSEDED IN PART BY SUCCESSOR 3 (§6.6b), 2026-08-15.** The endpoint now exists as
+> `deploy/kind/sandbox/41-spark-thrift.yaml`. Two corrections to the paragraph above:
+> **`start-thriftserver.sh` does not exist in this image** — the PyPI pyspark distribution ships four
+> scripts in `sbin/` and no thrift one (verified against pyspark 3.5.3's own sdist), so the manifest
+> `spark-submit`s the class directly. And the endpoint being present does **not** make the eight
+> variables settable for a passing L1: a Spark Thrift Server cannot answer `SHOW GRANT` at all, so
+> `can_read` is structurally unanswerable there. See §6.6b.
+
 > **SUCCESSOR 2 (2026-08-15) — INCREMENT 1: THE `MetastoreMetadata` IMPLEMENTATION. ACCEPTED
 > `e170bcb5`.** `metastore_sql.SqlMetastoreAdapter` answers L1's three questions over one
 > `MetastoreSession` (a DB-API 2.0 connection, opened lazily, driver imported from a closed table
@@ -2863,6 +2871,15 @@ so at the place an operator would otherwise set the variables.
 > deployed run is honestly unprepared — which both deployment files now say, at the exact place an
 > operator would otherwise set them.
 >
+> > **SUCCESSOR 3 (§6.6b, 2026-08-15) closes the second and REFRAMES the third.** The endpoint is
+> > `deploy/kind/sandbox/41-spark-thrift.yaml`, and it is **not** `start-thriftserver.sh` — that
+> > script is not in the pyspark distribution (four `sbin/` scripts, none of them thrift; verified
+> > against pyspark 3.5.3's sdist). The third is not a configuration anyone can supply: a Spark
+> > Thrift Server rejects `SHOW GRANT` by grammar (`unsupportedHiveNativeCommands`), and the swap
+> > requires Spark-only `parquet.`<path>`` syntax that a real HiveServer2 could not run — so no
+> > single engine available here has both properties. `can_read` is unanswerable on kind, by design
+> > rather than by omission.
+>
 > **Six stale honesty claims corrected in the same commit**, each of which had become false the
 > moment increment 1 landed: `l0_gate.py`'s section header, `test_chain.py`'s `_run` docstring and
 > the UNPREPARED test's, `test_seam_walkthrough.py`'s `_config`, `test_queue_lane.py`'s `_config`,
@@ -2875,6 +2892,109 @@ so at the place an operator would otherwise set the variables.
 > `-m eval` **73 passed**; ruff clean on all touched files; **no new mypy errors** — 469 in 124
 > files, identical to `799bcf98`'s, measured by archiving that commit's `src` and running the same
 > config against it, and none in any file this successor touched.
+
+---
+
+## 6.6b SUCCESSOR 3 (2026-08-15): the cluster's SQL endpoint
+
+SUCCESSOR 2 ended by naming E2's remaining deployment work as *"Task 0's inventory, and a thrift
+endpoint (`start-thriftserver.sh` in the spark pod + a Service)"*, plus a third item: *"L1 cannot
+pass against an endpoint with no SQL-standard authorization"*. This section is the endpoint. It
+also **retires the parenthesis** — that script does not exist — and converts the third item from a
+thing a deployment might configure into a thing this engine structurally cannot do.
+
+> **SUCCESSOR 3 — INCREMENT 1: THE THRIFT ENDPOINT MANIFEST. ACCEPTED `<hash-1>` (2026-08-15).
+> FILES ONLY — no `kubectl`, no `docker`, no apply, no cluster contact of any kind.**
+>
+> **`deploy/kind/sandbox/41-spark-thrift.yaml`** — a `spark-thrift` Deployment plus a ClusterIP
+> Service `spark-thrift:10000`, on the SAME `featuregen-spark:local` image, mounting the SAME
+> `spark-defaults` ConfigMap and the SAME `spark-warehouse` PVC as `40-spark.yaml`. One engine, one
+> catalog, one Spark version — the JDBC coordinates for `postgres:5432/metastore` are not restated
+> anywhere, because a second copy is how two "engines" end up seeing two catalogs.
+>
+> **THREE FACTS WERE VERIFIED AGAINST THE PINNED DISTRIBUTION BEFORE A LINE WAS WRITTEN**, by
+> listing the members of `pyspark-3.5.3.tar.gz` itself (the 3.5.x line publishes an sdist, not a
+> wheel) — not inferred from a newer version and not from memory:
+>
+> 1. **`sbin/start-thriftserver.sh` IS NOT SHIPPED.** pyspark's `sbin/` holds exactly four scripts:
+>    `spark-config.sh`, `spark-daemon.sh`, `start-history-server.sh`, `stop-history-server.sh`.
+>    **Every prior note in this plan and in `20-backend.yaml` that named that script was wrong**, and
+>    following them would have produced a Deployment whose command does not exist. The manifest does
+>    what the missing script would have done — `spark-submit --class …HiveThriftServer2
+>    spark-internal` — and `bin/spark-submit` IS shipped and IS on PATH (pip installs `bin/` into
+>    the environment's `bin`).
+> 2. **`spark-hive-thriftserver_2.12-3.5.3.jar` IS bundled**, so the class resolves. `Dockerfile.spark`
+>    now ASSERTS both this jar and `spark-submit` at build time, so a future pyspark bump that drops
+>    either fails `docker build` on the operator's laptop instead of becoming a CrashLoopBackOff.
+> 3. **`hive-metastore-2.3.9.jar`, `hive-exec-2.3.9-core.jar`, `hive-common`, `hive-serde` are ALL
+>    already bundled** under the same names `Dockerfile.spark` curls from Maven. That file's claim
+>    that "Hive metastore support is not in the base pyspark wheel's jar set" is **false**; the real
+>    cause of the silent-Derby symptom is the `SPARK_CONF_DIR` one `40-spark.yaml` documents. The
+>    download is kept as a version pin and its comment corrected to say so.
+>
+> **WHY SPARK AND NOT HiveServer2 — decided by `publish_sql.py:134`, not by preference.** The swap is
+> `CREATE OR REPLACE VIEW … AS SELECT … FROM parquet.`<path>``, and `parquet.`<path>`` is Spark SQL's
+> path-as-relation syntax. Hive has no such construct, so a real HiveServer2 would fail the one
+> statement the publication step exists to perform. It is moot besides: the image carries no
+> HiveServer2 — its only Hive server jar is `hive-service-rpc` (the `TCLIService` wire protocol),
+> not `hive-service`.
+>
+> **THE BRIEFED REQUIREMENT COULD NOT BE MET, AND THE REASON IS STRUCTURAL RATHER THAN A GAP.** The
+> task asked for "SQL-standard authorization ENABLED and a named admin principal", fail-closed.
+> **A Spark Thrift Server cannot have SQL-standard authorization at all.** Spark's SQL grammar
+> carries a rule literally named `unsupportedHiveNativeCommands`, and `GRANT`, `REVOKE` and
+> `SHOW GRANT` are members: Spark parses them only to reject them, as
+> `[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT`. Spark never routes through Hive's
+> `Driver`, so the `…authorization.plugin.sqlstd` classes sitting on the classpath in `hive-exec` are
+> never consulted. Verified by extracting the grammar tokens and the rule name from
+> `SqlBaseParser`/`SqlBaseLexer`, and the message template from Spark's own
+> `error/error-conditions.json`. No configuration changes this, in this image or any other.
+>
+> **So E2's third blocker is not closable on kind, and the tension is a design fact worth stating
+> once:** the swap REQUIRES Spark (only Spark parses `parquet.`<path>``), `can_read` REQUIRES an
+> authorization model (only Hive's `Driver` has one), and no single engine here has both. The
+> honest posture is the one the adapter was already built for — `can_read` raises
+> `MetastoreReadScopeUnanswerable`, and **L1 does not pass against the sandbox endpoint**. That is
+> recorded here rather than discovered on the cluster, which was the point.
+>
+> **AUTHENTICATION, on the other axis, is real but unavailable HERE.** The forked Hive service layer
+> inside `spark-hive-thriftserver` does ship `HiveAuthFactory` with LDAP, CUSTOM, PAM and Kerberos
+> providers. None can run in this image, and each reason was checked rather than assumed: CUSTOM
+> needs a compiled `PasswdAuthenticationProvider` and the image installs `openjdk-17-jre-headless`
+> with **no `javac`**; LDAP needs a directory server and this cluster runs postgres/backend/worker/
+> frontend and nothing else; KERBEROS needs a KDC and keytabs; PAM needs native JPAM libraries.
+> `NONE` is therefore not a convenience default chosen over something stronger — **it is the only
+> mode the image can run**, and the manifest says so at the setting rather than implying a choice.
+>
+> **WHAT ACTUALLY BOUNDS ACCESS, then, stated so nobody mistakes it for more:** the Service is
+> `ClusterIP` (never published to the host) and the whole file is opt-in, outside `k8s/`, so
+> `deploy.sh` never applies it. **A `NetworkPolicy` was deliberately NOT shipped**: `deploy.sh` runs
+> `kind create cluster` with no CNI configuration, which means kindnet, and **kindnet does not
+> implement NetworkPolicy** — the object would be accepted, enforce nothing, and read in review as a
+> control that exists. An unenforced policy is worse than an absent one.
+>
+> **ONE ADAPTER DEFECT FOUND AND FIXED, and it would have fired on first contact.** Spark's actual
+> rejection — `Operation not allowed: SHOW GRANT` — matched **no** entry in `FAULT_PATTERNS`, so it
+> classified `UNRECOGNISED` and **raised**, meaning the one condition the module has a designed typed
+> answer for would have reached the operator as an unknown fault. Added to the
+> `READ_SCOPE_UNANSWERABLE` patterns, deliberately narrow (`operation not allowed: show grant`, not
+> the bare prefix): Spark uses `Operation not allowed:` for unrelated refusals too — TRUNCATE on an
+> external table, ALTER TABLE SET SERDE — and matching it alone would report those as an answer about
+> read scope, which is the over-broad-pattern failure that table's own comment warns against. Two
+> tests pin it, one for each half.
+>
+> **DEPLOYMENT-FILE VALUES ARE NOW COPY-PASTE CORRECT** against the Service that exists:
+> `.env.example`, `20-backend.yaml` and `25-worker.yaml` state `spark-thrift` / `10000` / `NONE`,
+> each with the reason and each with the `can_read` limitation named at the exact place an operator
+> would otherwise expect L1 to pass. `up.sh` applies the manifest AFTER the Hive schema init (the
+> server opens its metastore connection at startup, so the order is load-bearing) and points the
+> operator at the increment-3 harness rather than at beeline.
+>
+> Gates: full suite **11342 passed, 20 skipped** (baseline `b268567b` was 11340/20; the two new
+> tests are the Spark-phrasing pair above); `-m eval` **73 passed**; ruff clean on both touched
+> Python files;
+> no new mypy errors; all three touched manifests re-parsed with `yaml.safe_load_all` and `up.sh`
+> checked with `bash -n`.
 
 ---
 
