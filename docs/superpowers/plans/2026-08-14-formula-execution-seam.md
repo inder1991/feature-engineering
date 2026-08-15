@@ -1695,7 +1695,7 @@ the platform crash is not a capability record.
   name.
 - Both tests are **deleted by D3** — record that in the task, so the guard cannot outlive its cause.
 
-> **ACCEPTED `PENDING-D0` (2026-08-15).** **HALF OF THIS TASK WAS ALREADY BUILT** — plan defect
+> **ACCEPTED `754bdfb8` (2026-08-15).** **HALF OF THIS TASK WAS ALREADY BUILT** — plan defect
 > found and corrected above. `queue_lane.py:719-721` has caught `PublishStepMissing` and returned
 > `status="publish_step_missing"` since `b21a794a` (Phase G's own lane commit), and
 > `test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason` already pins the request to
