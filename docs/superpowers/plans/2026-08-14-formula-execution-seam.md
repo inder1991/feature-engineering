@@ -2996,7 +2996,7 @@ pass against an endpoint with no SQL-standard authorization"*. This section is t
 also **retires the parenthesis** — that script does not exist — and converts the third item from a
 thing a deployment might configure into a thing this engine structurally cannot do.
 
-> **SUCCESSOR 3 — INCREMENT 1: THE THRIFT ENDPOINT MANIFEST. ACCEPTED `<hash-1>` (2026-08-15).
+> **SUCCESSOR 3 — INCREMENT 1: THE THRIFT ENDPOINT MANIFEST. ACCEPTED `2c259f20` (2026-08-15).
 > FILES ONLY — no `kubectl`, no `docker`, no apply, no cluster contact of any kind.**
 >
 > **`deploy/kind/sandbox/41-spark-thrift.yaml`** — a `spark-thrift` Deployment plus a ClusterIP
@@ -3089,7 +3089,7 @@ thing a deployment might configure into a thing this engine structurally cannot 
 > no new mypy errors; all three touched manifests re-parsed with `yaml.safe_load_all` and `up.sh`
 > checked with `bash -n`.
 
-> **SUCCESSOR 3 — INCREMENT 2: THE OPERATOR RUNBOOK AND TASK 0 ALIGNMENT. ACCEPTED `<hash-2>`
+> **SUCCESSOR 3 — INCREMENT 2: THE OPERATOR RUNBOOK AND TASK 0 ALIGNMENT. ACCEPTED `46af69c7`
 > (2026-08-15).** Documentation only.
 >
 > **THE RUNBOOK IS NINE STEPS, NOT EIGHT.** The endpoint goes in at **step 3** — after the images
@@ -3135,7 +3135,7 @@ thing a deployment might configure into a thing this engine structurally cannot 
 > increment — the count is 14 above increment 1's because increment 3's harness tests were already
 > in the tree when this ran, so **the same run gates increment 3**.
 
-> **SUCCESSOR 3 — INCREMENT 3: THE VALIDATION HARNESS. ACCEPTED `<hash-3>` (2026-08-15).**
+> **SUCCESSOR 3 — INCREMENT 3: THE VALIDATION HARNESS. ACCEPTED `1ffee9bc` (2026-08-15).**
 > `scripts/thrift_smoke.py` — read-only, three metadata reads, nothing written.
 >
 > **IT IS THE PRODUCTION CODE PATH, WHICH IS THE ENTIRE POINT.** It builds a real
