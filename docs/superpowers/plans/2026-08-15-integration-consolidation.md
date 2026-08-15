@@ -1,145 +1,194 @@
-# Integration consolidation — the exact-feature vertical slice
+# Integration consolidation — capability-grounded, exact-feature execution
 
-**Date:** 2026-08-16 · **Revision 3** — restructured after a review found revision 2 internally
-contradictory. Kept: the goal, the scope, every finding. Replaced: the linear R0–R9 ordering.
+**Date:** 2026-08-16 · **Revision 4** — rewritten after a review showed revision 3 started from the
+desired UI outcome and skipped the executable facts beneath it. Goal and scope unchanged. **The
+30-day estimate is removed** until R4-0 resolves the pilot, the execution environment and the
+Formula-v2 path.
 
-**The whole goal:**
+**The goal:** when you choose a feature, the system builds **that exact feature** and shows the result.
 
-> When you choose a feature, the system must build **that exact feature** on Hadoop and show you the
-> result.
+## 0.0 Why revision 3 was not executable **[R4]**
 
-**The first success:**
+It named `balance_slope_90d` as the first vertical slice. Measured against the code, that single
+choice smuggles in a new execution architecture, a new statistical operation and a data onboarding:
 
-> You select `balance_slope_90d`, click **Build in sandbox**, Kedro runs on Hadoop, Hive gets exactly
-> `balance_slope_90d`, and the UI shows its output profile.
+| Gate | Reality | Verified |
+|---|---|---|
+| Admission accepts the schema | **Formula-v1 ONLY** — *"A v2 (or any-other-version) formula reaching admission is refused loudly"* | `admission.py:228-237` |
+| Engine advertises the aggregate | advertises exactly `count_distinct, count_non_null, count_rows, sum` — **`slope` is not advertised** | `engine_capability`, probed live |
+| A reviewed executable formula exists | `balance_slope` has none; the v1 reviewed set is **two recipes**; the only reviewed v2 exemplar is `posted_debit_amount` — and v2 cannot be admitted at all | probed live |
+| Source data exists | deployed catalogs are `cib` (1 table, customer master) and `ftr` (1 table, transactions). **No account-day balance snapshot** | probed live |
+| The API can request execution | `business_dt` **appears nowhere** in `materialization_runs.py`; without it the lane returns no execution seam — every public request is compile-only | reproduced |
+| "Hadoop submission" | `LocalClusterSubmitter` is *"a local `kedro` run"* — a subprocess, not YARN/Livy/remote Spark; the worker image has PySpark and no Java | `submit.py:168` |
 
-## 0.0 Why revision 2 was not implementable **[R3]**
+**I had the slope evidence first-hand and did not connect it.** In C1 I built the engine capability
+registry, wrote the test asserting v2-only aggregates — `slope` among them — are *not* renderable,
+and then chose slope as the pilot. That is the specific failure this revision exists to prevent:
+**a pilot must be selected from measured capability, never from a mockup.**
 
-Its Release 2 promised a Hadoop build with staged progress and a profile — while the sandbox
-execution tier was R3, group validation R4, live Hive inspection R7, and profiling R9. **The plan's
-own first-success statement required a profile that the plan implemented two releases later.** A
-linear ordering cannot express a vertical slice; the slice needs a thin piece of each layer, not all
-of one layer before the next.
+### The measured field, today
 
-Revision 3 is therefore organised around **five load-bearing concepts**, in dependency order:
+```
+admission accepts: formula-v1 ONLY
+engine advertises: count_distinct, count_non_null, count_rows, sum
 
-> `feature_key` → **build request** → **executable revision** → **materialization group revision** →
-> **profiled run**
+reviewed v1 expectations (the only schema that can compile):
+  merchant_mcc_diversity   count_distinct   engine=YES   FORMULA_AUTHORABLE
+  obligor_facility_count   count_distinct   engine=YES   FORMULA_AUTHORABLE
+reviewed v2 expectations:
+  posted_debit_amount      (v2 — admission refuses v2 entirely)
+```
 
-### What the review found, validated **[R3]**
+The schema gate alone cuts 317 recipes to **two**. Whether either has a source table, bindable
+operands, a spine and an inventory mapping on the deployed cluster is **R4-0's** question, and this
+plan does not pre-empt its answer. `merchant_mcc_diversity` additionally carries the open D-7 grain
+disagreement, which is a governance decision, not an engineering one.
 
-| # | Finding | Verified | Verdict |
-|---|---|---|---|
-| 1 | A route-existence contract test **passes while the UI stays broken** — `/features/recipe` exists and refuses every call with 409 (`assist.py` keeps the route deliberately: *"a 404 would tell a client it had the wrong address"*) | reproduced | **CONFIRMED** |
-| 2 | "Author after selection" has no durable workflow, and the machinery it replaces **defaults off**: `recipe_formula_shadow_enabled()` reads `FEATUREGEN_RECIPE_FORMULA_SHADOW` defaulting `"0"` | reproduced | **CONFIRMED** |
-| 3 | **Canonical identity lands too late.** `govern.py:609` selects the latest contract `WHERE feature_name = %s`, with the comment *"ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation)"*. Three approved "Balance slope" variants become **versions of one feature**, by design | reproduced | **CONFIRMED — worse than assumed** |
-| 4 | **A group cannot be represented.** The run is keyed by `logical_group_name` and publication is *"atomic per group … never per-feature"*, yet only ONE `(considered_revision_id, option_id)` pair is recorded | reproduced | **CONFIRMED** |
-| 5 | Release order contradicts the Release 2 promise | self-evident in revision 2 | **CONFIRMED** |
-| 6 | **Sandbox still requires a confirmer** — `require_confirmer` gates every `POST /materialization-runs`, and compilation defaults to PRODUCTION | reproduced | **CONFIRMED** |
-| 7 | Set validation lands after the build it should gate | self-evident | **CONFIRMED** |
-| 8 | Live cluster facts stay caller assertions (`published_schema` on the POST body) until R7 | reproduced earlier | **CONFIRMED** |
-| 9 | One-hop joins and cross-catalog bridges are different increments; the chain refuses cross-catalog for want of `BridgeExecutionAuthorization` | reproduced earlier | **CONFIRMED** |
-| 10 | Recognition absorption is **traceability-only** — revision 2's labels (D1–D3, C4, A1, A3, H1) name a structure it deleted | self-evident | **CONFIRMED — my defect** |
-| 11 | Leakage narrowing was promised "immediately" with **no task assigned to do it** | self-evident | **CONFIRMED — my defect** |
-| 12 | Profiling is a metric list, not a durable contract | — | **CONFIRMED** |
+**All 23 findings were validated; the load-bearing ones were reproduced.** None dismissed.
 
 ## 1. Stages
 
-### S1 — integrity gate (3 days)
-- **S1-1 — behavioural, not route-existence, contract tests.** For every UI operation, call the real
-  backend handler and assert the **capability is supported** — not that the URL appears in OpenAPI.
-- **S1-2 — hide/disable "Write definitions"** until S7 reimplements it. A visible control whose only
-  outcome is 409 is the defect; removing the call is the fix, not mocking it.
-- **S1-3 — narrow the leakage wording NOW.** The UI stops claiming "structurally safe against
-  leakage" while the only hard check is `selected_ref == target_ref`. *(Revision 2 promised this and
-  assigned it nowhere.)*
-- **S1-4 — recognition correctness, in full, here.** Partial recovery (schema v3, membership semantic,
-  drop invalids before caps), canonical-vs-registry digest compared at dispatch, closed vocabularies
-  enforced, single-flight idempotency, paid-gate durability + real spend caps. **Recognition is the
-  front door; it does not wait behind a Build button.**
-- **S1-5 — ruff ratchet.** 79 repo-wide / 35 in `src/`: fix or ratchet, never leave it ambient.
+### R4-0 — capability-grounded pilot selection (no assumed pilot)
+Capture the cluster inventory **read-only** and compute a candidate matrix over: source table exists ·
+operands bind · population/spine exists · reviewed executable formula exists · engine supports every
+aggregate · inventory maps the physical table. **Select the simplest candidate that passes all six.**
+If none passes, R4-0's output is the shortest list of gaps to close — not a pilot chosen anyway.
 
-### S2 — exact selected-feature identity (6 days) — **migration**
-- **S2-1 — `feature_key` vs `display_label`.** `balance_slope_90d` as immutable machine identity;
-  *"Balance slope · 90 days"* as human text. **Underscore identifiers never appear as display text.**
-  **Applied at CONTRACT CREATION**, not only at executable-revision time — otherwise `govern.py`'s
-  name lookup keeps collapsing variants into versions of one feature.
-- **S2-2 — `ExecutableFeatureBuildRequest`** — mutable, evented: `queued → authoring → refused /
-  failed / ready`. This is what selecting a feature *creates*, and where retries, concurrency and
-  idempotency live.
-- **S2-3 — `ExecutableFeatureRevision`** — immutable, minted **only after** the selected formula
-  verifies: option id, exact parameter binding, contract id/version, formula hash, physical-plan hash,
-  canonical output name, work-item id.
-- **S2-4 — author from the selected option's canonical typed parameter payload**, replacing
-  speculative leading-variant capture. **Explicit cutover** — the shadow machinery defaults off and
-  must not be assumed live.
-- **Legacy:** contracts are immutable, so ambiguous existing ones stay **legacy/non-executable** until
-  explicitly mapped or reconfirmed. They are never silently rewritten.
+**No catalog upload or re-upload without explicit approval.** `balance_slope_90d` stays as the
+*second*, more valuable acceptance feature, after account snapshots and slope execution exist.
 
-### S3 — the materialization group contract (5 days) — **migration**
-- **S3-1 — `materialization_group_revision` + `materialization_group_member`**, one member per
-  executable revision; the run references `group_revision_id`; **the server derives work items and
-  membership — clients never submit arbitrary work-item lists.**
-- **S3-2 — group compatibility validated before a build is accepted**: grain, cadence, duplicate
-  output names, access classification, point-in-time rules, join safety, population spine. Recommend
-  groupings rather than refusing outright.
-- **S3-3 — execution tier derived SERVER-SIDE** from operation and destination namespace; a caller
-  may not ask for PRODUCTION. Sandbox admits AI-proposed evidence **with visible provenance**;
-  production keeps the stronger gates. `require_confirmer` no longer gates a sandbox build.
+*In parallel, not blocking:* hide the retired "Write definitions" control; narrow the leakage wording
+now; recognition correctness; ruff ratchet. Recognition fails open for generation, so it must not
+gate proving one deterministic feature executes.
 
-### S4 — the first functional vertical slice (10 days)
-One exact, single-table feature — `balance_slope_90d` — all the way through, with **a thin piece of
-every layer it needs**:
+### R4-1 — exact `FeatureDefinitionRevision`
+Persist the **canonical typed planning-request JSON** plus schema version and hash — today the option
+row stores `repr(value)` parameter strings, which prove equality but cannot reconstruct the request.
+**`repr()` must never enter execution identity.**
 
-UI "Build in sandbox" → exact formula → compile → generated Kedro project → **live Hive schema
-inspection** (server-side; `published_schema` stops being a caller assertion) → **capability probe**
-(a supported path that earns and stores the attestation) → Hadoop submission → validation → atomic
-sandbox publication → **minimal profile**.
+Five identities, separated because the code already has overlapping ones:
+- `feature_definition_key` — logical meaning + canonical parameters (`recipe:balance_slope?window_days=90`)
+- `feature_definition_revision` — a revision of that meaning
+- `executable_revision_id` — exact formula, binding, IR, environment-independent plan
+- `output_column_name` — normalized physical name, deterministic collision handling
+- `display_label` — presentation only (*"Balance slope · 90 days"*; **never an underscore identifier**)
 
-Plus **no stranded requests**: `configuration failed / waiting for retry / cancelled / running /
-failed / published`, retryable as the same logical request.
+**Applied at contract creation**, or `govern.py`'s *"ONE feature per feature_name"* lookup keeps
+collapsing variants into versions of one feature. **Rebinding a physical column mints a new executable
+revision, not a new logical feature.** Existing ambiguous contracts stay legacy/non-executable.
 
-**S4 is the done-bar.** Everything before it exists to make it true; everything after it widens it.
+### R4-2 — explicit build workflow
+**Selection stays local and reversible** — the Workbench promises that today, and creating an
+authoring request on a checkbox would spend resources before the human commits. **The explicit "Build
+in sandbox" click creates the durable request.**
 
-### S5 — single-catalog multi-table (6 days)
-One-hop governed joins: find the relationship, check uniqueness, determine fan-out, choose the
-population, freeze the join in the plan, **refuse when fan-out safety is unknown**. Chains later.
+Three lifecycles, separated:
+- `FeatureBuildRequest` — durable user intent
+- `FeatureBuildAttempt` — retryable authoring/compilation attempt
+- `MaterializationRun` — execution/publication outcome
 
-### S6 — cross-catalog (6 days)
-Bridge realization + `BridgeExecutionAuthorization` pinned into the run, recording bridge revision,
-joined columns, cardinality, evidence, human confirmation, and sandbox- vs production-safety. This is
-what the verified-but-unrealized `cust_num` ↔ `cif_id` bridge needs.
+A retry mints a **new attempt** under the same request; it never mutates a failed attempt back to
+running. Cancellation states explicitly which of these it does: drop a queued item, abort authoring,
+kill the remote application, or forbid publication after computation.
 
-### S7 — broader capability (12 days)
-LLM-idea promotion (today `conceptual_pattern` is refused by the policy whose own message names the
-formula seam as its promoter); **"Write definitions" reimplemented** through the semantic planner;
-richer leakage detection with **deterministic outcomes — `PASS` / `REFUSE` / `UNRESOLVED`** over
-prediction cutoff, horizon, target-lineage closure, event-vs-knowledge time and prohibited lifecycle
-stages, the LLM explaining but never deciding; multi-feature profiles; production promotion; a
-dedicated materialization worker; publication consistency across the control-plane row and the
-metastore swap.
+### R4-3 — selected-formula authoring, and the Formula-v2 bridge
+Author from the exact selected option into a **selected-authoring work item owned by the build
+request** — not through `recipe_formula_shadow_work_item`, whose identity is a speculative shadow
+capture bound to a generation run (and whose capture defaults **off**).
 
-### S8 — predictive evaluation (charter later)
-Model-input assembly, LightGBM/AUROC over single features and sets, feeding back into ranking.
+**Define the Formula-v2 executable artifact and add admission + lowering.** BR-6 never minted a
+`TypedFormulaV2`; the artifact is a proposal/output-policy pair, and admission refuses v2 outright.
+**Implement only the operation the chosen pilot needs** — not the whole v2 grammar.
 
-## 2. Contracts this plan owes, stated rather than implied **[R3]**
+### R4-4 — group integration onto the existing owners
+There is already `MaterializationContractV1` (the authoritative compatibility/group hash),
+`FeatureGroupPlanV1`, `GroupContractBinding`, `GroupPlanRevision`. The new concept must **map onto
+them, not compete**:
 
-- **`feature_output_profile`** keyed by materialization run, group revision, executable revision,
-  business date and profile-schema version; inherits the group's access classification; **computed
-  inside Hadoop, summaries only across the boundary**; a profile failure is recorded separately and
-  **never falsely fails an otherwise validated publication**.
-- **Build request vs revision** — the mutable lifecycle and the immutable artifact are different
-  records. Revision 2 defined only the artifact, leaving failure, retry, concurrency and idempotency
-  undefined.
-- **Leakage verdicts** — `PASS` / `REFUSE` / `UNRESOLVED`, with the behaviour on missing evidence
-  stated, not inferred.
+```
+FeatureSelectionGroupRevision → compile members → MaterializationContractV1
+   → group by exact contract hash → FeatureGroupPlanV1 → existing binding/revision/publication
+```
+
+**Two gates, because the authoritative one cannot run early:** a cheap **preflight** (duplicate
+selections, duplicate output names, declared cadence, obvious grain differences) that *recommends*
+groupings; then a **post-compile** decision on **equality of the full `MaterializationContractV1`
+hash** — which includes sensitivity, access, retention + policy version, availability promise,
+publication policy, backfill boundary, spine declaration and classification/physical-type policy
+versions. **The hash is authoritative**; a hand-maintained subset would drift. Incompatible selections
+are **split into multiple group revisions with an explanation**, never silently refused.
+
+### R4-5 — sandbox execution readiness
+- **`business_dt` on the API** — without it every request is compile-only.
+- **Live Hive schema read server-side**; `published_schema` stops being a caller assertion.
+- **Captured inventory** from R4-0.
+- **Dedicated materialization worker — before the first cluster run.** A long compile currently
+  blocks relays, timers, projections and pollers in the shared tick. This is functional isolation,
+  not deferred performance work.
+- **A real remote execution seam** — remote submitter with durable application id and status, or a
+  dedicated execution pod with Java/Spark and shared storage. The current local subprocess is not
+  Hadoop submission and must not be described as such.
+- **Persistent artifacts** — the generated project sits on ephemeral worker disk today, so a restart
+  loses the sealed artifact and with it retry, audit, reconciliation and proof that a rerun used the
+  same bytes. Persistent storage, or deterministic regeneration from the immutable revision plus hash
+  verification.
+- **Execution tier derived server-side**; a caller may not request PRODUCTION. Sandbox admits
+  AI-proposed evidence with visible provenance; structural safety, PIT correctness, fan-out safety and
+  read authorization still fail closed. **A governed contract is load-bearing for production
+  promotion, not for sandbox exploration** — and `require_confirmer` must not gate a sandbox build or
+  its status read.
+
+### R4-6 — validate and publish honestly
+Structural and data validation, then **publication intent → metastore swap → observed confirmation →
+control-plane completion → reconciler repairs incomplete states.** Until that exists the claim is
+narrowed to **"table-level atomic visibility"** — the swap and the Postgres transaction are not atomic
+together, and the code says so.
+
+### R4-7 — profile and UI
+**Profiling is a separate attempt, not a node in the publishing pipeline** — otherwise a profile
+failure fails the publication it must not fail. Two records, because one keyed by executable revision
+would duplicate group metrics:
+
+```
+feature_group_profile(run_id, group_revision_id, business_dt, …)   -- row count, duplicate keys
+feature_column_profile(run_id, executable_revision_id, business_dt, …) -- nulls, min/max/mean/median
+```
+
+With profile-schema version, exact-vs-approximate algorithm and version, bounded histogram/cardinality
+policy, null and invalid-value semantics, attempt status and retry identity, an idempotent ingestion
+API, and suppression for identifier/restricted features. **Computed inside Hadoop; summaries only
+cross the boundary.** The UI shows *published, profile pending* · *published, profiled* · *published,
+profile failed*. The first golden run may require a successful profile as its acceptance bar while the
+lifecycle still permits publication with a failed one.
+
+APIs the UI needs, named: create build request · get request + attempts · retry · cancel ·
+confirm/split a proposed group · get output profile.
+
+### Then
+One-hop governed joins (directional cardinality, duplicate and null join keys, SCD2 overlap refusal,
+PIT dimension selection, population preservation, fan-out allocation, row-count inflation validation)
+→ cross-catalog with the exact bridge realization revision, evidence snapshot, environment and tier
+pinned, and `ExecutionTier.SANDBOX` passed explicitly → LLM-idea promotion → richer leakage
+(`PASS`/`REFUSE`/`UNRESOLVED`, deterministic decides, model explains) → production promotion → AUROC.
+
+**The `cust_num` ↔ `cif_id` example becomes an acceptance fixture only after a current observed bridge
+snapshot confirms it.**
+
+## 2. Testing correction **[R4]**
+"Call the real backend handler for every UI operation" would demand 2xx from operations whose correct
+answer is a business refusal. Instead: **OpenAPI route/method/schema conformance** for every frontend
+operation · a **retired-capability registry** · **selected** end-to-end behavioural tests against a
+real app, test database and controlled provider · and an explicit assertion that **no visible control
+invokes a retired endpoint**. A route-existence check alone passes while the UI is broken —
+`/features/recipe` exists and refuses everything.
 
 ## 3. Sequencing
 
 ```
-S1 ─► S2 ─► S3 ─► S4 ⟨the done-bar⟩ ─► S5 ─► S6 ─► S7 ─► S8 ⟨later⟩
+R4-0 ⟨decides the pilot⟩ ─► R4-1 ─► R4-2 ─► R4-3 ─► R4-4 ─► R4-5 ─► R4-6 ─► R4-7 ─► widen
+        │
+        └─ parallel: recognition correctness · leakage wording · retired-control removal · ruff
 ```
 
-**≈ 30 days to S4**, then widening. The change from revision 2 is not scope but shape: a vertical
-slice that runs one real feature end to end, rather than eight horizontal layers that only meet at
-the end.
+**No duration estimate until R4-0 reports.** Revision 3's "≈30 days to S4" assumed a pilot that cannot
+execute, an API that cannot request execution, and a submitter that is not Hadoop.
