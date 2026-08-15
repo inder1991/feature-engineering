@@ -2115,10 +2115,21 @@ that runs in CI.
 > answers `False` on that route and `EXTERNAL_VALIDATION_OUTSTANDING` can only clear through the
 > `frozen.validation_status != "DESIGN_CHECKED"` short-circuit at `activation_policy.py:195`.
 > **NOT FIXED HERE, deliberately:** naming the contract needs an option → contract resolution that
-> does not exist (`contract` is keyed by `feature_name`; `contract_gate1_choice_revision` records
-> the option but the two id spaces are different), and inventing one inside a proof task is the
-> exact failure mode §8's verify-then-write rule exists to stop. E0 asserts the defect in both
-> directions instead, so it is a green test rather than a note.
+> does not exist — `contract` is keyed by FEATURE identity, and nothing anywhere records which
+> contract a given option decision produced — and inventing one inside a proof task is the exact
+> failure mode §8's verify-then-write rule exists to stop. E0 asserts the defect in both directions
+> instead, so it is a green test rather than a note.
+>
+> **CORRECTED TWICE BY SUCCESSOR 4 (§6.6c, 2026-08-15).** (1) This paragraph used to add *"…
+> `contract_gate1_choice_revision` records the option but the two id spaces are different"*, which
+> is false: a choice row's `option_id` and `semantic_option_decision.option_id` are the SAME id
+> space (both are `considered.options_by_id`, `gate1.py:1404-1426` / `:1499-1507`), and the confirm
+> route already relies on it. The missing thing was a RECORD on the contract side, not a
+> translation between two id spaces. (2) The defect itself is now CLOSED: migration 1069 stamps
+> the option key on the contract at mint and the route resolves along it, so
+> *"`POST /materialization-runs` accepts"* IS reachable for the served exemplar — the flipped test
+> proves exactly that, and pins the remaining boundary (a contract governed before 1069 carries no
+> link, resolves to `None`, and still fails closed).
 
 > **ACCEPTED `cb8788f4` (2026-08-15).** `tests/featuregen/api/test_seam_walkthrough.py` — one
 > walk, in the DEFAULT suite, plus the two tests that keep it from being decoration.
@@ -3175,6 +3186,72 @@ thing a deployment might configure into a thing this engine structurally cannot 
 
 ---
 
+## 6.6c SUCCESSOR 4 (2026-08-15): the option → contract resolution
+
+E0's acceptance row named a defect and deliberately left it open: `POST /materialization-runs`
+called `assemble_current_activation_state` **without `contract_id`**, so C3's contract-keyed
+`_requirements_closed` read was dead on the one route that gates materialization, and
+`EXTERNAL_VALIDATION_OUTSTANDING` could only ever clear through the `DESIGN_CHECKED` short-circuit
+(`activation_policy.py:195`). The row said naming a contract "needs an option → contract resolution
+that does not exist", and refused to invent one inside a proof task. This successor builds it.
+
+> **SUCCESSOR 4 — INCREMENT 1: THE LINK, RECORDED AT MINT. ACCEPTED `<hash-1>` (2026-08-15).**
+> Migration **1069** (`contract_option_link.sql`) adds `considered_revision_id` + `option_id` to
+> `contract` — nullable, composite FK to `semantic_option_decision (considered_revision_id,
+> option_id)` against 1063's own `semantic_option_decision_option_uq`, a named CHECK for the
+> half-stated case, a partial index on the pair. 1067's shape, for 1067's reasons.
+>
+> **PLAN DEFECT, VERIFIED AND CORRECTED — E0's row was wrong about WHY the resolution was
+> missing.** It says *"`contract_gate1_choice_revision` records the option but the two id spaces
+> are different"*. They are the SAME id space: `_private_considered_revision_snapshot`
+> (`gate1.py:1404-1426`) mints `options_by_id` from `cs.option_ids_by_path`, and
+> `_persist_considered_revision` (`:1499-1507`) keys `persist_option_decisions` by exactly those
+> ids — so a choice row's `option_id` IS a `semantic_option_decision.option_id`, and the confirm
+> route already depends on it (`api/routes/contract.py:1512` loads `load_frozen_option_facts` with
+> the recorded choice's pair for the A2 re-check). The id space that genuinely does not reach
+> either of them is `contract`'s, which is FEATURE identity — and that is the gap 1069 closes. The
+> row's operative conclusion (do not invent the resolution inside E0) was right for the wrong
+> reason; the sentence is corrected in place.
+>
+> **THE DIRECTION OF THE LINK, and why it is not a matter of taste.** A contract is minted FROM a
+> choice of an option, and `confirm_contract` is the ONE writer (a single production call site).
+> The confirm route already holds both halves there — it loads the frozen decision row for the A2
+> re-check immediately before minting — so the stamp happens at the only moment both id spaces are
+> in one caller's hands. The reverse column cannot exist: `semantic_option_decision` is
+> append-only and is written at GENERATION, before any contract does. A separate link table would
+> be a third store for a fact that is one-to-one with a contract VERSION and immutable with it, and
+> it would need its own write-once triggers to earn what 1012 already gives. And a join BY NAME is
+> refused on principle and by evidence: the walkthrough fixture's own option carries three
+> different strings — the card's name (`Complaints`), the governed `feature_name` (the same card
+> name), and the decision row's `source_definition_id` (`complaint_count`) — so a name-based
+> resolution would not have found the row at all. A test asserts that inequality rather than
+> describing it.
+>
+> **NULLABLE IS THE HONEST VALUE, AND THE WORM TABLE MAKES IT PERMANENT.** 1012 forbids UPDATE and
+> DELETE on `contract`, so these columns can only ever be written by the INSERT that mints the row:
+> every contract governed before 1069 keeps a truthful NULL, there is no backfill path, and none
+> was invented. The route passes the pair only when `load_frozen_option_facts` returned a row in
+> that same transaction — the FK refuses a citation nothing can resolve, and the writer refuses
+> half a key with the same sentence B4's route uses.
+>
+> **The migration is audited against a POPULATED table**: the link is dropped, a contract is seeded
+> in the pre-1069 shape, and 1069's own SQL is run against it — the ALTER lands on a WORM table
+> that already has rows (a rewriting migration would ABORT on 1012's trigger rather than fail in
+> review), the definition is byte-identical afterwards, nothing is backfilled, and the constraints
+> then bite. Re-runnability is proved by applying it twice.
+>
+> **Two mutants, both caught:** a route that never states the key (2 failures — the recorded link
+> is asserted equal to the human's own choice, not merely non-null), and a migration carrying the
+> columns but neither constraint (4 failures).
+>
+> 10 cases in `tests/featuregen/api/test_contract_option_link.py`.
+> Gates: full suite **11366 passed, 20 skipped** (baseline on `b73c17c1` was 11356/20 — the ten new
+> tests and nothing else moved); `-m eval` **73 passed**; ruff clean on all three touched files;
+> mypy clean on `govern.py` and the 2 errors in `contract.py:883` are pre-existing (measured by
+> HEAD-swap, identical line and codes) — none added.
+
+---
+
 ## 7. Sequencing and dependencies
 
 ```
@@ -3217,8 +3294,10 @@ E1 needs D3; E2 needs E1 + explicit user go ────────────
   `spark_semantics_gate.py`) are **not** `test_*` files and are not collected by the default suite,
   by design: `pyspark`/`kedro` are not dependencies of this platform. Run them via `make l0-gate`
   for any task touching `render/` or the chain.
-- Migrations **1055** (reserved, G-3), **1066**, **1067**, **1068** (added at execution, task B2) —
-  those four and no others. The free
+- Migrations **1055** (reserved, G-3), **1066**, **1067**, **1068** (added at execution, task B2)
+  and **1069** (`contract.considered_revision_id + option_id`, claimed at execution by SUCCESSOR 4,
+  §6.6c — the free frontier was verified to be 1069 before it was taken) —
+  those five and no others. The free
   frontier is 1066 (1065 is the highest applied; 1055 is a live reservation, not an error). Claiming
   a number appends to the Track-1-owned reservation table **in the same commit** — never "next
   available" at execution time. Deploy backend-first, with explicit user approval per the standing

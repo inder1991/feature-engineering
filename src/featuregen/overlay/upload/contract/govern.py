@@ -524,6 +524,7 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
                      snapshot_lineage: Mapping[str, str | None] | None = None,
                      confirmed_binding_hash: str | None = None,
                      plan_envelope: PlanEnvelopeV1 | None = None,
+                     option_key: tuple[str, str] | None = None,
                      templates=None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
@@ -539,7 +540,22 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     The rebuilt plan's FULL physical read set (join keys / bridge keys / anchors) is then persisted as
     role-labelled ``contract_input_column`` + ``contract_metadata_dependency`` lineage, so the H2c read
     gate detects drift on ANY physical column the governed contract reads (the C-1 gap, closed here).
-    ``templates`` (default ALL_TEMPLATES) is injectable for tests that plan over a fixture recipe."""
+    ``templates`` (default ALL_TEMPLATES) is injectable for tests that plan over a fixture recipe.
+
+    SUCCESSOR 4 (migration 1069) — ``option_key`` is the ``(considered_revision_id, option_id)`` of the
+    SEMANTIC OPTION this contract is being minted FROM, stamped onto the contract row HERE because this
+    is the only moment both id spaces are in one caller's hands. It is never reconstructed afterwards:
+    ``feature_name`` is not identity (a re-confirm mints a new version under the same name), so a
+    name-based join would be a guess. ``None`` is the honest value for a confirm that names no served
+    option decision — a direct/legacy confirm, or an option the generation run never froze a decision
+    row for — and it stays NULL forever, since 1012 makes this table WORM and there is no UPDATE path
+    to fill it in later. Half a key raises: an option is addressed by BOTH halves, and recording half
+    would put provenance in the table that nothing could resolve (1069 carries the same rule as a
+    CHECK, and its FK is what proves the pair names a real decision row)."""
+    if option_key is not None and not (option_key[0] and option_key[1]):
+        raise ContractValidationError(
+            "a governed option is named by BOTH considered_revision_id and option_id; half a key "
+            "names no approval and would record provenance nothing could resolve")
     # [3] STEP 0 — SOURCE-LOCK THE DRIFT BASELINE FIRST. confirm runs on READ COMMITTED (the route keeps
     # it off REPEATABLE READ, MF-2), and ingest_upload / apply_field_correction serialize their writes on
     # ``ingest_source_lock_key``. Without taking those same source locks, a same-source ingest could COMMIT
@@ -644,9 +660,9 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         "metadata_snapshot_id, metadata_content_hash, metadata_input_fingerprint, "
         "initial_validation_status, initial_verification, "
         "generation_source, recipe_id, physical_plan_id, planner_declaration_id, "
-        "personal_data_policy_revision_ids) "
+        "personal_data_policy_revision_ids, considered_revision_id, option_id) "
         "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, "
-        "%s, %s, %s, %s, %s::jsonb)",
+        "%s, %s, %s, %s, %s::jsonb, %s, %s)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
          json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
          "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
@@ -669,7 +685,11 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          # is a draft-time reading; a policy revoked and re-approved in between is a content-distinct
          # revision, and the governed artifact has to name what covered it at the GOVERNING WRITE.
          # `[]` means the feature bound no personal data, never that nothing was checked.
-         json.dumps(list(check.personal_data_policy_revision_ids))))
+         json.dumps(list(check.personal_data_policy_revision_ids)),
+         # SUCCESSOR 4 (1069): the option this contract was minted FROM, recorded at the one moment
+         # both id spaces are in hand. NULL when the confirm named no served decision row — an honest
+         # absence that stays absent, because 1012 gives this table no UPDATE to fill in later.
+         *(option_key if option_key is not None else (None, None))))
     # H2b STEP 4 — insert the immutable, write-once contract_input_column lineage: one role-labelled row
     # per reconciled input (derives + grain + as_of + governed join). This + the pointer (STEP 5) are the
     # AUTHORITATIVE write; feature/feature_derives_from (STEP 7) are the current-pointer compat projection.

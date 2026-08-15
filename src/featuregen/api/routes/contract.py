@@ -1503,6 +1503,12 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # fold that gated the draft runs again at the GOVERNING write, over the same frozen
     # decision row and a FRESH current-state re-read. A review revoked, a policy moved, or a
     # snapshot drifted between draft and confirm blocks HERE, with the same typed shape.
+    # SUCCESSOR 4 (migration 1069) — the same load also decides whether this contract can RECORD the
+    # option it is minted from. The key is stated only when the decision row is really there: the FK
+    # in 1069 refuses a pair naming no row, and `frozen is not None` IS that row, read in this very
+    # transaction. An option the generation run never froze a decision for mints a contract with an
+    # honest NULL rather than a citation nothing can resolve.
+    option_key: tuple[str, str] | None = None
     if recorded_choice.considered_revision_id and recorded_choice.option_id:
         from featuregen.overlay.upload.semantic_option_decision import (
             assemble_current_activation_state,
@@ -1513,6 +1519,7 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             conn, considered_revision_id=recorded_choice.considered_revision_id,
             option_id=recorded_choice.option_id)
         if frozen is not None:
+            option_key = (recorded_choice.considered_revision_id, recorded_choice.option_id)
             current = assemble_current_activation_state(
                 conn, frozen=frozen,
                 snapshot_id=(recorded_choice.snapshot_lineage or {}).get("snapshot_id"),
@@ -1661,7 +1668,11 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
                                 # never the client body): confirm_contract REBUILDS it against the current
                                 # snapshot, requires the SAME physical_plan_id + declaration id + a fresh
                                 # verdict, and persists its full read set as role-labelled lineage.
-                                plan_envelope=env)
+                                plan_envelope=env,
+                                # SUCCESSOR 4 — the option this contract is minted FROM, stamped on
+                                # the row (1069). Set only when the decision row loaded above; the
+                                # governed link is never reconstructed by feature_name afterwards.
+                                option_key=option_key)
     except GovernedPlanDrift as e:   # H3c — the rebuilt plan drifted (id / freshness) → regenerate
         raise HTTPException(status_code=409, detail="plan drifted, regenerate") from e
     except ContractValidationError as e:
