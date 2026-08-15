@@ -1,11 +1,14 @@
 # The recognition repair seam — a correct answer must not be lost to a sloppy sibling
 
 **Date:** 2026-08-15 · **Origin:** a live run on the kind sandbox, not a code review.
+**Revision 2** — rewritten after an adversarial review of revision 1 (`730c69a8`) found four
+blockers, three of which made tasks as-written unbuildable. What that review corrected is marked
+**[R2]** throughout, because a plan that hides its own defects teaches nobody.
 
 ## 0. What happened, and what is verified
 
-A user asked *"customers whose transaction activity suddenly accelerates are about to leave"* with the
-goal *"predict churn in the next 90 days"*. The recognizer returned this, recorded verbatim in
+A user asked *"customers whose transaction activity suddenly accelerates are about to leave"*, goal
+*"predict churn in the next 90 days"*. The recognizer returned this, recorded verbatim in
 `llm_call.raw_output` (run `grun_01M02SAZWKC6FJ4DPTY4WVCB12`, 13:20:17Z):
 
 ```json
@@ -21,148 +24,213 @@ goal *"predict churn in the next 90 days"*. The recognizer returned this, record
  "modelling_contexts": []}
 ```
 
-**The first candidate is correct.** The second is transparently a placeholder — it says so. The
-platform discarded BOTH, recorded `technical_failure`, and the screen told the user *"No use-case was
-recognised for this objective"*. The run then served **917 unscoped candidates** (306 of 317 recipes)
-instead of the churn-scoped set.
+The first candidate is correct. The second says `"placeholder"` in as many words. The platform
+discarded BOTH, recorded `technical_failure`, told the user *"No use-case was recognised"*, and
+served **917 unscoped candidates** (306 of 317 recipes).
 
 ### 0.1 The verified defect chain
 
 | # | Fact | Evidence |
 |---|---|---|
-| 1 | The registered output schema declares `use_case_id` as a bare string — the 88 ids are prose in the prompt only | `enrich_llm.py:1452` (`("use_case_recognition", 1)`), `"use_case_id": {"type": "string"}` |
-| 2 | Sibling fields in the SAME schema DO carry enums (`status`, `relationship`, `confidence`) | same block |
-| 3 | The inner seam accepts a semantic validator and drives bounded repair/retry from it | `intake/llm.py:403-406` (`validate_output: Callable[...]`), §9.2 taxonomy at `:188` |
-| 4 | **The audited wrapper hardcodes the validator to schema-only, and exposes no parameter for a caller's own** | `enrich_llm.py:2099`: `drive_structured_call(dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))`; signature at `:1997-2007` has no `validate_output` |
-| 5 | So the recognizer validates AFTER the call returns, outside the repair loop, where the only verdict is reject-everything | `taxonomy/recognizer.py:187` `validate_recognition_output(output)` in a `try/except` → `unscoped_result(..., technical=True)` |
-| 6 | Consequently the call logged `{"result": "ok"}` with `repair_attempts: []` — the model was never asked to fix its own output | `llm_call` row, 13:20:17Z |
-| 7 | `validate_recognition_output`'s own docstring claims it is *"the `validate_output` callback `drive_structured_call` invokes"* — on this path nothing invokes it there | `taxonomy/recognition.py:8` |
-| 8 | The taxonomy validator is all-or-nothing: the first bad candidate raises | `recognition.py:126` inside `_validate_candidate`, called per-candidate from `validate_recognition_output` |
-| 9 | The same module already has the FORGIVING pattern for two sibling dimensions, deliberately and documented | `recognition.py:221` — *"Unlike `validate_recognition_output` — which fails the WHOLE recognition on a malformed core"*; `normalize_dimensions` |
-| 10 | The UI reports absence, not loss | `WorkbenchScreen.tsx:2060` *"No use-case was recognised for this objective."* |
-| 11 | The audited wrapper has ~29 call sites, incl. the formula seam which delegates to it precisely to avoid re-implementing repair | `formula/audited.py:99,141` |
+| 1 | The registered schema declares `use_case_id` as a bare string; the 88 ids are prose in the prompt only | `enrich_llm.py:1452` |
+| 2 | Sibling fields in the SAME schema carry enums (`status`, `relationship`, `confidence`) | same block |
+| 3 | The inner seam accepts a semantic validator and drives bounded repair from it | `intake/llm.py:403-406`, §9.2 taxonomy `:188` |
+| 4 | **The audited wrapper hardcodes the validator to schema-only and exposes no parameter for the caller's own** | `enrich_llm.py:2099`; signature `:1997-2007` |
+| 5 | The recognizer therefore validates AFTER the call, outside the repair loop | `taxonomy/recognizer.py:187` |
+| 6 | The call logged `{"result": "ok"}` with `repair_attempts: []` — the model was never asked to fix its output | `llm_call` row 13:20:17Z |
+| 7 | `validate_recognition_output`'s docstring claims it IS the callback the inner seam invokes | `recognition.py:8` |
+| 8 | The taxonomy validator is all-or-nothing — the first bad candidate raises | `recognition.py:126` |
+| 9 | The module already has the forgiving idiom for two sibling dimensions, deliberately | `recognition.py:221`, `normalize_dimensions` |
+| 10 | The UI reports absence, not loss | `WorkbenchScreen.tsx:2060` |
+| 11 | **[R2 — corrected]** The wrapper has **12 distinct caller modules**, not "~29". Revision 1 quoted a raw grep line count as a caller count | `grep -rl`, verified at `730c69a8` |
 
-**Not a cause:** billing (the call returned HTTP 200), the prompt (88 ids rendered, churn listed
-first — `recognizer_prompt.py`, 8906 chars), or the model being unreachable. The model was also
-sloppy in a second way — two candidates both `"primary"` where the rules allow one — which is a
-second independent signal that entry #2 was junk.
+### 0.2 What revision 1 got wrong — verified at `730c69a8` **[R2]**
 
-**Deliberate-design caveat, stated so it is argued rather than assumed:** fail-closed on the CORE
-classification is a considered choice (fact 9 documents the contrast). This plan does not overturn
-it. It restores the step that was supposed to come first — letting the model repair — and only then
-decides what to do with a still-invalid body.
+| # | Blocker | Evidence |
+|---|---|---|
+| B1 | **Task 3 was unbuildable.** After repair exhaustion the wrapper returns `output=None` on BOTH the discard and failed paths, so the recognizer has no body left to partition. Modifying `recognition.py` alone cannot work | `enrich_llm.py:2128`, `:2135`; `recognizer.py:172-184` |
+| B2 | **Re-running the same objective returns a NEW http result over an OLD stored row.** Persistence is unique on `(intent_id, input_hash)`, and `input_hash` covers only redacted user input + redaction policy — not prompt, schema, taxonomy, validator or model. The endpoint calls the provider again, then `ON CONFLICT DO NOTHING` returns the OLD recognition id. After this fix ships, resubmitting the incident could display "Churn" while the returned id still points at the `technical_failure` row | `contract.py:1173-1202`, `scope_records.py:94-117,145-172,490-545` |
+| B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` |
+| B4 | **Revision 1 created schema v2 and never activated it.** `_OUTPUT_SCHEMA_VERSION = 1` is hardcoded; `register_enrichment_schemas()` uses a MUTABLE `register_schema` that overwrites an existing version, so a dynamically-derived enum could mean different things on different deployments | `recognizer.py:55`, `enrich_llm.py:1902-1918`, `documents/registry.py:29-49` |
 
-## 0.2 The done-bar
+**Measured, not assumed [R2]:** 88 selectable leaves / 123 taxonomy nodes; the projected v2 schema is
+~3.6 KB and passes the repository's provider-compatibility check. **The enum is therefore mandatory
+in this repair, not optional hardening** — revision 1 deferred it on a size concern that does not
+exist.
 
-> A recognition whose body carries one valid candidate and one invalid one ends as a CLASSIFIED
-> scope over the valid candidate — after the model has been given its designed chance to repair —
-> and any residue the platform dropped is named to the user, never reported as absence.
+**Not a cause:** billing (HTTP 200), the prompt (88 ids rendered, churn listed first), model
+reachability. The model was independently sloppy in a second way — two `"primary"` candidates where
+the rules allow one.
 
-## 1. Tasks
+## 0.3 The done-bar **[R2 — corrected]**
 
-### Task 1 — the audited wrapper stops swallowing the caller's validator (½ day)
+Revision 1's done-bar required a valid sibling to survive *even when repair fails*, while its
+sequencing called Tasks 1+2 the "minimum honest fix". Those contradict: 1+2 only help when the model
+repairs successfully. Resolved by making partition part of the functional fix:
 
-**Modify:** `src/featuregen/overlay/upload/enrich_llm.py`
-- `drive_audited_structured_call` gains `validate_semantics: Callable[[Mapping[str, Any]], None] | None = None`.
-- `:2099` composes instead of replacing: registry schema first (unchanged, still the fail-closed
-  floor), then the caller's validator when given. One lambda, both checks, so a semantic failure is
-  a REPAIRABLE outcome exactly as a schema failure already is.
-- `audited_structured_call` (the output-only view, `:1978`) passes it through.
+> A recognition whose body carries one valid candidate and one invalid one ends as a scope over the
+> valid candidate — after the model has been given its designed chance to repair, and whether or not
+> that repair succeeds — with every dropped candidate named by a closed reason code, and never
+> reported to the user as absence.
 
-**Why the default is `None`:** every one of the ~29 existing call sites keeps today's behaviour
-byte-for-byte, including `formula/audited.py`, which delegates here specifically to inherit repair.
+**Stated plainly, as the review required:** after repair exhaustion this **does** overturn the
+current all-or-nothing core policy, in the bounded way §4 freezes. Revision 1 claimed it did not.
+That claim was wrong.
 
-**Acceptance (tests):**
-- `test_a_semantic_failure_is_repaired_not_returned` — a scripted client returns an invalid body then
-  a valid one; the result is the valid body and `repair_attempts` records the round.
-- `test_the_registry_schema_still_fails_closed_first` — a body failing the SCHEMA is unchanged in
-  outcome and message, whether or not `validate_semantics` is supplied.
-- `test_every_existing_call_site_is_byte_identical` — the wrapper without the new argument produces
-  the identical `LLMRequest` and validator behaviour (AST/structural over call sites + a golden).
+## 1. Tasks — corrected sequence **[R2]**
 
-### Task 2 — the recognizer uses it (½ day)
+### Task 0 — `RecognitionContractV2`: request identity and provenance (2 days) — **migration**
 
-**Modify:** `src/featuregen/overlay/upload/taxonomy/recognizer.py`
-- Pass `validate_semantics=validate_recognition_output` at `:151`.
-- Keep the post-call `validate_recognition_output` at `:187` as the belt-and-braces floor — a
-  repair that never succeeded must still not yield a scope.
-- **Correct the docstring at `recognition.py:8`** — it describes a wiring that did not exist.
+Nothing else is safe until re-running an objective is honest.
 
-**Acceptance (tests):**
-- `test_the_padded_body_from_the_live_incident_now_recognises` — the EXACT `raw_output` above as
-  turn 1, a clean single-candidate body as turn 2 → `CLASSIFIED` on
-  `customer.relationship_attrition.churn`. This is the regression test for the incident.
-- `test_a_body_that_stays_invalid_after_repair_still_fails_closed` — no scope is invented.
-- `test_repair_is_recorded_on_the_llm_call` — `repair_attempts` is non-empty, so the audit shows
-  what happened.
+**New:** `recognition_request_hash` over `input_content_hash` + prompt content/version + schema
+content/version + taxonomy content/version + semantic-validator version + model and generation
+controls. `input_content_hash` keeps its current meaning (user input only) — the two answer
+different questions and neither may absorb the other.
 
-### Task 3 — partial validity, decided rather than inherited (1 day)
+**Modify:** idempotency becomes `(intent_id, recognition_request_hash)`. An existing request **loads
+and returns the stored result with no second provider call** — which also removes today's silent
+double-spend. `llm_call_ref` is stored ON the recognition attempt, so the served result and the audit
+row are one fact.
 
-Task 1+2 fix the incident. Task 3 answers the question the incident raises: *when repair fails and
-the body still has one good candidate and one bad one, is reject-everything right?*
+**Migration:** additive column + index; the old unique key stays until backfilled rows carry the new
+hash. Append-only rows are never overwritten (1060/1061 discipline).
 
-**Modify:** `src/featuregen/overlay/upload/taxonomy/recognition.py`
-- `validate_recognition_output` keeps its all-or-nothing contract (callers depend on it).
-- **New** `partition_candidates(output) -> (kept, dropped)` beside `normalize_dimensions`, following
-  that function's documented non-fatal idiom: structurally-valid, closed-taxonomy candidates are
-  kept; each dropped one carries its reason code.
-- The recognizer folds a post-repair body through it: candidates survive → `CLASSIFIED`/`AMBIGUOUS`
-  with `warnings` naming every drop; none survive → today's `technical_failure`.
+**Acceptance:**
+- `test_a_changed_prompt_or_model_is_a_new_request` — same user text, different contract → new row.
+- `test_an_identical_request_returns_the_stored_result_without_calling_the_provider`.
+- `test_the_returned_recognition_id_is_the_row_the_response_was_built_from` — the B2 incident,
+  pinned: a re-run may never return an id whose stored status disagrees with the payload.
+- Migration audit against a POPULATED legacy table (the standing lesson).
 
-**The rule that keeps this honest:** a dropped candidate never becomes silence. `warnings` already
-exists on `RecognitionResult` (`recognition.py:113`) and is already persisted
-(`intent_recognition_attempt.warnings`).
+### Task 1 — immutable schema v2, activated (1 day)
 
-**Acceptance (tests):**
-- `test_one_valid_and_one_junk_candidate_yields_the_valid_scope_and_names_the_drop`
-- `test_two_primaries_after_partition_is_still_a_refusal` — the cap is not laundered by dropping.
-- `test_nothing_valid_survives_is_unchanged` — the existing failure path is untouched.
+**New:** `("use_case_recognition", 2)` — `use_case_id` carries `"enum": [...]` of the 88 leaves,
+**frozen as generated, reviewed bytes**, not derived at import. Generation is a one-off tool whose
+output is committed and pinned by hash; taxonomy growth requires v3. This is the only way the same
+version means the same thing on every deployment given the mutable registry (B4).
 
-### Task 4 — the schema stops permitting `x` (½ day) — **schema version 2**
+**Also:** remove model-returnable `technical_failure` from the provider schema — it is an internal
+platform outcome, never an LLM classification.
 
-**Modify:** `enrich_llm.py:1452` — a NEW `("use_case_recognition", 2)` whose `use_case_id` carries
-`"enum": [...]` built FROM `selectable_leaves()`/`USE_CASE_REGISTRY`, never hand-typed (the C1
-precedent: an advertisement derived from the thing it describes). v1 stays byte-frozen.
+**Modify:** `_OUTPUT_SCHEMA_VERSION = 2`; the schema inventory test; the evaluator (Task 6).
 
-**Open question for the operator, stated not assumed:** 88 enum members is a large constraint to put
-on the wire, and the registry is versioned independently of the schema. If the taxonomy grows, the
-schema must version with it. Recommend shipping Tasks 1-3 first and treating this as defence in
-depth once they are proven.
+**Acceptance:** `test_v1_is_byte_frozen`; `test_v2_bytes_match_their_pinned_hash`;
+`test_the_leaf_list_equals_the_registry_at_generation_time` (drift fails CI, loudly, rather than
+silently changing meaning); `test_an_invalid_id_fails_at_the_schema_layer`;
+`test_technical_failure_is_not_a_provider_status`.
 
-**Acceptance (tests):**
-- `test_the_enum_is_derived_from_the_registry_not_typed` (AST/structural).
-- `test_v1_is_byte_frozen`.
-- `test_an_invalid_id_now_fails_at_the_schema_layer` — and therefore repairs.
+### Task 2 — governed validator composition, with a failure contract (1 day)
 
-### Task 5 — the surface stops reporting loss as absence (½ day)
+**Modify:** `drive_audited_structured_call` gains
+`validate_semantics: Callable[[Mapping], None] | None = None`; `:2099` composes schema-first then
+semantics. Default `None` keeps all 12 caller modules byte-identical.
 
-**Modify:** `frontend/src/screens/WorkbenchScreen.tsx:2060` and the payload behind it — when
-recognition dropped candidates or exhausted repair, say so: *"one proposed objective was discarded as
-invalid — showing all buildable recipes"*, never the bare *"No use-case was recognised"*.
+**The failure contract [R2]:**
+- Only a typed `SchemaValidationError` from the semantic validator enters repair.
+- **Any other exception becomes an AUDITED technical failure** — it may not escape before
+  `_record_llm_call_durable`, since the provider has already been called and billed.
+- Repair instructions carry **closed, value-free codes** — `UNKNOWN_USE_CASE_ID`,
+  `MULTIPLE_PRIMARY_CANDIDATES`, `DUPLICATE_CANDIDATE` — and **never reflect the raw invalid id**
+  back into a prompt or the UI.
 
-**Acceptance (tests):** a Vitest case per state (recognised / nothing recognised / recognised-then-
-discarded); the standing honest-absence law asserted on the third.
+**Also [R2 / B1]:** the outcome-returning wrapper (never the output-only view) additionally returns
+`failure_kind` and `last_schema_valid_semantic_invalid_output`, exposed **only** after audit linkage
+succeeds, and **never** for schema-invalid, provider-failed, egress-blocked or audit-degraded
+results. The output-only wrapper keeps returning `None` for every invalid result.
+
+**Acceptance:** `test_a_semantic_failure_is_repaired_not_returned`;
+`test_the_registry_schema_still_fails_closed_first`;
+`test_a_validator_raising_an_unexpected_error_is_audited_not_escaped`;
+`test_repair_prompts_never_contain_the_invalid_value`;
+`test_the_invalid_body_is_exposed_only_on_the_semantic_arm`;
+`test_all_twelve_existing_call_sites_are_byte_identical`.
+
+### Task 3 — the recognizer uses it (½ day)
+
+Pass `validate_semantics=validate_recognition_output`; keep the post-call check as the floor; correct
+the false docstring at `recognition.py:8`.
+
+**Acceptance:** `test_the_padded_body_from_the_live_incident_now_recognises` (the exact `raw_output`
+above as turn 1, clean body as turn 2 → CLASSIFIED on `customer.relationship_attrition.churn`);
+`test_a_body_that_stays_invalid_after_repair_reaches_task_4`; `test_repair_is_recorded_on_the_llm_call`.
+
+### Task 4 — strict partial partition, semantics frozen (1½ days)
+
+Consumes Task 2's exposed post-repair body (B1).
+
+**The rule, frozen [R2]:**
+- **Candidate-local defects may be dropped**: unknown id, non-leaf primary, bad confidence/relationship
+  band, malformed evidence spans.
+- **Aggregate defects refuse the whole result**: duplicate ids, more than three candidates, multiple
+  primaries, status incompatible with candidates, malformed status.
+- `classified` after partition still requires **exactly one** primary.
+- **No promotion** of a secondary to primary, ever.
+- Every drop carries a closed, value-free reason code.
+
+So the live incident — two primaries — refuses on the aggregate rule *unless repair fixed it, which
+is why Task 3 comes first*. The partition rescues the single-junk-sibling case; it does not launder a
+cap violation.
+
+**Acceptance:** one case per bullet above, plus
+`test_the_only_primary_being_invalid_does_not_promote_a_secondary`;
+`test_nothing_valid_survives_is_unchanged`; the normalized result and its drop codes persist.
+
+### Task 5 — the API and UI say which of five things happened (1 day)
+
+**[R2]** `warnings` may NOT carry candidate loss: it already holds dimension warnings
+(`UNKNOWN_MODELLING_CONTEXT`, `UNKNOWN_TARGET_ENTITY`) that the UI renders as *"We couldn't map part
+of what you described…"*, which would misdescribe a discarded candidate.
+
+**New contract:**
+```
+recognition_quality:
+  disposition: clean | repaired | partially_recovered | unscoped | technical_failure
+  repair_attempts: int
+  dropped_candidate_count: int
+  drop_reason_codes: [...]
+```
+**Five distinct messages** — partial recovery says *"One invalid proposal was discarded; review the
+remaining scope"* and **keeps the surviving scope** (revision 1's "showing all buildable recipes" was
+wrong here); repair-exhausted offers broadening; genuine unscoped, ambiguous-without-primary, and
+clean each say their own thing.
+
+**Acceptance:** a Vitest case per disposition; the honest-absence law asserted on the two that are
+not absence.
+
+### Task 6 — evaluation and rollout (2 days)
+
+**[R2]** Version the evaluator with the contract; evaluate the **exact served, normalized result**
+linked by `llm_call_ref`, retaining raw output separately for audit. Re-run the 100-case real-provider
+gate, applicability recall, false-narrowing, stability and cost gates, plus repair-rate — and replay
+the live incident.
 
 ## 2. Risks
 
-- **The wrapper is a governed seam with ~29 callers.** The additive default is what makes this safe;
-  Task 1's byte-identity test is the guard, not the intention.
-- **Repair costs a provider round-trip.** Bounded by the existing §9.2 taxonomy — this plan adds no
-  new retry policy, it only lets an existing one see the failure.
-- **Task 3 changes what a partially-invalid body means.** That is a governance-visible semantic
-  change; it ships behind its own tests and is separable from 1+2.
-- **Not addressed here:** why `claude-opus-4-8` padded the list at all. The cluster ran
-  `claude-sonnet-5` on 2026-08-14 (4/4 classified) and `claude-opus-4-8` today (0/2). Model choice is
-  the operator's; this plan makes the platform robust to either.
+- **Task 0 is a persistence change on an append-only store.** Migration audited against populated
+  data; old rows never rewritten.
+- **Repair costs a provider round-trip**, bounded by the existing §9.2 taxonomy. Task 6 measures the
+  rate; Task 0's true idempotency removes today's silent re-spend.
+- **Task 4 overturns core all-or-nothing after repair exhaustion** — stated, bounded, tested.
+- **Not addressed:** why `claude-opus-4-8` padded the list (`claude-sonnet-5` 4/4 on 2026-08-14;
+  `claude-opus-4-8` 0/2 on 2026-08-15). Model choice is the operator's; this plan makes the platform
+  robust to either.
 
 ## 3. Sequencing
 
 ```
-Task 1 ──► Task 2      (fixes the incident; smallest honest fix)
-             │
-             ├──► Task 3   (partial validity — the policy question)
-             ├──► Task 4   (schema enum — defence in depth, operator call)
-             └──► Task 5   (the surface tells the truth)
+Task 0 (contract + persistence) ──► Task 1 (frozen schema v2)
+                                        │
+                                        ▼
+                       Task 2 (composition + failure contract + body exposure)
+                                        │
+                                        ▼
+                       Task 3 (recognizer) ──► Task 4 (partition) ──► Task 5 (API/UI)
+                                                                          │
+                                                                          ▼
+                                                                    Task 6 (gates)
 ```
 
-**Minimum honest fix: Tasks 1 + 2** (~1 day). Everything after is hardening.
+**≈ 9 days.** There is no shorter honest fix: Tasks 2+3 alone leave the done-bar unmet whenever
+repair fails, and shipping them without Task 0 means a re-run can show one answer while returning
+another's id.
