@@ -1,6 +1,7 @@
 # V2 as the feature language, on shared execution
 
-**Date:** 2026-08-16 · **Revision 5** — rewritten to the product direction of 2026-08-16.
+**Date:** 2026-08-16 · **Revision 6** — revision 5 plus the generate → verify → publish workflow (§1.5), which
+separates what code generation may claim from what only execution can prove.
 
 > **V1 remains the stable compatibility language. V2 becomes the intelligent, policy-aware language
 > for all new features. LLMs create and enrich V2 formulas; a deterministic V2 compiler resolves
@@ -157,6 +158,88 @@ sandbox** click creates the durable request. Three lifecycles kept apart — `Fe
 **table-level atomic visibility** with reconciliation. Profiling is a **separate attempt** whose
 failure cannot fail a validated publication.
 
+### P7b — the generate → verify → publish workflow **[R6]**
+
+**Governing rule:**
+
+> Code generation is immediate. **Verification is user-triggered.** Its checks run in parallel once
+> triggered, and every result is attached to the exact generated artifact.
+
+Nothing executes because code appeared. Generation answers *"can this be generated honestly?"* —
+never *"does this work?"*
+
+#### Three distinct actions, never collapsed
+
+| Action | Does | Available |
+|---|---|---|
+| **Generate code** | produces visible, sealed code; executes nothing | when policies resolve |
+| **Verify in sandbox** | on-demand execution and correctness validation | after generation |
+| **Publish to sandbox** | promotes the verified generation | after a passing verification |
+
+#### What generation checks, automatically
+
+These are the honesty preconditions, and they run as part of generation:
+
+- the formula is structurally valid;
+- every required column is bound;
+- **every policy reference is resolved** (invariant 1);
+- the generated code contains **no placeholders**;
+- formula and artifact hashes are valid;
+- **the generated code consumes every declared policy** (invariant 3 — checked here, at the one point
+  where the plan and the emitted code are both in hand).
+
+Passing these means the code was generated honestly. **It claims nothing about execution.**
+
+#### What verification runs, on demand and in parallel
+
+Build the generated project · run gold-data semantic tests · Spark compilation checks · execute on
+sandbox/Hadoop · validate keys and grain · validate types and null policies · check row-count
+inflation · profile the output · compare expected against actual semantics.
+
+Independent checks run concurrently; the request is one durable object with per-check results, so a
+failure names **which** check failed rather than failing the set.
+
+#### States
+
+`Generated — not verified` · `Verification queued` · `Verification running` · `Verification passed` ·
+`Verification failed` · **`Verification stale`**
+
+```
+Posted debit amount · 90 days
+  Formula        Ready
+  Policies       Resolved
+  Code           Generated
+  Verification   Not run
+  [View generated code]   [Verify in sandbox]
+```
+
+After a pass, the result is itemised — project builds · gold-data result matches · Spark execution
+completed · output grain is account · no duplicate account/date keys · output types match · profile
+completed — with `[View results] [Run again] [Publish to sandbox]`.
+
+#### Verification is bound to the exact artifact
+
+A result records: generated project hash · V2 formula hash · resolved policy hashes · physical binding
+revisions · compiler and renderer versions · verification dataset or input snapshot · the result.
+
+**Staleness is detected automatically; re-verification is not.** If the formula, code, binding or
+policy moves, the state flips to *"Verification stale — formula or dependency changed"* and **names
+what changed**. The platform does **not** silently re-run: spending compute is the user's decision,
+and a quietly-refreshed pass would hide the fact that the thing verified is no longer the thing built.
+
+#### Two notes
+
+- **Verification is execution**, so it needs everything P6 enumerates — `business_dt`, live Hive
+  reads, a real remote submitter, the dedicated worker, persistent artifacts. Making the trigger
+  explicit changes *when* that infrastructure is exercised, not whether it is needed.
+- **Profiling appears twice, deliberately.** In verification it is a *check* (did the output look
+  sane?). At publication it is the durable `feature_group_profile` / `feature_column_profile` record,
+  a separate attempt whose failure must not fail a validated publication.
+
+**OPEN — the operator's decision, not this plan's:** may an *unverified* generation be published if
+explicitly marked as such? The direction leaves it open. Until it is answered, publication requires a
+passing verification.
+
 ### P8 — expand V2 incrementally
 Current-vs-previous differences → ratios and percentage changes → signed sums (credits − debits −
 fees) → avg/min/max → stddev and percentiles → recency and streaks → slope and trend → concentration
@@ -184,7 +267,7 @@ the **as-of snapshot window shape**, which alone takes derivable blueprints from
 ## 3. Sequencing
 
 ```
-P1 ─► P2 ─► P3 ─► P4 ─► P5 ─► P6 ⟨first real run⟩ ─► P7 ─► P8
+P1 ─► P2 ─► P3 ─► P4 ─► P5 ─► P6 ⟨first real run⟩ ─► P7 ─► P7b ⟨generate/verify/publish⟩ ─► P8
                                     ▲
         identity · group contract · execution infrastructure ─┘
         (parallel: integrity gate · recognition · leakage wording · ruff)
