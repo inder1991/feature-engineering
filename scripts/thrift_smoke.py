@@ -24,6 +24,15 @@ designed answer and this script exits 0 for it.** `True` would be the
 unconfigured-allowlist-reads-as-everything defect and `False` a denial nobody issued. See the
 manifest header and the plan's §6.6b.
 
+**AND IT PRINTS THE DEPLOYMENT'S READ-SCOPE POSTURE BEFORE ASKING ANYTHING** (SUCCESSOR 5, the
+user's decision of 2026-08-15). Question 3's outcome says what the ENGINE can do;
+`FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL` says what the DEPLOYMENT then does about it
+— accept it and record a `READ_SCOPE_UNVERIFIED` warning per table, or fail the run closed. Those
+are two different facts and an operator reading one without the other cannot predict what a run will
+do, so the `declared` line is printed on EVERY invocation, in both states, and loudly when it is
+set. Nothing here reads it to change behaviour: this script asks metadata questions and never runs
+L1.
+
 USAGE (operator; every value explicit, nothing defaulted):
 
     FEATUREGEN_MATERIALIZE_METASTORE_ENGINE=hive \\
@@ -72,6 +81,7 @@ from featuregen.materialize.metastore_sql import (
 # SECOND source of truth for the variables a deployment sets, and the entire value of this script is
 # that it dials exactly what the worker would dial. If `queue_lane` renames one, this must break.
 from featuregen.materialize.queue_lane import (
+    _DECLARE_NO_AUTHORIZATION_MODEL_ENV,
     _METASTORE_AUTH_ENV,
     _METASTORE_ENGINE_ENV,
     _METASTORE_HOST_ENV,
@@ -122,6 +132,30 @@ def endpoint_from_env(env: Mapping[str, str]) -> MetastoreEndpoint:
         raise ConfigurationRefused(str(error)) from error
 
 
+def _declaration_line(env: Mapping[str, str]) -> str:
+    """The deployment's READ-SCOPE POSTURE, printed at first contact — LOUDLY when it is declared.
+
+    This script is the first thing that touches a new endpoint, so it is the right place to show
+    the one setting that decides whether an unanswerable read scope stops a run. Printed on every
+    invocation, in both states: a line that appeared only when the declaration was set would leave
+    an operator unable to tell "not declared" from "this script does not know about it".
+
+    Read from the environment the caller passed, exactly as ``queue_lane`` reads it, through the
+    lane's OWN variable name — not a literal spelled here, which would be a second source of truth
+    for the setting whose whole risk is being set somewhere nobody looked.
+    """
+    stated = (env.get(_DECLARE_NO_AUTHORIZATION_MODEL_ENV) or "").strip()
+    if stated.lower() in {"1", "true", "yes", "on"}:
+        return (f"*** {_DECLARE_NO_AUTHORIZATION_MODEL_ENV}={stated} — THIS DEPLOYMENT DECLARES IT "
+                f"HAS NO AUTHORIZATION MODEL. A run here proceeds WITHOUT anyone verifying that "
+                f"the authorized roles may read its inputs; every accepted table is recorded as a "
+                f"READ_SCOPE_UNVERIFIED warning on the run's own L1 report. Correct for a sandbox "
+                f"whose engine cannot answer SHOW GRANT. NEVER set it on a real deployment. ***")
+    return (f"{_DECLARE_NO_AUTHORIZATION_MODEL_ENV} is not set (the strict posture): an "
+            f"unanswerable read scope FAILS a run closed. This is the correct state for every "
+            f"deployment whose engine has an authorization model")
+
+
 def _report(label: str, run: Callable[[], str]) -> bool:
     """Run one question, print its TYPED outcome, and say whether the endpoint answered.
 
@@ -142,6 +176,9 @@ def _report(label: str, run: Callable[[], str]) -> bool:
         print(f"  {'':<22} {error}")
         print(f"  {'':<22} ^ EXPECTED against a Spark Thrift Server — Spark rejects SHOW GRANT by")
         print(f"  {'':<22}   grammar. It is the designed answer, not a fault.")
+        print(f"  {'':<22}   Whether a RUN then proceeds depends on the declaration printed above:")
+        print(f"  {'':<22}   declared, L1 accepts this and records READ_SCOPE_UNVERIFIED per table;")
+        print(f"  {'':<22}   undeclared, L1 fails the run closed.")
         return True
     except MetastoreAnswerRefused as error:
         print(f"  {label:<22} REFUSED         {error}")
@@ -195,6 +232,7 @@ def main(argv: Sequence[str] | None = None,
           f"principal={endpoint.principal}")
     print(f"table     {args.schema}.{args.table}")
     print(f"roles     {' '.join(args.roles)}")
+    print(f"declared  {_declaration_line(environ)}")
     print("asking L1's three questions (read-only; nothing is written)")
 
     session = (MetastoreSession(endpoint=endpoint) if connect is None

@@ -2389,6 +2389,11 @@ and a durable capability attestation that outlives the run that produced it.
    question, so first contact happens through the production code path rather than a beeline
    session. **Expect question 3 to report READ SCOPE UNANSWERABLE and the script to exit 0**: see
    the GRANT subsection below for why that is the correct answer here and not a misconfiguration.
+   The script also prints the deployment's READ-SCOPE POSTURE (`declared …`) before it asks
+   anything, in both states — question 3 says what the ENGINE can do, and the declaration says what
+   the DEPLOYMENT then does about it, and an operator reading one without the other cannot predict
+   what a run will do (SUCCESSOR 5, §6.6d). `up.sh` prints the invocation WITH
+   `FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL=1`; drop it to see the strict posture.
 4. **Land Task 0's inventory in the pod** and confirm it LOADS —
    `python -c "from featuregen.materialize.inventory import load_inventory;
    load_inventory('<path>')"` inside the pod. A file that exists but does not load fails exactly
@@ -2400,6 +2405,27 @@ and a durable capability attestation that outlives the run that produced it.
    stranded at `requested` with nothing queued behind it — re-triggering then needs a FRESH
    idempotency key, and the stranded row can never be closed at all (DEFERRED-WORK A.35, which D4
    chose to surface as *"never accepted — check the lane configuration"* rather than close).
+   **The EXECUTION block goes in here too — all eight together — and on kind ONE MORE LINE**
+   (SUCCESSOR 5, §6.6d), the exact spelling being:
+
+   ```yaml
+   FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL: "1"
+   ```
+
+   **WHAT YOU ARE ACCEPTING BY WRITING THAT LINE:** every run of this deployment proceeds without
+   anyone having verified that the authorized roles may read the tables it reads, because this
+   engine cannot be asked. Nothing else is relaxed — an unreachable metastore, an unknown table, a
+   refused answer and an unclassified driver error still fail a run exactly as they do without it —
+   and nothing is silent: each accepted table is recorded as a `READ_SCOPE_UNVERIFIED` warning on
+   that run's own L1 report, `GET /materialization-runs/{id}` reports
+   `read_scope_verified: false` with a plain-language sentence, and the run screen shows it.
+   **PRODUCTION MUST NEVER SET IT.** That guardrail lives in three places, and none of them is a
+   code check: this step, the `.env.example` block (which ships the line commented, as `"0"`, with
+   the acceptance spelled out), and `20-backend.yaml`'s own block at the line an operator would
+   edit. The one STRUCTURAL protection is that it is not a member of the all-eight-or-none block —
+   so no deployment is ever forced to state a value, unset is the strict posture, and a production
+   ConfigMap that simply never mentions it is already correct. The cheap loud check is step 3's
+   smoke script, which prints the posture back at the operator before asking anything.
 6. **Roll BOTH Deployments.** A ConfigMap edit does not restart a pod, and a pod started before the
    edit keeps the old environment for its whole life. **A rolled pod loses a `pip install` done into
    the running container** — the PyHive step above is per-pod-lifetime until it is baked into the
@@ -2419,6 +2445,12 @@ and a durable capability attestation that outlives the run that produced it.
    `publish_sql.SqlPublicationSwap` (§6.6). What now stops a run on kind is different and narrower —
    `can_read` is unanswerable against a Spark endpoint, so `PREPARE_RUN` fails at L1's THIRD
    question rather than for want of an implementation. See the GRANT subsection.
+   **CORRECTED AGAIN (SUCCESSOR 5, §6.6d):** that narrower blocker is now the operator's to lift.
+   With step 5's declaration set, L1 accepts the unanswerable read scope and the run continues to
+   the submission and the swap; without it, the sentence above still holds exactly. So the expected
+   terminal on kind is `PUBLISHED` once the probe (step 7) has run AND the declaration is in the
+   ConfigMap — and the run that gets there reports `read_scope_verified: false` on this very
+   surface, which is the correct reading of what happened rather than a caveat about it.
 9. **Read the table** — `sandbox_feature.<group>` — and compare it with the run's reported
    published object. This is §0.5 item 7 and it is the only step that can close it.
 
@@ -2468,6 +2500,23 @@ and the endpoint itself must carry, verified as real class names in `hive-exec`:
 > the classification and the swap, and leaves read-scope to an environment with an authorization
 > model. §0.5 item 7 is closable only if L1's read-scope question is satisfied some other way, which
 > is a governance decision this plan does not take.
+>
+> > **THE GOVERNANCE DECISION WAS TAKEN — user, 2026-08-15, option (a). See §6.6d.** Everything
+> > above about the ENGINE stands unchanged and was re-verified: Spark still rejects `SHOW GRANT` by
+> > grammar, the swap still needs Spark-only syntax, no single engine here has both, and `can_read`
+> > still raises. What changed is the last sentence only. A deployment may now EXPLICITLY DECLARE
+> > that it has no authorization model
+> > (`FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL`), and under that declaration L1 folds
+> > this one unanswerable question into an ACCEPTED, recorded outcome — a `READ_SCOPE_UNVERIFIED`
+> > warning per table on the run's own L1 report — instead of failing the run. **So "L1 cannot pass
+> > on kind" is superseded by "L1 passes on kind only under a declared posture, and every run that
+> > does so says so, forever."** The earlier framing of this as a STRUCTURAL blocker was right about
+> > the engine and wrong only in assuming the platform had no honest way to let an operator accept
+> > it. §0.5 item 7 is therefore reachable on kind — with the acceptance stamped on the run rather
+> > than assumed away. Production must never declare, and the guardrail is stated at every place an
+> > operator would set it (runbook step 5, `.env.example`, `20-backend.yaml`, `25-worker.yaml`,
+> > `41-spark-thrift.yaml`, `up.sh`) plus the smoke script, which prints the posture back before
+> > asking anything.
 
 #### What Task 0 can capture FROM THE ENDPOINT, and what it cannot
 
@@ -2982,7 +3031,8 @@ so at the place an operator would otherwise set the variables.
 > > Thrift Server rejects `SHOW GRANT` by grammar (`unsupportedHiveNativeCommands`), and the swap
 > > requires Spark-only `parquet.`<path>`` syntax that a real HiveServer2 could not run — so no
 > > single engine available here has both properties. `can_read` is unanswerable on kind, by design
-> > rather than by omission.
+> > rather than by omission. **(SUCCESSOR 5, §6.6d: still unanswerable, and no longer fatal — a
+> > deployment may declare it, and L1 then accepts and records it.)**
 >
 > **Six stale honesty claims corrected in the same commit**, each of which had become false the
 > moment increment 1 landed: `l0_gate.py`'s section header, `test_chain.py`'s `_run` docstring and
@@ -3060,6 +3110,14 @@ thing a deployment might configure into a thing this engine structurally cannot 
 > honest posture is the one the adapter was already built for — `can_read` raises
 > `MetastoreReadScopeUnanswerable`, and **L1 does not pass against the sandbox endpoint**. That is
 > recorded here rather than discovered on the cluster, which was the point.
+>
+> > **SUPERSEDED IN ITS LAST CLAIM BY SUCCESSOR 5 (§6.6d, 2026-08-15), and in nothing else.** The
+> > engine tension is real and unchanged; what "not closable" assumed is that the only two answers
+> > available were a lie and a refusal. The user's decision added a third: a deployment may DECLARE
+> > that it has no authorization model, and L1 then accepts this ONE outcome and records the
+> > acceptance on the run forever. `can_read` still raises here — the adapter was not touched — so
+> > read **"L1 does not pass against the sandbox endpoint"** as **"…unless the deployment declares,
+> > and then every run it passes carries `READ_SCOPE_UNVERIFIED`"**.
 >
 > **AUTHENTICATION, on the other axis, is real but unavailable HERE.** The forked Hive service layer
 > inside `spark-hive-thriftserver` does ship `HiveAuthFactory` with LDAP, CUSTOM, PAM and Kerberos
@@ -3447,6 +3505,59 @@ default rather than assume.
 > the 2 report round-trip cases and the 2 route cases, and nothing else moved); `-m eval` **73
 > passed**; frontend **813 passed / 40 files** (baseline 810 — the three read-scope render cases); `tsc --noEmit` clean; ruff clean on every touched file; mypy clean on both
 > touched source modules.
+
+> **SUCCESSOR 5 — INCREMENT 3: THE RUNBOOK, THE SMOKE SCRIPT AND THE PLAN'S OWN FRAMING. ACCEPTED
+> `<increment 3>` (2026-08-15).** One code change, and it is the loud structural guard: everything
+> else is documentation and the corrections this decision forces.
+>
+> **`thrift_smoke.py` PRINTS THE POSTURE BEFORE IT ASKS ANYTHING**, on every invocation and in BOTH
+> states — declared, in a `*** … ***` line that says what a run will now do and that a real
+> deployment must never set it; undeclared, as *"the strict posture: an unanswerable read scope
+> FAILS a run closed"*. Printed in both because a line that appeared only when the declaration was
+> set would leave *not declared* and *this script does not know about the setting* looking
+> identical. The variable is IMPORTED from `queue_lane` by name, never re-spelled — a literal here
+> would be a second source of truth for the one setting whose whole risk is being set somewhere
+> nobody looked — and a test pins that identity. The script reads it to PRINT and never to decide:
+> it asks metadata questions and does not run L1. Its READ SCOPE UNANSWERABLE branch now also says
+> what the two postures do with that outcome, because question 3 is a fact about the ENGINE and the
+> declaration is a fact about the DEPLOYMENT, and an operator holding one without the other cannot
+> predict what a run will do.
+>
+> **THE 9-STEP RUNBOOK GAINS THE DECLARATION AT STEP 5** (the ConfigMap edit) with the exact YAML
+> line, what the operator is accepting by writing it, and what is NOT relaxed by it. Step 3 gains
+> the posture line; step 8's expected terminal on kind becomes `PUBLISHED` under a declaration —
+> *reporting* `read_scope_verified: false`, which is the correct reading of what happened rather
+> than a caveat about it.
+>
+> **WHERE THE "PRODUCTION MUST NEVER SET IT" GUARDRAIL ACTUALLY LIVES, stated rather than implied:**
+> runbook step 5, `.env.example`, `20-backend.yaml`, `25-worker.yaml`, `41-spark-thrift.yaml` and
+> `up.sh` all say it at the line an operator would edit; the smoke script prints it back at them.
+> The one STRUCTURAL protection is increment 1's placement decision — it is not a member of the
+> all-eight-or-none block, so no deployment is ever forced to state a value, and a production
+> ConfigMap that never mentions it is already correct. **There is deliberately no code check that a
+> deployment "is production"**, because this codebase has no such fact: inventing one (a hostname
+> pattern, an environment-id prefix) would be a guard that is wrong in exactly the deployments
+> nobody anticipated, and it would replace an operator's explicit statement with the platform's
+> inference — the thing increment 1's whole argument refuses.
+>
+> **FOUR PLAN FRAMINGS CORRECTED, each verified against what it claimed before it was touched.** The
+> GRANT subsection's *"§0.5 item 7 is closable only if L1's read-scope question is satisfied some
+> other way, which is a governance decision this plan does not take"* → the decision was taken;
+> §6.6b's *"E2's third blocker is not closable on kind"* and *"L1 does not pass against the sandbox
+> endpoint"* → superseded in their last claim only; §6.6b's *"`can_read` is unanswerable on kind, by
+> design rather than by omission"* → still unanswerable, no longer fatal; and E2 step 8's *"what now
+> stops a run on kind"* → now the operator's to lift. **Everything those passages say about the
+> ENGINE is unchanged and was re-verified rather than re-asserted**: Spark still rejects `SHOW GRANT`
+> by grammar, the swap still needs Spark-only `parquet.`<path>`` syntax, no single engine here has
+> both, and `can_read` still raises. Nothing was deleted; each correction is a dated nested note
+> beside the claim it supersedes, which is this plan's own convention.
+>
+> Files: `scripts/thrift_smoke.py` (+ 4 new tests), `deploy/kind/sandbox/41-spark-thrift.yaml`,
+> `deploy/kind/sandbox/up.sh`, this plan.
+> Gates: full suite **11416 passed, 20 skipped** (11408/20 after increment 2 — the 8 new
+> `test_thrift_smoke.py` rows: three plain cases plus the five-value truthy-set parametrization,
+> and nothing else moved); `-m eval` **73 passed**; ruff clean on both touched
+> Python files; `yaml.safe_load_all` on the manifest and `bash -n` on `up.sh`.
 
 ---
 

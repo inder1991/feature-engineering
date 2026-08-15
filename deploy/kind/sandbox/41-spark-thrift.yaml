@@ -70,9 +70,20 @@
 # THE CONSEQUENCE FOR L1, which is a real posture and not a gap: `can_read` asks
 # `SHOW GRANT ROLE … ON TABLE …`, this endpoint refuses the question, and the adapter raises
 # `MetastoreReadScopeUnanswerable` — by design, because `True` ("everything is readable") and
-# `False` (a denial nobody issued) are both lies. **So L1 cannot pass against this sandbox
-# endpoint.** That is not closed by any manifest; it needs an engine with an authorization model.
-# Recorded in the plan's §6.6 SUCCESSOR 3 block rather than left to be discovered on the cluster.
+# `False` (a denial nobody issued) are both lies. That is not closed by any manifest; it needs an
+# engine with an authorization model. Recorded in the plan's §6.6 SUCCESSOR 3 block rather than
+# left to be discovered on the cluster.
+#
+# **AND SINCE THE USER'S DECISION OF 2026-08-15 (§6.6d) IT IS NO LONGER A DEAD END.** The adapter's
+# behaviour here is unchanged — it still raises, whatever anyone configured — but a deployment may
+# now DECLARE that its engine has no authorization model, and under that declaration L1 accepts
+# this one unanswerable question instead of failing the run: set
+# `FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL: "1"` in `backend-config` (documented in
+# full in `deploy/kind/k8s/20-backend.yaml`). Every accepted table is then recorded as a
+# `READ_SCOPE_UNVERIFIED` warning on that run's own L1 report, and
+# `GET /materialization-runs/{id}` says so in plain language. **A real deployment must never set
+# it**, which is why it is not a member of the eight-variable execution block: unset is the strict
+# posture, and unset is what a ConfigMap that never mentions it already is.
 #
 # AUTHENTICATION is a different axis, and Spark's thrift server does support it — the forked Hive
 # service layer inside `spark-hive-thriftserver` ships `HiveAuthFactory` with LDAP, CUSTOM, PAM and

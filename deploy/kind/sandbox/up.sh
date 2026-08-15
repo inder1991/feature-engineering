@@ -118,6 +118,7 @@ host; it authenticates nobody).
       FEATUREGEN_MATERIALIZE_METASTORE_PORT=10000 \
       FEATUREGEN_MATERIALIZE_METASTORE_AUTH=NONE \
       FEATUREGEN_MATERIALIZE_METASTORE_PRINCIPAL=featuregen \
+      FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL=1 \
       python /tmp/thrift_smoke.py --schema sandbox_feature --table smoke \
         --roles featuregen --confirm-endpoint spark-thrift:10000
 
@@ -126,4 +127,13 @@ host; it authenticates nobody).
   production code path. EXPECT L1's third question to report READ SCOPE UNANSWERABLE: this endpoint
   is Spark, and Spark rejects `SHOW GRANT` by grammar. That is the designed answer, not a fault —
   see the manifest header and the plan's §6.6b.
+
+  THE LAST VARIABLE ABOVE IS A DECLARATION, NOT A SETTING, and the script prints it back at you
+  before it asks anything. It says: this deployment has no authorization model, so accept an
+  unverified read scope. With it, a RUN gets past L1 and records a READ_SCOPE_UNVERIFIED warning per
+  table on its own validation report (visible in plain language at GET /materialization-runs/{id}
+  and on the run screen); without it, a run against this endpoint still fails closed at L1. Drop it
+  from the line above to see the strict posture. **Never set it on a real deployment** — it belongs
+  to a sandbox whose engine cannot answer, and to nothing else. The user's decision of 2026-08-15;
+  see plan §6.6d and deploy/kind/k8s/20-backend.yaml for the full block.
 EOF

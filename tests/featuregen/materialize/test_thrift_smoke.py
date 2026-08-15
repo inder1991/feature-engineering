@@ -183,6 +183,52 @@ def test_SPARKS_UNANSWERABLE_READ_SCOPE_IS_EXIT_ZERO_because_it_is_an_ANSWER(cap
     assert connection.opened_for[0].host == "spark-thrift"
 
 
+def test_the_DECLARED_posture_is_printed_LOUDLY_at_first_contact(capsys) -> None:
+    """SUCCESSOR 5: the setting that decides whether an unanswerable read scope stops a run must be
+    visible on the screen where that outcome is first seen. An operator who reads
+    "READ SCOPE UNANSWERABLE" without knowing the posture cannot predict what a run will do."""
+    connect, _connection = _connect_factory()
+
+    code = smoke.main(_ARGV, {**_ENV, smoke._DECLARE_NO_AUTHORIZATION_MODEL_ENV: "1"}, connect)
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "DECLARES IT HAS NO AUTHORIZATION MODEL" in out
+    assert "NEVER set it on a real deployment" in out
+    assert "READ_SCOPE_UNVERIFIED" in out
+
+
+def test_the_STRICT_posture_is_printed_TOO_so_the_line_is_never_ambiguous(capsys) -> None:
+    """Printed in BOTH states. A line that appeared only when the declaration was set would leave
+    "not declared" and "this script does not know about the setting" looking identical."""
+    connect, _connection = _connect_factory()
+
+    code = smoke.main(_ARGV, _ENV, connect)
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "is not set (the strict posture)" in out
+    assert "FAILS a run closed" in out
+    assert "DECLARES IT HAS NO AUTHORIZATION MODEL" not in out
+
+
+@pytest.mark.parametrize("stated", ["0", "", "false", "off", "maybe"])
+def test_only_the_LANES_OWN_truthy_set_reads_as_declared(stated: str) -> None:
+    """The same truthy set the lane uses, and the same safe side of every ambiguity — proved
+    against the script's own line rather than against a copy of the rule."""
+    line = smoke._declaration_line({**_ENV, smoke._DECLARE_NO_AUTHORIZATION_MODEL_ENV: stated})
+    assert "is not set (the strict posture)" in line
+
+
+def test_the_declaration_is_read_through_the_LANES_OWN_variable_name() -> None:
+    """A literal spelled in the script would be a second source of truth for the one setting whose
+    whole risk is being set somewhere nobody looked."""
+    from featuregen.materialize import queue_lane
+
+    assert smoke._DECLARE_NO_AUTHORIZATION_MODEL_ENV is \
+        queue_lane._DECLARE_NO_AUTHORIZATION_MODEL_ENV
+
+
 def test_an_UNREACHABLE_endpoint_is_exit_THREE(capsys) -> None:
     """The outcome that genuinely means *this endpoint is not usable yet*."""
     def connect(_endpoint):
