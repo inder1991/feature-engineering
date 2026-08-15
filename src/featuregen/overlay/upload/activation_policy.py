@@ -64,6 +64,9 @@ class FrozenOptionFactsV1:
     formula_expectation_revision: str = ""
     snapshot_id: str = ""
     plan_refusal_codes: tuple[str, ...] = ()   # WHY no plan folded (B7/B10 refusals)
+    readiness_blockers: tuple[str, ...] = ()   # the serving fold's measured blockers (C3):
+    #                                            temporal/binding/policy facts the durable write
+    #                                            cannot re-measure — carried into the re-fold
     confirmed_uoa_entity: str = ""              # the UOA the human had confirmed at serving
     read_set: tuple[str, ...] = ()              # the frozen plan's bound refs (C2 floor input)
     plan_catalog_source: str = ""

@@ -60,12 +60,14 @@ _EVENT_TYPES = ("ASSESSED", "EXTERNAL_PASSED", "EXTERNAL_FAILED", "INVALIDATED",
 # --------------------------------------------------------------------------------------------------
 def _fold_effective_state(
     events: Sequence[Mapping], blocking_req_ids: frozenset[str], *, contract_id: str
-) -> tuple[str, str, bool]:
+) -> tuple[str, str, bool, frozenset[str]]:
     """Fold a contract's validation events (ascending ``seq``) into ``(validation_status,
-    effective_verification, superseded)``. The LATEST-seq event governs (a later INVALIDATED demotes
-    a prior DATA-CHECKED); ``blocking_req_ids`` is the set of the contract's blocking requirements
-    (from ``feature_validation_requirement``), the requirements the DATA-CHECKED promotion depends
-    on.
+    effective_verification, superseded, passed_requirement_ids)``. The LATEST-seq event governs (a
+    later INVALIDATED demotes a prior DATA-CHECKED); ``blocking_req_ids`` is the set of the
+    contract's blocking requirements (from ``feature_validation_requirement``), the requirements
+    the DATA-CHECKED promotion depends on. The passed set is the fold's OWN working state, returned
+    (C3) so a per-requirement read shares this one implementation of its transition rules — a
+    second walk would be a second opinion about the same events.
 
     MF-4: SUPERSEDED is TERMINAL. Once a newer contract version has retired this one, the fold
     freezes the row as history — ``superseded`` is set True, the effective stamp is demoted to
@@ -146,12 +148,30 @@ def _fold_effective_state(
             # reachable via a raw/corrupt row — treat as poison.
             raise ProjectionApplyError(AGGREGATE, contract_id, f"unknown event_type {etype!r}")
 
-    return status, verification, superseded
+    return status, verification, superseded, frozenset(passed)
 
 
 # --------------------------------------------------------------------------------------------------
 # Reads over the dedicated stream + supporting tables.
 # --------------------------------------------------------------------------------------------------
+def passed_requirement_codes(conn: DbConn, contract_id: str) -> frozenset[str]:
+    """C3 — the requirement CODES with a current external pass on this contract, by the fold's
+    own rules (epoch reset on ASSESSED, discard on EXTERNAL_FAILED, cleared on INVALIDATED,
+    frozen after SUPERSEDED). Activation's ``requirements_closed`` asks this; the answer walks
+    the same prefix the projection state was folded from, through the same function."""
+    events = _event_prefix(conn, contract_id, _head_seq(conn))
+    blocking = _blocking_requirement_ids(conn, contract_id)
+    _status, _verification, _superseded, passed = _fold_effective_state(
+        events, blocking, contract_id=contract_id)
+    if not passed:
+        return frozenset()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT code FROM feature_validation_requirement "
+            "WHERE contract_id = %s AND requirement_id = ANY(%s)",
+            (contract_id, list(passed)))
+        return frozenset(row[0] for row in cur.fetchall())
+
 def _blocking_requirement_ids(conn: DbConn, contract_id: str) -> frozenset[str]:
     with conn.cursor() as cur:
         cur.execute(
@@ -238,7 +258,7 @@ def apply_event(conn: DbConn, event_row: Mapping) -> bool:
 
     events = _event_prefix(conn, contract_id, seq)
     blocking = _blocking_requirement_ids(conn, contract_id)
-    status, verification, superseded = _fold_effective_state(
+    status, verification, superseded, _passed = _fold_effective_state(
         events, blocking, contract_id=contract_id)
 
     conn.execute(

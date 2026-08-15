@@ -1621,6 +1621,55 @@ replacing the hardwired `False` (`:364`).
   execution floor returns `activation_decision(..., "execute_materialization").allowed is True`.
   **This is the §0.5 item 3 bar.**
 
+> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline (same context as C1/C2). **THE
+> MILESTONE PASSES**: `test_all_four_materialization_codes_can_clear_together` ends in
+> `activation_decision(..., "execute_materialization").allowed is True` with an EMPTY blocker
+> list — the §0.5 item 3 bar, over a real frozen row.
+>
+> **The re-fold, and what it carries.** `effective_readiness` is `fold_readiness` re-run at the
+> durable write (BR-7's one fold — never a second opinion): the review fact and the engine
+> verdict are re-read NOW (an un-review DEMOTES a frozen `MATERIALIZATION_READY` to
+> `FORMULA_BLOCKED`; C2's advertisement promotes), while the serving fold's measured
+> temporal/binding/policy blockers CARRY VERBATIM on a new frozen fact
+> (`FrozenOptionFactsV1.readiness_blockers`, riding the story jsonb like its B10 neighbours —
+> nothing at the durable write can re-measure a binder verdict; drift in what they measured
+> surfaces through the pins and snapshot checks). The fold's own vocabulary is stripped from the
+> carried codes first — it re-derives those, and carrying them would double-count a fact the
+> re-read may have changed. Non-recipe sources keep the frozen readiness: no fold owns them.
+>
+> **TWO PLAN CORRECTIONS, both structural:**
+> 1. **`requirements_closed` cannot be a pure option-row read.** The validation store is
+>    CONTRACT-keyed (`feature_validation_requirement` + the 1009 event stream) and
+>    `semantic_option_decision` carries NO contract identity — no column, no FK, nowhere. The
+>    read therefore rides an explicit `contract_id` parameter on
+>    `assemble_current_activation_state` (None → False, fail closed: nothing recorded is not
+>    nothing owed). The passed set comes from the projection's OWN fold —
+>    `_fold_effective_state` now returns it (4th element, one call site updated) and
+>    `passed_requirement_codes` maps ids→codes through the same walk; a second implementation
+>    of the epoch/discard/invalidate rules was the alternative and was rejected.
+> 2. **`gold_validated` has NO recorded source anywhere.** The provider half never ran (A3's
+>    billing deferral) and no store records a gold-evaluation outcome; the fold input is served
+>    by `_gold_evaluation_recorded` — honestly `False` for every recipe, a NAMED absence with a
+>    docstring, not a hardwired verdict. The milestone seeds it there (the plan pre-authorized
+>    seeding); the honest production ceiling today is `FORMULA_AUTHORABLE`, and a test pins
+>    exactly that.
+>
+> **What the milestone seeds vs. what is real.** REAL: the frozen row through the real writers;
+> review events from all three required roles at the frozen revision (the BR-23 fold, no
+> patching); the execution/authoring floors via seeded `field_evidence` read through the REAL
+> resolver pins (`human/confirmed` clears both matrix columns); the C1/C2 engine verdict; the
+> activation fold itself. SEEDED, each named: the gold hook (above) and snapshot freshness
+> (contract-rung scaffolding — snapshot minting rides the generation pipeline).
+>
+> **Mutant proof:** restoring the pre-C3 passthrough (`effective_readiness=frozen.readiness`)
+> fails 3 of the 5 new tests; the requirements walk (none→half→all→empty) discriminates a
+> hardwired boolean in either direction by construction. 5 cases in
+> `tests/featuregen/overlay/upload/test_activation_refold.py`.
+> Gates: full suite **11146 passed, 20 skipped** (11141/20 after C2); `-m eval` **73 passed**; ruff clean on the four touched
+> files; the 2 mypy errors in `activation_policy.py`/`feature_validation_projection.py` are
+> pre-existing (measured on HEAD copies by swap — the projection's is HEAD's `:188` shifted) —
+> none added.
+
 ---
 
 ## 5. Phase D — G-2 and G-3: the chain reaches a published table *(weld 3)*

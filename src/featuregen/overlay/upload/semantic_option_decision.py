@@ -119,6 +119,11 @@ def decision_facts_for_candidate(candidate, idea, observation_id: str | None,
             "output_grain": request.output_grain,
             "confirmed_uoa_entity": uoa_entity,
             "confirmed_spine_ref": spine_ref,
+            # C3: the serving fold's measured blockers (temporal/binding/policy). The durable
+            # write cannot re-measure them — no context, no binder there — so the re-fold
+            # carries them verbatim; drift in what they measured surfaces through the pins
+            # and snapshot checks instead. Rides the story jsonb like its neighbours.
+            "readiness_blockers": list(candidate.readiness_blockers),
             # C2: the bound operands' MEASURED authorities at serving — what the execution
             # floor re-checks against current resolutions at the durable write.
             "operand_authorities": {binding.ref[1]: binding.authority
@@ -352,6 +357,7 @@ def load_frozen_option_facts(conn, *, considered_revision_id: str,
         formula_expectation_revision=formula_revision,
         snapshot_id=snapshot_id or "",
         plan_refusal_codes=tuple((story or {}).get("plan_refusals") or ()),
+        readiness_blockers=tuple((story or {}).get("readiness_blockers") or ()),
         confirmed_uoa_entity=(story or {}).get("confirmed_uoa_entity") or "",
         read_set=tuple(plan.get("read_set") or ()),
         plan_catalog_source=plan.get("catalog_source") or "",
@@ -417,15 +423,55 @@ def _formula_schema_supported(recipe_id: str) -> bool:
         return False
 
 
+def _gold_evaluation_recorded(recipe_id: str) -> bool:
+    """C3 — has a gold + provider evaluation PASSED for this recipe's reviewed expectation?
+
+    Honestly ``False`` for every recipe today: the provider half has never run (Anthropic
+    billing is exhausted — A3's acceptance row records the deferral) and NO store records a
+    gold-evaluation outcome anywhere in the platform. This is a named absence, not a hardwired
+    verdict: the day a gold gate writes results, this function becomes the read of that store,
+    and the milestone test seeds it here — which is what makes ``MATERIALIZATION_READY``
+    reachable in a test without a single dishonest production default."""
+    return False
+
+
+def _requirements_closed(conn, contract_id: str | None,
+                         codes: tuple[str, ...]) -> bool:
+    """C3 — every frozen outstanding requirement code has a recorded CURRENT pass.
+
+    The validation store is CONTRACT-keyed (``feature_validation_requirement`` +
+    the 1009 event stream) and an option row carries no contract identity — the plan's
+    "a real read over the option" needed the caller to say WHICH contract, so the read rides
+    an explicit ``contract_id``. No codes → closed (nothing outstanding). No contract →
+    ``False``, fail closed: nothing recorded is not the same as nothing owed."""
+    if not codes:
+        return True
+    if not contract_id:
+        return False
+    try:
+        from featuregen.overlay.upload.feature_validation_projection import (
+            passed_requirement_codes,
+        )
+
+        return set(codes) <= set(passed_requirement_codes(conn, contract_id))
+    except Exception:                         # unreadable store → not closed, fail closed
+        return False
+
+
 def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                                       snapshot_id: str | None,
-                                      intent_id: str | None = None):
+                                      intent_id: str | None = None,
+                                      contract_id: str | None = None):
     """The activation policy's CURRENT layer — the small re-read at the durable write.
 
     Everything here fails toward blocking (the same posture as the dataclass defaults):
     a review that cannot be re-verified is not current; an absent snapshot is unverifiable;
     a policy hash that moved since generation is drift. NOTHING here re-binds or substitutes —
-    divergence surfaces as a typed regenerate blocker in the fold."""
+    divergence surfaces as a typed regenerate blocker in the fold.
+
+    ``contract_id`` is the governed contract this option minted, when one exists — the key
+    ``requirements_closed`` reads the validation store under (C3). ``None`` is honest for an
+    option that never reached a contract, and fails that one read closed."""
     from featuregen.overlay.upload.activation_policy import CurrentActivationStateV1
     from featuregen.overlay.upload.semantic_eligibility import authority_matrix_hash
 
@@ -510,24 +556,59 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
     else:
         uoa_now = frozen_uoa is None
 
+    # C2 — a real read: the reviewed expectation's demands against the selected engine's
+    # advertisement. Only a recipe has a reviewed expectation to ask about; every other
+    # source keeps the fail-closed default.
+    is_recipe = frozen.generation_source == "recipe" and bool(frozen.source_definition_id)
+    formula_supported = (_formula_schema_supported(frozen.source_definition_id)
+                         if is_recipe else False)
+
+    # C3 — effective readiness is a RE-FOLD at the durable write, not an inheritance. The
+    # serving fold's measured blockers (temporal/binding/policy — nothing here can re-measure
+    # them) carry verbatim; the review fact and the engine verdict are re-read NOW, so an
+    # un-review demotes and an advertised engine promotes, through the one fold (BR-7).
+    # The fold's own vocabulary is stripped from the carried codes first — it re-derives those
+    # itself, and carrying them would double-count a fact the re-read may have changed.
+    effective = frozen.readiness
+    if is_recipe:
+        try:
+            from featuregen.overlay.upload.recipe_readiness import (
+                BLOCKER_ENGINE_UNSUPPORTED,
+                BLOCKER_GOLD_UNPROVEN,
+                BLOCKER_GRAMMAR_UNSUPPORTED,
+                BLOCKER_NO_REVIEWED_EXPECTATION,
+                ReadinessInputsV1,
+                fold_readiness,
+            )
+
+            fold_owned = {BLOCKER_NO_REVIEWED_EXPECTATION, BLOCKER_GRAMMAR_UNSUPPORTED,
+                          BLOCKER_GOLD_UNPROVEN, BLOCKER_ENGINE_UNSUPPORTED,
+                          "model_feature_spec_owns_readiness"}
+            effective = fold_readiness(ReadinessInputsV1(
+                computation_kind=frozen.computation_kind,
+                governed_policy_blockers=tuple(
+                    code for code in frozen.readiness_blockers if code not in fold_owned),
+                reviewed_expectation=has_reviewed_formula_expectation(
+                    frozen.source_definition_id),
+                grammar_verdict="ok",
+                gold_validated=_gold_evaluation_recorded(frozen.source_definition_id),
+                engine_verdict="ok" if formula_supported else "unsupported_engine",
+            )).state
+        except Exception:                     # unfoldable → the frozen truth, never a promotion
+            effective = frozen.readiness
+
     return CurrentActivationStateV1(
         review_current=review_now,
         policy_revisions_current=pins_current,
         uoa_current=uoa_now,
         snapshot_freshness=freshness,
-        # Effective readiness is the FROZEN readiness until a re-fold exists (C-phase): honest,
-        # and materialization stays blocked regardless (readiness != MATERIALIZATION_READY for
-        # every recipe today, schema unsupported, execution authority unevaluated).
-        effective_readiness=frozen.readiness,
+        effective_readiness=effective,
         formula_expectation_revision=frozen.formula_expectation_revision,
-        # C2 — a real read: the reviewed expectation's demands against the selected engine's
-        # advertisement. Only a recipe has a reviewed expectation to ask about; every other
-        # source keeps the fail-closed default.
-        formula_schema_supported=(
-            _formula_schema_supported(frozen.source_definition_id)
-            if frozen.generation_source == "recipe" and frozen.source_definition_id
-            else False),
-        requirements_closed=False,
+        formula_schema_supported=formula_supported,
+        # C3 — a real read over the validation store, keyed by the governed contract the
+        # caller names; no contract or no recorded pass fails closed.
+        requirements_closed=_requirements_closed(
+            conn, contract_id, frozen.outstanding_requirement_codes),
         execution_authority_evaluated=execution_evaluated,
         execution_floor_met=execution_now,
         authoring_floor_met=authoring_now)
