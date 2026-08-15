@@ -194,7 +194,7 @@ silently changing meaning); `test_an_invalid_id_fails_at_the_schema_layer`;
 `test_technical_failure_is_not_a_provider_status`; **[R4]** a test that the DISPATCHED request
 carries the v2 contract, and one that the same user text hashes differently under v1 and v2.
 
-> **TASK 1 (2026-08-15) — ACCEPTED `PENDING`.** `("use_case_recognition", 2)` is registered from
+> **TASK 1 (2026-08-15) — ACCEPTED `a8ac1b8c`.** `("use_case_recognition", 2)` is registered from
 > **committed bytes** — `src/featuregen/overlay/upload/taxonomy/use_case_recognition_v2.schema.json`
 > (5 624 bytes, 88 ids), generated once by
 > `python -m featuregen.overlay.upload.taxonomy.recognition_schema`, reviewed as a diff, and pinned
