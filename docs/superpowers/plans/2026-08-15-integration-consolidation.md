@@ -1,6 +1,38 @@
 # Integration consolidation — one plan for every open finding
 
-**Date:** 2026-08-15
+**Date:** 2026-08-15 · **Revision 2** — restructured around the product owner's direction of
+2026-08-15, whose release ordering and success criterion this plan now adopts verbatim.
+
+**The whole goal, in one line:**
+
+> When you choose a feature, the system must build **that exact feature** on Hadoop and show you the
+> result.
+
+**The first success, stated concretely enough to be unarguable:**
+
+> You select `balance_slope_90d`, click **Build in sandbox**, Kedro runs on Hadoop, Hive gets exactly
+> `balance_slope_90d`, and the UI shows its output profile.
+
+## 0.0 What the owner's direction changed in this plan **[R2]**
+
+Two additions are better than what revision 1 had, and both are adopted:
+
+1. **A frontend↔backend contract test (Release 0).** Revision 1 fixed the dead `/features/recipe`
+   call as a one-off (C2). It did not fix the *class*: frontend tests mock a success that the backend
+   permanently refuses, so any future retirement re-creates the bug invisibly. A test that checks the
+   real client's calls against the real server's routes turns that into an automatic failure. **This
+   is now R0-2 and runs before everything else.**
+2. **Build formulas only for SELECTED features.** Revision 1 fixed the leading-variant divergence by
+   reconciling keys at the route (A2). The owner's fix is better and cheaper: stop speculatively
+   capturing a formula per recipe at generation, and capture the exact parameterization *after* the
+   human selects it. That removes the divergence **at the source** rather than detecting it at the
+   boundary — there is no leading variant to diverge from. Reconciliation stays as the belt-and-braces
+   check. **This is now R1-2.**
+
+Two scope changes follow: **output profiling moves INTO this plan** (owner's step 9) where revision 1
+had deferred it, and **leakage strengthening moves BEFORE the first Hadoop run** (owner's step 7),
+because a first real run that quietly uses a leaky column teaches the wrong lesson.
+
 **Supersedes:** `2026-08-15-recognition-seam-review-remediation.md` (`a6c7cd77`) — its seven tasks are
 absorbed below as **D1–D3, C4, A1, A3, H1**. That plan fixed one seam; these findings say the seams
 do not join up, and fixing them separately would sequence the work wrongly.
@@ -64,139 +96,108 @@ worker-tick contention, the publication consistency window, and the post-publica
 > with the run's provenance naming the precise option that was approved — and no claim on any screen
 > outruns what was actually checked.
 
-## 1. Part A — stop the bleeding
+## 1. Releases
 
-### A1 — the build is green under the project's own scripts (½ day)
-Three fixtures gain `recognition_quality: null` / `ambiguity_note: null`; extract one typed fixture
-factory. **Every frontend gate in every plan and brief now names `npm run typecheck`, `npm test`,
-`npx oxlint`** — `tsc --noEmit` is banned as a gate, having twice reported green over a red build.
+Structure and order are the owner's. Every finding from both reviews is mapped to a release; nothing
+is dropped, and where a finding is deliberately deferred it says so.
 
-### A2 — an approved option can only execute its own formula (3 days) — **release blocker**
-The narrow fix, ahead of Part B's full identity: **the route reconciles the governed option key with
-the submitted work items and refuses a mismatch**, and the authoring intent's name carries the
-variant, not the bare `recipe_id`. Where a work item exists only for the leading variant, the
-non-leading option is **refused by name** — never silently executed at another parameterization.
+### Release 0 — the codebase is healthy (1 day)
+- **R0-1 — the build is green.** *(DONE `5feebf09`: three `RecognitionResp` fixtures now come from
+  one typed factory defaulting `recognition_quality` to `null` — the honest legacy state.)*
+  **`tsc --noEmit` is banned as a gate**; every plan and brief names `npm run typecheck`, `npm test`,
+  `npx oxlint`, run from `frontend/`. It reported green over a red build twice.
+- **R0-2 — a frontend↔backend contract test.** The real client's routes are checked against the real
+  server's, so a call to a retired endpoint fails automatically. Today `api.ts:2083` POSTs
+  `/features/recipe`, which `_refuse_bypass` refuses unconditionally, and the frontend tests mock a
+  success — this test is what makes that class impossible.
+- **R0-3 — ruff clean.** 79 repo-wide, 35 under `src/`.
 
-*Acceptance:* approving "Balance slope — 180 days" and submitting the 90-day work item **refuses**;
-a matched pair proceeds; a run's recorded option and its executed formula are asserted equal.
+### Release 1 — an approved feature is bound to its exact formula (7 days) — **migration**
+- **R1-1 — `ExecutableFeatureRevision`.** Considered revision + option id, **exact parameter
+  binding**, contract id/version, formula content hash, physical-plan hash, canonical output name,
+  work-item id. Verified before execution.
+- **R1-2 — formulas are built only for SELECTED features** *(the owner's fix, adopted over revision
+  1's)*. Generate ideas → human selects → author formulas for the selection → verify → prepare.
+  Speculative per-recipe capture at its "leading variant" is what allows an approved 90-day option to
+  execute a 30-day formula; removing the speculation removes the divergence at source, and is cheaper.
+- **R1-3 — canonical parameterized identity.** `balance_slope_30d` / `_90d` / `_180d` in identity and
+  display name. Today **940 variants share 317 labels; 918 collide across 295 labels.**
+- **R1-4 — materialization accepts a revision, not raw work-item ids**, with key reconciliation kept
+  as belt-and-braces.
+- **R1-5 — recognition partial recovery** (schema v3: membership semantic, not enum; drop invalids
+  before applying caps). Reasoning in the superseded plan's §0.2.
 
-### A3 — recognition partial recovery actually works (2½ days) — **schema v3**
-Membership moves out of the wire schema into the semantic validator (still driving repair via Task
-2's arm); `partition_candidates` drops candidate-local invalids **before** applying aggregate caps.
-Two genuinely valid primaries still refuse. Full reasoning in the superseded plan's §0.2.
+### Release 2 — the user runs it from the UI (6 days)
+- **R2-1 — "Build in sandbox"** after governance, with staged progress: preparing formula → compiling
+  → generating Kedro project → validating → running on Hadoop → checking output → publishing sandbox
+  table → creating profile. Linked to the exact candidates.
+- **R2-2 — "Write definitions" reimplemented** through the semantic planner; the dead call removed.
+- **R2-3 — publication capability earnable**: a supported path that runs the probe and stores the
+  attestation. Today the refusal is correct and undischargeable.
+- **R2-4 — no stranded requests**: `configuration failed / waiting for retry / cancelled / running /
+  failed / published`, and the same logical request is retryable after a fix.
 
-*Acceptance:* the verbatim incident body, repair exhausted → `CLASSIFIED` on churn with one drop
-recorded — replacing the test that currently asserts the opposite.
+### Release 3 — sandbox exploration, production promotion (6 days)
+- **R3-1 — an execution tier on the job.** SANDBOX/PRODUCTION exists internally; the HTTP surface
+  exposes none and compilation defaults to production.
+- **R3-2 — AI-proposed metadata runs in sandbox**, with the provenance shown as the owner wrote it:
+  *"This feature uses an AI-proposed customer identifier mapping. Evidence: matching names, types and
+  data overlap. Human confirmation: not recorded."* Production keeps the stronger gates.
+- **R3-3 — a promotion path for LLM ideas.** `conceptual_pattern` is refused by the policy whose own
+  message names the formula seam as its promoter — a closed loop.
 
-## 2. Part B — one executable identity
+### Release 4 — the selection is checked as a group (2 days)
+Grain, cadence, duplicate output names, access restrictions, point-in-time rules, join safety,
+population source — **before** anything runs, with grouping recommended rather than refused
+("Group 1: customer daily; Group 2: customer monthly; Group 3: account daily"). Closes the missing
+set-level re-check the UI already admits to at `WorkbenchScreen.tsx:2435`.
 
-The concept whose absence produces A2, the variant collisions and the missing set validation.
+### Release 5 — features over more than one table (8 days)
+- **R5-1 — one-hop governed joins reach the planner**: find the relationship, check uniqueness,
+  determine fan-out, choose the population, freeze the join in the plan, **refuse when fan-out safety
+  is unknown**. Today `fold_frozen_binding_plan` refuses `cross_dataset` outright and the module never
+  consults a governed join, so governing a relationship changes nothing. Chains come later.
+- **R5-2 — cross-catalog via the bridge**, recording which bridge, which columns, cardinality,
+  evidence, whether a human confirmed, and sandbox- vs production-safety. This is what the
+  **verified-but-unrealized `cust_num` ↔ `cif_id` bridge** needs, and what most of the 787
+  missing-operand candidates are waiting on.
 
-### B1 — `ExecutableFeatureRevision` (4 days) — **migration**
-Durable, carrying: considered revision + option id, **exact parameter binding**, governed contract
-id/version, formula content hash, physical-plan hash, canonical output name, formula work-item id.
+### Release 6 — leakage detection worth the claim (5 days)
+Target-derived columns, post-cutoff information, post-outcome events, target-defining status flags,
+availability at prediction time. **Deterministic rules decide; the LLM only warns.** Until they exist
+the UI's "structurally safe against leakage" is narrowed **immediately** — today the only hard check
+is `selected_ref == target_ref`.
 
-### B2 — canonical parameterized identity (2 days)
-`balance_slope_30d` / `_90d` / `_180d`. The parameter binding enters the identity **and** the display
-name. 918 variants currently share 317 labels; after this, none do.
+### Release 7 — Hadoop execution is reliable (7 days)
+- **R7-1 — the worker reads Hive**, not the browser: table existence, real columns, partitions,
+  published generation, supported publication mechanism. `published_schema` stops being a caller
+  assertion about cluster state.
+- **R7-2 — a dedicated materialization worker.** Compilation, Kedro and Hadoop execution leave the
+  tick shared with relay, timers, projections and ingestion.
+- **R7-3 — publication consistency** across the control-plane row and the metastore swap
+  (intent/apply/confirm, or reconciliation).
+- **R7-4 — identity and durability debts**: canonical-vs-registry schema digest compared at dispatch;
+  closed vocabularies enforced where documented; single-flight idempotency; the paid gate committed
+  before spend and capped during it.
 
-### B3 — materialization accepts a revision, not raw work-item ids (2 days)
-The A2 reconciliation becomes structural: there is nothing to mismatch.
+### Release 8 — the first real feature (operator)
+`balance_slope_90d` end to end. **Requires explicit go** — cluster spend, and the inventory capture
+that is still unstarted.
 
-### B4 — set-level validation before governance (2 days)
-Duplicate output names, incompatible grain/cadence, conflicting join assumptions, features that
-cannot publish together — checked at the set, not discovered by materialization. Closes the
-`:2435` follow-up the UI already admits to.
+### Release 9 — output profiling (3 days)
+Row count, null %, min/max/mean/median, duplicate key count, last refreshed. **Summaries only —
+customer-level data never leaves Hadoop.**
 
-## 3. Part C — the journey completes
+### Release 10 — is the feature actually useful (deferred, charter later)
+LightGBM/AUROC over single features and sets, feeding back into ranking. `model_input` is deferred at
+`render/project.py:113` and stays deferred until Releases 0–9 hold.
 
-- **C1 — the UI starts and follows a run (3 days).** A create function, a "Build in sandbox" action
-  after governance, and queued → compiling → validating → running → published/refused in the
-  workspace, linked to the exact candidates. *(Deployment enablement stays an operator act.)*
-- **C2 — "Write definitions" through the semantic pipeline (3 days).** Reimplemented against the real
-  planner; the dead `/features/recipe` call removed. **Frontend tests must stop mocking success on a
-  permanently-409 endpoint** — that mock is why this survived.
-- **C3 — publication capability is earnable (1½ days).** A supported operator path that runs the
-  probe and stores the attestation. Today the refusal is correct and undischargeable.
-- **C4 — stranded requests reach a terminal (1 day).** The `requested → failed` edge with the
-  reconciler as its only writer (previously recorded as A.35 and deferred to the surface).
-
-## 4. Part D — claims match reality
-
-- **D1 — recorded identity is the executed contract (1½ days).** Immutable registration for
-  `use_case_recognition`; dispatch compares resolved and canonical digests and refuses a mismatch;
-  the evaluator verifies `schema_content_hash`; repair/retry policy versions enter request identity.
-- **D2 — the closed vocabulary is enforced (1 day)** at construction and persistence; corrupt legacy
-  data reads as `null` plus a diagnostic.
-- **D3 — one provider call per request under concurrency (1 day).** Advisory lock over
-  `(intent_id, request_hash)` + a second lookup before dispatch.
-- **D4 — leakage claims narrowed to what is checked (1 day).** The UI stops saying "structurally safe
-  against leakage" while only exact-reference equality is enforced. **Copy changes now; the stronger
-  checks are D6.**
-- **D5 — the worker reads the live schema (1 day).** `published_schema` stops being a caller
-  assertion about physical cluster state.
-- **D6 — real leakage checks (4 days).** Target-lineage closure, post-outcome stage checks,
-  availability-vs-cutoff, proxy warnings. LLM critic stays advisory.
-
-## 5. Part E — sandbox exploration vs production promotion
-
-Resolves the standing product direction: AI-proposed evidence should be explorable, with visible
-provenance, while promotion carries stronger gates.
-
-- **E1 — an execution tier on the materialization job (3 days).** SANDBOX vs PRODUCTION exists
-  internally; the HTTP surface exposes none and compilation defaults to production.
-- **E2 — a promotion path for LLM ideas (3 days).** Today `conceptual_pattern` is refused by the
-  policy whose own message names the formula seam as the promoter — a closed loop.
-
-## 6. Part F — reach
-
-- **F1 — governed joins reach the planner (4 days).** Multi-table within one catalog: consult the
-  governed join instead of refusing `cross_dataset` outright, so governing a relationship and
-  regenerating actually changes the answer.
-- **F2 — cross-catalog becomes reachable (4 days).** Including `BridgeExecutionAuthorization` through
-  the chain. **This is what the verified-but-unrealized customer bridge needs**, and what most of the
-  787 missing-operand candidates are waiting on.
-
-## 7. Part G — operability
-
-- **G1 — a dedicated materialization worker pool (2 days).** Compilation and L0 currently share a
-  single-threaded tick with relay, timers, projections and ingestion.
-- **G2 — publication consistency (3 days).** Intent/apply/confirm or reconciliation for the window
-  between the control-plane row and the metastore swap.
-
-## 8. Part H — release qualification
-
-- **H1 — the paid gate is durable and capped (2 days).** Commit before any provider call; resumable;
-  budgets checked *before* each recognition; `budget_exhausted` reported distinctly; rename any field
-  that is a threshold rather than a ceiling.
-- **H2 — qualify the release (operator).** Add the motivating churn case to a reviewed corpus, get
-  gold labels expert-reviewed, then run the 100-case gate. **Explicit approval required — real
-  spend.** Until then the honest status is *"repair-loop and observability implementation complete,
-  release qualification incomplete."*
-
-## 9. Explicitly NOT in this plan
-
-Output EDA/profile history, drift summaries, backtesting, the model tournament, model-input assembly
-and feature selection. `model_input` is deferred at `render/project.py:113` and stays deferred: none
-of it is worth building on a journey that cannot yet execute the feature that was approved.
-
-## 10. Sequencing
+## 2. Sequencing
 
 ```
-A1 ─► A2 ─► A3            (blockers; A1 first, it blocks all frontend work)
-        │
-        ▼
-B1 ─► B2 ─► B3 ─► B4      (one identity; B3 makes A2 structural)
-        │
-        ├─► C1 ─► C2 ─► C3 ─► C4      (the journey completes)
-        ├─► D1..D5 ─► D6              (claims match reality; D4 copy now, D6 later)
-        ├─► E1 ─► E2                  (sandbox vs production)
-        └─► F1 ─► F2                  (reach: multi-table, then cross-catalog)
-                        │
-                        ▼
-                  G1, G2 ─► H1 ─► H2 ⟨operator⟩
+R0 ─► R1 ─► R2 ─► R3 ─► R4 ─► R5 ─► R6 ─► R7 ─► R8 ⟨operator⟩ ─► R9 ─► R10 ⟨later⟩
 ```
 
-**≈ 55 focused days.** The first honest milestone is **A + B + C1**: one approved feature executes
-*its own* formula, started from the UI. That is the vertical slice the second review asks for, and
-nothing after it is safe to prioritise before it.
+**≈ 45 focused days to Release 7**, plus the operator's cluster work. The order is the owner's, with
+one note: **R6 (leakage) lands before R8 (the first real run)** deliberately — a first run that
+quietly uses a leaky column would teach exactly the wrong lesson about what the platform guarantees.
