@@ -700,7 +700,7 @@ runnable under the current code, and the engineering half of this task is mostly
 reasons why — see the acceptance below. The operator half (actually spending ~110-330 provider calls)
 is unstarted and needs explicit approval.
 
-> **TASK 6, ENGINEERING HALF (2026-08-15) — ACCEPTED `<pending>`.** The evaluator is
+> **TASK 6, ENGINEERING HALF (2026-08-15) — ACCEPTED `03d5d4a4`.** The evaluator is
 > `recognition-release-evaluator-v2`: it scores the **served, normalized result** the platform handed
 > its caller, re-derives that result from the immutable `llm_call` row rather than trusting the
 > attempt, refuses a run recorded under a contract it was not written for, and reports two new
