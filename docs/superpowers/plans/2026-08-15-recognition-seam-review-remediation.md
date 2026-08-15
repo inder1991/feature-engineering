@@ -1,5 +1,12 @@
 # Recognition seam — review remediation
 
+> **SUPERSEDED 2026-08-15 by `2026-08-15-integration-consolidation.md`.** A second review found
+> that the seams do not join up: an approved option can execute a different parameterization, the
+> UI cannot start materialization at all, and the second authoring path calls a permanently-409
+> endpoint. Fixing this seam alone would sequence the work wrongly. Every task here is absorbed
+> there (A1, A3, C4, D1–D3, H1); the reasoning below — especially §0.2's three-decision
+> composition — remains the record of WHY partial recovery was unreachable, and is not restated.
+
 **Date:** 2026-08-15 · **Successor to:** `2026-08-15-recognition-repair-seam.md` (Tasks 0–6, all
 landed, `73100d78`).
 
