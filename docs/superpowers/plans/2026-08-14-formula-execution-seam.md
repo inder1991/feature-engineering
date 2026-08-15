@@ -1776,7 +1776,7 @@ the same rule `run_l0` already follows.
 - The real-JVM half runs in `l0_gate.py`'s sibling (`make l0-gate`), not the default suite —
   `pyspark`/`kedro` are deliberately not dependencies of this platform.
 
-> **ACCEPTED `PENDING-D1` (2026-08-15).** G-2 is composed: `prepare_run` → `run_l1` → `submit`,
+> **ACCEPTED `d3ff1064` (2026-08-15).** G-2 is composed: `prepare_run` → `run_l1` → `submit`,
 > inside `_commit`'s one transaction, on a run whose L0 PASSED and whose publication capability was
 > PROVEN. **THE TWO PLAN CORRECTIONS ARE ABOVE**, both structural — the attestation is part of an
 > execution's identity, and the run's business date is not the deployment's to state.
