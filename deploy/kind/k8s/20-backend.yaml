@@ -161,6 +161,13 @@ data:
   # copied into the image at all. Turning the switch on against it would not degrade politely — see
   # the paragraph below for what it would actually do.
   FEATUREGEN_MATERIALIZE_ENABLED: "0"
+  # THIS CONFIGMAP IS READ BY THE WORKER TOO, and that matters more than it looks: `25-worker.yaml`
+  # takes the same `backend-config` through `envFrom`, and the WORKER is the only process that
+  # compiles (the backend route only validates, mints a request and enqueues). So this one line is
+  # the whole deployment's materialization switch, there is no second place to flip — and there
+  # must not be one: an `env:` entry on either Deployment takes precedence over `envFrom` and would
+  # silently pin that pod to a value this file no longer says. A ConfigMap edit is not a restart:
+  # roll BOTH Deployments afterwards, or the running pods keep the old environment for life.
   # The four settings a deployment that turns the switch ON must also supply. Deliberately left
   # UNSET rather than pointed at paths this image does not contain: the lane resolves them only when
   # a job is claimed, names the missing one, and leaves the request queued for the fix — but that
@@ -174,9 +181,11 @@ data:
   # failure exactly: `load_inventory` raises before the lane accepts anything. So turn the switch on
   # and these four together — and only once the inventory is one a compilation can read.
   #   the directory each sealed project tree is written under (one subdirectory per generation).
-  #   READY: no volume is mounted there, so a demo cluster writes to the pod's EPHEMERAL layer and a
-  #   restart takes every sealed tree with it. `materialize_to` mkdirs its parents and the container
-  #   runs as root, so the path needs no volume to work — it needs one to SURVIVE.
+  #   READY, and it is the WORKER's disk this describes, not the backend's — the backend never
+  #   writes a tree. No volume is mounted there, so a demo cluster writes to the worker pod's
+  #   EPHEMERAL layer and a worker restart takes every sealed tree with it. `materialize_to` mkdirs
+  #   its parents and the container runs as root, so the path needs no volume to work — it needs
+  #   one to SURVIVE.
   # FEATUREGEN_MATERIALIZE_PROJECT_ROOT: "/var/lib/featuregen/materialize"
   #   the YAML of captured cluster facts every compilation reads (§0's typed input).
   #   NOT READY — the one blocker. Nothing in this repo or this image satisfies it; a compile needs

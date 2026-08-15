@@ -2250,10 +2250,8 @@ Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), n
 
 **Two real deployment blockers must be closed FIRST, and they are engineering, not operations:**
 
-1. **`deploy/kind/k8s/25-worker.yaml` carries no `MATERIALIZE` env at all** — not the flag, not the
-   four companion settings. The worker Deployment postdates Phase G and never received them. Since
-   the worker is the only thing that compiles, a flag flipped on the backend alone accepts requests
-   nothing will ever claim.
+1. ~~**`deploy/kind/k8s/25-worker.yaml` carries no `MATERIALIZE` env at all**~~ — **WRONG, see the
+   correction below. It carries all of it, through `envFrom`.**
 2. **`FEATUREGEN_MATERIALIZE_INVENTORY` has no usable value in-pod.** The only inventory in the repo
    is `conf/environments/hdfc-local-inventory.yml`, which `load_inventory` **refuses by design**
    (`engine_versions.hive` is null, `tables: {}` — it is a template, and DEFERRED-WORK `:230` says
@@ -2261,10 +2259,128 @@ Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), n
    settings do have usable values since the followups branch added `/opt/kedro-venv` with
    kedro + pyspark. **This is Task 0 of the codegen program, unstarted, and it gates E2 absolutely.**
 
-Then, and only then: deploy backend-first with migrations 1055/1066/1067; flip
-`FEATUREGEN_MATERIALIZE_ENABLED` on backend **and** worker; run the probe; run one governed feature;
-read the table. **Explicit user go required** — live cluster, cluster spend, and a durable capability
-attestation. Never without it.
+> **PLAN CORRECTION (E2, verified, and following the task as briefed would have SHIPPED the defect
+> it describes.** Blocker 1 is false. `25-worker.yaml:65` declares
+> `envFrom: [configMapRef: {name: backend-config}]` — the *same* ConfigMap `20-backend.yaml`
+> defines, the one that carries `FEATUREGEN_MATERIALIZE_ENABLED: "0"` and the four commented
+> companion settings. Parsed both files to confirm it: each Deployment's only `env:` entry is
+> `ANTHROPIC_API_KEY`, and both take the whole ConfigMap through `envFrom`. So the flag is ONE
+> edit for both processes and there is no second place to flip.
+>
+> **And adding the briefed block would have created the failure it was meant to prevent.**
+> Kubernetes gives `env` precedence over `envFrom`. A mirrored
+> `FEATUREGEN_MATERIALIZE_ENABLED: "0"` in `25-worker.yaml` would silently pin the WORKER off
+> after an operator flipped the ConfigMap on — the backend accepting triggers that nothing ever
+> claims, which is word-for-word the failure blocker 1 describes. What landed instead is the
+> documentation that makes the inheritance and the trap legible at both ends, plus one correction:
+> the backend ConfigMap's `PROJECT_ROOT` note ("no volume is mounted there… a restart takes every
+> sealed tree with it") is written from the backend's perspective and is about the **worker's**
+> ephemeral disk — the backend never writes a tree.
+
+> **ACCEPTED `PENDING-E2` (2026-08-15). ENGINEERING HALF ONLY; EVERY CLUSTER STEP BELOW NEEDS AN
+> EXPLICIT GO.** `deploy/kind/k8s/25-worker.yaml` gains the materialization block as
+> **documentation, not duplication** (the correction above says why): the worker is the only
+> process that compiles; it already inherits the whole `FEATUREGEN_MATERIALIZE_*` block through
+> `envFrom`; an `env:` entry for any of those names must never be added; a ConfigMap edit is not a
+> restart, so BOTH Deployments must be rolled; and `PROJECT_ROOT` describes this pod's ephemeral
+> disk. `20-backend.yaml` gains the matching note at the flag and the corrected `PROJECT_ROOT`
+> paragraph. **No `kubectl`, no apply, no deploy — these are file changes.** Both files re-parsed
+> with `yaml.safe_load_all` after editing.
+
+#### What codegen Task 0 must produce, field by field — the operator brief
+
+The inventory is the one absolute gate and it **cannot be written from this repository**: every
+value below is an observation of a live cluster. `load_inventory` is total — there is no partial
+load — so the file is refused until all of it is there. Reproduced against
+`conf/environments/hdfc-local-inventory.yml` on `15cff93f`, the first refusal is verbatim:
+
+> `engine_versions.hive is missing or null. Every runtime version is required: an unpinned
+> dependency resolves to whatever the index offers on the day…`
+
+Task 0 must capture and write, each one satisfying a validation that currently refuses:
+
+- **`environment_id`** — non-blank text. Must equal the `environment_id` every capability
+  attestation is keyed on (§10.3), or the probe's evidence describes a different environment.
+- **`captured_at`** — non-blank text, `_required` + `_text`. Never enters an identity hash; it
+  exists so *"this inventory is four months old"* is answerable.
+- **`engine_versions`** — **all eight**, each non-null and non-blank:
+  `hive`, `spark`, `metastore`, `python`, `java`, `pyspark`, `kedro`, `kedro_datasets`.
+  Four describe the cluster (`hive`/`spark`/`metastore` are the attestation key; `java` is what a
+  Spark version is only meaningful against); four are what §7's generated project pins itself to.
+  `kedro_datasets` is separately versioned from `kedro` and is what `spark.SparkHiveDataset`
+  resolves out of — a lock naming only `kedro` leaves the class that reads every governed source
+  table unpinned.
+- **`logical_schema_map`** — one entry per governed logical table ref (`source::schema.table`)
+  whose `graph_node.schema_name` is NULL. Consulted only in that case; if neither yields a schema
+  the compilation refuses `PHYSICAL_SCHEMA_NOT_RESOLVED` rather than defaulting to `public` and
+  reading a different table than the catalog governs. The uploads are schema-flattened, so these
+  lines are expected to be needed.
+- **`tables`** — one entry per governed table, keyed `SCHEMA.TABLE` exactly as the cluster spells
+  it (case is preserved; two keys that fold to the same identifier are refused). Each entry needs
+  **every** key present:
+  - `partition_columns` — ORDERED `[name, physical type]` pairs; the partition path is built from
+    the order. A verified-unpartitioned table writes `null`. **`[]` is refused** — "we do not know
+    how this is partitioned" is not "scan it".
+  - `partition_mapping` — **DECLARED, never captured**, one of exactly five kinds
+    (`event_time_partition`, `availability_partition`, `static_snapshot`, `full_scan`,
+    `verified_unpartitioned`). `null` loads and then refuses at compile with
+    `PARTITION_MAPPING_NOT_DECLARED`. A kind outside the closed set is refused at load, as is a
+    `transform` outside `{date_iso, date_compact}`. **This field is identity-bearing** — correcting
+    it later invalidates sealed artifacts.
+  - `columns` — ORDERED `[name, physical type]` as the metastore prints them, **not normalised**:
+    `varchar(150)` is not `string`, and §6's adapter is what decides what the difference means.
+  - `location` — the physical path.
+  - `rewritten_in_place` — a boolean no metastore knows: it is a statement about how the feed
+    operates, and it is why an unpartitioned mutable table's snapshot is not content-addressed.
+- **Getting it into the pod.** The file is not in the image and no volume mounts it. Task 0's
+  output must also be delivered — a ConfigMap or Secret mounted at the path
+  `FEATUREGEN_MATERIALIZE_INVENTORY` names, or a build-time copy. Nothing in the repo does this
+  today.
+- **Not consumed, and must not be mistaken for done.** The `engines:` block is *declared for
+  later*: `load_inventory` tolerates the key without reading it, `ClusterInventoryV1` has no typed
+  field for it, and `SOURCE_ENGINE_UNSUPPORTED` exists in `codes.py` with nothing raising it.
+
+#### The operator runbook — every step needs an explicit go
+
+Nothing below may be run without the user saying so, each time: it is a live cluster, real spend,
+and a durable capability attestation that outlives the run that produced it.
+
+1. **Migrations, backend-first.** `1055` (active-revision pointer, G-3), `1066`
+   (`semantic_option_decision.binding_plan`), `1067` (`materialization_request` option link),
+   `1068` (`recipe_formula_shadow_work_item.binding_plan`). The backend's init container runs
+   `python -m featuregen migrate` before serving, so rolling the backend image applies them; the
+   worker's init container WAITS for the same schema and does not compete. All four are append-only
+   or additive-nullable and were each audited against a POPULATED seeded legacy shape.
+2. **Roll the backend, confirm `/health`, and only then the worker.** A worker on the new image
+   against the old schema is the one ordering that has no repair path.
+3. **Land Task 0's inventory in the pod** and confirm it LOADS —
+   `python -c "from featuregen.materialize.inventory import load_inventory;
+   load_inventory('<path>')"` inside the pod. A file that exists but does not load fails exactly
+   like a missing one: `load_inventory` raises before the lane accepts anything.
+4. **Edit the ConfigMap once** — `kubectl -n featuregen edit configmap backend-config` — setting
+   `FEATUREGEN_MATERIALIZE_ENABLED: "1"` **and** uncommenting all four companion settings together.
+   The lane resolves them only when a job is claimed; a missing one is retryable, so the job burns
+   its 12 attempts and dead-letters, and because the lane never claimed the request it is left
+   stranded at `requested` with nothing queued behind it — re-triggering then needs a FRESH
+   idempotency key, and the stranded row can never be closed at all (DEFERRED-WORK A.35, which D4
+   chose to surface as *"never accepted — check the lane configuration"* rather than close).
+5. **Roll BOTH Deployments.** A ConfigMap edit does not restart a pod, and a pod started before the
+   edit keeps the old environment for its whole life.
+6. **Run the publication probe** (`materialize/probe.py`, D2's driver) against the environment and
+   record the attestation. It is keyed on `environment_id` + mechanism + the exact
+   `hive`/`spark`/`metastore` triple: publication is refused `CAPABILITY_UNPROVEN` until one
+   exists, and an attestation probed on other engine versions is refused too — drift is unproven,
+   not failed.
+7. **Trigger ONE governed feature** and read `GET /materialization-runs/{id}` (D4's surface). The
+   expected terminals, each an outcome rather than an error: `PUBLICATION_REFUSED` if the probe has
+   not run, `RUN_FAILED` at `PREPARE_RUN` if the G-2 adapters are still absent (they are — no
+   `MetastoreMetadata` implementation exists in `src/`; **writing them is E2's remaining
+   engineering and it is not done**), and `PUBLISHED` only when both are closed.
+8. **Read the table** — `sandbox_feature.<group>` — and compare it with the run's reported
+   published object. This is §0.5 item 7 and it is the only step that can close it.
+
+**What this plan may then claim, and no more:** *"one governed contract materializes end to end
+through Kedro on kind; publication is proven for that environment at those engine versions."*
 
 ---
 

@@ -62,6 +62,37 @@ spec:
         - name: worker
           image: featuregen-backend:local
           imagePullPolicy: IfNotPresent
+          # ── MATERIALIZATION (Phase G / the formula-execution seam, task E2) ───────────────────
+          #
+          # THE WORKER IS THE ONLY PROCESS THAT COMPILES. The backend route validates a trigger,
+          # mints a `materialization_request` and enqueues; every stage after that — resolve,
+          # admit, compile, render, seal, L0, and (once the G-2 adapters exist) prepare/L1/submit/
+          # publish — runs inside THIS pod's tick, on this pod's one connection.
+          #
+          # IT ALREADY HAS THE WHOLE `FEATUREGEN_MATERIALIZE_*` BLOCK, and that is why no `env:`
+          # entry for any of those names appears below. `envFrom` above pulls the SAME
+          # `backend-config` ConfigMap the backend reads (`20-backend.yaml`), which is where
+          # `FEATUREGEN_MATERIALIZE_ENABLED` ("0" today) and the four commented companion settings
+          # live. So the flip is ONE ConfigMap edit for both Deployments, and there is exactly one
+          # place to read the deployment's materialization posture from.
+          #
+          # DO NOT "mirror" those names into the `env:` block below. Kubernetes gives `env`
+          # precedence over `envFrom`, so a duplicated `FEATUREGEN_MATERIALIZE_ENABLED: "0"` here
+          # would SILENTLY PIN THE WORKER OFF after an operator flipped the ConfigMap on — the
+          # backend would accept triggers and nothing would ever claim them, which is precisely the
+          # failure the duplication would have been added to prevent.
+          #
+          # WHAT THE OPERATOR MUST STILL DO, because a ConfigMap edit is not a restart: roll BOTH
+          # `deployment/backend` and `deployment/worker` after the edit. A pod started before the
+          # change keeps the old environment for its whole life.
+          #
+          # `FEATUREGEN_MATERIALIZE_PROJECT_ROOT` IS ABOUT THIS POD'S DISK, not the backend's.
+          # 20-backend.yaml documents it under the backend because that is where the whole block is
+          # written, but the sealed project trees are written HERE, by this container, and no volume
+          # is mounted at that path — so on a demo cluster they live on this pod's ephemeral layer
+          # and a worker restart takes every sealed tree with it. `materialize_to` mkdirs its
+          # parents and this container runs as root, so the path needs no volume to WORK; it needs
+          # one to SURVIVE.
           envFrom:
             - configMapRef: { name: backend-config }
           env:
