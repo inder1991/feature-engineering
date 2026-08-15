@@ -1856,6 +1856,63 @@ column, hands every reading — including the ones that looked bad — to the as
 - **Operator action, explicit go required:** run the probe against the kind cluster; record the
   attestation. Cluster spend + a durable governance record.
 
+> **PLAN CORRECTION (D2, verified).** The stated signature
+> `probe_publication_capability(cluster, *, mechanism, engine_versions)` cannot run. `publish.py`'s
+> own law — *"Nothing is generated here. No clock, no id factory"* — makes **`probe_id`** and
+> **`clock`** parameters rather than things a driver mints (a probe that minted its own id would
+> record when it was *told*, not what ran, and the attestation is recorded UNDER that id).
+> `ProbeObservation` refuses an empty column list, so **`readers`** and **`columns`** are required;
+> and §10.3 step 5's "repeated while ADDING a feature column" has to be told WHICH column, so
+> **`feature_column`** is too. `environment_id` is deliberately NOT a parameter — it is the
+> target's own fact, and a parameter would let a probe run against one cluster and be recorded
+> against another.
+>
+> **PLAN CORRECTION (D2, verified).** `RENDERABLE_MECHANISMS` already exists, in
+> `render/publish.py:62`, and is already a frozenset of one. The driver READS it rather than
+> declaring a second: A.26 names `RENDERABLE_MECHANISMS` and `publish_entry_body` as the two places
+> to extend, and a copy here would be a third that drifts. A test monkeypatches the renderer's set
+> and asserts the driver follows.
+
+> **ACCEPTED `PENDING-D2` (2026-08-15).** `src/featuregen/materialize/probe.py` — the live driver,
+> `PublicationTarget` (the cluster seam) and nothing else. **NO LIVE PROBE WAS RUN**: nothing in
+> this task touched `kubectl`, a cluster or a subprocess, and running it against kind stays an
+> OPERATOR ACTION requiring an explicit go (cluster spend + a durable governance record).
+>
+> **A.26's constraint is structural, not observed.** `test_the_driver_states_no_verdict_of_its_own`
+> parses the module's AST and asserts `ProbeResult` is never CALLED in it while
+> `assess_probe_observations` is — a behavioural test could only ever prove the verdict was right
+> for the inputs it happened to try, and this proves there is nowhere else for one to come from.
+> The signature test is its other half: no `passed=`, no `covers_schema_evolution=`, no
+> `evidence_hash=`, no `result=`.
+>
+> **Every reading is handed over, and the test says so.** `_look` returns each reader's observation
+> in order with no filtering, no de-duplication and no retry-until-clean: a torn read is the single
+> most valuable thing a probe can observe (it is what tells `PUBLISH_MECHANISM_UNSUPPORTED` from
+> `CAPABILITY_UNPROVEN`), and a driver that smoothed it away would report a pass on an environment
+> it had just watched fail. A reader that could not read returns `None` and contributes nothing
+> rather than a fabricated reading — which can only make the verdict weaker, the right direction
+> for an absence.
+>
+> **The vacuity guard is where A.26 put it — in the TYPE.** `test_a_probe_that_observed_nothing_
+> cannot_pass` drives a target whose every reader fails, and asserts the verdict rather than a
+> branch; the driver still ASKED all eight times, so the emptiness is an observation and not a skip.
+> A second case pins the other vacuity (readers who only ever saw one generation watched no swap).
+>
+> **The sequence.** Two rounds of publish-A → poll → publish-B → poll, the second over
+> `columns + (feature_column,)`, all four rounds' readings handed over as ONE evidence set — two
+> probes would produce two attestations neither of which covers schema evolution. Four calls that
+> could only ever be assessed as a failure (no readers, no columns, a feature column already
+> published, a non-renderable mechanism) are `ValueError`s BEFORE any cluster time: §14 has no
+> member for "this call was assembled wrongly", and spending a live run to report a demonstrated
+> absence where nothing was demonstrated is the worst of both.
+>
+> **Mutant proof, two, both caught:** (a) re-constructing the assessor's own answer as a fresh
+> `ProbeResult` fails the AST test; (b) handing over only the first reader's look fails
+> `test_every_reading_reaches_the_assessor_including_the_bad_ones`. 14 cases in
+> `tests/featuregen/materialize/test_probe.py`.
+> Gates: full suite **11165 passed, 20 skipped**; `-m eval` **73 passed**; ruff + mypy clean on
+> both new files.
+
 ### Task D3 — G-3: the publish step (2½ days) — **migration 1055**
 
 **New:** `src/featuregen/db/migrations/1055_feature_active_revision.sql` — the reserved
