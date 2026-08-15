@@ -5,7 +5,7 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
   | 'integrations' | 'governance' | 'dashboard' | 'gate' | 'asset' | 'suggested'
-  | 'analysis' | 'entity-map' | 'recipes'
+  | 'analysis' | 'entity-map' | 'recipes' | 'materialization'
 
 // 'asset' is the catalog asset-detail screen (Delivery G). It carries source + object_ref via the
 // existing params mechanism (a Details action on a search hit navigates('asset', {source,
@@ -32,6 +32,15 @@ export function entityMapEnabled(): boolean {
   return import.meta.env.VITE_ENTITY_MAP === '1'
 }
 
+// The materialization run sheet (Phase G, D4) rides its own Vite flag, same call-time pattern. It
+// mirrors the SERVER's switch: `FEATUREGEN_MATERIALIZE_ENABLED` is default-OFF and every
+// /materialization-runs route 404s while it is off, so a reachable screen with an unreachable API
+// behind it would be a surface that can only ever show an error. Flag-off, '#/materialization'
+// parses like any unknown hash: absent, not broken.
+export function materializationRunsEnabled(): boolean {
+  return import.meta.env.VITE_MATERIALIZATION_RUNS === '1'
+}
+
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')
   const q = raw.indexOf('?')
@@ -40,6 +49,7 @@ export function parseHash(hash: string): { route: Route; params: URLSearchParams
   const known = ROUTES.includes(path)
     || (path === 'gate' && gateConsoleEnabled())
     || (path === 'entity-map' && entityMapEnabled())
+    || (path === 'materialization' && materializationRunsEnabled())
   const route = known ? (path as Route) : 'overview'
   return { route, params: new URLSearchParams(query) }
 }

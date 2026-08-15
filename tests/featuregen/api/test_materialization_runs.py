@@ -42,12 +42,18 @@ from featuregen.materialize.control_plane import (
     append_run_event,
     record_generation,
 )
+from featuregen.materialize.publish import (
+    ActiveRevision,
+    PublishMechanism,
+    record_active_revision,
+)
 from featuregen.materialize.queue_lane import (
     MATERIALIZATION_FLAG,
     MATERIALIZATION_HANDLER,
     MaterializationJobV1,
     decode_job,
     encode_job,
+    materialization_message_id,
 )
 from featuregen.materialize.request_store import (
     RequestLifecycle,
@@ -660,6 +666,154 @@ def test_GET_FOLDS_THE_PLANE_once_a_run_exists(client, admin_headers, work_items
     assert (body["generation_id"], body["run_id"]) == (generation_id, run_id)
     assert body["run_status"] == "refused"
     assert body["run_status_reason"] is None
+
+
+def test_GET_reports_a_REFUSAL_as_an_OUTCOME_with_its_code(
+        client, admin_headers, work_items, db, on) -> None:
+    """§0.0's correction, made a property of the API. `PUBLICATION_REFUSED` is G-1's SUCCESS
+    terminal — the project compiled, rendered, sealed and PROVED its build, and the request lands
+    `committed` because that evidence is on the plane. The surface must lead with `refused` as an
+    OUTCOME and carry the code that says which refusal it was, or a client has to infer failure from
+    a terminal that reads red."""
+    request_id = _refused_run(client, admin_headers, db, work_items)
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "refused"
+    assert body["terminal_event"] == "PUBLICATION_REFUSED"
+    assert body["refusal_code"] == "CAPABILITY_UNPROVEN"
+    assert body["lifecycle_state"] == "committed"
+    assert body["published_object"] is None
+
+
+def test_a_REFUSED_run_does_not_report_an_EARLIER_runs_published_object(
+        client, admin_headers, work_items, db, on) -> None:
+    """The pointer is a fact about the GROUP; this route answers what became of one REQUEST. A run
+    that was refused, reported beside a live table name an earlier run published, would read as
+    though it had published it — so the field is scoped by `run_id` and this request honestly has
+    none of its own."""
+    published = _sealed_run(client, admin_headers, db, work_items)
+    record_active_revision(db, ActiveRevision(
+        revision_id="frev_earlier", logical_group_name=_GROUP, generation_id=published[1],
+        run_id=published[2], published_object=f"sandbox_feature.{_GROUP}",
+        capability_attestation_id="probe-1", mechanism=PublishMechanism.VERSIONED_POINTER,
+        seq=0, activated_at="2026-08-15T00:00:01+00:00"))
+    request_id = _refused_run(client, admin_headers, db, work_items, key="second-key")
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "refused"
+    assert body["published_object"] is None
+
+
+def test_GET_reports_a_PUBLISHED_run_and_the_object_a_reader_can_QUERY(
+        client, admin_headers, work_items, db, on) -> None:
+    """The name comes from migration 1055's pointer, which exists only because a swap happened.
+    `group_binding.physical_target` names `sandbox_feature.<group>` for every group whether or not
+    anything was ever published there, so reporting THAT would hand an operator a table that does
+    not resolve."""
+    request_id, generation_id, run_id = _sealed_run(client, admin_headers, db, work_items)
+    append_run_event(db, MaterializationRunEvent(
+        run_id=run_id, seq=0, generation_id=generation_id, event_kind=RunEventKind.PUBLISHED,
+        occurred_at="2026-08-15T00:00:01+00:00", detail="published sandbox_feature.cif_daily"))
+    advance_lifecycle(db, request_id=request_id, to_state=RequestLifecycle.COMMITTED)
+    record_active_revision(db, ActiveRevision(
+        revision_id="frev_api", logical_group_name=_GROUP, generation_id=generation_id,
+        run_id=run_id, published_object=f"sandbox_feature.{_GROUP}",
+        capability_attestation_id="probe-1", mechanism=PublishMechanism.VERSIONED_POINTER,
+        seq=0, activated_at="2026-08-15T00:00:01+00:00"))
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "published"
+    assert body["terminal_event"] == "PUBLISHED"
+    assert body["refusal_code"] is None
+    assert body["published_object"] == f"sandbox_feature.{_GROUP}"
+    assert body["published_generation_id"] == generation_id
+
+
+def test_GET_reports_a_RUN_FAILED_terminal_without_inventing_a_refusal_code(
+        client, admin_headers, work_items, db, on) -> None:
+    """A run that failed outside the gates is not a governed verdict about a feature, so there is no
+    refusal code to report and reporting one would name a decision nobody made."""
+    request_id, generation_id, run_id = _sealed_run(client, admin_headers, db, work_items)
+    append_run_event(db, MaterializationRunEvent(
+        run_id=run_id, seq=0, generation_id=generation_id, event_kind=RunEventKind.RUN_FAILED,
+        occurred_at="2026-08-15T00:00:01+00:00",
+        detail="the pipeline ran and failed with returncode 42"))
+    advance_lifecycle(db, request_id=request_id, to_state=RequestLifecycle.FAILED)
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "failed"
+    assert body["terminal_event"] == "RUN_FAILED"
+    assert body["refusal_code"] is None
+    assert body["published_object"] is None
+
+
+def test_a_request_that_was_never_accepted_is_legible(
+        client, admin_headers, work_items, db, on) -> None:
+    """DEFERRED-WORK **A.35**, closed on the SURFACE rather than in the state machine.
+
+    An unconfigured deployment makes every delivery fail; when the attempt budget runs out the
+    message is dead-lettered while the request is still `requested` holding no lease, and §3.2 ships
+    no legal terminal from there. Before D4 the surface showed it as pending indefinitely, which is
+    the actual defect an operator meets. Now it says the class by name, says what to check, and says
+    what to do — while the row stays honestly non-terminal, because terminalizing it would record a
+    verdict about work nobody ever claimed.
+    """
+    request_id = client.post(_PATH, json=_body(work_items),
+                             headers=admin_headers).json()["request_id"]
+    db.execute("UPDATE queue SET status = 'dead' WHERE message_id = %s",
+               (materialization_message_id(request_id),))
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "never_accepted"
+    assert body["lifecycle_state"] == "requested"
+    assert body["terminal"] is False, "the row stays non-terminal — no edge was added"
+    assert "never accepted" in body["run_status_reason"]
+    assert "FEATUREGEN_MATERIALIZE_" in body["run_status_reason"]
+    assert "fresh idempotency key" in body["run_status_reason"].lower()
+    assert body["terminal_event"] is None and body["refusal_code"] is None
+
+
+def test_a_request_whose_job_is_still_CLAIMABLE_is_pending_not_stranded(
+        client, admin_headers, work_items, on) -> None:
+    """The other half of A.35's discrimination, and the reason it is read from the QUEUE: a
+    `requested` row looks identical whether its message is waiting, being retried, or dead."""
+    request_id = client.post(_PATH, json=_body(work_items),
+                             headers=admin_headers).json()["request_id"]
+
+    body = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert body["outcome"] == "pending"
+    assert "no run exists yet" in body["run_status_reason"]
+
+
+def _sealed_run(client, admin_headers, db, work_items, *, key=_KEY) -> tuple[str, str, str]:
+    """A request advanced to `running` over a real generation — the state a terminal hangs off."""
+    request_id = client.post(_PATH, json=_body(work_items, key=key),
+                             headers=admin_headers).json()["request_id"]
+    accept_request(db, request_id=request_id, lease_seconds=60)
+    generation_id, run_id = f"gen-{request_id[-8:]}", f"run-{request_id[-8:]}"
+    record_generation(db, MaterializationGeneration(
+        generation_id=generation_id, logical_group_name=_GROUP,
+        materialization_contract_hash="c" * 64, group_plan_hash="p" * 64,
+        generated_project_hash="g" * 64, created_at="2026-08-15T00:00:00+00:00"))
+    advance_lifecycle(db, request_id=request_id, to_state=RequestLifecycle.RUNNING,
+                      generation_id=generation_id, run_id=run_id)
+    return request_id, generation_id, run_id
+
+
+def _refused_run(client, admin_headers, db, work_items, *, key=_KEY) -> str:
+    request_id, generation_id, run_id = _sealed_run(client, admin_headers, db, work_items, key=key)
+    append_run_event(db, MaterializationRunEvent(
+        run_id=run_id, seq=0, generation_id=generation_id,
+        event_kind=RunEventKind.PUBLICATION_REFUSED, occurred_at="2026-08-15T00:00:01+00:00",
+        detail="CAPABILITY_UNPROVEN: no attestation exists for environment 'hdfc-local'"))
+    advance_lifecycle(db, request_id=request_id, to_state=RequestLifecycle.COMMITTED)
+    return request_id
 
 
 def test_GET_404s_for_an_UNKNOWN_id(client, admin_headers, on) -> None:

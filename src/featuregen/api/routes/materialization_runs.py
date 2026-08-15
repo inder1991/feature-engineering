@@ -66,7 +66,12 @@ from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.materialize.canonical import materialize_hash
-from featuregen.materialize.control_plane import fold_run_status, read_run_events
+from featuregen.materialize.control_plane import (
+    RunEventKind,
+    fold_run_status,
+    read_run_events,
+)
+from featuregen.materialize.publish import read_active_revision
 from featuregen.materialize.queue_lane import (
     MATERIALIZATION_FLAG,
     PAYLOAD_VERSION,
@@ -74,9 +79,11 @@ from featuregen.materialize.queue_lane import (
     decode_job,
     enqueue_materialization,
     materialization_enabled,
+    materialization_message_id,
 )
 from featuregen.materialize.request_store import (
     MaterializationRequestV1,
+    RequestLifecycle,
     read_request,
     record_request,
 )
@@ -265,7 +272,13 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
     stored = read_request(conn, request_id=request_id)
     if stored is None:
         raise HTTPException(status_code=404, detail="materialization request not found")
-    status, reason = _run_verdict(conn, stored)
+    # Read ONCE and threaded, not recomputed per field: `_is_stranded` costs a queue lookup, and
+    # two calls could in principle straddle a worker claiming the request between them and report
+    # `never_accepted` beside a reason that says it is pending.
+    stranded = _is_stranded(conn, stored)
+    status, reason = _run_verdict(conn, stored, stranded=stranded)
+    terminal = _terminal_event(conn, stored)
+    revision = _published_by_this_run(conn, stored)
     return {
         "request_id": stored.request_id,
         "logical_group_name": stored.logical_group_name,
@@ -281,6 +294,19 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
         "run_id": stored.run_id,
         "run_status": status,
         "run_status_reason": reason,
+        #: WHAT the plane recorded, not how it felt about it. `refused` is an OUTCOME — a
+        #: PUBLICATION_REFUSED run compiled, rendered, sealed and PROVED its build, and its request
+        #: is `committed` because its evidence is on the plane. A surface that rendered it as an
+        #: error would be lying about the one terminal G-1 was designed to reach.
+        "terminal_event": None if terminal is None else terminal.value,
+        "outcome": _outcome(stored, terminal, stranded=stranded),
+        "refusal_code": _refusal_code(conn, stored, terminal),
+        #: The name a reader can query, or `None` for "not published yet" — never a name this
+        #: route derived. `group_binding.physical_target` NAMES `sandbox_feature.<group>` whether or
+        #: not anything was ever published there, so reporting it would be inventing a table.
+        "published_object": None if revision is None else revision.published_object,
+        "published_generation_id": None if revision is None else revision.generation_id,
+        "published_at": None if revision is None else revision.activated_at,
         "resolved_input_digest": stored.resolved_input_digest,
         "requested_at": stored.requested_at.isoformat(),
         "accepted_at": None if stored.accepted_at is None else stored.accepted_at.isoformat(),
@@ -662,14 +688,145 @@ def _queue_status(conn: psycopg.Connection, queue_id: int) -> str:
 # ── the status fold ──────────────────────────────────────────────────────────────────────────────
 
 
-def _run_verdict(conn: psycopg.Connection,
-                 request: MaterializationRequestV1) -> tuple[str | None, str | None]:
+#: What the SURFACE calls each shape, and the vocabulary a client renders from. It is deliberately
+#: NOT `RunStatus` — a status is folded from the plane and exists only once a run does, while this
+#: also has to name the two shapes that never reached one (`pending`, `never_accepted`). Four of the
+#: six are outcomes and two are in-flight; NONE of them is an error, which is the whole point of
+#: having the word `refused` here rather than leaving a client to infer failure from a red-looking
+#: terminal.
+_OUTCOMES = {
+    RunEventKind.PUBLISHED: "published",
+    RunEventKind.PUBLICATION_REFUSED: "refused",
+    RunEventKind.RUN_FAILED: "failed",
+    RunEventKind.GATES_FAILED: "rejected",
+}
+
+
+def _terminal_event(conn: psycopg.Connection,
+                    request: MaterializationRequestV1) -> RunEventKind | None:
+    """The run's terminal event, or ``None`` when the plane holds none for it.
+
+    ``None`` is an ORDINARY answer twice over and a client must be able to tell the two apart from
+    the fields beside it: a request still being worked has not reached one yet, and a refusal before
+    the project was sealed has nowhere in the plane to be recorded at all (a run event needs a
+    generation, and a generation needs a rendered project). ``run_status_reason`` says which.
+    """
+    if request.run_id is None:
+        return None
+    events = read_run_events(conn, request.run_id)
+    return events[-1].event_kind if events and events[-1].is_terminal() else None
+
+
+def _published_by_this_run(conn: psycopg.Connection, request: MaterializationRequestV1):
+    """Migration 1055's pointer **only when THIS request put it there**.
+
+    The route answers "what became of this request", and a group's active revision is a fact about
+    the GROUP: a run that was refused would otherwise report the object an EARLIER run published, and
+    an operator reading a refusal beside a live table name would reasonably conclude their run had
+    published it. Scoped by ``run_id``, which is what the pointer records.
+
+    A group whose newest revision belongs to another run therefore reads as *"not published yet"* on
+    this request — true of this request, which is the question asked. What is currently published for
+    the group is a different question and needs its own surface rather than this field.
+    """
+    if request.run_id is None:
+        return None
+    revision = read_active_revision(conn, request.logical_group_name)
+    return revision if revision is not None and revision.run_id == request.run_id else None
+
+
+def _is_stranded(conn: psycopg.Connection, request: MaterializationRequestV1) -> bool:
+    """DEFERRED-WORK **A.35**: a request left at ``requested`` that no worker will ever claim again.
+
+    An unconfigured deployment (a missing ``FEATUREGEN_MATERIALIZE_INVENTORY``, say) makes every
+    delivery fail, and when the queue's attempt budget runs out the message is dead-lettered while
+    the request is still ``requested`` holding no lease — the lane deliberately does not accept
+    before it has a configuration, because accepting first would burn every arriving request into a
+    terminal no operator fix could recover. So nothing will ever deliver it again.
+
+    **THE CHOICE MADE HERE (D4): NAME THE CLASS, DO NOT ADD THE EDGE.** A.35's alternative was a
+    ``requested → failed`` transition with the reconciler as its only writer, and it was rejected
+    for three reasons. (1) The reconciler already REFUSES to invent a verdict for this class — it
+    reports ``NO_LEGAL_TERMINAL`` and gauges the standing count — and the edge would turn that
+    refusal into a terminalization on the evidence "the message is unreachable", which is a
+    judgement about work nobody ever claimed. (2) The operator's actual complaint is that the STATUS
+    SURFACE showed it as pending indefinitely; that is a surface defect and it is fixed here, with
+    no state-machine change. (3) Terminalizing is a one-way door on a row whose whole value is that
+    it is honest about never having been claimed, while saying so is not — and §3.3's rule is that a
+    re-run is a NEW request anyway, so nothing is lost while the old row stands.
+
+    Read from the queue rather than from the request, because the request row cannot know: a
+    ``requested`` row looks identical whether its message is waiting, being retried, or dead. The
+    message id is DERIVED (``materialization_message_id``), so this is a primary-key lookup and not
+    a scan.
+    """
+    if request.lifecycle_state is not RequestLifecycle.REQUESTED:
+        return False
+    row = conn.execute(
+        "SELECT status FROM queue WHERE message_id = %s",
+        (materialization_message_id(request.request_id),)).fetchone()
+    # No queue row at all is stranded too, and more plainly so: the request was minted and its job
+    # was never enqueued, so there is nothing anywhere that could drive it.
+    return row is None or str(row[0]) not in _CLAIMABLE
+
+
+def _outcome(request: MaterializationRequestV1, terminal: RunEventKind | None, *,
+             stranded: bool) -> str:
+    """The one word a surface leads with — and `refused` is an OUTCOME, not an error.
+
+    §0.0's correction, made a property of the API rather than a note in a plan.
+    ``PUBLICATION_REFUSED`` is G-1's SUCCESS terminal: the project WAS compiled, rendered, sealed
+    and PROVED to build in a separate interpreter, and the request lands ``committed`` because the
+    evidence is on the plane. What is refused is publication, and until an environment has a passing
+    capability attestation that is the truthful end of every run. A client that painted it red would
+    be telling an operator their feature was rejected.
+
+    ``never_accepted`` is DEFERRED-WORK A.35's class, named rather than repaired — see
+    :func:`_is_stranded` for the choice and why the state-machine edge was rejected.
+    """
+    if terminal is not None:
+        return _OUTCOMES.get(terminal, terminal.value.lower())
+    if stranded:
+        return "never_accepted"
+    if not request.lifecycle_state.is_terminal():
+        return "pending"
+    # Terminal with no run event: a governed refusal before the project was sealed, which has
+    # nowhere in the plane to be recorded. `run_status_reason` is where that is said.
+    return "failed" if request.lifecycle_state is RequestLifecycle.FAILED else "refused"
+
+
+def _refusal_code(conn: psycopg.Connection, request: MaterializationRequestV1,
+                  terminal: RunEventKind | None) -> str | None:
+    """``CAPABILITY_UNPROVEN`` / ``PUBLISH_MECHANISM_UNSUPPORTED`` — read off the terminal event's
+    own detail, which is where the chain put it (``"<code>: <detail>"``).
+
+    Parsed rather than stored a second time: the detail IS the durable statement, and a column
+    holding the code beside it would be a second answer that could disagree. ``None`` whenever the
+    terminal is not a refusal, so a client cannot render a code for a run that was not refused.
+    """
+    if terminal is not RunEventKind.PUBLICATION_REFUSED or request.run_id is None:
+        return None
+    events = read_run_events(conn, request.run_id)
+    detail = events[-1].detail if events else None
+    return None if not detail or ":" not in detail else detail.split(":", 1)[0].strip()
+
+
+def _run_verdict(conn: psycopg.Connection, request: MaterializationRequestV1, *,
+                 stranded: bool) -> tuple[str | None, str | None]:
     """``(run_status, reason)`` — the plane's fold, or a plain statement of why there is none.
 
     Exactly one of the two is ever non-null. A reason is not an error message: "this request never
     reached the plane" is the ordinary durable shape of a pre-render refusal, and of every request
     that has not yet been claimed.
     """
+    if request.run_id is None and stranded:
+        return None, (
+            f"this request was never accepted: it is still {request.lifecycle_state.value!r}, it "
+            f"holds no lease, and its queued job is no longer claimable — so no worker will deliver "
+            f"it again and nothing ran. Check the materialization lane's configuration "
+            f"(FEATUREGEN_MATERIALIZE_* on the worker), then re-trigger with a FRESH idempotency "
+            f"key: a re-run is a new request (§3.3), and this row deliberately stays as it is "
+            f"because §3.2 ships no legal terminal from 'requested' (DEFERRED-WORK A.35)")
     if request.run_id is None:
         return None, (
             f"no run exists for this request: it is {request.lifecycle_state.value!r}. "

@@ -2012,6 +2012,66 @@ choice here.
 UI law (`ui-honest-absence-never-fabricate`) asserted on the empty state;
 `test_a_request_that_was_never_accepted_is_legible`.
 
+> **ACCEPTED `PENDING-D4` (2026-08-15).** The greenfield claim is re-verified: `grep -rn
+> 'materialization' frontend/src/` found two unrelated string literals and no screen, no `api.ts`
+> function and no type. So this is new UI.
+>
+> **THE A.35 DECISION: name the class, do NOT add the edge.** Recorded here and in
+> `docs/DEFERRED-WORK.md` (the row is now ⚪ with the argument attached).
+> `LEGAL_LIFECYCLE_TRANSITIONS` is untouched; `GET /materialization-runs/{id}` answers
+> `outcome: "never_accepted"` for a `requested` request whose queue message is no longer claimable,
+> and `run_status_reason` names the class, says what to check (`FEATUREGEN_MATERIALIZE_*` on the
+> worker) and what to do (a FRESH idempotency key — §3.3: a re-run is a NEW request). **Three
+> reasons the edge lost:** the reconciler already refuses to invent a verdict for this class
+> (`NO_LEGAL_TERMINAL`) and the edge would convert that refusal into a terminalization on the
+> evidence "the message is unreachable" — a judgement about work nobody claimed; the operator's
+> actual complaint was a SURFACE defect ("pending indefinitely") and it is closed without a
+> state-machine change; and terminalizing is a one-way door on a row whose whole value is being
+> honest about never having been claimed. It is read from the QUEUE, not the request, because a
+> `requested` row looks identical whether its message is waiting, being retried, or dead — and the
+> message id is derived, so it is a primary-key lookup.
+>
+> **`refused` renders as an OUTCOME.** `_OUTCOMES` maps the four terminal kinds to a word, and the
+> screen carries a three-way TONE (`good`/`neutral`/`bad`) rather than a boolean precisely so
+> `refused` can be neutral: `PUBLICATION_REFUSED` is G-1's SUCCESS terminal (compiled, rendered,
+> sealed, build PROVED, request `committed`), and a red badge would tell an operator their feature
+> was rejected when nothing about it was. A Vitest case asserts the `data-tone` attribute, because
+> the tone IS the claim and it is what a stylesheet paints.
+>
+> **Honest absence, and the one that matters.** `published_object === null` renders *"Not published
+> yet"* and the test asserts that `sandbox_feature` appears NOWHERE on the page — the platform names
+> a physical target for every group whether or not anything was published there, so showing it would
+> hand an operator a table that does not resolve. Every other `null` renders the absence's own
+> meaning, supplied by the caller because only the caller knows which silence it is; where the
+> server sends a reason (`run_status_reason`) the screen prints the SERVER's sentence verbatim and
+> composes none of its own. `refusal_code` is parsed off the terminal event's own detail rather than
+> stored a second time, and is `None` whenever the terminal is not a refusal.
+>
+> **A defect found while writing it, and fixed here.** `read_active_revision` answers about the
+> GROUP, and this route answers about one REQUEST — so a refused run would have reported the object
+> an EARLIER run published, and an operator reading a refusal beside a live table name would
+> reasonably conclude their run had put it there. `_published_by_this_run` scopes the pointer by
+> `run_id`; a group whose newest revision belongs to another run reads as "not published yet" on
+> this request, which is true of this request. What is currently published for the GROUP is a
+> different question and needs its own surface.
+>
+> **What this task did NOT do.** The plan's note that `allowed_actions`/`blocked_actions` "already
+> carry the four codes and their `next_step`" is about the ACTIVATION surface, not the run-status
+> one: nothing on `materialization_request` carries them, and rendering them here would mean
+> re-deriving an activation decision on a request that has already been accepted. Left where they
+> are.
+>
+> **The screen is flag-gated, mirroring the server.** `VITE_MATERIALIZATION_RUNS`, call-time like
+> `gateConsoleEnabled`: `FEATUREGEN_MATERIALIZE_ENABLED` is default-OFF and every
+> `/materialization-runs` route 404s while it is off, so a reachable screen with an unreachable API
+> behind it could only ever show an error. Flag-off, `#/materialization` parses like any unknown
+> hash — absent, not broken.
+> 6 new route cases in `tests/featuregen/api/test_materialization_runs.py` (42 total) and 8 Vitest
+> cases in `MaterializationRunScreen.test.tsx`.
+> Gates: full suite **11188 passed, 20 skipped** (11182/20 after D3); `-m eval` **73 passed**;
+> frontend **810 passed / 40 files** (baseline 802); ruff + mypy clean on both touched Python
+> files; `tsc --noEmit` and `oxlint` clean.
+
 ---
 
 ## 6. Phase E — proof

@@ -1,10 +1,11 @@
 import type { ReactElement } from 'react'
-import { entityMapEnabled, gateConsoleEnabled, useHashRoute } from './nav'
+import { entityMapEnabled, gateConsoleEnabled, materializationRunsEnabled, useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
 import { AssetDetailScreen } from './screens/AssetDetailScreen'
 import { EntityMapScreen } from './screens/EntityMapScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
+import { MaterializationRunScreen } from './screens/MaterializationRunScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
 import { IntegrationsScreen } from './screens/IntegrationsScreen'
@@ -174,6 +175,14 @@ const ICONS: Record<Route, ReactElement> = {
     <NavIcon>
       <rect x="3.25" y="2.75" width="9.5" height="10.5" rx="1.25" />
       <path d="M5.5 5.75h5M5.5 8h5M5.5 10.25h3" />
+    </NavIcon>
+  ),
+  // A detail sheet reached with a request_id, behind VITE_MATERIALIZATION_RUNS. The entry exists
+  // only because ICONS is an exhaustive Record<Route> (mirrors 'asset' / 'gate').
+  materialization: (
+    <NavIcon>
+      <path d="M3 11.5 8 3l5 8.5z" />
+      <path d="M3 13.25h10" />
     </NavIcon>
   ),
   // Also a detail sheet, not a nav tab (absent from PAGES): one table's suggested features. The
@@ -471,6 +480,9 @@ export default function App() {
           />
         )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
+        {route === 'materialization' && materializationRunsEnabled() && (
+          <MaterializationRunScreen requestId={params.get('request_id') ?? ''} />
+        )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
         {route === 'workbench' && <WorkbenchScreen />}
         {route === 'analysis' && <AnalysisWorkspaceScreen />}

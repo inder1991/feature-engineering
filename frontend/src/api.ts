@@ -4109,3 +4109,52 @@ export function postConceptConfirmations(
 ): Promise<ConceptConfirmationResult> {
   return post('/governance/concept-confirmations', { source, items, reason: reason ?? null })
 }
+
+// ── materialization runs (Phase G) ───────────────────────────────────────────────────────────────
+// GET /materialization-runs/{id}. The whole shape is the SERVER's answer and this client applies no
+// policy to it: `outcome` is the one word to lead with, and the server decides which word — most
+// importantly that `refused` is an OUTCOME rather than an error (a PUBLICATION_REFUSED run
+// compiled, rendered, sealed and PROVED its build; what is refused is publication, and the request
+// is `committed` because its evidence is on the control plane).
+//
+// Every nullable field below is an HONEST ABSENCE with its own meaning, never a placeholder to fill
+// in. `published_object === null` means "not published yet" — the platform names a physical target
+// for every group whether or not anything was ever published there, so a client that showed that
+// name would be inventing a table a reader cannot query.
+export type MaterializationOutcome =
+  | 'published' | 'refused' | 'failed' | 'rejected' | 'pending' | 'never_accepted'
+
+export interface MaterializationRunDetail {
+  request_id: string
+  logical_group_name: string
+  requested_by: string
+  authorized_roles: string[]
+  idempotency_key: string
+  activation_state: Record<string, unknown>
+  considered_revision_id: string | null
+  option_id: string | null
+  lifecycle_state: string
+  terminal: boolean
+  generation_id: string | null
+  run_id: string | null
+  // Folded from the append-only plane, never stored: null when no run exists yet, and then
+  // `run_status_reason` says WHICH silence it is. Exactly one of the two is ever non-null.
+  run_status: string | null
+  run_status_reason: string | null
+  terminal_event: string | null
+  outcome: MaterializationOutcome
+  // Present only on a refusal, and it is the code the terminal event itself carries.
+  refusal_code: string | null
+  published_object: string | null
+  published_generation_id: string | null
+  published_at: string | null
+  resolved_input_digest: string | null
+  requested_at: string
+  accepted_at: string | null
+  lease_expires_at: string | null
+  updated_at: string
+}
+
+export function getMaterializationRun(requestId: string): Promise<MaterializationRunDetail> {
+  return request(`/materialization-runs/${encodeURIComponent(requestId)}`)
+}
