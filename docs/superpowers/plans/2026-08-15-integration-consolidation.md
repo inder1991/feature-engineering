@@ -1,18 +1,21 @@
 # V2 as the feature language, on shared execution
 
-**Date:** 2026-08-16 · **Revision 8** — restructured onto the reviewed twelve-stage sequence. A
-second detailed review raised **26 findings; all 26 validated against this tree**, and eight of them
-are errors revision 7 introduced. The phase numbering changes from `P1–P8` to `S1–S12` because the
-*order* changed, not just the content — renumbering the old phases would have hidden that.
+**Date:** 2026-08-16 · **Revision 9** — restructured onto the reviewed **S0–S11** sequence. A third
+review raised **14 functional blockers plus eight design gaps; all validated against this tree.** The
+dominant correction is again sequencing: revision 8 decided group membership and minted an
+"executable formula" **before the compiler knows the complete physical reads and the materialization
+contract**, which is not derivable that early.
 
 > **V1 remains the stable compatibility language. V2 becomes the intelligent, policy-aware language
 > for all new features. LLMs create and enrich V2 formulas; a deterministic V2 compiler resolves
 > their banking meaning and runs them through the existing Spark/Kedro materialization platform.**
 
-**Do not reduce V2 to V1. Do not build a second V2 platform.**
+**Do not reduce V2 to V1. Do not build a second V2 platform.** Revision 4's "lowering" stays
+withdrawn — it destroys policy identity. Reuse V1's **execution machinery**; never V1's **artifact**.
 
-Revision 4's "lowering" stays **withdrawn** — it destroys policy identity. Reuse V1's **execution
-machinery**; never V1's **artifact**.
+**Scope discipline this revision adopts:** narrow the first executing vertical slice to semantics
+provable end-to-end, while preserving the whole V2 language and its expansion roadmap. Nothing below
+removes eventual functionality.
 
 ## 0. Position
 
@@ -22,419 +25,445 @@ machinery**; never V1's **artifact**.
 | Gets | correctness fixes only | policy awareness, multi-expression, advanced aggregation, LLM authorship |
 | Users choose? | no — the platform decides internally | no — the UI never asks for a version |
 
-**Shared execution** means V1 and V2 use the same Spark packaging, source binding, Hive access,
-window implementation, aggregation functions, staging, validation, feature-table assembly,
-publication and run tracking. **V2 adds preparation and calculation operators — not a second
-materialization product.**
+**Shared execution** means one Spark packaging, source binding, Hive access, window implementation,
+aggregation, staging, validation, assembly, publication and run tracking. **V2 adds preparation and
+calculation operators — not a second materialization product.**
 
-**V2-as-default is not flag-guarded, deliberately** (pre-live; the standing steer is to avoid flags
-that only defer a decision). But it **is** gated on S12's live-provider acceptance: `replay_v2`'s own
-docstring records that every run driving it in the suite is a recorded fixture, so *"a real model
-held to `AUTHOR_INSTRUCTION_V2` emits a usable v2 proposal"* is currently unproven.
+**Two-speed default [R9].** *Deterministic recipe-driven V2 generation* may ship at S1. **Free-form
+LLM-authored V2 must not become the default until S11's live-provider acceptance passes** —
+`replay_authoring_v2` records that every run driving it in the suite is a recorded fixture, so "a
+real model held to `AUTHOR_INSTRUCTION_V2` emits a usable v2 proposal" is unproven. Revision 8 put
+the UI stage ahead of that gate without noticing the dependency.
 
 ## 0.1 Verified before planning
 
-Everything here was re-checked against this working tree for revision 8.
+Re-checked against this tree for revision 9. **Reviewed baseline: `29f3b8ac`; targeted suite 2,827
+passed, 1 skipped.**
 
-**The shape of what exists**
+**The authoring and admission path is structurally V1-only**
 
-- **The authored V2 artifact is already a durable pair** — `AuthoringResultV2` (`result_v2.py:76`)
-  folds `TypedFormulaProposalV2` + `FormulaOutputPolicyV2`. **There is no executable V2 artifact, and
-  no `TypedFormulaV2` was ever minted.**
-- **The window is already a governed type.** `expression_ir.py:284` `PitSpec` carries
-  `window_basis · window_length · window_unit · window_start_inclusive · window_end_inclusive ·
-  window_timezone` plus the clock, and `nodes_compute.py:956` already renders the window from it. It
-  **deliberately excludes** `empty_window` and `null_input` (`:287`).
-- **`banking_policies.py` registers policy KINDS and their resolution homes — it is not a
-  realization store.** Some homes point back at the formula schema or output authority itself.
-- **`data_agent/eligibility_store.py` is keyed by `(catalog_source, table)`** and carries
-  `reversal_mode · reversal_column · non_reversed_values` — a flag/code shape only.
-- **The engine advertises four aggregates** (`sum`, `count_rows`, `count_non_null`, `count_distinct`)
-  derived from **renderer dispatch** (`renderable_aggregations()`), **not from execution evidence**.
-- **Physical typing accepts `TypedFormulaV1` only** (`physical_types.py:375`).
-- **Two governance mechanisms exist, not one.** `governance/attributes.py:14` `VERIFICATION_STAMPS`
-  is the `feature_versions` vocabulary (migration 0060 CHECK); `feature_validation_projection.py`
-  folds `ASSESSED / EXTERNAL_PASSED / EXTERNAL_FAILED / INVALIDATED / SUPERSEDED` into `DATA-CHECKED`
-  only when every blocking requirement holds a current pass.
+- `AuthoringResultV2` (`result_v2.py:76`) folds `TypedFormulaProposalV2` + `FormulaOutputPolicyV2`,
+  and `replay_authoring_v2.py:209` has its own terminal restorer.
+- **But `resolve.py:48` imports only the V1 restorer and `AuthoringResult`**;
+  `admission.py:156` types `result: AuthoringResult`, `:175` types `formula: TypedFormulaV1`, and
+  `:228` refuses v2 by name. "Add V2 admission" is six tasks, not a line.
+- **`recipe_formula_shadow_work_item` is the ONLY durable intent anchor.** `resolve.py` reads it
+  directly (`_SELECT_WORK_ITEM`) and documents it as the columns "that carry an authoring intent".
+- **The V2 worker always enters the LLM replay orchestrator** (`recipe_formula_worker.py`,
+  `if authors_v2: run_authoring_v2_replay(...)`). There is **no deterministic authoring producer.**
 
-**The shape of what is broken**
+**Grouping cannot be known early**
 
-- **Generation, execution and publication are ONE operation.** `compile_feature_group`
-  (`chain.py:467`) records → renders → validates → `_execute_the_run` (whenever the selection is a
-  `PublisherSelection`) → `publish_generation`. Continuous.
-- **It is group-wide**, keyed by `logical_group_name` — not per-feature.
-- **Verification currently requires publication capability.** `sandbox_execution_hash`
-  (`identity.py:479`) requires a non-defaulted `capability_attestation_id`; the docstring makes the
-  non-default deliberate.
-- **The UI cannot reach code generation.** `api.ts:4190` has **only** a materialization-run GET —
-  no POST client. The backend POST takes raw `recipe_formula_shadow_work_item` ids, and those are
-  opportunistic, flag-dependent, created on the *generation response* path, and capped at
-  `MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12`. **A user-selected candidate outside that top 12 has no
-  executable work item.**
-- **Feature identity still collapses variants.** `govern.py:610` selects
-  `WHERE feature_name = %s ORDER BY version DESC LIMIT 1` — "count 30d", "count 90d", "count
-  excluding reversals" and "count in base currency" all resolve to one feature.
-- **`required_policy_kinds()` has ZERO production callers** — only its own `__all__`, its docstring,
-  and tests. Nothing derives the *required* policy set anywhere in the pipeline.
-- **The staging manifest carries no policy evidence** — `_manifest_lines` is *"counts, hashes and
-  locations only"*.
-- **`business_dt` never reaches the queue** — the string does not appear in
-  `api/routes/materialization_runs.py` at all, so every public request is compile-only.
-- **Cross-catalog execution refuses by construction** — `chain.py:906`: the chain has no parameter
-  carrying a `BridgeExecutionAuthorization`, so a bridged group stops at `PREPARE_RUN` with
-  `JOIN_CARDINALITY_UNKNOWN`.
-- **Migration prefixes already collide** at **0973, 0974, 1034, 1036, 1037, 1038, 1040**. Prose
-  reservations are demonstrably not enough.
-- **Two DEFERRED-WORK blockers sit on the pilot path**: A.32 🔴 `requirements.lock` installs an
-  environment that cannot construct the rendered catalog; and `input_snapshot_ids` are hashed but are
-  not content snapshots, so two runs over the same partitions after an in-place rewrite share an
-  execution identity.
+- `derive_contract(conn, ir: FormulaExecutionIRV1, ...)` takes **the IR**; classification consumes
+  the complete physical read set.
+- **`group_by_contract` refuses a compilation with more than one contract** — it does not split.
 
-**The exemplar's contradictions, enumerated rather than assumed**
+**Activation contradicts the plan's own §0.3**
 
-| | Recipe (`transaction_foundation.py:46-49`) | Gold fixture (`gold_v2/30_posted_debit_amount_exemplar.json`) |
-|---|---|---|
-| status | `eligible_status:foundation-posted-events` | `policy:eligible-posted-status` |
-| reversal | `reversal_correction:foundation-flag-or-code` | `policy:reversal-neutralizes-original` |
-| direction | `direction_sign:foundation-signed-by-indicator` | `policy:dc-sign-convention` |
-| currency | `currency_conversion:foundation-base-currency` | `policy:governed-rate-at-booking` |
-| window | — | trailing 90 day, **`Asia/Dubai`**, **`[inclusive, exclusive)`**, `empty_window: zero`, `null_input: ignore` |
+- `semantic_eligibility.py` `AUTHORITY_MATRIX`: `llm/proposed` → `authoring: False`,
+  `execution_at_governed: False`, with the comment *"`llm/proposed` NEVER clears execution."*
+- The materialization route gates on `_require_the_option_allows_materialization` under action
+  `execute_materialization`.
 
-**Revision 7 over-narrowed this and is corrected here.** It claimed timezone and boundaries were
-"not conventions to choose" because `PitSpec` governs them. `PitSpec` supplies the **fields**; it
-does not supply the **values**, and the two artifacts disagree. No new window type is needed — **and
-a decision is still required.**
+**The pilot's "gold" is three disagreeing artifacts, and the exemplar cannot reproduce its own answer**
 
-**Standing instruction for every stage: check what exists before designing what to add.** Three
-revisions running proposed building something the codebase already had.
+| | timezone | boundary | length |
+|---|---|---|---|
+| derived blueprint (`recipe_formula_blueprint_derivation.py`) | **UTC** | `(start, end]` | recipe |
+| V2 proposal fixture (`gold_v2/30_posted_debit_amount_exemplar.json`) | **Asia/Dubai** | `[start, end)` | **90 d** |
+| execution gold (`recipes/gold/posted_debit_amount_expected.json`) | — | `(start, end]` | **30 d** |
 
-## 0.2 Non-negotiable rules — this plan's invariants
+**And the decisive one [R9]:** the synthetic ledger stores `direction` as **`D`** (11 rows) / `C`
+(1 row), while the V2 fixture's predicate is `direction == "debit"`. **Rendering that predicate
+literally returns zero rows — not `ACC1=300.00` / `ACC2=93.50`.** The pilot exemplar, as frozen today,
+cannot reproduce its own hand-computed result. This is the whole policy-realization thesis in one
+fixture: a direction policy must *map* the semantic notion to the source's encoding, and rendering
+the raw authored predicate is precisely the bug.
+
+The execution gold is also missing cases it needs: a spine account with **zero** eligible
+transactions · an unknown-transaction account · a reversal arriving **after** the cutoff · a
+duplicate and a missing FX rate · an FX record whose **knowledge time** is after the cutoff.
+
+**Everything else confirmed**
+
+- `PitSpec` (`expression_ir.py:284`) governs the expression window and **excludes** `empty_window`
+  and `null_input` (`:287`). It has no offset or future-horizon representation.
+- **Input snapshot ids are not content snapshots** — `runprep.py` hashes the requirement id, ordered
+  partitions and business date. An in-place rewrite yields the same id.
+- **`GATES_PASSED` is not terminal.** `TERMINAL_RUN_EVENT_KINDS` = `{GATES_FAILED, PUBLISHED,
+  PUBLICATION_REFUSED, RUN_FAILED}`. A verification the user never publishes stays permanently
+  non-terminal.
+- **The validation registry has exactly eight external requirements**: `ADDITIVITY_SUPPORTS_OPERATION
+  · CURRENCY_CONSISTENT · GRAIN_IS_UNIQUE · JOIN_CONNECTIVITY · TEMPORAL_IS_POPULATED ·
+  TEMPORAL_LAG_BOUNDED · TYPE_IS_NUMERIC · UNIT_CONSISTENT`.
+- `sandbox_execution_hash` (`identity.py:479`) requires a non-defaulted `capability_attestation_id`.
+- `compile_feature_group` (`chain.py:467`) renders → validates → executes → publishes continuously,
+  keyed by `logical_group_name`.
+- `govern.py:610` selects `WHERE feature_name = %s ORDER BY version DESC LIMIT 1`.
+- `api.ts:4190` has only a materialization-run GET; the backend POST takes shadow work-item ids
+  capped at `MAX_RECIPE_FORMULA_CAPTURES_PER_RUN = 12`.
+- `required_policy_kinds()` has **zero production callers**.
+- `_manifest_lines` is *"counts, hashes and locations only"*.
+- `physical_types.resolve_physical_type` accepts `TypedFormulaV1` only.
+- `engine_capability` derives from **renderer dispatch**, not execution evidence.
+- `banking_policies.py` registers kinds; `eligibility_store.py` is keyed `(catalog_source, table)`
+  with a **flag/code-only** reversal shape; currency and allocation have **no store at all**.
+- `business_dt` appears **nowhere** in `api/routes/materialization_runs.py`.
+- Cross-catalog execution refuses at `chain.py:906`; migration prefixes collide at **0973, 0974,
+  1034, 1036, 1037, 1038, 1040**.
+- DEFERRED-WORK: A.32 🔴 `requirements.lock` cannot construct the rendered catalog; DATE clocks
+  outside UTC refuse because PIT carries no clock type.
+
+**Standing instruction: check what exists before designing what to add.** Four revisions running
+proposed building something the codebase already had.
+
+## 0.2 Invariants
 
 1. No V2 formula executes with an unresolved policy reference.
 2. **A non-empty policy string is not proof that the policy exists.**
-3. Every resolved policy must be **consumed** by the execution plan, **proved by the renderer, not
-   asserted by the plan**.
+3. Every resolved policy is **consumed**, proved by **typed DAG connectivity plus total renderer
+   dispatch** — never by a reported hash alone **[R9]**.
 4. No policy may disappear when V2 reuses existing operators.
 5. Policy revisions and physical bindings enter executable identity.
-6. V1 formula hashes remain unchanged.
+6. V1 formula hashes and V1 IR canonical bytes remain unchanged.
 7. V1 and V2 share publication and validation machinery.
 8. The LLM proposes and explains; deterministic code executes.
 9. The UI never asks a user to choose a formula version.
-10. **"Supported" means generated code has been executed successfully** — not that the schema can
-    describe the operation.
-11. **[R8] Required = declared = resolved = consumed.** Checking only that *declared* policies
-    resolve is necessary and insufficient: `AuthorityRefsV2` permits a partial block, so a formula can
-    omit a required policy entirely and still pass. A missing status, reversal or sign policy produces
-    confidently wrong numbers.
+10. **"Supported" means generated code has been executed successfully**, recorded against a
+    **capability signature** — not an operator name **[R9]**.
+11. **Required = declared = resolved = consumed, occurrence-addressed [R9]:**
+    ```
+    executable_revision + expression_path + physical source binding revision
+      + policy kind + semantic role
+    ```
+    Kind-level sets fail for ratio, difference and composite formulas: two expressions may each need
+    their own status or reversal realization, and one must not satisfy both merely by sharing a kind.
+    The invariant is a **one-to-one** mapping between requirement occurrences, resolved realizations,
+    typed IR operators and renderer consumption.
 
-**Rule 10's bootstrap.** Advertise-after-execution plus a UI offering only advertised operations is
-circular. The escape: an operator's first execution happens on **S8's development gold path, outside
-the product**. Nothing is advertised to a user in order to become executable.
+**Rule 10's bootstrap:** an operator's first execution happens on **S7's development gold path,
+outside the product**. Nothing is advertised to a user in order to become executable.
 
-## 0.3 Division of labour
+## 0.3 Division of labour, and what each action costs
 
 **LLM:** understand the hypothesis · select recipes · propose candidates · map roles to concepts ·
 recommend physical columns · interpret source-specific status descriptions · propose debit/credit
 conventions and reversal representations · identify currency and rate columns · produce structured V2
 formulas · critique · explain refusals · summarise results.
 
-**Deterministic code:** validate V2 structure · bind columns · **derive the required policy set** ·
-resolve policy records · check every policy is executable · compile the execution plan · generate
-Spark · execute arithmetic · validate output · publish. **The LLM never injects free-form SQL.**
+**Deterministic code:** validate structure · bind columns · **derive the required policy set** ·
+resolve realizations · check executability · compile the plan · generate Spark · execute · validate ·
+publish. **The LLM never injects free-form SQL.**
 
-**Reviewed recipes instantiate deterministic V2 blueprints directly [R8].** Do not ask a model to
-restate arithmetic the registry already knows.
+**Reviewed recipes instantiate deterministic V2 blueprints directly** — never ask a model to restate
+arithmetic the registry already holds.
 
-**Human confirmation does not gate sandbox experimentation.** An LLM-proposed policy is usable when it
-carries producer, confidence, evidence, source columns, observed values, and model/prompt version —
-disclosed in the UI. **Missing or contradictory semantics still refuse**, because that is a
-calculation problem, not a governance preference.
+**Activation becomes consequence-specific [R9].** Revision 8 asserted that human confirmation does
+not gate sandbox experimentation; the `AUTHORITY_MATRIX` says `llm/proposed` clears nothing, and the
+only positive route test monkeypatches state to pass. Replace the single `execute_materialization`
+gate with three actions:
+
+| Action | `llm/proposed`, deterministically validated |
+|---|---|
+| `generate_code` | **may clear** |
+| `verify_in_sandbox` | **may clear** |
+| `publish_sandbox` | **own policy — does not inherit the above** |
+
+**Hard contradictions, leakage, unsupported fan-out and missing semantics still refuse** at every
+level: those are calculation problems, not governance preferences.
 
 ## 0.4 Three words that must not blur
 
-- **Execution proof** (S8) — development-time, mutation-tested, against reviewed gold fixtures. How
-  an operator earns advertisability under rule 10.
-- **Sandbox verification** (S9) — the user-triggered product capability, against the exact sealed
-  artifact on real data.
-- **Publication** (S10) — atomic, group-wide, capability-checked.
+**Execution proof** (S7) — development-time, mutation-tested, against reviewed gold. **Sandbox
+verification** (S8) — user-triggered, against the exact sealed artifact on real data. **Publication**
+(S9) — atomic, group-wide, promoting *exactly the verified bytes*.
 
-**Do not re-run generic gold fixtures for a user verification** unless a tested input-remapping
-mechanism exists. They are different data with different meaning.
+**Never re-run generic gold fixtures for a user verification** without a tested input-remapping
+mechanism. They are different data with different meaning.
 
-## 0.5 Migration reservations — a checked ledger, not prose [R8]
+## 0.5 Migration ledger
 
-Prefixes already collide at 0973, 0974, 1034, 1036, 1037, 1038, 1040, so **S1 builds a ledger with a
-uniqueness test in CI** before any number below is used. Storage this plan needs: exact
-selected-feature identity and build mapping · build requests and attempts · group membership · policy
-realization revisions · verification requests and results · operator execution proofs · profiles.
-**Numbers are allocated in S1 against the ledger, and deliberately not guessed here** — revision 7
-reserved three for a plan that needs at least seven.
+Prefixes already collide seven times, so **S0 builds a ledger with a CI uniqueness test** before any
+allocation. Storage needed: generalized authoring work item · exact selected-feature identity and
+build mapping · policy realization revisions · verification requests/attempts/results · verified
+output revisions · publication requests/attempts · operator execution proofs · profiles.
+
+**Reuse existing tables where their meaning fits** — `materialization_request`,
+`materialization_generation`, the compiled-artifact and run-event tables. **Do not add parallel
+`FeatureBuild*` tables without an explicit migration map [R9].**
 
 ## 1. The sequence
 
-### S1 — foundation decisions and ownership
-
-**A hard STOP gate, because S1 is where humans decide [R8].** Revision 7 asked the executor to
-"record contradictions but not decide them" while its acceptance demanded a frozen artifact. Those
-cannot both happen. The gate is:
+### S0 — freeze the complete pilot truth *(hard STOP: humans decide)*
 
 ```
 enumerate contradictions → governance/product decision → decision record
-   → reconcile recipe, blueprint, fixture and expected rows → freeze hash
+   → reconcile blueprint, fixture, execution gold and expected rows → freeze hash
 ```
 
-The contradictions are enumerated in §0.1 — **policy-reference namespace, timezone, window
-inclusivity**. Whether the canonical namespace is `eligible_status:*` or `policy:*`, and which
-window convention wins, are **the user's or operator's calls and are not resolved here**. Enumerate
-further contradictions rather than assuming that table is complete.
+**Reconcile all three artifacts, not two** — the derived blueprint (UTC, `(start,end]`), the V2
+fixture (Asia/Dubai, `[start,end)`, 90 d) and the execution gold (`(start,end]`, 30 d). Decide:
+policy-reference namespace · window timezone, boundary and length · **reversal-as-of semantics** ·
+**direction mapping (`D`/`C` ↔ debit/credit)** · population spine · **FX join and cardinality** ·
+publication rule.
 
-Also in S1: the migration ledger · **exact selected-feature identity** (`feature_definition_key` /
-`revision` / `executable_revision_id` / `output_column_name` / `display_label`) · build-request
-identity · group membership · and a named owner for the V2 IR.
+**Replace the gold corpus with one coherent parameterized exemplar**, extended to cover: a spine
+account with zero eligible rows · an unknown-transaction account · a reversal arriving after cutoff ·
+duplicate and missing FX rates · an FX record whose knowledge time is after cutoff.
 
-> **Acceptance:** a decision record exists for each contradiction, naming who decided; recipe,
-> blueprint, fixture and expected rows agree afterwards; the frozen expectation is a stored hashed
-> artifact; the migration ledger has a CI uniqueness test that fails on the seven existing
-> collisions unless they are explicitly grandfathered.
+**Decide the FX catalog question [R9].** The pilot joins booking-date FX while cross-catalog
+execution refuses by construction. Either **prove and pin a same-catalog rate source**, or bring a
+bounded reference-data join authorization into the pilot. Do not assume it away.
 
-### S2 — exact feature identity *(prerequisite, not parallel)*
+Also: the migration ledger.
 
-**Promoted out of "carried forward, blocking nothing" [R8].** `govern.py:610`'s lookup by
-`feature_name` collapses distinct variants, so generation and contract creation cannot address the
-feature a user actually chose. Everything downstream inherits the ambiguity.
+> **Acceptance:** each contradiction has a decision record naming who decided; all three artifacts
+> agree afterwards; the frozen exemplar is stored and hashed; **the frozen predicate returns the
+> hand-computed rows against the ledger's actual `D`/`C` encoding**; the ledger's CI uniqueness test
+> fails on the seven existing collisions unless explicitly grandfathered.
 
-Applied **at contract creation**. Plus the **selected-feature build mapping**:
+### S1 — exact selection and durable authoring
 
-```
-considered_revision_id + option_id + feature_definition_key
-  + executable_revision_id + output_column_name  →  the exact build work item
-```
+**Exact feature identity** (`feature_definition_key` / `revision` / `executable_revision_id` /
+`output_column_name` / `display_label`), applied **at contract creation**, reusing the existing
+suggestion and option identities.
 
-**Generate must create or find that work item. It must never depend on shadow capture** — those are
-opportunistic, flag-dependent and capped at 12.
+**Generalize the work item — do not delete it [R9].** Revision 8 required that no generation path
+read `recipe_formula_shadow_work_item`; that row is the only durable bridge into materialization.
+Generalize it into **`formula_authoring_work_item`**, and restate the requirement as:
 
-> **Acceptance:** four variants of one display name resolve to four features; a candidate ranked
-> outside the shadow top 12 generates successfully; no generation path reads
-> `recipe_formula_shadow_work_item`.
+> Generation must not depend on shadow **ranking**, the **top-12 cap**, or **opportunistic capture**.
+> A selected option creates the same kind of sealed work item directly.
 
-### S3 — the policy-realization layer
+**Stable output-column naming [R9]** — four exact identities can still collide on one
+`posted_debit_amount` Hive column. Variants need deterministic, stable physical names.
 
-**`banking_policies.py` is a registry of kinds, not a store [R8].** Build
-**`PolicyRealizationRevisionV1`** — immutable, keyed by:
+**A deterministic authoring producer [R9]** — today the V2 worker always enters LLM replay. The
+producer binds the reviewed blueprint → constructs the proposal deterministically → runs the **same**
+structural, output-authority and critic gates → writes the **standard V2 replay trace** → yields an
+ordinary `AuthoringResultV2`. **No second admission shortcut.**
 
-```
-abstract policy ref + physical dataset binding + environment/source + effective semantics
-```
+**V2 resolution and admission, as explicit tasks:** version-dispatched trace restoration · V2
+terminal hash verification · `ResolvedFeatureInputV2` · `AdmittedFeatureV2` · proposal/output-pair
+coherence · shared batch and name-collision handling. V1 admission byte-untouched.
 
-carrying executable fields, provenance, revision, physical dependencies and temporal rules.
+> **Acceptance:** four variants of one display name resolve to four features with four stable column
+> names; a candidate outside the shadow top 12 authors and admits; a reviewed recipe produces a
+> durable replayable `AuthoringResultV2` with **no provider call**; a **frozen-bytes test pins
+> existing V1 formula hashes** (rule 6, untested through revision 8).
 
-- **Status** → status column, eligible values, null behaviour.
-- **Direction** → representation (positive magnitude + indicator, or signed amount), direction
-  column, debit values, amount normalization.
-- **Reversal** → flag/code · linked reversal transaction · compensating transaction · status history ·
-  negative entry. Today's eligibility store implements **flag/code only**. Each mode gets its own
-  deterministic implementation; **unsupported modes refuse by name, never approximated as a flag**.
-- **Currency** → currency column, base currency, rate table, source/target keys, effective timestamp,
-  booking-vs-settlement rule, rate direction, rounding. **No source-specific rate-policy store exists
-  today**, and `output_authority_v2.py` currently reflects an arbitrary non-empty ref as
-  `converted:<ref>` without proving the policy exists — rule 2, in code.
-- **Allocation** → full · equal split · ownership percentage · primary owner · other governed method.
-  **No executable realization store exists today.**
+### S2 — split actions and lifecycle contracts
 
-**Required-policy derivation, wired [R8].** `required_policy_kinds()` exists and has no caller. Give
-it one, post-binding, deriving from aggregate and operation · monetary/unit facts · filter semantics ·
-per-row currency · source lifecycle representation · cross-grain rollup · physical source
-characteristics. Then enforce rule 11's equality.
-
-**Policy inputs get full PIT and read-set treatment [R8].** `PitSpec` covers the expression's source
-window and nothing else — not the FX rate table, reversal history, linked reversals, allocation
-tables or effective-dated mappings. Every realization that reads data contributes its own event and
-knowledge time · as-of join rule · physical input requirements · sensitivity/access/retention class ·
-run input snapshots · lineage · authorization · executable identity. **Without this an FX or reversal
-join can read the future, or read an undeclared restricted table.**
-
-**Policy inputs also enter the materialization contract.** A feature reading a restricted FX table
-must not land in a public group because its primary transaction input is public.
-
-> **Acceptance:** an unresolvable reference refuses by name rather than defaulting; a formula that
-> omits a required kind refuses under rule 11; an unsupported reversal mode refuses and names the
-> mode; a realization whose as-of rule would read post-cutoff FX refuses; a restricted policy input
-> changes the group's classification.
-
-### S4 — the executable V2 revision
-
-**`ExecutableFormulaRevisionV2`, and only now [R8].** Revision 7 placed this before policy
-resolution existed, so its own acceptance was unsatisfiable. It combines: authored `AuthoringResultV2`
-(unchanged) · physical bindings · resolved policy realizations · complete read set including policy
-inputs · policy dependencies · **IR schema version, compiler version and policy-realization
-versions**.
-
-**The `compiler-lowering version` field is deleted — there is no lowering [R8].**
-
-V2 admission added; V1 admission byte-untouched (rule 6).
-
-> **Acceptance:** a revision round-trips through durable state with every hash re-verified; **a
-> frozen-bytes test pins a corpus of existing V1 formula hashes and fails if any moves** — rule 6 is
-> this program's compatibility guarantee and was untested through revision 7; a v3-or-later formula
-> refuses by name at V2 admission, as `admission.py:228` already does for v2 at v1.
-
-### S5 — V2 physical typing and IR
-
-**`FormulaExecutionIRV2`, a distinct type [R8]** — never a mutation of V1's IR, so V1 canonical bytes
-stay frozen. Bounded and typed: `Scan · Filter · ReversalNeutralization · Join · CalculatedColumn ·
-Aggregate · FinalCombination`.
-
-**No `TimeWindow` operator.** `PitSpec` models the window and the renderer already renders it; a
-second representation is the duplication rule 4 exists to prevent.
-
-**`PhysicalTypePolicyV2`, versioned [R8]** — `resolve_physical_type` takes `TypedFormulaV1` only, so
-V2 has no Hive/Spark type adapter at all. It must settle AVG scale and precision · ratio and
-percentage scale · FX multiplication precision · percentile output · slope output · nullability ·
-empty-window behaviour · rounding and overflow. **The group plan and rendered schema cannot be
-correct before this exists.**
-
-Pilot plan: scan → filter eligible statuses → apply debit direction → neutralize reversals → window
-*(from `PitSpec`)* → join booking-date FX → `normalized_amount = amount × rate` → group by account →
-`SUM`.
-
-**Safe reuse requires BOTH checks (rule 4):** does the structure fit existing operators, **and** can
-every resolved policy be implemented by them? Only then is V1's computation path reused — and the
-formula **remains V2** for identity, audit and provenance.
-
-> **Acceptance:** V1 IR canonical bytes are unchanged by S5; the pilot compiles with no window node;
-> a policy no existing operator can implement refuses rather than compiling to a plan that drops it;
-> FX multiplication precision is asserted, not inherited by accident.
-
-### S6 — code generation only
-
-Render and seal readable Kedro nodes: `filter_eligible_transactions` ·
-`normalize_transaction_direction` · `neutralize_reversals` · `join_booking_fx_rates` ·
-`calculate_base_currency_amount` · `aggregate_posted_debit_amount` ·
-`validate_posted_debit_amount`. **No window node** — the window renders inside the calculation node
-from `PitSpec`, as it does for V1.
-
-**Execute nothing. Publish nothing.**
-
-**Rule 3's proof, corrected — the revision-7 mechanism was forgeable [R8].** Copying policy hashes
-from the plan into the staging manifest proves only that *the plan mentioned them*. A mutation could
-delete reversal filtering, leave the hash in place, and the gate would pass. Instead:
-
-```
-render_policy_operator(...) → rendered code fragment + consumed_policy_hashes
-```
-
-**The renderer may return a hash only from the code branch that actually emitted the operation.**
-Before sealing, generation compares `union(renderer-reported consumed)` against the resolved
-required set. The runtime manifest may *retain* that proof; it must never *manufacture* it.
-
-Generation's honesty preconditions: structurally valid formula · every required column bound · **every
-required policy resolved (rule 11)** · no placeholders · valid hashes · renderer-proved consumption.
-Passing these means the code was generated honestly. **It claims nothing about execution.**
-
-> **Acceptance:** deleting the reversal filter from a rendered node makes generation refuse and name
-> the policy, **with the hash still present in the plan**; the consumed set is a function of emitted
-> code, or the check proves nothing.
-
-### S7 — split the chain into three commands
-
-**The central prerequisite for on-demand verification [R8].** `compile_feature_group` cannot be
-retrofitted with a request kind; it must become three real commands:
+`compile_feature_group` becomes three commands — it cannot be retrofitted with a request kind:
 
 | Command | Does | Must not |
 |---|---|---|
-| `generate_artifact()` | render, seal, store code | execute, publish |
-| `verify_artifact()` | execute the exact sealed artifact in sandbox, record results | publish |
-| `publish_verified_artifact()` | revalidate current verification, recheck capability, publish atomically | execute |
+| `generate_code()` | render, seal, store | execute, publish |
+| `verify_in_sandbox()` | execute the sealed artifact, record results | publish |
+| `publish_sandbox()` | promote **exactly the verified output** | execute |
 
-**`VerificationExecutionIdentityV1`, separate from `sandbox_execution_hash` [R8].** The existing hash
-requires a `capability_attestation_id`, so it cannot honestly identify an execution with no
-publication intention. The new identity covers rendered artifact identity · environment · business
-date · resolved parameters · exact input snapshots · verification check-suite version · compiler and
-renderer versions. **Publication capability is checked only by `publish_verified_artifact()`.**
-
-Three lifecycles kept apart: `FeatureBuildRequest` (intent) · `FeatureBuildAttempt` (retryable) ·
-`MaterializationRun` (outcome).
-
-> **Acceptance:** generation reaches sealed code with no run event on the plane; verification
-> executes with no publication capability present; publication refuses on a stale or absent
-> verification; no path from generate to publish exists without two further explicit commands.
-
-### S8 — development execution proof
-
-Against the synthetic ledger, the **generated Spark code** — not a test-side Python function —
-reproduces the hand-calculated result: posted debit AED **included** · credit **excluded** ·
-pending/failed **excluded** · reversed original **excluded** · reversal row **excluded** · USD
-**converted at the booking-date rate** · out-of-window **excluded**.
-
-**Required mutation failures:** drop the status filter · count reversal rows · use one flat FX rate ·
-use settlement instead of booking date · ignore direction · shift the window boundary.
-
-**`OperatorExecutionProofV1` [R8]** — a real store. Advertised operations become
-`renderer-supported ∩ current successful execution proof`. **Revision 7 cited
-`engine_capability.py` as the precedent for execution-derived advertising; it is not** — it derives
-from `renderable_aggregations()`, i.e. renderer dispatch, and the tests pin that. It is the
-precedent for *deriving rather than hand-maintaining*, and nothing more.
-
-**Close the pilot's blockers here:** the DATE-clock refusal outside UTC (PIT carries no clock type)
-and A.32 🔴 (`requirements.lock` cannot construct the rendered catalog).
-
-> **Acceptance:** all seven expectations hold against generated code; all six mutations fail; each
-> proof names S1's frozen gold hash, so a changed expectation invalidates it.
-
-### S9 — on-demand sandbox verification
-
-**Governing rule:**
-
-> Code generation is immediate. **Verification is user-triggered.** Its checks run in dependency
-> waves once triggered, and every result is attached to the exact generated artifact.
-
-**Checks are a DAG, not a flat parallel set [R8]:**
+**Three request/attempt/result triples [R9]**, because `GATES_PASSED` is not terminal and a verified
+-but-unpublished run would otherwise never close:
 
 ```
-build + static checks → execute → ⟨keys · grain · types · nulls · inflation · profile⟩ → fold
+BuildRequest        → BuildAttempt        → GeneratedArtifact
+VerificationRequest → VerificationAttempt → VerifiedOutputRevision
+PublicationRequest  → PublicationAttempt  → ActiveRevision
 ```
 
-Only the last wave is parallel. The request is one durable object with per-check results, so a
-failure names **which** check failed.
+**`VerificationExecutionIdentityV1`**, separate from `sandbox_execution_hash`, which requires a
+`capability_attestation_id` and so cannot honestly identify an execution with no publication
+intention. Covers rendered artifact identity · environment · business date · resolved parameters ·
+input snapshots · check-suite version · compiler and renderer versions.
 
-**Verification does not write `DATA-CHECKED` [R8].** Revision 7 had the wrong mechanism. Store the
-verification as **its own immutable evidence**; if it satisfies a contract requirement, link it to
-the exact `contract_id` and `requirement_id` and **emit `EXTERNAL_PASSED`**, letting
-`feature_validation_projection` derive `DATA-CHECKED` when every blocking requirement holds a current
-pass. A verification may occur before a feature version exists at all. **Never write
-`USEFULNESS-CHECKED` from materialization verification.**
+> **Acceptance:** generation leaves no run event on the plane; verification executes with no
+> publication capability present; every triple reaches a terminal state; the migration map from
+> existing tables is explicit.
 
-**Staleness is computed on read, never pushed on write.** The reader recompares the recorded hash set
-— generated project · V2 formula · resolved policies · binding revisions · compiler and renderer
-versions · input snapshot — against current. Disagreement *is* staleness. Detected automatically,
-**never re-run automatically**: the state names what changed and waits.
+### S3 — minimal executable policy realization, **with a producer**
 
-**Profiling splits in two [R8]:** blocking output-sanity checks belong to verification; advisory
-EDA/profile generation is a separate attempt whose failure cannot fail a validated publication.
+**`PolicyRealizationRevisionV1`** — immutable, keyed by `abstract policy ref + physical dataset
+binding + environment/source + effective semantics`, carrying executable fields, provenance,
+revision, physical dependencies and temporal rules.
 
-> **Acceptance:** a verification survives restart with per-check results intact; changing any one
-> recorded input flips a pass to stale and names it; a pass emits `EXTERNAL_PASSED` and writes no
-> stamp directly; nothing writes `USEFULNESS-CHECKED`; `Generated — not verified` is never rendered
-> by a failure path.
+**Implement only the pilot's modes; define the rest and refuse them by name:** eligible statuses ·
+**indicator-based debit selection** (the `D`/`C` mapping) · the decided reversal mode ·
+booking-date FX.
 
-### S10 — atomic sandbox publication
+**Add the producer workflow [R9]** — without it the store stays empty and every V2 formula refuses.
+It needs: the LLM structured-output contract · source/profile evidence collection · deterministic
+proposal validation · conflict detection · current-revision selection · realization writes · UI
+disclosure.
 
-Require a current passing verification *(provisional — see the open decision)*, recheck publication
-capability and policy dependencies at publish time, then publish the **whole group atomically** with
-table-level visibility and reconciliation.
+**Resolve the dual authority [R9]:** status and reversal already have a **mutable** store at
+`eligibility_store.py`. Either migrate it or put a single adapter in front of it. **Two current
+answers is not an option.**
 
-**OPEN — the operator's decision, not this plan's:** may an unverified generation be published if
-explicitly marked as such?
+**Wire `required_policy_kinds()`** — it has no caller — into occurrence-addressed derivation
+(rule 11) from aggregate and operation · monetary/unit facts · filter semantics · per-row currency ·
+source lifecycle representation · cross-grain rollup · physical source characteristics.
 
-> **Acceptance:** a stale verification blocks publication; capability revoked between verify and
-> publish blocks publication; a partial group never becomes visible.
+**Policy inputs get full PIT and read-set treatment.** `PitSpec` covers only the expression window —
+not FX tables, reversal history, linked reversals, allocation tables or effective-dated mappings.
+Each reading realization contributes event and knowledge time · as-of join rule · physical input
+requirements · sensitivity/access/retention class · run input snapshots · lineage · authorization ·
+executable identity. **Policy inputs also enter the materialization contract**: a restricted FX table
+must not ride into a public group behind a public transaction input.
 
-### S11 — UI integration
+> **Acceptance:** an unresolvable reference refuses by name; a formula omitting a required occurrence
+> refuses under rule 11; an unsupported reversal mode refuses and names it; a realization whose
+> as-of rule would read post-cutoff FX refuses; one status kind used by two expressions requires two
+> realizations; a restricted policy input changes the group's classification.
 
-Wire the exact selected option to **Generate → Verify → Publish**, three actions never collapsed.
+### S4 — the bound V2 formula
 
-**States:** `Generated — not verified` · `Verification queued` · `Verification running` ·
-`Verification passed` · `Verification failed` · `Verification stale`.
+**`BoundFormulaRevisionV2`** — authored proposal, output policy, physical formula bindings, policy
+realization pins. **It makes no complete-read-set claim [R9]**; revision 8's artifact asserted reads
+that only planning discovers.
+
+**Compiler versions must not change the bound formula's semantic identity.**
+
+> **Acceptance:** a compiler version bump leaves the bound-formula hash unchanged; the artifact
+> cannot be constructed with an unpinned realization.
+
+### S5 — V2 IR, complete reads, contracts and the authoritative group split
+
+**`FormulaExecutionIRV2`, a distinct type** — never a mutation of V1's IR. Bounded and typed:
+`Scan · Filter · DirectionSelection · ReversalNeutralization · Join · CalculatedColumn · Aggregate ·
+FinalCombination`. **No `TimeWindow`** — `PitSpec` models the window and the renderer already renders
+it.
+
+**`TemporalReadSpecV2` beside `PitSpec` [R9]** — V1's `PitSpec` cannot express V2 offsets or future
+horizons, and extending it would move V1 identity (rule 6).
+
+**`PhysicalTypePolicyV2`, versioned** — `resolve_physical_type` takes `TypedFormulaV1` only. Settles
+AVG scale/precision · ratio and percentage scale · FX multiplication precision · percentile · slope ·
+nullability · empty-window behaviour · rounding and overflow.
+
+**`CompilationIdentityV2`** = bound-formula hash + IR hash + compiler/IR versions.
+
+**The authoritative group split becomes a numbered step [R9]**, out of "carried forward":
+
+```
+S1 records a user-selected build SET
+  → after IR creation, derive ONE contract per feature
+  → split the set into one or more FeatureGroupPlanV1
+  → generate, verify and publish each group INDEPENDENTLY
+```
+
+`group_by_contract` today **refuses** more than one contract; it must split. **The UI shows the split
+before verification.**
+
+Pilot plan: scan → filter eligible statuses → **select debit by indicator** → neutralize reversals →
+window *(from `PitSpec`)* → join booking-date FX → `normalized_amount = amount × rate` → group by
+account → `SUM`.
+
+> **Acceptance:** V1 IR canonical bytes unchanged; a selected set spanning two contracts yields two
+> groups rather than a refusal; the pilot compiles with no window node; the `D`/`C` mapping appears
+> as a typed operator, not a literal predicate.
+
+### S6 — generate and persist readable code
+
+Nodes: `filter_eligible_transactions` · `select_debit_direction` · `neutralize_reversals` ·
+`join_booking_fx_rates` · `calculate_base_currency_amount` · `aggregate_posted_debit_amount` ·
+`validate_posted_debit_amount`. **No window node.** **Execute nothing. Publish nothing.**
+
+**Rule 3's proof, corrected twice over [R9].** Revision 7 copied plan hashes into the manifest —
+forgeable. Revision 8 had the renderer report a hash from the emitting branch — **still forgeable**:
+code could emit a filter, report its hash, and then aggregate the *raw* input. The proof must be
+**typed DAG connectivity plus total renderer dispatch**: the consumed operator must lie on the path
+from scan to the emitted aggregate, and every resolved occurrence must be dispatched. The runtime
+manifest may *retain* the proof; it must never *manufacture* it.
+
+Plus a **stable code-view API** for the UI.
+
+> **Acceptance:** emitting a filter and then aggregating the unfiltered input **refuses**; deleting
+> reversal filtering refuses with the hash still present in the plan; every occurrence from rule 11
+> maps to exactly one dispatched operator on the connected path.
+
+### S7 — independent generated-code gold proof
+
+The **generated Spark code** reproduces the frozen exemplar: posted debit AED included · credit
+excluded · pending/failed excluded · reversed original excluded · reversal row excluded · USD
+converted at the booking-date rate · out-of-window excluded — **plus** zero-eligible spine account ·
+unknown-transaction account · post-cutoff reversal · duplicate and missing FX rate · post-cutoff FX
+knowledge time · PIT boundaries.
+
+**Required mutation failures:** drop the status filter · count reversal rows · one flat FX rate ·
+settlement instead of booking date · ignore direction · shift the window boundary.
+
+**`OperatorExecutionProofV1` mints a capability signature [R9]** — not "SUM", but input/output types ·
+window form · policy operator families · null and empty behaviour · rounding. Advertised operations
+become `renderer-supported ∩ current execution proof`. (`engine_capability.py` is the precedent for
+*deriving rather than hand-maintaining* — **not** for execution-derived advertising, which it does not
+do.)
+
+**Close here:** the DATE-clock refusal outside UTC, and A.32 🔴 `requirements.lock`.
+
+> **Acceptance:** every case and mutation behaves; each proof names S0's frozen hash; a signature
+> mismatch does not satisfy a proof.
+
+### S8 — execution infrastructure and on-demand verification
+
+**Infrastructure, assigned to this stage rather than listed loose [R9]:** `business_dt` on the API
+(absent entirely today) · server-side Hive schema read · captured inventory · persistent artifacts ·
+a real remote submission seam · **a dedicated materialization worker**, since a long compile blocks
+relays, timers, projections and ingestion.
+
+> Code generation is immediate. **Verification is user-triggered.**
+
+**Checks are a DAG, not a flat parallel set:**
+`build + static → execute → ⟨keys · grain · types · nulls · inflation · profile⟩ → fold`.
+
+**Input snapshots become pinnable without Iceberg [R9]:** record a Hive table snapshot/version where
+available; otherwise a **partition file manifest hash**; compare at publication; and where the
+environment can supply neither, **mark the verification `input unpinned`** rather than calling it
+exact. Revision 8 called these "exact snapshots" while `runprep.py` hashes only requirement,
+partitions and business date.
+
+**`VerifiedOutputRevisionV1` [R9]** — the handoff publication needs, since publication must not
+execute: generation and verification identities · immutable staging location · output data/file
+manifest hash · schema hash and row count · group-plan and IR hashes · verification result ·
+expiry/retention status.
+
+**Verification maps to requirements explicitly [R9], never blanket-promotes.** The registry holds
+eight specific external requirements. Build a many-to-many
+`verification_check_result → contract_id → requirement_id` map, and **emit `EXTERNAL_PASSED` only
+where the check's result schema genuinely matches that requirement**, letting
+`feature_validation_projection` derive `DATA-CHECKED`. **A group pass must not turn every member
+`DATA-CHECKED`.** Never write `USEFULNESS-CHECKED` from materialization verification.
+
+**Staleness is computed on read**, comparing the recorded hash set against current; detected
+automatically, **never re-run automatically**.
+
+**Profiling splits:** blocking output-sanity checks belong to verification; advisory EDA/profile
+generation is a separate attempt that cannot fail a validated publication.
+
+> **Acceptance:** a verification survives restart with per-check results intact; changing any
+> recorded input flips a pass to stale and names it; an unpinnable environment marks `input
+> unpinned`; a keys/types check does not satisfy `JOIN_CONNECTIVITY`; nothing writes a stamp
+> directly.
+
+### S9 — atomic sandbox publication
+
+Publish **only the exact verified output** — compare the staging manifest before promotion; **no
+re-execution**. Recheck publication capability and policy dependencies at publish time. Whole group,
+atomically, with reconciliation.
+
+**Decided by this review [R9], previously left open:** *generated code may remain unverified
+indefinitely; **feature-table publication requires a current passing verification***. Recorded as a
+product rule, revisitable by the operator — revision 8 deferred it to S10, which was too late to
+shape the lifecycle.
+
+> **Acceptance:** a changed or missing staging manifest blocks promotion; a stale verification
+> blocks; capability revoked between verify and publish blocks; a partial group never becomes
+> visible.
+
+### S10 — UI integration
+
+**Generate → Verify → Publish**, three actions never collapsed. States: `Generated — not verified` ·
+`Verification queued` · `Verification running` · `Verification passed` · `Verification failed` ·
+`Verification stale`.
 
 ```
 Posted debit amount · 90 days
@@ -445,71 +474,64 @@ Posted debit amount · 90 days
   [View generated code]   [Verify in sandbox]
 ```
 
-**The UI must disclose group scope [R8].** Verification and publication are group-wide
-(`logical_group_name`), while these read as per-feature actions. Show when several selected features
-share one atomic group, and that **one failed member prevents publishing the group**.
+Show: selection · **the derived group split, before verification** · generated code · **policy
+provenance** (producer, confidence, evidence, observed values, model/prompt version) · verification
+state · publish eligibility. Disclose that **one failed member prevents publishing its group**.
 
-Unresolved policies show the exact blocker: *"Currency conversion unresolved: no governed
-booking-date rate source is bound."* Selection stays local and reversible; **Generate code** creates
-the durable request. Needs the missing materialization POST client — `api.ts` has only the GET.
+Unresolved policies name the blocker: *"Currency conversion unresolved: no governed booking-date rate
+source is bound."* Needs the missing materialization POST client — `api.ts` has only the GET.
 
-> **Acceptance:** no path reaches execution without an explicit click; a stale result renders as
-> stale, not as a failure; group scope is visible before a publish action; a candidate outside the
-> shadow top 12 is generable from the UI.
+**Population spine, cadence, availability promise and logical group naming need a product workflow
+[R9]** — the current API makes the caller invent all four.
 
-### S12 — incremental V2 expansion
+> **Acceptance:** no path reaches execution without an explicit click; group scope is visible before
+> a publish action; a candidate outside the shadow top 12 is generable; a stale result renders as
+> stale, not failure.
 
-Current-vs-previous differences → ratios and percentage changes → signed sums → avg/min/max → stddev
-and percentiles → recency and streaks → slope and trend → concentration (HHI, top share) →
-future-horizon and allocation.
+### S11 — live-provider acceptance, then incremental expansion
 
-**One family at a time, only when renderer support and gold execution proof both exist (rule 10).**
+**The gate:** at least one real-provider structured-output acceptance test before **free-form** V2
+becomes the default. Deterministic recipe-driven generation already shipped at S1.
 
-**Also here: V2's live-provider acceptance.** At least one real-provider structured-output test
-before V2-as-default is honest — today only recorded fixtures exercise the path.
+Then, one family at a time, each needing renderer support **and** an execution proof: ratios →
+offsets → composites → percentiles → slopes → allocation → future horizons.
 
-> **Acceptance:** the advertised set is computed as `renderer-supported ∩ execution-proved`; adding
-> a renderer branch without a proof advertises nothing.
+> **Acceptance:** the advertised set is computed as `renderer-supported ∩ execution-proved`; adding a
+> renderer branch without a proof advertises nothing.
 
 ## 2. Carried forward
 
-**Runs in parallel, gated at merge:** behavioural (not route-existence) frontend↔backend contract
-tests, since `/features/recipe` exists and refuses everything · hide the retired "Write definitions"
+**Parallel, gated at merge:** behavioural (not route-existence) frontend↔backend contract tests,
+since `/features/recipe` exists and refuses everything · hide the retired "Write definitions"
 control · recognition correctness in full · ruff ratchet (79 repo-wide, 35 in `src/`).
 
-**Narrow the leakage claim.** Carried since revision 2 **without its context, which no revision has
-restated** — recover the original finding from its source review before acting.
+**Narrow the leakage claim** — carried since revision 2 **without its context, which no revision has
+restated**; recover the original finding before acting.
 
 **Still required:** canonical typed planning-request JSON persisted, since `repr()` cannot
-reconstruct a request · the group contract mapped onto `MaterializationContractV1` and
-`FeatureGroupPlanV1` with a cheap preflight and a post-compile authoritative split on the full
-contract hash · a **qualified evaluation-artifact reader** with a validity contract (migration 1029's
-four tables exist; a stale pass is not a pass) · the **as-of snapshot window shape**, which alone
-takes derivable blueprints from 90 to ~192.
-
-**Execution infrastructure, feeding S8 and S9:** `business_dt` on the API — absent entirely today ·
-live server-side Hive schema read · captured inventory · a real remote execution seam
-(`LocalClusterSubmitter` is a local subprocess on an image with no Java) · a dedicated materialization
-worker, since a long compile currently blocks relays, timers, projections and ingestion · persistent
-artifacts, since the generated project sits on ephemeral worker disk.
+reconstruct a request · `MaterializationContractV1` / `FeatureGroupPlanV1` mapping with a cheap
+preflight and a post-compile authoritative split on the full contract hash *(now S5)* · a
+**qualified evaluation-artifact reader** with a validity contract (migration 1029's four tables
+exist; a stale pass is not a pass) · the **as-of snapshot window shape**, which alone takes derivable
+blueprints from 90 to ~192.
 
 **Out of scope, recorded so it is not assumed:** cross-catalog execution refuses by construction
-(`chain.py:906`); content-addressed input snapshots need the deferred Iceberg layer.
+(`chain.py:906`) — **unless S0 decides the pilot needs it**; content-addressed input snapshots need
+the deferred Iceberg layer, which S8's manifest hash works around rather than solves.
 
 ## 3. Sequencing
 
 ```
-S1 decisions ─► S2 identity ─► S3 policy realizations ─► S4 executable revision
-   ─► S5 typing + IR ─► S6 generate-only ─► S7 split the chain
-   ─► S8 execution proof ⟨first real run⟩ ─► S9 verify ─► S10 publish ─► S11 UI ─► S12 expand
-                                    ▲
-      execution infrastructure ─────┘   (parallel: integrity gate · recognition · leakage · ruff)
+S0 freeze truth ─► S1 selection + durable authoring ─► S2 split actions/lifecycle
+  ─► S3 policy realization + producer ─► S4 bound formula ─► S5 IR + contracts + GROUP SPLIT
+  ─► S6 generate-only ─► S7 gold proof ⟨first real execution⟩ ─► S8 infra + verify
+  ─► S9 publish ─► S10 UI ─► S11 live gate + expand
 ```
 
-**What moved, and why.** Decisions and identity lead because everything downstream addresses a
-feature (S2) under semantics someone chose (S1). Policy realizations precede the executable artifact,
-because revision 7's artifact could not be assembled before its contents existed. Generation is
-separated from the chain split so the renderer's consumption proof lands before there is a command
-boundary to test it across.
+**What moved, and why.** The pilot truth is frozen first because the exemplar currently cannot
+reproduce its own answer. Actions and lifecycles split at S2, before anything is built across the
+boundary they create. The group split moved into S5, where contracts first exist — revision 8 fixed
+membership at S1, four stages before the compiler could know it. The bound formula (S4) makes no
+read-set claim; only the IR (S5) can.
 
-**No duration estimate.** Five revisions have now carried one that a review invalidated.
+**No duration estimate.** Six revisions have now carried one that a review invalidated.
