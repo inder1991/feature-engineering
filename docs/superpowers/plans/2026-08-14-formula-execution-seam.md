@@ -2114,7 +2114,7 @@ that runs in CI.
 > exact failure mode §8's verify-then-write rule exists to stop. E0 asserts the defect in both
 > directions instead, so it is a green test rather than a note.
 
-> **ACCEPTED `PENDING-E0` (2026-08-15).** `tests/featuregen/api/test_seam_walkthrough.py` — one
+> **ACCEPTED `cb8788f4` (2026-08-15).** `tests/featuregen/api/test_seam_walkthrough.py` — one
 > walk, in the DEFAULT suite, plus the two tests that keep it from being decoration.
 >
 > **THE WALK, and every step of it is a real surface.** Reviews recorded FIRST (real
@@ -2193,7 +2193,7 @@ Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), n
 > `PUBLISHED`, `run_status` folds to it) — on an artifact whose build is genuinely verified, which
 > is the part only this gate can add. The last hop is E2's deployment work and an operator action.
 
-> **ACCEPTED `PENDING-E1` (2026-08-15). RAN LOCALLY, GREEN.** Two tests appended to
+> **ACCEPTED `812c0cef` (2026-08-15). RAN LOCALLY, GREEN.** Two tests appended to
 > `tests/featuregen/materialize/l0_gate.py` — the JVM gate, not the default suite, because
 > `pyspark`/`kedro` are deliberately not dependencies of this platform.
 >
@@ -2277,7 +2277,7 @@ Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), n
 > sealed tree with it") is written from the backend's perspective and is about the **worker's**
 > ephemeral disk — the backend never writes a tree.
 
-> **ACCEPTED `PENDING-E2` (2026-08-15). ENGINEERING HALF ONLY; EVERY CLUSTER STEP BELOW NEEDS AN
+> **ACCEPTED `828fcfa4` (2026-08-15). ENGINEERING HALF ONLY; EVERY CLUSTER STEP BELOW NEEDS AN
 > EXPLICIT GO.** `deploy/kind/k8s/25-worker.yaml` gains the materialization block as
 > **documentation, not duplication** (the correction above says why): the worker is the only
 > process that compiles; it already inherits the whole `FEATUREGEN_MATERIALIZE_*` block through
