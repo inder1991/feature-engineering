@@ -383,3 +383,184 @@ def verify_frozen_configuration(
     if current.configuration_hash != frozen.configuration_hash:
         raise ConfigurationDrifted(
             "author/critic configuration changed after observation")
+
+
+# ── the v2 generation ────────────────────────────────────────────────────────────────────────────
+
+
+def _operation_grammar_material_v2() -> dict:
+    """The v2 grammar's own material. Nothing here is shared with v1's: a change to
+    ``validate_semantics_v2`` must invalidate v2 work and leave v1 work alone, and vice versa.
+
+    ``operation_rules`` is in the envelope because the v2 rule table IS the grammar's semantics —
+    which aggregate needs an operand, which takes a second one, which carries an argument, what
+    additivity each folds to. It is also what ``recipe_tool_runner_v2`` answers
+    ``list_supported_operations`` and ``validate_draft_formula`` out of, so a rule-table edit that
+    would change what the model is told cannot slip past a frozen v2 work item.
+    """
+    from featuregen.formula.capability_v2 import classify_formula_capability_v2
+    from featuregen.formula.operations_v2 import OPERATION_RULES
+    from featuregen.formula.output_authority_v2 import resolve_output_v2
+    from featuregen.formula.schema_v2 import (
+        OPERATION_GRAMMAR_VERSION_V2,
+        AggregateFunctionV2,
+        FinalOperationV2,
+        WindowBasisV2,
+        validate_semantics_v2,
+    )
+
+    return {
+        "version": OPERATION_GRAMMAR_VERSION_V2,
+        "aggregate_functions": _enum_values(AggregateFunctionV2),
+        "final_operations": _enum_values(FinalOperationV2),
+        "window_basis": _enum_values(WindowBasisV2),
+        "window_units": _enum_values(WindowUnit),
+        "additivity": _enum_values(AdditivityClass),
+        "operation_rules": {
+            aggregation.value: {
+                "operand_required": rule.operand_required,
+                "argument": rule.argument,
+                "additivity": rule.additivity.value,
+                "result_kind": rule.result_kind,
+                "order_sensitive": rule.order_sensitive,
+                "second_operand": rule.second_operand,
+            }
+            for aggregation, rule in sorted(
+                OPERATION_RULES.items(), key=lambda item: item[0].value)
+        },
+        "semantic_validator_sha256": _hash_bytes(
+            inspect.getsource(validate_semantics_v2).encode("utf-8")),
+        "capability_classifier_sha256": _hash_bytes(
+            inspect.getsource(classify_formula_capability_v2).encode("utf-8")),
+        "output_authority_sha256": _hash_bytes(
+            inspect.getsource(resolve_output_v2).encode("utf-8")),
+    }
+
+
+def freeze_current_configuration_v2(
+    *,
+    generation_settings: Mapping[str, Any],
+) -> FrozenAuthorCriticConfigurationV1:
+    """Freeze a **Formula-v2** run's configuration — the same ENVELOPE, entirely v2 material.
+
+    The envelope shape is deliberately identical, so ``load_frozen_configuration_json`` (which only
+    re-hashes stored bytes) reads either generation without knowing which it holds. What differs is
+    every byte inside it:
+
+    * the author contract is ``AUTHOR_INSTRUCTION_V2`` / ``AUTHOR_PROMPT_ID_V2`` under the
+      ``formula_author_turn_v2`` output schema — the distinct constants A3 created for exactly this
+      reason: *"a v2 run authored under the v1 identity would be indistinguishable in a frozen
+      contract from a v1 run"*;
+    * the grammar, disposition and version material is v2's (see
+      :func:`_operation_grammar_material_v2`).
+
+    The CRITIC contract is v1's, unchanged, and that is not an oversight: A3 widened ``critic`` to
+    review both generations from one closed context, so there is one critic prompt, one critic
+    schema, and one set of finding codes. Freezing a second identity for the same bytes would
+    invent a difference that does not exist.
+
+    There is no ``author_instruction`` parameter: v2 has exactly one authoring identity, and a
+    caller that could pass a different one could freeze a v2 work item under a prompt no v2 run
+    would ever use.
+    """
+    from featuregen.formula.author import (
+        AUTHOR_INSTRUCTION_V2,
+        AUTHOR_PROMPT_ID_V2,
+        AUTHOR_PROMPT_VERSION_V2,
+    )
+    from featuregen.formula.result_v2 import (
+        DISPOSITION_POLICY_VERSION_V2,
+        _fold_v2,
+        derive_disposition_v2,
+    )
+    from featuregen.formula.schema_v2 import (
+        CANONICALIZATION_VERSION_V2,
+        FORMULA_SCHEMA_VERSION_V2,
+        OPERATION_GRAMMAR_VERSION_V2,
+    )
+    from featuregen.formula.turns_v2 import (
+        AUTHOR_TURN_SCHEMA_ID_V2,
+        AUTHOR_TURN_SCHEMA_VERSION_V2,
+        AUTHOR_TURN_V2_SCHEMA,
+    )
+
+    from featuregen.formula.output_authority_v2 import (  # isort: skip
+        OUTPUT_POLICY_VERSION_V2,
+    )
+
+    author = freeze_provider_contract(
+        role="author",
+        generation_settings=generation_settings,
+        prompt_id=AUTHOR_PROMPT_ID_V2,
+        prompt_version=AUTHOR_PROMPT_VERSION_V2,
+        instruction=AUTHOR_INSTRUCTION_V2,
+        output_schema_id=AUTHOR_TURN_SCHEMA_ID_V2,
+        output_schema_version=AUTHOR_TURN_SCHEMA_VERSION_V2,
+        output_schema=AUTHOR_TURN_V2_SCHEMA,
+    )
+    critic = freeze_provider_contract(
+        role="critic",
+        generation_settings=generation_settings,
+        prompt_id=CRITIC_PROMPT_ID,
+        prompt_version=1,
+        instruction=CRITIC_INSTRUCTION,
+        output_schema_id=CRITIC_SCHEMA_ID,
+        output_schema_version=CRITIC_SCHEMA_VERSION,
+        output_schema=CRITIC_SCHEMA,
+    )
+    tool_registry_hash = _hash_bytes(_canonical_bytes(_tool_registry_material()))
+    operation_grammar_hash = _hash_bytes(_canonical_bytes(_operation_grammar_material_v2()))
+    critic_policy_hash = _hash_bytes(_canonical_bytes({
+        "version": CRITIC_POLICY_VERSION,
+        "schema_hash": critic.schema_content_hash,
+        "prompt_hash": critic.prompt_content_hash,
+    }))
+    disposition_policy_hash = _hash_bytes(_canonical_bytes({
+        "version": DISPOSITION_POLICY_VERSION_V2,
+        # BOTH halves, unlike v1's single ``derive_disposition`` hash: in v2 the §F precedence
+        # lives in ``_fold_v2`` and the artifact-coherence guards in ``derive_disposition_v2``, and
+        # a change to either one changes what a frozen run would decide.
+        "fold_sha256": _hash_bytes(
+            inspect.getsource(derive_disposition_v2).encode("utf-8")),
+        "precedence_sha256": _hash_bytes(inspect.getsource(_fold_v2).encode("utf-8")),
+    }))
+    version_vector = {
+        "formula_schema": FORMULA_SCHEMA_VERSION_V2,
+        "operation_grammar": OPERATION_GRAMMAR_VERSION_V2,
+        "output_policy": OUTPUT_POLICY_VERSION_V2,
+        "canonicalization": CANONICALIZATION_VERSION_V2,
+        "critic_policy": CRITIC_POLICY_VERSION,
+        "disposition_policy": DISPOSITION_POLICY_VERSION_V2,
+    }
+    envelope = {
+        "author_contract_hash": author.contract_hash,
+        "critic_contract_hash": critic.contract_hash,
+        "tool_registry_hash": tool_registry_hash,
+        "operation_grammar_hash": operation_grammar_hash,
+        "critic_policy_hash": critic_policy_hash,
+        "disposition_policy_hash": disposition_policy_hash,
+        "version_vector": version_vector,
+        "configuration_policy_version": FROZEN_CONFIGURATION_POLICY_VERSION,
+    }
+    return FrozenAuthorCriticConfigurationV1(
+        author=author,
+        critic=critic,
+        tool_registry_hash=tool_registry_hash,
+        operation_grammar_hash=operation_grammar_hash,
+        critic_policy_hash=critic_policy_hash,
+        disposition_policy_hash=disposition_policy_hash,
+        version_vector_json=_canonical_bytes(version_vector).decode("utf-8"),
+        configuration_policy_version=FROZEN_CONFIGURATION_POLICY_VERSION,
+        configuration_hash=_hash_bytes(_canonical_bytes(envelope)),
+    )
+
+
+def verify_frozen_configuration_v2(
+    frozen: FrozenAuthorCriticConfigurationV1,
+    *,
+    generation_settings: Mapping[str, Any],
+) -> None:
+    current = freeze_current_configuration_v2(generation_settings=generation_settings)
+    if current.configuration_hash != frozen.configuration_hash:
+        raise ConfigurationDrifted(
+            "author/critic v2 configuration changed after observation")

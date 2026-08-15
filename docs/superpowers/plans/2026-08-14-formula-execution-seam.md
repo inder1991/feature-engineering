@@ -2444,7 +2444,84 @@ goes RED and says why."* Four increments, each its own commit, each closing one 
 > looking for.
 >
 > 35 new cases in `tests/featuregen/formula/test_recipe_authoring_v2.py`. Gates: full suite
-> **11226 passed, 20 skipped** (baseline on `8298f68e` was 11191/20 — the 35 new tests and nothing else moved); `-m eval` **73 passed**; ruff clean, no new mypy errors on the touched files.
+> **11226 passed, 20 skipped** (baseline on `8298f68e` was 11191/20 — the 35 new tests and
+> nothing else moved); `-m eval` **73 passed**; ruff clean, no new mypy errors on the touched files.
+
+
+> **SUCCESSOR EXECUTION (2026-08-15) — INCREMENT 2: `run_authoring_v2_replay`. ACCEPTED `<inc2>`.
+> SHIPPED, UNVERIFIED AGAINST A LIVE PROVIDER.** `formula/replay_authoring_v2.py` — the
+> replay-shaped sibling of the orchestrator production actually runs, carrying every seam A3's
+> defect 1 enumerated: checkpoint/replay, frozen configuration, proposal validator, tool runner,
+> facts reader, deterministic `authoring_run_id`, critic metadata loader, progress callback, lease
+> fence.
+>
+> **The stage vocabulary is v1's, and that is not a style choice.**
+> `replay_trace._verify_stage_transition` ENFORCES `AUTHOR_TURN_n → AUTHOR_PROPOSAL_PARSED →
+> EXPECTATION_VALIDATED → CRITIC_COMPLETED → OUTPUT_POLICY_RESOLVED → TERMINAL`, so a v2 run that
+> invented its own stage names could never be resumed. Every resume point, idempotency key and
+> fence-guarded write is v1's; the grammar inside them is v2's throughout. **No new stage names, no
+> new table, no migration.**
+>
+> **`freeze_current_configuration_v2` had to exist, and the test says why.** The charter's line —
+> *"frozen_configuration must hash the V2 instruction + schema ids"* — is not a preference:
+> `freeze_current_configuration` hard-codes `AUTHOR_TURN_SCHEMA_ID` / `AUTHOR_TURN_V1_SCHEMA` and
+> the v1 grammar/fold material. `test_a_v1_frozen_configuration_is_DRIFT_for_a_v2_run` pins all
+> four differences (configuration hash, prompt id, output schema id, grammar hash) and proves a
+> v1-frozen work item can never author a v2 formula. The ENVELOPE shape is deliberately unchanged,
+> so `load_frozen_configuration_json` — which only re-hashes stored bytes — reads either generation
+> without knowing which it holds. The critic contract stays v1's, because A3 widened `critic` to
+> review both generations from one closed context and a second identity for the same bytes would
+> invent a difference that does not exist.
+>
+> **The v2 grammar material includes the OPERATION RULE TABLE**, which v1's has no analogue for. It
+> is the v2 semantics (operand / second-operand / argument requirements, additivity, result kind)
+> and it is also what `recipe_tool_runner_v2` answers the model out of, so a rule-table edit that
+> would change what the model is told cannot slip past a frozen work item. The disposition hash
+> covers BOTH `derive_disposition_v2` and `_fold_v2`; v1 hashes only its constructor, and that gap
+> is not worth copying.
+>
+> **THREE THINGS THE CODE SAID THAT THE CHARTER DID NOT, each reproduced:**
+>
+> 1. **A REJECTED v2 replay run writes `failed`, where `authoring_v2` writes `completed`.**
+>    `replay_authoring` maps invalid→`failed`, unsupported→`completed`, technical→`failed`; the
+>    non-replay v2 orchestrator maps only TECHNICAL_FAILURE to `FAILED`. The charter said *"the SAME
+>    orchestration laws as v1's — do not invent different semantics"*, so this module follows the
+>    store it writes to and `run_status` stays meaningful for a recovering worker. Both halves are
+>    asserted, and the divergence is stated in the module docstring rather than smoothed over.
+> 2. **A v1-declared body cannot produce `invalid_formula` THROUGH A PROVIDER**, so the test that
+>    claimed it was wrong. The v2 wire schema pins `formula_schema_version` to 2 (A3 recorded this):
+>    a v1 body fails RESPONSE validation, the loop never gets a proposal, and the run ends
+>    **TECHNICAL** — which says nothing about the grammar. The orchestrator's own version guard
+>    stays as defence in depth for a non-provider caller, and
+>    `test_the_wire_pins_the_version_so_a_v1_body_never_becomes_a_false_grammar_verdict` asserts
+>    both halves. The same correction applies to any malformed body: reaching the REJECTED arm needs
+>    a proposal the WIRE admits and `validate_semantics_v2` refuses (a grain key naming a table).
+> 3. **`formula_authoring_trace_event` is WRITE-ONCE at the database.** The planned tamper test
+>    (`UPDATE` the terminal's recorded hash, replay, expect a refusal) cannot run: a trigger raises
+>    *"records are write-once: UPDATE is not allowed"*. That is strictly stronger than the test
+>    intended, so it is asserted as such and the hash check is driven at `_restore_terminal_result`
+>    with a fabricated checkpoint instead.
+>
+> **The facts-reader seam's failure mode is worse than "a missing currency", and the test measures
+> the real one.** Hand the orchestrator a v1 PATH-keyed bundle and the operand resolves to empty
+> facts, so the output TYPE has no governed authority either: the run comes back
+> `external_requirement` with **no authoritative policy at all**, not merely a currency-less one.
+>
+> **⟨LLM⟩ THE LIVE HALF IS DEFERRED, HONESTLY** — A3's deferral, unchanged. Every run in the suite
+> is a `FakeLLM` recorded fixture; billing is exhausted (D-10). What is proven is the SEAM. What is
+> NOT proven is that a real model held to `AUTHOR_INSTRUCTION_V2` emits a usable v2 proposal.
+> `test_a_billing_refusal_is_technical_never_a_capability_or_grammar_verdict` is what makes the
+> deferral safe: a `PROVIDER_NON_RETRYABLE` refusal folds TECHNICAL with `capability_status="ok"`
+> and `structural_status="ok"` — a payment problem can never become a durable statement about the
+> v2 grammar (the `3219a209` precedent, now restated at the replay layer too).
+>
+> **The v1 replay orchestrator is pinned BYTE-IDENTICAL** by a source digest (`96c3dbc3…`), the way
+> A4 increment 1 pinned the frozen v1 egress arm. If it changes, that is a separate argued change,
+> not a side effect of the v2 work.
+>
+> 19 new cases in `tests/featuregen/formula/test_replay_authoring_v2.py`. Gates: full suite
+> **11245 passed, 20 skipped** (11226/20 after increment 1 — the 19
+> new tests and nothing else moved); `-m eval` **73 passed**; ruff + mypy clean on both touched source files.
 
 ---
 
