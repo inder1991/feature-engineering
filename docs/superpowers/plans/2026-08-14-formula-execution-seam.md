@@ -1513,6 +1513,39 @@ test asserts the two agree exhaustively.
 - `test_window_offset_and_future_horizon_advertisements_match_the_renderer`
 - `test_no_engine_capability_is_asserted_by_hand` — the constant is built, not typed (AST/structural).
 
+> **ACCEPTED `PENDING-HASH` (2026-08-15).** Landed inline by the main session after six consecutive
+> subagent API connection drops (three on one agent, three on its fresh replacement — none produced
+> any file change; the worktree was verified untouched between every attempt).
+>
+> **The derivation runs one layer deeper than the plan asked, on purpose.** `EngineCapabilityV1`
+> already exists (`formula/capability_v2.py:31` — BR-6 built the type and the engine arm; the plan's
+> §C1 wording reads as if the type were new). What C1 adds is the INSTANCE and its truth: a public
+> `renderable_aggregations()` ON THE RENDERER (`render/nodes_compute.py`, beside `_AGGREGATE_CALLS`)
+> states the renderer's own vocabulary — the dispatch's keys plus `COUNT_ROWS`, added beside the
+> fact that explains it (no operand to substitute; rendered on its own arm) — and
+> `engine_capability.py` builds the advertisement from that, mapping members to v2 value strings.
+> The two boolean advertisements are NOT written in the module at all: they are the dataclass's own
+> fail-closed defaults, and `materialize/render/` contains no `offset_periods` and no
+> `future_horizon` rendering anywhere — the advertisements test pins the absence at source level,
+> so offset rendering added without revisiting the advertisement fails the build.
+>
+> **The rendering-path test executes, per member, with four distinguishable answers.** One
+> projection (two 10s and a NULL for C1, one 7 for C2) yields sum=20/7, count_non_null=2/1,
+> count_distinct=1/1, count_rows=3/1 — a dispatch that wired two members to the same Spark call
+> collides on at least one row. `COUNT_ROWS` is exercised by re-aggregating the compiled SUM IR
+> and shedding the OPERAND role from its read set (`operand is None` IFF `COUNT_ROWS` is the
+> grammar rule the renderer enforces in both directions).
+>
+> **Mutant proof:** a hand-typed aggregation set fails the AST test; an over-advertised `"avg"`
+> fails three tests (its rendering-path case, the converse, and the no-hand-typing scan); a false
+> `supports_window_offset=True` fails the advertisements test. All three built and run; the
+> original restored and green.
+>
+> 8 cases in `tests/featuregen/materialize/test_engine_capability.py` (the plan's four plus the
+> unknown-engine lookup and a v2-only exclusion slice inside the converse).
+> Gates: full suite **11136 passed, 20 skipped** (baseline 11128/20 at `0146c92e`); `-m eval`
+> **73 passed**; ruff clean on the three touched files; mypy clean on `engine_capability.py`.
+
 ### Task C2 — activation reads the registry (1 day)
 
 **Modify:** `src/featuregen/overlay/upload/semantic_option_decision.py` —

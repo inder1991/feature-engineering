@@ -290,6 +290,18 @@ _AGGREGATE_CALLS: dict[AggregateFunction, str] = {
     AggregateFunction.COUNT_DISTINCT: "F.countDistinct",
 }
 
+def renderable_aggregations() -> frozenset[AggregateFunction]:
+    """The aggregates THIS renderer can emit — the dispatch's keys plus ``COUNT_ROWS``.
+
+    ``COUNT_ROWS`` is not in :data:`_AGGREGATE_CALLS` because it has no operand to substitute into
+    (``schema.py`` [c9]) and is rendered on its own arm; it is added here beside that fact rather
+    than asserted anywhere else. This function is the renderer describing itself — an engine
+    capability advertisement (D-5) derives from it, so an aggregate added to the vocabulary is
+    advertised only once it has been GIVEN a rendering in this module.
+    """
+    return frozenset(_AGGREGATE_CALLS) | {AggregateFunction.COUNT_ROWS}
+
+
 #: The two ``RoundingMode`` members a Spark function implements EXACTLY. The other four would have
 #: to be composed from floor/ceil over a scaled value, and §6 requires the DECLARED mode rather than
 #: one this renderer assembled — so they refuse rather than approximate.
