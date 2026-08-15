@@ -597,7 +597,7 @@ that body and the validator version, so both are honest; neither is free.
 **Acceptance:** a Vitest case per disposition; the honest-absence law asserted on the two that are
 not absence.
 
-> **TASK 5 (2026-08-15) — ACCEPTED `<pending>`.** `recognition_quality` is a served block —
+> **TASK 5 (2026-08-15) — ACCEPTED `f6854027`.** `recognition_quality` is a served block —
 > `{disposition, repair_attempts, dropped_candidate_count, drop_reason_codes}` — derived by
 > `recognition.recognition_quality(result, repair_attempts=…)`, persisted at INSERT by migration
 > **1071**, and read back from the STORED row so Task 0's invariant still holds: the block describes
