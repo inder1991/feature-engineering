@@ -3384,7 +3384,7 @@ for an operator to state it and accept its consequence. Everywhere else — ever
 not declare — behaviour is byte-for-byte what SUCCESSOR 2 built, which the tests assert at the
 default rather than assume.
 
-> **SUCCESSOR 5 — INCREMENT 1: THE DECLARATION AND THE FOLD. ACCEPTED `<increment 1>`
+> **SUCCESSOR 5 — INCREMENT 1: THE DECLARATION AND THE FOLD. ACCEPTED `24541da3`
 > (2026-08-15).**
 >
 > **WHERE THE DECLARATION LIVES, argued against the alternative it was measured against.**
@@ -3451,7 +3451,7 @@ default rather than assume.
 > file; mypy clean on all five touched source modules; both manifests re-parsed with
 > `yaml.safe_load_all`.
 
-> **SUCCESSOR 5 — INCREMENT 2: THE DURABLE, VISIBLE STAMP. ACCEPTED `<increment 2>` (2026-08-15).**
+> **SUCCESSOR 5 — INCREMENT 2: THE DURABLE, VISIBLE STAMP. ACCEPTED `113549cf` (2026-08-15).**
 >
 > **THE ACCEPTANCE RIDES TWO PERSISTED RECORDS, and neither of them is the HTTP response.**
 > `pipeline_validation_report.findings` carries it per table, typed and queryable from psql
@@ -3507,7 +3507,7 @@ default rather than assume.
 > touched source modules.
 
 > **SUCCESSOR 5 — INCREMENT 3: THE RUNBOOK, THE SMOKE SCRIPT AND THE PLAN'S OWN FRAMING. ACCEPTED
-> `<increment 3>` (2026-08-15).** One code change, and it is the loud structural guard: everything
+> `8b8c2416` (2026-08-15).** One code change, and it is the loud structural guard: everything
 > else is documentation and the corrections this decision forces.
 >
 > **`thrift_smoke.py` PRINTS THE POSTURE BEFORE IT ASKS ANYTHING**, on every invocation and in BOTH
