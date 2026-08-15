@@ -41,8 +41,19 @@ reviewed v2 expectations:
 
 The schema gate alone cuts 317 recipes to **two**. Whether either has a source table, bindable
 operands, a spine and an inventory mapping on the deployed cluster is **R4-0's** question, and this
-plan does not pre-empt its answer. `merchant_mcc_diversity` additionally carries the open D-7 grain
-disagreement, which is a governance decision, not an engineering one.
+plan does not pre-empt its answer.
+
+**`merchant_mcc_diversity` is INELIGIBLE as a pilot — three contradictions, not one [R5]:**
+
+| | v2 recipe | reviewed v1 formula |
+|---|---|---|
+| Output grain | `customer` | `merchant` |
+| Eligible rows | posted, non-reversed, non-technical | **inexpressible** — `ExpressionRoleExpectationV1` carries only `expression_path`, `aggregation`, `operand_role`, `source_relation_role`, `window`; there is no filter or authority field |
+| Additivity | `additive` | legacy declares non-additive |
+
+Generating its v1 formula would produce a technically valid number over the **wrong rows, at the wrong
+grain, with the wrong roll-up rule**. That is a refusal, not a disagreement for R4-0 to weigh — leaving
+**`obligor_facility_count` as the only v1 candidate**, pending R4-0 confirming its source data exists.
 
 **All 23 findings were validated; the load-bearing ones were reproduced.** None dismissed.
 
@@ -91,14 +102,71 @@ A retry mints a **new attempt** under the same request; it never mutates a faile
 running. Cancellation states explicitly which of these it does: drop a queued item, abort authoring,
 kill the remote application, or forbid publication after computation.
 
-### R4-3 — selected-formula authoring, and the Formula-v2 bridge
-Author from the exact selected option into a **selected-authoring work item owned by the build
-request** — not through `recipe_formula_shadow_work_item`, whose identity is a speculative shadow
-capture bound to a generation run (and whose capture defaults **off**).
+### R4-3 — selected-formula authoring, and the Formula-v2 bridge **[R5]**
 
-**Define the Formula-v2 executable artifact and add admission + lowering.** BR-6 never minted a
-`TypedFormulaV2`; the artifact is a proposal/output-policy pair, and admission refuses v2 outright.
-**Implement only the operation the chosen pilot needs** — not the whole v2 grammar.
+Author from the exact selected option into a **selected-authoring work item owned by the build
+request** — not through `recipe_formula_shadow_work_item`, whose capture requires
+`selected_for_initial_view` (so a feature the user scrolls to and picks may never have been captured),
+whose identity is a speculative shadow capture bound to a generation run, and whose flag defaults off.
+
+**Author deterministically wherever the recipe already decides.** A fully-specified recipe pins the
+operation, operand roles, window, grain and output policy — that is instantiation, not authorship.
+**Use the model only where a semantic choice genuinely remains**, and record which arm produced the
+formula. Cheaper, reproducible, and it removes the provider from the common path.
+
+**The v2 bridge is THREE layers, not one. Most of the value is in the first two.**
+
+**Layer 1 — resolve the authority refs. Required before ANY v2 execution, by any route.**
+`AuthorityRefsV2` governs *"which eligible-status set filters rows, which sign/direction convention
+reads amounts, how reversals neutralize originals, and which rate policy converts currency"* — and
+**`materialize/` never sees them** (verified: no reference anywhere under that package). So a v2
+formula today carries policy declarations that no execution honours. Each ref must resolve to a real
+filter, sign convention, reversal rule or conversion — **or refuse by name**.
+
+> **INVARIANT:** no v2 formula may execute by any route until its authority refs are resolved or
+> explicitly refused. Executing one with unresolved refs computes a number that does not match its own
+> formula, silently — precisely the failure the v1-only refusal exists to prevent, arriving through a
+> different door.
+
+**Layer 2 — lowering (the cheap bridge, and the one the pilot should use).** When a v2 formula's
+*computational shape* fits v1 — `identity`/`ratio`/`difference`, one of the four v1 aggregates,
+trailing or calendar window, **no** offset, **no** second operand, **no** aggregation argument —
+translate it to v1 with the Layer-1 policies expressed as v1's structural filters, and compile with the
+**existing compiler and existing renderer**. Anything outside that envelope refuses by name.
+
+*Measured:* the reviewed v2 exemplar `posted_debit_amount` qualifies on every count —
+`identity` / `sum` / `trailing` / offset 0 / no second operand / no argument. **Zero renderer work and
+no new compiler**, once Layer 1 exists.
+
+**Layer 3 — native v2, only where genuinely needed.** A fused executable artifact (BR-6 never minted a
+`TypedFormulaV2`; the artifact is a proposal *beside* an output policy) plus versioned admission —
+required for v2-only *shapes* (offsets, second operands, composite signed terms). Then per-operation
+rendering for v2-only *aggregates*, **one at a time, each with its semantic decision** (percentile:
+exact or approximate? slope: which time basis, what minimum observations? stddev: sample or
+population?) and each **executed** before the engine advertises it.
+
+**Sequencing inside R4-3:** Layer 1 → Layer 2 → pilot executes. Layer 3 waits until a feature people
+actually want is blocked by it.
+
+### R4-3b — a qualified evaluation-artifact reader **[R5]** — replaces a hardcoded refusal
+
+`_gold_evaluation_recorded()` returns `False` for every recipe, and its docstring — **mine, and
+false** — claims *"NO store records a gold-evaluation outcome anywhere in the platform."*
+
+**Migration 1029 creates four:** `recipe_formula_eval_run`, `recipe_formula_eval_case`,
+`recipe_formula_eval_attempt`, `recipe_formula_eval_artifact`. The store predates that comment. The
+end-to-end walkthrough proves the consequence by monkeypatching the function to `True`; without the
+patch, materialization stays blocked forever.
+
+**The gap is not a missing store — it is a missing reader with a validity contract.** A passing
+artifact only counts if it was produced under the *current* world, so the reader validates it against
+the current recipe revision, blueprint hash, grammar version, policy versions, model configuration and
+code revision. **A stale pass is not a pass.** Anything unverifiable stays `False` — but for a stated
+reason rather than a wrong one.
+
+**Acceptance:** a passing artifact under matching versions flips readiness; one whose recipe,
+blueprint, grammar or policy version has since moved does **not**, and names which moved; the
+walkthrough's monkeypatch is deleted and the test seeds a real artifact.
 
 ### R4-4 — group integration onto the existing owners
 There is already `MaterializationContractV1` (the authoritative compatibility/group hash),

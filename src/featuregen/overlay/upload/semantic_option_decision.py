@@ -426,12 +426,21 @@ def _formula_schema_supported(recipe_id: str) -> bool:
 def _gold_evaluation_recorded(recipe_id: str) -> bool:
     """C3 — has a gold + provider evaluation PASSED for this recipe's reviewed expectation?
 
-    Honestly ``False`` for every recipe today: the provider half has never run (Anthropic
-    billing is exhausted — A3's acceptance row records the deferral) and NO store records a
-    gold-evaluation outcome anywhere in the platform. This is a named absence, not a hardwired
-    verdict: the day a gold gate writes results, this function becomes the read of that store,
-    and the milestone test seeds it here — which is what makes ``MATERIALIZATION_READY``
-    reachable in a test without a single dishonest production default."""
+    ``False`` for every recipe today, but **not for the reason this docstring used to give.** It
+    claimed "NO store records a gold-evaluation outcome anywhere in the platform". That was WRONG:
+    migration 1029 creates ``recipe_formula_eval_run`` / ``_case`` / ``_attempt`` / ``_artifact``,
+    and has since long before this function was written. The error mattered — it justified a
+    hardcoded refusal on the grounds that there was nowhere to read from.
+
+    What is genuinely missing is a READER WITH A VALIDITY CONTRACT. A passing artifact only counts
+    if it was produced under the world that is current now, so the reader must check it against the
+    recipe revision, blueprint hash, grammar version, policy versions, model configuration and code
+    revision it was produced under. **A stale pass is not a pass**, and returning ``True`` for one
+    would launder an old verdict into a present authority.
+
+    So this stays ``False`` until that reader exists (plan task R4-3b) — a named absence with the
+    right name. The seam walkthrough patches it to ``True``, which is how the whole materialization
+    ladder is reachable in a test; that patch is deleted when the reader lands."""
     return False
 
 
