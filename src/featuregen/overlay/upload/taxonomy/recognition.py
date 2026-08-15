@@ -193,6 +193,32 @@ _CANDIDATE_BEARING: frozenset[str] = frozenset(
 _STATUS_VALUES: frozenset[str] = frozenset(s.value for s in RecognitionStatus)
 
 
+class RecognitionDisposition(StrEnum):
+    """WHICH of the five genuinely different things happened to one recognition (repair seam,
+    Task 5). ``RecognitionStatus`` says what the ANSWER is; this says what the PLATFORM did to get
+    it, which is the part the 2026-08-15 incident got wrong: a partial recovery and a total failure
+    both arrived at the UI as *"No use-case was recognised"*, which was true of neither.
+
+    * ``CLEAN`` — the model's first answer validated. Today's behaviour, and the only one with
+      nothing to say.
+    * ``REPAIRED`` — the first answer did NOT validate, the model was asked to fix it (§9.2 budget),
+      and the fixed answer is what the user is looking at. A correct answer with a correction in its
+      history: worth reviewing, never a failure.
+    * ``PARTIALLY_RECOVERED`` — repair was spent and failed, and the strict partition kept the
+      candidates that were valid while naming what it discarded. **The surviving scope is real** and
+      must be shown as a scope, not replaced by an offer to broaden.
+    * ``UNSCOPED`` — a VALID answer that says nothing in the closed taxonomy clearly matched.
+    * ``TECHNICAL_FAILURE`` — no usable answer at all (provider failure/refusal, egress block, a
+      repair budget exhausted with nothing left standing). Fail-open: grounding continues unfiltered.
+    """
+
+    CLEAN = "clean"
+    REPAIRED = "repaired"
+    PARTIALLY_RECOVERED = "partially_recovered"
+    UNSCOPED = "unscoped"
+    TECHNICAL_FAILURE = "technical_failure"
+
+
 @dataclass(frozen=True, slots=True)
 class UseCaseCandidate:
     """One recognised use-case objective and its relationship to the request."""
@@ -217,9 +243,9 @@ class RecognitionResult:
     ``dropped_candidates`` (repair seam, Task 4) records what a strict partial partition discarded.
     It is deliberately NOT folded into ``warnings``: that field already carries the per-DIMENSION
     codes the UI renders as *"we couldn't map part of what you described"*, which would misdescribe a
-    discarded candidate as a mis-mapped regime. Task 5 turns this into the ``recognition_quality``
-    contract; until then it is an in-memory fact of the value object — see ``scope_records``, which
-    has no column for it, so a result read back from storage carries ``()``."""
+    discarded candidate as a mis-mapped regime. Task 5 gave it a column (migration 1071), so a result
+    read back from storage now carries its drops — until then it was in-memory only and the endpoint,
+    which serves the STORED row, could not see it at all."""
 
     status: RecognitionStatus
     candidates: tuple[UseCaseCandidate, ...]
@@ -233,6 +259,71 @@ class RecognitionResult:
     target_entity: str | None = None
     warnings: tuple[str, ...] = ()
     dropped_candidates: tuple[CandidateDrop, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class RecognitionQuality:
+    """The served answer to *"which of the five things happened?"* (repair seam, Task 5).
+
+    Deliberately a SEPARATE object from :class:`RecognitionResult` rather than three more fields on
+    it: a result is what the recognizer concluded, and this is what it cost to conclude it. The two
+    are persisted together and read back together, but only this one has a legacy shape — a row
+    written before migration 1071 carries no quality at all, and the honest answer there is
+    ``None``, never a fabricated ``clean``.
+
+    ``drop_reason_codes`` names WHICH rules discarded something (deduplicated, first-seen order);
+    ``dropped_candidate_count`` is the authority on HOW MANY candidates went, since two candidates
+    can be dropped for the same reason. Every code is one of :data:`RECOGNITION_FAILURE_CODES`, so
+    the whole object is value-free and safe on an API payload and in a UI string."""
+
+    disposition: RecognitionDisposition
+    repair_attempts: int
+    dropped_candidate_count: int
+    drop_reason_codes: tuple[str, ...]
+
+
+def recognition_quality(result: RecognitionResult, *, repair_attempts: int) -> RecognitionQuality:
+    """Derive the quality of one recognition from the result and the repair turns it took.
+
+    **The precedence is the contract, and it is ABSENCE FIRST.** A user acts on what they were
+    given, so the disposition names that before it names the platform's effort:
+
+    1. ``TECHNICAL_FAILURE`` / 2. ``UNSCOPED`` — the STATUS, whenever no scope was produced. These
+       two are absence, and absence outranks everything else that happened on the way to it.
+    3. ``PARTIALLY_RECOVERED`` — candidates survived a partition that discarded others.
+    4. ``REPAIRED`` — no loss, but the model needed at least one repair turn.
+    5. ``CLEAN``.
+
+    The one case where 1-2 hide something real is an ``unscoped`` body that ALSO lost a candidate
+    (reachable: an unscoped status may carry candidates, and one of them may be junk). It reports
+    ``unscoped`` — because "nothing matched, ground everything" is what the user gets — while
+    ``dropped_candidate_count``/``drop_reason_codes`` still carry the loss on the same object. The
+    loss is reported, never the headline. A ``technical_failure`` cannot carry drops at all:
+    ``recognizer._partial_recovery`` returns the unchanged fail-open result when nothing survives.
+
+    ``repair_attempts`` counts the turns the MODEL was asked to fix its own answer — never transient
+    retries (a truncated response re-requested is not a correction), which is why it is threaded from
+    the seam's repair ledger rather than inferred from a provider-call count."""
+    codes: list[str] = []
+    for drop in result.dropped_candidates:
+        if drop.reason_code not in codes:
+            codes.append(drop.reason_code)
+    if result.status is RecognitionStatus.TECHNICAL_FAILURE:
+        disposition = RecognitionDisposition.TECHNICAL_FAILURE
+    elif result.status is RecognitionStatus.UNSCOPED:
+        disposition = RecognitionDisposition.UNSCOPED
+    elif result.dropped_candidates:
+        disposition = RecognitionDisposition.PARTIALLY_RECOVERED
+    elif repair_attempts > 0:
+        disposition = RecognitionDisposition.REPAIRED
+    else:
+        disposition = RecognitionDisposition.CLEAN
+    return RecognitionQuality(
+        disposition=disposition,
+        repair_attempts=max(int(repair_attempts), 0),
+        dropped_candidate_count=len(result.dropped_candidates),
+        drop_reason_codes=tuple(codes),
+    )
 
 
 def _validate_candidate(candidate: Any, index: int) -> str:

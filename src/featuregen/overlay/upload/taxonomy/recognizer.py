@@ -47,11 +47,13 @@ from featuregen.overlay.upload.enrich_llm import (
 from featuregen.overlay.upload.taxonomy.recognition import (
     RECOGNITION_VALIDATOR_VERSION,
     TAXONOMY_VERSION,
+    RecognitionQuality,
     RecognitionResult,
     RecognitionStatus,
     UseCaseCandidate,
     normalize_dimensions,
     partition_candidates,
+    recognition_quality,
     status_after_partition,
     unscoped_result,
     validate_recognition_output,
@@ -90,10 +92,19 @@ register_contract_version(RECOGNITION_REQUEST_CONTRACT, RECOGNITION_REQUEST_VERS
 
 @dataclass(frozen=True, slots=True)
 class AuditedRecognition:
+    """One recognition and everything the platform knows about how it got there.
+
+    ``quality`` (repair seam, Task 5) is derived HERE rather than at the endpoint because the repair
+    count only exists on the seam result: by the time a caller holds a ``RecognitionResult`` the
+    number of turns the model was asked to fix its answer is gone. It is computed on EVERY arm,
+    including the fail-open ones — "which of the five things happened" has an answer even when the
+    answer to "what did you recognise?" is nothing."""
+
     result: RecognitionResult
     llm_call_ref: str | None
     provider_calls: int
     usage: dict[str, Any]
+    quality: RecognitionQuality
 
 
 def resolve_recognizer_model(model_id: str | None = None) -> str:
@@ -240,6 +251,26 @@ def _partial_recovery(audited: AuditedStructuredResult, *, model: str) -> Recogn
     return replace(result, dropped_candidates=dropped)
 
 
+def _audited(result: RecognitionResult,
+             audited: AuditedStructuredResult | None = None) -> AuditedRecognition:
+    """Wrap a result in its audit facts and its QUALITY — the one constructor every arm of
+    ``recognize_with_audit`` returns through.
+
+    It is a single function on purpose. There are five terminal arms and each one must answer "which
+    of the five things happened"; five separate constructions is five chances for one arm to answer
+    it differently, or not at all, and the arm most likely to be forgotten is a failure arm — which
+    is exactly the one the user is currently mis-told about. ``audited=None`` is the pre-seam
+    dispatch failure: no provider call, no repair, no audit row."""
+    return AuditedRecognition(
+        result,
+        audited.llm_call_ref if audited is not None else None,
+        audited.provider_calls if audited is not None else 0,
+        audited.usage if audited is not None else {},
+        recognition_quality(
+            result, repair_attempts=audited.repair_attempts if audited is not None else 0),
+    )
+
+
 def _recognition_instruction(
     redacted_hypothesis: str,
     redacted_goal: str | None,
@@ -309,17 +340,12 @@ def recognize_with_audit(
         )
     except Exception:
         logger.exception("recognition dispatch raised; failing open to technical_failure")
-        return AuditedRecognition(
-            unscoped_result(
-                "recognition dispatch error",
-                model_id=model,
-                prompt_version=PROMPT_VERSION,
-                technical=True,
-            ),
-            None,
-            0,
-            {},
-        )
+        return _audited(unscoped_result(
+            "recognition dispatch error",
+            model_id=model,
+            prompt_version=PROMPT_VERSION,
+            technical=True,
+        ))
 
     output = audited.output
     if not output:                              # egress block / provider failure / empty body
@@ -329,19 +355,13 @@ def recognize_with_audit(
         # candidate must not be lost to a sloppy sibling just because the model could not repair.
         recovered = _partial_recovery(audited, model=model)
         if recovered is not None:
-            return AuditedRecognition(recovered, audited.llm_call_ref, audited.provider_calls,
-                                      audited.usage)
-        return AuditedRecognition(
-            unscoped_result(
-                "recognition failed or egress-blocked",
-                model_id=model,
-                prompt_version=PROMPT_VERSION,
-                technical=True,
-            ),
-            audited.llm_call_ref,
-            audited.provider_calls,
-            audited.usage,
-        )
+            return _audited(recovered, audited)
+        return _audited(unscoped_result(
+            "recognition failed or egress-blocked",
+            model_id=model,
+            prompt_version=PROMPT_VERSION,
+            technical=True,
+        ), audited)
 
     try:
         # The FLOOR, not the check: the same rules already ran inside the repair loop (above), so
@@ -350,20 +370,15 @@ def recognize_with_audit(
         # scope, and because `output` is about to be mapped into a governed result object.
         validate_recognition_output(output)     # closed-taxonomy semantics (id in registry, primary leaf)
     except SchemaValidationError as exc:
-        return AuditedRecognition(
-            unscoped_result(
-                # `exc`'s message is value-free by construction (`recognition._reject`): it names
-                # the closed code and the candidate POSITION, never the model's text. This note is
-                # persisted and shown to a human.
-                f"recognition output invalid: {exc}",
-                model_id=model,
-                prompt_version=PROMPT_VERSION,
-                technical=True,
-            ),
-            audited.llm_call_ref,
-            audited.provider_calls,
-            audited.usage,
-        )
+        return _audited(unscoped_result(
+            # `exc`'s message is value-free by construction (`recognition._reject`): it names
+            # the closed code and the candidate POSITION, never the model's text. This note is
+            # persisted and shown to a human.
+            f"recognition output invalid: {exc}",
+            model_id=model,
+            prompt_version=PROMPT_VERSION,
+            technical=True,
+        ), audited)
 
     try:
         result = _result_from_output(output, model_id=model)
@@ -375,12 +390,7 @@ def recognize_with_audit(
             prompt_version=PROMPT_VERSION,
             technical=True,
         )
-    return AuditedRecognition(
-        result,
-        audited.llm_call_ref,
-        audited.provider_calls,
-        audited.usage,
-    )
+    return _audited(result, audited)
 
 
 def recognize(

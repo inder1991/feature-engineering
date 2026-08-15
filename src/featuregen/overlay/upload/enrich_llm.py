@@ -2010,13 +2010,20 @@ class AuditedStructuredResult:
     under a dispatch-audit context, its linkage) exists — a body nobody can account for is a body
     nobody may act on. It is NEVER a validated output: ``output`` stays None, so no existing caller
     can mistake it for one, and the output-only ``audited_structured_call`` projection never sees
-    it at all."""
+    it at all.
+
+    ``repair_attempts`` (repair seam, Task 5) counts the turns on which the MODEL was asked to fix
+    its own answer — ``class == "repair"`` in the driver's ledger, never a ``retry``. A truncation or
+    a transient provider fault re-requested is not a correction, and reporting it as one would tell a
+    user their answer had been questioned when it had not; ``provider_calls - 1`` conflates exactly
+    those two. 0 means the first answer stood (or that nothing was dispatched)."""
     output: dict | None
     llm_call_ref: str | None
     provider_calls: int
     usage: dict
     failure_kind: str | None = None
     last_schema_valid_semantic_invalid_output: dict | None = None
+    repair_attempts: int = 0
 
 
 #: A semantic repair complaint is a CLOSED CODE — `UNKNOWN_USE_CASE_ID`, `DUPLICATE_CANDIDATE` —
@@ -2101,6 +2108,15 @@ def _compose_validation(reg: DocumentSchemaRegistry, schema_id: str, schema_vers
                              "technical failure", schema_id, schema_version)
 
     return _validate
+
+
+def _repair_turns(outcome: StructuredCallOutcome) -> int:
+    """How many turns the MODEL was asked to fix its own answer. The driver's ledger mixes two
+    classes — ``repair`` (the answer was faulted) and ``retry`` (a truncation/transient fault, where
+    the same question is simply asked again) — and only the first is a correction. Tolerant of a
+    ledger entry that is not a mapping: this feeds a served label, never a control decision."""
+    return sum(1 for a in outcome.repair_attempts
+               if isinstance(a, Mapping) and a.get("class") == "repair")
 
 
 def _terminal_failure_kind(outcome: StructuredCallOutcome,
@@ -2335,7 +2351,8 @@ def drive_audited_structured_call(
             # one nobody can account for, which outranks any judgement about WHY it was invalid.
             return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
                                            provider_calls=outcome.provider_calls, usage=usage,
-                                           failure_kind=FAILURE_KIND_AUDIT_DEGRADED)
+                                           failure_kind=FAILURE_KIND_AUDIT_DEGRADED,
+                                           repair_attempts=_repair_turns(outcome))
 
     if state.fault is not None:
         logger.warning("enrichment call %s (schema %s) discarded: the semantic validator raised %s",
@@ -2344,7 +2361,8 @@ def drive_audited_structured_call(
         # call is recorded above rather than lost to an exception leaving the seam.
         return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
                                        provider_calls=outcome.provider_calls, usage=usage,
-                                       failure_kind=FAILURE_KIND_VALIDATOR_FAULT)
+                                       failure_kind=FAILURE_KIND_VALIDATOR_FAULT,
+                                       repair_attempts=_repair_turns(outcome))
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
@@ -2357,10 +2375,12 @@ def drive_audited_structured_call(
             output=None, llm_call_ref=llm_call_ref, provider_calls=outcome.provider_calls,
             usage=usage, failure_kind=kind,
             last_schema_valid_semantic_invalid_output=(
-                state.invalid_output if kind == FAILURE_KIND_SEMANTIC_INVALID else None))
+                state.invalid_output if kind == FAILURE_KIND_SEMANTIC_INVALID else None),
+            repair_attempts=_repair_turns(outcome))
     output = outcome.output if isinstance(outcome.output, dict) else None
     return AuditedStructuredResult(output=output, llm_call_ref=llm_call_ref,
-                                   provider_calls=outcome.provider_calls, usage=usage)
+                                   provider_calls=outcome.provider_calls, usage=usage,
+                                   repair_attempts=_repair_turns(outcome))
 
 
 def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,

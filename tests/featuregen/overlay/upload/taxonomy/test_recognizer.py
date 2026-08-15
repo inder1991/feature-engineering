@@ -9,12 +9,16 @@ ids and never the non-selectable ``financial_crime`` domain parent. See
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from featuregen.contracts.contract_versions import contract_owner
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.intake.llm import (
+    PROVIDER_MAX_TOKENS,
     PROVIDER_OK,
     PROVIDER_REFUSAL,
     FakeLLM,
@@ -40,6 +44,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     RECOGNITION_VALIDATOR_VERSION,
     TAXONOMY_VERSION,
     CandidateDrop,
+    RecognitionDisposition,
     RecognitionStatus,
     unscoped_result,
 )
@@ -658,14 +663,16 @@ def test_only_the_semantic_arm_is_partitioned(db, monkeypatch) -> None:
     assert audited.result.dropped_candidates == ()
 
 
-def test_a_partitioned_result_is_not_persisted_with_its_drops_yet(db) -> None:
-    """Stated, not hidden. `intent_recognition_attempt` has no column for candidate loss, and Task 4
-    adds no migration — so a result READ BACK from storage carries no drops. The information is not
-    lost: `llm_call.raw_output` holds the exact body verbatim, the recognition row links to it via
-    `llm_call_ref` (Task 0), and the partition is a pure function of that body and the validator
-    version pinned in the request hash — so the drop set is recomputable from evidence. Task 5's
-    `recognition_quality` contract is where it becomes a served field, and it needs a migration this
-    task is not allowed to write."""
+def test_a_partitioned_result_persists_its_drops(db) -> None:
+    """**Task 5 closed the loss Task 4 recorded.** Until migration 1071 there was no column for
+    candidate loss, so a result read back from storage carried `dropped_candidates == ()` — and by
+    Task 0's invariant the endpoint serves the STORED row, which meant the drops never reached the
+    wire at all. This test used to assert that loss (`…_is_not_persisted_with_its_drops_yet`) rather
+    than hide it; it now asserts its closure, on the same body.
+
+    The evidence the drops were always recomputable FROM stays durable and joined to the row —
+    `llm_call.raw_output` holds the partitioned body verbatim — because a served summary and the
+    evidence for it are different obligations."""
     body = {"status": "classified",
             "candidates": [_candidate(CHURN, relationship="primary"), _blank_span_sibling()]}
     audited = recognize_with_audit(db, _RecordingClient(_script(body)),
@@ -676,15 +683,20 @@ def test_a_partitioned_result_is_not_persisted_with_its_drops_yet(db) -> None:
     recognition_id = record_recognition_attempt(
         db, intent_id="intent_partition_drops", input_hash=request_hash, result=audited.result,
         actor="ds1", input_content_hash="c9" * 32, recognition_request_hash=request_hash,
-        llm_call_ref=audited.llm_call_ref)
+        llm_call_ref=audited.llm_call_ref, quality=audited.quality)
     stored = load_recognition_attempt(db, recognition_id=recognition_id)
 
     assert stored is not None
-    assert stored.result.status is RecognitionStatus.CLASSIFIED       # the OUTCOME persists…
+    assert stored.result is not audited.result                        # rebuilt from the ROW
+    assert stored.result.status is RecognitionStatus.CLASSIFIED
     assert [c.use_case_id for c in stored.result.candidates] == [CHURN]
-    assert stored.result.dropped_candidates == ()                     # …the drop record does not
-    # The evidence it is recomputable FROM is durable, and joined to this row.
-    assert stored.result is not audited.result
+    assert stored.result.dropped_candidates == (
+        CandidateDrop(index=1, reason_code=MALFORMED_EVIDENCE_SPANS),)
+    assert stored.quality is not None
+    assert stored.quality.disposition is RecognitionDisposition.PARTIALLY_RECOVERED
+    assert stored.quality.dropped_candidate_count == 1
+    assert stored.quality.drop_reason_codes == (MALFORMED_EVIDENCE_SPANS,)
+    assert stored.quality.repair_attempts == 2        # the budget was spent before anything was cut
     row = db.execute(
         "SELECT llm_call_ref FROM intent_recognition_attempt WHERE recognition_id = %s",
         (recognition_id,)).fetchone()
@@ -692,6 +704,63 @@ def test_a_partitioned_result_is_not_persisted_with_its_drops_yet(db) -> None:
     raw = db.execute("SELECT raw_output FROM llm_call WHERE llm_call_ref = %s",
                      (audited.llm_call_ref,)).fetchone()[0]
     assert len(raw["output"]["candidates"]) == 2      # the body the partition ran on, verbatim
+
+
+def test_a_row_written_without_a_quality_reads_back_as_an_absence(db) -> None:
+    """The legacy shape, and the honest-absence law on the read path. A caller that did not observe
+    the quality writes three NULLs, and the reader says `None` — never a fabricated `clean`, which
+    would claim the model answered first time when nobody recorded whether it did."""
+    audited = recognize_with_audit(db, _RecordingClient(_script(_CLEAN_BODY)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+    request_hash = "b5" * 32
+    recognition_id = record_recognition_attempt(
+        db, intent_id="intent_no_quality", input_hash=request_hash, result=audited.result,
+        actor="ds1", input_content_hash="ca" * 32, recognition_request_hash=request_hash)
+    stored = load_recognition_attempt(db, recognition_id=recognition_id)
+
+    assert stored is not None
+    assert stored.quality is None
+    assert stored.result.dropped_candidates == ()
+    assert db.execute(
+        "SELECT recognition_disposition, repair_attempt_count, dropped_candidates "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (recognition_id,)).fetchone() == (None, None, None)
+
+
+def test_a_quality_that_describes_a_different_result_is_refused(db) -> None:
+    """The stored drops come from the RESULT and the served count is a projection of them, so a
+    quality built from some other result would be persisted as a count that silently disagrees with
+    the record it summarises. Refused at the writer, where it is still a bug rather than a lie."""
+    audited = recognize_with_audit(db, _RecordingClient(_script(_CLEAN_BODY)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+    mismatched = replace(audited.quality, dropped_candidate_count=3,
+                         drop_reason_codes=(MALFORMED_EVIDENCE_SPANS,))
+    request_hash = "b6" * 32
+    with pytest.raises(ValueError, match="does not describe this result"):
+        record_recognition_attempt(
+            db, intent_id="intent_bad_quality", input_hash=request_hash, result=audited.result,
+            actor="ds1", input_content_hash="cb" * 32, recognition_request_hash=request_hash,
+            quality=mismatched)
+
+
+def test_a_retry_is_not_a_repair(db) -> None:
+    """The distinction `repair_attempts` exists to keep. A truncated turn is re-REQUESTED — the same
+    question, asked again — while a repair turn tells the model its answer was faulted. Counting
+    them together (the tempting `provider_calls - 1`) would tell a user their scope had been
+    questioned when it had not, on a call where nothing was ever wrong with the answer."""
+    truncated = FakeResponse(output={}, provider_status=PROVIDER_MAX_TOKENS)
+    client = _RecordingClient(FakeLLM(script={RECOGNIZER_TASK: [
+        truncated, FakeResponse(output=_CLEAN_BODY, provider_status=PROVIDER_OK)]}))
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS)
+
+    assert audited.result.status is RecognitionStatus.CLASSIFIED
+    assert len(client.requests) == 2                      # two PHYSICAL provider calls…
+    assert audited.provider_calls == 2
+    assert audited.quality.repair_attempts == 0           # …and zero corrections
+    assert audited.quality.disposition is RecognitionDisposition.CLEAN
+    ledger = db.execute("SELECT repair_attempts FROM llm_call WHERE llm_call_ref = %s",
+                        (audited.llm_call_ref,)).fetchone()[0]
+    assert [a["class"] for a in ledger] == ["retry"]      # the ledger says which kind it was
 
 
 def test_the_validator_version_moved_with_what_the_recognizer_accepts(monkeypatch) -> None:

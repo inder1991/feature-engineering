@@ -247,3 +247,127 @@ def test_the_served_result_and_its_audit_row_are_one_fact(make_client, conn):
     task = conn.execute(
         "SELECT task FROM llm_call WHERE llm_call_ref = %s", (row[3],)).fetchone()
     assert task is not None and task[0] == RECOGNIZER_TASK
+
+
+# ── Task 5 (2026-08-15): the response says WHICH of five things happened ────────────────────────
+#
+# Before this, `status` was the whole story and the screen turned four different outcomes into one
+# sentence — "No use-case was recognised" — which was true of exactly one of them. One case per
+# disposition, each asserting the block AND what the user is left holding.
+
+# A second real leaf, so a two-primary body breaks the caps rule rather than the closed enum.
+DEPOSIT = "customer.relationship_attrition.deposit_attrition"
+
+
+def _body(*candidates: dict, status: str = "classified") -> dict:
+    return {"status": status, "candidates": list(candidates), "ambiguity_note": None}
+
+
+def _cand(use_case_id: str = CHURN, *, relationship: str = "primary",
+          evidence_spans: list[str] | None = None) -> dict:
+    return {"use_case_id": use_case_id, "relationship": relationship, "confidence": "high",
+            "evidence_spans": ["churn"] if evidence_spans is None else evidence_spans,
+            "rationale": "the hypothesis is about customers leaving"}
+
+
+# Two primaries: schema-valid (both ids are real leaves, every band in range) and semantically
+# invalid, so it is the caller's own rules that spend a repair turn.
+_DOUBLE_PRIMARY = FakeResponse(output=_body(_cand(), _cand(DEPOSIT)))
+# A valid primary beside a candidate whose only fault is a BLANK evidence span — the one
+# candidate-local defect the frozen v2 schema accepts and the semantic rules reject, and therefore
+# the only one that can reach the partition at all (Task 4's [R6] finding).
+_ONE_JUNK_SIBLING = FakeResponse(
+    output=_body(_cand(), _cand(DEPOSIT, relationship="secondary", evidence_spans=["   "])))
+
+
+def _scripted(*responses: FakeResponse) -> FakeLLM:
+    """A sequence of turns. FakeLLM repeats the last response once exhausted, so a single response
+    drives the whole repair budget and a two-response script drives 'invalid, then fixed'."""
+    return FakeLLM(script={RECOGNIZER_TASK: list(responses)})
+
+
+def _quality(res) -> dict:
+    body = res.json()
+    assert res.status_code == 200, res.text
+    assert body["recognition_quality"] is not None, "the response records no quality at all"
+    return body["recognition_quality"]
+
+
+def _post(client, hypothesis: str) -> object:
+    return client.post("/contract/recognitions",
+                       json={"hypothesis": hypothesis, "objective": "predict churn"}, headers=AUTH)
+
+
+def test_a_first_answer_that_validated_is_served_as_clean(make_client):
+    res = _post(make_client(_llm(_CLASSIFIED)), "customers churn when their balance drops")
+    assert _quality(res) == {"disposition": "clean", "repair_attempts": 0,
+                             "dropped_candidate_count": 0, "drop_reason_codes": []}
+
+
+def test_an_answer_the_model_had_to_fix_is_served_as_repaired(make_client):
+    """The model broke a rule no JSON Schema can state (two primaries), was asked to fix it, and
+    did. The user's scope is the FIXED answer — and the response says so rather than presenting it
+    as the model's first word."""
+    res = _post(make_client(_scripted(_DOUBLE_PRIMARY, _CLASSIFIED)),
+                "customers churn when their balance drops")
+    body = res.json()
+    assert _quality(res) == {"disposition": "repaired", "repair_attempts": 1,
+                             "dropped_candidate_count": 0, "drop_reason_codes": []}
+    assert body["status"] == "classified"
+    assert [c["use_case_id"] for c in body["candidates"]] == [CHURN]
+
+
+def test_a_partial_recovery_keeps_its_scope_and_names_what_it_lost(make_client):
+    """THE case the incident is about. Repair was spent and failed; the valid candidate is still the
+    user's scope, the discarded one is named by a closed code, and `unscoped` is FALSE — a partial
+    recovery must never be served as "here is everything instead"."""
+    res = _post(make_client(_scripted(_ONE_JUNK_SIBLING)),
+                "customers churn when their balance drops")
+    body = res.json()
+    assert _quality(res) == {"disposition": "partially_recovered", "repair_attempts": 2,
+                             "dropped_candidate_count": 1,
+                             "drop_reason_codes": ["MALFORMED_EVIDENCE_SPANS"]}
+    # The surviving scope is REAL and is what the response carries.
+    assert body["status"] == "classified"
+    assert body["unscoped"] is False
+    assert [c["use_case_id"] for c in body["candidates"]] == [CHURN]
+    # And the loss does NOT ride `warnings`, which the UI renders as a mis-mapped DIMENSION.
+    assert body["warnings"] == []
+
+
+def test_a_valid_answer_that_matched_nothing_is_served_as_unscoped(make_client):
+    res = _post(make_client(_llm(_UNSCOPED)), "forecast quarterly rainfall in the north")
+    assert _quality(res) == {"disposition": "unscoped", "repair_attempts": 0,
+                             "dropped_candidate_count": 0, "drop_reason_codes": []}
+    assert res.json()["unscoped"] is True
+    # The recognizer's own note is no longer withheld — it is why the answer was unscoped.
+    assert res.json()["ambiguity_note"] == "nothing in the closed taxonomy applies"
+
+
+def test_no_usable_answer_at_all_is_served_as_a_technical_failure(make_client):
+    """Distinct from `unscoped`: the platform has no answer, rather than an answer that says
+    nothing matched. Still HTTP 200, still fail-open."""
+    res = _post(make_client(_llm(_REFUSAL)), "customers churn when their balance drops")
+    assert _quality(res)["disposition"] == "technical_failure"
+    assert res.json()["unscoped"] is True
+    assert res.json()["candidates"] == []
+
+
+def test_the_quality_is_read_back_from_the_stored_row_not_the_call(make_client, conn):
+    """Task 0's invariant applies to the quality too: the block is served from the ROW the returned
+    id names, so a second identical request — answered with no provider call at all — reports the
+    same five-valued fact rather than a fresh guess."""
+    client = make_client(_scripted(_ONE_JUNK_SIBLING))
+    payload = {"hypothesis": "customers churn when their balance drops",
+               "objective": "predict churn"}
+    first = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    second = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert first.status_code == 200 and second.status_code == 200, (first.text, second.text)
+    assert second.json() == first.json()
+    row = conn.execute(
+        "SELECT recognition_disposition, repair_attempt_count, dropped_candidates "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (first.json()["recognition_id"],)).fetchone()
+    assert row[0] == "partially_recovered"
+    assert row[1] == 2
+    assert row[2] == [{"index": 1, "reason_code": "MALFORMED_EVIDENCE_SPANS"}]

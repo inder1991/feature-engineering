@@ -145,6 +145,57 @@ function signalWarningText(code: string): string {
   return SIGNAL_WARNING_TEXT[code] ?? humanizeCode(code)
 }
 
+// ── Gate #1: what actually happened to this recognition (repair seam, Task 5) ────────────────────
+//
+// The 2026-08-15 incident put four different outcomes behind ONE sentence — "No use-case was
+// recognised for this objective" — which was true of exactly one of them. It was shown for a
+// technical failure, for a genuine "nothing in the taxonomy matched", for an ambiguous answer whose
+// alternatives were sitting in the response unrendered, and (once the platform learned to keep a
+// valid candidate away from a sloppy sibling) for a partial recovery that HAD a scope.
+//
+// Two independent lines, because they answer two different questions and a user can need both:
+//   * `scopeNotice` — what you are looking at. Absence first: a platform failure and an answer of
+//     "nothing matched" are not the same thing, and neither is an answer with alternatives but no
+//     designated primary.
+//   * `qualityNotice` — what it cost to get here. A discarded proposal or a correction the model was
+//     asked for; silent when the first answer simply validated.
+// Both are PLATFORM text keyed off closed vocabularies. The recognizer's own `ambiguity_note` is on
+// the wire but deliberately not rendered as either: on a failure arm it is a diagnostic naming a
+// rule code, which is support material, not a sentence for the person confirming a scope.
+
+function scopeNotice(rec: RecognitionResp, hasPrimary: boolean): string | null {
+  if (rec.status === 'technical_failure')
+    return 'Recognition could not be validated; you may broaden to all recipes.'
+  if (rec.status === 'unscoped')
+    return 'No governed use case clearly matched. Show all buildable recipes to generate over everything.'
+  if (hasPrimary) return null
+  if (rec.candidates.length > 0)
+    return 'Several alternatives were found; choose one as the primary, or broaden to all recipes.'
+  return 'No use-case was recognised for this objective. Show all buildable recipes to generate over everything.'
+}
+
+function qualityNotice(rec: RecognitionResp): string | null {
+  const quality = rec.recognition_quality
+  // No block at all = an attempt stored before the platform recorded this (migration 1071), or a
+  // backend older than this client — the two are indistinguishable here and want the same answer.
+  // Saying nothing is the honest render: "the model answered first time" and "nobody wrote down
+  // whether it did" are different facts, and only one of them is knowable. Nullish, not `=== null`:
+  // an absent key is the shape an older backend actually sends.
+  if (quality == null) return null
+  if (quality.dropped_candidate_count > 0) {
+    // Reachable on `partially_recovered` and, rarely, on an `unscoped` answer that also lost a
+    // candidate — the loss is reported either way. A drop is only ever recorded when something
+    // SURVIVED the partition (a result with no survivors keeps today's fail-open shape and records
+    // no drops), so "the remaining scope" always names something the user can actually see.
+    return quality.dropped_candidate_count === 1
+      ? 'One invalid proposal was discarded; review the remaining scope.'
+      : `${quality.dropped_candidate_count} invalid proposals were discarded; review the remaining scope.`
+  }
+  if (quality.disposition === 'repaired')
+    return 'The first answer did not validate; the model was asked to correct it. Review the scope before confirming.'
+  return null
+}
+
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
@@ -2050,35 +2101,48 @@ export function WorkbenchScreen() {
             We recognised what you're building. Confirm it, adjust it, or show every buildable
             recipe. Nothing generates until you confirm.
           </p>
-          {recognition.status === 'ambiguous' && (
+          {recognition.status === 'ambiguous' && primaryCandidate !== null && (
             <p className="hint" role="status">
               The objective read as ambiguous — check the primary before confirming.
             </p>
           )}
-          {primaryCandidate === null ? (
-            <p role="status">
-              No use-case was recognised for this objective. Show all buildable recipes to generate
-              over everything.
+          {/* What you are looking at, and what it cost. Five outcomes, five sentences — see
+              scopeNotice/qualityNotice. */}
+          {scopeNotice(recognition, primaryCandidate !== null) !== null && (
+            <p role="status">{scopeNotice(recognition, primaryCandidate !== null)}</p>
+          )}
+          {qualityNotice(recognition) !== null && (
+            <p className="hint" role="status" data-role="recognition-quality">
+              {qualityNotice(recognition)}
             </p>
-          ) : (
+          )}
+          {/* The proposals render whenever the recognizer made any — NOT only when one of them is
+              the primary. A partial recovery whose primary was the discarded candidate, and an
+              ambiguous answer that designated none, both have real alternatives to choose from;
+              hiding them behind "no use-case was recognised" reported presence as absence. */}
+          {recognition.candidates.length > 0 && (
             <>
-              <div className="scope-primary" data-role="primary">
-                <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-                  <span className="badge recommended">Primary</span>
-                  <span style={{ fontWeight: 600 }}>{primaryCandidate.display_name}</span>
-                  <span className="badge">{primaryCandidate.confidence} confidence</span>
+              {primaryCandidate !== null && (
+                <div className="scope-primary" data-role="primary">
+                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                    <span className="badge recommended">Primary</span>
+                    <span style={{ fontWeight: 600 }}>{primaryCandidate.display_name}</span>
+                    <span className="badge">{primaryCandidate.confidence} confidence</span>
+                  </div>
+                  {primaryCandidate.evidence_spans.length > 0 && (
+                    <ul className="scope-evidence" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                      {primaryCandidate.evidence_spans.map(span => (
+                        <li key={span} style={{ color: 'var(--ink-soft)' }}>“{span}”</li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
-                {primaryCandidate.evidence_spans.length > 0 && (
-                  <ul className="scope-evidence" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
-                    {primaryCandidate.evidence_spans.map(span => (
-                      <li key={span} style={{ color: 'var(--ink-soft)' }}>“{span}”</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
+              )}
               {secondaryCandidates.length > 0 && (
                 <div style={{ marginTop: 12 }}>
-                  <h3 style={{ margin: '0 0 8px' }}>Also in scope</h3>
+                  <h3 style={{ margin: '0 0 8px' }}>
+                    {primaryCandidate !== null ? 'Also in scope' : 'Alternatives'}
+                  </h3>
                   <ul className="rows">
                     {secondaryCandidates.map(cand => (
                       <li

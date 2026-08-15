@@ -36,9 +36,13 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     UNKNOWN_TARGET_ENTITY,
     UNKNOWN_USE_CASE_ID,
     CandidateDrop,
+    RecognitionDisposition,
+    RecognitionResult,
     RecognitionStatus,
+    UseCaseCandidate,
     normalize_dimensions,
     partition_candidates,
+    recognition_quality,
     status_after_partition,
     unscoped_result,
     validate_recognition_output,
@@ -534,3 +538,129 @@ def test_partition_never_raises_and_never_mutates_its_input() -> None:
     for junk in (None, [], "string", {"status": None}, {"candidates": {}},
                  {"status": "classified", "candidates": [None]}):
         assert isinstance(partition_candidates(junk if isinstance(junk, dict) else {}), tuple)
+
+
+# ── Task 5 (2026-08-15): WHICH of the five things happened ──────────────────────────────────────
+#
+# `RecognitionStatus` answers "what did you recognise?"; `RecognitionDisposition` answers "what did
+# it take to get there?", and the incident is what happens when only the first is served: a partial
+# recovery, a repair-exhausted failure, a genuine "nothing matched" and an ambiguous answer with
+# real alternatives all reached the screen as the same sentence.
+
+def _result(status: RecognitionStatus, *, drops: tuple[CandidateDrop, ...] = (),
+            candidates: tuple[Any, ...] = ()) -> RecognitionResult:
+    return RecognitionResult(
+        status=status, candidates=candidates, ambiguity_note=None,
+        taxonomy_version=TAXONOMY_VERSION, recognizer_model_id="claude-sonnet-5",
+        prompt_version="3", dropped_candidates=drops)
+
+
+def _candidate_object(use_case_id: str = CHURN) -> UseCaseCandidate:
+    return UseCaseCandidate(use_case_id=use_case_id, relationship="primary", confidence="high",
+                            evidence_spans=("close their current account",), rationale="")
+
+
+def test_a_first_answer_that_validated_is_clean() -> None:
+    quality = recognition_quality(
+        _result(RecognitionStatus.CLASSIFIED, candidates=(_candidate_object(),)),
+        repair_attempts=0)
+    assert quality.disposition is RecognitionDisposition.CLEAN
+    assert quality.repair_attempts == 0
+    assert quality.dropped_candidate_count == 0
+    assert quality.drop_reason_codes == ()
+
+
+def test_an_answer_the_model_had_to_fix_is_repaired_not_clean() -> None:
+    """The distinction the UI needs: the answer is CORRECT, and it is correct on the second
+    telling. Nothing was lost, so this is not a partial recovery — but it is not the model's first
+    word either, and a reviewer is entitled to know that before confirming a scope."""
+    quality = recognition_quality(
+        _result(RecognitionStatus.CLASSIFIED, candidates=(_candidate_object(),)),
+        repair_attempts=1)
+    assert quality.disposition is RecognitionDisposition.REPAIRED
+    assert quality.repair_attempts == 1
+    assert quality.dropped_candidate_count == 0
+
+
+def test_a_partition_that_kept_something_is_partially_recovered() -> None:
+    quality = recognition_quality(
+        _result(RecognitionStatus.CLASSIFIED, candidates=(_candidate_object(),),
+                drops=(CandidateDrop(index=1, reason_code=MALFORMED_EVIDENCE_SPANS),)),
+        repair_attempts=2)
+    assert quality.disposition is RecognitionDisposition.PARTIALLY_RECOVERED
+    assert quality.repair_attempts == 2           # repair was SPENT first, and is still reported
+    assert quality.dropped_candidate_count == 1
+    assert quality.drop_reason_codes == (MALFORMED_EVIDENCE_SPANS,)
+
+
+def test_a_valid_answer_that_matched_nothing_is_unscoped_not_a_failure() -> None:
+    quality = recognition_quality(_result(RecognitionStatus.UNSCOPED), repair_attempts=0)
+    assert quality.disposition is RecognitionDisposition.UNSCOPED
+
+
+def test_no_usable_answer_at_all_is_a_technical_failure() -> None:
+    """Repair exhausted with nothing left standing, a provider refusal, an egress block: the
+    platform has no answer, which is a different thing from an answer that says 'nothing matched'."""
+    quality = recognition_quality(_result(RecognitionStatus.TECHNICAL_FAILURE), repair_attempts=2)
+    assert quality.disposition is RecognitionDisposition.TECHNICAL_FAILURE
+    assert quality.repair_attempts == 2
+
+
+def test_the_five_dispositions_are_all_reachable_and_closed() -> None:
+    """A sixth would have to be added here, to the migration's CHECK, and to the UI — which is the
+    point of enumerating them: the platform has exactly five things it can say happened."""
+    reached = {
+        recognition_quality(_result(RecognitionStatus.CLASSIFIED,
+                                    candidates=(_candidate_object(),)),
+                            repair_attempts=0).disposition,
+        recognition_quality(_result(RecognitionStatus.CLASSIFIED,
+                                    candidates=(_candidate_object(),)),
+                            repair_attempts=1).disposition,
+        recognition_quality(_result(RecognitionStatus.AMBIGUOUS, candidates=(_candidate_object(),),
+                                    drops=(CandidateDrop(index=0,
+                                                         reason_code=UNKNOWN_USE_CASE_ID),)),
+                            repair_attempts=2).disposition,
+        recognition_quality(_result(RecognitionStatus.UNSCOPED), repair_attempts=0).disposition,
+        recognition_quality(_result(RecognitionStatus.TECHNICAL_FAILURE),
+                            repair_attempts=0).disposition,
+    }
+    assert reached == set(RecognitionDisposition)
+
+
+def test_absence_outranks_effort_and_still_reports_the_loss() -> None:
+    """THE PRECEDENCE RULE, on the one body where it bites. An `unscoped` status may legally carry
+    candidates, and one of them may be junk — so a partition can drop something from a result the
+    user will still see as "nothing matched". The headline is what the user GETS (unscoped, ground
+    everything); the loss is not hidden by it, it rides the same object."""
+    quality = recognition_quality(
+        _result(RecognitionStatus.UNSCOPED, candidates=(_candidate_object(),),
+                drops=(CandidateDrop(index=1, reason_code=MALFORMED_EVIDENCE_SPANS),)),
+        repair_attempts=2)
+    assert quality.disposition is RecognitionDisposition.UNSCOPED
+    assert quality.dropped_candidate_count == 1
+    assert quality.drop_reason_codes == (MALFORMED_EVIDENCE_SPANS,)
+
+
+def test_the_count_is_the_authority_on_how_many_and_the_codes_on_which_rules() -> None:
+    """Two candidates discarded for the same reason is one CODE and two LOSSES. Serving the code
+    list as the count would under-report the loss; deduplicating nothing would render the same
+    sentence twice."""
+    quality = recognition_quality(
+        _result(RecognitionStatus.AMBIGUOUS, candidates=(_candidate_object(),),
+                drops=(CandidateDrop(index=1, reason_code=MALFORMED_EVIDENCE_SPANS),
+                       CandidateDrop(index=2, reason_code=MALFORMED_EVIDENCE_SPANS))),
+        repair_attempts=2)
+    assert quality.dropped_candidate_count == 2
+    assert quality.drop_reason_codes == (MALFORMED_EVIDENCE_SPANS,)
+
+
+def test_every_drop_code_the_quality_can_serve_is_value_free() -> None:
+    """The block goes to a browser unescaped by anything downstream, so its vocabulary is held to
+    the same seam rule as a repair complaint: an uppercase token cannot carry a use-case id."""
+    for code in sorted(RECOGNITION_FAILURE_CODES):
+        quality = recognition_quality(
+            _result(RecognitionStatus.AMBIGUOUS, candidates=(_candidate_object(),),
+                    drops=(CandidateDrop(index=0, reason_code=code),)),
+            repair_attempts=1)
+        assert quality.drop_reason_codes == (code,)
+        assert _SEMANTIC_REPAIR_CODE.fullmatch(code)

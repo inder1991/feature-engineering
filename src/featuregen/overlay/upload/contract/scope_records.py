@@ -35,6 +35,9 @@ from featuregen.idgen import mint_id
 from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
 from featuregen.overlay.upload.taxonomy.recognition import (
+    CandidateDrop,
+    RecognitionDisposition,
+    RecognitionQuality,
     RecognitionResult,
     RecognitionStatus,
     UseCaseCandidate,
@@ -50,6 +53,33 @@ def _actor_dict(actor: Any) -> dict[str, Any]:
         return identity_to_jsonb(actor)
     except Exception:
         return {"repr": str(actor)}
+
+
+def _drop_json(drop: CandidateDrop) -> dict[str, Any]:
+    """Serialize one partition drop for the ``dropped_candidates`` jsonb (1071). ``index`` stays
+    ``null`` when the whole RESULT was refused — an aggregate defect belongs to the SET, and naming a
+    candidate for it would blame one that may be perfectly well formed."""
+    return {"index": drop.index, "reason_code": drop.reason_code}
+
+
+def _drops_from_json(raw: Any) -> tuple[CandidateDrop, ...]:
+    """Rebuild the drop records from the stored jsonb, skipping anything that is not a drop record.
+
+    Tolerant on purpose: this feeds a served LABEL, and a row whose jsonb somebody hand-edited must
+    degrade to a smaller honest answer rather than 500 the recognition read path — recognition is
+    fail-open at every other layer and a reader is no place to break that."""
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    drops: list[CandidateDrop] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        code = entry.get("reason_code")
+        index = entry.get("index")
+        if isinstance(code, str) and (
+                index is None or (isinstance(index, int) and not isinstance(index, bool))):
+            drops.append(CandidateDrop(index=index, reason_code=code))
+    return tuple(drops)
 
 
 def _candidate_json(candidate: UseCaseCandidate) -> dict[str, Any]:
@@ -132,18 +162,24 @@ class StoredRecognition:
     The point of reading a result back rather than trusting the in-memory one is the B2 invariant:
     the ``recognition_id`` a caller returns must name the row its payload was built from. Whenever
     those two can drift — a concurrent writer winning the insert, an earlier answer already stored —
-    the ROW is the fact and the in-memory result is a guess."""
+    the ROW is the fact and the in-memory result is a guess.
+
+    ``quality`` is ``None`` for a row written before migration 1071. That is not a gap to be filled:
+    "the model answered first time" and "nobody recorded whether it did" are different facts, and
+    only one of them is knowable about a legacy row. Callers serve the absence."""
 
     recognition_id: str
     result: RecognitionResult
     llm_call_ref: str | None
     recognition_request_hash: str | None
+    quality: RecognitionQuality | None = None
 
 
 _ATTEMPT_COLUMNS = (
     "recognition_id, status, candidates, ambiguity_note, taxonomy_version, "
     "applicability_mapping_version, recognizer_model_id, prompt_version, recipe_registry_version, "
-    "modelling_contexts, target_entity, warnings, llm_call_ref, recognition_request_hash")
+    "modelling_contexts, target_entity, warnings, llm_call_ref, recognition_request_hash, "
+    "recognition_disposition, repair_attempt_count, dropped_candidates")
 
 
 def _stored_recognition(row: Any) -> StoredRecognition:
@@ -157,6 +193,16 @@ def _stored_recognition(row: Any) -> StoredRecognition:
             rationale=str(c.get("rationale", "")),
         )
         for c in (row[2] or ()) if isinstance(c, dict))
+    # 1071 writes the three quality columns together or not at all (its
+    # `intent_recognition_attempt_quality_is_coherent` CHECK), so ONE of them decides whether this
+    # row has a quality — reading three would invent a half-record where the constraint forbids one.
+    drops = _drops_from_json(row[16])
+    quality = None if row[14] is None else RecognitionQuality(
+        disposition=RecognitionDisposition(row[14]),
+        repair_attempts=int(row[15] or 0),
+        dropped_candidate_count=len(drops),
+        drop_reason_codes=tuple(dict.fromkeys(d.reason_code for d in drops)),
+    )
     return StoredRecognition(
         recognition_id=row[0],
         result=RecognitionResult(
@@ -171,9 +217,11 @@ def _stored_recognition(row: Any) -> StoredRecognition:
             modelling_contexts=tuple(row[9] or ()),
             target_entity=row[10],
             warnings=tuple(row[11] or ()),
+            dropped_candidates=drops,
         ),
         llm_call_ref=row[12],
         recognition_request_hash=row[13],
+        quality=quality,
     )
 
 
@@ -212,6 +260,7 @@ def record_recognition_attempt(
     input_content_hash: str | None = None,
     recognition_request_hash: str | None = None,
     llm_call_ref: str | None = None,
+    quality: RecognitionQuality | None = None,
 ) -> str:
     """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
     the candidate PROPOSALS, and the optional intent DIMENSIONS (``modelling_contexts`` / ``target_entity``)
@@ -230,7 +279,15 @@ def record_recognition_attempt(
       is the redacted-input hash exactly as before, and ``input_content_hash`` defaults from it.
 
     ``llm_call_ref`` ties the served result to the audit row for the call that produced it, so the
-    answer and its evidence are one fact rather than two rows nobody joined."""
+    answer and its evidence are one fact rather than two rows nobody joined.
+
+    ``quality`` (1071) records WHICH OF FIVE THINGS happened — the disposition, the repair turns the
+    model was asked for, and the candidates the partition discarded. It is written AT INSERT, never
+    patched in afterwards: 1024's ``intent_recognition_attempt_no_mutation`` trigger refuses UPDATE
+    and DELETE on this table, so there is no "record now, complete later" path and designing one
+    would mean a mutable row. ``None`` writes three NULLs, which is what a caller that did not
+    observe the quality should say — legacy rows read back as ``StoredRecognition.quality is None``
+    and are served as an absence rather than a fabricated ``clean``."""
     recognition_id = mint_id("rcg")
     candidates = [_candidate_json(c) for c in result.candidates]
     content_hash = input_content_hash if input_content_hash is not None else input_hash
@@ -243,6 +300,11 @@ def record_recognition_attempt(
         if input_content_hash is None:
             raise ValueError(
                 "a request-identity recognition must seal input_content_hash separately")
+    if quality is not None and quality.dropped_candidate_count != len(result.dropped_candidates):
+        # The DROPS are stored from the result and the served count is a projection of them, so a
+        # quality describing a DIFFERENT result would be persisted as a count that silently
+        # disagrees with the record it summarises. Refuse rather than store a plausible lie.
+        raise ValueError("recognition quality does not describe this result's dropped candidates")
     if input_json is not None:
         computed_hash = compute_input_hash(input_json)
         if computed_hash != content_hash:
@@ -257,8 +319,9 @@ def record_recognition_attempt(
         "taxonomy_version, applicability_mapping_version, recognizer_model_id, prompt_version, "
         "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by, "
         "input_json, input_content_hash, redaction_policy_version, recognition_request_hash, "
-        "llm_call_ref) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "llm_call_ref, recognition_disposition, repair_attempt_count, dropped_candidates) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+        "%s, %s, %s) "
         "ON CONFLICT (intent_id, input_hash) DO NOTHING",
         (recognition_id, intent_id, input_hash, result.status.value, Jsonb(candidates),
          result.ambiguity_note, result.taxonomy_version, result.applicability_mapping_version,
@@ -266,7 +329,12 @@ def record_recognition_attempt(
          Jsonb(list(result.modelling_contexts)), result.target_entity, Jsonb(list(result.warnings)),
          Jsonb(_actor_dict(actor)), Jsonb(input_json) if input_json is not None else None,
          content_hash if input_json is not None else None, redaction_policy_version,
-         recognition_request_hash, llm_call_ref))
+         recognition_request_hash, llm_call_ref,
+         # All three together or all three NULL — 1071's coherence CHECK says the same thing in the
+         # database, so a future caller that fills in one of them learns it from a constraint.
+         None if quality is None else quality.disposition.value,
+         None if quality is None else quality.repair_attempts,
+         None if quality is None else Jsonb([_drop_json(d) for d in result.dropped_candidates])))
     # Read back the governing id for this (intent, key) — the one just inserted, or the pre-existing
     # one when the INSERT hit ON CONFLICT DO NOTHING. Either way a repeat returns the SAME id.
     row = conn.execute(

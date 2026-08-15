@@ -597,6 +597,97 @@ that body and the validator version, so both are honest; neither is free.
 **Acceptance:** a Vitest case per disposition; the honest-absence law asserted on the two that are
 not absence.
 
+> **TASK 5 (2026-08-15) — ACCEPTED `<pending>`.** `recognition_quality` is a served block —
+> `{disposition, repair_attempts, dropped_candidate_count, drop_reason_codes}` — derived by
+> `recognition.recognition_quality(result, repair_attempts=…)`, persisted at INSERT by migration
+> **1071**, and read back from the STORED row so Task 0's invariant still holds: the block describes
+> the row the returned `recognition_id` names, not the call that happened to run. `ambiguity_note` is
+> no longer withheld either.
+>
+> **The precedence is ABSENCE FIRST, and it is the contract.** `technical_failure` → `unscoped` →
+> `partially_recovered` → `repaired` → `clean`. A user acts on what they were given, so the
+> disposition names that before it names the platform's effort. The one body where this bites is an
+> `unscoped` answer that ALSO lost a candidate (legal: an unscoped status may carry candidates, and
+> one may be junk): it reports `unscoped` while `dropped_candidate_count`/`drop_reason_codes` still
+> carry the loss on the same object — reported, never the headline
+> (`test_absence_outranks_effort_and_still_reports_the_loss`). A `technical_failure` cannot carry
+> drops at all: `_partial_recovery` returns the unchanged fail-open result when nothing survives, so
+> **a recorded drop always implies a survivor** — which is what makes *"review the remaining scope"*
+> name something the user can actually see.
+>
+> **Plan defect [R7] — the two "fives" are not the same five, and one of them was unimplementable as
+> written.** The contract enumerates `clean | repaired | partially_recovered | unscoped |
+> technical_failure`; the message list enumerates partial recovery / repair-exhausted / genuine
+> unscoped / **ambiguous-without-primary** / clean. `repaired` has no message in that list, and
+> ambiguous-without-primary is not a disposition at all — it is a SHAPE a candidate-bearing result
+> can take under three of them. Resolved with two INDEPENDENT lines rather than one switch: *what you
+> are looking at* (`scopeNotice`, absence-first, including the alternatives state) and *what it cost*
+> (`qualityNotice`: a discarded proposal, or a correction the model was asked for). Every disposition
+> still renders distinguishably — which is what the acceptance asks — and the hardest case now reports
+> BOTH facts: a partial recovery whose discarded candidate WAS the primary says "several alternatives
+> were found" and "one invalid proposal was discarded" at once
+> (`test_a_partial_recovery_that_lost_its_primary_reports_BOTH_facts`).
+>
+> **Plan defect [R7] — the UI defect was bigger than a sentence: the alternatives were never
+> RENDERED.** The whole candidate block sat inside `primaryCandidate !== null`, so an ambiguous answer
+> whose secondaries were sitting in the response showed *"No use-case was recognised"* and dropped
+> them on the floor. *"Several alternatives were found; choose or broaden"* was not implementable
+> until that block moved to `recognition.candidates.length > 0`. It now renders under a heading that
+> says which it is (`Also in scope` beside a primary, `Alternatives` without one), and choosing one is
+> the existing "Make primary" click, after which the confirm button appears. **This is the
+> honest-absence law's real content here**: presence was being reported as absence, and the fix is not
+> a better sentence but showing what was there.
+>
+> **Plan defect [R7] — the block needed a repair count the platform did not carry.**
+> `AuditedStructuredResult` exposed `provider_calls` only, and `provider_calls - 1` conflates a REPAIR
+> (the model's answer was faulted) with a RETRY (a truncation or transient fault, where the same
+> question is simply asked again). Telling a user their scope had been questioned when it had not is
+> the same class of error as the incident. The seam result gained `repair_attempts`, counted from the
+> driver's ledger on `class == "repair"`; `test_a_retry_is_not_a_repair` scripts a `max_tokens` turn
+> and pins 2 provider calls, 0 corrections, disposition `clean`. Mutant (`len(repair_attempts)`): that
+> test fails.
+>
+> **Migration 1071** (`1071_recognition_quality.sql`, FILE ONLY — never applied anywhere): three
+> nullable columns (`recognition_disposition`, `repair_attempt_count`, `dropped_candidates` jsonb) and
+> two CHECKs — the disposition vocabulary is CLOSED (a sixth value needs a migration that says so),
+> and **the quality is written whole or not at all** (the reader decides "does this row have a
+> quality?" from ONE column, so three that could disagree would let it serve a `clean` beside an
+> unrecorded drop set). **Coexistence rule: NULL is a fact, not a gap.** There is no backfill and
+> cannot be — 1024's `intent_recognition_attempt_no_mutation` trigger refuses UPDATE and DELETE — and
+> none would be honest: "the model answered first time" and "nobody recorded whether it did" are
+> different facts, and only one is knowable about a legacy row. So the quality is written AT INSERT
+> (there is no record-now-complete-later path on an append-only table), a legacy row serves
+> `recognition_quality: null`, and the UI falls back to exactly today's behaviour. `dropped_candidates`
+> is NULL rather than `'[]'` for the same reason: an empty list would claim nothing was dropped.
+> Audited against a POPULATED legacy-shape table — dropped back to pre-1071, seeded, re-applied, twice
+> — including a test that runs the OLD `ON CONFLICT (intent_id, input_hash)` statement to prove 1070's
+> keys survived a second migration on the same table. Both CHECKs were proved load-bearing by
+> weakening them to `CHECK (true)`: one refusal test fails on the first, two on the second.
+>
+> **Verified rather than assumed.** (a) `record_recognition_attempt` REFUSES a quality whose
+> `dropped_candidate_count` disagrees with the result it is stored beside — the drops come from the
+> RESULT and the served count is a projection of them, so the alternative is a plausible lie.
+> (b) Task 4's `test_a_partitioned_result_is_not_persisted_with_its_drops_yet` is the test this task
+> INVERTS; it is renamed `…_persists_its_drops` and now asserts the closure on the same body, with the
+> `llm_call.raw_output` evidence assertions kept. (c) A caller that records no quality records no
+> drops either — that is the coherence rule, not an oversight, and `test_a_row_written_without_a_
+> quality_reads_back_as_an_absence` pins it. (d) `ambiguity_note` is on the wire but deliberately NOT
+> rendered as the message: on a failure arm it is a diagnostic naming a rule code and a candidate
+> position (support material), and the five sentences are platform-authored.
+>
+> **Mutants, each watched failing.** Precedence swap (drops before absence, no `repaired` arm): 4
+> tests. Drops not persisted: 3. Retries counted as repairs: 1. `qualityNotice` silenced: 4 Vitest
+> cases. The old absence-for-everything branch restored: 2 Vitest cases, both honest-absence ones.
+>
+> 28 new backend tests — 9 unit (`…/taxonomy/test_recognition_contract.py`), 3 in
+> `…/taxonomy/test_recognizer.py` plus one REWRITTEN in place, 6 route
+> (`tests/featuregen/api/test_contract_recognitions.py`), 10 migration
+> (`tests/featuregen/db/test_migration_1071.py`) — and 10 new Vitest cases. Gates: full suite
+> **11557 passed, 20 skipped** (+28 on Task 4's 11529/20 — exactly the tests added, the rewritten one
+> keeping its slot); `-m eval` **73 passed**; frontend **823 passed** (+10 on 813); `tsc --noEmit` clean;
+> ruff clean on every touched file; mypy unchanged (the same 6 pre-existing errors in
+> `enrich_llm.py`/`contract.py`, confirmed by HEAD-swap).
+
 ### Task 6 — evaluation and rollout (2 days)
 
 **[R2]** Version the evaluator with the contract; evaluate the **exact served, normalized result**

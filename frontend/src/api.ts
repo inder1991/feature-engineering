@@ -1412,6 +1412,28 @@ export interface RecognitionResp {
   modelling_contexts: string[]
   target_entity: string | null
   warnings: string[]
+  // WHICH of five things happened to this recognition (repair seam, Task 5). `status` alone cannot
+  // tell a partial recovery from a first-time answer, or a repair-exhausted failure from a genuine
+  // "nothing matched" — and the screen used to say "No use-case was recognised" for all of them.
+  // `null` means the stored attempt predates migration 1071 and nobody recorded its quality: the UI
+  // then says exactly what it said before, which is the truth about that row.
+  recognition_quality: RecognitionQuality | null
+  // The recognizer's own note. On a failure arm this is value-free platform text naming a closed
+  // rule code and a candidate POSITION; on an answered arm it is the model's note about the
+  // objective. Served for completeness (an API that hides its own diagnosis is hard to support);
+  // the messages below are platform-authored and never this string.
+  ambiguity_note: string | null
+}
+
+// The five dispositions, and what they cost. `drop_reason_codes` are the closed, value-free
+// recognition failure codes (`MALFORMED_EVIDENCE_SPANS`, …) — never a model-chosen string, so they
+// are safe to render; `dropped_candidate_count` is the authority on HOW MANY candidates were
+// discarded, since two can go for the same reason.
+export interface RecognitionQuality {
+  disposition: 'clean' | 'repaired' | 'partially_recovered' | 'unscoped' | 'technical_failure'
+  repair_attempts: number
+  dropped_candidate_count: number
+  drop_reason_codes: string[]
 }
 
 // The human's confirmed Gate #1 scope, in the shape the UI holds it (camelCase). `primary` /

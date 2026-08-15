@@ -2318,6 +2318,183 @@ describe('Gate #1 scope confirmation', () => {
   })
 })
 
+// -------------------------------------------- Task 5: which of five things happened (repair seam)
+//
+// The 2026-08-15 incident put four different outcomes behind ONE sentence — "No use-case was
+// recognised for this objective" — which was true of exactly one of them. One case per disposition,
+// plus the standing honest-absence law asserted on the two that are NOT absence: a partial recovery
+// and an ambiguous answer both HAVE proposals, and reporting either as absence is the defect.
+describe('Gate #1 recognition quality', () => {
+  const ABSENCE = /No use-case was recognised for this objective/
+
+  function candidate(
+    use_case_id: string, display_name: string, relationship: 'primary' | 'secondary',
+  ): api.RecognitionCandidate {
+    return {
+      use_case_id, display_name, relationship, confidence: 'high',
+      evidence_spans: ['about to leave'],
+    }
+  }
+
+  function recognition(over: Partial<api.RecognitionResp> = {}): api.RecognitionResp {
+    return {
+      intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+      candidates: [candidate('churn', 'Customer churn', 'primary')],
+      modelling_contexts: [], target_entity: null, warnings: [],
+      recognition_quality: {
+        disposition: 'clean', repair_attempts: 0, dropped_candidate_count: 0,
+        drop_reason_codes: [],
+      },
+      ambiguity_note: null,
+      ...over,
+    }
+  }
+
+  function quality(over: Partial<api.RecognitionQuality>): api.RecognitionQuality {
+    return {
+      disposition: 'clean', repair_attempts: 0, dropped_candidate_count: 0, drop_reason_codes: [],
+      ...over,
+    }
+  }
+
+  async function render_(rec: api.RecognitionResp) {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(rec)
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    await screen.findByRole('heading', { name: /confirm the scope/i })
+  }
+
+  it('clean: the scope, and nothing about how it was reached', async () => {
+    await render_(recognition())
+    expect(screen.getByText('Customer churn')).toBeInTheDocument()
+    expect(screen.queryByText(ABSENCE)).toBeNull()
+    // Today's behaviour, unchanged: a first answer that validated has nothing to explain.
+    expect(document.querySelector('[data-role="recognition-quality"]')).toBeNull()
+    expect(screen.queryByText(/discarded/i)).toBeNull()
+    expect(screen.queryByText(/did not validate/i)).toBeNull()
+  })
+
+  it('repaired: the answer is the CORRECTED one, and says so', async () => {
+    await render_(recognition({
+      recognition_quality: quality({ disposition: 'repaired', repair_attempts: 1 }),
+    }))
+    expect(screen.getByText(/The first answer did not validate; the model was asked to correct it/))
+      .toBeInTheDocument()
+    // It is not a failure and not a loss: the scope is right there to confirm.
+    expect(screen.getByText('Customer churn')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /confirm scope and generate/i })).toBeInTheDocument()
+    expect(screen.queryByText(/discarded/i)).toBeNull()
+  })
+
+  it('partially recovered: KEEPS its scope and names the loss', async () => {
+    await render_(recognition({
+      recognition_quality: quality({
+        disposition: 'partially_recovered', repair_attempts: 2, dropped_candidate_count: 1,
+        drop_reason_codes: ['MALFORMED_EVIDENCE_SPANS'],
+      }),
+    }))
+    expect(screen.getByText('One invalid proposal was discarded; review the remaining scope.'))
+      .toBeInTheDocument()
+    // THE regression this task exists to stop: a partial recovery is not an offer to broaden.
+    expect(screen.getByText('Customer churn')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /confirm scope and generate/i })).toBeInTheDocument()
+    expect(screen.queryByText(ABSENCE)).toBeNull()
+    expect(screen.queryByText(/could not be validated/i)).toBeNull()
+  })
+
+  it('unscoped: a valid answer that matched nothing', async () => {
+    await render_(recognition({
+      status: 'unscoped', unscoped: true, candidates: [],
+      recognition_quality: quality({ disposition: 'unscoped' }),
+    }))
+    expect(screen.getByText(/No governed use case clearly matched/)).toBeInTheDocument()
+    expect(screen.queryByText(/could not be validated/i)).toBeNull()
+    expect(screen.getByRole('button', { name: /show all buildable recipes/i })).toBeInTheDocument()
+  })
+
+  it('technical failure: no usable answer at all, said as itself', async () => {
+    await render_(recognition({
+      status: 'technical_failure', unscoped: true, candidates: [],
+      recognition_quality: quality({ disposition: 'technical_failure', repair_attempts: 2 }),
+    }))
+    expect(screen.getByText('Recognition could not be validated; you may broaden to all recipes.'))
+      .toBeInTheDocument()
+    // Distinct from "nothing matched" — the platform failed, the taxonomy did not answer.
+    expect(screen.queryByText(/No governed use case clearly matched/)).toBeNull()
+    expect(screen.getByRole('button', { name: /show all buildable recipes/i })).toBeInTheDocument()
+  })
+
+  it('alternatives without a primary are shown as alternatives, never as absence', async () => {
+    // THE HONEST-ABSENCE LAW, on the first of the two dispositions that are not absence. The
+    // alternatives were in the response all along; the old branch rendered the absence sentence and
+    // dropped them on the floor, so the user could neither see nor choose them.
+    await render_(recognition({
+      status: 'ambiguous',
+      candidates: [candidate('engagement', 'Engagement decline', 'secondary'),
+                   candidate('deposit', 'Deposit attrition', 'secondary')],
+      recognition_quality: quality({ disposition: 'clean' }),
+    }))
+    expect(screen.getByText(/Several alternatives were found; choose one as the primary/))
+      .toBeInTheDocument()
+    expect(screen.queryByText(ABSENCE)).toBeNull()
+    expect(screen.getByRole('heading', { name: 'Alternatives' })).toBeInTheDocument()
+    expect(screen.getByText('Engagement decline')).toBeInTheDocument()
+    expect(screen.getByText('Deposit attrition')).toBeInTheDocument()
+    // And choosing one is a click, which is what "choose or broaden" has to mean.
+    await userEvent.click(screen.getAllByRole('button', { name: 'Make primary' })[0])
+    expect(screen.getByRole('button', { name: /confirm scope and generate/i })).toBeInTheDocument()
+  })
+
+  it('a partial recovery that lost its primary reports BOTH facts', async () => {
+    // The second of the two non-absence dispositions, in its hardest shape: the discarded candidate
+    // WAS the primary, so the status downgraded to ambiguous and no scope is designated. Neither
+    // fact may hide the other, and neither is absence.
+    await render_(recognition({
+      status: 'ambiguous',
+      candidates: [candidate('deposit', 'Deposit attrition', 'secondary')],
+      recognition_quality: quality({
+        disposition: 'partially_recovered', repair_attempts: 2, dropped_candidate_count: 1,
+        drop_reason_codes: ['MALFORMED_EVIDENCE_SPANS'],
+      }),
+    }))
+    expect(screen.getByText(/Several alternatives were found/)).toBeInTheDocument()
+    expect(screen.getByText('One invalid proposal was discarded; review the remaining scope.'))
+      .toBeInTheDocument()
+    expect(screen.getByText('Deposit attrition')).toBeInTheDocument()
+    expect(screen.queryByText(ABSENCE)).toBeNull()
+  })
+
+  it('more than one discarded proposal is counted, not pluralised away', async () => {
+    await render_(recognition({
+      recognition_quality: quality({
+        disposition: 'partially_recovered', repair_attempts: 2, dropped_candidate_count: 2,
+        drop_reason_codes: ['MALFORMED_EVIDENCE_SPANS'],
+      }),
+    }))
+    expect(screen.getByText('2 invalid proposals were discarded; review the remaining scope.'))
+      .toBeInTheDocument()
+  })
+
+  it('an attempt with no recorded quality says nothing about how it was reached', async () => {
+    // Migration 1071 has no backfill and cannot have one (the table is append-only), so a legacy
+    // row carries no quality. The client says what it did before rather than inventing a `clean`.
+    await render_(recognition({ recognition_quality: null }))
+    expect(screen.getByText('Customer churn')).toBeInTheDocument()
+    expect(document.querySelector('[data-role="recognition-quality"]')).toBeNull()
+    expect(screen.queryByText(ABSENCE)).toBeNull()
+  })
+
+  it('a recognition with no candidates at all still says nothing was recognised', async () => {
+    // The one case the old sentence was TRUE of, kept: a classified-shaped response carrying
+    // nothing. Absence is still reported as absence.
+    await render_(recognition({ candidates: [], recognition_quality: null }))
+    expect(screen.getByText(ABSENCE)).toBeInTheDocument()
+  })
+})
+
 // ------------------------------------------------------ Phase 2A: deterministic ranking (VITE_INTENT_RANKING)
 describe('Phase 2A ranking', () => {
   // Three ranked eligible recipes, deliberately supplied OUT of canonical order to prove the UI

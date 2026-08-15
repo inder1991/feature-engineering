@@ -145,6 +145,7 @@ from featuregen.overlay.upload.taxonomy.ranking_signals import (
 )
 from featuregen.overlay.upload.taxonomy.recognition import (
     APPLICABILITY_MAPPING_VERSION,
+    RecognitionQuality,
     RecognitionStatus,
 )
 from featuregen.overlay.upload.taxonomy.recognizer import (
@@ -1131,6 +1132,22 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
     return _considered_set_response(conn, intent, cs)
 
 
+def _quality_payload(quality: RecognitionQuality | None) -> dict | None:
+    """The served ``recognition_quality`` block, or ``None`` for a row that has none.
+
+    ``None`` is not "clean". A recognition written before migration 1071 records nothing about how it
+    was reached, and the table is append-only (1024) so nothing can be filled in later — reporting
+    those rows as clean would manufacture the one fact this whole contract exists to stop guessing
+    at. Every value in the block is platform-authored: five closed dispositions, two integers, and
+    the closed value-free ``RECOGNITION_FAILURE_CODES``. Nothing the model wrote passes through it."""
+    if quality is None:
+        return None
+    return {"disposition": quality.disposition.value,
+            "repair_attempts": quality.repair_attempts,
+            "dropped_candidate_count": quality.dropped_candidate_count,
+            "drop_reason_codes": list(quality.drop_reason_codes)}
+
+
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
 def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
                  client: _LLM) -> dict:
@@ -1198,7 +1215,7 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
             actor=identity.subject, input_json=input_json,
             redaction_policy_version=REDACTION_VERSION,
             input_content_hash=input_content_hash, recognition_request_hash=request_hash,
-            llm_call_ref=audited.llm_call_ref)
+            llm_call_ref=audited.llm_call_ref, quality=audited.quality)
         # THE INVARIANT: the response is built from the PERSISTED row, never from the in-memory
         # result — so the returned recognition_id always names the row the payload came from. The
         # two can differ whenever another writer won the insert for this same request, and B2 is
@@ -1221,7 +1238,19 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
             "status": result.status.value, "unscoped": unscoped, "candidates": candidates,
             "modelling_contexts": list(result.modelling_contexts),
             "target_entity": result.target_entity,
-            "warnings": list(result.warnings)}
+            "warnings": list(result.warnings),
+            # Task 5: WHICH of five things happened. `status` alone cannot tell a partial recovery
+            # from a clean answer, or a repair-exhausted failure from a genuine "nothing matched" —
+            # and the UI said "No use-case was recognised" for all four. `null` means the stored row
+            # predates migration 1071 and nobody recorded its quality; the client falls back to
+            # status alone, which is the truth about that row.
+            "recognition_quality": _quality_payload(stored.quality),
+            # The recognizer's own note, no longer withheld: on a failure arm it is the value-free
+            # platform text `recognition._reject` built (a closed code and a candidate POSITION,
+            # never model content); on an answered arm it is the model's note about the objective —
+            # the same class of content as the evidence spans already rendered beside it. Recognition
+            # never sees catalog columns, so neither form can carry one.
+            "ambiguity_note": result.ambiguity_note}
 
 
 def _intent_row(conn, intent_id: str):
