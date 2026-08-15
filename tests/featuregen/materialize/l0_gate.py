@@ -71,20 +71,21 @@ from tests.featuregen.materialize.test_resolve import no_dsn  # noqa: F401 - aut
 
 from featuregen.materialize.codes import PublicationRefusalCode, ValidationFindingCode
 from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
-from featuregen.materialize.control_plane import RunEventKind
+from featuregen.materialize.control_plane import RunEventKind, RunStatus, run_status
 from featuregen.materialize.identity import (
     REQUIREMENTS_LOCK_FILENAME,
     CompilationIdentity,
     SealedProject,
     seal_project,
 )
+from featuregen.materialize.publish import read_active_revision
 from featuregen.materialize.render.project import (
     PIPELINE_NAME,
     REQUIRED_RUN_PARAMETERS,
     materialize_to,
 )
 from featuregen.materialize.request_store import RequestLifecycle
-from featuregen.materialize.submit import submission_command
+from featuregen.materialize.submit import LocalClusterSubmitter, submission_command
 from featuregen.materialize.validation import (
     ValidationStatus,
     read_validation_reports,
@@ -454,3 +455,123 @@ def test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session(
         capture_output=True, text=True, timeout=480, check=False, cwd=str(root), env=environment)
     assert "RUN_PARAMETERS_MISSING" not in completed.stdout + completed.stderr, \
         (completed.stdout[-2000:], completed.stderr[-2000:])
+
+
+# ── Task E1 — §0.5 items 5–7: the governed contract MATERIALIZES ─────────────────────────────────
+#
+# E0 (`tests/featuregen/api/test_seam_walkthrough.py`) walks items 1–4 in the DEFAULT suite and
+# stops exactly where the collected suite structurally must: it injects `run_l0`'s verdict, and it
+# never executes the artifact. The two tests below are the other half, and they can only live here.
+#
+# WHAT IS REAL AND WHAT IS A TEST-SCOPED FAKE, stated once so neither is mistaken for the other.
+# The project is compiled, rendered, sealed and materialized by the production chain; `run_l0` is
+# the real one against a real kedro+pyspark interpreter; `LocalClusterSubmitter` is the production
+# submitter and it really launches the rendered pipeline in that interpreter.
+# `_G2Metastore` and `_Swap` are fakes DEFINED IN THE TESTS, and they are the honest vehicle here
+# for a reason that is recorded in D1's and D3's acceptance rows: **no `MetastoreMetadata` and no
+# `PublicationSwap` implementation exists anywhere in `src/`** — `lane_config_from_env` produces
+# `metastore=None` and every deployed run is honestly unprepared. Writing those adapters is E2's
+# deployment work against a real cluster; what this gate proves is that the CHAIN composes through
+# their seams and publishes, on an artifact whose build is genuinely verified. Neither fake is
+# importable from `src/`, and nothing here makes the platform claim a cluster it has not met.
+
+
+def test_the_chain_SUBMITS_the_rendered_project_into_a_REAL_kedro_session(
+        the_declared_environment, db, monkeypatch, tmp_path, l0_python: str, l0_env) -> None:
+    """§0.5 item 5, as far as an environment with no cluster honestly allows: `prepare_run` →
+    `run_l1` → `submit`, with the SUBMISSION really executed by the production submitter.
+
+    `test_the_run_parameters_hook_fires_and_passes_inside_a_REAL_kedro_session` proves the hook
+    fires when a caller assembles the parameters by hand. This proves the CHAIN's own
+    `prepared.parameters` clear it — the parameters `prepare_run` resolved, handed to
+    `LocalClusterSubmitter` through `RunExecution`, launched in the interpreter that has the
+    engines. The run then dies on `banking.transactions` not existing, which is the truth of this
+    machine: there is no Hive, no warehouse and no data. What the assertion demands is that it did
+    NOT die at the parameter gate — a run refused before it started proves nothing about
+    submission, and that distinction is the whole content of this test.
+    """
+    seeded = chain_tests._seed(db)
+    request_id = chain_tests._request(seeded, request_id="req-e1-submit")
+    work_items = [chain_tests._authored(seeded, monkeypatch, suffix="e1submit")]
+    chain_tests._attest_capability(seeded)
+    submitter = LocalClusterSubmitter(
+        python_executable=l0_python, env=l0_env, timeout_seconds=900.0)
+
+    outcome = chain_tests._run(
+        seeded, request_id, work_items, tmp_path,
+        l0=L0Interpreter(python_executable=l0_python, timeout_seconds=600.0, env=l0_env),
+        execution=chain_tests._execution(
+            metastore=chain_tests._G2Metastore(chain_tests.INVENTORY), submitter=submitter))
+
+    assert outcome.validation_report is not None
+    assert outcome.validation_report.status is ValidationStatus.PASSED
+    assert outcome.l1_report is not None and outcome.l1_report.status is ValidationStatus.PASSED, \
+        outcome.l1_report
+    assert outcome.submission is not None, "the chain reached SUBMIT"
+    assert outcome.submission.returncode is not None, (
+        "execution never STARTED — that is an environment fault, not a pipeline verdict: "
+        + outcome.submission.detail)
+    assert "RUN_PARAMETERS_MISSING" not in outcome.submission.detail, outcome.submission.detail
+    # ...and the run stopped where a submission that ran and failed must stop, saying so.
+    assert outcome.stopped_at is ChainStage.SUBMIT, outcome.stopped_at
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert str(outcome.submission.returncode) in chain_tests.read_run_events(
+        seeded, outcome.run_id)[-1].detail
+
+
+def test_the_governed_contract_REACHES_A_PUBLISHED_TABLE(
+        the_declared_environment, db, monkeypatch, tmp_path, l0_python: str, l0_env) -> None:
+    """§0.5 items 5–7 on a BUILD-VERIFIED artifact: `prepare_run` → `run_l1` → `submit` → publish,
+    terminal `PUBLISHED`, and the object the plane says is readable is named on the durable
+    active-revision pointer (migration 1055).
+
+    The collected suite proves this ladder with `run_l0`'s verdict injected. Here the verdict is
+    the real one from a real interpreter, so the generation that publishes is a generation whose
+    project genuinely imports and constructs its kedro pipeline — which is what makes "this
+    contract materialized" a claim about an artifact rather than about a mock.
+
+    **Which seam is real in WHICH test, because the two must not be confused.** The submitter here
+    is `_Submitter`, the recording fake: this test's subject is the LADDER ABOVE submission —
+    that a build-verified generation reaches `PUBLISHED` and leaves a pointer. The test above is
+    where the submission is genuinely executed, and it cannot reach here because a real run against
+    a machine with no Hive fails and the chain correctly stops at `SUBMIT`. Neither test can be
+    both, and neither pretends to be.
+
+    **The honest limit, and it is the whole of E2.** `sandbox_feature.<group>` is not queried,
+    because there is no metastore on this machine to query and no adapter in `src/` that could ask
+    one. What is asserted instead is everything the control plane can prove without a cluster: the
+    swap was handed the published object, the generation and the columns; the pointer row exists;
+    the terminal is `PUBLISHED`; and `run_status` — the ONLY place a run's status comes from —
+    folds to it. Making the last hop real is a deployment against a live cluster and needs an
+    operator, which is exactly where §0.5 item 7 stays until then.
+    """
+    seeded = chain_tests._seed(db)
+    request_id = chain_tests._request(seeded, request_id="req-e1-publish")
+    work_items = [chain_tests._authored(seeded, monkeypatch, suffix="e1publish")]
+    chain_tests._attest_capability(seeded)
+    swap = chain_tests._Swap()
+
+    outcome = chain_tests._run(
+        seeded, request_id, work_items, tmp_path,
+        l0=L0Interpreter(python_executable=l0_python, timeout_seconds=600.0, env=l0_env),
+        execution=chain_tests._execution(swap=swap))
+
+    # The build proof is the REAL one, read back off the durable record.
+    stored = read_validation_reports(seeded, generation_id=outcome.generation_id)
+    assert [report.status for report in stored if report.level.value == "L0"] == \
+        [ValidationStatus.PASSED], [report.payload() for report in stored]
+
+    # `stopped_at` names the stage the run REACHED, and for a published run that is the publish
+    # step itself — not `None`. Asserted rather than left out: a run that "stopped" anywhere
+    # earlier and still claimed `PUBLISHED` would be the one shape this ladder must never produce.
+    assert outcome.stopped_at is ChainStage.PUBLISH, outcome.stopped_at
+    assert outcome.terminal_event is RunEventKind.PUBLISHED
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
+    assert run_status(seeded, outcome.run_id) is RunStatus.PUBLISHED
+
+    revision = read_active_revision(seeded, outcome.logical_group_name)
+    assert revision is not None
+    assert revision.generation_id == outcome.generation_id
+    assert [call["published_object"] for call in swap.calls] == [revision.published_object]
+    assert swap.calls[0]["generation_id"] == outcome.generation_id
+    assert chain_tests._FEATURE in swap.calls[0]["columns"], swap.calls[0]["columns"]

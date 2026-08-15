@@ -2183,6 +2183,69 @@ that runs in CI.
 Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), not the default suite:
 `prepare_run` → `run_l1` → `submit` → publish → the object is queryable.
 
+> **PLAN CORRECTION (E1, verified). "→ the object is queryable" cannot be asserted by any gate on
+> any developer machine, and calling it item 7 in the same breath as items 5–6 hides that.** §0.5
+> item 7 is *"`sandbox_feature.<group>` returns rows on the kind cluster"* — it needs a metastore
+> to ask and an adapter to ask it with, and D3's acceptance row records that **neither
+> `MetastoreMetadata` nor `PublicationSwap` has an implementation anywhere in `src/`**. The JVM
+> gate can prove everything the control plane can state without a cluster (the publish step ran,
+> the swap was handed the object/generation/columns, the durable pointer exists, the terminal is
+> `PUBLISHED`, `run_status` folds to it) — on an artifact whose build is genuinely verified, which
+> is the part only this gate can add. The last hop is E2's deployment work and an operator action.
+
+> **ACCEPTED `PENDING-E1` (2026-08-15). RAN LOCALLY, GREEN.** Two tests appended to
+> `tests/featuregen/materialize/l0_gate.py` — the JVM gate, not the default suite, because
+> `pyspark`/`kedro` are deliberately not dependencies of this platform.
+>
+> **`test_the_chain_SUBMITS_the_rendered_project_into_a_REAL_kedro_session` (§0.5 item 5).** The
+> chain's OWN `prepared.parameters` — the ones `prepare_run` resolved, not a hand-assembled dict —
+> are handed to the production `LocalClusterSubmitter` through `RunExecution` and really launch the
+> rendered project in the interpreter that has the engines. The existing hook test proves the gate
+> fires for a caller who assembles parameters by hand; this proves the CHAIN clears it. The run
+> then dies on `banking.transactions` not existing, which is the truth of a machine with no Hive
+> and no data — so the assertion is that it did **not** die at the parameter gate
+> (`RUN_PARAMETERS_MISSING` absent, `returncode is not None`), that `run_l1` PASSED first, and that
+> the run stops at `SUBMIT` with the returncode in the event detail. A run refused before it
+> started would prove nothing about submission, and that distinction is the whole content of the
+> test.
+>
+> **`test_the_governed_contract_REACHES_A_PUBLISHED_TABLE` (§0.5 items 5–7, to the honest limit).**
+> The full ladder on a BUILD-VERIFIED artifact: the L0 verdict is the real one from a real
+> interpreter, read back off the durable record, and the generation that publishes is therefore a
+> generation whose project genuinely imports and constructs its kedro pipeline. Terminal
+> `PUBLISHED`, lifecycle `COMMITTED`, `run_status` folds to `PUBLISHED`, `read_active_revision`
+> names the object (migration 1055), and the swap's recorded call carries that same object, the
+> generation id and the feature column. The collected suite proves this ladder with the verdict
+> injected; this is the same ladder with the verdict earned.
+>
+> **THE FAKES ARE TEST-SCOPED AND THE HEADER SAYS SO IN ONE PLACE.** `_G2Metastore` and `_Swap`
+> are defined in `test_chain.py`, never in `src/`, and the gate's new section header states why
+> that is the honest vehicle rather than a shortcut: no adapter exists to be real, so a "real" one
+> here would be a fake with a better address. What the gate proves is that the chain COMPOSES
+> through those seams and publishes; writing the adapters is E2's deployment work.
+>
+> **THE GATE RAN ON THIS MACHINE.** `.venv-artifact` was built from the golden project's own
+> `requirements.lock` (kedro 0.19.9 / kedro-datasets 4.1.0 / pyspark 3.5.1, plus `hdfs` + `s3fs`
+> per A.32) against Temurin 17. Both new tests take `the_declared_environment`, so under
+> `.venv-l0-modern` or the kind image they SKIP with the engine disagreement named — a build proof
+> is a claim about one environment and A.42 made `run_l0` refuse to make it anywhere else.
+>
+> **A DEFECT THIS GATE FOUND IN ITS OWN FIRST DRAFT, kept as an assertion.** The publish test first
+> demanded `outcome.stopped_at is None` and went RED: `stopped_at` names the stage a run REACHED,
+> and for a published run that is `ChainStage.PUBLISH`. Corrected to assert that stage by name
+> rather than deleted, because a run that stopped anywhere EARLIER and still claimed `PUBLISHED` is
+> the one shape this ladder must never produce.
+>
+> Gates: the JVM gate **RAN LOCALLY AND IS GREEN** —
+> `FEATUREGEN_L0_PYTHON=$PWD/.venv-artifact/bin/python PYSPARK_PYTHON=… PYSPARK_DRIVER_PYTHON=…
+> uv run pytest tests/featuregen/materialize/l0_gate.py -q` → **7 passed** (5 pre-existing + the 2
+> new) against kedro 0.19.9 / kedro-datasets 4.1.0 / pyspark 3.5.1 on Temurin 17.0.19;
+> `spark_semantics_gate.py` re-run on the same interpreter, unchanged. **Only the artifact line was
+> exercised:** `.venv-l0-modern` was not built on this machine, and under it both new tests SKIP by
+> construction (`the_declared_environment`) rather than assert anything — `make l0-gate` builds it
+> and runs all four combinations. Full suite and `-m eval` are unaffected: this file is not named
+> `test_*` and the default suite never collects it (re-confirmed after the edit).
+
 ### Task E2 — kind cluster acceptance (1 day engineering + **operator action**)
 
 **Two real deployment blockers must be closed FIRST, and they are engineering, not operations:**
