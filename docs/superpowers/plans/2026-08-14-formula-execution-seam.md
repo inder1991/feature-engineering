@@ -2364,31 +2364,124 @@ and a durable capability attestation that outlives the run that produced it.
    or additive-nullable and were each audited against a POPULATED seeded legacy shape.
 2. **Roll the backend, confirm `/health`, and only then the worker.** A worker on the new image
    against the old schema is the one ordering that has no repair path.
-3. **Land Task 0's inventory in the pod** and confirm it LOADS —
+3. **Stand up the SQL endpoint, and prove it through the production adapter** — SUCCESSOR 3, §6.6b.
+   `bash deploy/kind/sandbox/up.sh` builds the image, initialises the Hive schema, applies
+   `40-spark.yaml` and then `41-spark-thrift.yaml` (a `spark-thrift` ClusterIP Service on 10000, the
+   same image and the same catalog). The order inside the script is load-bearing: the server opens
+   its metastore connection while starting, so it goes up AFTER the schema init.
+   **Two things must be delivered into the backend/worker pods first, because neither image has
+   them:** `pip install "PyHive[hive]" thrift` (the control plane declares no engine client — a
+   missing driver is a `ValueError`, which the lane treats as DETERMINISTIC, so it fails the request
+   and dead-letters rather than retrying), and `scripts/thrift_smoke.py` itself
+   (`Dockerfile.backend` copies only `src/`, so `kubectl cp` it). Then run the smoke test — it
+   drives the SAME `metastore_sql` adapter the worker uses and prints one typed outcome per L1
+   question, so first contact happens through the production code path rather than a beeline
+   session. **Expect question 3 to report READ SCOPE UNANSWERABLE and the script to exit 0**: see
+   the GRANT subsection below for why that is the correct answer here and not a misconfiguration.
+4. **Land Task 0's inventory in the pod** and confirm it LOADS —
    `python -c "from featuregen.materialize.inventory import load_inventory;
    load_inventory('<path>')"` inside the pod. A file that exists but does not load fails exactly
    like a missing one: `load_inventory` raises before the lane accepts anything.
-4. **Edit the ConfigMap once** — `kubectl -n featuregen edit configmap backend-config` — setting
+5. **Edit the ConfigMap once** — `kubectl -n featuregen edit configmap backend-config` — setting
    `FEATUREGEN_MATERIALIZE_ENABLED: "1"` **and** uncommenting all four companion settings together.
    The lane resolves them only when a job is claimed; a missing one is retryable, so the job burns
    its 12 attempts and dead-letters, and because the lane never claimed the request it is left
    stranded at `requested` with nothing queued behind it — re-triggering then needs a FRESH
    idempotency key, and the stranded row can never be closed at all (DEFERRED-WORK A.35, which D4
    chose to surface as *"never accepted — check the lane configuration"* rather than close).
-5. **Roll BOTH Deployments.** A ConfigMap edit does not restart a pod, and a pod started before the
-   edit keeps the old environment for its whole life.
-6. **Run the publication probe** (`materialize/probe.py`, D2's driver) against the environment and
+6. **Roll BOTH Deployments.** A ConfigMap edit does not restart a pod, and a pod started before the
+   edit keeps the old environment for its whole life. **A rolled pod loses a `pip install` done into
+   the running container** — the PyHive step above is per-pod-lifetime until it is baked into the
+   image, so re-do it after this roll or the first claimed job dead-letters on a missing driver.
+7. **Run the publication probe** (`materialize/probe.py`, D2's driver) against the environment and
    record the attestation. It is keyed on `environment_id` + mechanism + the exact
    `hive`/`spark`/`metastore` triple: publication is refused `CAPABILITY_UNPROVEN` until one
    exists, and an attestation probed on other engine versions is refused too — drift is unproven,
    not failed.
-7. **Trigger ONE governed feature** and read `GET /materialization-runs/{id}` (D4's surface). The
+8. **Trigger ONE governed feature** and read `GET /materialization-runs/{id}` (D4's surface). The
    expected terminals, each an outcome rather than an error: `PUBLICATION_REFUSED` if the probe has
-   not run, `RUN_FAILED` at `PREPARE_RUN` if the G-2 adapters are still absent (they are — no
-   `MetastoreMetadata` implementation exists in `src/`; **writing them is E2's remaining
-   engineering and it is not done**), and `PUBLISHED` only when both are closed.
-8. **Read the table** — `sandbox_feature.<group>` — and compare it with the run's reported
+   not run, `RUN_FAILED` at `PREPARE_RUN` if the execution block is unset or an adapter refuses,
+   and `PUBLISHED` only when both are closed.
+   **CORRECTED (SUCCESSOR 3):** this step used to say the G-2 adapters were absent — "no
+   `MetastoreMetadata` implementation exists in `src/`; writing them is E2's remaining engineering
+   and it is not done". **They exist**: SUCCESSOR 2 wrote `metastore_sql.SqlMetastoreAdapter` and
+   `publish_sql.SqlPublicationSwap` (§6.6). What now stops a run on kind is different and narrower —
+   `can_read` is unanswerable against a Spark endpoint, so `PREPARE_RUN` fails at L1's THIRD
+   question rather than for want of an implementation. See the GRANT subsection.
+9. **Read the table** — `sandbox_feature.<group>` — and compare it with the run's reported
    published object. This is §0.5 item 7 and it is the only step that can close it.
+
+#### The GRANT model — what `can_read` actually needs, and why kind cannot supply it
+
+`can_read` issues, per role, exactly:
+
+```sql
+SHOW GRANT ROLE `<role>` ON TABLE `<schema>`.`<table>`
+```
+
+and reads the **`privilege` column by NAME** from the result, passing only if it holds `SELECT` or
+`ALL` (`_READ_PRIVILEGES`). `INSERT` on a table is not read access, and "holds some grant" is a
+different question from "may read". So on an endpoint that supports SQL-standard authorization, the
+admin grants **per table, not per schema** — a schema-level grant is not what this statement asks
+about — over exactly L1's read set:
+
+```sql
+SET ROLE ADMIN;
+CREATE ROLE featuregen_reader;
+GRANT ROLE featuregen_reader TO USER featuregen;          -- the METASTORE_PRINCIPAL
+GRANT SELECT ON TABLE risk.transactions TO ROLE featuregen_reader;   -- one line PER TABLE
+SHOW GRANT ROLE featuregen_reader ON TABLE risk.transactions;        -- what can_read will run
+```
+
+and the endpoint itself must carry, verified as real class names in `hive-exec`:
+`hive.security.authorization.enabled=true`,
+`hive.security.authorization.manager=org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory`,
+`hive.security.authenticator.manager=org.apache.hadoop.hive.ql.security.SessionStateUserAuthenticator`,
+`hive.users.in.admin.role=<the named admin>`, `hive.server2.enable.doAs=false`.
+
+> **NONE OF THIS CAN BE RUN AGAINST THE KIND SANDBOX, and the reason is the engine rather than the
+> configuration.** The endpoint there is a Spark Thrift Server, and **Spark's SQL grammar carries a
+> rule named `unsupportedHiveNativeCommands` whose members include `GRANT`, `REVOKE` and
+> `SHOW GRANT`** — it parses them only to reject them, as
+> `[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT`, and never consults Hive's
+> authorization plugin even though `SQLStdHiveAuthorizerFactory` is on the classpath. So every
+> statement in the block above fails there, and `can_read` correctly raises
+> `MetastoreReadScopeUnanswerable`.
+>
+> **And it cannot be fixed by swapping in a HiveServer2**, which is the obvious next thought: the
+> publication swap is `CREATE OR REPLACE VIEW … AS SELECT … FROM parquet.`<path>``
+> (`publish_sql.py:134`), and `parquet.`<path>`` is Spark-only path-as-relation syntax that Hive
+> cannot parse. **The swap requires Spark; `can_read` requires Hive's Driver; no single engine
+> available here has both.** That is a genuine seam-level constraint, recorded rather than worked
+> around, and it means **L1 cannot pass on kind** — the sandbox proves the endpoint, the transport,
+> the classification and the swap, and leaves read-scope to an environment with an authorization
+> model. §0.5 item 7 is closable only if L1's read-scope question is satisfied some other way, which
+> is a governance decision this plan does not take.
+
+#### What Task 0 can capture FROM THE ENDPOINT, and what it cannot
+
+The inventory needs **all eight** `engine_versions`. The endpoint answers three of them, and being
+precise about which matters because the other five are venv facts that an operator standing at a
+beeline prompt cannot see:
+
+| field | from the endpoint? | how |
+|---|---|---|
+| `spark` | **YES** | `SELECT version()` — the `SparkVersion` expression; returns version + git revision |
+| `java` | **YES** | `SELECT reflect('java.lang.System','getProperty','java.version')` — `CallMethodViaReflection`; `reflect`/`java_method` are registered builtins |
+| `hive` | **YES** (client) | `SET spark.sql.hive.metastore.version` — the Hive **client** Spark uses (2.3.9 on the sandbox), which is what the attestation key means here |
+| `metastore` | **NO** | the schema version lives in the metastore DB's own `VERSION` table; ask Postgres, not the endpoint. On the sandbox there is no separate metastore *service* — Spark's built-in client talks JDBC — so this describes the schema `up.sh` initialised |
+| `python` | **NO** | the interpreter that RUNS the artifact (`FEATUREGEN_MATERIALIZE_SUBMIT_PYTHON`). The endpoint is a JVM and has no opinion about it |
+| `pyspark` | **NO** | a package version in the run venv. It SHOULD equal `spark`, and capturing it from the endpoint would assume the equality the field exists to check |
+| `kedro` | **NO** | venv only — `pip show kedro` in the submit interpreter |
+| `kedro_datasets` | **NO** | venv only, and separately versioned from `kedro`; it is what `spark.SparkHiveDataset` resolves out of |
+
+The `tables` entries are a different matter and the endpoint IS the right source for most of them:
+`columns` come from `DESCRIBE` **unnormalised** (`varchar(150)` is not `string`), `partition_columns`
+from `SHOW PARTITIONS` plus `DESCRIBE`'s partition section in the metastore's own ORDER, and
+`location` from `DESCRIBE FORMATTED`. **`partition_mapping` and `rewritten_in_place` are NOT
+capturable from any endpoint** — the first is DECLARED and identity-bearing (correcting it later
+invalidates sealed artifacts), the second is a statement about how the feed operates that no
+metastore knows.
 
 **What this plan may then claim, and no more:** *"one governed contract materializes end to end
 through Kedro on kind; publication is proven for that environment at those engine versions."*
@@ -2995,6 +3088,52 @@ thing a deployment might configure into a thing this engine structurally cannot 
 > Python files;
 > no new mypy errors; all three touched manifests re-parsed with `yaml.safe_load_all` and `up.sh`
 > checked with `bash -n`.
+
+> **SUCCESSOR 3 — INCREMENT 2: THE OPERATOR RUNBOOK AND TASK 0 ALIGNMENT. ACCEPTED `<hash-2>`
+> (2026-08-15).** Documentation only.
+>
+> **THE RUNBOOK IS NINE STEPS, NOT EIGHT.** The endpoint goes in at **step 3** — after the images
+> are rolled (step 2) and BEFORE the ConfigMap edit (now step 5), because the eight variables that
+> edit sets name a Service that has to resolve. Two prerequisites are stated there that nothing in
+> this plan had noticed: **PyHive is not a dependency of this project** (`METASTORE_DRIVERS` names
+> it, the control plane declares no engine client on purpose) and **`Dockerfile.backend` copies only
+> `src/`**, so neither the driver nor the smoke script is in the pod. A missing driver raises
+> `ValueError`, which `_DETERMINISTIC` treats as non-retryable — the request FAILS and dead-letters
+> rather than waiting for a fix. Step 6 now also warns that rolling the Deployments discards a
+> `pip install` made into a running container.
+>
+> **THE GRANT MODEL IS WRITTEN FOR THE ENGINE THAT CAN HONOUR IT, AND ITS UNAVAILABILITY HERE IS
+> STATED RATHER THAN SOFTENED.** `can_read` runs `SHOW GRANT ROLE … ON TABLE …` and reads the
+> `privilege` column by name, passing only on `SELECT` or `ALL` — so grants are **per table**, over
+> exactly L1's read set, and a schema-level grant does not answer the statement being run. The
+> endpoint settings are given with class names verified to exist in `hive-exec`
+> (`SQLStdHiveAuthorizerFactory`, `SessionStateUserAuthenticator`). **None of it runs on kind**, and
+> the section says so with the mechanism: Spark rejects `GRANT`/`REVOKE`/`SHOW GRANT` by grammar.
+> It also closes the obvious escape — swapping in a HiveServer2 — because the swap needs Spark-only
+> `parquet.`<path>`` syntax. **The swap requires Spark, `can_read` requires Hive's Driver, and no
+> engine available here is both.** L1 therefore cannot pass on kind, which is now recorded as a
+> seam-level constraint rather than a task somebody can pick up.
+>
+> **TASK 0's CAPTURE IS SPLIT BY SOURCE, because the brief's worry was exactly right.** Of the eight
+> `engine_versions` the endpoint answers **three** — `spark` (`SELECT version()`, the `SparkVersion`
+> expression), `java` (`SELECT reflect('java.lang.System','getProperty','java.version')`, via
+> `CallMethodViaReflection`; `version`/`reflect`/`java_method` confirmed as registered builtins in
+> `FunctionRegistry$`) and `hive` as the CLIENT version (`SET spark.sql.hive.metastore.version`).
+> It cannot answer `python`, `pyspark`, `kedro` or `kedro_datasets` — all venv facts — and
+> `metastore` comes from the metastore DB's own `VERSION` table rather than the endpoint.
+> `pyspark` is called out separately: it SHOULD equal `spark`, and reading it from the endpoint
+> would assume the very equality the field exists to let someone check. The `tables` half is the
+> opposite — the endpoint IS the right source for `columns` (unnormalised), `partition_columns` and
+> `location` — except `partition_mapping` and `rewritten_in_place`, which no metastore knows.
+>
+> **ONE MORE STALE CLAIM CORRECTED.** Runbook step 8 still said the G-2 adapters were absent ("no
+> `MetastoreMetadata` implementation exists in `src/`; writing them is E2's remaining engineering
+> and it is not done"). SUCCESSOR 2 wrote both adapters; the sentence survived in the runbook after
+> being retired elsewhere. It now names the narrower thing that actually stops a run.
+>
+> Gates: full suite **11356 passed, 20 skipped**; `-m eval` **73 passed**. No code touched by this
+> increment — the count is 14 above increment 1's because increment 3's harness tests were already
+> in the tree when this ran, so **the same run gates increment 3**.
 
 ---
 
