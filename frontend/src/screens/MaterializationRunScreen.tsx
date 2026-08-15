@@ -28,6 +28,14 @@ import {
 // platform names a physical target (`sandbox_feature.<group>`) for every group whether or not
 // anything was ever published there, so showing that name would hand an operator a table they
 // cannot query. No invented owners, no invented timestamps, no invented table names.
+//
+// **READ SCOPE IS SHOWN ON EVERY RUN, INCLUDING THE ONES WHERE IT WAS FINE** (SUCCESSOR 5, the
+// user's decision of 2026-08-15). A deployment may declare that its engine has no authorization
+// model, and a run under that declaration passes L1 without anyone having verified that the
+// authorized roles may read its inputs. That is a legitimate, operator-accepted state — and it must
+// be legible here, because the alternative is a screen on which a verified run and an unverified one
+// look identical. Rendering it only when it is bad would make its absence meaningless, so the
+// section is unconditional and the tone carries the difference.
 
 // The server's vocabulary, and the tone each word is allowed to carry. Four are settled outcomes
 // and two are in flight; NONE is styled as an error, which is why the tone is a deliberate three-way
@@ -68,6 +76,26 @@ const OUTCOMES: Record<MaterializationOutcome, { label: string; tone: string; bl
       + 'Check the lane configuration (FEATUREGEN_MATERIALIZE_* on the worker) and re-trigger with '
       + 'a fresh idempotency key — a re-run is a new request, and this row stays as it is.',
   },
+}
+
+// How the read-scope answer READS, per state the server can send. The sentence is always the
+// server's; what this table holds is the tone, which is the same division of labour `OUTCOMES`
+// makes — and getting it wrong in either direction is the whole risk here.
+//
+// `false` is a WARNING and not an error: the run is legitimate, its deployment declared in advance
+// that its engine has no authorization model, and L1 recorded that acceptance per table. Painting it
+// red would tell an operator something went wrong when the platform did exactly what it was told.
+// Hiding it is worse and is the failure this whole surface exists to prevent — a reader must be able
+// to tell a run whose read scope was verified from one where nobody could ask.
+const READ_SCOPE: Record<'verified' | 'unverified' | 'unknown', { label: string; tone: string }> = {
+  verified: { label: 'Verified by the engine', tone: 'good' },
+  unverified: { label: 'NOT verified', tone: 'warning' },
+  unknown: { label: 'Not recorded', tone: 'neutral' },
+}
+
+function readScopeState(verified: boolean | null): 'verified' | 'unverified' | 'unknown' {
+  if (verified === null) return 'unknown'
+  return verified ? 'verified' : 'unverified'
 }
 
 function errorDetail(err: unknown): string {
@@ -128,6 +156,7 @@ export function MaterializationRunScreen({ requestId }: { requestId: string }) {
   if (run === null) return null
 
   const outcome = OUTCOMES[run.outcome]
+  const readScope = READ_SCOPE[readScopeState(run.read_scope_verified)]
   return (
     <section>
       <h2>Materialization run</h2>
@@ -168,6 +197,14 @@ export function MaterializationRunScreen({ requestId }: { requestId: string }) {
           <Field label="Run id" value={run.run_id} absent="no run was named" />
         </tbody>
       </table>
+
+      <h3>Read scope</h3>
+      <p>
+        <strong data-testid="read-scope" data-tone={readScope.tone}>{readScope.label}</strong>
+      </p>
+      <p className={run.read_scope_verified === null ? 'hint' : undefined}>
+        {run.read_scope_detail ?? 'nothing about read scope was recorded for this run'}
+      </p>
 
       <h3>Published object</h3>
       {run.published_object === null ? (

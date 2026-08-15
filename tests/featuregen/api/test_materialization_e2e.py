@@ -95,6 +95,7 @@ from featuregen.formula.canonical import formula_content_hash
 from featuregen.materialize.codes import (
     CompilationRefusalCode,
     PublicationRefusalCode,
+    ValidationFindingCode,
 )
 from featuregen.materialize.compile.chain import FIRST_RUN_EVENT_SEQ, ChainStage
 from featuregen.materialize.control_plane import (
@@ -127,9 +128,13 @@ from featuregen.materialize.request_store import (
     read_request,
 )
 from featuregen.materialize.validation import (
+    FindingSeverity,
+    ValidationFinding,
     ValidationLevel,
+    ValidationReportV1,
     ValidationStatus,
     read_validation_reports,
+    record_validation_report,
 )
 from featuregen.overlay.upload.bridge_store import executable_bridge_realizations
 from featuregen.runtime.handlers import HandlerRegistry
@@ -470,6 +475,11 @@ def test_a_governed_feature_becomes_a_BUILD_VERIFIED_project_over_HTTP(
     assert detail["logical_group_name"] == _GROUP
     assert detail["requested_by"] == "user:priya"
     assert detail["authorized_roles"] == ["platform-admin"]
+    # SUCCESSOR 5: this run never reached L1 (publication was refused before it), so read scope is
+    # an honest ABSENCE with its own sentence — never `true`, which would claim a check that did
+    # not happen, and never `false`, which would claim an acceptance nobody made.
+    assert detail["read_scope_verified"] is None
+    assert "no L1 validation is recorded" in detail["read_scope_detail"]
 
 
 def test_a_BRIDGED_group_compiles_over_HTTP_from_a_realization_it_LOADED(
@@ -651,3 +661,87 @@ def test_a_deployment_with_NO_L0_INTERPRETER_never_reaches_the_G1_terminal(
     detail = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
     assert detail["run_status"] == RunStatus.FAILED.value
     assert detail["lifecycle_state"] == RequestLifecycle.FAILED.value
+
+
+# ── SUCCESSOR 5: the route reports read scope from the RECORD, in plain language ─────────────────
+
+
+def _record_l1(conn, request, *, findings) -> str:
+    """Record one L1 report against a run that really happened, exactly as the chain records it.
+
+    The report is written through ``record_validation_report`` — §11's own writer, the one
+    ``run_l1``'s verdict goes through — against the generation a real triggered run produced. What
+    the route then reads is a row nothing in this test can reach around.
+    """
+    report_id = f"rep-l1-{request.run_id}"
+    # The two hashes are the GENERATION's own, read back from the plane: a report is a claim about
+    # a specific artifact, and inventing hashes here would file it against bytes nobody compiled.
+    project_hash, plan_hash = conn.execute(
+        "SELECT generated_project_hash, group_plan_hash FROM materialization_generation "
+        "WHERE generation_id = %s", (request.generation_id,)).fetchone()
+    record_validation_report(conn, ValidationReportV1(
+        report_id=report_id, generation_id=request.generation_id, run_id=request.run_id,
+        generated_project_hash=project_hash,
+        group_plan_hash=plan_hash, level=ValidationLevel.L1,
+        environment_id=INVENTORY.environment_id, status=(
+            ValidationStatus.PASSED if all(f.severity is FindingSeverity.WARNING for f in findings)
+            else ValidationStatus.FAILED),
+        started_at="2026-08-15T10:02:00+00:00", finished_at="2026-08-15T10:02:01+00:00",
+        findings=findings))
+    return report_id
+
+
+def test_the_route_reports_an_ACCEPTED_read_scope_in_PLAIN_LANGUAGE_from_the_record(
+        client, conn, admin_headers, governed_feature, deployment, l0_passes) -> None:
+    """A run that passed L1 under a DECLARED posture must say so on the surface an operator reads.
+
+    The declaration itself is nowhere in this test's environment, and that is the point: the route
+    reports what the RUN recorded, not what this pod happens to be configured with today. A route
+    that consulted the variable would answer differently for the same run tomorrow — and would say
+    "unverified" for a declared deployment whose engine actually answered.
+    """
+    request_id = _trigger(client, admin_headers, [governed_feature], key="acceptance-read-scope")
+    assert _tick(conn).materialization_processed == 1
+    stored = _stored(conn, request_id)
+
+    _record_l1(conn, stored, findings=(
+        ValidationFinding(
+            code=ValidationFindingCode.READ_SCOPE_UNVERIFIED, location="banking.transactions",
+            expected="an engine answer for 1 role(s)",
+            observed="this deployment declares no authorization model", count=1,
+            severity=FindingSeverity.WARNING),
+        ValidationFinding(
+            code=ValidationFindingCode.READ_SCOPE_UNVERIFIED, location="banking.customers",
+            expected="an engine answer for 1 role(s)",
+            observed="this deployment declares no authorization model", count=1,
+            severity=FindingSeverity.WARNING)))
+
+    detail = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert detail["read_scope_verified"] is False
+    said = detail["read_scope_detail"]
+    assert "declares no authorization model" in said
+    assert "banking.customers, banking.transactions" in said, "the tables are not named"
+    assert "2 table(s)" in said
+    # It is reported BESIDE the run's own outcome, not instead of it: nothing about the terminal
+    # this run reached changes because its read scope was accepted.
+    assert detail["terminal_event"] == RunEventKind.PUBLICATION_REFUSED.value
+
+
+def test_the_route_says_VERIFIED_when_the_engine_answered_for_every_table(
+        client, conn, admin_headers, governed_feature, deployment, l0_passes) -> None:
+    """The control. Same flow, same route, an L1 report with no such finding — and the answer flips.
+
+    Without this, "the route reports an accepted read scope" is satisfied by a route that says
+    `false` for every run there is.
+    """
+    request_id = _trigger(client, admin_headers, [governed_feature], key="acceptance-scope-ok")
+    assert _tick(conn).materialization_processed == 1
+    report_id = _record_l1(conn, _stored(conn, request_id), findings=())
+
+    detail = client.get(f"{_PATH}/{request_id}", headers=admin_headers).json()
+
+    assert detail["read_scope_verified"] is True
+    assert "the engine answered read scope for every table" in detail["read_scope_detail"]
+    assert report_id in detail["read_scope_detail"]
+    assert "declares no authorization model" not in detail["read_scope_detail"]

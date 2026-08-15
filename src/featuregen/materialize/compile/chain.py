@@ -857,7 +857,8 @@ class _RunAttempt:
                    detail=(f"published {revision.published_object} at generation "
                            f"{revision.generation_id} (revision seq {revision.seq}, "
                            f"{revision.mechanism.value} under attestation "
-                           f"{revision.capability_attestation_id})"),
+                           f"{revision.capability_attestation_id})"
+                           f"{_read_scope_note(l1_report)}"),
                    l1_report=l1_report, submission=submission,
                    sandbox_execution_hash=sandbox_execution_hash, active_revision=revision)
 
@@ -970,6 +971,36 @@ def _execute_the_run(
     return _RunAttempt.published(
         revision, l1_report=l1, submission=submitted,
         sandbox_execution_hash=prepared.sandbox_execution_hash)
+
+
+def _read_scope_note(report: ValidationReportV1) -> str:
+    """The plain-language acceptance, appended to the terminal a PUBLISHED run writes — or ``""``.
+
+    **WHY THE TERMINAL EVENT AND NOT ONLY THE REPORT.** The acceptance is already durable on
+    ``pipeline_validation_report``, per table and typed, and that is the record a later audit reads.
+    But the run event is what an operator reads FIRST — it is the one line
+    ``GET /materialization-runs/{id}`` and the run screen lead with — and a publication that says
+    only "published X at generation Y" reads as a run that passed every check. It did not: one check
+    could not be performed, and a deployment accepted that in advance. Saying so here costs one
+    sentence and is the difference between a record that is complete and a record that is merely
+    true.
+
+    ONLY the PUBLISHED terminal carries it. Every other terminal's detail names the thing that
+    stopped the run, and appending an accepted absence to a failure would compete with the headline
+    for a reader's attention while the report behind it says the same thing in full.
+
+    ``""`` for a run whose engine answered — which is what makes the sentence mean something when it
+    IS there. A note printed on every run is a note nobody reads.
+    """
+    accepted = [finding for finding in report.findings
+                if finding.code is ValidationFindingCode.READ_SCOPE_UNVERIFIED]
+    if not accepted:
+        return ""
+    tables = ", ".join(sorted(finding.location for finding in accepted))
+    return (f". READ SCOPE WAS NOT VERIFIED for {len(accepted)} table(s) ({tables}): this "
+            f"deployment declares no authorization model, so nobody checked whether the authorized "
+            f"roles may read this run's inputs — L1 report {report.report_id} records it per table "
+            f"as {ValidationFindingCode.READ_SCOPE_UNVERIFIED.value}")
 
 
 def _l1_detail(report: ValidationReportV1) -> str:

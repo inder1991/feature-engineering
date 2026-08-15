@@ -51,7 +51,7 @@ from featuregen.materialize import queue_lane
 from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
 from featuregen.materialize.compile.wiring import assemble_nodes
-from featuregen.materialize.control_plane import read_run_events
+from featuregen.materialize.control_plane import RunEventKind, read_run_events
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
 from featuregen.materialize.inventory import EventTimePartition
 from featuregen.materialize.metastore_sql import (
@@ -80,9 +80,12 @@ from featuregen.materialize.request_store import (
 )
 from featuregen.materialize.runprep import PARTITION_VALUE_FORMS
 from featuregen.materialize.validation import (
+    FindingSeverity,
     ReadScopeDeclaration,
     ValidationFinding,
+    ValidationLevel,
     ValidationStatus,
+    read_validation_reports,
 )
 from featuregen.runtime.observability import counters
 from featuregen.runtime.queue import (
@@ -115,7 +118,8 @@ def _job(request_id: str, work_item_ids, *, business_dt=None) -> Materialization
 
 
 def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None, swap=None,
-            staging_base=None) -> MaterializationLaneConfig:
+            staging_base=None,
+            read_scope=ReadScopeDeclaration.ENGINE_ANSWERS) -> MaterializationLaneConfig:
     """The DEPLOYMENT's half of the configuration — what the handler resolves at the boundary.
 
     G-2's fields default to `None` because that is what `lane_config_from_env` produces for a
@@ -127,7 +131,7 @@ def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None, swap=None,
     return MaterializationLaneConfig(
         inventory=INVENTORY, project_root=str(tmp_path), l0=l0, assemble_nodes=assemble_nodes,
         clock=_clock, metastore=metastore, submitter=submitter, swap=swap,
-        staging_base=staging_base)
+        staging_base=staging_base, read_scope=read_scope)
 
 
 @pytest.fixture
@@ -1052,3 +1056,119 @@ def test_a_lane_with_the_REAL_adapters_carries_a_run_PAST_prepare_run(
     assert len(swapped) == 1, "the publication was not exactly one metastore operation"
     assert "/warehouse/staging/" in swapped[0] and "/published/" in swapped[0]
     assert engine.connections == 1, "the metadata reads and the swap used two connections"
+
+
+# ── SUCCESSOR 5: the same run against an engine that CANNOT answer read scope ────────────────────
+#
+# `_metastore_double` stocks a `SHOW GRANT` result, which is a HiveServer2 with SQL-standard
+# authorization. The kind sandbox is a Spark Thrift Server, and it answers that statement the only
+# way its grammar allows: by rejecting it. These two tests drive the production chain over the
+# production adapters against exactly that engine, with and without the declaration.
+
+
+class _SparkRejectsShowGrant(Exception):
+    """Spark's own words, verbatim — the message `FAULT_PATTERNS` classifies as unanswerable.
+
+    A driver raises ONE exception type for every failure and the adapter classifies on the message,
+    so a test that raised a purpose-built exception class would prove the fold and skip the
+    classification that has to happen first.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT")
+
+
+def _spark_metastore_double(inventory):
+    engine = _metastore_double(inventory)
+    engine.answers = [(fragment, _SparkRejectsShowGrant() if fragment == "SHOW GRANT" else answer)
+                      for fragment, answer in engine.answers]
+    return engine
+
+
+def _l1_report(conn, generation_id: str):
+    l1 = [report for report in read_validation_reports(conn, generation_id=generation_id)
+          if report.level is ValidationLevel.L1]
+    assert l1, "no L1 report was recorded for this generation"
+    return l1[-1]
+
+
+def test_a_DECLARED_deployment_PUBLISHES_against_an_engine_that_cannot_answer_read_scope(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """THE DECISION, END TO END AND ON THE PERSISTED RECORD (user decision, 2026-08-15).
+
+    Everything is the production path: the real `SqlMetastoreAdapter` really issues
+    `SHOW GRANT ROLE … ON TABLE …`, the fake driver really answers with Spark's own rejection
+    message, `FAULT_PATTERNS` really classifies it, and `can_read` really raises. What the
+    declaration changes is what L1 does next — and the proof that it was recorded rather than
+    swallowed is read back out of the DATABASE, not off the objects this process held.
+    """
+    request = _recorded(catalog, request_id="req-lane-declared-read-scope")
+    work_items = [_authored(catalog, monkeypatch, suffix="declaredreadscope")]
+    enqueue_materialization(catalog, request, job=_job(
+        request.request_id, work_items, business_dt=_BUSINESS_DT))
+    _attest_capability(catalog)
+    engine = _spark_metastore_double(INVENTORY)
+    session = MetastoreSession(ENDPOINT, connect=engine.connect)
+
+    outcome = _drain(catalog, _config(
+        tmp_path, metastore=SqlMetastoreAdapter(session), swap=SqlPublicationSwap(session),
+        submitter=_Submitter(), staging_base="/warehouse/staging",
+        read_scope=ReadScopeDeclaration.NO_AUTHORIZATION_MODEL))
+
+    assert outcome.status == "completed"
+    assert outcome.stopped_at == ChainStage.PUBLISH.value
+    stored = read_request(catalog, request_id=request.request_id)
+    assert stored.lifecycle_state is RequestLifecycle.COMMITTED
+
+    # 1. THE REPORT ROW. Passed, and carrying the acceptance per table, at WARNING severity.
+    report = _l1_report(catalog, stored.generation_id)
+    assert report.status is ValidationStatus.PASSED
+    assert {finding.code for finding in report.findings} == \
+        {ValidationFindingCode.READ_SCOPE_UNVERIFIED}
+    assert all(finding.severity is FindingSeverity.WARNING for finding in report.findings)
+    assert all(finding.observed == "this deployment declares no authorization model"
+               for finding in report.findings)
+
+    # 2. THE TERMINAL EVENT. The run published, and its own line says read scope was not verified —
+    #    in words, on the record an operator reads first.
+    events = read_run_events(catalog, stored.run_id)
+    assert [event.event_kind for event in events] == [RunEventKind.PUBLISHED]
+    assert "READ SCOPE WAS NOT VERIFIED" in (events[0].detail or "")
+    assert "declares no authorization model" in events[0].detail
+
+    # 3. AND IT REALLY WAS THE PRODUCTION PATH: the statement was issued and rejected.
+    assert any(statement.startswith("SHOW GRANT ROLE") for statement in engine.statements)
+
+
+def test_the_SAME_engine_WITHOUT_the_declaration_publishes_NOTHING(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The control, held identical in every respect but the declaration.
+
+    Without it the run does not reach PUBLISH, nothing is published, and no L1 report claims a pass
+    — which is SUCCESSOR 2's fail-closed behaviour, unchanged. `MetastoreReadScopeUnanswerable` is
+    not in the lane's `_DETERMINISTIC` family, so the delivery is RETRYABLE: the request stays
+    non-terminal and the queue row is rescheduled, because "this engine cannot answer" is a
+    condition an operator can fix (by declaring it, or by pointing the lane at an engine that can).
+    """
+    request = _recorded(catalog, request_id="req-lane-undeclared-read-scope")
+    work_items = [_authored(catalog, monkeypatch, suffix="undeclaredreadscope")]
+    enqueue_materialization(catalog, request, job=_job(
+        request.request_id, work_items, business_dt=_BUSINESS_DT))
+    _attest_capability(catalog)
+    engine = _spark_metastore_double(INVENTORY)
+    session = MetastoreSession(ENDPOINT, connect=engine.connect)
+
+    outcome = _drain(catalog, _config(
+        tmp_path, metastore=SqlMetastoreAdapter(session), swap=SqlPublicationSwap(session),
+        submitter=_Submitter(), staging_base="/warehouse/staging"))
+
+    assert outcome.status != "completed"
+    assert outcome.stopped_at != ChainStage.PUBLISH.value
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is not \
+        RequestLifecycle.COMMITTED
+    assert catalog.execute(
+        "SELECT count(*) FROM materialization_run_event WHERE event_kind = 'PUBLISHED'"
+    ).fetchone()[0] == 0
+    assert catalog.execute(
+        "SELECT count(*) FROM pipeline_validation_report WHERE level = 'L1'"
+    ).fetchone()[0] == 0, "an L1 report was recorded for a run whose L1 never returned"

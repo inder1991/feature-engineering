@@ -31,6 +31,8 @@ const BASE = {
   terminal_event: 'PUBLICATION_REFUSED',
   outcome: 'refused' as const,
   refusal_code: 'CAPABILITY_UNPROVEN',
+  read_scope_verified: true,
+  read_scope_detail: 'the engine answered read scope for every table L1 checked',
   published_object: null,
   published_generation_id: null,
   published_at: null,
@@ -132,6 +134,67 @@ describe('materialization run screen', () => {
     expect(await screen.findByTestId('outcome')).toHaveTextContent('Never accepted')
     expect(screen.getByText(/Check the lane configuration/)).toBeInTheDocument()
     expect(screen.getByText(/fresh idempotency key/)).toBeInTheDocument()
+  })
+
+  // ── read scope (SUCCESSOR 5): a run accepted under a declared posture must LOOK different ──────
+
+  it('shows an UNVERIFIED read scope as a warning, in the server\'s own words', async () => {
+    serve({
+      outcome: 'published',
+      terminal_event: 'PUBLISHED',
+      run_status: 'PUBLISHED',
+      refusal_code: null,
+      published_object: 'sandbox_feature.cif_daily',
+      read_scope_verified: false,
+      read_scope_detail:
+        'read scope was not verified for 2 table(s) (banking.customers, banking.transactions): '
+        + 'this deployment declares no authorization model',
+    })
+
+    render(<MaterializationRunScreen requestId="mreq_1" />)
+
+    const scope = await screen.findByTestId('read-scope')
+    expect(scope).toHaveTextContent('NOT verified')
+    // A WARNING, never `bad`: the run is legitimate and its deployment accepted this in advance.
+    // A red badge would report a failure that did not happen — and `neutral` would bury a fact the
+    // whole feature exists to surface.
+    expect(scope).toHaveAttribute('data-tone', 'warning')
+    expect(screen.getByText(/declares no authorization model/)).toBeInTheDocument()
+    expect(screen.getByText(/banking.transactions/)).toBeInTheDocument()
+    // Still a published run, not an error: the two facts sit beside each other.
+    expect(screen.getByTestId('outcome')).toHaveAttribute('data-tone', 'good')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows a VERIFIED read scope on the very same screen, so the two are distinguishable', async () => {
+    serve({ outcome: 'published', published_object: 'sandbox_feature.cif_daily' })
+
+    render(<MaterializationRunScreen requestId="mreq_1" />)
+
+    const scope = await screen.findByTestId('read-scope')
+    expect(scope).toHaveTextContent('Verified by the engine')
+    expect(scope).toHaveAttribute('data-tone', 'good')
+    expect(screen.queryByText(/declares no authorization model/)).toBeNull()
+  })
+
+  it('says which SILENCE it is when read scope was never checked, and invents nothing', async () => {
+    serve({
+      outcome: 'pending', lifecycle_state: 'requested', terminal: false,
+      generation_id: null, run_id: null, run_status: null,
+      run_status_reason: 'no run exists yet: this request is \'requested\'',
+      terminal_event: null, refusal_code: null, accepted_at: null,
+      read_scope_verified: null,
+      read_scope_detail: 'no project was sealed, so L1 never ran and read scope was never checked',
+    })
+
+    render(<MaterializationRunScreen requestId="mreq_1" />)
+
+    const scope = await screen.findByTestId('read-scope')
+    expect(scope).toHaveTextContent('Not recorded')
+    expect(scope).toHaveAttribute('data-tone', 'neutral')
+    expect(screen.getByText(/so L1 never ran/)).toBeInTheDocument()
+    // Not a claim in either direction — an unchecked read scope is not a verified one.
+    expect(screen.queryByText(/Verified by the engine/)).toBeNull()
   })
 
   it('shows an honest empty state when no request is named', () => {

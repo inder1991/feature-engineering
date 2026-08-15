@@ -1742,6 +1742,57 @@ def test_a_recorded_report_reads_back_EQUAL_and_gates_regeneration(db) -> None:
     assert may_regenerate_for(db, generation_id=GEN) is False   # COLUMN_TYPE_MISMATCH blocks
 
 
+def test_an_ACCEPTED_read_scope_is_DURABLE_and_stays_distinguishable_forever(db) -> None:
+    """SUCCESSOR 5's distinguishability claim, asserted on the ROW rather than on an object.
+
+    A run that passed L1 under a declared posture and one whose engine actually answered both
+    record a `passed` L1 report. What tells them apart, for as long as the append-only plane
+    exists, is this finding — so it has to survive the JSON round trip with its severity and its
+    plain language intact, and the passing report has to be constructible on the way back in (the
+    constructor re-runs every invariant during `read_validation_reports`).
+    """
+    _seed_generation(db)
+    accepted = _report(ValidationStatus.PASSED, (
+        _finding(ValidationFindingCode.READ_SCOPE_UNVERIFIED, location="banking.transactions",
+                 expected="an engine answer for 1 role(s)",
+                 observed="this deployment declares no authorization model",
+                 severity=FindingSeverity.WARNING),))
+    record_validation_report(db, accepted)
+
+    (read,) = read_validation_reports(db, generation_id=GEN)
+    assert read == accepted
+    assert read.status is ValidationStatus.PASSED
+    assert read.findings[0].severity is FindingSeverity.WARNING
+    assert read.findings[0].observed == "this deployment declares no authorization model"
+    # An accepted absence is not a blocker: regenerating changes nothing about it.
+    assert may_regenerate_for(db, generation_id=GEN) is True
+
+    # And the row itself carries the words, so an operator with psql and no Python can find every
+    # run that proceeded this way.
+    row = db.execute(
+        "SELECT status, findings FROM pipeline_validation_report WHERE report_id = %s",
+        (accepted.report_id,)).fetchone()
+    assert row[0] == "passed"
+    assert row[1] == [{"code": "READ_SCOPE_UNVERIFIED", "severity": "warning",
+                       "classification": "environment_or_data",
+                       "location": "banking.transactions",
+                       "expected": "an engine answer for 1 role(s)",
+                       "observed": "this deployment declares no authorization model", "count": 1}]
+
+
+def test_a_report_from_a_VERIFIED_run_carries_no_such_finding(db) -> None:
+    """The control for the test above: without it, "distinguishable" is a claim about one row."""
+    _seed_generation(db)
+    verified = _report(ValidationStatus.PASSED)
+    record_validation_report(db, verified)
+
+    (read,) = read_validation_reports(db, generation_id=GEN)
+    assert read.findings == ()
+    assert db.execute(
+        "SELECT findings FROM pipeline_validation_report WHERE report_id = %s",
+        (verified.report_id,)).fetchone()[0] == []
+
+
 def test_reports_read_back_in_STARTED_order_with_an_L0_null_run_id_intact(db) -> None:
     """Recorded newest-first on purpose: the order read back is `started_at`, not insertion."""
     _seed_generation(db)

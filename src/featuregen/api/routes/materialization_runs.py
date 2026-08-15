@@ -66,6 +66,7 @@ from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.materialize.canonical import materialize_hash
+from featuregen.materialize.codes import ValidationFindingCode
 from featuregen.materialize.control_plane import (
     RunEventKind,
     fold_run_status,
@@ -86,6 +87,11 @@ from featuregen.materialize.request_store import (
     RequestLifecycle,
     read_request,
     record_request,
+)
+from featuregen.materialize.validation import (
+    ValidationLevel,
+    ValidationStatus,
+    read_validation_reports,
 )
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.queue import QueueIdempotencyConflict
@@ -279,6 +285,7 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
     status, reason = _run_verdict(conn, stored, stranded=stranded)
     terminal = _terminal_event(conn, stored)
     revision = _published_by_this_run(conn, stored)
+    read_scope_verified, read_scope_detail = _read_scope(conn, stored)
     return {
         "request_id": stored.request_id,
         "logical_group_name": stored.logical_group_name,
@@ -301,6 +308,14 @@ def materialization_run_detail(request_id: str, conn: _Conn) -> dict[str, Any]:
         "terminal_event": None if terminal is None else terminal.value,
         "outcome": _outcome(stored, terminal, stranded=stranded),
         "refusal_code": _refusal_code(conn, stored, terminal),
+        #: WHETHER ANYBODY VERIFIED THAT THIS RUN MAY READ ITS INPUTS, read off the run's own L1
+        #: report and never off a flag this process can see. A deployment that DECLARES it has no
+        #: authorization model gets `false` here for as long as the report exists — the run is
+        #: legitimate and the declaration accepted it in advance, and a surface that omitted it
+        #: would make an unverified run indistinguishable from a verified one. `null` is an honest
+        #: absence with three causes, and the detail says which.
+        "read_scope_verified": read_scope_verified,
+        "read_scope_detail": read_scope_detail,
         #: The name a reader can query, or `None` for "not published yet" — never a name this
         #: route derived. `group_binding.physical_target` NAMES `sandbox_feature.<group>` whether or
         #: not anything was ever published there, so reporting it would be inventing a table.
@@ -760,6 +775,53 @@ def _terminal_event(conn: psycopg.Connection,
         return None
     events = read_run_events(conn, request.run_id)
     return events[-1].event_kind if events and events[-1].is_terminal() else None
+
+
+def _read_scope(conn: psycopg.Connection,
+                request: MaterializationRequestV1) -> tuple[bool | None, str]:
+    """Whether L1's THIRD question was answered by the engine, and one sentence saying so.
+
+    **READ FROM THE PERSISTED REPORT, never from the environment.** The declaration
+    (``FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL``) is a property of the deployment AT
+    THE TIME THE RUN RAN, and this process may be a different pod on a different day with a
+    different ConfigMap. A route that consulted the variable would report today's posture beside a
+    run that was compiled under another one — and, worse, would answer identically for a declared
+    deployment whose engine actually answered. What is durable is the L1 report's own findings, so
+    that is what is read.
+
+    Three answers, and the ``None`` cases are told apart in words rather than collapsed:
+
+    * ``None`` — nothing was checked. No generation (no project was sealed), no L1 report (the run
+      stopped before it), or an L1 that could not run at all. Never ``True``: a check that did not
+      happen is not a check that passed, which is the same rule ``ValidationStatus.ERROR`` carries
+      zero findings for.
+    * ``False`` — L1 ran, the engine could not answer, and the deployment had DECLARED that it
+      cannot. The run proceeded on that acceptance and the report records it per table.
+    * ``True`` — the engine answered read scope for every table L1 checked.
+    """
+    if request.generation_id is None:
+        return None, ("no project was sealed for this request, so L1 never ran and nothing about "
+                      "read scope was recorded")
+    l1 = [report for report in read_validation_reports(conn, generation_id=request.generation_id)
+          if report.level is ValidationLevel.L1]
+    if not l1:
+        return None, ("no L1 validation is recorded for this run, so the tables it would read were "
+                      "never checked — read scope among them")
+    report = l1[-1]                                    # oldest-first, so the newest L1 is the last
+    if report.status is ValidationStatus.ERROR:
+        return None, (f"L1 could not run ({report.report_id}): the metastore did not answer, so "
+                      f"read scope was not checked either way")
+    accepted = [finding for finding in report.findings
+                if finding.code is ValidationFindingCode.READ_SCOPE_UNVERIFIED]
+    if accepted:
+        tables = ", ".join(sorted(finding.location for finding in accepted))
+        return False, (
+            f"read scope was NOT verified for {len(accepted)} table(s) ({tables}): this deployment "
+            f"declares no authorization model, so the engine was never asked whether the "
+            f"authorized roles may read them. The run was allowed to proceed because that "
+            f"declaration accepts exactly this, and L1 report {report.report_id} records it")
+    return True, (f"the engine answered read scope for every table L1 checked (report "
+                  f"{report.report_id})")
 
 
 def _published_by_this_run(conn: psycopg.Connection, request: MaterializationRequestV1):

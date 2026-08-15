@@ -3393,6 +3393,61 @@ default rather than assume.
 > file; mypy clean on all five touched source modules; both manifests re-parsed with
 > `yaml.safe_load_all`.
 
+> **SUCCESSOR 5 — INCREMENT 2: THE DURABLE, VISIBLE STAMP. ACCEPTED `<increment 2>` (2026-08-15).**
+>
+> **THE ACCEPTANCE RIDES TWO PERSISTED RECORDS, and neither of them is the HTTP response.**
+> `pipeline_validation_report.findings` carries it per table, typed and queryable from psql
+> (`code=READ_SCOPE_UNVERIFIED`, `severity=warning`, `observed="this deployment declares no
+> authorization model"`), and the PUBLISHED run event's own `detail` says it in words —
+> *"READ SCOPE WAS NOT VERIFIED for N table(s) (…): this deployment declares no authorization
+> model…"*. The second is not redundancy: the report is what an audit reads, and the event is what a
+> reader meets first, so a publication whose line said only *"published X at generation Y"* would
+> read as a run that passed every check. Only the PUBLISHED terminal carries the sentence — every
+> other terminal names the thing that stopped the run, and an accepted absence appended to a failure
+> would compete with the headline while the report behind it says the same thing in full — and a run
+> whose engine ANSWERED carries nothing, which is what makes the sentence mean something when it is
+> there.
+>
+> **`GET /materialization-runs/{id}` GAINS TWO FIELDS, READ OFF THE RECORD AND NEVER OFF THE
+> ENVIRONMENT.** `read_scope_verified` (`true`/`false`/`null`) and `read_scope_detail` (one sentence,
+> always). The route resolves them from the newest L1 report of the run's generation, and the reason
+> is a defect it would otherwise have: the declaration is a property of the deployment **at the time
+> the run ran**, and the pod answering the GET may be a different pod on a different day with a
+> different ConfigMap — a route that consulted the variable would report today's posture beside
+> yesterday's run, and would answer identically for a declared deployment whose engine actually
+> answered. `null` is an honest absence with three distinguished causes (no generation, no L1 report,
+> an L1 that could not run) and is never `true`: a check that did not happen is not a check that
+> passed, which is `ValidationStatus.ERROR`-carries-zero-findings applied to a surface.
+>
+> **THE D4 SCREEN RENDERS IT UNCONDITIONALLY**, tone `warning` — not `bad` (the run is legitimate and
+> its deployment accepted this in advance; red would report a failure that did not happen) and not
+> hidden (a section that appears only when something is wrong makes its absence meaningless, and the
+> whole point is that a verified run and an unverified one must not look identical). The sentence is
+> the server's, verbatim; the screen supplies the tone, which is exactly the division of labour
+> `OUTCOMES` already makes.
+>
+> **THE DISTINGUISHABILITY CLAIM IS ASSERTED ON THE DATABASE, twice.** `test_queue_lane` drives the
+> production chain over the production adapters against an engine that answers `SHOW GRANT` with
+> Spark's own `[_LEGACY_ERROR_TEMP_0035] Operation not allowed: SHOW GRANT` — so
+> `FAULT_PATTERNS` really classifies it and `can_read` really raises — and then reads the L1 report
+> row and the run-event row back out of the plane. Its control is the SAME engine with no
+> declaration: no PUBLISHED event, no L1 report, request not committed. A second pair in
+> `test_validation` proves the finding survives the JSON round trip with its severity and its words
+> intact, beside a verified run's empty findings list.
+>
+> **Three mutants, each run and each caught, then reverted:** (a) the route deriving the answer from
+> `FEATUREGEN_MATERIALIZE_DECLARE_NO_AUTHORIZATION_MODEL` instead of the record — 1 failure, the
+> route test that never sets it; (b) dropping the note from the PUBLISHED terminal — 1, on the
+> persisted event; (c) flattening the screen's `warning` tone to `neutral` — 2 frontend failures.
+>
+> Files: `compile/chain.py`, `api/routes/materialization_runs.py`, `frontend/src/api.ts`,
+> `frontend/src/screens/MaterializationRunScreen.tsx` (+ its test), `test_queue_lane.py`,
+> `test_validation.py`, `test_materialization_e2e.py`.
+> Gates: full suite **11408 passed, 20 skipped** (11402/20 after increment 1 — the 2 lane cases,
+> the 2 report round-trip cases and the 2 route cases, and nothing else moved); `-m eval` **73
+> passed**; frontend **813 passed / 40 files** (baseline 810 — the three read-scope render cases); `tsc --noEmit` clean; ruff clean on every touched file; mypy clean on both
+> touched source modules.
+
 ---
 
 ## 7. Sequencing and dependencies

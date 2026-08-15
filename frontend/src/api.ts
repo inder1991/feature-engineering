@@ -4145,6 +4145,15 @@ export interface MaterializationRunDetail {
   outcome: MaterializationOutcome
   // Present only on a refusal, and it is the code the terminal event itself carries.
   refusal_code: string | null
+  // Whether L1's THIRD question — may the authorized roles read the tables this run reads — was
+  // ANSWERED BY THE ENGINE. `false` is the one an operator must not miss: the run proceeded under a
+  // deployment that DECLARED it has no authorization model, so nobody verified the read scope. It
+  // is not an error and it is not a refusal; it is a fact about how this run passed, and it is
+  // recorded on the run's own L1 report forever. `null` is an honest absence with three causes and
+  // the server's own sentence says which. The sentence is ALWAYS the server's: this client applies
+  // no policy to it and composes none of its own.
+  read_scope_verified: boolean | null
+  read_scope_detail: string | null
   published_object: string | null
   published_generation_id: string | null
   published_at: string | null
