@@ -9,20 +9,30 @@ ids and never the non-selectable ``financial_crime`` domain parent. See
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from featuregen.contracts.contract_versions import contract_owner
+from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.intake.llm import (
     PROVIDER_OK,
     PROVIDER_REFUSAL,
     FakeLLM,
     FakeResponse,
 )
+from featuregen.intake.redaction import INPUT_KEY_REPAIR_ERRORS
 from featuregen.overlay.upload.contract.scope_records import (
     find_recognition_attempt,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.enrich_llm import (
+    FAILURE_KIND_SEMANTIC_INVALID,
+    AuditedStructuredResult,
+    register_enrichment_schemas,
+)
+from featuregen.overlay.upload.taxonomy import recognizer as recognizer_module
 from featuregen.overlay.upload.taxonomy.recognition import (
+    MULTIPLE_PRIMARY_CANDIDATES,
     TAXONOMY_VERSION,
     RecognitionStatus,
     unscoped_result,
@@ -35,6 +45,7 @@ from featuregen.overlay.upload.taxonomy.recognizer import (
     recognition_request_hash,
     recognition_request_material,
     recognize,
+    recognize_with_audit,
 )
 from featuregen.overlay.upload.taxonomy.recognizer_prompt import (
     PROMPT_VERSION,
@@ -362,3 +373,167 @@ def test_a_v1_answer_is_not_reused_as_the_answer_to_the_v2_question(db, monkeypa
     assert recognition_request_material(input_content_hash=sealed)["input_content_hash"] == sealed
     monkeypatch.undo()
     assert recognition_request_material(input_content_hash=sealed)["input_content_hash"] == sealed
+
+
+# ── Task 3 (2026-08-15): the recognizer's OWN rules run INSIDE the repair loop ───────────────────
+
+#: The live incident, recorded verbatim in ``llm_call.raw_output`` (run
+#: ``grun_01M02SAZWKC6FJ4DPTY4WVCB12``, 13:20:17Z). TWO defects, and they fail on DIFFERENT arms:
+#: the invented ``"x"`` id is malformed STRUCTURE under the frozen v2 enum (Task 1), and the two
+#: ``"primary"`` candidates are a SEMANTIC failure no JSON Schema can express (this task).
+_LIVE_INCIDENT_BODY: dict[str, Any] = {
+    "status": "classified",
+    "candidates": [
+        {"use_case_id": CHURN, "relationship": "primary", "confidence": "high",
+         "evidence_spans": ["predict churn in the next 90 days",
+                            "customers whose transaction activity suddenly accelerates are about "
+                            "to leave"],
+         "rationale": ""},
+        {"use_case_id": "x", "relationship": "primary", "confidence": "high",
+         "evidence_spans": ["x"], "rationale": "placeholder"}],
+    "modelling_contexts": [],
+}
+
+#: What the model returns when it is finally ASKED to fix its answer.
+_CLEAN_BODY: dict[str, Any] = {
+    "status": "classified",
+    "candidates": [_candidate(CHURN, relationship="primary",
+                              evidence_spans=("predict churn in the next 90 days",))],
+    "modelling_contexts": [],
+}
+
+#: The body whose ONLY defect is the aggregate one: two VALID leaf ids, both ``primary``. The v2
+#: schema accepts it (asserted, not assumed, below) — so if this drives repair, the caller's
+#: semantics drove it and nothing else could have.
+_DOUBLE_PRIMARY_BODY: dict[str, Any] = {
+    "status": "classified",
+    "candidates": [_candidate(CHURN, relationship="primary"),
+                   _candidate(DEPOSIT, relationship="primary")],
+}
+
+_HYPOTHESIS = "customers whose transaction activity suddenly accelerates are about to leave"
+_GOAL = "predict churn in the next 90 days"
+
+
+def _script(*bodies: dict[str, Any]) -> FakeLLM:
+    """FakeLLM over a SEQUENCE of turns (it repeats the last one once exhausted, so a single body
+    drives the whole repair budget and a two-body script drives 'invalid, then fixed')."""
+    return FakeLLM(script={RECOGNIZER_TASK: [FakeResponse(output=b, provider_status=PROVIDER_OK)
+                                             for b in bodies]})
+
+
+def _repair_reasons(client: _RecordingClient) -> list[str]:
+    """The complaint text actually put on the wire in the LAST turn — read from the dispatched
+    request, never inferred. This string is re-prompted to the provider AND persisted."""
+    return list(client.requests[-1].inputs.get(INPUT_KEY_REPAIR_ERRORS, []))
+
+
+def test_the_padded_body_from_the_live_incident_now_recognises(db) -> None:
+    """The incident, end to end: the padded body is asked to be fixed, the fixed answer is what the
+    user gets, and the correct candidate is no longer discarded with its placeholder sibling.
+
+    Honest about the split: it is TASK 1 that routes THIS body into repair (the ``"x"`` fails the
+    frozen enum), so this case would already pass before Task 3. It is pinned anyway because it is
+    the incident, and because the acceptance of Task 3 is that the OTHER defect in the very same
+    body — two primaries — is now repairable too (the next test isolates it)."""
+    client = _RecordingClient(_script(_LIVE_INCIDENT_BODY, _CLEAN_BODY))
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    assert audited.result.status is RecognitionStatus.CLASSIFIED
+    assert [c.use_case_id for c in audited.result.candidates] == [CHURN]
+    assert len(client.requests) == 2, "the model was not asked to fix the padded body"
+    # The complaint names the failing field, never the model's text.
+    wire = str(_repair_reasons(client))
+    assert "placeholder" not in wire and "'x'" not in wire
+
+
+def test_the_semantic_arm_alone_drives_repair(db) -> None:
+    """The distinct contribution of Task 3, isolated. Both ids are real leaves and every band is in
+    range, so the frozen v2 schema ACCEPTS this body — asserted directly against the registry, so
+    the proof does not rest on reading the schema file. The only thing left that can drive a repair
+    turn is ``validate_recognition_output`` running INSIDE the loop."""
+    register_enrichment_schemas(db)
+    DocumentSchemaRegistry(db).validate(
+        "use_case_recognition", _OUTPUT_SCHEMA_VERSION, _DOUBLE_PRIMARY_BODY)   # no raise
+
+    client = _RecordingClient(_script(_DOUBLE_PRIMARY_BODY, _CLEAN_BODY))
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    assert audited.result.status is RecognitionStatus.CLASSIFIED
+    assert [c.use_case_id for c in audited.result.candidates] == [CHURN]
+    assert len(client.requests) == 2
+    # A closed code — the model is told WHICH rule it broke, and nothing about the values it chose.
+    assert _repair_reasons(client) == [MULTIPLE_PRIMARY_CANDIDATES]
+    assert CHURN not in str(_repair_reasons(client))
+
+
+def test_a_body_that_stays_invalid_after_repair_reaches_task_4(db, monkeypatch) -> None:
+    """Repair exhausted on the SEMANTIC arm: the platform still invents no scope, and the final
+    schema-valid body rides out on the seam result for Task 4 to partition. The seam call is SPIED
+    (the real function runs) — the exposure is a fact about the recognizer's own call site."""
+    seen: list[Any] = []
+    real = recognizer_module.drive_audited_structured_call
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        outcome = real(*args, **kwargs)
+        seen.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(recognizer_module, "drive_audited_structured_call", _spy)
+    client = _RecordingClient(_script(_DOUBLE_PRIMARY_BODY))       # never fixed
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    assert audited.result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert audited.result.candidates == ()          # no scope is invented from an unrepaired body
+    assert len(client.requests) == 3                # 1 + DEFAULT_REPAIR_BUDGET
+    assert len(seen) == 1
+    assert seen[0].output is None                   # never a validated result
+    assert seen[0].failure_kind == FAILURE_KIND_SEMANTIC_INVALID
+    assert seen[0].last_schema_valid_semantic_invalid_output == _DOUBLE_PRIMARY_BODY
+
+
+def test_repair_is_recorded_on_the_llm_call(db) -> None:
+    """The incident's audit row said ``repair_attempts: []`` — the evidence that the model was never
+    asked. It is not empty any more, and it names the closed code, not the value."""
+    client = _RecordingClient(_script(_DOUBLE_PRIMARY_BODY, _CLEAN_BODY))
+    audited = recognize_with_audit(db, client, redacted_hypothesis=_HYPOTHESIS,
+                                   redacted_goal=_GOAL)
+
+    row = db.execute(
+        "SELECT validation_result, repair_attempts FROM llm_call WHERE llm_call_ref = %s",
+        (audited.llm_call_ref,)).fetchone()
+    assert row is not None
+    validation_result, repair_attempts = row[0], row[1]
+    assert repair_attempts, "the repair round-trip left no audit trace"
+    assert [a["class"] for a in repair_attempts] == ["repair"]
+    assert [a["reason"] for a in repair_attempts] == [MULTIPLE_PRIMARY_CANDIDATES]
+    assert validation_result["result"] == "repaired"
+
+
+def test_the_post_call_floor_still_refuses_a_body_the_seam_let_through(db, monkeypatch) -> None:
+    """Belt and braces. The seam now runs the same rules inside the loop, so this can only fire if
+    that wiring regresses — which is exactly why it stays: a repair that never succeeded must still
+    never yield a scope. The seam is replaced (not spied) to manufacture the impossible."""
+    monkeypatch.setattr(
+        recognizer_module, "drive_audited_structured_call",
+        lambda *_a, **_k: AuditedStructuredResult(
+            output=dict(_DOUBLE_PRIMARY_BODY), llm_call_ref="llmc_floor", provider_calls=1,
+            usage={}))
+    audited = recognize_with_audit(db, _RecordingClient(_script(_CLEAN_BODY)),
+                                   redacted_hypothesis=_HYPOTHESIS)
+
+    assert audited.result.status is RecognitionStatus.TECHNICAL_FAILURE
+    assert audited.result.candidates == ()
+    # …and the note the user's row carries names the rule, never the model's text.
+    assert MULTIPLE_PRIMARY_CANDIDATES in str(audited.result.ambiguity_note)
+
+
+def test_the_recognizer_is_a_reviewed_consumer_of_the_semantic_seam(db) -> None:
+    """Task 2 left an enumerable allow-list of call sites permitted to pass ``validate_semantics``.
+    Task 3 adds ONE line to it. Asserted here as well as in the seam's own AST test so the
+    recognizer's side of the contract is visible from the recognizer's own file."""
+    source = Path(recognizer_module.__file__).read_text(encoding="utf-8")
+    assert "validate_semantics=validate_recognition_output" in source

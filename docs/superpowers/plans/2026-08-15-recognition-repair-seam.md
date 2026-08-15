@@ -36,11 +36,11 @@ served **917 unscoped candidates** (306 of 317 recipes).
 | 2 | Sibling fields in the SAME schema carry enums (`status`, `relationship`, `confidence`) | same block |
 | 3 | The inner seam accepts a semantic validator and drives bounded repair from it | `intake/llm.py:403-406`, §9.2 taxonomy `:188` |
 | 4 | **The audited wrapper hardcodes the validator to schema-only and exposes no parameter for the caller's own** | **[R5 — line numbers corrected]** at Task 2's start: hardcoded lambda `enrich_llm.py:2141`, signature `:2039-2049` (the plan's `:2099`/`:1997` were pre-Task-1) |
-| 5 | The recognizer therefore validates AFTER the call, outside the repair loop | `taxonomy/recognizer.py:187` |
+| 5 | The recognizer therefore validates AFTER the call, outside the repair loop | **[R6 — line corrected]** `taxonomy/recognizer.py:274` at Task 3's start (the plan's `:187` was pre-Task-0/1) |
 | 6 | The call logged `{"result": "ok"}` with `repair_attempts: []` — the model was never asked to fix its output | `llm_call` row 13:20:17Z |
-| 7 | `validate_recognition_output`'s docstring claims it IS the callback the inner seam invokes | `recognition.py:8` |
+| 7 | `validate_recognition_output`'s docstring claims it IS the callback the inner seam invokes | `recognition.py:8` — **[R6]** and its TWIN in `recognizer.py`'s own module docstring, which the plan never named; both corrected in Task 3 |
 | 8 | The taxonomy validator is all-or-nothing — the first bad candidate raises | `recognition.py:126` |
-| 9 | The module already has the forgiving idiom for two sibling dimensions, deliberately | `recognition.py:221`, `normalize_dimensions` |
+| 9 | The module already has the forgiving idiom for two sibling dimensions, deliberately | **[R6 — line corrected]** `recognition.py:224` at Task 3's start, `normalize_dimensions` |
 | 10 | The UI reports absence, not loss | `WorkbenchScreen.tsx:2060` |
 | 11 | **[R5 — corrected again]** The wrapper has **13 distinct caller modules / 14 call sites** outside the seam module (plus its own two internal projections), not "12" and not "~29". Revision 1 quoted a raw grep line count; revision 2's replacement was one short (it omitted `formula/audited.py`, the only caller outside `overlay/upload/`) | AST enumeration, `test_every_existing_call_site_is_byte_identical` |
 
@@ -377,6 +377,78 @@ the false docstring at `recognition.py:8`.
 above as turn 1, clean body as turn 2 → CLASSIFIED on `customer.relationship_attrition.churn`);
 `test_a_body_that_stays_invalid_after_repair_reaches_task_4`; `test_repair_is_recorded_on_the_llm_call`.
 
+> **TASK 3 (2026-08-15) — ACCEPTED `PENDING`.** `recognize_with_audit` now passes
+> `validate_semantics=validate_recognition_output`, and the recognizer is the ONE reviewed line added
+> to Task 2's `_SEMANTIC_SEAM_CONSUMERS` allow-list. The post-call `validate_recognition_output` stays
+> as the FLOOR, re-commented to say what it now is: not the check (the same rules ran inside the loop
+> already) but the guarantee that a wiring regression can never yield a scope from an unrepaired body.
+> `test_the_post_call_floor_still_refuses_a_body_the_seam_let_through` manufactures exactly that
+> regression by replacing the seam.
+>
+> **The semantic arm alone was proved to drive repair, not assumed.** The incident body has TWO
+> defects that fail on DIFFERENT arms, so it cannot distinguish them. The isolating case is
+> `_DOUBLE_PRIMARY_BODY` — two REAL leaves, every band in range, both `"primary"` — and the test
+> first asserts `DocumentSchemaRegistry.validate("use_case_recognition", 2, body)` accepts it
+> **against the live registry**, not by reading the schema file. With the frozen v2 schema
+> demonstrably satisfied, the only thing left that can spend a repair turn is the caller's semantics.
+> It does: 2 provider calls, `repair_attempts == [{"class": "repair", "reason":
+> "MULTIPLE_PRIMARY_CANDIDATES"}]`, and the second turn's answer is what the user gets.
+>
+> **How a semantic failure names itself.** `recognition.py` gained a closed, enumerable vocabulary
+> (`RECOGNITION_FAILURE_CODES`, 14 codes) and one constructor, `_reject(code, detail)`, returning
+> `AttestedSchemaValidationError(f"{code}: {detail}", llm_safe_reason=code)`. Every raise site in
+> `_validate_candidate` and `validate_recognition_output` was converted. **The messages are now
+> value-free too, not only the attested reason** — the old ones interpolated `uid!r` /
+> `relationship!r` / the span, and that message is what `recognizer.py` folds into the
+> `ambiguity_note` of a fail-open result, which is persisted and shown to a human. A message may now
+> carry author literals and a candidate POSITION (platform arithmetic), nothing else. Two
+> parametrized tests, one row per raise site, assert the code AND that the rendered exception
+> contains neither a sentinel value nor a real id the model proposed. Mutant (drop the attestation,
+> keep the message): 29 tests fail, including the repair-reason and audit-row assertions, which
+> degrade to the seam's dull constant.
+>
+> **`RECOGNITION_VALIDATOR_VERSION` is deliberately NOT bumped.** It is a leg of Task 0's request
+> identity and its rule is "bump when what this module ACCEPTS or REJECTS changes". Task 3 changes
+> only how a rejection is *reported*; the accepted set is byte-identical, so bumping would re-ask
+> every stored objective for nothing. Task 4, which changes the accepted set, is where it moves.
+>
+> **Plan defects found and corrected.** (a) **[R6]** The false docstring is a PAIR, not a single
+> line: `recognizer.py`'s own module docstring claimed the recognizer "drives it through
+> `drive_structured_call` — which already provides the bounded repair/retry/fail-closed runtime
+> contract against `validate_recognition_output`", the same untruth as `recognition.py:8` and in the
+> file that actually owns the call site. §0.1 row 7 names only `recognition.py:8`. Both are corrected,
+> and both now say what was false and why. (b) **[R6]**
+> `test_the_padded_body_from_the_live_incident_now_recognises` **cannot fail against Task-3-unfixed
+> code** — Task 1's frozen enum already routes THAT body into repair, so it passed before this task
+> and after it. It is kept as the incident's regression pin, and the acceptance that actually
+> discriminates is the double-primary isolation. Watched failing before the wiring: the isolation
+> test (`TECHNICAL_FAILURE`, 1 provider call), `…reaches_task_4` (`assert 1 == 3`),
+> `test_repair_is_recorded_on_the_llm_call` (`repair_attempts == []` — the incident's own signature),
+> and the allow-list test. (c) **[R6]** §0.1 row 5's `recognizer.py:187` is now `:274`, and row 9's
+> `recognition.py:221` is now `:224` — line numbers have moved under every task so far. (d)
+> **[R6 — a defect in Task 4's FROZEN rule, found here]** `TOO_MANY_CANDIDATES` (">3 candidates
+> refuses") is **unreachable** through `validate_recognition_output`: `relationship` is closed to two
+> values, the per-relationship caps already forbid a fourth candidate (1+2), and a candidate whose
+> relationship does not parse raises candidate-locally before any aggregate check runs.
+> `test_the_total_cap_is_dominated_by_the_per_relationship_caps` pins that a 4-candidate body reports
+> `TOO_MANY_SECONDARY_CANDIDATES`, and `test_the_declared_vocabulary_is_exactly_what_the_validator_
+> can_raise` asserts the domination is the ONLY gap in the vocabulary — so nobody reads a green
+> parametrized suite as coverage it does not have. The constant stays: Task 4's partition counts over
+> the RAW list and does reach it.
+>
+> **What Task 3 changes on its own.** A body whose only fault is a rule the JSON Schema cannot state
+> is now a doubt the model is asked to resolve, inside the existing §9.2 budget, instead of a silent
+> whole-result discard. When repair succeeds the user gets the answer. When it does not, the
+> disposition is still today's fail-open `TECHNICAL_FAILURE` — and the final schema-valid body is
+> exposed on the seam result (`failure_kind == "semantic_invalid"`), which is what Task 4 consumes.
+>
+> 12 new test functions → **35 test cases** (6 in `…/taxonomy/test_recognizer.py`; 6 in
+> `…/taxonomy/test_recognition_contract.py`, of which 2 are parametrized ×13 = 29 cases); one
+> reviewed line added to `_SEMANTIC_SEAM_CONSUMERS`. Gates: full suite **11500 passed, 20 skipped**
+> (+35 on Task 2's 11465/20 — exactly the cases added); `-m eval` **73 passed**; ruff clean on every
+> touched file; mypy clean on both touched src files (no new errors; the 4 pre-existing
+> `enrich_llm.py` ones are untouched — no other src file changed).
+
 ### Task 4 — strict partial partition, semantics frozen (1½ days)
 
 Consumes Task 2's exposed post-repair body (B1).
@@ -385,7 +457,10 @@ Consumes Task 2's exposed post-repair body (B1).
 - **Candidate-local defects may be dropped**: unknown id, non-leaf primary, bad confidence/relationship
   band, malformed evidence spans.
 - **Aggregate defects refuse the whole result**: duplicate ids, more than three candidates, multiple
-  primaries, status incompatible with candidates, malformed status.
+  primaries, status incompatible with candidates, malformed status. **[R6 — found in Task 3]** "more
+  than three candidates" is unreachable through `validate_recognition_output` (the 1-primary +
+  2-secondary caps dominate it, and an unparseable `relationship` raises candidate-locally first);
+  the partition reaches it only because it counts over the RAW list.
 - `classified` after partition still requires **exactly one** primary.
 - **No promotion** of a secondary to primary, ever.
 - Every drop carries a closed, value-free reason code.

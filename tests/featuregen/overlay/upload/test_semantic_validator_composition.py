@@ -362,6 +362,10 @@ def test_an_audit_degraded_result_exposes_nothing(db, monkeypatch) -> None:
 _SEMANTIC_SEAM_CONSUMERS = {
     # the output-only projection, which must pass the parameter THROUGH to be a true projection
     ("src/featuregen/overlay/upload/enrich_llm.py", "drive_audited_structured_call"),
+    # Task 3 (2026-08-15): the use-case recognizer, the first real consumer. Its rules are a CLOSED
+    # TAXONOMY and shape caps ("exactly one primary") — precisely the contract a JSON Schema cannot
+    # express — and it keeps its post-call check as the floor. Reviewed line, added deliberately.
+    ("src/featuregen/overlay/upload/taxonomy/recognizer.py", "drive_audited_structured_call"),
 }
 
 

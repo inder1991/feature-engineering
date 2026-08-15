@@ -1,9 +1,16 @@
 """Phase-1A Task 2 — the LLM-only, fail-open use-case recognizer.
 
 ``recognize`` builds ONE ``LLMRequest`` over the *redacted* hypothesis/goal (NEVER catalog columns),
-drives it through ``drive_structured_call`` — which already provides the bounded repair/retry/
-fail-closed runtime contract against ``validate_recognition_output`` — then maps the outcome to a
-``RecognitionResult``.
+drives it through the AUDITED seam (``drive_audited_structured_call`` → ``drive_structured_call``),
+then maps the outcome to a ``RecognitionResult``.
+
+Since Task 3 of ``docs/superpowers/plans/2026-08-15-recognition-repair-seam.md`` the seam is handed
+``validate_semantics=validate_recognition_output``, so the closed-taxonomy rules are enforced INSIDE
+that bounded repair/retry/fail-closed runtime contract, after the registered JSON Schema. **This
+docstring previously claimed that was already true; it was not** — the audited wrapper hardcoded its
+validator to schema-only, and the taxonomy rules ran only in the post-call pass below. A body no JSON
+Schema can fault (two primaries, a duplicated id) was therefore discarded whole with the model never
+asked to fix it, which is the 2026-08-15 live incident.
 
 It is FAIL-OPEN by construction: it NEVER raises to its caller and NEVER blocks generation. Every
 technical failure — a provider failure/refusal, a validation budget exhausted (``STATUS_FAILED``), a
@@ -241,6 +248,12 @@ def recognize_with_audit(
             dispatch_audit=dispatch_audit,
             run_id=audit_run_id or ENRICHMENT_RUN_ID,
             record_egress_block=audit_run_id is not None,
+            # Repair seam, Task 3: the closed-taxonomy rules run INSIDE the §9.2 repair loop, after
+            # the registered schema. Before this, they ran only in the post-call pass below — so a
+            # body the JSON Schema could not fault (two primaries; a duplicated id) was discarded
+            # whole without the model ever being asked to fix it. This is the ONE reviewed entry in
+            # the seam's `_SEMANTIC_SEAM_CONSUMERS` allow-list.
+            validate_semantics=validate_recognition_output,
         )
     except Exception:
         logger.exception("recognition dispatch raised; failing open to technical_failure")
@@ -271,10 +284,17 @@ def recognize_with_audit(
         )
 
     try:
+        # The FLOOR, not the check: the same rules already ran inside the repair loop (above), so
+        # reaching here means a body the seam believed valid is not — a wiring regression, not a
+        # model failure. It stays because a repair that never succeeded must still never yield a
+        # scope, and because `output` is about to be mapped into a governed result object.
         validate_recognition_output(output)     # closed-taxonomy semantics (id in registry, primary leaf)
     except SchemaValidationError as exc:
         return AuditedRecognition(
             unscoped_result(
+                # `exc`'s message is value-free by construction (`recognition._reject`): it names
+                # the closed code and the candidate POSITION, never the model's text. This note is
+                # persisted and shown to a human.
                 f"recognition output invalid: {exc}",
                 model_id=model,
                 prompt_version=PROMPT_VERSION,

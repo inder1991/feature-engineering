@@ -11,11 +11,27 @@ from typing import Any
 
 import pytest
 
-from featuregen.contracts import SchemaValidationError
+from featuregen.contracts import AttestedSchemaValidationError, SchemaValidationError
+from featuregen.overlay.upload.enrich_llm import _SEMANTIC_REPAIR_CODE, _semantic_repair_code
 from featuregen.overlay.upload.taxonomy.recognition import (
+    CLASSIFIED_REQUIRES_ONE_PRIMARY,
+    DUPLICATE_CANDIDATE,
+    INVALID_CONFIDENCE,
+    INVALID_RELATIONSHIP,
+    INVALID_STATUS,
+    MALFORMED_CANDIDATE,
+    MALFORMED_CANDIDATE_LIST,
+    MALFORMED_EVIDENCE_SPANS,
+    MULTIPLE_PRIMARY_CANDIDATES,
+    PRIMARY_NOT_A_LEAF_OBJECTIVE,
+    RECOGNITION_FAILURE_CODES,
+    STATUS_REQUIRES_A_CANDIDATE,
     TAXONOMY_VERSION,
+    TOO_MANY_CANDIDATES,
+    TOO_MANY_SECONDARY_CANDIDATES,
     UNKNOWN_MODELLING_CONTEXT,
     UNKNOWN_TARGET_ENTITY,
+    UNKNOWN_USE_CASE_ID,
     RecognitionStatus,
     normalize_dimensions,
     unscoped_result,
@@ -214,3 +230,93 @@ def test_validate_output_is_structural_for_core_only_ignores_dimensions():
     bad_primary["modelling_contexts"] = ["ifrs9"]      # a valid dim does not rescue an invalid primary
     with pytest.raises(SchemaValidationError):
         validate_recognition_output(bad_primary)
+
+
+# ── Task 3 (2026-08-15): every rejection names a CLOSED, VALUE-FREE code ─────────────────────────
+#
+# The codes are not decoration. Since the recognizer hands this validator to the audited seam as
+# `validate_semantics`, each one is (a) re-prompted to the provider as the repair complaint, (b)
+# persisted verbatim into `llm_call.repair_attempts`, and (c) folded into the human-visible
+# `ambiguity_note` when repair never succeeds. A code that failed the seam's shape rule would be
+# silently scrubbed to a dull constant and the model would be re-asked with no information at all.
+
+#: One body per raise site, and the code it must attest. `_LEAKED` is the model-chosen text that
+#: must not appear in the exception message — the message is what reaches the human-visible note.
+_LEAKED = "zz-recognition-leak-sentinel-zz"
+
+_REJECTIONS: list[tuple[str, dict[str, Any]]] = [
+    (MALFORMED_CANDIDATE, _classified([_LEAKED])),                                    # type: ignore[list-item]
+    (UNKNOWN_USE_CASE_ID, _classified([_candidate(_LEAKED)])),
+    # In the registry, but a domain PARENT — a primary that would scope to zero recipes.
+    (PRIMARY_NOT_A_LEAF_OBJECTIVE, _classified([_candidate("financial_crime")])),
+    (INVALID_RELATIONSHIP, _classified([_candidate(CHURN, relationship=_LEAKED)])),
+    (INVALID_CONFIDENCE, _classified([_candidate(CHURN, confidence=_LEAKED)])),
+    (MALFORMED_EVIDENCE_SPANS, _classified([_candidate(CHURN, evidence_spans=("   ",))])),
+    (INVALID_STATUS, {"status": _LEAKED, "candidates": []}),
+    (MALFORMED_CANDIDATE_LIST, {"status": "unscoped", "candidates": _LEAKED}),
+    (DUPLICATE_CANDIDATE, _classified([_candidate(CHURN, relationship="primary"),
+                                       _candidate(CHURN, relationship="secondary")])),
+    (MULTIPLE_PRIMARY_CANDIDATES, _classified([_candidate(CHURN, relationship="primary"),
+                                               _candidate(DEPOSIT, relationship="primary")])),
+    (TOO_MANY_SECONDARY_CANDIDATES, _classified([
+        _candidate(CHURN, relationship="secondary"),
+        _candidate(DEPOSIT, relationship="secondary"),
+        _candidate(PRIMACY, relationship="secondary")])),
+    (STATUS_REQUIRES_A_CANDIDATE, {"status": "ambiguous", "candidates": []}),
+    (CLASSIFIED_REQUIRES_ONE_PRIMARY, _classified([
+        _candidate(CHURN, relationship="secondary")])),
+]
+
+
+@pytest.mark.parametrize(("code", "body"), _REJECTIONS, ids=[c for c, _ in _REJECTIONS])
+def test_each_rejection_attests_its_closed_code(code: str, body: dict[str, Any]) -> None:
+    with pytest.raises(AttestedSchemaValidationError) as excinfo:
+        validate_recognition_output(body)
+    assert excinfo.value.llm_safe_reason == code
+    assert code in RECOGNITION_FAILURE_CODES
+
+
+@pytest.mark.parametrize(("code", "body"), _REJECTIONS, ids=[c for c, _ in _REJECTIONS])
+def test_no_rejection_interpolates_the_offending_value(code: str, body: dict[str, Any]) -> None:
+    """The message names the rule and, at most, a candidate POSITION. It never quotes what the model
+    said — the value has not been through the §9.4 egress guard, and this text is persisted and
+    displayed."""
+    with pytest.raises(AttestedSchemaValidationError) as excinfo:
+        validate_recognition_output(body)
+    rendered = f"{excinfo.value} {excinfo.value.llm_safe_reason}"
+    assert _LEAKED not in rendered
+    assert "financial_crime" not in rendered      # a real id the model proposed is model text too
+    assert CHURN not in rendered
+
+
+def test_every_failure_code_survives_the_seam_shape_rule() -> None:
+    """The whole vocabulary at once. `enrich_llm._SEMANTIC_REPAIR_CODE` scrubs anything that is not
+    a closed token back to one value-free constant, so a code that failed this would cost a repair
+    turn its only information — and the failure would be a log line, not a test."""
+    for code in RECOGNITION_FAILURE_CODES:
+        assert _SEMANTIC_REPAIR_CODE.fullmatch(code), code
+        assert _semantic_repair_code(
+            AttestedSchemaValidationError("m", llm_safe_reason=code)) == code
+
+
+def test_the_declared_vocabulary_is_exactly_what_the_validator_can_raise() -> None:
+    """Drift both ways: a code declared but unreachable is a promise nothing keeps, and a raise site
+    that invents a code outside the set escapes Task 4's closed drop-reason contract."""
+    raised = {code for code, _ in _REJECTIONS}
+    unreached = RECOGNITION_FAILURE_CODES - raised
+    # TOO_MANY_CANDIDATES is DOMINATED, not missed: with `relationship` closed to two values, the
+    # per-relationship caps (1 primary + 2 secondary) already forbid a fourth candidate, and an
+    # unparseable relationship is a candidate-LOCAL failure that raises before any aggregate runs.
+    # The next test pins that domination; the constant stays because Task 4's partition, which
+    # counts over the RAW list, does reach it.
+    assert unreached == {TOO_MANY_CANDIDATES}
+
+
+def test_the_total_cap_is_dominated_by_the_per_relationship_caps() -> None:
+    with pytest.raises(AttestedSchemaValidationError) as excinfo:
+        validate_recognition_output(_classified([
+            _candidate(CHURN, relationship="primary"),
+            _candidate(DEPOSIT, relationship="secondary"),
+            _candidate(PRIMACY, relationship="secondary"),
+            _candidate("customer.cross_sell", relationship="secondary")]))
+    assert excinfo.value.llm_safe_reason == TOO_MANY_SECONDARY_CANDIDATES
