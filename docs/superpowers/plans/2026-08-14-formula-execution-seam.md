@@ -2086,6 +2086,98 @@ the lane compiles → `run_l0` **passed** → the compiled read set **equals the
 Modelled on the parent plan's Task E0 (`bd43964d`), which is the precedent for a walkthrough gate
 that runs in CI.
 
+> **PLAN CORRECTION (E0, verified). "→ authored (recorded-fixture) result →" cannot be a step of
+> this walk, and the reason is already recorded twice in this document.** A3's plan defect 1 says
+> the live authoring worker is `replay_authoring.run_authoring` and that routing a v2 work item
+> through it needs a *replay-shaped* v2 orchestrator nobody has written; A4 increment 2 then made
+> the worker **terminalize every v2 work item** with `V2_AUTHORING_UNAVAILABLE` precisely so the
+> absence could not become a false verdict. Downstream, `materialize/resolve.py` restores a v1
+> `AuthoringResult` (`_restore_result`), and A3's plan defect 2 established that a v2 artifact is a
+> *pair* (proposal + `FormulaOutputPolicyV2`) — there is no `TypedFormulaV2` and no path from one
+> into admission at all. So the recipe whose governed decision §0.5 item 1 is *about*
+> (`posted_debit_amount`, the only reviewed v2 exemplar) **structurally cannot be the recipe that
+> compiles**, and E0 asserts item 2 up to the platform's own refusal rather than faking an author.
+
+> **PLAN CORRECTION (E0, verified, and it is a DEFECT rather than a wording problem).**
+> §0.5 item 4's *"`POST /materialization-runs` accepts"* is **unreachable for any option whose own
+> eligibility fold names an outstanding requirement code**, and the served exemplar is one:
+> `semantic_eligibility` appends `STATUS_POLICY_UNRESOLVED` unconditionally for an operand carrying
+> a `status_policy_ref`, which `posted_debit_amount` has on two of its nine operands. The cause is
+> one missing argument: `api/routes/materialization_runs.py:455` calls
+> `assemble_current_activation_state(conn, frozen=…, snapshot_id=…)` **without `contract_id`**, so
+> C3's contract-keyed `_requirements_closed` read (`semantic_option_decision.py:610`) always
+> answers `False` on that route and `EXTERNAL_VALIDATION_OUTSTANDING` can only clear through the
+> `frozen.validation_status != "DESIGN_CHECKED"` short-circuit at `activation_policy.py:195`.
+> **NOT FIXED HERE, deliberately:** naming the contract needs an option → contract resolution that
+> does not exist (`contract` is keyed by `feature_name`; `contract_gate1_choice_revision` records
+> the option but the two id spaces are different), and inventing one inside a proof task is the
+> exact failure mode §8's verify-then-write rule exists to stop. E0 asserts the defect in both
+> directions instead, so it is a green test rather than a note.
+
+> **ACCEPTED `PENDING-E0` (2026-08-15).** `tests/featuregen/api/test_seam_walkthrough.py` — one
+> walk, in the DEFAULT suite, plus the two tests that keep it from being decoration.
+>
+> **THE WALK, and every step of it is a real surface.** Reviews recorded FIRST (real
+> `recipe_review_event` rows, every role the recipe names, at its live canonical revision hash —
+> so the SERVING fold measures them rather than a later re-read papering over a frozen `False`) →
+> `POST /contract/recognitions` + `POST /contract/considered-set` on a real `posting_bank` catalog
+> → three served option decisions for `posted_debit_amount`, all `bound`, all
+> `has_reviewed_formula_expectation = true` (**§0.5 item 1**) → one durable
+> `recipe_formula_shadow_work_item` at an EXACT candidate key carrying the frozen plan envelope
+> and its 64-char hash, with `binding_plan`/`read_set` proved ABSENT from the provider payload
+> (**item 2, capture half**) → the platform's own `declared_expectation_schema` read off that real
+> row answers `formula-v2` (**item 2, authoring half — the honest boundary**) →
+> `activation_decision(frozen, current, "execute_materialization").blockers == ()` on a real frozen
+> row (**item 3**) → `POST /materialization-runs` **202** with the governed option as provenance →
+> `process_materialization_once` compiles → `run_l0` **PASSED**, read back through
+> `read_validation_reports` → the compiled read set **equals** the frozen envelope's, as a SET
+> EQUALITY (**item 4**).
+>
+> **THE READ-SET ASSERTION IS AN EQUALITY, not a subset.** `compiled == frozen | additions`, where
+> the four additions are pinned individually with their reasons (the spine's relation, its ordered
+> key, its availability column — the population is a separate governed declaration, §4 — and the
+> expression's source relation, which admission's check 7 already compared). A widening cannot hide
+> inside a passing compile, and a new class of addition must be argued for in the open. Measured:
+> the compilation authorizes exactly nine refs, the envelope's five plus those four.
+>
+> **THE GAP IS A GREEN ASSERTION, which is the point.** `assert declared !=
+> AUTHORABLE_EXPECTATION_SCHEMA` carries the message *"if this is now authorable, the v2
+> orchestrator landed and this walkthrough must be extended through it"*. The day someone writes
+> the replay-shaped v2 orchestrator, E0 goes RED and says why. An omitted step would have said
+> nothing.
+>
+> **MUTANT PROOF, THREE, EACH RUN AND EACH CAUGHT.** (a) `divergence = None` in `ir.compile_ir` —
+> the envelope check disabled — makes `test_a_narrowed_envelope_breaks_the_walk_INSIDE_the_lane`
+> fail with `status='completed'` where it demands `refused`, so the check is proved LIVE IN THE
+> LANE and not only in B3's unit tests. (b) `declared_expectation_schema` returning
+> `AUTHORABLE_EXPECTATION_SCHEMA` unconditionally fails the walk at the boundary assertion.
+> (c) Deleting `posted_debit_amount` from `RECIPE_FORMULA_V2_EXPECTATIONS` — the "un-review the
+> exemplar" mutant this task was briefed to try — is **unreachable**: `validate_v2_registry()` runs
+> at import and raises `RecipeContractError` ("authors readiness 'FORMULA_AUTHORABLE' but its own
+> declarations fold to 'FORMULA_BLOCKED'"), so the registry's own guard is strictly stronger than
+> any test. Recorded rather than worked around.
+>
+> **WHAT IS SEEDED, EACH NAMED — the C3 milestone's vocabulary, deliberately.** The gold/provider
+> evaluation (`_gold_evaluation_recorded`, the documented hook; no store exists) and snapshot
+> freshness (`compare_snapshot_to_current`; snapshot minting rides the generation pipeline, not a
+> test) — the same two C3 seeded, for the same reasons. `run_l0`'s VERDICT is injected at
+> `chain.run_l0` exactly as the whole materialize suite does, over a project that is really
+> rendered, sealed and materialized on disk — the real interpreter is E1's, and `pyspark`/`kedro`
+> are not dependencies of this platform. The one option decision this test WRITES rather than
+> reads is the C3-milestone-shaped row (a `DESIGN_CHECKED` idea), and it carries the served run's
+> own revision id, revision hash, plan envelope and metadata snapshot — everything about it except
+> the validation status is the served run's, and the validation status is the subject of the
+> correction above.
+>
+> **`_seed_work_item` gained one keyword, `binding_plan=None`**, so a work item can carry the
+> frozen envelope (B2 / migration 1068). The default is the pre-1068 shape every existing caller
+> already relies on, which
+> `test_a_run_without_an_envelope_compiles_exactly_as_before` pins.
+>
+> Gates: full suite **11191 passed, 20 skipped** (baseline on `15cff93f` was 11188/20 — the three
+> new tests and nothing else moved); `-m eval` **73 passed**; ruff clean on both touched files;
+> mypy unaffected (`[tool.mypy] files = ["src"]`, and this task touches no source module).
+
 ### Task E1 — the governed contract materializes (1½ days)
 
 Extends E0 through §0.5 items 5–7 in the JVM gate (`make l0-gate` sibling), not the default suite:

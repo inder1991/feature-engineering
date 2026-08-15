@@ -82,9 +82,13 @@ def _provider_input(intent) -> dict:
             "formula_expectation": _expectation(intent.name)}
 
 
-def _seed_work_item(db, name: str, suffix: str) -> str:
+def _seed_work_item(db, name: str, suffix: str, *, binding_plan: dict | None = None) -> str:
     """One ``recipe_formula_shadow_work_item`` and the FK chain it stands on, through the REAL
-    writers — a hand-rolled INSERT would let a defect in the writer hide behind the fixture."""
+    writers — a hand-rolled INSERT would let a defect in the writer hide behind the fixture.
+
+    ``binding_plan`` is the FROZEN PLAN ENVELOPE (B2, migration 1068). ``None`` is the default and
+    is the shape of every work item written before that migration — the state
+    ``test_a_run_without_an_envelope_compiles_exactly_as_before`` pins."""
     intent_id, run_id = f"intent-{suffix}", f"genrun-{suffix}"
     scope_id, revision_id = f"scope-{suffix}", f"revision-{suffix}"
     considered_hash = f"considered-{suffix}"
@@ -132,7 +136,8 @@ def _seed_work_item(db, name: str, suffix: str) -> str:
         frozen_configuration_hash=f"cfg-{suffix}",
         request_identity={"subject": "user:test", "actor_kind": "human", "authenticated": True,
                           "auth_method": "password", "role_claims": ["analyst"]},
-        request_read_scope_hash=f"scope-hash-{suffix}")
+        request_read_scope_hash=f"scope-hash-{suffix}",
+        binding_plan=binding_plan)
     return work_item_id
 
 
