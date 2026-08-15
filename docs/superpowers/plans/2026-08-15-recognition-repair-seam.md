@@ -111,7 +111,7 @@ for the length of the deploy window.
   pinned: a re-run may never return an id whose stored status disagrees with the payload.
 - Migration audit against a POPULATED legacy table (the standing lesson).
 
-> **TASK 0 (2026-08-15) — ACCEPTED.** `recognizer.recognition_request_hash` =
+> **TASK 0 (2026-08-15) — ACCEPTED `a8dece15`.** `recognizer.recognition_request_hash` =
 > `contract_hash_v1("recognition-request", "1", …)` over `input_content_hash` + prompt id/version and
 > prompt CONTENT + schema id/version and schema CONTENT + taxonomy version and closed-leaf CONTENT +
 > applicability/recipe-registry versions + the new `recognition.RECOGNITION_VALIDATOR_VERSION` + the
