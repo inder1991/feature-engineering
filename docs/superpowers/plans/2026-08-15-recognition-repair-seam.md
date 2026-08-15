@@ -477,7 +477,7 @@ cap violation.
 `test_the_only_primary_being_invalid_does_not_promote_a_secondary`;
 `test_nothing_valid_survives_is_unchanged`; the normalized result and its drop codes persist.
 
-> **TASK 4 (2026-08-15) — ACCEPTED `PENDING`.** `recognition.partition_candidates(output) ->
+> **TASK 4 (2026-08-15) — ACCEPTED `b2266f8f`.** `recognition.partition_candidates(output) ->
 > (kept, dropped)` sits beside `normalize_dimensions` and never raises, exactly as that idiom does.
 > `recognizer._partial_recovery` folds it, on the ONE seam disposition that carries a body
 > (`semantic_invalid`), AFTER the repair budget has been spent — never instead of it. Survivors →
