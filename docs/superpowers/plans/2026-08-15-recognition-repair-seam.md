@@ -35,20 +35,20 @@ served **917 unscoped candidates** (306 of 317 recipes).
 | 1 | The registered schema declares `use_case_id` as a bare string; the 88 ids are prose in the prompt only | `enrich_llm.py:1452` |
 | 2 | Sibling fields in the SAME schema carry enums (`status`, `relationship`, `confidence`) | same block |
 | 3 | The inner seam accepts a semantic validator and drives bounded repair from it | `intake/llm.py:403-406`, §9.2 taxonomy `:188` |
-| 4 | **The audited wrapper hardcodes the validator to schema-only and exposes no parameter for the caller's own** | `enrich_llm.py:2099`; signature `:1997-2007` |
+| 4 | **The audited wrapper hardcodes the validator to schema-only and exposes no parameter for the caller's own** | **[R5 — line numbers corrected]** at Task 2's start: hardcoded lambda `enrich_llm.py:2141`, signature `:2039-2049` (the plan's `:2099`/`:1997` were pre-Task-1) |
 | 5 | The recognizer therefore validates AFTER the call, outside the repair loop | `taxonomy/recognizer.py:187` |
 | 6 | The call logged `{"result": "ok"}` with `repair_attempts: []` — the model was never asked to fix its output | `llm_call` row 13:20:17Z |
 | 7 | `validate_recognition_output`'s docstring claims it IS the callback the inner seam invokes | `recognition.py:8` |
 | 8 | The taxonomy validator is all-or-nothing — the first bad candidate raises | `recognition.py:126` |
 | 9 | The module already has the forgiving idiom for two sibling dimensions, deliberately | `recognition.py:221`, `normalize_dimensions` |
 | 10 | The UI reports absence, not loss | `WorkbenchScreen.tsx:2060` |
-| 11 | **[R2 — corrected]** The wrapper has **12 distinct caller modules**, not "~29". Revision 1 quoted a raw grep line count as a caller count | `grep -rl`, verified at `730c69a8` |
+| 11 | **[R5 — corrected again]** The wrapper has **13 distinct caller modules / 14 call sites** outside the seam module (plus its own two internal projections), not "12" and not "~29". Revision 1 quoted a raw grep line count; revision 2's replacement was one short (it omitted `formula/audited.py`, the only caller outside `overlay/upload/`) | AST enumeration, `test_every_existing_call_site_is_byte_identical` |
 
 ### 0.2 What revision 1 got wrong — verified at `730c69a8` **[R2]**
 
 | # | Blocker | Evidence |
 |---|---|---|
-| B1 | **Task 3 was unbuildable.** After repair exhaustion the wrapper returns `output=None` on BOTH the discard and failed paths, so the recognizer has no body left to partition. Modifying `recognition.py` alone cannot work | `enrich_llm.py:2128`, `:2135`; `recognizer.py:172-184` |
+| B1 | **Task 3 was unbuildable.** After repair exhaustion the wrapper returns `output=None` on BOTH the discard and failed paths, so the recognizer has no body left to partition. Modifying `recognition.py` alone cannot work | **[R5 — line numbers corrected]** at Task 2's start `enrich_llm.py:2170` (audit-degraded discard), `:2177` (STATUS_FAILED); `recognizer.py:172-184` |
 | B2 | **Re-running the same objective returns a NEW http result over an OLD stored row.** Persistence is unique on `(intent_id, input_hash)`, and `input_hash` covers only redacted user input + redaction policy — not prompt, schema, taxonomy, validator or model. The endpoint calls the provider again, then `ON CONFLICT DO NOTHING` returns the OLD recognition id. After this fix ships, resubmitting the incident could display "Churn" while the returned id still points at the `technical_failure` row | `contract.py:1173-1202`, `scope_records.py:94-117,145-172,490-545` |
 | B3 | **The release gate would certify a different contract than production runs.** The evaluator is pinned to `SCHEMA_VERSION = 1` and re-runs the OLD all-or-nothing validator over `llm_call.raw_output`, so a partially-recovered result scores as a technical failure | `recognition_release_eval.py:52-56,216-280,304-320` |
 | B4 | **Revision 1 created schema v2 and never activated it.** `_OUTPUT_SCHEMA_VERSION = 1` is hardcoded; `register_enrichment_schemas()` uses a MUTABLE `register_schema` that overwrites an existing version, so a dynamically-derived enum could mean different things on different deployments | `recognizer.py:55`, `enrich_llm.py:1902-1918`, `documents/registry.py:29-49` |
@@ -270,8 +270,8 @@ carries the v2 contract, and one that the same user text hashes differently unde
 ### Task 2 — governed validator composition, with a failure contract (1 day)
 
 **Modify:** `drive_audited_structured_call` gains
-`validate_semantics: Callable[[Mapping], None] | None = None`; `:2099` composes schema-first then
-semantics. Default `None` keeps all 12 caller modules byte-identical.
+`validate_semantics: Callable[[Mapping], None] | None = None`; the hardcoded lambda composes
+schema-first then semantics. Default `None` keeps all **[R5]** 13 caller modules byte-identical.
 
 **The failure contract [R2]:**
 - Only a typed `SchemaValidationError` from the semantic validator enters repair.
@@ -291,7 +291,82 @@ results. The output-only wrapper keeps returning `None` for every invalid result
 `test_a_validator_raising_an_unexpected_error_is_audited_not_escaped`;
 `test_repair_prompts_never_contain_the_invalid_value`;
 `test_the_invalid_body_is_exposed_only_on_the_semantic_arm`;
-`test_all_twelve_existing_call_sites_are_byte_identical`.
+**[R5]** `test_every_existing_call_site_is_byte_identical` (renamed from
+`test_all_twelve_…` — the count was wrong, and a count in a test NAME goes stale silently).
+
+> **TASK 2 (2026-08-15) — ACCEPTED `TASK2_HASH`.** `drive_audited_structured_call` and its
+> output-only projection now take `validate_semantics`, and the hardcoded lambda became
+> `_compose_validation` — **registered schema FIRST, then the caller's semantics**. The order is the
+> contract: a semantic validator reading a body the registry has not accepted would be reading
+> unvalidated structure, which is the class of bug it exists to catch. `None` (every caller today)
+> is byte-for-byte the lambda it replaced.
+>
+> **How a caller supplies a code — no new type was needed, and the plan's "extend
+> `SchemaValidationError` if needed" is answered NO.** `AttestedSchemaValidationError(msg,
+> llm_safe_reason=CODE)` already exists and `intake/llm._safe_reason` already prefers it over the
+> structural pointer. What did NOT exist is any guarantee that the attested string is value-free —
+> `errors.py` can only ASK its authors, and Task 4's drop codes will be authored by whoever adds a
+> rule. So the seam ENFORCES it: `_SEMANTIC_REPAIR_CODE = ^[A-Z][A-Z0-9_]{0,63}$`. An uppercase
+> token cannot carry a use-case id, a column ref or a model-chosen string; anything else — prose, an
+> interpolated value, an empty reason, a plain `SchemaValidationError` with no attestation at all —
+> degrades to one value-free constant. Value-freedom is therefore structural for every semantic
+> validator that will ever be wired here, not only the reviewed ones.
+>
+> **Where the guard had to go, verified rather than assumed.** `_record_llm_call_durable` runs
+> AFTER `drive_structured_call` returns (`:2143` at Task 2's start), so an exception escaping a
+> caller's validator escapes the seam BEFORE the audit row for a call the provider already served
+> and billed. The fault is therefore **captured, not re-raised**: the composed validator stores it
+> and returns normally, which ends the driver's loop without spending repair budget on a crash the
+> model cannot fix, and the wrapper then OVERRIDES the driver's (now untrue) `{"result": "ok"}` with
+> `{"result": "validator_fault", "reason": "semantic validator raised KeyError"}` before recording.
+> The type name only — never `str(exc)`, which is exactly the value under suspicion. `BaseException`
+> is deliberately not caught: a dying process is not a disposition.
+>
+> **B1 — the exposure, and the line drawn through it.** `AuditedStructuredResult` gains
+> `failure_kind` (a closed vocabulary: `egress_blocked` / `provider_failed` / `schema_invalid` /
+> `semantic_invalid` / `validator_fault` / `audit_degraded`) and
+> `last_schema_valid_semantic_invalid_output`. **The BODY is exposed on the semantic arm ONLY**, and
+> only below the audit-linkage branch, so a discarded-because-unlinked result withholds it
+> unconditionally. `output` stays `None` on every failing arm and the output-only
+> `audited_structured_call` never sees the body at all — no existing caller can mistake it for a
+> validated result. **A deliberate reading of "those keep returning nothing":** the four negatives
+> return no BODY but DO carry their `failure_kind`. Withholding the label would leave Task 5 unable
+> to tell its five dispositions apart — which is the task it exists to do — and the label is
+> platform-authored text with no model or catalog content in it, so it is safe anywhere the `None`
+> already is.
+>
+> **Two stale-body traps, both closed by a test.** (a) semantic-invalid turn 1 → REFUSED repair
+> turn: the terminal REASON decides the kind first (`REPAIR_EXHAUSTED_REASON`, now a named constant
+> in `intake/llm.py` rather than prose matched at a distance), so the call is `provider_failed` and
+> exposes nothing. (b) semantic-invalid turn 1 → SCHEMA-invalid repair turn: the last-body slot is
+> reset at the top of every validation, so it can only ever describe the FINAL body validated.
+>
+> **Seven mutants, each watched failing.** re-raise the validator fault → the KeyError/ValueError/
+> TypeError leaves the seam and no `llm_call` row is written; trust the attestation → the rejected
+> value `zz-placeholder-sentinel-zz` appears in the outbound payload; semantics before schema → the
+> validator is handed `{"concept": 5}` and a schema-invalid body is misclassified `semantic_invalid`
+> and exposed; classify from state alone → the refused-repair case reports `semantic_invalid`;
+> expose on the audit-degraded arm → the body rides out unlinked; drop the last-body reset → the
+> stale body rides out; record the driver's `"ok"` on a fault → the audit row claims a discarded
+> answer succeeded. (Every test also fails against unfixed HEAD, on the unexpected keyword.)
+>
+> **Plan defects found and corrected above.** (a) The caller count is **13 modules / 14 call sites**
+> outside the seam module, not 12 — revision 2 missed `formula/audited.py`, the only caller outside
+> `overlay/upload/`; the acceptance test was renamed off the number and now enumerates the sites by
+> AST, asserts none passes `validate_semantics`, and pins the one allowed pass-through in an
+> enumerable `_SEMANTIC_SEAM_CONSUMERS` set (Task 3 adds the recognizer to it as a reviewed line).
+> (b) Rows 4 and B1 carried line numbers that Task 1 had already moved by ~40 lines; corrected to
+> what was verified at Task 2's start. (c) B1's substance was confirmed exactly as written.
+>
+> **What Task 2 changes on its own: nothing user-visible.** No caller passes the parameter yet, so
+> the platform behaves identically; this is the capability Tasks 3 and 4 consume. `formula/audited.py`
+> is untouched and still inherits repair through delegation.
+>
+> 17 new tests (13 functions, two parametrized) in
+> `tests/featuregen/overlay/upload/test_semantic_validator_composition.py`. Gates:
+> full suite **11465 passed, 20 skipped** (+17 on Task 1's 11448/20 — exactly the tests added);
+> `-m eval` **73 passed**; ruff clean on every touched file; mypy unchanged (the same 4 pre-existing
+> `enrich_llm.py` errors, confirmed by HEAD-swap).
 
 ### Task 3 — the recognizer uses it (½ day)
 

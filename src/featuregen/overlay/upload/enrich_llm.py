@@ -18,21 +18,29 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 
 import psycopg
 
 from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.errors import (
+    AttestedSchemaValidationError,
+    SchemaValidationError,
+)
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
+    REPAIR_EXHAUSTED_REASON,
     STATUS_FAILED,
     LLMClient,
     LLMRequest,
+    StructuredCallOutcome,
     compute_input_hash,
     drive_structured_call,
     record_llm_call,
@@ -1960,6 +1968,27 @@ def register_enrichment_schemas(conn) -> None:
         reg.register_schema(name, ver, schema, _OWNER)
 
 
+# ---- the closed failure vocabulary of one governed structured call ---------------------------
+# WHY a vocabulary and not a boolean: `output is None` collapses five different things — the
+# payload never left the building, the provider never answered, the body was malformed, the body
+# was well-formed but broke the caller's own rules, or the audit linkage did not commit. A caller
+# that must tell a user which of those happened (the recognition repair plan's Task 5) cannot
+# reconstruct it from a None, and every one of these tokens is PLATFORM-authored — no model text,
+# no catalog text — so it is safe to surface anywhere the None already is.
+FAILURE_KIND_EGRESS_BLOCKED = "egress_blocked"      # blocked BEFORE dispatch; nothing egressed
+FAILURE_KIND_PROVIDER_FAILED = "provider_failed"    # refusal / retry exhaustion / auth / unknown
+FAILURE_KIND_SCHEMA_INVALID = "schema_invalid"      # repair exhausted on the REGISTERED schema
+FAILURE_KIND_SEMANTIC_INVALID = "semantic_invalid"  # repair exhausted on the CALLER's semantics
+FAILURE_KIND_VALIDATOR_FAULT = "validator_fault"    # the caller's validator itself raised
+FAILURE_KIND_AUDIT_DEGRADED = "audit_degraded"      # C5-T6: the logical outcome audit did not commit
+
+#: The `llm_call.validation_result["result"]` token a validator fault records. Deliberately NOT
+#: `failed_into_clarification` (the model did not fail — we did) and NOT `ok`: the row must say that
+#: a billed provider answer was discarded by a platform fault, or the audit lies about a call that
+#: really happened.
+_VALIDATOR_FAULT_RESULT = "validator_fault"
+
+
 @dataclass(frozen=True, slots=True)
 class AuditedStructuredResult:
     """The FULL disposition of one governed structured call (Child-1 Task 3).
@@ -1970,11 +1999,120 @@ class AuditedStructuredResult:
     have recorded (``record_egress_block=False``, the enrichment default). ``provider_calls``
     counts the PHYSICAL provider requests issued (initial + repairs/retries; 0 when blocked before
     dispatch). ``usage`` is the outcome's provider-reported cost metadata (input/output tokens…);
-    {} when nothing was dispatched."""
+    {} when nothing was dispatched.
+
+    ``failure_kind`` is one of the ``FAILURE_KIND_*`` tokens above, or None when ``output`` is a
+    validated body. ``last_schema_valid_semantic_invalid_output`` is the ONE narrow exception to
+    "an invalid result carries no body": the final answer of a call that exhausted its repairs
+    while SCHEMA-VALID and SEMANTICALLY invalid, so a caller can partition what survives inside it
+    (the recognition plan's Task 4) instead of discarding a correct answer with its sloppy sibling.
+    It is populated ONLY on ``FAILURE_KIND_SEMANTIC_INVALID`` and ONLY once the audit row (and,
+    under a dispatch-audit context, its linkage) exists — a body nobody can account for is a body
+    nobody may act on. It is NEVER a validated output: ``output`` stays None, so no existing caller
+    can mistake it for one, and the output-only ``audited_structured_call`` projection never sees
+    it at all."""
     output: dict | None
     llm_call_ref: str | None
     provider_calls: int
     usage: dict
+    failure_kind: str | None = None
+    last_schema_valid_semantic_invalid_output: dict | None = None
+
+
+#: A semantic repair complaint is a CLOSED CODE — `UNKNOWN_USE_CASE_ID`, `DUPLICATE_CANDIDATE` —
+#: and this pattern is what makes that structural rather than a promise. `_safe_reason` already
+#: refuses to put a jsonschema message on the wire because it embeds the offending INSTANCE VALUE;
+#: an author-attested reason is exempt from that rebuild, so without this an author could
+#: interpolate the very value the guard exists to suppress (and `AttestedSchemaValidationError`'s
+#: own docstring can only ASK them not to). An uppercase token cannot carry a use-case id, a column
+#: ref or a model-chosen string, and the check is applied at the seam, so it holds for every
+#: semantic validator that will ever be wired here — not only the reviewed ones.
+_SEMANTIC_REPAIR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+#: What a validator gets when it declines to name a code (a plain ``SchemaValidationError``) or
+#: attests something that is not one. Author literal, value-free, deliberately dull: a duller repair
+#: complaint costs one round-trip's precision, a leak costs the egress boundary.
+_SEMANTIC_REPAIR_FALLBACK = "the result did not satisfy the semantic contract"
+
+
+@dataclass(slots=True)
+class _SemanticValidationState:
+    """What the composed validator learned, carried out of ``drive_structured_call`` (which returns
+    only its own taxonomy). ``invalid_output`` is the last body that passed the SCHEMA and failed
+    the SEMANTICS — reset at the top of every validation, so it can only ever describe the FINAL
+    body validated, never a stale earlier turn. ``fault`` is an unexpected exception the caller's
+    validator raised (a platform bug, not a model failure)."""
+    invalid_output: dict | None = None
+    fault: Exception | None = None
+
+
+def _semantic_repair_code(exc: SchemaValidationError) -> str:
+    """The value-free code this semantic failure may put on the wire. Honours an attested reason
+    ONLY when it is a closed code; anything else — prose, an interpolated value, an empty string —
+    degrades to the constant. The rejected reason is never logged: it is the thing under suspicion."""
+    if isinstance(exc, AttestedSchemaValidationError):
+        code = str(exc.llm_safe_reason or "").strip()
+        if _SEMANTIC_REPAIR_CODE.fullmatch(code):
+            return code
+        logger.warning("semantic validator attested a repair reason that is not a closed code; "
+                       "using the value-free constant instead")
+    return _SEMANTIC_REPAIR_FALLBACK
+
+
+def _compose_validation(reg: DocumentSchemaRegistry, schema_id: str, schema_version: int,
+                        validate_semantics: Callable[[Mapping[str, Any]], None] | None,
+                        state: _SemanticValidationState) -> Callable[[Mapping[str, Any]], None]:
+    """The ``validate_output`` callback ``drive_structured_call`` drives its repair loop from:
+    REGISTERED SCHEMA FIRST, then the caller's semantics.
+
+    Order is the contract, not a preference. The registry is the fail-closed floor every existing
+    caller already depends on, and a semantic validator reading a body the schema has not accepted
+    would be reading unvalidated structure — the exact class of bug it exists to catch.
+
+    THE FAILURE CONTRACT, which is what makes handing this seam a caller's own code safe:
+
+    * a typed ``SchemaValidationError`` from the semantics is re-raised as an ATTESTED one carrying
+      a closed code, so it is indistinguishable IN KIND from a structural failure and the same §9.2
+      budget governs both — a semantic doubt can no more loop forever than a malformed one;
+    * ANY other exception is a fault in OUR code, not the model's. It is captured, NOT raised: a
+      raise here would escape ``drive_structured_call`` before ``_record_llm_call_durable`` runs,
+      and the provider has already been called and billed — losing that record loses the evidence
+      that content left the building. Returning normally ends the loop without spending repair
+      budget on a crash the model cannot fix; the caller then converts the captured fault into an
+      audited technical failure. ``BaseException`` (KeyboardInterrupt/SystemExit) is deliberately
+      not caught — a dying process is not a disposition.
+
+    With ``validate_semantics=None`` this is byte-for-byte the hardcoded lambda it replaced."""
+
+    def _validate(output: Mapping[str, Any]) -> None:
+        state.invalid_output = None
+        reg.validate(schema_id, schema_version, output)   # the floor — unchanged, and FIRST
+        if validate_semantics is None:
+            return
+        try:
+            validate_semantics(output)
+        except SchemaValidationError as exc:
+            state.invalid_output = dict(output)
+            raise AttestedSchemaValidationError(
+                str(exc), llm_safe_reason=_semantic_repair_code(exc)) from exc
+        except Exception as exc:   # noqa: BLE001 — a validator fault must be AUDITED, never escape
+            state.fault = exc
+            logger.exception("semantic validator raised for %s (schema %s); recording an audited "
+                             "technical failure", schema_id, schema_version)
+
+    return _validate
+
+
+def _terminal_failure_kind(outcome: StructuredCallOutcome,
+                           state: _SemanticValidationState) -> str:
+    """Which of the failure kinds a STATUS_FAILED outcome is. The terminal REASON decides first:
+    a call whose last turn was refused by the provider is a provider failure even when an EARLIER
+    turn was semantically invalid, so a stale body can never be presented as the answer that
+    failed."""
+    if outcome.validation_result.get("reason") != REPAIR_EXHAUSTED_REASON:
+        return FAILURE_KIND_PROVIDER_FAILED
+    return (FAILURE_KIND_SEMANTIC_INVALID if state.invalid_output is not None
+            else FAILURE_KIND_SCHEMA_INVALID)
 
 
 def _record_blocked_call(conn, *, run_id: str, task: str, prompt_id: str, prompt_version: int,
@@ -2011,7 +2149,9 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
                             actor: IdentityEnvelope | None = None,
                             prompt_version: int = 1, schema_version: int = 1,
                             dispatch_audit: DispatchAuditContext | None = None,
-                            cacheable_metadata_keys: tuple[str, ...] = ()) -> dict | None:
+                            cacheable_metadata_keys: tuple[str, ...] = (),
+                            validate_semantics: Callable[[Mapping[str, Any]], None] | None = None,
+                            ) -> dict | None:
     """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
     block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
@@ -2028,12 +2168,18 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     ``dispatch_audit`` (C5-T3): the INGESTION call sites thread a ``DispatchAuditContext`` so every
     PHYSICAL provider attempt (initial + each repair/retry re-call inside ``drive_structured_call``)
     is pre-dispatch audited via the ``AuditingClient`` wrapper, fail-closed. ``None`` (contract
-    authoring / feature generation) keeps today's behavior byte-identical — no dispatch audit."""
+    authoring / feature generation) keeps today's behavior byte-identical — no dispatch audit.
+
+    ``validate_semantics`` threads straight through (see ``_compose_validation``). This projection
+    returns ``None`` for every invalid result exactly as before — including a semantically invalid
+    one: the post-repair body is exposed on ``drive_audited_structured_call``'s result ONLY, so no
+    caller of this signature can receive an unvalidated body by accident."""
     return drive_audited_structured_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
         prompt_version=prompt_version, schema_version=schema_version,
-        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys).output
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys,
+        validate_semantics=validate_semantics).output
 
 
 def drive_audited_structured_call(
@@ -2046,10 +2192,12 @@ def drive_audited_structured_call(
         run_id: str = ENRICHMENT_RUN_ID,
         record_egress_block: bool = False,
         generation_settings: dict | None = None,
-        logical_call_ref: str | None = None) -> AuditedStructuredResult:
+        logical_call_ref: str | None = None,
+        validate_semantics: Callable[[Mapping[str, Any]], None] | None = None,
+        ) -> AuditedStructuredResult:
     """The outcome-returning core of ``audited_structured_call`` (same governance, richer return —
-    mirrors ``drive_structured_call`` naming). Two ADDITIVE knobs beyond that seam's parameters,
-    both defaulting to the historical behavior so ``audited_structured_call`` stays byte-identical:
+    mirrors ``drive_structured_call`` naming). Three ADDITIVE knobs beyond that seam's parameters,
+    all defaulting to the historical behavior so ``audited_structured_call`` stays byte-identical:
 
     * ``run_id`` — the audit run bucket the immutable llm_call is recorded under (default
       ``ENRICHMENT_RUN_ID``). Formula authoring threads its ``authoring_run_id`` so every provider
@@ -2058,7 +2206,13 @@ def drive_audited_structured_call(
       fail-closed, feature-context adapter block, or the ``assert_llm_safe`` backstop) still writes
       a CONTENT-FREE llm_call row (``_record_blocked_call``) so the result carries an audited
       ``llm_call_ref`` for the block itself. False (default) keeps the enrichment behavior:
-      security-event only, no llm_call row, ``llm_call_ref=None``."""
+      security-event only, no llm_call row, ``llm_call_ref=None``.
+    * ``validate_semantics`` — the caller's OWN rules, run inside the bounded repair loop after the
+      registered schema (``_compose_validation`` holds the ordering and the failure contract). A
+      caller whose contract the JSON Schema cannot express — a closed taxonomy, "exactly one
+      primary" — used to check AFTER this seam returned, which meant the model was never asked to
+      fix an answer we then discarded whole. ``None`` (every caller but the one that asked for it)
+      is byte-for-byte the hardcoded schema-only lambda this replaced."""
     actor = actor or _ENRICH_ACTOR
     effective_generation_settings = (
         dict(generation_settings)
@@ -2074,7 +2228,8 @@ def drive_audited_structured_call(
                 prompt_version=prompt_version, schema_id=schema_id,
                 schema_version=schema_version, actor=actor, reason=reason,
                 generation_settings=effective_generation_settings)
-        return AuditedStructuredResult(output=None, llm_call_ref=ref, provider_calls=0, usage={})
+        return AuditedStructuredResult(output=None, llm_call_ref=ref, provider_calls=0, usage={},
+                                       failure_kind=FAILURE_KIND_EGRESS_BLOCKED)
 
     reg = DocumentSchemaRegistry(conn)
     schema = _require_schema(conn, reg, schema_id, schema_version)   # D10: raise, never unenforced
@@ -2138,15 +2293,24 @@ def drive_audited_structured_call(
             logical_call_ref=logical_call_ref or mint_id("lc"),
                                          redaction_version=redaction_version)
         dispatch_client = auditing_client
+    state = _SemanticValidationState()
     outcome = drive_structured_call(
-        dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))
+        dispatch_client, req,
+        _compose_validation(reg, schema_id, schema_version, validate_semantics, state))
+    # A captured validator fault means the driver saw a body it believed valid, so its own
+    # `validation_result` would record an "ok" that never happened. The audit row states what
+    # actually became of the (billed) answer.
+    validation_result = (
+        {"result": _VALIDATOR_FAULT_RESULT,
+         "reason": f"semantic validator raised {type(state.fault).__name__}"}
+        if state.fault is not None else outcome.validation_result)
     llm_call_ref = _record_llm_call_durable(   # #20: evidence survives an upload-tx rollback
         conn, run_id=run_id, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction=({"redacted_spans": spans, "sample_strip": sample_audits}
                          if (spans or sample_audits) else {}),
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
-        validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
+        validation_result=validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
     usage = dict(outcome.cost_metadata or {})
     if dispatch_audit is not None and auditing_client is not None:
@@ -2167,15 +2331,33 @@ def drive_audited_structured_call(
                            schema_id)
             # discard — not eligible for cache/evidence. The llm_call is durable + the provider was
             # called, so the ref/provider_calls/usage are surfaced even though output is withheld.
+            # This arm returns FIRST and withholds the body unconditionally: an unlinked result is
+            # one nobody can account for, which outranks any judgement about WHY it was invalid.
             return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
-                                           provider_calls=outcome.provider_calls, usage=usage)
+                                           provider_calls=outcome.provider_calls, usage=usage,
+                                           failure_kind=FAILURE_KIND_AUDIT_DEGRADED)
+
+    if state.fault is not None:
+        logger.warning("enrichment call %s (schema %s) discarded: the semantic validator raised %s",
+                       task, schema_id, type(state.fault).__name__)
+        # OUR failure, not the model's: nothing is returned and nothing is exposed, but the billed
+        # call is recorded above rather than lost to an exception leaving the seam.
+        return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
+                                       provider_calls=outcome.provider_calls, usage=usage,
+                                       failure_kind=FAILURE_KIND_VALIDATOR_FAULT)
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
                        outcome.validation_result)
         # provider/repair failure -> don't cache the (unverified) output; the call is still audited.
-        return AuditedStructuredResult(output=None, llm_call_ref=llm_call_ref,
-                                       provider_calls=outcome.provider_calls, usage=usage)
+        # B1: on the SEMANTIC arm only, the final schema-valid body rides out alongside the None so
+        # a caller can partition what survives inside it. `output` stays None on every arm.
+        kind = _terminal_failure_kind(outcome, state)
+        return AuditedStructuredResult(
+            output=None, llm_call_ref=llm_call_ref, provider_calls=outcome.provider_calls,
+            usage=usage, failure_kind=kind,
+            last_schema_valid_semantic_invalid_output=(
+                state.invalid_output if kind == FAILURE_KIND_SEMANTIC_INVALID else None))
     output = outcome.output if isinstance(outcome.output, dict) else None
     return AuditedStructuredResult(output=output, llm_call_ref=llm_call_ref,
                                    provider_calls=outcome.provider_calls, usage=usage)

@@ -315,6 +315,13 @@ def transient_backoff_s(retries_used: int) -> float:
 #: Bound on the rendered repair feedback — a pathological error list must not grow the payload.
 _MAX_REPAIR_FEEDBACK_CHARS = 2000
 
+#: The terminal `validation_result["reason"]` of a call that ran out of repairs on a body the
+#: VALIDATOR refused — as opposed to one the PROVIDER never delivered (refusal, retry exhaustion,
+#: auth, non-retryable). Named and exported because an audited caller has to tell those two apart to
+#: classify its own failure, and re-matching the prose at a distance would break silently the day
+#: this string is reworded. The value is byte-identical to the literal it replaced.
+REPAIR_EXHAUSTED_REASON = "repair budget exhausted (malformed structure)"
+
 #: Bound on ONE author-attested reason (see `AttestedSchemaValidationError`). Separate from
 #: `_MAX_REPAIR_FEEDBACK_CHARS` on purpose: that one bounds the JOINED string `_wire_prompt`
 #: renders, i.e. the WIRE only. The reason is also stored per attempt and un-joined in
@@ -470,7 +477,7 @@ def drive_structured_call(
                 provider_calls += 1
                 _accrue(spend, resp)
                 continue
-            return _failed(resp, attempts, "repair budget exhausted (malformed structure)",
+            return _failed(resp, attempts, REPAIR_EXHAUSTED_REASON,
                            provider_calls=provider_calls, cost_metadata=spend)
         if ps == PROVIDER_REFUSAL:
             return _failed(resp, attempts, "provider refusal (policy decline)",
