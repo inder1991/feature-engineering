@@ -97,7 +97,10 @@ test.describe('workbench journey — real backend, scripted model, real blockers
     }
 
     // ── 4. Regenerate as the human does: the same objective again, the recognition
-    // panel returns, and this time the UOA proposal gets its one-click YES. ──────────────
+    // panel returns, and this time the UOA proposal gets its one-click YES. The brief
+    // collapsed to its submitted snapshot when the round landed, so the generate path
+    // comes back through the explicit Revise brief control. ────────────────────────────
+    await page.getByRole('button', { name: 'Revise brief' }).click()
     await page.getByRole('button', { name: /generate candidate sets/i }).click()
     await expect(page.getByText(/You're predicting per/)).toBeVisible()
     await page.getByRole('button', { name: 'Yes', exact: true }).click()

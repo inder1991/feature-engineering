@@ -244,7 +244,17 @@ async function registerSelection(count: number) {
   await userEvent.click(screen.getByRole('button', { name: 'Save ideas' }))
 }
 
+// Slice 1: once a brief has been submitted the intake form collapses to the compact submitted
+// brief, so every post-submit interaction with a brief field goes through the explicit Revise
+// brief control. A no-op before the first round (the form is already the page).
+async function reviseBrief() {
+  const revise = screen.queryByRole('button', { name: 'Revise brief' })
+  if (revise) await userEvent.click(revise)
+}
+
 async function openDescribe() {
+  // Path 2 (write definitions myself) is a card in the draft shell, so it comes back with the form.
+  await reviseBrief()
   await userEvent.click(screen.getByRole('button', { name: /write definitions myself/i }))
 }
 
@@ -777,6 +787,7 @@ describe('selection and registration', () => {
     await registerSelection(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
     // Second round returns a candidate with the same LLM-chosen name: it was never registered.
+    await reviseBrief()
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const checkbox = await screen.findByRole('checkbox', { name: 'Select avg_balance' })
     expect(checkbox).not.toBeChecked()
@@ -798,6 +809,9 @@ describe('selection and registration', () => {
     registerFeature.mockImplementation(() => pending.promise)
     featureFreshness.mockResolvedValue(FRESH)
     await renderAndGenerate([IDEA])
+    // The brief form is what carries the generate path and the scope fields, so re-open it: the
+    // lock under test is on the CONTROLS, not on their visibility.
+    await reviseBrief()
     await selectCandidate('avg_balance')
     await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
     // Confirm step: no new round and no scope edit can pull rows out from under the approval.
@@ -870,6 +884,7 @@ describe('scope changes', () => {
   it('editing the goal keeps candidates', async () => {
     await renderAndGenerate([IDEA])
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Prediction goal'), ' next quarter')
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.queryByText(/scope changed/i)).not.toBeInTheDocument()
@@ -909,6 +924,7 @@ describe('scope changes', () => {
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByText(/leaky candidates were rejected/i)).toBeInTheDocument()
     // Candidates were screened against the previous target: any edit voids them.
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Target column'), '2')
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
     expect(screen.queryByText(/leaky candidates were rejected/i)).not.toBeInTheDocument()
@@ -920,6 +936,7 @@ describe('scope changes', () => {
     await selectCandidate('avg_balance')
     await selectCandidate('txn_count')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
     expect(
@@ -933,6 +950,7 @@ describe('scope changes', () => {
     ]))
     expect(await screen.findByText('Temporal set')).toBeInTheDocument()
     expect(screen.getByText('1 rejected')).toBeInTheDocument()
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
     expect(screen.queryByText('1 rejected')).not.toBeInTheDocument()
@@ -1267,6 +1285,7 @@ describe('whole-round feedback', () => {
     })
     await selectCandidate('avg_balance')
     // The goal input is edited after the round: feedback still reruns the ROUND's objective.
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Prediction goal'), ' fast')
     contractConsideredSet.mockResolvedValueOnce(
       considered(singleSetRound([idea('inactivity_days')])))
@@ -1385,6 +1404,7 @@ describe('whole-round feedback', () => {
     // A fresh engine round outranks the in-flight feedback round. Both run through considered-set;
     // the fresh generate's response is queued next and the stale feedback resolves afterward.
     contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([OTHER_IDEA])))
+    await reviseBrief()
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     await act(async () => {
@@ -1405,6 +1425,7 @@ describe('whole-round feedback', () => {
     const pending = deferred<api.ConsideredSetResp>()
     contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Target column'), 'c')
     await act(async () => {
       pending.resolve(considered(singleSetRound([idea('stale_signal')])))
@@ -1424,6 +1445,7 @@ describe('whole-round feedback', () => {
     expect(screen.getByRole('button', {
       name: 'Regenerate with feedback · round 2 of 3',
     })).toBeInTheDocument()
+    await reviseBrief()
     await userEvent.type(screen.getByLabelText('Target column'), 'c')
     expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
@@ -2803,7 +2825,9 @@ describe('Intake target confirmation', () => {
     // no confirm gate on the pin path — recorded server-side without a click
     expect(screen.queryByRole('button', { name: /yes, that's my target/i })).toBeNull()
     expect(contractIntakeTarget).not.toHaveBeenCalled()
-    // the pin threads into the manual target field for the considered-set request
+    // the pin threads into the manual target field for the considered-set request (which the
+    // submitted-brief shell now keeps behind Revise brief)
+    await reviseBrief()
     expect(screen.getByLabelText('Target column')).toHaveValue('public.labels.churned')
   })
 
@@ -3040,5 +3064,228 @@ describe('D3: operation-class grouping, buildability, and the deep link', () => 
     const link = screen.getByText('needs confirmation →') as HTMLAnchorElement
     expect(link.getAttribute('href')).toBe(
       '#asset?source=cib&object_ref=public.accounts.customer_id')
+  })
+})
+
+// ── Slice 1: the phase-aware post-submit workspace ────────────────────────────────────────────
+//
+// The screen used to render the full intake form above every result, with the hypothesis input
+// still editable beside output generated from earlier text. These pin the corrected hierarchy:
+// ONE derived phase drives the shell, the submitted brief is a snapshot and not an input, and the
+// results own the first viewport.
+
+describe('post-submit workspace shell', () => {
+  function phaseOf(container: HTMLElement): string | null {
+    return container.querySelector('section[data-phase]')?.getAttribute('data-phase') ?? null
+  }
+
+  // A v2 response whose per-option binding states are the ONLY source of the composition strip.
+  function withBindingStates(
+    cs: api.ConsideredSetResp,
+    states: string[],
+  ): api.ConsideredSetResp {
+    return {
+      ...cs,
+      contract_version: 2,
+      recommended_options: states.map((binding_state, i) => ({
+        option_id: `opt_${i}`, name: null, recipe_id: `recipe_${i}`, binding_state,
+        allowed_actions: ['save_idea'], blocked_actions: {},
+      })),
+    }
+  }
+
+  it('draft is the intake form and nothing else: no brief card, no results, no composition', () => {
+    const { container } = render(<WorkbenchScreen />)
+    expect(phaseOf(container)).toBe('draft')
+    expect(screen.getByLabelText('Hypothesis')).toBeInTheDocument()
+    expect(screen.getByLabelText('Prediction goal')).toBeInTheDocument()
+    expect(screen.queryByText('Your submitted brief')).toBeNull()
+    expect(screen.queryByRole('heading', { name: /proposed feature/i })).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'What this run returned' })).toBeNull()
+    expect(screen.queryByText(/no grounded candidates/i)).toBeNull()
+  })
+
+  it('a landed round replaces the intake form with the compact submitted brief', async () => {
+    const { container } = render(<WorkbenchScreen />)
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(phaseOf(container)).toBe('compare')
+    // The whole intake form is gone — not merely visually shrunk.
+    expect(screen.queryByLabelText('Hypothesis')).toBeNull()
+    expect(screen.queryByLabelText('Prediction goal')).toBeNull()
+    expect(screen.queryByLabelText('Catalog source')).toBeNull()
+    expect(screen.queryByRole('button', { name: /generate candidate sets/i })).toBeNull()
+    // and the compact brief states what the run was submitted with.
+    expect(screen.getByText('Your submitted brief')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    expect(screen.getByText('Goal: predict churn')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Revise brief' })).toBeInTheDocument()
+  })
+
+  // THE CRITICAL FINDING, pinned. A user must never be able to read results beside request text
+  // that did not produce them.
+  it('the brief quotes the ROUND snapshot and does not follow the draft field', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Revise brief' }))
+    await userEvent.clear(screen.getByLabelText('Hypothesis'))
+    await userEvent.type(screen.getByLabelText('Hypothesis'), 'dormant cards precede attrition')
+    // Cancel: back to the run exactly as it was.
+    await userEvent.click(screen.getByRole('button', { name: 'Keep submitted brief' }))
+
+    // The results are still the old round's, and the brief beside them still says what produced
+    // them — the edited draft text is nowhere near the submitted brief.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    expect(screen.queryByText('dormant cards precede attrition')).toBeNull()
+    // and nothing silently reverted the human's typing either.
+    await userEvent.click(screen.getByRole('button', { name: 'Revise brief' }))
+    expect(screen.getByLabelText('Hypothesis')).toHaveValue('dormant cards precede attrition')
+  })
+
+  it('a scope edit voids the round and returns the screen to its draft shell', async () => {
+    const { container } = render(<WorkbenchScreen />)
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await reviseBrief()
+    await userEvent.type(screen.getByLabelText('Target column'), 'public.labels.churned')
+    // The candidates that brief produced are gone, so the brief that describes them goes too.
+    expect(screen.queryByText('Your submitted brief')).toBeNull()
+    expect(phaseOf(container)).toBe('draft')
+    expect(screen.getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
+  })
+
+  it('composition counts the binding states THIS run returned, and invents nothing', async () => {
+    contractConsideredSet.mockResolvedValueOnce(withBindingStates(
+      considered(singleSetRound([IDEA, OTHER_IDEA])),
+      ['bound', 'bound', 'ambiguous', 'missing', 'blocked'],
+    ))
+    await renderAndGenerateRaw()
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'What this run returned' })).toBeInTheDocument()
+    // One assertion over the whole tally: order, counts and labels, from the wire alone.
+    expect(screen.getByRole('img', {
+      name: '2 bound, 1 ambiguous, 1 missing operands, 1 structurally blocked',
+    })).toBeInTheDocument()
+    // Each state says what it MEANS — an unconfirmed proposal is work, never a failure.
+    expect(screen.getByText(/every operand resolved/)).toBeInTheDocument()
+    expect(screen.getByText(/needs confirming before these can bind/)).toBeInTheDocument()
+    expect(screen.getByText(/refused by a named rule, not a gap/)).toBeInTheDocument()
+    // The concept's illustrative figures are NOT the product.
+    expect(screen.queryByText('787')).toBeNull()
+    expect(screen.queryByText('917')).toBeNull()
+  })
+
+  it('an unknown binding state renders as words and still counts toward the total', async () => {
+    contractConsideredSet.mockResolvedValueOnce(withBindingStates(
+      considered(singleSetRound([IDEA])), ['bound', 'quarantined_by_policy'],
+    ))
+    await renderAndGenerateRaw()
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('img', {
+      name: '1 bound, 1 quarantined by policy',
+    })).toBeInTheDocument()
+  })
+
+  it('no composition strip when the response carried no option binding states', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'What this run returned' })).toBeNull()
+  })
+
+  it('a landed round moves focus to the stage heading and announces the counts', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    expect(await screen.findByText('Temporal set')).toBeInTheDocument()
+    const heading = screen.getByRole('heading', { name: 'Compare and refine' })
+    expect(heading).toHaveAttribute('tabindex', '-1')
+    expect(heading).toHaveFocus()
+    expect(screen.getByText('Results ready: 2 sets, 4 candidates.')).toBeInTheDocument()
+  })
+
+  it('announces without stealing the caret while the human is typing', async () => {
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    // The human goes back to the hypothesis field while the round is still in flight.
+    const field = screen.getByLabelText('Hypothesis')
+    act(() => { field.focus() })
+    await act(async () => {
+      pending.resolve(considered(singleSetRound([IDEA])))
+    })
+    // Their half-written revision is not deleted and their caret is not moved…
+    expect(screen.getByLabelText('Hypothesis')).toHaveFocus()
+    expect(screen.queryByRole('heading', { name: 'Compare and refine' })).toBeNull()
+    // …and the round is still announced, and still marked as belonging to the submitted brief.
+    expect(screen.getByText('Results ready: 1 set, 1 candidate.')).toBeInTheDocument()
+    expect(screen.getByText(/results below were generated for the submitted brief/i))
+      .toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+  })
+
+  it('empty: reports the absence and the zero it measured, inventing nothing', async () => {
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([])))
+    const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
+    expect(phaseOf(container)).toBe('empty')
+    // The submitted brief still says what was asked; unset scope reads "not set", never a guess.
+    expect(screen.getByText(HYPOTHESIS)).toBeInTheDocument()
+    expect(screen.getByText('catalog · not set')).toBeInTheDocument()
+    expect(screen.getByText('target · not set')).toBeInTheDocument()
+    // The engine-output card states the measured zero, and no composition is drawn over nothing.
+    expect(screen.getByText('0 candidates')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'What this run returned' })).toBeNull()
+    expect(screen.getByText('No candidates were returned for this brief.')).toBeInTheDocument()
+  })
+
+  it('error: the notice is the page, and the form the human filled in stays open to retry', async () => {
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/ai assist is not configured/i)
+    expect(phaseOf(container)).toBe('error')
+    // No round was produced, so there is no snapshot to show: the screen does NOT invent a brief
+    // card for a run that never landed.
+    expect(screen.queryByText('Your submitted brief')).toBeNull()
+    // The typed brief is still there, one click from a retry.
+    expect(screen.getByLabelText('Hypothesis')).toHaveValue(HYPOTHESIS)
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
+  })
+
+  it('scope review owns the shell, and the output card says what is not there yet', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue({
+      intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+      candidates: [{
+        use_case_id: 'customer.churn', display_name: 'Customer churn',
+        relationship: 'primary', confidence: 'high', evidence_spans: ['churn'],
+      }],
+      modelling_contexts: [], target_entity: null, warnings: [],
+      recognition_quality: null, ambiguity_note: null,
+    })
+    const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByRole('heading', { name: /confirm the scope/i })).toBeInTheDocument()
+    expect(phaseOf(container)).toBe('scope_review')
+    expect(screen.getByRole('heading', { name: 'Confirm scope' })).toBeInTheDocument()
+    expect(screen.getByText('No candidates yet')).toBeInTheDocument()
+    expect(screen.getByText('The run waits on your scope confirmation.')).toBeInTheDocument()
   })
 })

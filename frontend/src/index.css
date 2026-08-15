@@ -1469,6 +1469,258 @@ section > h2:first-child {
   }
 }
 
+/* ---------------------------------------------------------------- run deck (post-submit shell)
+   Three cards that replace the intake form once a brief has been submitted: what you asked (from
+   the round snapshot, never editable here), what came back, and the one next act. Hairlines
+   between cells, no new tokens. */
+
+.run-deck {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(190px, 0.75fr) minmax(230px, 0.9fr);
+  gap: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.deck-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 20px;
+  min-width: 0;
+}
+
+.deck-card + .deck-card {
+  border-left: 1px solid var(--line);
+}
+
+/* the submitted brief, quoted: the identity of the run, not an input */
+.deck-quote {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.deck-quote::before {
+  content: '\201C';
+}
+
+.deck-quote::after {
+  content: '\201D';
+}
+
+.deck-objective {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.deck-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.deck-chips .badge {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.deck-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.deck-metric {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+}
+
+/* an absence is not a measurement: it does not get the big numeral treatment */
+.deck-metric--absent {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  letter-spacing: normal;
+  color: var(--ink-soft);
+}
+
+.deck-metric-label {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.deck-detail {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.deck-detail li::before {
+  content: '·';
+  padding-right: 6px;
+  color: var(--accent);
+}
+
+.deck-card--action {
+  background: var(--accent-soft);
+}
+
+.deck-stage {
+  margin: 0;
+  font-size: 17px;
+}
+
+.deck-stage:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.deck-next {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+@media (max-width: 900px) {
+  .run-deck {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* stacked: the current stage leads, exactly as the review's narrow-screen rule asks */
+  .deck-card--action {
+    order: -1;
+  }
+
+  .deck-card + .deck-card {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+}
+
+/* the revise banner: says what the visible results belong to, and offers the cancel arm */
+.brief-revising {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+/* -------------------------------------------------------------- composition of a landed round
+   Counted in the client from the per-option binding_state on the wire. Colour is never the only
+   carrier: every segment has a labelled, counted row beneath it. */
+
+.composition {
+  margin-block: 12px;
+}
+
+.comp-bar {
+  display: flex;
+  height: 8px;
+  margin-top: 12px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.comp-seg {
+  display: block;
+  min-width: 2px;
+  background: var(--line-strong);
+}
+
+.comp-seg[data-state='bound'] {
+  background: var(--ok-solid);
+}
+
+.comp-seg[data-state='ambiguous'] {
+  background: var(--warn-solid);
+}
+
+.comp-seg[data-state='missing'] {
+  background: var(--line-strong);
+}
+
+.comp-seg[data-state='blocked'] {
+  background: var(--danger-solid);
+}
+
+.comp-key {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.comp-key li {
+  display: grid;
+  grid-template-columns: 10px 3.5em minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.comp-key strong {
+  color: var(--ink);
+}
+
+.comp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--line-strong);
+  transform: translateY(-1px);
+}
+
+.comp-dot[data-state='bound'] {
+  background: var(--ok-solid);
+}
+
+.comp-dot[data-state='ambiguous'] {
+  background: var(--warn-solid);
+}
+
+.comp-dot[data-state='missing'] {
+  background: var(--line-strong);
+}
+
+.comp-dot[data-state='blocked'] {
+  background: var(--danger-solid);
+}
+
+.comp-n {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--ink);
+}
+
 /* ---------------------------------------------------------------- workbench feedback (appended)
    Phase 3: the whole-round feedback panel (regenerate under guidance, pins kept) and the
    per-candidate refine box with its recorded revision diff. Existing tokens only; composes the

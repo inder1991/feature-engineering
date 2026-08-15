@@ -220,6 +220,149 @@ function dispositionReason(d: RecipeDisposition): string {
   return codes.length > 0 ? codes.join(', ') : d.final_disposition.replace(/_/g, ' ')
 }
 
+// ── Slice 1: ONE derived view phase, and the shell renders from it ───────────────────────────────
+//
+// The screen used to decide visibility panel by panel, so the state strip could say "Compare" while
+// the page still led with the intake form and pushed the results below the fold. There is now a
+// single discriminated value. It is DERIVED — no new source of truth, no phase state to keep in
+// sync — and it owns the SHELL (which header renders, what the stage heading says, what the next
+// action is). Panel CONTENT stays data-driven: rejections render because there are rejections, not
+// because of a phase.
+type WorkbenchPhase =
+  | 'draft'         // no brief has landed: the intake form is the page
+  | 'planning'      // a run is in flight and nothing is on screen to decide about yet
+  | 'scope_review'  // a recognition is waiting on the human's Gate #1 confirmation
+  | 'compare'       // candidates are on screen and nothing is picked
+  | 'approve'       // candidates are picked and the tray's confirm is the next act
+  | 'complete'      // something was registered or governed and nothing is pending
+  | 'empty'         // a round landed and returned no candidates
+  | 'error'         // a run failed; the notice is the whole story
+
+interface PhaseInput {
+  // Recognition OUTRANKS `generating` on purpose: while the human's confirmed scope is being
+  // grounded the recognition panel is still the thing on screen, so the phase must not flip to
+  // planning and pull the panel out from under the click that started it.
+  awaitingScope: boolean
+  generating: boolean
+  candidateCount: number
+  // A round landed and returned zero candidates (distinct from "no round has run", which is null).
+  roundReturnedNothing: boolean
+  selectedCount: number
+  settledCount: number
+  hasNotice: boolean
+}
+
+function derivePhase(s: PhaseInput): WorkbenchPhase {
+  if (s.awaitingScope) return 'scope_review'
+  if (s.generating) return 'planning'
+  if (s.candidateCount > 0) {
+    if (s.selectedCount > 0) return 'approve'
+    return s.settledCount > 0 ? 'complete' : 'compare'
+  }
+  if (s.roundReturnedNothing) return 'empty'
+  return s.hasNotice ? 'error' : 'draft'
+}
+
+// The stage heading + the one sentence under it. Facts and the next act, never instruction (the
+// draft shell keeps the teaching copy). Phrased in the app's own vocabulary: candidates are
+// generated, selections are picked, registration saves, governance signs.
+//
+// `draft` and `error` are the two phases that render the intake FORM rather than the deck, so
+// their entries never reach the screen today. They stay because the map is total over the phase
+// union — a later slice that gives the draft shell its own deck inherits copy, not a hole.
+const STAGE_COPY: Record<WorkbenchPhase, { title: string; next: string }> = {
+  draft: {
+    title: 'State the goal',
+    next: 'Describe what you are predicting, then generate candidates or write definitions yourself.',
+  },
+  planning: {
+    title: 'Planning over the catalog',
+    next: 'The engine is grounding recipes against this catalog. Nothing is saved by this step.',
+  },
+  // "Confirm scope" is the review's own stage verb, and it is deliberately NOT the panel's own
+  // heading ("Confirm the scope"): one phase owns the page headline, and two identical <h2>s would
+  // make the deck a second title for the same thing.
+  scope_review: {
+    title: 'Confirm scope',
+    next: 'Nothing generates until you confirm, adjust, or broaden the recognised scope below.',
+  },
+  compare: {
+    title: 'Compare and refine',
+    next: 'Take a set, pick candidates across sets, or tell the engine what to change.',
+  },
+  approve: {
+    title: 'Ready for your approval',
+    next: 'Approve and register writes your selected definitions, under your name.',
+  },
+  // Deliberately does NOT name the act: a round can settle by registration, by governance, or by
+  // both, and the summary must not claim the one that did not happen. The row chips carry the
+  // precise word ("Registered feat_01", the contract id) where it is true of that item.
+  complete: {
+    title: 'Nothing waiting on you',
+    next: 'Your saved items are marked in the list. Keep picking from this round, or revise the '
+      + 'brief to generate a new one.',
+  },
+  empty: {
+    title: 'No candidates for this brief',
+    next: 'Nothing grounded against this catalog. Revise the brief and generate again.',
+  },
+  error: {
+    title: 'The run did not complete',
+    next: 'The notice above is what the platform reported. Adjust the brief and try again.',
+  },
+}
+
+// ── The composition of THIS run ─────────────────────────────────────────────────────────────────
+//
+// Counted in the FRONTEND from the per-option `binding_state` the server already sends
+// (recommended_options + actionable_options). No number here is authored: a run that returned four
+// options describes four options. The labels say what each state MEANS, because a bare count of
+// "ambiguous" reads as a failure when it is a piece of confirmation work nobody has done yet.
+const BINDING_STATE_ORDER = ['bound', 'ambiguous', 'missing', 'blocked'] as const
+const BINDING_STATE_TEXT: Record<string, string> = {
+  bound: 'every operand resolved — ready to compare',
+  ambiguous: 'a proposed meaning needs confirming before these can bind',
+  missing: 'this catalog holds no column the recipe needs',
+  blocked: 'refused by a named rule, not a gap in your data',
+}
+const BINDING_STATE_LABEL: Record<string, string> = {
+  bound: 'Bound',
+  ambiguous: 'Ambiguous',
+  missing: 'Missing operands',
+  blocked: 'Structurally blocked',
+}
+
+interface CompositionRow {
+  state: string
+  label: string
+  meaning: string | null
+  count: number
+}
+
+// Tally binding states in the authored order first, then any state this client does not know —
+// an unknown state from a newer backend renders as words with NO invented meaning, never crashes
+// and never silently drops an option from the total.
+function composeBindingStates(entries: OptionActionsEntry[]): CompositionRow[] {
+  const counts = new Map<string, number>()
+  for (const entry of entries) {
+    counts.set(entry.binding_state, (counts.get(entry.binding_state) ?? 0) + 1)
+  }
+  const rows: CompositionRow[] = []
+  for (const state of BINDING_STATE_ORDER) {
+    const count = counts.get(state)
+    if (count === undefined) continue
+    counts.delete(state)
+    rows.push({
+      state, label: BINDING_STATE_LABEL[state] ?? humanizeCode(state),
+      meaning: BINDING_STATE_TEXT[state] ?? null, count,
+    })
+  }
+  for (const [state, count] of [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    rows.push({ state, label: humanizeCode(state), meaning: null, count })
+  }
+  return rows
+}
+
 const HELP_STYLE = { fontSize: 12 } as const
 // Solid ok chip (index.css has no fresh badge class; mirrors .badge.stale's solid treatment).
 const OK_SOLID_CHIP_STYLE = {
@@ -895,6 +1038,14 @@ export function WorkbenchScreen() {
   // consumed, the recorded strips, and the in-flight flag.
   const [roundHypothesis, setRoundHypothesis] = useState('')
   const [roundObjective, setRoundObjective] = useState('')
+  // Slice 1: the compact submitted brief replaces the intake form once a round's snapshot exists.
+  // `briefRevising` is the human's explicit re-open of the draft form (the Revise brief control) —
+  // the full drawer with its own cancel/replace policy is Slice 3. `roundToken` counts LANDED
+  // engine rounds and nothing else: it is the one signal the focus + announcement effect fires on,
+  // so a selection, a registration or an approved refine never re-announces a round.
+  const [briefRevising, setBriefRevising] = useState(false)
+  const [roundToken, setRoundToken] = useState(0)
+  const [liveMessage, setLiveMessage] = useState('')
   const [setFbInstruction, setSetFbInstruction] = useState('')
   const [setFbRounds, setSetFbRounds] = useState(0)
   const [setFbRecords, setSetFbRecords] = useState<SetFeedbackRecord[]>([])
@@ -921,6 +1072,14 @@ export function WorkbenchScreen() {
   // revision / Revert to original unmount the button that held focus, so without an explicit
   // move keyboard focus falls back to <body>.
   const focusTarget = useRef<string | null>(null)
+  // The active stage's <h2>: focus moves here when a round lands, so a keyboard or screen-reader
+  // user is put at the new work instead of left on the submit control they pressed.
+  const stageHeadingRef = useRef<HTMLHeadingElement>(null)
+  // Is the human's caret in one of the brief's TEXT fields right now? Read at the moment a round
+  // lands, before React has touched the DOM: if they are mid-sentence the form must not collapse
+  // under them and take the half-typed revision with it. Buttons inside the panel (Generate, the
+  // path cards) deliberately do NOT count — clicking Generate is how a round starts.
+  const briefTextFocused = useRef(false)
   // Latest-state mirrors (assigned every render) so async arrivals decide against CURRENT
   // state, not their submit-time closure: feedback pins read the selection as it stands when
   // the response lands, and a refine result checks whether its row registered meanwhile.
@@ -1055,6 +1214,56 @@ export function WorkbenchScreen() {
     : selectedCount > 0 || anyRegistered ? 'done' : 'active'
   const gate4: GateState = selectedCount > 0 ? 'active' : anyRegistered ? 'done' : 'todo'
 
+  // ---- Slice 1: the derived view phase, and the shell that renders from it ----
+  // A brief has been SUBMITTED once the round snapshot exists — the exact text the engine was
+  // given. That snapshot is written when a round lands (recognition, or a considered set) and
+  // dropped by any scope edit that voids the round, so its presence and the results on screen can
+  // never disagree. The draft `hypothesis` / `goal` fields deliberately do NOT feed this: they are
+  // the next brief, not this one.
+  const briefSubmitted = roundHypothesis.trim() !== ''
+  const phase = derivePhase({
+    awaitingScope: confirmationUi && recognition !== null,
+    generating,
+    candidateCount: allCandidates.length,
+    roundReturnedNothing: generated !== null && generated.length === 0,
+    selectedCount,
+    settledCount: allCandidates.filter(
+      c => registered[c.key] !== undefined || governed[c.key] !== undefined).length,
+    hasNotice: notice !== '',
+  })
+  // The full intake form belongs to the draft shell. It comes back for exactly three reasons: no
+  // brief has been submitted yet, the human asked to revise, or the run failed and the fastest
+  // honest recovery is the form they already filled in (no snapshot describes a failed run, so
+  // there is nothing to collapse to).
+  const formOpen = !briefSubmitted || briefRevising || phase === 'error'
+  const stage = STAGE_COPY[phase]
+  // What this run's options are made of, counted from the wire. Empty for legacy/free-form rounds
+  // that carry no option-actions entries — then the strip does not render at all rather than
+  // implying a composition nobody measured.
+  const optionEntries = Object.values(optionActions)
+  const composition = composeBindingStates(optionEntries)
+
+  // Generation completion is a deliberate transition: focus moves to the active stage heading so a
+  // keyboard user lands on the new work, and the count change is announced politely. Fires on
+  // `roundToken` alone — one event per LANDED round, never on a selection or a re-render. Focus is
+  // NOT stolen while the human is typing (the review's constraint: no forced scroll mid-keystroke);
+  // the announcement still goes out, because that costs the typist nothing.
+  useEffect(() => {
+    if (roundToken === 0) return
+    const count = generated?.length ?? 0
+    const sets = setLenses.length
+    setLiveMessage(
+      count === 0
+        ? 'No candidates were returned for this brief.'
+        : `Results ready: ${sets} ${sets === 1 ? 'set' : 'sets'}, `
+          + `${count} ${count === 1 ? 'candidate' : 'candidates'}.`)
+    const active = document.activeElement
+    const typing = active instanceof HTMLElement
+      && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)
+    if (!typing) stageHeadingRef.current?.focus()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roundToken])
+
   function fail(err: unknown) {
     setNotice(
       err instanceof ApiError && err.status === 503
@@ -1074,6 +1283,17 @@ export function WorkbenchScreen() {
     // Drop any stale governance intent: the candidates it governed no longer exist.
     setIntentId(null)
     setGenerationRunId(null)
+  }
+
+  // A scope edit voids the round, so it voids the round's IDENTITY too: the submitted brief
+  // described a run whose candidates no longer exist, and leaving the card up would be the same
+  // "results beside text that did not produce them" defect this slice exists to remove. Dropping
+  // the snapshot returns the screen to its draft shell, which is exactly what the human now needs.
+  // Not folded into clearFeedback(): applyConsideredRound calls that AFTER writing the snapshot.
+  function clearRoundBrief() {
+    setRoundHypothesis('')
+    setRoundObjective('')
+    setBriefRevising(false)
   }
 
   // Resets both feedback channels: round counters, recorded strips, typed instructions, and
@@ -1121,6 +1341,7 @@ export function WorkbenchScreen() {
     setConfirmingGovern(false)
     clearSets()
     clearFeedback()
+    clearRoundBrief()
     if (hadCandidates) setScopeChanged(true)
   }
 
@@ -1137,6 +1358,7 @@ export function WorkbenchScreen() {
     setConfirmingGovern(false)
     clearSets()
     clearFeedback()
+    clearRoundBrief()
     if (hadGenerated) setScopeChanged(true)
   }
 
@@ -1205,6 +1427,12 @@ export function WorkbenchScreen() {
     // whole-round feedback reruns these even if the inputs are edited later.
     setRoundHypothesis(roundHyp)
     setRoundObjective(roundObj)
+    // The round landed: the submitted brief is authoritative again, so a draft form the human
+    // re-opened to revise closes — UNLESS their caret is in it, in which case collapsing would
+    // delete a revision they are in the middle of writing. It stays open with its "these results
+    // came from the submitted brief" banner, which is the honest read of that moment.
+    setBriefRevising(briefTextFocused.current)
+    setRoundToken(token => token + 1)
     if (resetFeedback) clearFeedback()
   }
 
@@ -1277,6 +1505,9 @@ export function WorkbenchScreen() {
       if (seq !== generateSeq.current) return
       setRoundHypothesis(hypothesis.trim())
       setRoundObjective(objective)
+      // The snapshot is taken: from here the brief is what the RUN was submitted with, and a
+      // re-opened draft form closes back down to it (unless the human is mid-keystroke in it).
+      setBriefRevising(briefTextFocused.current)
       setRecognition(rec)
       setRecognitionTransition(null)
       setScopePrimary(rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
@@ -1608,6 +1839,8 @@ export function WorkbenchScreen() {
       // Kept candidates keep their consumed refine rounds; replaced ones drop theirs.
       setRefines(prevMap => Object.fromEntries(
         Object.entries(prevMap).filter(([key]) => pinnedKeys.has(key))))
+      // A feedback round is a landed round too — it replaces what is on screen, so it announces.
+      setRoundToken(token => token + 1)
     } catch (err) {
       if (seq !== generateSeq.current) return
       // The round never ran: candidates stay, no round is consumed.
@@ -1942,7 +2175,8 @@ export function WorkbenchScreen() {
   return (
     // Carry the current round's governing intent on the DOM so a later task can govern these
     // candidates into a signed contract; undefined until the first successful generate.
-    <section data-intent-id={intentId ?? undefined}>
+    // `data-phase` publishes the one derived view phase the shell renders from.
+    <section data-intent-id={intentId ?? undefined} data-phase={phase}>
       <div className="gates" role="list" aria-label="Where you are in the loop">
         {/* E4 cutover: cells 1 and 2 name what the ONE engine actually does. Cell 1 folds in the
             two human steps that sit between the brief and generation — the scope confirmation
@@ -1974,127 +2208,248 @@ export function WorkbenchScreen() {
           sub="Nothing is saved or governed without your click, under your name."
         />
       </div>
-      <div className="panel">
-        {notice && (
-          <div role="alert" className="callout callout--warn">
-            <CalloutGlyph d={WARN_GLYPH} />
-            <div className="callout-body">
-              <p>{notice}</p>
-            </div>
+      {/* The blocking notice is a platform fact about the deployment, not a property of the intake
+          form it used to live inside: it renders above whichever shell is showing. */}
+      {notice && (
+        <div role="alert" className="callout callout--warn">
+          <CalloutGlyph d={WARN_GLYPH} />
+          <div className="callout-body">
+            <p>{notice}</p>
           </div>
-        )}
-        <form onSubmit={generate} style={{ display: 'grid', gap: 16, margin: 0 }}>
-          <div className="field" style={{ maxWidth: 640 }}>
-            <label htmlFor="wb-hypothesis">Hypothesis</label>
-            <input
-              id="wb-hypothesis"
-              value={hypothesis}
-              onChange={e => setHypothesis(e.target.value)}
-              placeholder="e.g. customers whose balance is draining are about to leave"
-              style={{ height: 40 }}
-            />
-          </div>
-          <div className="field" style={{ maxWidth: 640 }}>
-            <label htmlFor="wb-goal">Prediction goal</label>
-            <input
-              id="wb-goal"
-              value={goal}
-              onChange={e => setGoal(e.target.value)}
-              placeholder="e.g. predict customer churn in the next 90 days"
-              style={{ height: 40 }}
-            />
-            <div
-              className="hint"
-              style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}
-            >
-              <span>
-                Both paths use it: the engine generates against it, and written definitions attach
-                to it.
+        </div>
+      )}
+
+      {/* ── The post-submit run deck ──────────────────────────────────────────────────────────
+          Replaces the intake form once a round's snapshot exists. Three cards answer the four
+          questions the old page made the human scroll for: what did I ask, what came back, and
+          what do I do now. The brief is quoted from the ROUND SNAPSHOT and is not editable here —
+          that is the whole point. Editing the live hypothesis input beside results generated from
+          different text was the review's Critical finding, and the only way back to the fields is
+          the explicit Revise brief control. */}
+      {!formOpen && (
+        <div className="panel run-deck">
+          <article className="deck-card">
+            <p className="micro-label">Your submitted brief</p>
+            <blockquote className="deck-quote">{roundHypothesis}</blockquote>
+            <p className="deck-objective">
+              Goal: {roundObjective.trim() !== '' ? roundObjective : 'not set'}
+            </p>
+            <div className="deck-chips">
+              <span className="badge mono">
+                catalog · {source.trim() !== '' ? source.trim() : 'not set'}
               </span>
-              <span>Try</span>
-              <button type="button" className="role-chip" onClick={() => setGoal(EXAMPLE_GOAL)}>
-                {EXAMPLE_GOAL}
+              {/* `screenedTarget` is the target AS THE ROUND WAS SCREENED; before a considered set
+                  lands (scope review) there is no such snapshot yet, so the live field is the only
+                  truth there — and a target edit voids the round, so the two cannot drift. */}
+              <span className="badge mono" title={(screenedTarget ?? target.trim()) || undefined}>
+                target · {screenedTarget ?? (target.trim() !== '' ? target.trim() : 'not set')}
+              </span>
+            </div>
+            <div className="deck-foot">
+              <span className="micro-label">Submitted snapshot</span>
+              {/* Not a disclosure: this control is replaced by the form it opens (and by that
+                  form's "Keep submitted brief" cancel), so it never owns an expanded state. */}
+              <button type="button" className="btn" onClick={() => setBriefRevising(true)}>
+                Revise brief
               </button>
             </div>
-          </div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
-            <div className="field" style={{ flex: '1 1 220px' }}>
-              <label htmlFor="wb-source">Catalog source</label>
-              {/* Scope edits clear candidates, so both lock under feedbackLocked: a row
-                  must not leave view while its registration is being written. */}
-              <input
-                id="wb-source"
-                value={source}
-                onChange={e => changeSource(e.target.value)}
-                placeholder="e.g. deposits"
-                disabled={feedbackLocked}
-              />
-              <p className="hint" style={HELP_STYLE}>
-                Required. The catalog the engine plans over: generation reads one catalog's
-                governed meaning. Cross-catalog generation returns in a later release.
+          </article>
+
+          <article className="deck-card">
+            <p className="micro-label">Engine output</p>
+            {generated === null ? (
+              <>
+                {/* Honest absence: no round has produced candidates for this brief yet. Structure
+                    stays, the number does not get invented. */}
+                <span className="deck-metric deck-metric--absent">No candidates yet</span>
+                <span className="deck-metric-label">
+                  {phase === 'scope_review'
+                    ? 'The run waits on your scope confirmation.'
+                    : 'The engine has not returned a round for this brief.'}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="deck-metric tabular-nums">
+                  {generated.length} {generated.length === 1 ? 'candidate' : 'candidates'}
+                </span>
+                <span className="deck-metric-label tabular-nums">
+                  {setLenses.length} {setLenses.length === 1 ? 'set' : 'sets'}
+                  {selectedCount > 0 ? ` · ${selectedCount} selected` : ''}
+                </span>
+              </>
+            )}
+            <ul className="deck-detail">
+              {screenedTarget !== null && <li>Screened against {screenedTarget}</li>}
+              {rejections.length > 0 && (
+                <li className="tabular-nums">
+                  {rejections.length} {rejections.length === 1 ? 'rejection' : 'rejections'} listed
+                  below
+                </li>
+              )}
+              {/* Says a recommendation EXISTS; the advisory pick and its caveat stay together
+                  where the sets are compared, never summarised into a verdict up here. */}
+              {recommendation !== null && <li>Recommendation included</li>}
+            </ul>
+          </article>
+
+          <article className="deck-card deck-card--action">
+            <p className="micro-label">Your next action</p>
+            {/* The focus target for a landed round, and the page's one stage headline. */}
+            <h2 id="wb-stage-heading" tabIndex={-1} ref={stageHeadingRef} className="deck-stage">
+              {stage.title}
+            </h2>
+            <p className="deck-next">{stage.next}</p>
+          </article>
+        </div>
+      )}
+
+      {/* Polite announcement of a landed round. Deliberately NOT role="status": the screen already
+          has status regions whose identity tests and users rely on. */}
+      <div aria-live="polite" className="visually-hidden">{liveMessage}</div>
+
+      {formOpen && (
+        <div
+          className="panel"
+          id="wb-brief-form"
+          onFocusCapture={e => {
+            const el = e.target as HTMLElement
+            briefTextFocused.current = el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+          }}
+          onBlurCapture={() => { briefTextFocused.current = false }}
+        >
+          {briefSubmitted && (
+            <div className="brief-revising">
+              <p className="hint" style={{ margin: 0 }}>
+                Revising the brief. The results below were generated for the submitted brief and are
+                unchanged until a new round lands.
               </p>
+              {/* The review's rule: revising has two explicit outcomes and neither is silent. This
+                  is the Cancel arm — it returns to the run exactly as it was. The other arm is
+                  Generate, already in the form. (The populated drawer is Slice 3.) */}
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setBriefRevising(false)}
+              >
+                Keep submitted brief
+              </button>
             </div>
-            <div className="field" style={{ flex: '1 1 220px' }}>
-              <label htmlFor="wb-target">Target column</label>
+          )}
+          <form onSubmit={generate} style={{ display: 'grid', gap: 16, margin: 0 }}>
+            <div className="field" style={{ maxWidth: 640 }}>
+              <label htmlFor="wb-hypothesis">Hypothesis</label>
               <input
-                id="wb-target"
-                value={target}
-                onChange={e => changeTarget(e.target.value)}
-                placeholder="e.g. public.labels.churned"
-                disabled={feedbackLocked}
+                id="wb-hypothesis"
+                value={hypothesis}
+                onChange={e => setHypothesis(e.target.value)}
+                placeholder="e.g. customers whose balance is draining are about to leave"
+                style={{ height: 40 }}
               />
-              <p className="hint" style={HELP_STYLE}>
-                What you are predicting. Candidates are screened against it server-side, so leaky
-                features never reach you.
-              </p>
             </div>
-          </div>
-          <div className="paths">
-            <button
-              type="submit"
-              className="path path-generate"
-              disabled={!hypothesis.trim() || !goal.trim() || generating || feedbackLocked}
-            >
-              <span className="k">Path 1 · The engine</span>
-              <span className="t">
-                <PathGlyph>
-                  <circle cx="8" cy="8" r="6.2" />
-                  <path d="M8 5v6M5 8h6" />
-                </PathGlyph>
-                {generating ? 'Generating' : 'Generate candidate sets'}
-              </span>
-              <span className="d">
-                Governed recipes and model intents planned over this catalog's confirmed meaning,
-                grouped by operation class — blockers and their next steps named, never hidden.
-              </span>
-            </button>
-            <button
-              type="button"
-              className="path path-describe"
-              aria-pressed={describeOpen}
-              aria-controls="wb-describe-panel"
-              onClick={() => setDescribeOpen(open => !open)}
-            >
-              <span className="k">Path 2 · Your definitions</span>
-              <span className="t">
-                <PathGlyph>
-                  <path d="M3 13h10M4 10.5 10.8 3.7a1.4 1.4 0 0 1 2 2L6 12.5l-2.8.8z" />
-                </PathGlyph>
-                Write definitions myself
-              </span>
-              <span className="d">
-                One definition per line; each becomes a draft candidate with its real join path,
-                drafted together.
-              </span>
-            </button>
-          </div>
-        </form>
-      </div>
+            <div className="field" style={{ maxWidth: 640 }}>
+              <label htmlFor="wb-goal">Prediction goal</label>
+              <input
+                id="wb-goal"
+                value={goal}
+                onChange={e => setGoal(e.target.value)}
+                placeholder="e.g. predict customer churn in the next 90 days"
+                style={{ height: 40 }}
+              />
+              <div
+                className="hint"
+                style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}
+              >
+                <span>
+                  Both paths use it: the engine generates against it, and written definitions attach
+                  to it.
+                </span>
+                <span>Try</span>
+                <button type="button" className="role-chip" onClick={() => setGoal(EXAMPLE_GOAL)}>
+                  {EXAMPLE_GOAL}
+                </button>
+              </div>
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
+              <div className="field" style={{ flex: '1 1 220px' }}>
+                <label htmlFor="wb-source">Catalog source</label>
+                {/* Scope edits clear candidates, so both lock under feedbackLocked: a row
+                    must not leave view while its registration is being written. */}
+                <input
+                  id="wb-source"
+                  value={source}
+                  onChange={e => changeSource(e.target.value)}
+                  placeholder="e.g. deposits"
+                  disabled={feedbackLocked}
+                />
+                <p className="hint" style={HELP_STYLE}>
+                  Required. The catalog the engine plans over: generation reads one catalog's
+                  governed meaning. Cross-catalog generation returns in a later release.
+                </p>
+              </div>
+              <div className="field" style={{ flex: '1 1 220px' }}>
+                <label htmlFor="wb-target">Target column</label>
+                <input
+                  id="wb-target"
+                  value={target}
+                  onChange={e => changeTarget(e.target.value)}
+                  placeholder="e.g. public.labels.churned"
+                  disabled={feedbackLocked}
+                />
+                <p className="hint" style={HELP_STYLE}>
+                  What you are predicting. Candidates are screened against it server-side, so leaky
+                  features never reach you.
+                </p>
+              </div>
+            </div>
+            <div className="paths">
+              <button
+                type="submit"
+                className="path path-generate"
+                disabled={!hypothesis.trim() || !goal.trim() || generating || feedbackLocked}
+              >
+                <span className="k">Path 1 · The engine</span>
+                <span className="t">
+                  <PathGlyph>
+                    <circle cx="8" cy="8" r="6.2" />
+                    <path d="M8 5v6M5 8h6" />
+                  </PathGlyph>
+                  {generating ? 'Generating' : 'Generate candidate sets'}
+                </span>
+                <span className="d">
+                  Governed recipes and model intents planned over this catalog's confirmed meaning,
+                  grouped by operation class — blockers and their next steps named, never hidden.
+                </span>
+              </button>
+              <button
+                type="button"
+                className="path path-describe"
+                aria-pressed={describeOpen}
+                aria-controls="wb-describe-panel"
+                onClick={() => setDescribeOpen(open => !open)}
+              >
+                <span className="k">Path 2 · Your definitions</span>
+                <span className="t">
+                  <PathGlyph>
+                    <path d="M3 13h10M4 10.5 10.8 3.7a1.4 1.4 0 0 1 2 2L6 12.5l-2.8.8z" />
+                  </PathGlyph>
+                  Write definitions myself
+                </span>
+                <span className="d">
+                  One definition per line; each becomes a draft candidate with its real join path,
+                  drafted together.
+                </span>
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Phase 1B Gate #1: the human confirms/overrides/broadens the recognised scope BEFORE the
-          considered set is generated. Only rendered behind intent_confirmation_ui, after a
-          recognition has landed and before it is confirmed. */}
-      {confirmationUi && recognition !== null && (
+          considered set is generated. Rendered from the derived phase, which is exactly "a
+          recognition is awaiting confirmation" and outranks an in-flight grounding call — the
+          panel must not vanish under the click that started it. */}
+      {phase === 'scope_review' && recognition !== null && (
         <div className="panel" id="wb-scope-panel">
           <h2>Confirm the scope</h2>
           <p className="hint" style={{ marginTop: 4 }}>
@@ -2525,116 +2880,6 @@ export function WorkbenchScreen() {
         </div>
       )}
 
-      {/* Phase 1B disposition lens: only when a SCOPED response carried dispositions and the
-          intent_disposition_lens flag is on. Groups the recipe library by how the confirmed scope
-          dispositioned each recipe, and keeps "show all buildable recipes" one click away. */}
-      {dispositionLens && dispositions !== null && (
-        <div className="panel" id="wb-disposition-lens">
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
-            <h2>How your scope dispositioned the recipes</h2>
-            <span className="micro-label tabular-nums">
-              <span style={{ color: 'var(--accent)' }}>{dispositions.length}</span> recipes
-            </span>
-          </div>
-          {DISPOSITION_GROUPS.map(group => {
-            const recipes = dispositions.filter(d => d.final_disposition === group.key)
-            if (recipes.length === 0) return null
-            return (
-              <div key={group.key} className="disposition-group" style={{ marginTop: 12 }}>
-                <h3 style={{ margin: '0 0 8px' }}>
-                  {group.heading}{' '}
-                  <span className="micro-label tabular-nums">{recipes.length}</span>
-                </h3>
-                <ul className="rows">
-                  {recipes.map(d => (
-                    <li key={d.recipe_id} className="row" style={{ gap: 10, alignItems: 'baseline' }}>
-                      <span className="mono" style={{ fontWeight: 600 }}>{d.recipe_id}</span>
-                      <span className="hint">{dispositionReason(d)}</span>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )
-          })}
-          <div style={{ marginTop: 12 }}>
-            <button
-              type="button"
-              className="btn"
-              disabled={generating}
-              onClick={() => void broadenScope()}
-            >
-              Show all buildable recipes
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Phase 2A: the deterministic presentation-priority ranking of the eligible recipes. Rendered
-          only behind VITE_INTENT_RANKING, when a scoped response carried `ranking`. A DISTINCT
-          presentation from the candidate cards: canonical order, an initial-view subset with a
-          "Show all" expander, per-recipe rank reasons and (for held-back recipes) a separate
-          "why not shown initially" stream, and the LLM recommendation as its own labelled band. */}
-      {rankingUi && ranking !== null && (
-        <div className="panel" id="wb-ranking">
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
-            <h2>Recipes by priority</h2>
-            <span className="micro-label tabular-nums">
-              <span style={{ color: 'var(--accent)' }}>{rankedOrder.length}</span>{' '}
-              {rankedOrder.length === 1 ? 'recipe' : 'recipes'}
-            </span>
-            {rankingVersion && <span className="micro-label">ranking {rankingVersion}</span>}
-          </div>
-          <p className="hint" style={{ marginTop: 4 }}>
-            A deterministic presentation priority over the eligible recipes — a stable ordering, never
-            a prediction of predictive value.
-          </p>
-          {/* The LLM "recommended starting set" is a SEPARATE band from the deterministic ranking: an
-              advisory lens pick, clearly labelled and visually distinct, never merged into the ranked
-              list below. Its own reasoning + caveat, verbatim from the backend. */}
-          {recommendation !== null && (
-            <div
-              className="advice"
-              data-band="recommended-starting-set"
-              style={{ marginTop: 12 }}
-            >
-              <p>
-                <strong>
-                  Recommended starting set: {lensLabel(recommendation.recommended_lens)}.
-                </strong>{' '}
-                {recommendation.reasoning}
-              </p>
-              <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
-            </div>
-          )}
-          {/* The deterministic ranked list: the initial-view subset first. */}
-          <ul className="rows">
-            {rankedInitial.map(r => (
-              <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
-            ))}
-          </ul>
-          {rankedRest.length > 0 && (
-            <>
-              <button
-                type="button"
-                className="btn"
-                aria-expanded={showAllRanked}
-                aria-controls="wb-ranking-rest"
-                onClick={() => setShowAllRanked(open => !open)}
-              >
-                {showAllRanked ? 'Show fewer' : `Show all ${rankedOrder.length} recipes`}
-              </button>
-              {showAllRanked && (
-                <ul className="rows" id="wb-ranking-rest">
-                  {rankedRest.map(r => (
-                    <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
-                  ))}
-                </ul>
-              )}
-            </>
-          )}
-        </div>
-      )}
-
       {generated?.length === 0 && (
         <>
           <div className="empty" role="status">
@@ -2691,6 +2936,57 @@ export function WorkbenchScreen() {
               open={rejectionsOpen}
               onToggle={() => setRejectionsOpen(open => !open)}
             />
+          )}
+          {/* ── What this run's options are made of ─────────────────────────────────────────────
+              A count is not a queue. Every number here is tallied from the `binding_state` the
+              server put on each option of THIS run — nothing is authored, nothing is carried over
+              from another run, and the strip simply does not render when the response carried no
+              option-actions entries to count. Each state says what it MEANS, because "ambiguous"
+              on its own reads as a failure when it is confirmation work nobody has done yet. */}
+          {composition.length > 0 && (
+            <div className="panel composition" id="wb-composition">
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+                <h3 style={{ margin: 0 }}>What this run returned</h3>
+                <span className="micro-label tabular-nums">
+                  <span style={{ color: 'var(--accent)' }}>{optionEntries.length}</span>{' '}
+                  {optionEntries.length === 1 ? 'option' : 'options'}
+                </span>
+              </div>
+              <p className="hint" style={{ marginTop: 4 }}>
+                Counted from the binding state the engine returned for each option
+                {allCandidates.length !== optionEntries.length
+                  && ` (${allCandidates.length} ${allCandidates.length === 1
+                    ? 'candidate is' : 'candidates are'} on the list below)`}
+                .
+              </p>
+              <div
+                className="comp-bar"
+                role="img"
+                aria-label={composition
+                  .map(row => `${row.count} ${row.label.toLowerCase()}`).join(', ')}
+              >
+                {composition.map(row => (
+                  <span
+                    key={row.state}
+                    className="comp-seg"
+                    data-state={row.state}
+                    style={{ width: `${(row.count / optionEntries.length) * 100}%` }}
+                  />
+                ))}
+              </div>
+              <ul className="comp-key">
+                {composition.map(row => (
+                  <li key={row.state}>
+                    <span className="comp-dot" data-state={row.state} aria-hidden="true" />
+                    <span className="comp-n tabular-nums">{row.count}</span>
+                    <span>
+                      <strong>{row.label}</strong>
+                      {row.meaning !== null && <> — {row.meaning}</>}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {multiSet && generated !== null && (
             <>
@@ -3340,6 +3636,116 @@ export function WorkbenchScreen() {
             </form>
           )}
         </>
+      )}
+
+      {/* Phase 1B disposition lens: only when a SCOPED response carried dispositions and the
+          intent_disposition_lens flag is on. Groups the recipe library by how the confirmed scope
+          dispositioned each recipe, and keeps "show all buildable recipes" one click away. */}
+      {dispositionLens && dispositions !== null && (
+        <div className="panel" id="wb-disposition-lens">
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+            <h2>How your scope dispositioned the recipes</h2>
+            <span className="micro-label tabular-nums">
+              <span style={{ color: 'var(--accent)' }}>{dispositions.length}</span> recipes
+            </span>
+          </div>
+          {DISPOSITION_GROUPS.map(group => {
+            const recipes = dispositions.filter(d => d.final_disposition === group.key)
+            if (recipes.length === 0) return null
+            return (
+              <div key={group.key} className="disposition-group" style={{ marginTop: 12 }}>
+                <h3 style={{ margin: '0 0 8px' }}>
+                  {group.heading}{' '}
+                  <span className="micro-label tabular-nums">{recipes.length}</span>
+                </h3>
+                <ul className="rows">
+                  {recipes.map(d => (
+                    <li key={d.recipe_id} className="row" style={{ gap: 10, alignItems: 'baseline' }}>
+                      <span className="mono" style={{ fontWeight: 600 }}>{d.recipe_id}</span>
+                      <span className="hint">{dispositionReason(d)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+          })}
+          <div style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className="btn"
+              disabled={generating}
+              onClick={() => void broadenScope()}
+            >
+              Show all buildable recipes
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Phase 2A: the deterministic presentation-priority ranking of the eligible recipes. Rendered
+          only behind VITE_INTENT_RANKING, when a scoped response carried `ranking`. A DISTINCT
+          presentation from the candidate cards: canonical order, an initial-view subset with a
+          "Show all" expander, per-recipe rank reasons and (for held-back recipes) a separate
+          "why not shown initially" stream, and the LLM recommendation as its own labelled band. */}
+      {rankingUi && ranking !== null && (
+        <div className="panel" id="wb-ranking">
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+            <h2>Recipes by priority</h2>
+            <span className="micro-label tabular-nums">
+              <span style={{ color: 'var(--accent)' }}>{rankedOrder.length}</span>{' '}
+              {rankedOrder.length === 1 ? 'recipe' : 'recipes'}
+            </span>
+            {rankingVersion && <span className="micro-label">ranking {rankingVersion}</span>}
+          </div>
+          <p className="hint" style={{ marginTop: 4 }}>
+            A deterministic presentation priority over the eligible recipes — a stable ordering, never
+            a prediction of predictive value.
+          </p>
+          {/* The LLM "recommended starting set" is a SEPARATE band from the deterministic ranking: an
+              advisory lens pick, clearly labelled and visually distinct, never merged into the ranked
+              list below. Its own reasoning + caveat, verbatim from the backend. */}
+          {recommendation !== null && (
+            <div
+              className="advice"
+              data-band="recommended-starting-set"
+              style={{ marginTop: 12 }}
+            >
+              <p>
+                <strong>
+                  Recommended starting set: {lensLabel(recommendation.recommended_lens)}.
+                </strong>{' '}
+                {recommendation.reasoning}
+              </p>
+              <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
+            </div>
+          )}
+          {/* The deterministic ranked list: the initial-view subset first. */}
+          <ul className="rows">
+            {rankedInitial.map(r => (
+              <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
+            ))}
+          </ul>
+          {rankedRest.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="btn"
+                aria-expanded={showAllRanked}
+                aria-controls="wb-ranking-rest"
+                onClick={() => setShowAllRanked(open => !open)}
+              >
+                {showAllRanked ? 'Show fewer' : `Show all ${rankedOrder.length} recipes`}
+              </button>
+              {showAllRanked && (
+                <ul className="rows" id="wb-ranking-rest">
+                  {rankedRest.map(r => (
+                    <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
       )}
     </section>
   )
