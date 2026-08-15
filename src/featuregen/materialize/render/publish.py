@@ -52,6 +52,7 @@ from featuregen.materialize.render._yaml import yaml_scalar
 __all__ = [
     "RENDERABLE_MECHANISMS",
     "published_dataset_name",
+    "published_output_location",
     "publish_entry_body",
     "render_publish",
 ]
@@ -79,6 +80,23 @@ def published_dataset_name(plan: FeatureGroupPlanV1) -> str:
             f"dataset name is derived from the logical group name and there is nowhere else to "
             f"take one from")
     return f"feature_{plan.logical_group_name}"
+
+
+def published_output_location(published_object: str, staging_root: str) -> str:
+    """WHERE a generation's immutable versioned output is — the ONE definition of that path.
+
+    Two readers, and that is the whole reason it is a function. The catalog entry below renders it
+    with Kedro's ``${runtime_params:staging_root}`` placeholder, so the RUN writes there; the
+    deployment's :class:`~featuregen.materialize.publish_sql.SqlPublicationSwap` renders it with the
+    run's resolved staging root, so the pointer switch points THERE. Two spellings of one derived
+    path are two paths, and the second one finds an empty directory rather than an error.
+
+    The LAST dot separates namespace from table, exactly as :func:`publish_entry_body` splits it:
+    the sandbox namespace may itself be catalog-qualified, and a group name (a Hive identifier)
+    never carries a dot.
+    """
+    _, table = published_object.rsplit(".", 1)
+    return f"{staging_root}/{_PUBLISHED_PREFIX}/{table}"
 
 
 def _check(plan: FeatureGroupPlanV1, selection: PublisherSelection) -> None:
@@ -117,9 +135,6 @@ def publish_entry_body(
     """
     _check(plan, selection)
     target = physical_target_for(plan.logical_group_name)
-    # The LAST dot separates namespace from table: the sandbox namespace may itself be
-    # catalog-qualified, and the group name (a hive identifier) never carries a dot.
-    _, table = target.rsplit(".", 1)
     versions = selection.engine_versions
     return (
         f"  # THE PUBLICATION TARGET (§10.3), derived from the sandbox binding: {target}",
@@ -140,7 +155,7 @@ def publish_entry_body(
         f"after §9's gates pass; it is not a catalog entry and is deliberately not rendered here.",
         "  type: spark.SparkDataset",
         f"  filepath: "
-        f"{yaml_scalar('${runtime_params:staging_root}/' + _PUBLISHED_PREFIX + '/' + table)}",
+        f"{yaml_scalar(published_output_location(target, '${runtime_params:staging_root}'))}",
         '  file_format: "parquet"',
         "  save_args:",
         '    mode: "errorifexists"',

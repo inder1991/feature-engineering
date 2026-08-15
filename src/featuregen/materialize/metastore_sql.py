@@ -406,7 +406,10 @@ class SqlMetastoreAdapter:
                 # sequence the seam documents, and it is the one empty this module may produce.
                 return ()
             raise self._routed(fault, schema, table) from fault
-        return tuple(_partition_of(str(row[0]), f"{schema}.{table}") for row in rows if row)
+        # `str(row[0])` and not `if row` — a row with no cells is a listing entry naming no
+        # partition, and skipping it would shorten the listing by one silently.
+        return tuple(_partition_of("" if not row else str(row[0]), f"{schema}.{table}")
+                     for row in rows)
 
     # ── which columns and physical types does it have ───────────────────────────────────────────
 
@@ -431,7 +434,7 @@ class SqlMetastoreAdapter:
             return None
 
         try:
-            names, rows = self.session.table(f"DESCRIBE {quoted_schema}.{quoted_table}")
+            _columns, rows = self.session.table(f"DESCRIBE {quoted_schema}.{quoted_table}")
         except MetastoreFaultError as fault:
             if fault.fault is MetastoreFault.TABLE_UNKNOWN:
                 return None                            # dropped between the two statements
@@ -443,7 +446,6 @@ class SqlMetastoreAdapter:
                 f"table: a table that exists has columns, so an empty description is an answer "
                 f"that did not happen (the rule `MetastoreInventoryAdapter._layout` already "
                 f"applies to a capture)")
-        del names
         return described
 
     # ── may these roles read it ─────────────────────────────────────────────────────────────────

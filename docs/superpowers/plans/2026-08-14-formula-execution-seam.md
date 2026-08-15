@@ -2759,6 +2759,64 @@ so at the place an operator would otherwise set the variables.
 > `test_metastore_sql.py` cases and the one new L1 case, and nothing else moved); `-m eval`
 > **73 passed**; ruff clean on all four touched files; mypy clean on both touched source files.
 
+> **SUCCESSOR 2 (2026-08-15) — INCREMENT 2: THE `PublicationSwap` IMPLEMENTATION. ACCEPTED
+> `<hash2>`.** `publish_sql.SqlPublicationSwap` performs G-3's pointer switch over the SAME
+> session the metadata adapter uses — one transport, so L1's answers and the swap cannot come from
+> two clients seeing two worlds.
+>
+> **THE MECHANISM, and why the statement count IS the property.** §10.3's `VERSIONED_POINTER` is
+> *"immutable versioned physical outputs with ONE reader-visible pointer/view switch"*.
+> `render.publish` already renders the immutable output (generation-scoped path, `errorifexists`);
+> what remained was the pointer, and it moves with a single `CREATE OR REPLACE VIEW <target> AS
+> SELECT <the plan's columns, in the plan's order> FROM parquet.<location>` — one metastore commit,
+> which is exactly what the probe watches readers through, and which carries the SCHEMA too (so it
+> can cover step 5's added column, where a partition-location swap cannot). `PublicationSwap`'s
+> docstring says a seam with a separate metadata write and pointer flip *"would be two operations,
+> and the attestation would be evidence about neither"* — so a test COUNTS the mutating statements
+> rather than asserting the swap "worked", and the drop-then-create mutant fails four tests.
+>
+> **THE READ-BACK IS NOT DECORATION — THIS REPOSITORY HAS MET THE FAILURE IT CATCHES.**
+> `deploy/kind/sandbox/up.sh` records it in its own words: *"A write succeeding proves nothing:
+> Spark falls back to an embedded Derby metastore silently, and a second SEQUENTIAL session still
+> sees the tables"*, and `40-spark.yaml` records the same trap a second time. A DDL statement that
+> returns without error against a session-local catalog is precisely the swap that half-happened,
+> and the plane would then hold a pointer no reader can follow. So the swap asks the engine what
+> the object now IS (`SHOW CREATE TABLE`, metadata — never a row) and raises
+> `PublicationSwapUnconfirmed` unless the answer names this generation's location;
+> `publish_generation`'s transaction then rolls the 1055 row back and the plane claims nothing.
+> Removing the read-back fails three tests.
+>
+> **ONE DEFINITION OF THE PUBLISHED LOCATION, and this is a plan gap closed rather than a
+> preference.** The rendered catalog entry writes `<staging_root>/published/<table>` and the swap
+> must point at THAT; two spellings of one derived path are two paths, and the second finds an
+> empty directory rather than an error. `render.publish.published_output_location` is now the one
+> definition, called by the entry (with Kedro's `${runtime_params:staging_root}` placeholder) and
+> by the swap (with the run's resolved root). The rendered bytes are unchanged — the goldens pass
+> untouched, which is what proves the extraction was a refactor.
+>
+> **IDEMPOTENCY, honestly split.** `CREATE OR REPLACE VIEW` is idempotent by construction, so
+> re-running a completed swap emits the same statement and leaves the same definition — the
+> seam's *no-op* half, asserted. The *refusal* half is not this module's and it must not invent a
+> second opinion: `publish_generation` records the 1055 pointer BEFORE swapping, and that table's
+> trigger refuses a `seq` that does not strictly extend the group.
+>
+> **Injection is refused, never escaped**, for `quoted_identifier`'s reason: the target's segments
+> and every published column are validated as identifiers, and the location — which is a path and
+> cannot be validated as one — is refused if it contains any character that could end its own
+> quoting.
+>
+> 17 new cases in `test_publish_sql.py`. The DB-API double gained one honest capability: unstocked,
+> it APPLIES the `CREATE OR REPLACE VIEW` and reports it back, so the read-back test is a real
+> round-trip through the statement the swap emitted rather than a canned confirmation that would
+> agree with any swap at all.
+>
+> Gates: full suite **11340 passed, 20 skipped** (11300/20 after increment 1 — the 17 new
+> `test_publish_sql.py` cases, plus increment 3's 7 lane cases and the 16 parametrized rows its
+> eight new env vars add to the deployment-file documentation test, all of which were in the tree
+> when this ran); `-m eval` **73 passed**; ruff clean on all touched files; mypy
+> clean on both touched source modules. Mutant proof: (a) drop-then-create → 4 failed; (b) trust
+> the write, no read-back → 3 failed.
+
 ---
 
 ## 7. Sequencing and dependencies
