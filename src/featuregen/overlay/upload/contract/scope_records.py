@@ -3,8 +3,12 @@
 Three append-only writers/readers over the ``0974_intent_scope_records`` tables:
 
 * :func:`record_recognition_attempt` — persists the recognizer's PROPOSAL for an intent, BEFORE any
-  generation run exists. Idempotent on ``(intent_id, input_hash)``: the same intent + redacted input
-  resolves to the SAME ``recognition_id`` (never a second row), so re-recognising is free.
+  generation run exists. Idempotent on ``(intent_id, input_hash)``, where ``input_hash`` is the
+  idempotency KEY: current callers key on the full REQUEST identity (input + prompt + schema +
+  taxonomy + validator + model, see 1070), legacy rows key on the redacted input alone.
+* :func:`find_recognition_attempt` / :func:`load_recognition_attempt` — the stored answer, by request
+  identity or by id. Reading the row back is what keeps the served payload and the returned
+  ``recognition_id`` describing the same fact.
 * :func:`use_case_provenance` — derives accepted/added/overridden provenance from the immutable
   recognition attempt and the confirmed scope. The client never supplies governance provenance.
 * :func:`record_confirmed_scope` — writes the human-confirmed governing scope for exactly one
@@ -30,7 +34,11 @@ from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, ScopeExpansion
-from featuregen.overlay.upload.taxonomy.recognition import RecognitionResult, UseCaseCandidate
+from featuregen.overlay.upload.taxonomy.recognition import (
+    RecognitionResult,
+    RecognitionStatus,
+    UseCaseCandidate,
+)
 
 
 def _actor_dict(actor: Any) -> dict[str, Any]:
@@ -117,6 +125,81 @@ def recognition_input_material(
     return material
 
 
+@dataclass(frozen=True, slots=True)
+class StoredRecognition:
+    """One PERSISTED recognition attempt, rebuilt from its row.
+
+    The point of reading a result back rather than trusting the in-memory one is the B2 invariant:
+    the ``recognition_id`` a caller returns must name the row its payload was built from. Whenever
+    those two can drift — a concurrent writer winning the insert, an earlier answer already stored —
+    the ROW is the fact and the in-memory result is a guess."""
+
+    recognition_id: str
+    result: RecognitionResult
+    llm_call_ref: str | None
+    recognition_request_hash: str | None
+
+
+_ATTEMPT_COLUMNS = (
+    "recognition_id, status, candidates, ambiguity_note, taxonomy_version, "
+    "applicability_mapping_version, recognizer_model_id, prompt_version, recipe_registry_version, "
+    "modelling_contexts, target_entity, warnings, llm_call_ref, recognition_request_hash")
+
+
+def _stored_recognition(row: Any) -> StoredRecognition:
+    """Rebuild a :class:`StoredRecognition` from one ``_ATTEMPT_COLUMNS`` row."""
+    candidates = tuple(
+        UseCaseCandidate(
+            use_case_id=str(c["use_case_id"]),
+            relationship=c["relationship"],
+            confidence=c["confidence"],
+            evidence_spans=tuple(c.get("evidence_spans") or ()),
+            rationale=str(c.get("rationale", "")),
+        )
+        for c in (row[2] or ()) if isinstance(c, dict))
+    return StoredRecognition(
+        recognition_id=row[0],
+        result=RecognitionResult(
+            status=RecognitionStatus(row[1]),
+            candidates=candidates,
+            ambiguity_note=row[3],
+            taxonomy_version=row[4],
+            applicability_mapping_version=row[5],
+            recognizer_model_id=row[6],
+            prompt_version=row[7],
+            recipe_registry_version=row[8],
+            modelling_contexts=tuple(row[9] or ()),
+            target_entity=row[10],
+            warnings=tuple(row[11] or ()),
+        ),
+        llm_call_ref=row[12],
+        recognition_request_hash=row[13],
+    )
+
+
+def load_recognition_attempt(conn, *, recognition_id: str) -> StoredRecognition | None:
+    """The stored attempt by id, or ``None`` when no such row exists."""
+    row = conn.execute(
+        f"SELECT {_ATTEMPT_COLUMNS} FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (recognition_id,)).fetchone()
+    return None if row is None else _stored_recognition(row)
+
+
+def find_recognition_attempt(
+    conn, *, intent_id: str, recognition_request_hash: str,
+) -> StoredRecognition | None:
+    """The stored answer to an IDENTICAL request, or ``None`` if this build has never asked it.
+
+    Keyed on the request hash COLUMN, never on ``input_hash``: a legacy row carries an input-content
+    hash in ``input_hash`` and a NULL request hash, and must never be mistaken for an answer to a
+    request whose identity nobody recorded. A hit here is what lets the endpoint skip the provider."""
+    row = conn.execute(
+        f"SELECT {_ATTEMPT_COLUMNS} FROM intent_recognition_attempt "
+        "WHERE intent_id = %s AND recognition_request_hash = %s",
+        (intent_id, recognition_request_hash)).fetchone()
+    return None if row is None else _stored_recognition(row)
+
+
 def record_recognition_attempt(
     conn,
     *,
@@ -126,17 +209,43 @@ def record_recognition_attempt(
     actor: Any,
     input_json: dict[str, Any] | None = None,
     redaction_policy_version: str | None = None,
+    input_content_hash: str | None = None,
+    recognition_request_hash: str | None = None,
+    llm_call_ref: str | None = None,
 ) -> str:
     """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
     the candidate PROPOSALS, and the optional intent DIMENSIONS (``modelling_contexts`` / ``target_entity``)
     + per-dimension ``warnings`` from ``result``. Idempotent on ``(intent_id, input_hash)``: a repeat
-    ``INSERT`` is a no-op and the EXISTING ``recognition_id`` is returned, so the same intent + redacted
-    input always resolves to the same attempt (never a second row)."""
+    ``INSERT`` is a no-op and the EXISTING ``recognition_id`` is returned, so the same intent + the same
+    KEY always resolves to the same attempt (never a second row).
+
+    ``input_hash`` is the IDEMPOTENCY KEY, and Task 0 of the recognition repair seam widened what that
+    key is allowed to be. Two forms coexist, distinguished by ``recognition_request_hash`` (1070):
+
+    * **request-identity (current)** — the caller passes ``recognition_request_hash`` and, with it,
+      ``input_hash`` EQUAL to it and ``input_content_hash`` carrying the redacted-input hash on its
+      own. The key then covers prompt, schema, taxonomy, validator and model, so a re-run under a
+      changed contract is a NEW attempt rather than a silent alias of the old one.
+    * **input-only (legacy, and every caller that has not been migrated)** — no request hash; the key
+      is the redacted-input hash exactly as before, and ``input_content_hash`` defaults from it.
+
+    ``llm_call_ref`` ties the served result to the audit row for the call that produced it, so the
+    answer and its evidence are one fact rather than two rows nobody joined."""
     recognition_id = mint_id("rcg")
     candidates = [_candidate_json(c) for c in result.candidates]
+    content_hash = input_content_hash if input_content_hash is not None else input_hash
+    if recognition_request_hash is not None:
+        # The DB says the same thing (1070's `intent_recognition_attempt_request_is_the_key` CHECK);
+        # saying it here too means a caller learns it from a name rather than from a constraint.
+        if input_hash != recognition_request_hash:
+            raise ValueError(
+                "a request-identity recognition must key on its own recognition_request_hash")
+        if input_content_hash is None:
+            raise ValueError(
+                "a request-identity recognition must seal input_content_hash separately")
     if input_json is not None:
         computed_hash = compute_input_hash(input_json)
-        if computed_hash != input_hash:
+        if computed_hash != content_hash:
             raise ValueError("recognition input hash does not match input_json")
         if not redaction_policy_version:
             raise ValueError("redaction_policy_version is required with input_json")
@@ -147,16 +256,18 @@ def record_recognition_attempt(
         "(recognition_id, intent_id, input_hash, status, candidates, ambiguity_note, "
         "taxonomy_version, applicability_mapping_version, recognizer_model_id, prompt_version, "
         "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by, "
-        "input_json, input_content_hash, redaction_policy_version) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "input_json, input_content_hash, redaction_policy_version, recognition_request_hash, "
+        "llm_call_ref) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (intent_id, input_hash) DO NOTHING",
         (recognition_id, intent_id, input_hash, result.status.value, Jsonb(candidates),
          result.ambiguity_note, result.taxonomy_version, result.applicability_mapping_version,
          result.recognizer_model_id, result.prompt_version, result.recipe_registry_version,
          Jsonb(list(result.modelling_contexts)), result.target_entity, Jsonb(list(result.warnings)),
          Jsonb(_actor_dict(actor)), Jsonb(input_json) if input_json is not None else None,
-         input_hash if input_json is not None else None, redaction_policy_version))
-    # Read back the governing id for this (intent, input) — the one just inserted, or the pre-existing
+         content_hash if input_json is not None else None, redaction_policy_version,
+         recognition_request_hash, llm_call_ref))
+    # Read back the governing id for this (intent, key) — the one just inserted, or the pre-existing
     # one when the INSERT hit ON CONFLICT DO NOTHING. Either way a repeat returns the SAME id.
     row = conn.execute(
         "SELECT recognition_id, input_json, input_content_hash, redaction_policy_version "
@@ -165,7 +276,7 @@ def record_recognition_attempt(
         (intent_id, input_hash)).fetchone()
     if input_json is not None and (
         row[1] != input_json
-        or row[2] != input_hash
+        or row[2] != content_hash
         or row[3] != redaction_policy_version
     ):
         raise ValueError("existing recognition attempt has different sealed input")

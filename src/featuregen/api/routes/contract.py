@@ -93,7 +93,9 @@ from featuregen.overlay.upload.contract.scope_records import (
     RecognitionInput,
     RecognitionInputUnavailable,
     dimension_provenance,
+    find_recognition_attempt,
     generation_input_for_run,
+    load_recognition_attempt,
     load_recognition_input,
     recognition_id_for_scope,
     recognition_input_material,
@@ -145,7 +147,10 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     APPLICABILITY_MAPPING_VERSION,
     RecognitionStatus,
 )
-from featuregen.overlay.upload.taxonomy.recognizer import recognize
+from featuregen.overlay.upload.taxonomy.recognizer import (
+    recognition_request_hash,
+    recognize_with_audit,
+)
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 from featuregen.overlay.upload.taxonomy.versions import RANKING_MAPPING_VERSION
 from featuregen.runtime.observability import counters
@@ -1177,14 +1182,31 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
         redacted_feedback=redacted_feedback,
         supersedes_scope_id=body.supersedes_scope_id,
     )
-    input_hash = compute_input_hash(input_json)
-    result = recognize(conn, client, redacted_hypothesis=intent.redacted_hypothesis,
-                       redacted_goal=redacted_goal, redacted_feedback=redacted_feedback,
-                       actor=identity)
-    recognition_id = record_recognition_attempt(
-        conn, intent_id=intent.intent_id, input_hash=input_hash, result=result,
-        actor=identity.subject, input_json=input_json,
-        redaction_policy_version=REDACTION_VERSION)
+    input_content_hash = compute_input_hash(input_json)
+    # Task 0 (repair seam, B2): the idempotency key is the whole REQUEST — the redacted input PLUS the
+    # prompt, schema, taxonomy, semantic validator and model that decide what an answer would mean.
+    # Computed BEFORE any dispatch, which is what lets an already-answered request skip the provider.
+    request_hash = recognition_request_hash(input_content_hash=input_content_hash)
+    stored = find_recognition_attempt(
+        conn, intent_id=intent.intent_id, recognition_request_hash=request_hash)
+    if stored is None:
+        audited = recognize_with_audit(
+            conn, client, redacted_hypothesis=intent.redacted_hypothesis,
+            redacted_goal=redacted_goal, redacted_feedback=redacted_feedback, actor=identity)
+        recognition_id = record_recognition_attempt(
+            conn, intent_id=intent.intent_id, input_hash=request_hash, result=audited.result,
+            actor=identity.subject, input_json=input_json,
+            redaction_policy_version=REDACTION_VERSION,
+            input_content_hash=input_content_hash, recognition_request_hash=request_hash,
+            llm_call_ref=audited.llm_call_ref)
+        # THE INVARIANT: the response is built from the PERSISTED row, never from the in-memory
+        # result — so the returned recognition_id always names the row the payload came from. The
+        # two can differ whenever another writer won the insert for this same request, and B2 is
+        # exactly what happens when the id is taken from storage while the body is not.
+        stored = load_recognition_attempt(conn, recognition_id=recognition_id)
+        if stored is None:                      # unreachable: the row was just read back by key
+            raise HTTPException(status_code=500, detail="recognition attempt did not persist")
+    recognition_id, result = stored.recognition_id, stored.result
     # Fail-open asymmetry: unscoped / technical_failure -> full grounding downstream (recognition never
     # narrows on doubt). The recipe count is NOT here — applicability computes it after generate.
     unscoped = result.status in (RecognitionStatus.UNSCOPED, RecognitionStatus.TECHNICAL_FAILURE)

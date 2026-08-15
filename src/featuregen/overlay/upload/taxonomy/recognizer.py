@@ -23,15 +23,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from featuregen.canonical import contract_hash_v1, jcs_sha256
 from featuregen.contracts import SchemaValidationError
+from featuregen.contracts.contract_versions import register_contract_version
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import DEFAULT_LLM_MODEL, LLMClient
 from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
+    canonical_output_schema,
+    current_enrichment_generation_settings,
     drive_audited_structured_call,
 )
 from featuregen.overlay.upload.taxonomy.recognition import (
+    RECOGNITION_VALIDATOR_VERSION,
     TAXONOMY_VERSION,
     RecognitionResult,
     RecognitionStatus,
@@ -45,6 +50,11 @@ from featuregen.overlay.upload.taxonomy.recognizer_prompt import (
     PROMPT_VERSION,
     build_recognition_prompt,
 )
+from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY, selectable_leaves
+from featuregen.overlay.upload.taxonomy.versions import (
+    APPLICABILITY_MAPPING_VERSION,
+    RECIPE_REGISTRY_VERSION,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +64,13 @@ RECOGNIZER_TASK = "use_case_recognition"
 _OUTPUT_SCHEMA_ID = "use_case_recognition"
 _OUTPUT_SCHEMA_VERSION = 1
 
+# The serialized identity of ONE recognition request (Task 0 of the recognition repair seam). Owned
+# here because this module is where the (task, prompt, schema, validator, model) unit is assembled.
+RECOGNITION_REQUEST_CONTRACT = "recognition-request"
+RECOGNITION_REQUEST_VERSION = "1"
+register_contract_version(RECOGNITION_REQUEST_CONTRACT, RECOGNITION_REQUEST_VERSION,
+                          owner="featuregen.overlay.upload.taxonomy.recognizer")
+
 
 @dataclass(frozen=True, slots=True)
 class AuditedRecognition:
@@ -61,6 +78,70 @@ class AuditedRecognition:
     llm_call_ref: str | None
     provider_calls: int
     usage: dict[str, Any]
+
+
+def resolve_recognizer_model(model_id: str | None = None) -> str:
+    """The model id this build would actually recognise with. ONE resolution, used both by the call
+    and by the request identity that decides whether the call happens at all — an identity computed
+    from a different rule than the dispatch would key a stored answer to a model that never saw it."""
+    return model_id or os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)
+
+
+def _taxonomy_content_hash() -> str:
+    """The closed vocabulary the validator enforces and the prompt offers, by CONTENT.
+
+    ``TAXONOMY_VERSION`` alone is not enough: a leaf added or renamed without a version bump changes
+    which answers are reachable, and the whole point of request identity is that a stored answer is
+    only reusable for a question that has not changed underneath it."""
+    return jcs_sha256({
+        "selectable_leaves": sorted(selectable_leaves()),
+        "registry_ids": sorted(USE_CASE_REGISTRY),
+    })
+
+
+def recognition_request_material(*, input_content_hash: str,
+                                 model_id: str | None = None) -> dict[str, Any]:
+    """The complete identity of one recognition REQUEST: the redacted user input PLUS everything
+    about this build that decides what the answer means.
+
+    ``input_content_hash`` keeps its own, narrower meaning — the redacted user input and the
+    redaction policy that produced it, and nothing else. The two hashes answer different questions
+    ("did the user ask the same thing?" vs "would this build ask it the same way?") and NEITHER may
+    absorb the other: sealed-input verification (``load_recognition_input``) must stay able to
+    re-derive the input hash from the input alone, and idempotency must stop reusing an answer the
+    current build would no longer give.
+
+    Identity fields only, per ``featuregen.canonical``: no timestamps, no actor, no run ids. The
+    prompt and schema enter as CONTENT hashes rather than by version, because a version is a promise
+    and content is a fact — and this build's registry is mutable (``register_schema`` upserts), so a
+    version number alone can mean two different bodies on two deployments."""
+    return {
+        "input_content_hash": input_content_hash,
+        "task": RECOGNIZER_TASK,
+        "prompt_id": PROMPT_ID,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_content_hash": jcs_sha256({"prompt": build_recognition_prompt()}),
+        "schema_id": _OUTPUT_SCHEMA_ID,
+        "schema_version": _OUTPUT_SCHEMA_VERSION,
+        "schema_content_hash": jcs_sha256(
+            canonical_output_schema(_OUTPUT_SCHEMA_ID, _OUTPUT_SCHEMA_VERSION)),
+        "taxonomy_version": TAXONOMY_VERSION,
+        "taxonomy_content_hash": _taxonomy_content_hash(),
+        "applicability_mapping_version": APPLICABILITY_MAPPING_VERSION,
+        "recipe_registry_version": RECIPE_REGISTRY_VERSION,
+        "semantic_validator_version": RECOGNITION_VALIDATOR_VERSION,
+        "recognizer_model_id": resolve_recognizer_model(model_id),
+        "generation_settings": current_enrichment_generation_settings(),
+    }
+
+
+def recognition_request_hash(*, input_content_hash: str, model_id: str | None = None) -> str:
+    """The JCS contract hash of :func:`recognition_request_material` — the idempotency key for one
+    recognition attempt. Deterministic and provider-free: it is computed BEFORE any dispatch, which
+    is what lets an already-answered request be served from storage without calling the provider."""
+    return contract_hash_v1(
+        RECOGNITION_REQUEST_CONTRACT, RECOGNITION_REQUEST_VERSION,
+        recognition_request_material(input_content_hash=input_content_hash, model_id=model_id))
 
 
 def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> RecognitionResult:
@@ -139,7 +220,7 @@ def recognize_with_audit(
     dispatch is pre-audited + attributed to that run (stage ``recognizer``; subjects empty — the
     call is about the redacted request, never a catalog object). Today's callers pass nothing —
     ``None`` dispatches unattributed, byte-for-byte as before."""
-    model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)
+    model = resolve_recognizer_model(model_id)
     instruction = _recognition_instruction(
         redacted_hypothesis, redacted_goal, redacted_feedback)
     dispatch_audit = None

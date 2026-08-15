@@ -40,6 +40,15 @@ from featuregen.overlay.upload.taxonomy.versions import (
 # the three the *result* carries; the recognizer adds recognizer_model_id + prompt_version.
 TAXONOMY_VERSION = "1.0.0"
 
+# The version of the SEMANTIC validator below — ``validate_recognition_output`` and the closed bands,
+# caps and leaf rule it enforces. It is NOT the taxonomy version (the taxonomy can grow without the
+# rules changing) and NOT the output-schema version (the schema is structure; this is semantics).
+# It is a leg of the recognition REQUEST IDENTITY: the same words, the same prompt and the same model
+# can yield a different DISPOSITION under different validation rules, so a stored answer produced
+# under one validator may not be served as the answer under another. Bump it whenever what this
+# module ACCEPTS or REJECTS changes — the repair-seam plan's Tasks 2 and 4 both do exactly that.
+RECOGNITION_VALIDATOR_VERSION = "1"
+
 # The selectable LEAVES (terminal objectives). A primary MUST be one of these — the applicability layer
 # scopes on leaves, so a non-leaf selectable parent (e.g. "customer", "credit") would scope to zero recipes.
 _SELECTABLE_LEAVES: frozenset[str] = frozenset(selectable_leaves())

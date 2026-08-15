@@ -14,7 +14,9 @@ from featuregen.intake.llm import compute_input_hash
 from featuregen.overlay.upload.contract.scope_records import (
     confirmation_delta,
     dimension_provenance,
+    find_recognition_attempt,
     generation_input_for_run,
+    load_recognition_attempt,
     load_recognition_input,
     recognition_input_material,
     record_confirmed_scope,
@@ -577,3 +579,93 @@ def test_provenance_wired_into_record_yields_truthful_delta(db) -> None:
     assert delta["rejected"] == ["frtb"]                  # proposed, dropped (account is REPLACED, not here)
     assert set(delta["added"]) == {"lcr", "customer"}     # confirmed, not proposed
     assert delta["replaced"] == [{"from": "account", "to": "customer"}]
+
+
+# ── Task 0 (2026-08-15): request identity, and reading the answer back ──────────────────────────
+
+
+def test_a_stored_attempt_round_trips_as_the_result_it_was(db) -> None:
+    """The response is built from the ROW, so the row must rebuild the whole result — status,
+    both proposals with their spans, the quintet, the dimensions and the warnings. Anything this
+    read drops would silently disappear from every served re-run."""
+    result = RecognitionResult(
+        status=RecognitionStatus.CLASSIFIED,
+        candidates=_result().candidates,
+        ambiguity_note="a note",
+        taxonomy_version="tax_v9", recognizer_model_id="model_v9", prompt_version="prompt_v9",
+        applicability_mapping_version="map_v9", recipe_registry_version="reg_v9",
+        modelling_contexts=("ifrs9",), target_entity="customer",
+        warnings=("UNKNOWN_TARGET_ENTITY",))
+    rid = record_recognition_attempt(
+        db, intent_id="intent_rt", input_hash="req_rt", result=result, actor="ds1",
+        input_content_hash="content_rt", recognition_request_hash="req_rt",
+        llm_call_ref="llm_rt")
+    stored = load_recognition_attempt(db, recognition_id=rid)
+    assert stored is not None
+    assert stored.recognition_id == rid
+    assert stored.result == result
+    assert stored.llm_call_ref == "llm_rt"
+    assert stored.recognition_request_hash == "req_rt"
+
+
+def test_an_unknown_recognition_id_loads_as_absent(db) -> None:
+    assert load_recognition_attempt(db, recognition_id="rcg_nope") is None
+
+
+def test_a_legacy_row_is_never_found_by_request_identity(db) -> None:
+    """FAIL CLOSED on the legacy NULL. A pre-1070 row was keyed by user input alone, so nobody knows
+    which prompt, schema, validator or model produced it — serving it as the answer to a request
+    whose identity was never recorded is exactly the confusion Task 0 exists to end. The cost is one
+    provider call on the first re-run of a legacy objective, and that is the honest price."""
+    record_recognition_attempt(
+        db, intent_id="intent_legacy", input_hash="content_only", result=_result(), actor="ds1")
+    assert find_recognition_attempt(
+        db, intent_id="intent_legacy", recognition_request_hash="content_only") is None
+
+
+def test_the_stored_answer_is_found_by_request_identity(db) -> None:
+    rid = record_recognition_attempt(
+        db, intent_id="intent_f", input_hash="req_f", result=_result(), actor="ds1",
+        input_content_hash="content_f", recognition_request_hash="req_f")
+    found = find_recognition_attempt(
+        db, intent_id="intent_f", recognition_request_hash="req_f")
+    assert found is not None and found.recognition_id == rid
+    # Another intent's identical request is a different question.
+    assert find_recognition_attempt(
+        db, intent_id="intent_other", recognition_request_hash="req_f") is None
+
+
+def test_a_request_identity_row_must_key_on_its_own_hash(db) -> None:
+    """The 1070 CHECK, refused in code too, so a caller learns it from a name and not a constraint."""
+    with pytest.raises(ValueError, match="key on its own recognition_request_hash"):
+        record_recognition_attempt(
+            db, intent_id="intent_bad", input_hash="content_bad", result=_result(), actor="ds1",
+            input_content_hash="content_bad", recognition_request_hash="req_bad")
+
+
+def test_a_request_identity_row_must_seal_its_input_separately(db) -> None:
+    """Defaulting the sealed content hash from the KEY is exactly the conflation Task 0 undoes."""
+    with pytest.raises(ValueError, match="seal input_content_hash separately"):
+        record_recognition_attempt(
+            db, intent_id="intent_bad2", input_hash="req_bad2", result=_result(), actor="ds1",
+            recognition_request_hash="req_bad2")
+
+
+def test_the_sealed_input_is_verified_against_the_content_hash_not_the_key(db) -> None:
+    """The sealed material must re-derive `input_content_hash` — the request hash never could, and a
+    guard that compared against the KEY would have to be relaxed into uselessness to let it pass."""
+    material = recognition_input_material(
+        redacted_hypothesis="customers churn", redacted_prediction_goal="predict churn",
+        redaction_policy_version="r1")
+    content_hash = compute_input_hash(material)
+    rid = record_recognition_attempt(
+        db, intent_id="intent_seal", input_hash="req_seal", result=_result(), actor="ds1",
+        input_json=material, redaction_policy_version="r1",
+        input_content_hash=content_hash, recognition_request_hash="req_seal")
+    sealed = load_recognition_input(db, recognition_id=rid, intent_id="intent_seal")
+    assert sealed.input_content_hash == content_hash
+    with pytest.raises(ValueError, match="does not match input_json"):
+        record_recognition_attempt(
+            db, intent_id="intent_seal2", input_hash="req_seal2", result=_result(), actor="ds1",
+            input_json=material, redaction_policy_version="r1",
+            input_content_hash="not_the_content_hash", recognition_request_hash="req_seal2")

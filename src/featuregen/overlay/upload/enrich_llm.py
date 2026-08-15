@@ -1899,6 +1899,28 @@ def _require_schema(conn, reg: DocumentSchemaRegistry, schema_id: str, schema_ve
     return schema
 
 
+def canonical_output_schema(schema_id: str, schema_version: int) -> dict:
+    """The IN-CODE canonical body for ``(schema_id, schema_version)`` — the exact object
+    ``register_enrichment_schemas`` writes to the registry, deep-copied so a caller cannot mutate
+    the source of truth.
+
+    This reads the module's own table rather than the DB registry deliberately: it needs no
+    connection, and it answers "what does THIS build declare?" — which is what a request-identity
+    hash must hash. ``DocumentSchemaRegistry.register_schema`` is MUTABLE (a version can be
+    overwritten in place), so the stored row answers a different, weaker question.
+
+    Raises ``SchemaUnregisteredError`` naming the pair, for the same reason ``_require_schema``
+    does: a version bumped without a body is a caller bug, never a silent ``None``."""
+    import copy
+
+    schema = _SCHEMAS.get((schema_id, schema_version))
+    if schema is None:
+        raise SchemaUnregisteredError(
+            f"output schema ({schema_id!r}, v{schema_version}) has no canonical body in this "
+            "build; add it to enrich_llm._SCHEMAS before requesting it")
+    return copy.deepcopy(schema)
+
+
 def register_enrichment_schemas(conn) -> None:
     """Register the enrichment output-schemas so the audited call can resolve/validate them.
     Idempotent (register_schema upserts). Called at overlay bootstrap.

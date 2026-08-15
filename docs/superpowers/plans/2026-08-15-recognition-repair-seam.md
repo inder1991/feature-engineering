@@ -91,10 +91,18 @@ different questions and neither may absorb the other.
 **Modify:** idempotency becomes `(intent_id, recognition_request_hash)`. An existing request **loads
 and returns the stored result with no second provider call** — which also removes today's silent
 double-spend. `llm_call_ref` is stored ON the recognition attempt, so the served result and the audit
-row are one fact.
+row are one fact. **[R3]** That last one needs a caller change the task text did not name: the
+endpoint calls `recognize`, the compatibility projection that *discards* `llm_call_ref`; only
+`recognize_with_audit` returns it.
 
-**Migration:** additive column + index; the old unique key stays until backfilled rows carry the new
-hash. Append-only rows are never overwritten (1060/1061 discipline).
+**Migration:** additive column + index. **[R3 — corrected]** The old unique key stays **permanently**,
+not "until backfilled rows carry the new hash". There is no backfill and cannot be: 1024's
+`intent_recognition_attempt_no_mutation` trigger refuses UPDATE and DELETE on this table outright
+(the 1060/1061 append-only discipline), so a legacy row keeps a truthful NULL for a request identity
+nobody observed. And the constraint itself must survive for a stronger reason than backfill: old code
+names `(intent_id, input_hash)` in an `ON CONFLICT` clause, migrations land before the new image, and
+Postgres errors when that inference matches no constraint — dropping it would 500 every recognition
+for the length of the deploy window.
 
 **Acceptance:**
 - `test_a_changed_prompt_or_model_is_a_new_request` — same user text, different contract → new row.
@@ -102,6 +110,66 @@ hash. Append-only rows are never overwritten (1060/1061 discipline).
 - `test_the_returned_recognition_id_is_the_row_the_response_was_built_from` — the B2 incident,
   pinned: a re-run may never return an id whose stored status disagrees with the payload.
 - Migration audit against a POPULATED legacy table (the standing lesson).
+
+> **TASK 0 (2026-08-15) — ACCEPTED.** `recognizer.recognition_request_hash` =
+> `contract_hash_v1("recognition-request", "1", …)` over `input_content_hash` + prompt id/version and
+> prompt CONTENT + schema id/version and schema CONTENT + taxonomy version and closed-leaf CONTENT +
+> applicability/recipe-registry versions + the new `recognition.RECOGNITION_VALIDATOR_VERSION` + the
+> resolved recognizer model + the audited seam's generation settings. Content hashes wherever a
+> version number can lie: B4's mutable `register_schema` is exactly that hazard, and a leaf added
+> without a version bump is the same hazard in the taxonomy. `input_content_hash` is carried INTO the
+> material, never replaced by it — the sealed-input path (`load_recognition_input`, and 1024's
+> `contract_generation_input` lineage trigger, which joins on `input_content_hash`) is untouched.
+>
+> **B2 was reproduced before it was fixed**, as a test, not an argument. Scripting the fake provider
+> `[refusal, classified]` and posting the SAME objective twice returned `status="classified"` over a
+> `recognition_id` whose stored row read `technical_failure`: *"the returned recognition_id points at
+> a row whose stored status disagrees with the payload: stored='technical_failure',
+> served='classified'"*. The other two acceptance tests failed against the same unfixed code —
+> `assert 2 == 1` on physical provider calls, and one id returned for two different models.
+>
+> **The invariant is structural, not asserted.** The endpoint no longer builds a response from the
+> in-memory result at all: on a miss it records the attempt, RE-READS the row by id, and serves that;
+> on a hit it serves the stored row with no dispatch. So the concurrent case — another writer winning
+> the insert — cannot reintroduce B2 either: the loser serves the winner's row, which is the row its
+> id names. `recognize` → `recognize_with_audit` at the call site, which is where `llm_call_ref`
+> comes from.
+>
+> **Plan defects found and corrected above, both in Task 0's own text.** (a) *"the old unique key
+> stays until backfilled rows carry the new hash"* — there is no backfill path at all: 1024's
+> `intent_recognition_attempt_no_mutation` trigger refuses UPDATE and DELETE on this table. (b) The
+> task assumed `llm_call_ref` was in hand at the endpoint; it was not — the route called `recognize`,
+> the compatibility projection that discards it.
+>
+> **The coexistence rule chosen, and why.** 0974's `UNIQUE (intent_id, input_hash)` is kept
+> **permanently**, and the widened key rides inside it: `input_hash` was always the *idempotency key*
+> (0974's own comment calls it that, and 1024 gave the sealed content its own `input_content_hash`
+> column precisely because they are different questions), so a request-identity row writes the same
+> value into `input_hash` and the new `recognition_request_hash`, enforced by 1070's
+> `intent_recognition_attempt_request_is_the_key` CHECK. Dropping the old constraint was rejected
+> on a deploy fact, not a preference: migrations land BEFORE the new image, old code names
+> `(intent_id, input_hash)` in an `ON CONFLICT` clause, and Postgres errors when that inference
+> matches no constraint — every recognition would 500 for the length of the window. Legacy rows keep
+> a NULL request hash, which is the truth about them and not a gap; `find_recognition_attempt` matches
+> on the request-hash column only, so a legacy row is never served as the answer to a request whose
+> identity nobody recorded (cost: one provider call on the first re-run of a legacy objective).
+> `llm_call_ref` is nullable and deliberately **not** an FK — `_record_llm_call_durable` commits on a
+> separate connection by design (finding #20) and degrades to best-effort, and recognition is
+> fail-open: an FK could turn a degraded audit into a 5xx.
+>
+> **Migration 1070** (`1070_recognition_request_identity.sql`, FILE ONLY — never applied anywhere):
+> two nullable columns, the CHECK, and a PARTIAL UNIQUE index. Audited against a POPULATED
+> legacy-shape table — dropped back to pre-1070, seeded with legacy rows, re-applied, re-applied
+> again — including a test that runs the OLD `ON CONFLICT (intent_id, input_hash)` statement to prove
+> the inference still resolves. The CHECK was proved load-bearing by weakening it to `CHECK (true)`
+> and watching the refusal test fail.
+>
+> 22 new tests: 4 API (`tests/featuregen/api/test_contract_recognitions.py`), 4 request-identity
+> (`…/taxonomy/test_recognizer.py`, one leg of the contract per assertion), 7 persistence
+> (`…/contract/test_scope_records.py`), 7 migration (`tests/featuregen/db/test_migration_1070.py`).
+> Gates: full suite **11440 passed, 20 skipped** (baseline on `77884e93` was 11418/20 — +22, exactly
+> the tests added); `-m eval` **73 passed**; ruff clean on all touched files; mypy unchanged (the same
+> 6 pre-existing errors in `enrich_llm.py`/`contract.py`, confirmed by HEAD-swap).
 
 ### Task 1 — immutable schema v2, activated (1 day)
 

@@ -144,3 +144,106 @@ def test_recognitions_dedup_is_per_actor(make_client, conn):
         "SELECT count(*) FROM contract_intent WHERE hypothesis = %s",
         (payload["hypothesis"],)).fetchone()[0]
     assert n == 2
+
+
+# ── Task 0 (2026-08-15): request identity — B2, the id that disagreed with its payload ──────────
+
+class _CountingLLM:
+    """A FakeLLM that reports how many PHYSICAL provider requests it served.
+
+    Counting rows in ``llm_call`` would not do: the audit write is best-effort and may land on a
+    separate connection, so an absent row proves nothing about whether the provider was called."""
+
+    def __init__(self, *responses: FakeResponse) -> None:
+        self._inner = FakeLLM(script={RECOGNIZER_TASK: list(responses)})
+        self.calls = 0
+
+    def call(self, request):
+        self.calls += 1
+        return self._inner.call(request)
+
+
+def test_the_returned_recognition_id_is_the_row_the_response_was_built_from(make_client, conn):
+    """B2, pinned. Recognition persistence was idempotent on ``(intent_id, input_hash)`` where
+    ``input_hash`` covered ONLY the redacted user input — so a re-run called the provider AGAIN, got
+    a DIFFERENT answer, and ``ON CONFLICT DO NOTHING`` handed back the FIRST row's id. The response
+    was built from the new in-memory result while confirmation and provenance read the old row.
+
+    On the live incident that meant a screen could say "Churn" over an id whose stored status is
+    ``technical_failure``. The invariant, stated so it cannot regress: the id in the response names
+    the row the response was built from."""
+    llm = _CountingLLM(_REFUSAL, _CLASSIFIED)
+    client = make_client(llm)
+    payload = {"hypothesis": "customers churn when their balance drops",
+               "objective": "predict churn in the next 90 days"}
+    first = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    second = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert first.status_code == 200 and second.status_code == 200, (first.text, second.text)
+    body = second.json()
+    stored = conn.execute(
+        "SELECT status FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (body["recognition_id"],)).fetchone()
+    assert stored is not None, "the returned recognition_id names no row at all"
+    assert stored[0] == body["status"], (
+        "the returned recognition_id points at a row whose stored status disagrees with the "
+        f"payload: stored={stored[0]!r}, served={body['status']!r}")
+
+
+def test_an_identical_request_returns_the_stored_result_without_calling_the_provider(make_client):
+    """The same objective, recognised twice under the same contract, is ONE provider call. Today's
+    second call is a silent double-spend whose answer is then thrown away."""
+    llm = _CountingLLM(_CLASSIFIED)
+    client = make_client(llm)
+    payload = {"hypothesis": "customers churn when their balance drops",
+               "objective": "predict churn in the next 90 days"}
+    first = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert first.status_code == 200, first.text
+    assert llm.calls == 1
+    second = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert second.status_code == 200, second.text
+    assert llm.calls == 1, "an identical request re-called the provider"
+    assert second.json() == first.json()
+
+
+def test_a_changed_prompt_or_model_is_a_new_request(make_client, conn, monkeypatch):
+    """Same user text, different recognition contract → a NEW attempt. The model is one leg of the
+    request identity: the same words classified by a different model are a different question, and
+    the answer to one may not be served as the answer to the other."""
+    llm = _CountingLLM(_CLASSIFIED)
+    client = make_client(llm)
+    payload = {"hypothesis": "customers churn when their balance drops",
+               "objective": "predict churn in the next 90 days"}
+    first = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert first.status_code == 200, first.text
+    monkeypatch.setenv("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")
+    second = client.post("/contract/recognitions", json=payload, headers=AUTH)
+    assert second.status_code == 200, second.text
+    assert second.json()["intent_id"] == first.json()["intent_id"]   # same immutable intent
+    assert second.json()["recognition_id"] != first.json()["recognition_id"]
+    assert llm.calls == 2
+    rows = conn.execute(
+        "SELECT recognizer_model_id FROM intent_recognition_attempt WHERE intent_id = %s "
+        "ORDER BY created_at",
+        (first.json()["intent_id"],)).fetchall()
+    assert [r[0] for r in rows] == ["claude-sonnet-5", "claude-opus-4-8"]
+
+
+def test_the_served_result_and_its_audit_row_are_one_fact(make_client, conn):
+    """``llm_call_ref`` on the attempt itself. Before this, the answer lived in one table and the
+    evidence for it in another, joined by nothing — so "which call produced the row this scope was
+    confirmed from?" had no answer at all."""
+    client = make_client(_llm(_CLASSIFIED))
+    res = client.post("/contract/recognitions", json={
+        "hypothesis": "customers churn when their balance drops",
+        "objective": "predict churn in the next 90 days"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    row = conn.execute(
+        "SELECT recognition_request_hash, input_hash, input_content_hash, llm_call_ref "
+        "FROM intent_recognition_attempt WHERE recognition_id = %s",
+        (res.json()["recognition_id"],)).fetchone()
+    assert row[0] and row[0] == row[1]          # the request identity IS the idempotency key
+    assert row[2] and row[2] != row[0]          # the sealed user input keeps its own, narrower hash
+    assert row[3], "the attempt does not name the audited call that produced it"
+    task = conn.execute(
+        "SELECT task FROM llm_call WHERE llm_call_ref = %s", (row[3],)).fetchone()
+    assert task is not None and task[0] == RECOGNIZER_TASK

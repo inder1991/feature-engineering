@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from featuregen.contracts.contract_versions import contract_owner
 from featuregen.intake.llm import (
     PROVIDER_OK,
     PROVIDER_REFUSAL,
@@ -21,7 +22,14 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
     RecognitionStatus,
 )
-from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK, recognize
+from featuregen.overlay.upload.taxonomy.recognizer import (
+    RECOGNITION_REQUEST_CONTRACT,
+    RECOGNITION_REQUEST_VERSION,
+    RECOGNIZER_TASK,
+    recognition_request_hash,
+    recognition_request_material,
+    recognize,
+)
 from featuregen.overlay.upload.taxonomy.recognizer_prompt import (
     PROMPT_VERSION,
     build_recognition_prompt,
@@ -190,3 +198,66 @@ def test_invalid_primary_still_fails_even_with_valid_dimensions(db) -> None:
     assert result.candidates == ()
     assert result.modelling_contexts == ()
     assert result.target_entity is None
+
+
+# ── Task 0 (2026-08-15): the recognition REQUEST identity ───────────────────────────────────────
+
+
+def test_the_request_hash_covers_every_leg_of_the_contract(monkeypatch) -> None:
+    """One leg per line, each proved by changing ONLY it. This is the whole point of Task 0: the
+    old key covered the redacted user input and nothing else, so a build that would now answer
+    differently kept serving — and re-serving the id of — the old answer."""
+    base = recognition_request_hash(input_content_hash="c" * 64)
+
+    assert recognition_request_hash(input_content_hash="d" * 64) != base       # user input
+    assert recognition_request_hash(
+        input_content_hash="c" * 64, model_id="claude-opus-4-8") != base       # model
+
+    def _leg(module: str, name: str, value: Any) -> str:
+        monkeypatch.setattr(f"featuregen.overlay.upload.taxonomy.{module}.{name}", value)
+        return recognition_request_hash(input_content_hash="c" * 64)
+
+    assert _leg("recognizer", "build_recognition_prompt", lambda: "a different prompt") != base
+    monkeypatch.undo()
+    assert _leg("recognizer", "PROMPT_VERSION", "99") != base
+    monkeypatch.undo()
+    # The schema by CONTENT, not by version number (blocker B4: `register_schema` upserts, so one
+    # version can mean two bodies on two deployments — the number alone is not an identity).
+    assert _leg("recognizer", "canonical_output_schema",
+                lambda _id, _v: {"type": "object"}) != base
+    monkeypatch.undo()
+    assert _leg("recognizer", "TAXONOMY_VERSION", "9.9.9") != base
+    monkeypatch.undo()
+    assert _leg("recognizer", "RECOGNITION_VALIDATOR_VERSION", "2") != base
+    monkeypatch.undo()
+    assert _leg("recognizer", "APPLICABILITY_MAPPING_VERSION", "9.9.9") != base
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.taxonomy.recognizer.current_enrichment_generation_settings",
+        lambda: {"provider": "fake", "model": "test", "max_tokens": 4096})
+    assert recognition_request_hash(input_content_hash="c" * 64) != base       # generation controls
+
+
+def test_the_two_hashes_answer_different_questions() -> None:
+    """``input_content_hash`` keeps its own meaning — the redacted user input, and nothing else —
+    and is carried INTO the request material rather than replaced by it. Neither absorbs the other:
+    sealed-input verification must stay able to re-derive its hash from the input alone."""
+    content = "e" * 64
+    material = recognition_request_material(input_content_hash=content)
+    assert material["input_content_hash"] == content
+    assert recognition_request_hash(input_content_hash=content) != content
+
+
+def test_the_request_hash_is_stable_across_calls() -> None:
+    """No clock, no randomness, no set-ordering: an identity that drifted would make every re-run a
+    new request and reinstate the double-spend Task 0 removes."""
+    assert (recognition_request_hash(input_content_hash="f" * 64)
+            == recognition_request_hash(input_content_hash="f" * 64))
+
+
+def test_the_request_contract_version_is_registered() -> None:
+    """``contract_hash_v1`` refuses an unregistered (name, version) — the loud failure that stops an
+    ungoverned identity being minted. Asserted directly so the registration is not merely implied by
+    the hash happening to work."""
+    assert contract_owner(RECOGNITION_REQUEST_CONTRACT, RECOGNITION_REQUEST_VERSION) == (
+        "featuregen.overlay.upload.taxonomy.recognizer")
