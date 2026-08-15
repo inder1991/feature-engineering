@@ -97,6 +97,7 @@ from featuregen.materialize.compile.chain import (
     L0Interpreter,
     NodeAssembler,
     PublishStepMissing,
+    RunExecution,
     compile_feature_group,
 )
 from featuregen.materialize.compile.wiring import assemble_nodes as _wired_assembler
@@ -125,6 +126,8 @@ from featuregen.materialize.spine import (
     SnapshotPolicyKind,
     SpineSourceDeclarationV1,
 )
+from featuregen.materialize.submit import PipelineSubmitter
+from featuregen.materialize.validation import MetastoreMetadata
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.queue import (
     MaterializationQueueClaim,
@@ -201,6 +204,11 @@ _RELEASED_LEASE_SECONDS = 0.001
 #: derived one — and it is stated ONCE, here.
 COMPILE_BUDGET_SECONDS = 600.0
 
+#: G-2's three stages, read as a SET rather than spelled out at the fold, so a stage added to
+#: ``ChainStage`` and forgotten here fails the test that names this membership rather than being
+#: silently reported as a governed refusal.
+_G2_STAGES = frozenset({ChainStage.PREPARE_RUN, ChainStage.VALIDATE_L1, ChainStage.SUBMIT})
+
 _PROJECT_ROOT_ENV = "FEATUREGEN_MATERIALIZE_PROJECT_ROOT"
 _INVENTORY_ENV = "FEATUREGEN_MATERIALIZE_INVENTORY"
 _L0_PYTHON_ENV = "FEATUREGEN_MATERIALIZE_L0_PYTHON"
@@ -255,6 +263,13 @@ class MaterializationJobV1:
     mechanism: PublishMechanism
     published_schema: tuple[str, ...] | None
     contract_overrides: ContractOverrides | None = None
+    #: The run's business date (``YYYY-MM-DD``), or ``None`` for "this trigger asked for no run".
+    #: G-2's ``prepare_run`` resolves every partition from it, so it is a per-run DECLARATION and
+    #: cannot come from the deployment: a worker-wide date would run every group at whatever day the
+    #: worker was configured with. ``None`` is not a default that means "today" — it is the honest
+    #: statement that the trigger asked for a compilation and not for an execution, and the chain
+    #: records it as an unprepared run rather than picking a date on the caller's behalf.
+    business_dt: str | None = None
 
 
 def encode_job(job: MaterializationJobV1) -> dict[str, Any]:
@@ -272,6 +287,7 @@ def encode_job(job: MaterializationJobV1) -> dict[str, Any]:
                              else list(job.published_schema)),
         "contract_overrides": (None if job.contract_overrides is None
                                else _plain(job.contract_overrides)),
+        "business_dt": job.business_dt,
     }
 
 
@@ -303,6 +319,12 @@ def decode_job(payload: Mapping[str, Any]) -> MaterializationJobV1:
         published_schema=None if schema is None else tuple(
             _texts(schema, where="job published_schema")),
         contract_overrides=None if overrides is None else _decode_overrides(overrides),
+        # `.get` with no version bump: an OPTIONAL key added to a payload version is readable by
+        # both spellings — a job frozen before D1 decodes as `business_dt=None`, which is exactly
+        # what it asked for (a compilation, no run), and one frozen after it is unreadable by no
+        # worker. Bumping PAYLOAD_VERSION would instead dead-letter every in-flight job.
+        business_dt=(None if material.get("business_dt") is None
+                     else _text(material.get("business_dt"), where="job business_dt")),
     )
 
 
@@ -552,6 +574,16 @@ class MaterializationLaneConfig:
     ``l0=None`` is a POSTURE, not a missing setting: the chain records the same ``error`` report an
     interpreter that could not be launched would, and the run terminates ``RUN_FAILED``. It is what
     a deployment with no kedro environment honestly is.
+
+    **``metastore``/``submitter``/``staging_base`` are G-2's half of the same posture** and follow
+    the same rule: ``None`` is an OUTCOME — an unprepared run, terminating ``RUN_FAILED`` at
+    ``ChainStage.PREPARE_RUN`` — never a skipped stage. They are separate fields here and one frozen
+    :class:`~featuregen.materialize.compile.chain.RunExecution` at the chain, because a deployment
+    supplies them one at a time while the chain must be handed either a complete seam or ``None``:
+    :meth:`execution_for` is the ONE place that fold happens, so no caller can assemble a half one.
+    Neither adapter can come from the environment — they are objects, not strings — so every
+    deployment configured by :func:`lane_config_from_env` today has ``metastore=None`` and every run
+    it drives is honestly unprepared.
     """
 
     inventory: ClusterInventoryV1
@@ -560,6 +592,28 @@ class MaterializationLaneConfig:
     assemble_nodes: NodeAssembler = _wired_assembler
     clock: Callable[[], str] = _utc_now_iso
     compile_budget_seconds: float = COMPILE_BUDGET_SECONDS
+    #: G-2's metastore seam — partitions, columns and read scope, metadata only. No implementation
+    #: exists in ``src/`` yet (``inventory.MetastoreInventoryAdapter`` answers capture's questions,
+    #: not L1's), so this is ``None`` in every deployment today.
+    metastore: MetastoreMetadata | None = None
+    #: G-2's submitter. ``LocalClusterSubmitter`` is the one implementation (``submit.py:169``).
+    submitter: PipelineSubmitter | None = None
+    #: §9's staging root base, under which ``staging_root_for`` derives a per-generation path.
+    staging_base: str | None = None
+
+    def execution_for(self, job: MaterializationJobV1) -> RunExecution | None:
+        """The chain's G-2 seam, or ``None`` when this deployment and this job cannot execute a run.
+
+        Four values, three from the deployment and one — the business date — from the JOB, because a
+        business date is a per-run declaration and a deployment-wide one would run every group at
+        whatever date the worker was configured with. ALL FOUR or ``None``: a half-configured seam
+        has no honest partial behaviour, and ``RunExecution`` would refuse it anyway.
+        """
+        if (self.metastore is None or self.submitter is None or self.staging_base is None
+                or job.business_dt is None):
+            return None
+        return RunExecution(metastore=self.metastore, submitter=self.submitter,
+                            business_dt=job.business_dt, staging_base=self.staging_base)
 
     @property
     def lease_seconds(self) -> float:
@@ -713,6 +767,7 @@ def process_materialization_once(
             assemble_nodes=resolved.assemble_nodes,
             project_root=resolved.project_root,
             l0=resolved.l0,
+            execution=resolved.execution_for(job),
             clock=resolved.clock,
             contract_overrides=job.contract_overrides,
         )
@@ -875,6 +930,15 @@ def _recorded(
     on the request (and, once a generation exists, on the plane). Re-delivering it could only
     produce a replay.
 
+    ``run_failed`` is D1's fourth member, and it exists for ``build_unproven``'s reason one stage
+    later: a run that stopped at ``PREPARE_RUN``, ``VALIDATE_L1`` or ``SUBMIT`` was compiled,
+    rendered, sealed AND build-verified, and then could not be prepared, could not be validated
+    against the environment, or ran and failed. Folding those into ``refused`` would tell an
+    operator the catalog refused their feature when the cluster is what did not answer — and
+    ``CompiledGroup.refusal`` is often ``None`` on those paths (an unconfigured execution seam and a
+    failed submission are not governed verdicts at all), so ``detail`` would be empty too. The
+    chain's ``l1_report`` and ``submission`` are where the three are told apart.
+
     ``build_unproven`` and ``refused`` are separate members because they are opposite facts about
     one run. A run that stopped at :attr:`ChainStage.VALIDATE_L0` was compiled, rendered and sealed
     and then FAILED to build (or was never proved to) — there is no governed refusal in it at all,
@@ -889,6 +953,8 @@ def _recorded(
         status = "completed"
     elif outcome.stopped_at is ChainStage.VALIDATE_L0:
         status = "build_unproven"
+    elif outcome.stopped_at in _G2_STAGES:
+        status = "run_failed"
     else:
         status = "refused"
     reported = MaterializationLaneOutcome(

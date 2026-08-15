@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import datetime
 import importlib.util
 import inspect
 import pathlib
@@ -100,7 +101,7 @@ from featuregen.materialize.control_plane import (
     run_status,
 )
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME, read_lock
-from featuregen.materialize.inventory import ClusterInventoryV1
+from featuregen.materialize.inventory import ClusterInventoryV1, EventTimePartition
 from featuregen.materialize.joins import CrossCatalogJoinStepV1
 from featuregen.materialize.publish import (
     ProbeObservation,
@@ -108,12 +109,15 @@ from featuregen.materialize.publish import (
     assess_probe_observations,
     record_attestation,
 )
+from featuregen.materialize.render.project import PIPELINE_NAME, REQUIRED_RUN_PARAMETERS
 from featuregen.materialize.request_store import (
     RequestLifecycle,
     accept_request,
     read_request,
     record_request,
 )
+from featuregen.materialize.runprep import PARTITION_VALUE_FORMS
+from featuregen.materialize.submit import SubmissionOutcome
 from featuregen.materialize.validation import (
     FindingClass,
     ValidationFinding,
@@ -244,14 +248,18 @@ def _clock():
 
 
 def _run(db, request_id, work_item_ids, root, *, overrides=None, published_schema=None,
-         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0,
+         spine=DECLARATION, inventory=INVENTORY, assemble=_assemble, l0=_L0, execution=None,
          **kwargs) -> CompiledGroup:
+    """``execution=None`` is the DEFAULT here for the same reason it is the deployed default: no
+    `MetastoreMetadata` implementation exists in `src/`, so an unprepared run is what a real
+    deployment produces. The G-2 tests hand it a fake; every other test is asserting about a chain
+    that terminates before G-2 is reachable at all."""
     return compile_feature_group(
         db, request_id=request_id, work_item_ids=work_item_ids, inventory=inventory,
         spine_declaration=spine, cadence=_CADENCE, availability_promise=_PROMISE,
         contract_overrides=overrides, mechanism=PublishMechanism.VERSIONED_POINTER,
         published_schema=published_schema, assemble_nodes=assemble, project_root=root, l0=l0,
-        clock=_clock, **kwargs)
+        execution=execution, clock=_clock, **kwargs)
 
 
 # ── the BRIDGED group: the chain's OWN realization load (DEFERRED-WORK A.36) ─────────────────────
@@ -1128,20 +1136,236 @@ def test_no_path_records_a_published_generation(ready, catalog) -> None:
     assert published_generation_ids(catalog) == frozenset()
 
 
-def test_a_PROVEN_capability_stops_the_chain_rather_than_letting_it_claim_a_publish(
-        catalog, monkeypatch, tmp_path) -> None:
-    """The one branch that could produce a lie. If an attestation exists, `select_publisher` returns
-    a selection — and there is no publish step to honour it (plan §3.5, DEFERRED A.26). Rendering a
-    publishing catalog entry for a project nothing will ever publish, and then recording either a
-    terminal that did not happen or no terminal at all, are both worse than stopping."""
-    request_id = _request(catalog, request_id="req-proven")
-    work_items = [_authored(catalog, monkeypatch, suffix="proven")]
+# ── G-2: prepare_run → run_l1 → submit, composed (D1) ────────────────────────────────────────────
+#
+# Every test below needs a PROVEN publication capability, and that is not a convenience: `prepare_run`
+# requires a `capability_attestation_id` and `sandbox_execution_hash` refuses a blank one, so §11.1
+# identifies an execution PARTLY BY the attestation it will publish under. A run in an environment
+# whose capability is unproven has no execution identity — there is nothing to prepare.
+
+_BUSINESS_DT = "2026-07-27"
+"""The spine's declared vintage. `CurrentSnapshot(observed_snapshot_ref="2026-07-27")` holds no
+history, so §4.2 refuses any OTHER business date rather than publishing one day's population under
+another day's — which is why this is the fixture's date and not an arbitrary one."""
+
+
+class _G2Metastore:
+    """A metastore that AGREES with the inventory, so L1 has nothing to find.
+
+    Its three answers are §11.2's. Columns and partition columns come from the layout the
+    compilation was authorized against, so a test cannot accidentally prove L1 passes against a
+    table nobody declared. Partitions are generated from the layout's OWN declared mapping over a
+    band of days around the run's business date — wide enough to cover every window the fixture
+    features declare — because the alternative (stocking the exact resolved set) needs the snapshots
+    `prepare_run` produces INSIDE the chain, which no caller can reach.
+    """
+
+    def __init__(self, inventory, *, business_dt=_BUSINESS_DT, band_days=500) -> None:
+        self._inventory = inventory
+        self._anchor = datetime.date.fromisoformat(business_dt)
+        self._band = band_days
+        self.partitions_asked: list[str] = []
+        self.described: list[str] = []
+        self.read_checks: list[str] = []
+
+    def list_partitions(self, *, schema: str, table: str):
+        self.partitions_asked.append(f"{schema}.{table}")
+        layout = self._inventory.layout_for(schema, table)
+        mapping = None if layout is None else layout.partition_mapping
+        if not isinstance(mapping, EventTimePartition):
+            return ()
+        form = PARTITION_VALUE_FORMS[mapping.transform]
+        return tuple(
+            ((mapping.partition_column, form(self._anchor + datetime.timedelta(days=offset))),)
+            for offset in range(-self._band, self._band + 1))
+
+    def describe_table(self, *, schema: str, table: str):
+        self.described.append(f"{schema}.{table}")
+        layout = self._inventory.layout_for(schema, table)
+        if layout is None:
+            return None
+        return tuple(layout.columns) + tuple(layout.partition_columns or ())
+
+    def can_read(self, *, schema: str, table: str, roles) -> bool:
+        self.read_checks.append(f"{schema}.{table}")
+        return True
+
+
+class _Submitter:
+    """§11.1's submission seam, recording what it was handed. Nothing is launched: the point of the
+    seam is that the control plane never runs the artifact's engines itself."""
+
+    def __init__(self, outcome=None) -> None:
+        self._outcome = outcome or SubmissionOutcome(
+            completed=True, returncode=0, detail="the pipeline completed")
+        self.calls: list[tuple[str, dict]] = []
+
+    def submit(self, project_root, *, run_parameters, pipeline_name=PIPELINE_NAME,
+               required_parameters=REQUIRED_RUN_PARAMETERS) -> SubmissionOutcome:
+        self.calls.append((str(project_root), dict(run_parameters)))
+        return self._outcome
+
+
+def _execution(metastore=None, submitter=None, *, business_dt=_BUSINESS_DT, staging_base="/staging"):
+    return chain.RunExecution(
+        metastore=metastore or _G2Metastore(INVENTORY),
+        submitter=submitter or _Submitter(),
+        business_dt=business_dt, staging_base=staging_base)
+
+
+def test_a_passed_L0_advances_to_prepare_run(catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The composition itself: a build-verified project under a PROVEN capability is prepared,
+    validated against the environment and submitted — in that order, and each stage reached.
+
+    The chain then raises `PublishStepMissing`, because a completed run is exactly the state G-3
+    exists for and there is nothing else true to say about it. That the raise happens INSIDE the
+    commit transaction is the point of the last assertion: nothing is left behind."""
+    request_id = _request(catalog, request_id="req-g2")
+    work_items = [_authored(catalog, monkeypatch, suffix="g2")]
+    _attest_capability(catalog)
+    metastore, submitter = _G2Metastore(INVENTORY), _Submitter()
+
+    with pytest.raises(chain.PublishStepMissing, match="no publish step"):
+        _run(catalog, request_id, work_items, tmp_path,
+             execution=_execution(metastore, submitter))
+
+    assert metastore.described, "L1 never asked the environment about a table"
+    assert metastore.read_checks, "L1 never asked whether these roles may read"
+    assert len(submitter.calls) == 1, "the prepared run was never submitted"
+    assert not list(tmp_path.iterdir()), "the raise rolled back the record but left a tree"
+    assert catalog.execute(
+        "SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
+
+
+def test_a_failed_L0_never_prepares(catalog, monkeypatch, tmp_path) -> None:
+    """A project proved NOT to build has no run to prepare, and resolving partitions for it would
+    resolve them for bytes nobody validated. The seam is fully configured, so the absence of every
+    G-2 call is a decision this chain made and not a thing the test could not reach."""
+    _inject_l0(monkeypatch, status=ValidationStatus.FAILED, findings=(
+        ValidationFinding(code=ValidationFindingCode.PROJECT_DOES_NOT_BUILD,
+                          location="sandbox_feature_cif_daily.pipeline_registry",
+                          expected="importable", observed="ImportError", count=1),))
+    request_id = _request(catalog, request_id="req-nol0")
+    work_items = [_authored(catalog, monkeypatch, suffix="nol0")]
+    _attest_capability(catalog)
+    metastore, submitter = _G2Metastore(INVENTORY), _Submitter()
+
+    outcome = _run(catalog, request_id, work_items, tmp_path,
+                   execution=_execution(metastore, submitter))
+
+    assert outcome.stopped_at is ChainStage.VALIDATE_L0
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.l1_report is None and outcome.submission is None
+    assert metastore.partitions_asked == [] and metastore.described == []
+    assert submitter.calls == []
+
+
+def test_the_prepared_parameters_are_exactly_REQUIRED_RUN_PARAMETERS(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """§11.1's rule, at the one seam that could break it: submission passes the PREPARED parameters,
+    not `business_dt` alone. Equality in both directions — a missing one is a value the rendered
+    `RunParametersHook` refuses, and an extra one is a value nothing in the project reads."""
+    request_id = _request(catalog, request_id="req-params")
+    work_items = [_authored(catalog, monkeypatch, suffix="params")]
+    _attest_capability(catalog)
+    submitter = _Submitter()
+
+    with pytest.raises(chain.PublishStepMissing):
+        _run(catalog, request_id, work_items, tmp_path, execution=_execution(submitter=submitter))
+
+    _root, parameters = submitter.calls[0]
+    assert set(parameters) == set(REQUIRED_RUN_PARAMETERS)
+    assert parameters["business_dt"] == _BUSINESS_DT
+    assert parameters["staging_root"].startswith("/staging/")
+    assert parameters["input_snapshots"], "a run that resolved no read is not a prepared run"
+
+
+def test_a_submission_failure_is_RUN_FAILED_with_the_returncode_in_the_detail(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """A pipeline that RAN and failed is not a governed refusal about a feature, and it is not a
+    build that could not be proved either: the terminal is `RUN_FAILED` at `ChainStage.SUBMIT`, and
+    the returncode is in the event's detail because it is what routes an operator to the logs."""
+    request_id = _request(catalog, request_id="req-submitfail")
+    work_items = [_authored(catalog, monkeypatch, suffix="submitfail")]
+    _attest_capability(catalog)
+    submitter = _Submitter(SubmissionOutcome(
+        completed=False, returncode=42, detail="the pipeline raised in node compute_total"))
+
+    outcome = _run(catalog, request_id, work_items, tmp_path,
+                   execution=_execution(submitter=submitter))
+
+    assert outcome.stopped_at is ChainStage.SUBMIT
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.lifecycle_state is RequestLifecycle.FAILED
+    assert outcome.refusal is None, "a failed pipeline is not a governed verdict about a feature"
+    assert outcome.submission is not None and outcome.submission.returncode == 42
+    assert outcome.l1_report is not None and outcome.l1_report.status is ValidationStatus.PASSED
+    assert outcome.sandbox_execution_hash
+    detail = read_run_events(catalog, outcome.run_id)[-1].detail
+    assert "42" in detail and "compute_total" in detail
+    assert "returncode" in detail
+
+
+def test_a_submission_that_never_STARTED_is_not_reported_as_one_that_failed(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """`submit.py:60`'s distinction, carried to the plane. `returncode is None` means no process
+    produced a verdict about the pipeline, and printing an exit status would be an invented
+    observation — the two route to different people."""
+    request_id = _request(catalog, request_id="req-nostart")
+    work_items = [_authored(catalog, monkeypatch, suffix="nostart")]
+    _attest_capability(catalog)
+    submitter = _Submitter(SubmissionOutcome(
+        completed=False, returncode=None, detail="the interpreter could not be launched"))
+
+    outcome = _run(catalog, request_id, work_items, tmp_path,
+                   execution=_execution(submitter=submitter))
+
+    assert outcome.stopped_at is ChainStage.SUBMIT
+    detail = read_run_events(catalog, outcome.run_id)[-1].detail
+    assert "never started" in detail and "returncode" not in detail
+
+
+def test_a_PROVEN_capability_without_an_execution_seam_is_an_UNPREPARED_run(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """`execution=None` is the deployed posture — no `MetastoreMetadata` exists in `src/` — and it
+    is an OUTCOME, never a skipped stage: the run stops at `PREPARE_RUN` and says which four things
+    the deployment did not configure. It must NOT be reported as a publication refusal (publication
+    capability is PROVEN here) and it must not claim a publish either."""
+    request_id = _request(catalog, request_id="req-unprepared")
+    work_items = [_authored(catalog, monkeypatch, suffix="unprepared")]
     _attest_capability(catalog)
 
-    with pytest.raises(chain.PublishStepMissing, match="publish step"):
-        _run(catalog, request_id, work_items, tmp_path)
+    outcome = _run(catalog, request_id, work_items, tmp_path, execution=None)
 
-    assert not list(tmp_path.iterdir())
+    assert outcome.stopped_at is ChainStage.PREPARE_RUN
+    assert outcome.terminal_event is RunEventKind.RUN_FAILED
+    assert outcome.lifecycle_state is RequestLifecycle.FAILED
+    assert outcome.submission is None and outcome.l1_report is None
+    detail = read_run_events(catalog, outcome.run_id)[-1].detail
+    assert "no run execution seam" in detail
+    assert "RunExecution" in detail
+    assert published_generation_ids(catalog) == frozenset()
+
+
+def test_an_UNPROVEN_capability_still_terminates_PUBLICATION_REFUSED_and_prepares_nothing(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """G-1's terminal survives D1 unchanged, and the seam being fully configured is what proves the
+    chain declined rather than could not: with no attestation there is no `capability_attestation_id`
+    to identify an execution with, so there is nothing to prepare — and that reason is already the
+    terminal's own detail."""
+    request_id = _request(catalog, request_id="req-unproven")
+    work_items = [_authored(catalog, monkeypatch, suffix="unproven")]
+    metastore, submitter = _G2Metastore(INVENTORY), _Submitter()
+
+    outcome = _run(catalog, request_id, work_items, tmp_path,
+                   execution=_execution(metastore, submitter))
+
+    assert outcome.stopped_at is ChainStage.PUBLISHER
+    assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
+    assert outcome.lifecycle_state is RequestLifecycle.COMMITTED
+    assert outcome.refusal is not None
+    assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
+    assert metastore.partitions_asked == [] and submitter.calls == []
 
 
 def _attest_capability(db) -> None:

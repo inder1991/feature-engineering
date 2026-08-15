@@ -1744,9 +1744,29 @@ plane (migration 1034's closed vocabulary). The append-only law holds: still no 
 this module (D3 owns that), and `test_the_chain_can_never_append_PUBLISHED` stays green until D3
 deliberately changes it.
 
+> **PLAN CORRECTION (D1, verified).** "After `VALIDATE_L0` passed" is necessary and **not
+> sufficient**: `prepare_run` takes a `capability_attestation_id` (`runprep.py:841`) and
+> `sandbox_execution_hash` refuses a blank one — *"a defaulted `capability_attestation_id` would let
+> an execution be identified without naming the attestation §10.3 requires"* (`identity.py:494`).
+> So §11.1 identifies an execution PARTLY BY the attestation it will publish under, and G-2 is
+> reachable **only under a `PublisherSelection`** — precisely the branch that raised
+> `PublishStepMissing` before rendering. Two structural consequences: the raise **moves to after
+> `SUBMIT`** (an unprepared run and a failed submission each have a truer thing to say than "the
+> publish step is missing"), and the two existing proven-capability tests change with it.
+
 **Modify:** `queue_lane.py` — `MaterializationLaneConfig` gains the submitter and the metastore
 adapter; both `None`-able, and `None` is an honest **outcome** (an unprepared run), never a skip —
 the same rule `run_l0` already follows.
+
+> **PLAN CORRECTION (D1, verified).** Two, not three, is the wrong count and the deployment is the
+> wrong owner for one of them. `prepare_run` also needs a **`staging_base`** (deployment) and a
+> **`business_dt`** (per-RUN — a worker-wide date would run every group at whatever day the worker
+> was configured with), and `MaterializationJobV1` carried no business date at all. The date rides
+> the queue payload as an OPTIONAL key with **no `PAYLOAD_VERSION` bump**: an optional key added to
+> a version is readable by both spellings, a job frozen before D1 decodes as `business_dt=None`
+> (which is what it asked for — a compilation, not a run), and bumping the version would instead
+> dead-letter every in-flight job. All four fold into ONE frozen `chain.RunExecution` at
+> `MaterializationLaneConfig.execution_for(job)`, so no caller can assemble a half-configured seam.
 
 **Acceptance (tests):** extend `tests/featuregen/materialize/test_chain.py`
 - `test_a_passed_L0_advances_to_prepare_run`, `test_a_failed_L0_never_prepares`
@@ -1755,6 +1775,66 @@ the same rule `run_l0` already follows.
 - `test_the_chain_still_appends_no_PUBLISHED`
 - The real-JVM half runs in `l0_gate.py`'s sibling (`make l0-gate`), not the default suite —
   `pyspark`/`kedro` are deliberately not dependencies of this platform.
+
+> **ACCEPTED `PENDING-D1` (2026-08-15).** G-2 is composed: `prepare_run` → `run_l1` → `submit`,
+> inside `_commit`'s one transaction, on a run whose L0 PASSED and whose publication capability was
+> PROVEN. **THE TWO PLAN CORRECTIONS ARE ABOVE**, both structural — the attestation is part of an
+> execution's identity, and the run's business date is not the deployment's to state.
+>
+> **THE LADDER, and why every rung is an OUTCOME rather than a skip** (`run_l0`'s rule, applied
+> four more times). `_RunAttempt` is the ONE place the terminal, the lifecycle and `stopped_at` are
+> decided together, because they are three readings of one fact and three expressions computing
+> them from the same booleans is how they come to disagree.
+> `VALIDATE_L0` not passed → nothing downstream is attempted (a run whose bytes were never
+> validated has no artifact to resolve partitions for) · no selection → `PUBLICATION_REFUSED`,
+> **G-1's terminal, unchanged**, and the reason is already its own detail · `execution=None` →
+> `RUN_FAILED` at `PREPARE_RUN` naming the four things the deployment did not configure · a spine
+> vintage or snapshot refusal → `PREPARE_RUN` with the governed code · L1 not passed →
+> `VALIDATE_L1` · a submission that ran and failed → `SUBMIT` with the returncode in the detail; one
+> that never STARTED → `SUBMIT` **without** one, because `returncode is None` means no process
+> produced a verdict and printing an exit status would be an invented observation · a completed
+> submission → `PublishStepMissing`, **which now rolls the whole record back** (generation,
+> artifact, both reports, tree) rather than committing a terminal nobody can write.
+>
+> **G-2 IS COMPOSED AND NOT YET RUNNABLE OUTSIDE TESTS, and that is honest rather than a gap.** No
+> `MetastoreMetadata` implementation exists anywhere in `src/` — `inventory.MetastoreInventoryAdapter`
+> answers CAPTURE's three questions (`describe_columns` / `describe_partition_columns` /
+> `table_location`), not L1's (`list_partitions` / `describe_table` / `can_read`) — so
+> `lane_config_from_env` produces `metastore=None` and every deployed run is honestly unprepared.
+> Writing that adapter is the operator-facing precondition for E1/E2, not a defect here.
+>
+> **Two existing tests changed, each recorded rather than quietly fixed.**
+> `test_a_PROVEN_capability_stops_the_chain_rather_than_letting_it_claim_a_publish` became
+> `..._without_an_execution_seam_is_an_UNPREPARED_run`: the terminal is now PRECISE where it used to
+> be blunt, and it must not read as a publication refusal because publication capability is PROVEN
+> on that path. The lane's `test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason` split
+> in two — the unconfigured deployment is `run_failed` with a `done` queue row (the message WAS
+> processed), and the plan's own
+> `test_the_lane_classifies_PublishStepMissing_instead_of_crashing` is the fully-configured half,
+> still `dead`-lettered and still un-retried. **Both are deleted by D3.** `_recorded` gained a
+> fourth lane status, `run_failed`, kept apart from `refused` for `build_unproven`'s reason: there
+> is no governed verdict about a feature on those three stages, and `CompiledGroup.refusal` is
+> often `None`.
+>
+> **A BRIDGED GROUP REFUSES AT `PREPARE_RUN`, by construction.** `prepare_run` requires a
+> `BridgeExecutionAuthorization` covering the artifact's exact IRs whenever the compilation declares
+> realization dependencies (`runprep.py:859`) and this chain has no parameter carrying one, so a
+> cross-catalog group stops with `JOIN_CARDINALITY_UNKNOWN` rather than executing an unauthorized
+> hop. That is ALSO what makes the default `required_parameters` correct at the submit seam: the one
+> name that widens the rendered set is `bridge_predicate_values` (`render/project.py:1296`), which
+> only a bridged artifact wires — and no bridged artifact can reach the submission. This is
+> DEFERRED-WORK A.39's "the two tiers meet in G-2" row, met and fail-closed.
+>
+> **Mutant proof, three, each caught:** (a) `execution=None` folded to `PUBLICATION_REFUSED` — the
+> "None is a skip" defect the rule forbids — fails the UNPREPARED test; (b) submitting
+> `{"business_dt": …}` instead of `prepared.parameters` fails
+> `test_the_prepared_parameters_are_exactly_REQUIRED_RUN_PARAMETERS` on the set equality; (c)
+> treating a non-completed submission as completed fails both submission tests (they reach the
+> raise instead). `test_the_chain_can_never_append_PUBLISHED` — the plan's
+> `test_the_chain_still_appends_no_PUBLISHED`, under the name it already ships with — stays green
+> untouched. 7 new cases in `test_chain.py`, 1 new in `test_queue_lane.py`.
+> Gates: full suite **11154 passed, 20 skipped** (11147/20 after D0); `-m eval` **73 passed**;
+> ruff + mypy clean on both touched source files.
 
 ### Task D2 — the publication probe driver (2 days; the live half is an **operator action**)
 

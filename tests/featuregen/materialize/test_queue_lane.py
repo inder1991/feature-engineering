@@ -23,6 +23,7 @@ import sys
 import pytest
 from tests.featuregen.materialize.test_chain import (
     _ACTOR,
+    _BUSINESS_DT,
     _CADENCE,
     _FEATURE,
     _GROUP,
@@ -32,8 +33,10 @@ from tests.featuregen.materialize.test_chain import (
     _attest_capability,
     _authored,
     _clock,
+    _G2Metastore,
     _inject_l0,
     _seed,
+    _Submitter,
 )
 from tests.featuregen.materialize.test_inventory import _document, _write
 from tests.featuregen.materialize.test_ir import DECLARATION, INVENTORY
@@ -44,7 +47,7 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
 
 from featuregen.materialize import queue_lane
 from featuregen.materialize.codes import ValidationFindingCode
-from featuregen.materialize.compile.chain import L0Interpreter
+from featuregen.materialize.compile.chain import ChainStage, L0Interpreter
 from featuregen.materialize.compile.wiring import assemble_nodes
 from featuregen.materialize.control_plane import read_run_events
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
@@ -89,19 +92,25 @@ def _recorded(db, *, request_id="req-lane-1", group=_GROUP, roles=_ROLES):
                           idempotency_key=f"key-{request_id}", activation_state={"flag": "on"})
 
 
-def _job(request_id: str, work_item_ids) -> MaterializationJobV1:
+def _job(request_id: str, work_item_ids, *, business_dt=None) -> MaterializationJobV1:
     return MaterializationJobV1(
         request_id=request_id, work_item_ids=tuple(work_item_ids), spine_declaration=DECLARATION,
         cadence=_CADENCE, availability_promise=_PROMISE,
         mechanism=PublishMechanism.VERSIONED_POINTER, published_schema=None,
-        contract_overrides=None)
+        contract_overrides=None, business_dt=business_dt)
 
 
-def _config(tmp_path, *, l0=_L0) -> MaterializationLaneConfig:
-    """The DEPLOYMENT's half of the configuration — what the handler resolves at the boundary."""
+def _config(tmp_path, *, l0=_L0, metastore=None, submitter=None,
+            staging_base=None) -> MaterializationLaneConfig:
+    """The DEPLOYMENT's half of the configuration — what the handler resolves at the boundary.
+
+    G-2's three fields default to `None` because that is what `lane_config_from_env` produces in
+    every deployment: neither adapter can come from an environment variable, and no
+    `MetastoreMetadata` implementation exists in `src/` at all. A run driven by this configuration
+    is honestly unprepared, which is the outcome the chain records."""
     return MaterializationLaneConfig(
         inventory=INVENTORY, project_root=str(tmp_path), l0=l0, assemble_nodes=assemble_nodes,
-        clock=_clock)
+        clock=_clock, metastore=metastore, submitter=submitter, staging_base=staging_base)
 
 
 @pytest.fixture
@@ -344,18 +353,54 @@ def test_the_job_a_worker_reads_back_is_the_job_that_was_frozen(catalog) -> None
 
 # ── failures: each one legible, none of them half a state ────────────────────────────────────────
 
-def test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason(
+def test_a_PROVEN_capability_this_deployment_cannot_EXECUTE_is_run_failed_not_publish_step_missing(
         catalog, monkeypatch, l0_passes, tmp_path) -> None:
-    """`PublishStepMissing` is a named exception the chain raises when publication capability is
-    PROVEN and G-3's publish step does not exist. It is a statement about the PLATFORM, so it must
-    not crash into the generic error path: the request fails, the reason is durable, and the row is
-    not retried (an operator ingesting an attestation is not a transient fault)."""
+    """D1 made this terminal PRECISE, and the precision is the point.
+
+    Before G-2 was composed, ANY proven capability raised `PublishStepMissing` before the project
+    was even rendered. Now the chain says the truer thing first: this deployment configures no
+    metastore adapter, no submitter and no staging base, so the run was never prepared — and the
+    publish step is not what is missing, because nothing ever got near it. `run_failed` is the
+    lane's word for the three G-2 stages, kept apart from `refused` because there is no governed
+    verdict about a feature here at all (`CompiledGroup.refusal` is `None`).
+
+    The message was PROCESSED — the chain recorded a terminal — so the queue row is `done` rather
+    than dead-lettered, and the project stays on disk as the evidence of what was built."""
     request = _recorded(catalog, request_id="req-lane-proven")
     work_items = [_authored(catalog, monkeypatch, suffix="laneproven")]
     enqueue_materialization(catalog, request, job=_job(request.request_id, work_items))
     _attest_capability(catalog)
 
     outcome = _drain(catalog, _config(tmp_path))
+
+    assert outcome.status == "run_failed"
+    assert outcome.stopped_at == ChainStage.PREPARE_RUN.value
+    assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
+        RequestLifecycle.FAILED
+    status, _error, _, _ = _queue_row(catalog, request.request_id)
+    assert status == "done"
+    assert "no run execution seam" in read_run_events(
+        catalog, read_request(catalog, request_id=request.request_id).run_id)[-1].detail
+
+
+def test_the_lane_classifies_PublishStepMissing_instead_of_crashing(
+        catalog, monkeypatch, l0_passes, tmp_path) -> None:
+    """The landmine's other end. With G-2 fully configured, a run that EXECUTES under a proven
+    capability reaches the one state G-3 exists for and the chain raises — a statement about the
+    PLATFORM, so it must not crash into the generic error path. The request fails, the reason is
+    durable on the queue row, and the message is dead-lettered rather than retried: an operator
+    ingesting an attestation is not a transient fault, and no retry can change it.
+
+    **DELETED BY D3**, with `PublishStepMissing` itself."""
+    request = _recorded(catalog, request_id="req-lane-executes")
+    work_items = [_authored(catalog, monkeypatch, suffix="laneexecutes")]
+    enqueue_materialization(catalog, request, job=_job(
+        request.request_id, work_items, business_dt=_BUSINESS_DT))
+    _attest_capability(catalog)
+
+    outcome = _drain(catalog, _config(
+        tmp_path, metastore=_G2Metastore(INVENTORY), submitter=_Submitter(),
+        staging_base="/staging"))
 
     assert outcome.status == "publish_step_missing"
     assert read_request(catalog, request_id=request.request_id).lifecycle_state is \
