@@ -294,7 +294,7 @@ results. The output-only wrapper keeps returning `None` for every invalid result
 **[R5]** `test_every_existing_call_site_is_byte_identical` (renamed from
 `test_all_twelve_…` — the count was wrong, and a count in a test NAME goes stale silently).
 
-> **TASK 2 (2026-08-15) — ACCEPTED `TASK2_HASH`.** `drive_audited_structured_call` and its
+> **TASK 2 (2026-08-15) — ACCEPTED `6fa9c0a8`.** `drive_audited_structured_call` and its
 > output-only projection now take `validate_semantics`, and the hardcoded lambda became
 > `_compose_validation` — **registered schema FIRST, then the caller's semantics**. The order is the
 > contract: a semantic validator reading a body the registry has not accepted would be reading
