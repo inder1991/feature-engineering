@@ -135,7 +135,53 @@ def _published_columns(plan) -> list[str]:
     return [column.name for column in expected_schema(plan)]
 
 
+@pytest.fixture(autouse=True)
+def _the_publish_step_exists(monkeypatch) -> None:
+    """**TEMPORARY — G-3 deletes this fixture with the guard it disarms.**
+
+    Most of this module tests §10.3's selection algebra, which needs PASSING attestations in the
+    table. `record_attestation` refuses to write one while G-3's publish step does not exist (plan
+    §0.4), so these tests state plainly that they are building that state on purpose — which is
+    exactly the difference the guard exists to draw between a test and an operator.
+    `test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists` turns it back
+    off, which is what makes this fixture safe to have.
+    """
+    monkeypatch.setattr(publish_module, "_PUBLISH_STEP_REGISTERED", True)
+
+
 # ══ 1. the back door that must not exist ═════════════════════════════════════════════════════════
+
+
+def test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists(
+        db, monkeypatch) -> None:
+    """§0.4's landmine, disarmed at the writer. **DELETED BY G-3, with the guard.**
+
+    Ingesting a probe result is a legitimate operational act — no code change, no deploy — and the
+    moment one PASSING result exists for a live environment, `select_publisher` returns a selection
+    and `compile/chain.py` has nothing to honour it with: every run of that environment turns from
+    the truthful `CAPABILITY_UNPROVEN` terminal into a `PublishStepMissing` platform error. So the
+    refusal is at the WRITER, where the operator is, and it names G-3 rather than blaming the probe.
+
+    A FAILING result still records, and that half is not incidental: it is the only evidence that
+    tells `PUBLISH_MECHANISM_UNSUPPORTED` apart from `CAPABILITY_UNPROVEN`, and a guard that
+    swallowed it would erase the distinction while claiming to protect it.
+    """
+    monkeypatch.setattr(publish_module, "_PUBLISH_STEP_REGISTERED", False)
+
+    with pytest.raises(RuntimeError, match="G-3's publish step does not exist"):
+        record_attestation(db, _result(_schema_evolution_run()))
+    assert read_attestations(db, environment_id=ENV,
+                            mechanism=PublishMechanism.VERSIONED_POINTER) == ()
+
+    torn = _clean_swap()
+    torn[1] = _observation("reader-2", "gen-A", columns=_NARROW, digest="digest-half-written")
+    failing = _result(torn, probe_id="probe-failed")
+    assert not failing.passed
+    recorded = record_attestation(db, failing)
+
+    assert recorded.attestation_id == "probe-failed"
+    assert [a.attestation_id for a in read_attestations(
+        db, environment_id=ENV, mechanism=PublishMechanism.VERSIONED_POINTER)] == ["probe-failed"]
 
 
 def test_record_attestation_accepts_ONLY_a_probe_result() -> None:

@@ -1678,17 +1678,58 @@ replacing the hardwired `False` (`:364`).
 
 §0.4. Until the publish step exists, an operator ingesting one passing attestation crashes every run.
 
-**Modify:** `src/featuregen/materialize/queue_lane.py` — catch `PublishStepMissing` in
-`process_materialization_once` and fail the request with a named, operator-legible reason (the
-exception's own docstring says it is "exported and named so a queue lane can classify it").
+~~**Modify:** `src/featuregen/materialize/queue_lane.py` — catch `PublishStepMissing` in
+`process_materialization_once`~~ — **ALREADY BUILT, verified.** `queue_lane.py:719-721` already
+catches it and returns `status="publish_step_missing"` with the exception's own text as the durable
+reason; `test_queue_lane.py:345` (`test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason`)
+already asserts the request lands `failed`, the queue row lands `dead` (not retried) and no tree is
+left behind. Both shipped in `b21a794a`, Phase G's own lane commit. This half of D0 is a no-op.
 **Modify:** `src/featuregen/materialize/publish.py` — `record_attestation` refuses to write a
 `passed` attestation while no publish step is registered, naming G-3. A capability record that makes
 the platform crash is not a capability record.
 
 **Acceptance (tests):**
 - `test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists`
-- `test_the_lane_classifies_PublishStepMissing_instead_of_crashing`
+- ~~`test_the_lane_classifies_PublishStepMissing_instead_of_crashing`~~ — exists as
+  `test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason`; not duplicated under a second
+  name.
 - Both tests are **deleted by D3** — record that in the task, so the guard cannot outlive its cause.
+
+> **ACCEPTED `PENDING-D0` (2026-08-15).** **HALF OF THIS TASK WAS ALREADY BUILT** — plan defect
+> found and corrected above. `queue_lane.py:719-721` has caught `PublishStepMissing` and returned
+> `status="publish_step_missing"` since `b21a794a` (Phase G's own lane commit), and
+> `test_a_PROVEN_capability_fails_the_request_with_a_LEGIBLE_reason` already pins the request to
+> `failed`, the queue row to `dead` (not retried — an operator ingesting an attestation is not a
+> transient fault) and the tree to empty. A second test under the plan's name would have asserted
+> the same three facts twice.
+>
+> **What landed: the writer-side guard.** `record_attestation` refuses a PASSING probe result while
+> `_PUBLISH_STEP_REGISTERED` is `False`, naming G-3 and saying what to do instead ("keep the
+> evidence and ingest it once G-3 lands"). A `RuntimeError`, for `PublishStepMissing`'s reason —
+> §14's closed vocabulary has no member for "the step that would act on this has not been built",
+> and typing one in would tell an operator the catalog refused their feature. **A FAILING result is
+> still ingested**, and that half is load-bearing rather than incidental: it is the only evidence
+> that tells `PUBLISH_MECHANISM_UNSUPPORTED` ("the design must change") from `CAPABILITY_UNPROVEN`
+> ("go run the probe"), so a guard that swallowed it would erase the distinction it claims to
+> protect. The new test asserts both directions.
+>
+> **Why a module constant and not a parameter.** A parameter would be a way for the caller to state
+> that the platform HAS a publish step, which is not the caller's fact to state. The three test
+> sites that legitimately need a passing attestation flip it explicitly — an autouse fixture in
+> `test_publish.py` (76 cases turn on §10.3's selection algebra, which needs passing rows) and a
+> try/finally in `test_chain._attest_capability`, which `test_queue_lane.py` imports. That flip IS
+> the guard working: a test building the landmine on purpose is exactly what it distinguishes from
+> an operator stepping on it.
+>
+> **DELETED BY D3**, all of it: the constant, the guard, the fixture, the try/finally and
+> `test_recording_a_passing_attestation_is_refused_until_the_publish_step_exists` — together with
+> `PublishStepMissing` itself, whose absence is the guard's entire cause.
+>
+> **Mutant proof:** deleting the two guard lines makes the new test fail `DID NOT RAISE
+> RuntimeError`. (Flipping the constant's default to `True` does NOT discriminate, because the test
+> sets it itself — recorded so the weaker mutant is not mistaken for the proof.)
+> Gates: full suite **11147 passed, 20 skipped** (baseline on `7daec8a6` was 11146/20);
+> `-m eval` **73 passed**; ruff + mypy clean on all three touched files.
 
 ### Task D1 — G-2 into the chain (3 days)
 

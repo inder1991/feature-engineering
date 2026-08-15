@@ -117,6 +117,22 @@ def _text(value: object, *, field: str, why: str) -> str:
     return value
 
 
+#: **TEMPORARY — G-3 DELETES THIS, together with the guard in :func:`record_attestation`.**
+#:
+#: Whether the publish step that would ACT on a proven capability exists. Until it does,
+#: ``compile/chain.py`` raises ``PublishStepMissing`` the moment ``select_publisher`` returns a
+#: selection, so ingesting one PASSING probe result for a live environment converts every
+#: materialization run of that environment from the truthful ``CAPABILITY_UNPROVEN`` terminal into
+#: a platform error — and ingesting a probe result is a legitimate operational act, not a code
+#: change (plan §0.4).
+#:
+#: It is a module constant rather than a parameter deliberately: a parameter would be a way for the
+#: caller to state that the platform has a publish step, which is not the caller's fact to state.
+#: The tests that deliberately construct the state this guard exists to prevent flip it, which is
+#: the difference between "a test built the landmine on purpose" and "an operator stepped on it".
+_PUBLISH_STEP_REGISTERED = False
+
+
 @dataclass(frozen=True, slots=True)
 class ProbeObservation:
     """ONE reader's ONE look at the publication target while the swap was in flight.
@@ -428,9 +444,22 @@ def record_attestation(
     Returns:
         The attestation as recorded, under ``probe_result.probe_id``.
 
+    **A PASSING result is refused while G-3's publish step does not exist** (plan §0.4, and
+    ``_PUBLISH_STEP_REGISTERED``'s own note). Not because the evidence is doubted — it is refused
+    precisely because it would be BELIEVED: ``select_publisher`` would return a selection, and
+    ``compile/chain.py`` has no step to honour one, so every subsequent run of that environment
+    would fail as a platform error instead of terminating on its truthful refusal. A capability
+    record that makes the platform crash is not a capability record. A FAILING result is still
+    ingested, because nothing acts on it and it is the only evidence that distinguishes
+    ``PUBLISH_MECHANISM_UNSUPPORTED`` from ``CAPABILITY_UNPROVEN``.
+
     Raises:
         TypeError: ``probe_result`` is not a :class:`ProbeResult` — a duck-typed stand-in would be
             a way to supply the verdict directly, which is the whole thing this refuses.
+        RuntimeError: the probe PASSED and G-3's publish step is not registered. A ``RuntimeError``
+            for ``PublishStepMissing``'s reason: this is a statement about the PLATFORM, and §14's
+            closed vocabulary has no member for "the step that would act on this has not been
+            built". **Deleted by G-3.**
         psycopg.errors.UniqueViolation: this probe has already been ingested. One probe is one
             piece of evidence and cannot support two attestations.
     """
@@ -439,6 +468,16 @@ def record_attestation(
             f"record_attestation ingests a ProbeResult, got {type(probe_result).__name__}: §10.3 "
             f"says an attestation may be created ONLY by ingesting a probe result, and accepting "
             f"anything shaped like one would restore the `passed=True` back door it removed")
+    if probe_result.passed and not _PUBLISH_STEP_REGISTERED:
+        raise RuntimeError(
+            f"probe {probe_result.probe_id!r} PASSED for environment "
+            f"{probe_result.environment_id!r} and mechanism {probe_result.mechanism.value}, and "
+            f"G-3's publish step does not exist: recording it would make select_publisher return a "
+            f"selection that compile/chain.py has no metastore write, active-revision record or "
+            f"pointer swap to honour, so every materialization run of that environment would raise "
+            f"PublishStepMissing instead of terminating on its truthful CAPABILITY_UNPROVEN "
+            f"refusal. Keep the evidence and ingest it once G-3 lands; a FAILING probe result is "
+            f"still recorded today, because nothing acts on one")
     attestation = PublicationCapabilityAttestation(
         attestation_id=probe_result.probe_id,
         environment_id=probe_result.environment_id,

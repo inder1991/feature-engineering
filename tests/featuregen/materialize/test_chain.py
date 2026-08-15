@@ -64,6 +64,7 @@ from tests.featuregen.materialize.test_resolve import (  # noqa: F401 — `no_ds
 from tests.featuregen.materialize.test_wiring import CRM_PHYSICAL, CROSS_CATALOG_DECLARATION
 
 from featuregen.materialize import control_plane
+from featuregen.materialize import publish as publish_module
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import (
@@ -1146,7 +1147,13 @@ def test_a_PROVEN_capability_stops_the_chain_rather_than_letting_it_claim_a_publ
 def _attest_capability(db) -> None:
     """A PASSING attestation that also covers schema evolution, for this environment, mechanism and
     engine versions — ingested through the only door there is (`record_attestation` accepts nothing
-    but a probe result, and every field of that result is derived from the observations)."""
+    but a probe result, and every field of that result is derived from the observations).
+
+    It flips `publish._PUBLISH_STEP_REGISTERED` for the write, because D0's guard refuses a passing
+    attestation while G-3's publish step does not exist. That is the point of the guard and not a
+    way around it: building the landmine on purpose is what these tests are FOR, and an operator
+    doing it by accident is what the guard stops. **G-3 deletes the flip with the guard.**
+    """
     observations = tuple(
         ProbeObservation(reader_id=f"reader-{index}", observed_at=f"2026-08-03T10:00:0{index}+00:00",
                          generation_id=generation, column_names=columns, row_count=7,
@@ -1161,7 +1168,12 @@ def _attest_capability(db) -> None:
         engine_versions=INVENTORY.engine_versions,
         completed_at="2026-08-03T10:00:09+00:00")
     assert result.passed and result.covers_schema_evolution, result
-    record_attestation(db, result)
+    registered = publish_module._PUBLISH_STEP_REGISTERED
+    publish_module._PUBLISH_STEP_REGISTERED = True
+    try:
+        record_attestation(db, result)
+    finally:
+        publish_module._PUBLISH_STEP_REGISTERED = registered
 
 
 # ── one test per refusing stage: it stops THERE, records the code, leaves nothing behind ─────────
