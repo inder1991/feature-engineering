@@ -169,6 +169,11 @@ def parse_versioned(raw: Mapping[str, Any]):
         return parse_proposal_v1(raw)
     if version == 2:
         return parse_proposal_v2(raw)
+    if version == 3:
+        # C-A2: the Formula-V2 LANGUAGE at wire version 3 — not a v3 language. Imported inside the
+        # dispatch because `parse_v3` imports this module's builders; a module-top import is a cycle.
+        from featuregen.formula.parse_v3 import parse_proposal_v3
+        return parse_proposal_v3(raw)
     raise SchemaError(
         f"formula_schema_version must be declared as 1 or 2; got {version!r} — a version is "
         "stated, never inferred from body shape")

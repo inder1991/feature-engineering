@@ -91,8 +91,17 @@ def test_the_dispatch_reads_the_declared_version_and_nothing_else():
     unversioned.pop("formula_schema_version")
     with pytest.raises(SchemaError, match="never inferred from body shape"):
         parse_versioned(unversioned)
+    # C-A2: 3 is now a KNOWN version (the Formula-V2 language at wire schema 3), so the
+    # unknown-version arm is asserted on a version that really is unknown.
     with pytest.raises(SchemaError, match="never inferred"):
-        parse_versioned({**v1_doc, "formula_schema_version": 3})
+        parse_versioned({**v1_doc, "formula_schema_version": 99})
+    # And the rule this test is named for still holds in the other direction: the DECLARED version
+    # decides, never the body shape. A v1-shaped body labelled 3 is parsed as v3 — structurally it
+    # is a valid v3 proposal, and sniffing the body to second-guess the label is precisely what
+    # this dispatch refuses to do.
+    from featuregen.formula.schema_v3 import TypedFormulaProposalV3
+    assert isinstance(parse_versioned({**v1_doc, "formula_schema_version": 3}),
+                      TypedFormulaProposalV3)
 
 
 def test_the_distributional_group_parses_and_the_argument_is_disciplined():
