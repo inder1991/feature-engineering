@@ -67,6 +67,11 @@ from featuregen.formula.authoring_v2 import (
     classify_output_policy_v2,
     forbids_authored_artifact_v2,
 )
+from featuregen.formula.authoring_versions import (
+    LEGACY_RESTART_REQUIRED,
+    BundleClassV2,
+    classify_version_bundle,
+)
 from featuregen.formula.capability_v2 import classify_formula_capability_v2
 from featuregen.formula.control import (
     FormulaControlFlow,
@@ -127,7 +132,7 @@ __all__ = [
 #: The wiring version of THIS orchestrator (stage order, resume points, axis mapping). Its own
 #: number beside ``authoring_v2``'s: the two modules can be re-wired independently, and a frozen
 #: run's manifest must name the one that decided it.
-AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 1
+AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 2   # C-A6: see `authoring_versions` for the policy
 
 #: The facts reader's contract: one v2 proposal in, the ref-keyed bundle plus the governed reads
 #: that failed CLOSED out. The worker injects ``FrozenRecipeReadContext.formula_facts_v2``.
@@ -359,6 +364,21 @@ def _technical_failure(conn, run_id: str, seq: int, reason: str, *,
     return result
 
 
+def _stored_versions(conn, run_id: str) -> dict | None:
+    """The version bundle a run was OPENED under, read back from its immutable manifest row.
+
+    Read rather than assumed, because for an existing run the bundle this build would write is not
+    the bundle that decided it — which is the whole question C-A6 asks.
+    """
+    row = conn.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id=%s", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    versions = row[0]
+    return dict(versions) if versions else None
+
+
 def run_authoring_v2_replay(
     conn,
     intent,
@@ -376,6 +396,7 @@ def run_authoring_v2_replay(
     critic_metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
+    formula_schema_version: int = 2,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
     resumably, under a lease, against a frozen configuration.
@@ -385,7 +406,9 @@ def run_authoring_v2_replay(
     """
     versions: dict[str, Any] = {
         "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
-        "formula_schema": 2,
+        # C-A6 — RECORDED, not hardcoded. A v3 run must not inherit `2`: the manifest would then
+        # say a v2 formula was authored, and every later reader keyed on it would agree.
+        "formula_schema": formula_schema_version,
         "operation_grammar": OPERATION_GRAMMAR_VERSION_V2,
         "critic": CRITIC_POLICY_VERSION,
         "disposition": DISPOSITION_POLICY_VERSION_V2,
@@ -398,6 +421,39 @@ def run_authoring_v2_replay(
             frozen_configuration.configuration_policy_version)
         versions["frozen_configuration_hash"] = frozen_configuration.configuration_hash
     intent_hash = canonical_hash(_intent_material(intent))
+
+    # C-A6 — classify the STORED manifest BEFORE opening the run. `open_authoring_run` compares
+    # `(intent_hash, versions, actor)` against the existing row and raises on any difference, so a
+    # legacy run would be refused there with a bare identity error before any adapter could be
+    # chosen. The manifest is written once (the run table is write-once by trigger), so for a run
+    # that already exists this is what the software that decided it declared — not what this build
+    # would declare now.
+    stored_versions = _stored_versions(conn, authoring_run_id) if authoring_run_id else None
+    if stored_versions is not None:
+        bundle = classify_version_bundle(stored_versions, current=versions)
+        if bundle is BundleClassV2.UNKNOWN:
+            raise RecoveryRequiresReconciliation(
+                f"authoring run {authoring_run_id} carries a version bundle this build does not "
+                f"recognise ({sorted(stored_versions.items())}): a partial match is not close "
+                f"enough, because the key it differs on is precisely the one that decided "
+                f"something differently")
+        if bundle is BundleClassV2.LEGACY:
+            # READ-ONLY, and the run is NOT re-opened: the row exists, and opening it under the
+            # current bundle is exactly the identity conflict this branch avoids.
+            # `load_verified_checkpoint` is handed the STORED bundle so the trace verifies against
+            # the manifest it was written under — the intent hash is still compared, so a changed
+            # intent refuses here exactly as it would on the current path.
+            legacy = load_verified_checkpoint(
+                conn, authoring_run_id, intent_hash=intent_hash, versions=stored_versions)
+            if legacy.terminal_result is not None:
+                return _restore_terminal_result(legacy, authoring_run_id)
+            raise RecoveryRequiresReconciliation(
+                f"{LEGACY_RESTART_REQUIRED}: authoring run {authoring_run_id} was opened under the "
+                f"pre-C-A6 orchestrator and did not reach a terminal result. Resuming would append "
+                f"new-orchestrator events — including REVIEW_BYPASSED, a transition the old stage "
+                f"table never allowed — under a manifest saying version 1 decided this run. "
+                f"Restart the run instead; the existing trace is left exactly as it is")
+
     run_id = open_authoring_run(
         conn,
         intent_hash=intent_hash,

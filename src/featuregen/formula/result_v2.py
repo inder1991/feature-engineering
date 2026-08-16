@@ -59,7 +59,7 @@ __all__ = [
 #: Version of the v2 fold precedence + coherence rules stamped on every v2 result. Its own pin:
 #: v1's :data:`~featuregen.formula.result.DISPOSITION_POLICY_VERSION` must be free to move without
 #: restamping v2 runs, and vice versa.
-DISPOSITION_POLICY_VERSION_V2 = 1
+DISPOSITION_POLICY_VERSION_V2 = 2   # C-A6: REVIEW_BYPASSED is a disposition this version knows
 
 #: The output statuses under which NO authoritative output policy can exist (§F honesty core).
 _UNRESOLVED_OUTPUT: frozenset[str] = frozenset({"needs_authority", "external_requirement"})

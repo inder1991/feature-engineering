@@ -121,7 +121,7 @@ __all__ = [
 ]
 
 #: Version of THIS orchestrator's wiring (stage order, axis mapping, trace vocabulary).
-AUTHORING_ORCHESTRATOR_VERSION_V2 = 1
+AUTHORING_ORCHESTRATOR_VERSION_V2 = 2   # C-A6: the stage mapping gained REVIEW_BYPASSED
 
 #: Every rule/registry version a v2 run is decided under, stamped on the manifest BEFORE any
 #: provider call, so a later policy bump can never be mistaken for the one that produced a verdict.

@@ -27,6 +27,7 @@ from tests.featuregen.formula.authoring_fixtures import (
 )
 
 from featuregen.formula import replay_authoring
+from featuregen.formula.result_v2 import DISPOSITION_POLICY_VERSION_V2
 from featuregen.formula.author import AUTHOR_TASK
 from featuregen.formula.critic import CRITIC_TASK
 from featuregen.formula.frozen_configuration import (
@@ -147,7 +148,9 @@ def test_the_orchestrator_wires_author_parse_authority_critic_and_trace(db) -> N
         output_additivity=result.candidate_output.output_additivity,
         external_type_required=False)
     assert result.candidate_proposal_hash and len(result.candidate_proposal_hash) == 64
-    assert result.disposition_policy_version == 1
+    assert result.disposition_policy_version == DISPOSITION_POLICY_VERSION_V2, (
+        "the constant, not a literal — C-A6 bumps it and a literal here would pin the run's"
+        " disposition version to a value the code no longer uses")
     assert run_status(db, "far_v2_happy") == "completed"
     assert _stages(db, "far_v2_happy") == [
         "AUTHOR_TURN_0", "AUTHOR_PROPOSAL_PARSED", "EXPECTATION_VALIDATED",
