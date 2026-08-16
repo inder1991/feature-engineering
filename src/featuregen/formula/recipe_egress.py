@@ -107,14 +107,21 @@ _WINDOW_KEYS_V1 = frozenset({
     "null_input",
 })
 _EXPECTATION_KEYS_V2 = _EXPECTATION_KEYS_V1 | {"formula_schema_version"}
-#: The twelve ``BoundExpressionExpectationV2`` keys.
+#: The ``BoundExpressionExpectationV2`` keys. ``row_selections`` (C-A3b) is a STRUCTURAL statement
+#: the model may see — it is what tells the author "this expression wants DEBIT rows" without the
+#: author inferring it from the recipe name — so it crosses the boundary, bounded and closed like
+#: every other token here.
 _EXPRESSION_KEYS_V2 = _EXPRESSION_KEYS_V1 | {
     "second_operand_ref",
     "aggregation_argument",
     "authority_refs",
+    "row_selections",
     "term_name",
     "term_sign",
 }
+#: The three ``SemanticRowSelectionV1`` keys, and its closed vocabularies. A selection carries no
+#: free text: the kind and the value are members of OUR vocabulary, and the role is bounded.
+_SELECTION_KEYS = frozenset({"kind", "role", "semantic_value"})
 _WINDOW_KEYS_V2 = _WINDOW_KEYS_V1 | {"offset_periods"}
 _AUTHORITY_REF_KEYS = frozenset({
     "status_policy_ref",
@@ -477,6 +484,34 @@ def _validate_window_v2(window: Any, path: str) -> None:
         raise RecipeEgressViolation(f"{path}.offset_periods is outside the reviewed bound")
 
 
+def _validate_selections(selections: Any, path: str) -> None:
+    """C-A3b — the row selections, egressed under the same closed discipline as every other token.
+
+    Membership is checked against :mod:`schema_v3`'s vocabulary rather than a copy: the whole point
+    of a closed token set is that ONE definition says what a legal selection is, and a second copy
+    here would be a boundary that could quietly widen while the schema stayed narrow.
+    """
+    from featuregen.formula.schema_v3 import SELECTION_TOKENS, SelectionKind
+
+    if not isinstance(selections, tuple | list):
+        raise RecipeEgressViolation(f"{path} must be a sequence")
+    seen: set[tuple[str, str]] = set()
+    for index, selection in enumerate(selections):
+        where = f"{path}[{index}]"
+        if not isinstance(selection, Mapping):
+            raise RecipeEgressViolation(f"{where} must be an object")
+        _exact_keys(selection, _SELECTION_KEYS, where)
+        kind = _closed_token(
+            selection["kind"], {k.value for k in SelectionKind}, f"{where}.kind")
+        _bounded_text(selection["role"], path=f"{where}.role", limit=MAX_ROLE)
+        _closed_token(selection["semantic_value"],
+                      SELECTION_TOKENS[SelectionKind(kind)], f"{where}.semantic_value")
+        key = (kind, selection["role"])
+        if key in seen:
+            raise RecipeEgressViolation(f"{where} duplicates (kind={kind}, role={key[1]!r})")
+        seen.add(key)
+
+
 def _validate_expression_v2(expression: Any, path: str, *, signed_sum: bool) -> None:
     if not isinstance(expression, Mapping):
         raise RecipeEgressViolation(f"{path} must be an object")
@@ -497,6 +532,8 @@ def _validate_expression_v2(expression: Any, path: str, *, signed_sum: bool) -> 
     if ((rule.second_operand == "required" and second_operand is None)
             or (rule.second_operand == "forbidden" and second_operand is not None)):
         raise RecipeEgressViolation(f"{path}.second_operand_ref disagrees with {aggregation}")
+
+    _validate_selections(expression["row_selections"], f"{path}.row_selections")
 
     _validate_ref(expression["source_relation_ref"], f"{path}.source_relation_ref")
     _validate_ref(expression["event_time_ref"], f"{path}.event_time_ref")

@@ -25,6 +25,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from featuregen.formula.schema_v3 import (
+    SELECTION_TOKENS,
+    SelectionKind,
+    SemanticRowSelectionV1,
+)
 from featuregen.overlay.upload.concepts import canonical_concept_name, is_classifier_producible
 
 RECIPE_CONTRACT_V2_SCHEMA_VERSION = "recipe-contract-v2"
@@ -220,6 +225,15 @@ class TemporalSpecV2:
                      "a contractual-future anchor requires a future-horizon policy")
 
 
+#: C-A3b — which kind-prefixed policy namespace must back a selection of each kind. The recipe's
+#: ``policy_refs`` are flat strings; D2's kind prefix is what makes "this ref governs direction"
+#: machine-checkable instead of a naming convention nobody enforces.
+_SELECTION_POLICY_PREFIX: dict[SelectionKind, str] = {
+    SelectionKind.TRANSACTION_DIRECTION: "direction_sign",
+    SelectionKind.ELIGIBILITY: "eligible_status",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class EligibilitySpecV2:
     included: str = ""
@@ -301,6 +315,19 @@ class RecipeDefinitionV2:
     review: RecipeReviewV1 = field(default_factory=RecipeReviewV1)
     replaces_legacy_ids: tuple[str, ...] = ()
     legacy_aliases: tuple[str, ...] = ()
+    #: C-A3b — the STRUCTURAL row selections this recipe declares (``direction/debit``).
+    #:
+    #: Before this field, ``posted_debit_amount`` and ``posted_credit_amount`` were structurally
+    #: IDENTICAL — same operands (``with_direction=True``), same ``direction_sign:`` policy ref —
+    #: and differed only in their recipe NAME and prose. A deterministic author could therefore
+    #: only obtain "debit" by inferring it from the name, which is exactly what this field exists
+    #: to stop.
+    #:
+    #: ``()`` means **this recipe declares no structural row selection** — a positive statement,
+    #: not "not migrated yet". A recipe whose rows genuinely need selecting must say so; an empty
+    #: tuple that actually meant "unknown" would let a recipe read complete while its semantics
+    #: were undecided.
+    row_selections: tuple[SemanticRowSelectionV1, ...] = ()
     schema_version: str = RECIPE_CONTRACT_V2_SCHEMA_VERSION
 
     def __post_init__(self) -> None:
@@ -323,6 +350,26 @@ class RecipeDefinitionV2:
                  "the primary objective may not also be supporting")
         off_leaf = [o for o in self.supporting_objectives if o not in leaves]
         _require(not off_leaf, f"supporting objectives off the taxonomy: {off_leaf}")
+
+        seen_selections: set[tuple[str, str]] = set()
+        for sel in self.row_selections:
+            _require(isinstance(sel, SemanticRowSelectionV1),
+                     f"row_selections carries {type(sel).__name__}, not SemanticRowSelectionV1")
+            tokens = SELECTION_TOKENS[sel.kind]
+            _require(sel.semantic_value in tokens,
+                     f"row selection {sel.kind.value}={sel.semantic_value!r} is not one of "
+                     f"{sorted(tokens)} — a recipe declares a SEMANTIC token, never a source's "
+                     f"physical literal")
+            key = (sel.kind.value, sel.role)
+            _require(key not in seen_selections,
+                     f"duplicate row selection for (kind={key[0]}, role={key[1]!r})")
+            seen_selections.add(key)
+            # D2's kind-prefixed namespace is what makes this checkable at all: the recipe's
+            # policy refs are flat strings, and the prefix is what says which KIND each governs.
+            prefix = _SELECTION_POLICY_PREFIX[sel.kind]
+            _require(any(ref.startswith(f"{prefix}:") for ref in self.eligibility.policy_refs),
+                     f"a {sel.kind.value} selection requires an eligibility policy_ref prefixed "
+                     f"{prefix!r} — the selection declares intent and the policy resolves it")
 
         roles = [op.role for op in self.operands]
         _require(len(roles) == len(set(roles)), "duplicate operand roles")

@@ -352,7 +352,13 @@ def test_the_v1_key_sets_are_exactly_the_reviewed_ones():
     assert egress_module._WINDOW_KEYS_V1 == frozenset({
         "event_time_role", "basis", "length_parameter", "unit", "start_inclusive",
         "end_inclusive", "timezone", "empty_window", "null_input"})
-    assert len(egress_module._EXPRESSION_KEYS_V2) == 12
+    # C-A3b took this from twelve to thirteen: `row_selections` is a STRUCTURAL statement the
+    # author must see (it is what says "this expression wants DEBIT rows" without inferring it
+    # from the recipe name), so it crosses the boundary — bounded and closed like every other
+    # token. The count is pinned precisely so widening the boundary is a conscious act.
+    assert len(egress_module._EXPRESSION_KEYS_V2) == 13
+    assert "row_selections" in egress_module._EXPRESSION_KEYS_V2
+    assert egress_module._SELECTION_KEYS == frozenset({"kind", "role", "semantic_value"})
     assert len(egress_module._WINDOW_KEYS_V2) == 10
 
 

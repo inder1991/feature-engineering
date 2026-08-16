@@ -36,6 +36,7 @@ from featuregen.formula.schema_v2 import (
     FinalOperationV2,
     WindowBasisV2,
 )
+from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.recipe_formula_contracts import (
     DecimalPolicyExpectationV1,
@@ -113,6 +114,9 @@ class ExpressionRoleExpectationV2:
     #: not roles: ``AuthorityRefsV2`` carries policy identifiers, they bind to nothing physical,
     #: and they are identity-bearing exactly as authored.
     authority_refs: AuthorityRefsV2 | None = None
+    #: C-A3b — the STRUCTURAL row selections carried through from the recipe. Not inferred: the
+    #: recipe declares them, this expectation transports them, and the binder never invents one.
+    row_selections: tuple[SemanticRowSelectionV1, ...] = ()
     #: Composite bodies only — the term's authored name and its ±1 sign.
     term_name: str = ""
     term_sign: int = 0
@@ -157,6 +161,8 @@ class BoundExpressionExpectationV2:
     window: WindowPolicyExpectationV2
     aggregation_argument: float | None = None
     authority_refs: AuthorityRefsV2 | None = None
+    #: C-A3b — carried through binding unchanged; a bound expectation selects what the recipe said.
+    row_selections: tuple[SemanticRowSelectionV1, ...] = ()
     term_name: str = ""
     term_sign: int = 0
 

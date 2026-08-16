@@ -21,6 +21,7 @@ rollups are separate recipes with an allocation policy, per the plan).
 """
 from __future__ import annotations
 
+from featuregen.formula.schema_v3 import SelectionKind, SemanticRowSelectionV1
 from featuregen.overlay.upload.recipe_contract_v2 import (
     EligibilitySpecV2,
     FormulaReferenceV2,
@@ -47,6 +48,14 @@ TXN_ELIGIBLE = "eligible_status:foundation-posted-events"
 TXN_REVERSALS = "reversal_correction:foundation-flag-or-code"
 TXN_SIGN = "direction_sign:foundation-signed-by-indicator"
 TXN_CCY = "currency_conversion:foundation-base-currency"
+
+#: C-A3b: the posted-eligibility contract for a recipe that also SELECTS by direction. Declaring a
+#: ``direction/…`` selection without a governed direction convention would be a recipe reading a
+#: direction column with no rule for what its values mean — the validation refuses it.
+_POSTED_DIRECTIONAL_ELIGIBILITY = EligibilitySpecV2(
+    included="posted transactions in an eligible status, one direction",
+    excluded="failed, reversed and technical events; the opposite direction",
+    policy_refs=(TXN_ELIGIBLE, TXN_REVERSALS, TXN_SIGN))
 
 _POSTED_ELIGIBILITY = EligibilitySpecV2(
     included="posted transactions in an eligible status",
@@ -105,18 +114,30 @@ def _rate_output(output_id: str, label: str) -> OutputSpecV2:
         zero_denominator_policy="zero transactions returns null")
 
 
+def _DIRECTION_SELECTION(value: str) -> SemanticRowSelectionV1:
+    """The structural statement a recipe NAME used to carry alone.
+
+    ``posted_debit_amount`` and ``posted_credit_amount`` were otherwise identical — same operands,
+    same policy refs — so "debit" existed only in the name and the prose, and a deterministic
+    author could reach it only by inference.
+    """
+    return SemanticRowSelectionV1(
+        kind=SelectionKind.TRANSACTION_DIRECTION, role="direction", semantic_value=value)
+
+
 def _recipe(recipe_id: str, *, definition: str, context: str, output: OutputSpecV2,
             result_class: str, operands: tuple[OperandSpecV2, ...],
             objective: str = PAY_BEHAVIOUR,
             eligibility: EligibilitySpecV2 = _POSTED_ELIGIBILITY,
             readiness: str = "FORMULA_BLOCKED",
+            row_selections: tuple[SemanticRowSelectionV1, ...] = (),
             expectation_ref: str | None = None) -> RecipeDefinitionV2:
     return RecipeDefinitionV2(
         recipe_id=recipe_id, revision=1, family="transaction_foundation",
         primary_objective=objective,
         business_definition=definition, decision_context=context,
         computation_kind="deterministic_formula",
-        output=output, operands=operands,
+        output=output, operands=operands, row_selections=row_selections,
         source_grain="transaction", output_grain="account",
         temporal=event_window(),
         readiness=readiness, parameters=(_WINDOW,),
@@ -161,13 +182,16 @@ TRANSACTION_FOUNDATION_RECIPES: tuple[RecipeDefinitionV2, ...] = (
                          "currencies",
                 policy_refs=(TXN_ELIGIBLE, TXN_REVERSALS, TXN_SIGN, TXN_CCY)),
             readiness="FORMULA_AUTHORABLE",
+            row_selections=(_DIRECTION_SELECTION("debit"),),
             expectation_ref="posted_debit_amount"),
     _recipe("posted_credit_amount",
             definition="Sum of eligible posted CREDIT amount per account over the window.",
             context="the income-side primitive",
             output=_amount_output("posted_credit_amount", "Posted credit amount"),
             result_class="sum",
-            operands=_base_operands(with_amount=True, with_direction=True)),
+            operands=_base_operands(with_amount=True, with_direction=True),
+            eligibility=_POSTED_DIRECTIONAL_ELIGIBILITY,
+            row_selections=(_DIRECTION_SELECTION("credit"),)),
     _recipe("posted_debit_transaction_count",
             definition="Count of eligible posted debit transactions over the window.",
             context="spend activity volume",

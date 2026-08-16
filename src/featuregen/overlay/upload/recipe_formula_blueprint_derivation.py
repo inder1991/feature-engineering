@@ -248,7 +248,12 @@ def derive_blueprint_v2(
             # binder proves they agree. The operand names it when there is one, the event clock
             # otherwise (COUNT_ROWS binds no operand but always binds a time).
             source_relation_role=operand_role or temporal.event_time_role,
-            window=window, authority_refs=authority),),
+            window=window, authority_refs=authority,
+            # C-A3b: carried from the recipe's DECLARATION. Nothing here reads the recipe id or
+            # its prose — which is the whole point: `posted_debit_amount` and
+            # `posted_credit_amount` are otherwise identical, so a derivation that inferred
+            # direction would be inferring it from the name.
+            row_selections=definition.row_selections),),
         grain=GrainExpectationV2(entity=definition.output_grain,
                                  key_roles=(entity_keys[0],)),
         semantic_parameter_projections=projections,
