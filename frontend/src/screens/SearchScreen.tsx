@@ -68,6 +68,24 @@ export function SearchScreen() {
   const seq = useRef(0)
   // The hash we last originated. Guards the sync-from-hash effect from reacting to our own writes.
   const appliedHash = useRef<string | null>(null)
+  const queryField = useRef<HTMLInputElement>(null)
+
+  // "/" focuses search from anywhere on the page — except while the user is typing, where it is
+  // just a character (`a/b` must stay `a/b`).
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
+      const active = document.activeElement
+      const typing = active instanceof HTMLInputElement
+        || active instanceof HTMLTextAreaElement
+        || (active instanceof HTMLElement && active.isContentEditable)
+      if (typing) return
+      event.preventDefault()
+      queryField.current?.focus()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   const runSearch = useCallback((nextQ: string, nextFilters: SearchFilters, nextOffset = 0) => {
     const id = ++seq.current
@@ -220,46 +238,46 @@ export function SearchScreen() {
       {/* Section landmark for assistive tech; the visible page title lives in the app page-head,
           so the mockup's layout stays clean (no repeated visible heading). */}
       <h2 className="visually-hidden">Search the catalog</h2>
+      {/* No global view toggle. A lineage graph needs an ANCHOR, and a toolbar control has none:
+          it sat disabled until results existed, then anchored on hits[0] — which is how an
+          unfiltered browse let the TABLE row hijack a column's anchor. Graph mode is still real
+          and is entered per row ("Explore relationships"); LineageView owns the way back. */}
       <form onSubmit={submit} role="search" className="search-bar">
-        <input
-          aria-label="Query"
-          className="search-input"
-          value={draft}
-          onChange={e => setDraft(e.target.value)}
-          placeholder="Column, table, or concept"
-        />
+        <div className="search-field">
+          <input
+            aria-label="Query"
+            type="search"
+            className="search-input"
+            ref={queryField}
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            placeholder="Business term, physical name, or concept"
+          />
+          {/* An explicit control, not the browser's own. `type=search` renders a native clear
+              affordance in some engines and none in others, and it is invisible to assistive
+              tech and to our tests — so the screen owns one that is always there. */}
+          {draft && (
+            <button
+              type="button"
+              className="search-clear"
+              aria-label="Clear search"
+              onClick={() => {
+                setDraft('')
+                queryField.current?.focus()
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
         <button type="submit" className="btn btn--primary search-submit">
           Search
         </button>
-        <div
-          className="viewtoggle"
-          role="group"
-          aria-label="Result view"
-          aria-describedby={hasHits ? undefined : 'viewtoggle-hint'}
-        >
-          <button
-            type="button"
-            aria-pressed={effectiveView === 'list'}
-            disabled={!hasHits}
-            onClick={() => setView('list')}
-          >
-            List
-          </button>
-          <button
-            type="button"
-            aria-pressed={effectiveView === 'graph'}
-            disabled={!hasHits}
-            onClick={() => setView('graph')}
-          >
-            Graph
-          </button>
-        </div>
-        {!hasHits && (
-          <span id="viewtoggle-hint" className="hint">
-            Run a search to map lineage.
-          </span>
-        )}
       </form>
+      <p className="hint search-help">
+        Try a business term, a physical name such as <code>cust_num</code>, or a concept.
+        Press <kbd>/</kbd> to search from anywhere on the page.
+      </p>
 
       {/* The row reserved 26px + 14px whether or not it had anything in it. Removing the
           "No filters" text left the empty container behind, which is most of the dead band
@@ -315,6 +333,12 @@ export function SearchScreen() {
                 re-vouched, and columns your roles cannot see are never shown. Nothing is shown that
                 cannot be trusted.
               </p>
+              {/* The exit. The zero-state named the causes but offered no control, so the only way
+                  back to a populated catalog was hand-editing the hash or removing chips one at a
+                  time. `apply('', {})` clears the query AND every facet in one commit. */}
+              <button type="button" className="btn" onClick={() => apply('', {})}>
+                Clear search and filters
+              </button>
             </div>
           )}
 

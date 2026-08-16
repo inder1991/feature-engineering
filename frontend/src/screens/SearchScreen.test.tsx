@@ -189,8 +189,10 @@ describe('search screen — results and rows', () => {
     })
     render(<SearchScreen />)
     await findRow('public.accounts.balance')
-    const toggle = screen.getByRole('group', { name: 'Result view' })
-    await userEvent.click(within(toggle).getByRole('button', { name: 'Graph' }))
+    // Graph mode is entered from a ROW now; the anchorless global toggle is gone.
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Explore relationships for public.accounts.balance' }),
+    )
     // Genuinely in graph view — the canvas is up and the list is gone.
     expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
     expect(screen.queryByTestId('hit-name')).toBeNull()
@@ -238,6 +240,18 @@ describe('search screen — results and rows', () => {
     expect(screen.getByText(/roles cannot see/i)).toBeInTheDocument()
   })
 
+  // The zero-state named the causes but offered no control: the only way back to a populated
+  // catalog was to hand-edit the hash or clear facets one chip at a time.
+  it('gives the empty state a way out', async () => {
+    searchCatalog.mockResolvedValue(result([], FACETS, 0))
+    render(<SearchScreen />)
+    await screen.findByText(/no results match/i)
+    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
+    await userEvent.click(screen.getByRole('button', { name: 'Clear search and filters' }))
+    expect(await screen.findByTestId('hit-name')).toHaveTextContent('balance')
+    expect(window.location.hash).toBe('#/search')
+  })
+
   it('shows a calm loading hint while the initial browse is in flight, not a zero-state', async () => {
     let resolve!: (r: api.SearchResult) => void
     searchCatalog.mockImplementationOnce(() => new Promise(r => { resolve = r }))
@@ -246,6 +260,32 @@ describe('search screen — results and rows', () => {
     expect(screen.queryByText(/no results match/i)).not.toBeInTheDocument()
     await act(async () => { resolve(result([HIT], FACETS, 1)); await Promise.resolve() })
     expect(await findRow('public.accounts.balance')).toBeInTheDocument()
+  })
+})
+
+// The search field itself: the one control that clears it, and the "/" shortcut that reaches it.
+describe('search screen — the search field', () => {
+  it('clears the query from the search field with one control', async () => {
+    render(<SearchScreen />)
+    const field = await screen.findByRole('searchbox', { name: 'Query' })
+    await userEvent.type(field, 'balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Clear search' }))
+    expect(field).toHaveValue('')
+  })
+
+  it('focuses the search field on "/" from anywhere on the page', async () => {
+    render(<SearchScreen />)
+    const field = await screen.findByRole('searchbox', { name: 'Query' })
+    field.blur()
+    await userEvent.keyboard('/')
+    expect(field).toHaveFocus()
+  })
+
+  it('does not steal a "/" typed into the field itself', async () => {
+    render(<SearchScreen />)
+    const field = await screen.findByRole('searchbox', { name: 'Query' })
+    await userEvent.type(field, 'a/b')
+    expect(field).toHaveValue('a/b')
   })
 })
 
@@ -549,16 +589,17 @@ describe('search screen — errors, ordering, keys', () => {
 // belongs to the row and is pinned in SearchHitRow.test.tsx. What stays here is the WIRING: which
 // route each action navigates to, and which row the graph anchors on.
 describe('search screen — row actions and graph', () => {
-  it('keeps the view toggle disabled with a hint while a search returns nothing', async () => {
-    searchCatalog.mockResolvedValue(result([], {}, 0))
+  // A lineage graph needs an ANCHOR, and a global toggle has none: it sat disabled until results
+  // existed, then silently anchored on hits[0] — which is how an unfiltered browse let the TABLE
+  // row hijack a column's anchor. Graph mode is still real; it is entered from a row.
+  it('offers no global view toggle — a graph needs an anchor, so it is entered from a row', async () => {
     render(<SearchScreen />)
-    expect(await screen.findByText(/no results match/i)).toBeInTheDocument()
-    const toggle = screen.getByRole('group', { name: 'Result view' })
-    expect(within(toggle).getByRole('button', { name: 'Graph' })).toBeDisabled()
-    expect(screen.getByText('Run a search to map lineage.')).toBeInTheDocument()
+    await screen.findByTestId('hit-name')
+    expect(screen.queryByRole('group', { name: 'Result view' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Graph' })).toBeNull()
   })
 
-  it('flips to the graph anchored on the first (facet-narrowed) hit, and back to the list', async () => {
+  it('returns from the graph to the list through the graph\'s own back control', async () => {
     searchCatalog.mockResolvedValue(
       result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }],
         FACETS, 2),
@@ -566,10 +607,8 @@ describe('search screen — row actions and graph', () => {
     render(<SearchScreen />)
     await findRow('public.accounts.balance')
 
-    const toggle = screen.getByRole('group', { name: 'Result view' })
-    await userEvent.click(within(toggle).getByRole('button', { name: 'Graph' }))
-    expect(within(toggle).getByRole('button', { name: 'Graph' })).toHaveAttribute(
-      'aria-pressed', 'true',
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Explore relationships for public.accounts.balance' }),
     )
     expect(lineageGraph).toHaveBeenCalledWith(
       'public.accounts.balance', 'deposits',
@@ -583,7 +622,8 @@ describe('search screen — row actions and graph', () => {
       screen.queryByRole('button', { name: 'More actions for public.accounts.balance' }),
     ).not.toBeInTheDocument()
 
-    await userEvent.click(within(toggle).getByRole('button', { name: 'List' }))
+    // The ONE exit, unchanged: LineageView's own `onBackToResults`.
+    await userEvent.click(screen.getByRole('button', { name: '← Results' }))
     expect(
       await screen.findByRole('button', { name: 'More actions for public.accounts.balance' }),
     ).toBeInTheDocument()

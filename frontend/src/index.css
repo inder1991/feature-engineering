@@ -7808,3 +7808,63 @@ button.stat:hover {
 
 /* 13px is the documented secondary size; the row's ramp is 14/13/11 and 12px is not a tier. */
 .pager-copy { color: var(--ink-faint); font-size: 13px; margin-right: auto; }
+
+/* The search field and its clear control. The input is no longer a direct flex child of
+   `.search-bar` — it is wrapped so the clear button can be positioned inside its right edge —
+   so this wrapper takes over the growing and the input fills it. */
+.search-field { position: relative; flex: 1; min-width: 0; }
+.search-field .search-input { width: 100%; padding-right: 36px; }
+
+/* `type="search"` makes Blink and WebKit draw their OWN clear glyph, which would sit beside ours
+   as a second, differently-styled X (and is invisible to assistive tech and to the tests). One
+   clear control, ours — so the engine's is suppressed. Firefox draws none, so nothing is lost. */
+.search-field .search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Inside the field's right edge, over the 36px of padding reserved above so it can never sit on
+   top of the text. Transparent until hover; `--ink-faint` is 5.89:1 on `--surface`. */
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  transform: translateY(-50%);
+  /* The base button rule pins `padding: 0 14px`, which is 28px of inline padding inside a 24px
+     box — the glyph would overflow its own content box rather than sit in it. */
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-faint);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.search-clear:hover { background: var(--surface-2); color: var(--ink); }
+
+/* The help line under the bar. `.hint` already carries the 13px secondary size and --ink-faint.
+
+   The spacing is a PAIR, not two independent margins: `.search-bar` owns a 14px bottom margin and
+   `.facet-cols` below owns no top margin at all, so leaving both alone would put 14px ABOVE the
+   help line and zero below it — the line would read as a caption for the results rather than for
+   the field it explains, and would sit flush against the facet rail. The bar gives up its bottom
+   margin only when the help line follows it, and the help line carries the 14px on downward. */
+.search-bar:has(+ .search-help) { margin-bottom: 0; }
+.search-help { margin: 6px 2px 14px; }
+
+/* The key cap. 11px is the documented micro tier — the base `code, kbd` rule is 13px, which reads
+   as a second body size sitting inside a secondary sentence. */
+.search-help kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* The zero-state's exit, set off from the paragraph that explains what withheld the rows. */
+.empty .btn { margin-top: 12px; }

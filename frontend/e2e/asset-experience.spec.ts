@@ -67,7 +67,10 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
   }) => {
     // --- search for the seeded asset (REAL GET /search) ---
     await page.goto('/#/search')
-    await page.getByRole('textbox', { name: 'Query' }).fill(TABLE)
+    // `searchbox`, not `textbox` (drift caught 2026-08-16): the query field is `type="search"`
+    // since Task 6, which changes its implicit ARIA role. `npm test`'s include glob is `src/**`,
+    // so nothing in this directory is covered by the unit suite — this file is checked by hand.
+    await page.getByRole('searchbox', { name: 'Query' }).fill(TABLE)
     // Two "Search" buttons exist since the nav gained one (drift caught 2026-08-14): scope
     // to the search FORM's own submit, not the nav entry.
     await page.locator('main').getByRole('button', { name: 'Search', exact: true }).click()
