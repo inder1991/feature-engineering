@@ -789,7 +789,9 @@ At the END of `frontend/src/index.css`:
   display: grid;
   gap: 6px;
   align-content: start;
-  font-size: 12px;
+  /* The documented secondary size. These lines are meaningful content, not micro-labels, and
+     13px keeps the row on DESIGN.md's 14/13/11 ramp with no undocumented tier. */
+  font-size: 13px;
   color: var(--ink-soft);
 }
 
