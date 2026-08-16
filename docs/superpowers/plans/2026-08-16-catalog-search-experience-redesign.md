@@ -1213,7 +1213,7 @@ it('shows six values and expands the rest on request', async () => {
   expect(group('Domain').getAllByRole('checkbox')).toHaveLength(9)
 })
 
-it('keeps "Not classified" out of the collapsed window', () => {
+it('keeps "Not classified" out of the collapsed window but still reachable', () => {
   renderPanel({
     domain: [
       { value: '(none)', count: 400 },
@@ -1221,8 +1221,13 @@ it('keeps "Not classified" out of the collapsed window', () => {
     ],
   })
   const labels = group('Domain').getAllByRole('checkbox').map(box => box.closest('label')?.textContent)
-  expect(labels).toHaveLength(6)
-  expect(labels?.some(text => text?.includes('Not classified'))).toBe(false)
+  // Six NAMED values plus the NULL bucket pinned after them: the collapsed window is six, and
+  // "Not classified" never eats one of those six — but it stays selectable without expanding,
+  // because "show me the unclassified columns" is a real question a steward asks.
+  expect(labels).toHaveLength(7)
+  expect(labels?.slice(0, 6).some(text => text?.includes('Not classified'))).toBe(false)
+  expect(labels?.[6]).toMatch(/Not classified/)
+  expect(group('Domain').getByRole('button', { name: 'Show all 9' })).toBeInTheDocument()
 })
 
 it('reflects the selected state of a filter', () => {
@@ -1305,7 +1310,12 @@ const FLAG_OPTIONS: { key: 'grain' | 'as_of'; label: string }[] = [
   { key: 'as_of', label: 'As-of field' },
 ]
 
-function facetLabel(key: string): string {
+/**
+ * The sidebar label for a facet key. EXPORTED because the screen's active-filter chips name the
+ * same facets: without one owner of this vocabulary a chip reads "sensitivity display: restricted"
+ * while the group above it reads "Sensitivity".
+ */
+export function facetLabel(key: string): string {
   const known = FACET_LABELS[key]
   if (known) return known
   const spaced = key.replace(/_/g, ' ')
@@ -1321,9 +1331,11 @@ function isFacetKey(key: string): key is SearchFacetKey {
  *
  * Two rules make it readable on a real catalog. First, the NULL bucket is a value, not a
  * headline: on a 150K-column catalog "(none)" is usually the largest count in the group, and
- * letting it lead makes every group look like it holds nothing. It renders last, as "Not
- * classified", and never inside the collapsed window. Second, groups collapse to six, because a
- * fifty-value group is a wall, not a filter.
+ * letting it lead makes every group look like it holds nothing. It is pinned after the named
+ * values, labelled "Not classified", and never consumes one of the six collapsed slots — but it
+ * stays selectable without expanding, because "show me the unclassified columns" is a real
+ * question. Second, groups collapse to six named values, because a fifty-value group is a wall,
+ * not a filter.
  */
 export function SearchFacetPanel({
   facets,
@@ -1367,7 +1379,7 @@ export function SearchFacetPanel({
         return (
           <fieldset className="facet-group" key={key}>
             <legend className="facet-group-title">{facetLabel(key)}</legend>
-            {[...shown, ...(isOpen && none ? [none] : [])].map(bucket => (
+            {[...shown, ...(none ? [none] : [])].map(bucket => (
               <label className="facet-option" key={bucket.value}>
                 <input
                   type="checkbox"
@@ -1381,12 +1393,14 @@ export function SearchFacetPanel({
                 <span className="facet-count tabular-nums">{bucket.count}</span>
               </label>
             ))}
-            {!isOpen && (hidden > 0 || none) && (
+            {!isOpen && hidden > 0 && (
               <button
                 type="button"
                 className="facet-more"
                 onClick={() => setExpanded(state => ({ ...state, [key]: true }))}
               >
+                {/* The count names the whole group, NULL bucket included, because that is what
+                    expanding reveals. */}
                 Show all {named.length + (none ? 1 : 0)}
               </button>
             )}
@@ -1455,13 +1469,15 @@ In `frontend/src/screens/SearchScreen.tsx`:
    `chips` with an iteration over the selected filter keys:
 
 ```tsx
-  // Active-filter chips, in the order the facet keys ride the query string, then flags.
+  // Active-filter chips, in the order the facet keys ride the query string, then flags. The chip
+  // wears the SAME label the sidebar group wears — `facetLabel` is the one owner of that
+  // vocabulary, so a chip can never read "sensitivity display" under a group reading "Sensitivity".
   const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
   for (const key of SEARCH_FACET_KEYS) {
     for (const value of filters[key] ?? []) {
       chips.push({
         id: `${key}:${value}`,
-        label: `${key.replace(/_/g, ' ')}: ${value === '(none)' ? 'not classified' : value}`,
+        label: `${facetLabel(key).toLowerCase()}: ${value === '(none)' ? 'not classified' : value}`,
         pii: key === 'sensitivity' && value === 'pii',
         remove: () => toggleFacet(key, value),
       })
@@ -1469,13 +1485,16 @@ In `frontend/src/screens/SearchScreen.tsx`:
   }
 ```
 
+Import it alongside the panel: `import { SearchFacetPanel, facetLabel } from './SearchFacetPanel'`.
+
 - [ ] **Step 7: Update the screen tests for the new group labels**
 
 In `frontend/src/screens/SearchScreen.test.tsx`, the sidebar assertions now read
 `Sensitivity` / `Declared tag` / `Column role` (was `Flags`), and the flag options are named
-`Grain key` / `As-of field` (was `Grain` / `As-of`). Update those queries. The
-`(none)` bucket in the `sensitivity` fixture now renders as `Not classified` and only after
-expanding that group — update the test that clicks it to click `Show all 2` first.
+`Grain key` / `As-of field` (was `Grain` / `As-of`). Update those queries. The `(none)` bucket in
+the `sensitivity` fixture now renders as `Not classified` — it is pinned last in its group and
+needs no expanding (the group has one named value, so no "Show all" button appears at all).
+Active-filter chips built from it read `declared tag: not classified`.
 
 - [ ] **Step 8: Style the panel additions**
 
