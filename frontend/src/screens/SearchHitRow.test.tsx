@@ -25,6 +25,14 @@ function renderRow(hit: api.SearchHit = HIT) {
   return { onOpen, onExplore, onSuggested }
 }
 
+// The tertiary actions live behind the row's `···` disclosure, so every test that reaches one has
+// to open it first — exactly as a reader does.
+async function openOverflow() {
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+}
+
 // Braced body, deliberately: a CONCISE arrow returns the mock, and Vitest calls a function
 // returned from beforeEach as that test's teardown — which would invoke featureImpact() with
 // nobody awaiting it, and a rejecting mock would then fail the test it just passed.
@@ -102,6 +110,7 @@ it('makes Open asset the primary action and Explore relationships the secondary'
 
 it('opens suggested features for the hit’s table', async () => {
   const { onSuggested } = renderRow()
+  await openOverflow()
   await userEvent.click(screen.getByRole('button', { name: 'Suggested features for accounts' }))
   expect(onSuggested).toHaveBeenCalledWith(HIT)
 })
@@ -109,6 +118,7 @@ it('opens suggested features for the hit’s table', async () => {
 it('lists derived feature ids inline when impact finds features', async () => {
   featureImpact.mockResolvedValue(['feat_01', 'feat_02'])
   renderRow()
+  await openOverflow()
   await userEvent.click(
     screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
   )
@@ -121,6 +131,7 @@ it('lists derived feature ids inline when impact finds features', async () => {
 it('says plainly when nothing derives from the column', async () => {
   featureImpact.mockResolvedValue([])
   renderRow()
+  await openOverflow()
   await userEvent.click(
     screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
   )
@@ -132,6 +143,7 @@ it('says plainly when nothing derives from the column', async () => {
 it('surfaces an impact failure as an alert without losing the row', async () => {
   featureImpact.mockRejectedValue(new api.ApiError(503, 'graph unavailable'))
   renderRow()
+  await openOverflow()
   await userEvent.click(
     screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
   )
@@ -139,4 +151,75 @@ it('surfaces an impact failure as an alert without losing the row', async () => 
   expect(screen.getByTestId('hit-name')).toHaveTextContent('balance')
   // A failed check is not an empty result: no heading over a list that was never fetched.
   expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
+})
+
+it('hides the tertiary actions behind an overflow disclosure', async () => {
+  renderRow()
+  expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+
+  const trigger = screen.getByRole('button', { name: 'More actions for public.accounts.balance' })
+  expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  await userEvent.click(trigger)
+  expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  expect(screen.getByRole('button', { name: 'Suggested features for accounts' })).toBeInTheDocument()
+  expect(
+    screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
+  ).toBeInTheDocument()
+})
+
+it('closes the overflow on Escape and returns focus to its trigger', async () => {
+  renderRow()
+  const trigger = screen.getByRole('button', { name: 'More actions for public.accounts.balance' })
+  await userEvent.click(trigger)
+  await userEvent.keyboard('{Escape}')
+  expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+  expect(trigger).toHaveFocus()
+})
+
+it('closes the overflow when the pointer goes elsewhere', async () => {
+  renderRow()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+  await userEvent.click(document.body)
+  expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+})
+
+it('closes the overflow after an item is chosen', async () => {
+  const { onSuggested } = renderRow()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+  await userEvent.click(screen.getByRole('button', { name: 'Suggested features for accounts' }))
+  expect(onSuggested).toHaveBeenCalledWith(HIT)
+  expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+})
+
+it('copies the object ref and says so', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  Object.assign(navigator, { clipboard: { writeText } })
+  renderRow()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Copy reference for public.accounts.balance' }),
+  )
+  expect(writeText).toHaveBeenCalledWith('public.accounts.balance')
+  expect(await screen.findByRole('status')).toHaveTextContent('Reference copied')
+})
+
+it('shows the reference when the browser refuses to copy it', async () => {
+  Object.assign(navigator, {
+    clipboard: { writeText: vi.fn().mockRejectedValue(new Error('denied')) },
+  })
+  renderRow()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Copy reference for public.accounts.balance' }),
+  )
+  expect(await screen.findByRole('status'))
+    .toHaveTextContent('Could not copy. The reference is public.accounts.balance')
 })

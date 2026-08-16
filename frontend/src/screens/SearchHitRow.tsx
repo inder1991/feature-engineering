@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react'
+import { Fragment, type ReactNode, useEffect, useRef, useState } from 'react'
 import { ApiError, type SearchHit, featureImpact } from '../api'
 import { hitBreadcrumb, hitCapabilities, hitDisplayName, hitMeta } from './searchHitDisplay'
 
@@ -24,6 +24,18 @@ export function SearchHitRow({
   const [impact, setImpact] = useState<string[] | null>(null)
   const [impactError, setImpactError] = useState('')
   const [checking, setChecking] = useState(false)
+  const [copyStatus, setCopyStatus] = useState('')
+
+  async function copyReference() {
+    try {
+      await navigator.clipboard.writeText(hit.object_ref)
+      setCopyStatus('Reference copied')
+    } catch {
+      // A browser may refuse clipboard access outright. Saying "copied" would be a lie, and
+      // saying only "failed" leaves the reader with nothing, so hand them the reference itself.
+      setCopyStatus(`Could not copy. The reference is ${hit.object_ref}`)
+    }
+  }
 
   async function checkImpact() {
     setChecking(true)
@@ -87,6 +99,8 @@ export function SearchHitRow({
 
         {meta.length > 0 && <p className="hint hit-meta">{meta.join(' · ')}</p>}
 
+        {copyStatus && <p className="hint" role="status">{copyStatus}</p>}
+
         {checking && <p className="hint">Checking feature impact…</p>}
         {impactError && (
           <p role="alert" className="error">Impact check failed: {impactError}</p>
@@ -129,24 +143,83 @@ export function SearchHitRow({
         >
           Explore relationships
         </button>
-        <button
-          type="button"
-          className="btn btn--ghost"
-          aria-label={`Suggested features for ${hit.table}`}
-          onClick={() => onSuggested(hit)}
-        >
-          Suggested features
-        </button>
-        <button
-          type="button"
-          className="btn btn--ghost"
-          aria-label={`Feature impact for ${hit.object_ref}`}
-          disabled={checking}
-          onClick={() => void checkImpact()}
-        >
-          Feature impact
-        </button>
+        <RowOverflow label={`More actions for ${hit.object_ref}`}>
+          <button
+            type="button"
+            aria-label={`Suggested features for ${hit.table}`}
+            onClick={() => onSuggested(hit)}
+          >
+            Suggested features
+          </button>
+          <button
+            type="button"
+            aria-label={`Feature impact for ${hit.object_ref}`}
+            disabled={checking}
+            onClick={() => void checkImpact()}
+          >
+            Feature impact
+          </button>
+          <button
+            type="button"
+            aria-label={`Copy reference for ${hit.object_ref}`}
+            onClick={() => void copyReference()}
+          >
+            Copy reference
+          </button>
+        </RowOverflow>
       </div>
     </li>
+  )
+}
+
+/**
+ * The row's overflow. A DISCLOSURE, not an ARIA menu: `role="menu"` promises arrow-key roving
+ * that a three-item popover does not need and we would not implement honestly. What it does
+ * promise it keeps — Escape closes and returns focus, a pointer elsewhere closes, and choosing an
+ * item closes.
+ */
+function RowOverflow({ label, children }: { label: string; children: ReactNode }) {
+  const [open, setOpen] = useState(false)
+  const wrap = useRef<HTMLDivElement>(null)
+  const trigger = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    function onPointerDown(event: PointerEvent) {
+      if (!wrap.current?.contains(event.target as Node)) setOpen(false)
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return
+      setOpen(false)
+      trigger.current?.focus()
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [open])
+
+  return (
+    <div className="hit-overflow" ref={wrap}>
+      <button
+        type="button"
+        ref={trigger}
+        className="btn btn--ghost hit-overflow-trigger"
+        aria-label={label}
+        aria-expanded={open}
+        onClick={() => setOpen(value => !value)}
+      >
+        ···
+      </button>
+      {open && (
+        // Choosing anything closes the popover: the click bubbles to this wrapper, so one handler
+        // covers every item without each item having to remember to close.
+        <div className="hit-overflow-items" onClick={() => setOpen(false)}>
+          {children}
+        </div>
+      )}
+    </div>
   )
 }

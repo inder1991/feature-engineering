@@ -441,13 +441,16 @@ describe('search screen — row actions and graph', () => {
       expect.objectContaining({ direction: 'both', depth: 1 }),
     )
     expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
+    // The probe for "a result row is on screen" is a control that lives ON the row. Feature
+    // impact moved behind the row's overflow disclosure, so it is absent in list view too and
+    // would make both halves of this assertion pass vacuously.
     expect(
-      screen.queryByRole('button', { name: 'Feature impact for public.accounts.balance' }),
+      screen.queryByRole('button', { name: 'More actions for public.accounts.balance' }),
     ).not.toBeInTheDocument()
 
     await userEvent.click(within(toggle).getByRole('button', { name: 'List' }))
     expect(
-      await screen.findByRole('button', { name: 'Feature impact for public.accounts.balance' }),
+      await screen.findByRole('button', { name: 'More actions for public.accounts.balance' }),
     ).toBeInTheDocument()
     expect(screen.queryByText('Relationship layers')).not.toBeInTheDocument()
   })
@@ -472,8 +475,12 @@ describe('search screen — row actions and graph', () => {
     // the context, which four identical pages otherwise dropped.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
+    // Tertiary now: reached through the row's `···` disclosure, not straight off the row.
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Suggested features for accounts' }),
+      await screen.findByRole('button', { name: 'More actions for public.accounts.balance' }),
+    )
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Suggested features for accounts' }),
     )
     expect(window.location.hash)
       .toBe('#/suggested?source=deposits&table=accounts&column=balance')
