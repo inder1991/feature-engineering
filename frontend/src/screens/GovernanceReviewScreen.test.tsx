@@ -363,16 +363,20 @@ describe('governance review — the decision queue', () => {
     )
   })
 
-  it('opens with the purpose line: the system proposes, a person disposes', async () => {
+  it('opens on the work, with no standing prose above it', async () => {
+    // NO PREAMBLE AT ALL. Every clause a page-level callout could carry is already on screen where
+    // it is actionable: "the platform may use this link now" is the LINK AVAILABILITY axis on the
+    // row, and "this records that a person agrees, and who — it does not change whether the
+    // platform may use it" is in the confirm panel, at the moment of confirming. A banner
+    // restating them is the interface explaining itself instead of presenting the work.
     getGovernanceQueue.mockResolvedValue(FULL)
     render(<GovernanceReviewScreen />)
     await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
-    const purpose = screen.getByTestId('gq-purpose')
-    expect(purpose).toHaveTextContent(/only a person can make/i)
-    expect(purpose).toHaveTextContent(/proposes/i)
-    expect(purpose).toHaveTextContent(/dispose/i)
-    // Confirmation means agreement with a semantic relationship, never permission to execute.
-    expect(purpose).toHaveTextContent(/agrees/i)
+
+    expect(screen.queryByTestId('gq-purpose')).toBeNull()
+    // The facts survive where they are used, and only there.
+    expect(within(row(FULL.items[0])).getByTestId('axis-availability'))
+      .toHaveTextContent(/the platform may use this link now/i)
   })
 
   it('answers "what needs me" in a summary strip before any detail', async () => {
@@ -381,9 +385,25 @@ describe('governance review — the decision queue', () => {
     const summary = await screen.findByTestId('gq-summary')
     expect(summary).toHaveTextContent('3')
     expect(summary).toHaveTextContent(/waiting for a person/i)
-    // Scope-honest: the counts describe what THIS operator can see, never a catalog total.
-    expect(screen.getByTestId('gq-scope-note'))
-      .toHaveTextContent(/scope-relative|what you can see/i)
+  })
+
+  it('does not annotate its own chip counts', async () => {
+    // The chips are FILTERS. Nobody sums a filter's counts against the queue length, so the fact
+    // that a cross-catalog link is counted under both its catalogs needs no defending — it only
+    // looks wrong if you perform arithmetic no reviewer performs. The note that used to sit here
+    // was the same species as the "scope-relative" disclaimer it replaced: the interface
+    // apologising for its own display. If a number needs a paragraph to defend it, the fix is the
+    // number's presentation, not the paragraph.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+
+    expect(screen.queryByText(/scope-relative/i)).toBeNull()
+    expect(screen.queryByTestId('gq-catalog-arith')).toBeNull()
+    expect(screen.queryByText(/belong to both catalogs/i)).toBeNull()
+    // Nothing between the filter bar and the first decision.
+    const filters = screen.getByTestId('gq-catalog-filter').closest('.gq-filters')
+    expect(filters?.nextElementSibling).toBe(screen.getByTestId('kind-entity_bridge'))
   })
 
   it('keeps the summary strip to one question, and leaves the kinds to the chips', async () => {
@@ -1136,21 +1156,31 @@ describe('governance review — the low-value candidate cluster', () => {
 })
 
 describe('governance review — honest emptiness and honest counts', () => {
-  it('reads an empty kind as settled, not as a failure', async () => {
+  it('says nothing at all about a kind with nothing waiting', async () => {
+    // A zero is not news, and the chip already carries it. This used to be four sections of prose,
+    // then one line of prose; it is now the chip, which is the whole honest statement.
+    //
+    // The prose also CLAIMED MORE THAN THE PAYLOAD KNOWS. `items_visible_to_you_by_kind` counts
+    // OPEN items, so a zero cannot tell "everything was decided" from "nothing was ever proposed" —
+    // and on the live catalogs Pass C has produced no discovered join at all. Saying "everything
+    // proposed there has already been decided" invented a history the screen cannot see.
     getGovernanceQueue.mockResolvedValue(FULL) // availability_time is 0
     render(<GovernanceReviewScreen />)
-    const settled = await screen.findByTestId('gq-settled-kinds')
-    // Named, so "settled" never hides WHICH kind is settled.
-    expect(settled).toHaveTextContent(/as-of date/i)
-    // And it says why there is nothing, rather than showing a bare "(0)".
-    expect(settled).toHaveTextContent(/already been decided/i)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+
+    expect(screen.queryByTestId('gq-settled-kinds')).toBeNull()
+    expect(screen.queryByText(/already been decided/i)).toBeNull()
+    expect(screen.queryByText(/keeps working either way/i)).toBeNull()
+    // The zero is on its chip, where it is a fact rather than a claim.
+    expect(within(screen.getByTestId('gq-kind-filter'))
+      .getByRole('button', { name: /as-of date \(0\)/i })).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('collapses every settled kind into one line, not one empty section each', async () => {
+  it('renders no section and no prose for the kinds with nothing waiting', async () => {
     // The live queue has FOUR kinds at zero. Each rendered a heading, a lead-in, a count chip and
-    // a 35-word paragraph — four sections of nothing sitting between the two kinds that hold the
-    // work, and four role="status" regions announcing "nothing to review" on load.
+    // a 35-word paragraph; then one collapsed line of prose. Neither earned the space — the chips
+    // carry the zeros, and prose about an empty section is prose about nothing.
     getGovernanceQueue.mockResolvedValue(queue({
       items: [bridge()],
       items_visible_to_you_by_kind: {
@@ -1158,18 +1188,37 @@ describe('governance review — honest emptiness and honest counts', () => {
       },
     }))
     render(<GovernanceReviewScreen />)
-    const settled = await screen.findByTestId('gq-settled-kinds')
+    await screen.findByTestId('kind-entity_bridge')
 
-    expect(settled).toHaveTextContent(/discovered joins/i)
-    expect(settled).toHaveTextContent(/table grain/i)
-    expect(settled).toHaveTextContent(/entity assignments/i)
-    // No section, no heading, no per-kind empty state for any of them.
     for (const kind of ['approved_join', 'grain', 'availability_time', 'entity_assignment']) {
       expect(screen.queryByTestId(`kind-${kind}`)).toBeNull()
     }
-    // The kind that HAS work keeps its own section, and there is exactly one settled line.
-    expect(screen.getByTestId('kind-entity_bridge')).toBeInTheDocument()
-    expect(screen.getAllByTestId('gq-settled-kinds')).toHaveLength(1)
+    expect(screen.queryByTestId('gq-settled-kinds')).toBeNull()
+    expect(screen.queryByText(/nothing is waiting on you in/i)).toBeNull()
+  })
+
+  it('leads a section only where there is a consequence the rows do not carry', async () => {
+    // A lead-in that DEFINES the kind sits directly above a card instantiating it: "The same
+    // business entity in two different catalogs" over "2 candidate links for the same branch,
+    // between CIB and FTR". The abstraction is redundant with its own example. What survives is
+    // only a lead-in stating something the rows cannot say for themselves.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge(), currencyBinding()],
+      items_visible_to_you_by_kind: { entity_bridge: 1, currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const bridges = within(await screen.findByTestId('kind-entity_bridge'))
+
+    expect(bridges.queryByText(/the same business entity in two different catalogs/i)).toBeNull()
+    expect(bridges.queryByText(/no per-catalog screen could show you/i)).toBeNull()
+
+    // The currency lead-in states a real consequence — money features are refused until it is
+    // decided — which no row on the card says. That half stays; the definition goes.
+    const currency = within(screen.getByTestId('kind-currency_binding'))
+    expect(currency.getByTestId('gq-kind-about'))
+      .toHaveTextContent(/features that sum money are refused until this is decided/i)
+    expect(currency.getByTestId('gq-kind-about').textContent)
+      .not.toMatch(/a fixed code, or the column on the same table/i)
   })
 
   it('distinguishes "nothing is waiting" from "we could not look"', async () => {
