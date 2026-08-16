@@ -94,6 +94,12 @@ The concept's "Data role" group is one of them. A server-driven panel gets all s
   values with **"Show all (N)"** to expand. Flags (grain/as-of) stay their own group titled
   **"Column role"** — deliberately distinct from the backend's `data_role`, which is a *table*
   role and is labelled **"Table role"**.
+  Two behaviours were added during review and are part of D6 as shipped: **selected values are
+  hoisted to the front** of a group before the window is taken (otherwise a deep link to a group's
+  ninth value renders six unchecked boxes while that filter is applied — the group misstates its
+  own state), and the window widens to `max(6, selected)` so the same defect cannot reappear at the
+  seventh selection; and the control is a **two-way toggle** ("Show all N" / "Show fewer") carrying
+  `aria-expanded`, because a one-way button that removes itself drops keyboard focus to `<body>`.
 - **D7 — Projection disclosure.** `ready` → a quiet "Catalog projection current" line in the
   toolbar. `lagged` → a warn callout above the rows: *"The catalog projection was behind when these
   results were read, so they may not yet reflect the newest resolved semantics."* Rows are always
@@ -128,6 +134,7 @@ Two items need backend work and an explicit go from the user before anyone opens
 | `frontend/src/screens/SearchHitRow.tsx` **(new)** | One result row: anatomy, badges, capability lines, action hierarchy, overflow disclosure, inline impact. |
 | `frontend/src/screens/SearchHitRow.test.tsx` **(new)** | Row behavior in isolation. |
 | `frontend/src/screens/SearchFacetPanel.tsx` **(new)** | Server-driven facet groups, collapse/expand, not-classified demotion, flags group. |
+| `frontend/src/screens/searchFacetLabels.ts` **(new)** | The facet-label vocabulary (`FACET_LABELS`, `facetLabel`), shared by the panel's group legends and the screen's active-filter chips. Its own module rather than an export from the panel: exporting a non-component from a component file costs Fast Refresh, and Task 1's `searchHitDisplay.ts` already set this pattern. |
 | `frontend/src/screens/SearchFacetPanel.test.tsx` **(new)** | Panel behavior in isolation. |
 | `frontend/src/screens/SearchScreen.tsx` **(modify)** | Search state, hash sync, paging, toolbar, projection disclosure, empty state, layout. Row and panel markup move out. |
 | `frontend/src/screens/SearchScreen.test.tsx` **(modify)** | Existing assertions updated to the new labels and copy. |
@@ -1525,7 +1532,9 @@ Append to the search block in `frontend/src/index.css`:
   border: 0;
   background: transparent;
   color: var(--accent);
-  font-size: 12px;
+  /* 13px, the documented secondary size — the row's type ramp is 14/13/11 and 12px is not a tier
+     DESIGN.md carries. */
+  font-size: 13px;
   font-weight: 600;
   text-align: left;
 }
@@ -1706,7 +1715,8 @@ Append to the search block in `frontend/src/index.css`:
   background: var(--ok);
 }
 
-.pager-copy { color: var(--ink-faint); font-size: 12px; margin-right: auto; }
+/* 13px is the documented secondary size; the row's ramp is 14/13/11 and 12px is not a tier. */
+.pager-copy { color: var(--ink-faint); font-size: 13px; margin-right: auto; }
 ```
 
 Do **not** add callout styles: `.callout`, `.callout-glyph`, `.callout-body` and `.callout--warn`
