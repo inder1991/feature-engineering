@@ -113,6 +113,51 @@ def test_a_selection_without_its_policy_ref_refuses():
         parse_proposal_v3(_v3_raw(authority_refs=None))
 
 
+def test_the_required_ref_is_checked_PER_KIND_not_just_per_presence():
+    """C-A4's real hole. The `authority_refs=None` case above passes even if the check only asked
+    "are there any refs at all" — so this expression carries refs, just not the RIGHT one. A
+    direction selection beside a status policy resolves to nothing."""
+    with pytest.raises(SchemaError, match="direction_policy_ref"):
+        parse_proposal_v3(_v3_raw(
+            authority_refs={"status_policy_ref": "eligible_status:foundation-posted-events"}))
+
+
+def test_an_ELIGIBILITY_selection_requires_the_STATUS_ref():
+    """The other half of the map. Direction was covered; eligibility was not, so a wrong entry in
+    `_REQUIRED_POLICY_REF` for this kind would have gone unnoticed."""
+    eligibility = [{"kind": "eligibility", "role": "eligibility", "semantic_value": "eligible"}]
+    with pytest.raises(SchemaError, match="status_policy_ref"):
+        parse_proposal_v3(_v3_raw(selections=eligibility,
+                                  authority_refs={"direction_policy_ref": _DIR_REF}))
+    # ...and it PARSES once the matching ref is present
+    parse_proposal_v3(_v3_raw(
+        selections=eligibility,
+        authority_refs={"status_policy_ref": "eligible_status:foundation-posted-events"}))
+
+
+def test_a_BLANK_ref_is_refused_exactly_as_a_missing_one():
+    """A present-but-EMPTY ref names no policy.
+
+    Reaching this rule at all takes care, and that is worth recording: `AuthorityRefsV2` refuses an
+    all-blank block, and separately refuses surrounding whitespace, so the only shape that gets
+    here is an EMPTY direction ref beside a real status ref. The selection rule is the last of
+    three, and it is the only one that knows a DIRECTION selection needs the DIRECTION ref.
+    """
+    with pytest.raises(SchemaError, match="direction_policy_ref"):
+        parse_proposal_v3(_v3_raw(authority_refs={
+            "direction_policy_ref": "",
+            "status_policy_ref": "eligible_status:foundation-posted-events"}))
+
+
+def test_EVERY_selection_kind_has_a_required_ref():
+    """A TOTAL map. A kind with no entry would raise `KeyError` inside the validator instead of
+    refusing by name — a crash where a governed refusal belongs."""
+    from featuregen.formula.schema_v3 import _REQUIRED_POLICY_REF
+
+    assert set(_REQUIRED_POLICY_REF) == set(SelectionKind)
+    assert set(SELECTION_TOKENS) == set(SelectionKind)
+
+
 def test_a_selection_beside_a_filter_refuses_selection_filter_conflict():
     """The schema cannot prove WHICH column a filter touches, so a filter beside a selection is
     refused rather than risk applying direction twice or contradicting it."""
