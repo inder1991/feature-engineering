@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -54,9 +54,11 @@ beforeEach(() => {
   searchCatalog.mockResolvedValue(page(0, 20, 45))
 })
 
+// Rows are addressed by the COLUMN NAME they now lead with: Task 2's row demoted the object_ref
+// to a breadcrumb, so `public.t.c0` is no longer one text node anywhere in the DOM.
 async function mount() {
   render(<SearchScreen />)
-  await screen.findByText('public.t.c0')
+  await screen.findByText('c0')
 }
 
 // ── the control exists and is honest about where it can go ──────────────────────────────────────
@@ -69,7 +71,7 @@ it('offers Next when more results exist than this page shows', async () => {
 it('does not offer a way forward when this page is the whole result set', async () => {
   searchCatalog.mockResolvedValue(page(0, 5, 5))
   render(<SearchScreen />)
-  await screen.findByText('public.t.c0')
+  await screen.findByText('c0')
   expect(screen.queryByRole('button', { name: /next/i })).toBeNull()
 })
 
@@ -86,14 +88,14 @@ it('Next asks the server for the rows after this page', async () => {
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(20))
-  expect(await screen.findByText('public.t.c20')).toBeInTheDocument()
+  expect(await screen.findByText('c20')).toBeInTheDocument()
 })
 
 it('Previous returns to the page before', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
   searchCatalog.mockResolvedValue(page(0, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /previous/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(0))
@@ -105,10 +107,10 @@ it('stops offering Next on the last page', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
   searchCatalog.mockResolvedValue(page(40, 5, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c40')
+  await screen.findByText('c40')
   expect(screen.queryByRole('button', { name: /next/i })).toBeNull()
   expect(screen.getByRole('button', { name: /previous/i })).toBeEnabled()
 })
@@ -119,20 +121,20 @@ it('returns to the first page when a facet changes', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
 
   // A facet toggle narrows the set — carrying offset=20 into a 3-row result would show nothing.
   searchCatalog.mockResolvedValue(page(0, 3, 3))
   await userEvent.click(screen.getByRole('checkbox', { name: /wide/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(0))
-  expect(await screen.findByText('public.t.c0')).toBeInTheDocument()
+  expect(await screen.findByText('c0')).toBeInTheDocument()
 })
 
 it('returns to the first page when a new query is submitted', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
 
   searchCatalog.mockResolvedValue(page(0, 2, 2))
   await userEvent.type(screen.getByLabelText('Query'), 'balance{Enter}')
@@ -145,11 +147,64 @@ it('says which slice of the whole set is on screen', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
-  // The range is interpolated from several JSX expressions, so assert on the element's text
-  // rather than on a single matching text node.
-  const line = screen.getAllByRole('status').map(n => n.textContent ?? '').join(' | ')
-  expect(line).toMatch(/21/)
-  expect(line).toMatch(/40/)
-  expect(line).toMatch(/45/)
+  await screen.findByText('c20')
+  // The pager is now the ONE statement of the slice, and this is the only test that exercises its
+  // arithmetic anywhere but the first page. Exact text, not /21/ + /40/ + /45/ over the joined
+  // status nodes: those loose patterns were satisfiable by a row name or by the bare total, and
+  // "of 45" quietly stopped being what matched /45/ once the count line read "45 assets".
+  expect(screen.getByText('Showing 21–40 of 45 matching assets')).toBeInTheDocument()
+  // The total is a property of the query, not of the page: it must not drift as the user walks.
+  // Addressed by its testid, not by role=status, and NOT because the count line stopped being a
+  // live region: this screen carries TWO on purpose — the count line, which speaks when a query
+  // lands (a one-page result renders no pager at all, so it is the only region that exists in the
+  // commonest result shape there is), and the pager copy, which speaks as the reader pages. Both
+  // are present here, so role=status is ambiguous and the testid is what pins THIS line.
+  // Anchored, so a count line that also restated the slice would not match.
+  expect(screen.getByTestId('result-count')).toHaveTextContent(/^45 assets$/)
+
+  // One more page, because a FULL page cannot tell `offset + hits.length` from `offset + 20`.
+  // The last page is short (5 of 45), so only the honest expression reads 41–45 here.
+  searchCatalog.mockResolvedValue(page(40, 5, 45))
+  await userEvent.click(screen.getByRole('button', { name: /next/i }))
+  await screen.findByText('c40')
+  expect(screen.getByText('Showing 41–45 of 45 matching assets')).toBeInTheDocument()
+})
+
+// Paging is a SILENT change for a screen reader unless the text that changes sits in a live
+// region. Collapsing the two slice statements into one left the survivor — the pager copy —
+// outside any live region, while the count line reads the same "45 assets" on every page. The
+// announcement has to live where the changing text lives.
+//
+// Scoped to the pager: a multi-page result set carries TWO live regions (the count, which speaks
+// on a new query, and this one, which speaks on a page change), so an unscoped getByRole('status')
+// would throw on the ambiguity rather than pin either of them.
+function pagerRegion(): HTMLElement {
+  return within(screen.getByRole('navigation', { name: 'Result pages' })).getByRole('status')
+}
+
+it('announces the new slice to a screen reader when the reader pages', async () => {
+  await mount()
+  const region = pagerRegion()
+  expect(region).toHaveTextContent('Showing 1–20 of 45 matching assets')
+
+  searchCatalog.mockResolvedValue(page(20, 20, 45))
+  await userEvent.click(screen.getByRole('button', { name: /next/i }))
+  await screen.findByText('c20')
+
+  // The SAME node, re-read: a live region that unmounts and remounts is not reliably announced,
+  // so node identity is part of the contract, not an incidental detail of this render.
+  expect(pagerRegion()).toBe(region)
+  expect(region).toHaveTextContent('Showing 21–40 of 45 matching assets')
+})
+
+// The count line keeps its own region, and keeps it UNCONDITIONALLY: a role that appeared only on
+// a multi-page set would mount a fresh region at the single-page → multi-page transition, and a
+// region that arrives already populated is not reliably announced at all.
+it('keeps the count line a live region beside the pager’s', async () => {
+  await mount()
+  const count = screen.getByTestId('result-count')
+  expect(count).toHaveAttribute('role', 'status')
+  expect(count).toHaveTextContent(/^45 assets$/)
+  // Two, and exactly two, in the successful multi-page state — the count and the pager copy.
+  expect(screen.getAllByRole('status')).toHaveLength(2)
 })

@@ -5306,9 +5306,90 @@ button.stat:hover {
   margin: 0;
 }
 
+/* ---- the burn-down ----
+
+   A queue worked THROUGH, not a scoreboard. The count leads at its own weight because it is the
+   one number a reviewer acts on; the bar carries the proportion, which is the thing a row of equal
+   tiles could not show, and it retreats as decisions land (the counts refetch after each one).
+
+   Colour is never the carrier: the bar is aria-hidden and every segment's number is written out in
+   the legend beneath it, so nothing here is readable only by hue. The three fills still clear 3:1
+   against each other and against --surface (WCAG 1.4.11) so the split is perceivable to a sighted
+   reader who cannot separate the hues. */
 .gq-summary {
-  margin-block: 12px 6px;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-block: 14px 8px;
 }
+
+.gq-burn-count {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin: 0;
+  font-size: 14px;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.gq-burn-count b {
+  font-family: var(--font-mono);
+  font-size: 34px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.gq-burn {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.gq-burn-bar {
+  display: flex;
+  height: 10px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+/* A segment for a count of 0 has flex-grow: 0 and collapses to nothing, which is correct — an
+   empty category should occupy no width rather than a hairline nobody can read. */
+.gq-seg[data-seg='yours']     { background: var(--accent); }
+.gq-seg[data-seg='elsewhere'] { background: var(--line-strong); }
+.gq-seg[data-seg='endorsed']  { background: var(--ok); }
+
+.gq-burn-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 7px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+.gq-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gq-key::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 2px;
+  background: currentcolor;
+}
+
+.gq-key[data-seg='yours']::before     { background: var(--accent); }
+.gq-key[data-seg='elsewhere']::before { background: var(--line-strong); }
+.gq-key[data-seg='endorsed']::before  { background: var(--ok); }
 
 .gq-filters {
   display: grid;
@@ -7788,3 +7869,365 @@ button.stat:hover {
 }
 
 .ccq-outcome { color: var(--ok); }
+
+/* ---- catalog search (2026-08-16 redesign) --------------------------------------------------
+   The result row: meaning leads, the physical address is a breadcrumb, one primary action.
+   Existing tokens only; composes the .row / .badge / .btn vocabulary. Nothing above is modified. */
+
+.rows .row.hit {
+  display: grid;
+  /* The capability column is fit-content, not a fixed minmax(0, 210px), and the actions are
+     placed explicitly. Most hits carry no capability at all (no grain, no as-of, no additivity),
+     and a fixed second track would have grown into 210px of blank space on those rows during
+     grid's maximize-tracks step — then auto-placed the actions INTO it, squeezing four buttons
+     into a 210px box. fit-content collapses an empty track to 0 and still caps a populated one. */
+  grid-template-columns: minmax(0, 1fr) fit-content(210px) auto;
+  gap: 16px;
+  align-items: start;
+  padding: 14px 16px;
+}
+
+.hit-main { min-width: 0; display: grid; gap: 4px; }
+
+.hit-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* The name leads, so it takes the body size rather than .mono's 13px — this rule follows .mono
+   in the cascade at equal specificity, which is what makes that win. */
+.hit-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* The physical address, demoted under the name but never hidden. --ink-faint is 5.89:1 on
+   --surface (see the token comment), so it clears 4.5:1 at this size. */
+.hit-breadcrumb {
+  margin: 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.hit-definition {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.hit-meta { margin: 2px 0 0; }
+
+/* Secondary size, not a 12px tier of its own: capability lines are meaningful content ("Grain key
+   for Account"), not micro-labels. With this the row uses only 14 / 13 / 11 — all documented. */
+.hit-capabilities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.hit-capabilities li { display: flex; align-items: baseline; gap: 7px; }
+
+.hit-capabilities li::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-line);
+}
+
+.hit-actions {
+  grid-column: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.hit-impact { margin-top: 6px; }
+.hit-impact ul { margin: 2px 0 0; padding-left: 18px; display: grid; gap: 2px; }
+
+/* The row's overflow disclosure. The popover is positioned against the trigger's own wrapper, so
+   it opens under the `···` rather than under the row. Secondary 13px for the items — the same
+   tier the definition and the capability lines use, no new size. */
+.hit-overflow { position: relative; }
+
+.hit-overflow-trigger { min-width: 34px; letter-spacing: 0.08em; }
+
+.hit-overflow-items {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  display: grid;
+  gap: 2px;
+  min-width: 200px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+/* `justify-content` and `height` are declared, not inherited: the base button rule above
+   (`button:where(:not(.nav-item))`) centres its content and pins a 32px height, which would
+   silently defeat the `text-align: left` below and stop a wrapped label growing its row. The
+   same pairing appears wherever this stylesheet renders a button as a list line. */
+.hit-overflow-items button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+  height: auto;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  text-align: left;
+}
+
+.hit-overflow-items button:hover:not(:disabled) { background: var(--surface-2); }
+.hit-overflow-items button:disabled { color: var(--ink-faint); cursor: not-allowed; }
+
+/* The facet group's "Show all N" disclosure. A group collapses to six named values, so the tail of
+   a fifty-value group sits behind this one control rather than becoming a wall.
+
+   13px — the documented secondary tier — not a 12px of its own. The base button rule centres its
+   content and pins a 32px height, so `justify-content` and `height` are declared here for the same
+   reason `.hit-overflow-items button` declares them: without them `text-align: left` is silently
+   defeated and the link cannot sit tight under the last option. */
+.facet-more {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  height: auto;
+  min-height: 0;
+  margin-top: 4px;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.facet-more:hover { color: var(--accent-hover); text-decoration: underline; }
+
+/* The panel renders NOTHING when the server returned no facets — the loading hint on every initial
+   load, and the alert after a failed search (`setResult(null)`), both reach that state. `.facet-cols`
+   is `224px minmax(0, 1fr)` and `.search-results` declares no `grid-column` anywhere in this file,
+   so as the only grid item it auto-places into column ONE and the results get squeezed into 224px
+   with an empty 1fr beside them.
+
+   Keyed on `:has()` rather than a modifier class from `SearchScreen.tsx`, so the panel remains the
+   single owner of when it renders and the layout cannot drift out of step with it. */
+.facet-cols:not(:has(.facet-panel)) {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+/* The results toolbar: the count and the slice on the left, the projection state on the right.
+   Both are facts about the SAME read, so they share one baseline rather than stacking. */
+.results-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* The projection marker the screen never rendered. Quiet by construction: `ready` is the normal
+   case, so it states the fact at micro-label size and gets out of the way. The `lagged` case is
+   NOT this element — it composes the house .callout--warn, which already carries its own styles. */
+.projection-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+/* `flex: none` for the same reason `.hit-capabilities li::before` and `.facet-pii-dot` declare it:
+   as a flex item a 6px square is shrinkable, and a dot compressed on one axis is an oval. */
+.projection-ok::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+/* `.pager` carried no layout rule at all, so its two buttons sat edge to edge (JSX drops the
+   whitespace between them) and `.pager-copy`'s `margin-right: auto` would have been inert. One
+   flex line: the slice copy reads first, the controls sit at the far end. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 13px is the documented secondary size; the row's ramp is 14/13/11 and 12px is not a tier. */
+.pager-copy { color: var(--ink-faint); font-size: 13px; margin-right: auto; }
+
+/* The search field and its clear control. The input is no longer a direct flex child of
+   `.search-bar` — it is wrapped so the clear button can be positioned inside its right edge —
+   so this wrapper takes over the growing and the input fills it. */
+.search-field { position: relative; flex: 1; min-width: 0; }
+.search-field .search-input { width: 100%; padding-right: 36px; }
+
+/* `type="search"` makes Blink and WebKit draw their OWN clear glyph, which would sit beside ours
+   as a second, differently-styled X (and is invisible to assistive tech and to the tests). One
+   clear control, ours — so the engine's is suppressed. Firefox draws none, so nothing is lost. */
+.search-field .search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+/* Inside the field's right edge, over the 36px of padding reserved above so it can never sit on
+   top of the text. Transparent until hover; `--ink-faint` is 5.89:1 on `--surface`. */
+.search-clear {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  transform: translateY(-50%);
+  /* The base button rule pins `padding: 0 14px`, which is 28px of inline padding inside a 24px
+     box — the glyph would overflow its own content box rather than sit in it. */
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-faint);
+  /* 15px, the size `.ln-drawer-close` uses — this control is that idiom (a 24px square glyph
+     button that dismisses something) declaration for declaration, so it takes that idiom's size
+     rather than introducing a second value for the same job. */
+  font-size: 15px;
+  line-height: 1;
+}
+
+.search-clear:hover { background: var(--surface-2); color: var(--ink); }
+
+/* The help line under the bar. `.hint` already carries the 13px secondary size and --ink-faint.
+
+   The spacing is a PAIR, not two independent margins: `.search-bar` owns a 14px bottom margin and
+   `.facet-cols` below owns no top margin at all, so leaving both alone would put 14px ABOVE the
+   help line and zero below it — the line would read as a caption for the results rather than for
+   the field it explains, and would sit flush against the facet rail. The bar gives up its bottom
+   margin only when the help line follows it, and the help line carries the 14px on downward. */
+.search-bar:has(+ .search-help) { margin-bottom: 0; }
+.search-help { margin: 6px 2px 14px; }
+
+/* The key cap. 11px is the documented micro tier — the base `code, kbd` rule is 13px, which reads
+   as a second body size sitting inside a secondary sentence. */
+.search-help kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+/* The zero-state's exit, set off from the paragraph that explains what withheld the rows.
+
+   Scoped to `.search-results`: `.empty` is shared vocabulary across ten screens, and at least one
+   of them (ConnectorPanel's "Go to Integrations") already renders a `.btn` inside one. An unscoped
+   rule filed under the catalog-search banner would silently restyle those. */
+.search-results .empty .btn { margin-top: 12px; }
+
+/* ---- responsive density ---------------------------------------------------------------------
+   Three widths, narrowest last so each block appends to the one above rather than fighting it. */
+
+/* Laptop: the capability column stops competing with the definition for width and moves under it.
+   The actions keep a column of their own and stay on row 1.
+
+   NO `grid-row: 1 / 3` on the actions. A span DECLARES the second track, so grid creates it on
+   every hit — and `gap: 16px` is charged between adjacent tracks whether or not either holds
+   anything, which would put 16px of dead space under every capability-less row (the common case:
+   no grain, no as-of, no additivity). The span bought nothing anyway, because the row already
+   sets `align-items: start`. With it gone, row 2 exists only when `.hit-capabilities` renders. */
+@media (max-width: 1180px) {
+  .rows .row.hit { grid-template-columns: minmax(0, 1fr) auto; }
+  .hit-capabilities { grid-column: 1; grid-row: 2; }
+  .hit-actions { grid-column: 2; }
+}
+
+/* Narrow: one column, actions wrap under the content, facets become a horizontal tray.
+   900px, NOT a new breakpoint: index.css:3994 already unsticks the sidebar and collapses
+   .facet-cols to one column at exactly this width. This block appends to that decision (equal
+   specificity, later in the file) rather than introducing a second, competing narrow width. */
+@media (max-width: 900px) {
+  .rows .row.hit { grid-template-columns: minmax(0, 1fr); }
+  .hit-capabilities,
+  .hit-actions { grid-column: 1; grid-row: auto; }
+  .hit-actions { flex-wrap: wrap; }
+
+  .facet-panel {
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+  }
+
+  /* Scoped to `.facet-panel`, not bare `.facet-group`: that class is NOT search's alone —
+     WorkbenchScreen renders the candidate filter bar's groups with it too (WorkbenchScreen.tsx,
+     `<div className="facet-group">` around a micro-label + `.facet-chips`). An unscoped rule filed
+     under the catalog-search banner would silently flip that bar to a horizontal row on every
+     narrow viewport. The workbench renders no `.facet-panel`, so this reaches search only. */
+  .facet-panel .facet-group {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 0;
+  }
+  .facet-panel .facet-group-title { margin-bottom: 0; white-space: nowrap; }
+  .facet-panel .facet-option { white-space: nowrap; }
+  .facet-panel .facet-more { margin-top: 0; white-space: nowrap; }
+}
+
+/* Phone: the overflow popover cannot hang off the right edge of a 360px screen. */
+@media (max-width: 620px) {
+  .hit-overflow-items { right: auto; left: 0; min-width: min(240px, calc(100vw - 48px)); }
+  .results-toolbar { flex-direction: column; align-items: flex-start; gap: 4px; }
+}
+
+/* The search field's wrap basis. The rule above set `.search-field { flex: 1 }` (= `1 1 0%`),
+   which never wraps and shrinks the field instead; the basis it replaced put the field's
+   hypothetical size at 320px so the Search button wrapped onto its own line on a narrow
+   container. Restore the basis — this is the only reason the row wraps at all, and
+   `.search-input`'s old `flex: 1 1 320px` (index.css:3727) is now inert because the input is no
+   longer a flex child. */
+.search-field { flex: 1 1 320px; }
+
+/* Motion: the popover is the only thing on this screen that animates, and only when motion is
+   welcome. `--dur` (160ms) and `--ease-out-quart` are the sheet's own motion tokens and sit
+   inside DESIGN.md's 150-200ms ease-out-quart band; opacity + transform only, no layout property.
+
+   The `no-preference` gate is belt and braces — the global reduce block at index.css:116 already
+   caps every animation-duration — and follows the precedent `.path` set at index.css:1202. */
+@media (prefers-reduced-motion: no-preference) {
+  .hit-overflow-items { animation: hit-overflow-in var(--dur) var(--ease-out-quart); }
+  @keyframes hit-overflow-in {
+    from { opacity: 0; transform: translateY(-2px); }
+    to { opacity: 1; transform: none; }
+  }
+}

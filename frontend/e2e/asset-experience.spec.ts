@@ -62,21 +62,24 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
     expect(body.status, JSON.stringify(body)).toBe('ingested')
   })
 
-  test('search -> Details renders the real asset detail, a nonblank graph, and no overflow', async ({
+  test('search -> Open asset renders the real asset detail, a nonblank graph, and no overflow', async ({
     page,
   }) => {
     // --- search for the seeded asset (REAL GET /search) ---
     await page.goto('/#/search')
-    await page.getByRole('textbox', { name: 'Query' }).fill(TABLE)
+    // `searchbox`, not `textbox` (drift caught 2026-08-16): the query field is `type="search"`
+    // since Task 6, which changes its implicit ARIA role. `npm test`'s include glob is `src/**`,
+    // so nothing in this directory is covered by the unit suite — this file is checked by hand.
+    await page.getByRole('searchbox', { name: 'Query' }).fill(TABLE)
     // Two "Search" buttons exist since the nav gained one (drift caught 2026-08-14): scope
     // to the search FORM's own submit, not the nav entry.
     await page.locator('main').getByRole('button', { name: 'Search', exact: true }).click()
 
-    // A real hit for the seeded asset surfaces its Details action (aria-label carries the object_ref,
-    // e.g. "Details for public.e2e_accounts.balance").
-    const details = page.getByRole('button', { name: new RegExp(`^Details for .*${TABLE}`) })
-    await expect(details.first()).toBeVisible()
-    await details.first().click()
+    // A real hit for the seeded asset surfaces its Open asset action — the row's ONE primary
+    // (aria-label carries the object_ref, e.g. "Open asset public.e2e_accounts.balance").
+    const openAsset = page.getByRole('button', { name: new RegExp(`^Open asset .*${TABLE}`) })
+    await expect(openAsset.first()).toBeVisible()
+    await openAsset.first().click()
 
     // --- navigation: the asset route + the REAL asset detail rendered ---
     // The hash carries the hit's own catalog_source; the detail heading is the asset's table[.column]

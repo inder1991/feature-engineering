@@ -7,30 +7,14 @@ import {
   type SearchFilters,
   type SearchHit,
   type SearchResult,
-  featureImpact,
   searchCatalog,
 } from '../api'
 import { useHashRoute } from '../nav'
+import { CalloutGlyph } from './IngestResultCallout'
 import { LineageView } from './LineageView'
-
-const FACET_GROUPS: { key: SearchFacetKey; label: string }[] = [
-  { key: 'source', label: 'Source' },
-  { key: 'domain', label: 'Domain' },
-  // Two sensitivity facets, deliberately named apart. `sensitivity_display` is the projected
-  // restriction label the asset page shows and the one a user means by "sensitivity";
-  // `sensitivity` is the raw tag a source file declared, which is empty on catalogs that declare
-  // none. Labelling both "Sensitivity" would put two different vocabularies under one word.
-  { key: 'sensitivity_display', label: 'Sensitivity' },
-  { key: 'sensitivity', label: 'Declared tag' },
-  { key: 'additivity', label: 'Additivity' },
-  { key: 'entity', label: 'Entity' },
-  { key: 'kind', label: 'Kind' },
-]
-
-const FLAG_OPTIONS: { key: 'grain' | 'as_of'; label: string }[] = [
-  { key: 'grain', label: 'Grain' },
-  { key: 'as_of', label: 'As-of' },
-]
+import { SearchFacetPanel } from './SearchFacetPanel'
+import { SearchHitRow } from './SearchHitRow'
+import { facetLabel } from './searchFacetLabels'
 
 function paramsToFilters(params: URLSearchParams): SearchFilters {
   const filters: SearchFilters = {}
@@ -62,6 +46,24 @@ function canonicalHash(params: URLSearchParams): string {
   return buildSearchHash(params.get('q') ?? '', paramsToFilters(params))
 }
 
+// `<input>` types that accept no typed text, so a "/" reaching one of them is a shortcut and not a
+// character. Every checkbox on this screen is an HTMLInputElement — the facet values and flags,
+// the graph's layer toggles, the rail's role chips — so treating the whole class as "typing" made
+// "/" inert exactly where keyboard focus most often sits, while the help line under the bar
+// promises it works from anywhere on the page.
+const NON_TEXT_INPUT_TYPES = new Set([
+  'button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit',
+])
+
+// Is the focused element somewhere the user is entering text? `input.type` is normalized lowercase
+// and defaults to 'text', so an unknown or absent type is treated as text-entry — the safe way
+// round, since the cost of a false positive is only that the shortcut does not fire.
+function isTextEntry(element: Element | null): boolean {
+  if (element instanceof HTMLTextAreaElement) return true
+  if (element instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(element.type)
+  return element instanceof HTMLElement && element.isContentEditable
+}
+
 export function SearchScreen() {
   const { params, navigate } = useHashRoute()
   // Committed search state lives in React; the hash mirrors it (a shareable output) and seeds it
@@ -84,6 +86,22 @@ export function SearchScreen() {
   const seq = useRef(0)
   // The hash we last originated. Guards the sync-from-hash effect from reacting to our own writes.
   const appliedHash = useRef<string | null>(null)
+  const queryField = useRef<HTMLInputElement>(null)
+
+  // "/" focuses search from anywhere on the page — except while the user is entering text, where
+  // it is just a character (`a/b` must stay `a/b`). `shiftKey` is deliberately NOT in the modifier
+  // guard: on several keyboard layouts "/" IS Shift+something, and excluding it would kill the
+  // shortcut outright for those users.
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
+      if (isTextEntry(document.activeElement)) return
+      event.preventDefault()
+      queryField.current?.focus()
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => document.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   const runSearch = useCallback((nextQ: string, nextFilters: SearchFilters, nextOffset = 0) => {
     const id = ++seq.current
@@ -181,8 +199,8 @@ export function SearchScreen() {
   }
 
   const hasHits = result !== null && result.hits.length > 0
-  // With no results there is nothing to anchor a graph on: fall back to list behavior (empty
-  // states, alerts) and disable the toggle.
+  // With no results there is nothing to anchor a graph on, so the screen falls back to list
+  // behavior (the empty state, the alert) even when an earlier anchor left `view` on 'graph'.
   const effectiveView = hasHits ? view : 'list'
   const graphAnchor = hasHits ? (anchor ?? result.hits[0]) : null
 
@@ -209,15 +227,17 @@ export function SearchScreen() {
     })
   }
 
-  // Active-filter chips, in facet-group order, then flags.
+  // Active-filter chips, in the order the facet keys ride the query string, then flags. The chip
+  // wears the SAME label the sidebar group wears — `facetLabel` is the one owner of that
+  // vocabulary, so a chip can never read "sensitivity display" under a group reading "Sensitivity".
   const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
-  for (const group of FACET_GROUPS) {
-    for (const value of filters[group.key] ?? []) {
+  for (const key of SEARCH_FACET_KEYS) {
+    for (const value of filters[key] ?? []) {
       chips.push({
-        id: `${group.key}:${value}`,
-        label: `${group.label.toLowerCase()}: ${value}`,
-        pii: group.key === 'sensitivity' && value === 'pii',
-        remove: () => toggleFacet(group.key, value),
+        id: `${key}:${value}`,
+        label: `${facetLabel(key).toLowerCase()}: ${value === '(none)' ? 'not classified' : value}`,
+        pii: key === 'sensitivity' && value === 'pii',
+        remove: () => toggleFacet(key, value),
       })
     }
   }
@@ -229,56 +249,51 @@ export function SearchScreen() {
   }
   const hasFilters = chips.length > 0
 
-  const flagBuckets = result
-    ? { grain: result.facets.grain?.[0], as_of: result.facets.as_of?.[0] }
-    : null
-  const showFlags = Boolean(flagBuckets && (flagBuckets.grain || flagBuckets.as_of))
-
   return (
     <section className="search-screen">
       {/* Section landmark for assistive tech; the visible page title lives in the app page-head,
           so the mockup's layout stays clean (no repeated visible heading). */}
       <h2 className="visually-hidden">Search the catalog</h2>
+      {/* No global view toggle. A lineage graph needs an ANCHOR, and a toolbar control has none:
+          it sat disabled until results existed, then anchored on hits[0] — which is how an
+          unfiltered browse let the TABLE row hijack a column's anchor. Graph mode is still real
+          and is entered per row ("Explore relationships"); LineageView owns the way back. */}
       <form onSubmit={submit} role="search" className="search-bar">
-        <input
-          aria-label="Query"
-          className="search-input"
-          value={draft}
-          onChange={e => setDraft(e.target.value)}
-          placeholder="Column, table, or concept"
-        />
+        <div className="search-field">
+          <input
+            aria-label="Query"
+            type="search"
+            className="search-input"
+            ref={queryField}
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            placeholder="Business term, physical name, or concept"
+          />
+          {/* An explicit control, not the browser's own. `type=search` renders a native clear
+              affordance in some engines and none in others, and it is invisible to assistive
+              tech and to our tests — so the screen owns one that is always there. */}
+          {draft && (
+            <button
+              type="button"
+              className="search-clear"
+              aria-label="Clear search"
+              onClick={() => {
+                setDraft('')
+                queryField.current?.focus()
+              }}
+            >
+              ×
+            </button>
+          )}
+        </div>
         <button type="submit" className="btn btn--primary search-submit">
           Search
         </button>
-        <div
-          className="viewtoggle"
-          role="group"
-          aria-label="Result view"
-          aria-describedby={hasHits ? undefined : 'viewtoggle-hint'}
-        >
-          <button
-            type="button"
-            aria-pressed={effectiveView === 'list'}
-            disabled={!hasHits}
-            onClick={() => setView('list')}
-          >
-            List
-          </button>
-          <button
-            type="button"
-            aria-pressed={effectiveView === 'graph'}
-            disabled={!hasHits}
-            onClick={() => setView('graph')}
-          >
-            Graph
-          </button>
-        </div>
-        {!hasHits && (
-          <span id="viewtoggle-hint" className="hint">
-            Run a search to map lineage.
-          </span>
-        )}
       </form>
+      <p className="hint search-help">
+        Try a business term, a physical name such as <code>cust_num</code>, or a concept.
+        Press <kbd>/</kbd> to search from anywhere on the page.
+      </p>
 
       {/* The row reserved 26px + 14px whether or not it had anything in it. Removing the
           "No filters" text left the empty container behind, which is most of the dead band
@@ -307,59 +322,12 @@ export function SearchScreen() {
 
       <div className={effectiveView === 'graph' ? 'facet-cols facet-cols--graph' : 'facet-cols'}>
         {effectiveView === 'list' && (
-        <aside className="facet-panel" aria-label="Filters">
-          {FACET_GROUPS.map(group => {
-            const buckets = result?.facets[group.key] ?? []
-            if (buckets.length === 0) return null
-            return (
-              <fieldset className="facet-group" key={group.key}>
-                <legend className="facet-group-title">{group.label}</legend>
-                {buckets.map(bucket => {
-                  const checked = (filters[group.key] ?? []).includes(bucket.value)
-                  const isPii = group.key === 'sensitivity' && bucket.value === 'pii'
-                  return (
-                    <label className="facet-option" key={bucket.value}>
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleFacet(group.key, bucket.value)}
-                      />
-                      {isPii && <span className="facet-pii-dot" aria-hidden="true" />}
-                      <span className="facet-name">{bucket.value}</span>{' '}
-                      <span className="facet-count tabular-nums">{bucket.count}</span>
-                    </label>
-                  )
-                })}
-              </fieldset>
-            )
-          })}
-          {showFlags && (
-            <fieldset className="facet-group">
-              <legend className="facet-group-title">Flags</legend>
-              {FLAG_OPTIONS.map(flag => {
-                const count = flagBuckets?.[flag.key]?.count ?? 0
-                const checked = Boolean(filters[flag.key])
-                // A flag with no matching rows and not already picked cannot narrow further.
-                const disabled = count === 0 && !checked
-                return (
-                  <label
-                    className={disabled ? 'facet-option facet-option--disabled' : 'facet-option'}
-                    key={flag.key}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={disabled}
-                      onChange={() => toggleFlag(flag.key)}
-                    />
-                    <span className="facet-name">{flag.label}</span>{' '}
-                    <span className="facet-count tabular-nums">{count}</span>
-                  </label>
-                )
-              })}
-            </fieldset>
-          )}
-        </aside>
+          <SearchFacetPanel
+            facets={result?.facets ?? {}}
+            filters={filters}
+            onToggleFacet={toggleFacet}
+            onToggleFlag={toggleFlag}
+          />
         )}
 
         <div className="search-results">
@@ -381,6 +349,19 @@ export function SearchScreen() {
                 re-vouched, and columns your roles cannot see are never shown. Nothing is shown that
                 cannot be trusted.
               </p>
+              {/* The exit. The zero-state named the causes but offered no control, so the only way
+                  back to a populated catalog was hand-editing the hash or removing chips one at a
+                  time. `apply('', {})` clears the query AND every facet in one commit.
+
+                  Rendered only when there IS a query or a facet to clear. The empty state also
+                  covers an empty catalog and a read scope that permits nothing, where this button
+                  would name an action it does not perform — the same reason the pager below drops
+                  its Next control rather than disabling it. */}
+              {(q || hasFilters) && (
+                <button type="button" className="btn" onClick={() => apply('', {})}>
+                  Clear search and filters
+                </button>
+              )}
             </div>
           )}
 
@@ -388,18 +369,62 @@ export function SearchScreen() {
               workspace that has its own anchor bar, and it was a third of the 300px of dead space
               before the canvas began. */}
           {!error && hasHits && effectiveView === 'list' && (
-            <p className="micro-label tabular-nums result-count" role="status">
-              <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
-              {result.total === 1 ? 'result' : 'results'}
-              {result.total > result.hits.length && (
-                // The SLICE, not just a count: with paging, "showing the first 20" stopped being
-                // true the moment the user moved forward, and a bare count gives no way to tell
-                // which 20 are on screen.
-                <span className="result-count-note">
-                  {' '}· showing {offset + 1}–{offset + result.hits.length} of {result.total}
-                </span>
+            <div className="results-toolbar">
+              {/* The COUNT only. The slice is stated once, by the pager — the control that
+                  navigates it — rather than twice in adjacent lines: the toolbar's slice note
+                  rendered exactly when `total > hits.length`, which is exactly when the pager
+                  renders too, so it was redundant in 100% of the states it could appear in.
+
+                  Still a live region, and it has to be: a result set that fits on one page renders
+                  NO pager, so the pager's region does not exist and dropping this one left the
+                  commonest result shape of all announcing nothing when a query lands (WCAG 4.1.3).
+                  It does not compete with the pager's region either — a live region whose text is
+                  unchanged does not announce, and this line reads the same "45 assets" on every
+                  page, so paging speaks only through the pager. The one overlap is a new query
+                  that changes the total AND pages: the reader hears the count and then the slice,
+                  which is redundancy rather than silence. */}
+              <p
+                className="micro-label tabular-nums result-count"
+                role="status"
+                data-testid="result-count"
+              >
+                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
+                {result.total === 1 ? 'asset' : 'assets'}
+              </p>
+              {/* The projection marker, finally rendered. Search reads the projected display
+                  columns, so a lagged projection means these rows may not reflect the newest
+                  resolved semantics — and until now the screen said nothing at all about it.
+                  Optional-chained: an older backend (or a frontend-first deploy) omits the field,
+                  and absence must render as absence rather than throw inside render. */}
+              {result.projection?.status === 'ready' && (
+                <p className="projection-ok" data-testid="search-projection">
+                  Catalog projection current
+                </p>
               )}
-            </p>
+            </div>
+          )}
+
+          {/* A disclosure, never a refusal: whatever is below stays on screen either way.
+              Deliberately NOT gated on list view. The toolbar above is chrome about a list slice,
+              but this is a statement about the truth of data that is still on screen in EITHER
+              view: a user already in Graph can submit a new query from the search bar, and
+              LineageView renders the anchor's concept, entity, grain and as-of — precisely the
+              projected display fields this marker qualifies. */}
+          {!error && hasHits && result.projection?.status === 'lagged' && (
+            <div className="callout callout--warn" role="status" data-testid="search-projection-lag">
+              {/* The house warn triangle. Circle+X is danger and circle+check is ok in this
+                  stylesheet's vocabulary, so a circle here would have spoken a third dialect. */}
+              <CalloutGlyph>
+                <path d="M8 2.75 14 13.25H2z" />
+                <path d="M8 6.75v2.75M8 11.5v.01" />
+              </CalloutGlyph>
+              <div className="callout-body">
+                <p>
+                  The catalog projection was behind when these results were read, so they may not
+                  yet reflect the newest resolved semantics.
+                </p>
+              </div>
+            </div>
           )}
 
           {/* A1: paging the RESULT LIST while a graph is on screen is chrome for a view that is
@@ -407,6 +432,22 @@ export function SearchScreen() {
           {!error && hasHits && effectiveView === 'list'
             && (offset > 0 || offset + result.hits.length < result.total) && (
             <nav className="pager" aria-label="Result pages">
+              {/* The ONE statement of the slice, in the control that navigates it. The pager only
+                  renders when there is more than one page, so this line appears exactly when
+                  paging is possible — which is when it earns its space.
+
+                  "matching", not "permitted": `total` counts the rows matching THIS query and
+                  THESE facets. "permitted" would claim the read-scoped universe is 42, which is
+                  false whenever a filter is active, and would quietly absorb freshness-withheld
+                  assets — which are permitted, and which the empty state names separately. */}
+              {/* A live region, because this is the one line on the screen whose text changes as
+                  the reader pages: the count line above cannot carry that announcement, since its
+                  text is identical on every page and an unchanged region announces nothing. The
+                  two regions are complementary, not competing — this one speaks on a page change,
+                  that one on a new query. */}
+              <span className="pager-copy tabular-nums" role="status">
+                Showing {offset + 1}–{offset + result.hits.length} of {result.total} matching assets
+              </span>
               <button
                 type="button"
                 className="ghost"
@@ -433,11 +474,11 @@ export function SearchScreen() {
           {!error && hasHits && effectiveView === 'list' && (
             <ul className="rows">
               {result.hits.map(hit => (
-                <HitRow
+                <SearchHitRow
                   key={`${hit.catalog_source}:${hit.object_ref}`}
                   hit={hit}
-                  onGraph={jumpToGraph}
-                  onDetails={openDetails}
+                  onOpen={openDetails}
+                  onExplore={jumpToGraph}
                   onSuggested={openSuggested}
                 />
               ))}
@@ -462,125 +503,5 @@ export function SearchScreen() {
         </div>
       </div>
     </section>
-  )
-}
-
-function HitRow({
-  hit,
-  onGraph,
-  onDetails,
-  onSuggested,
-}: {
-  hit: SearchHit
-  onGraph: (hit: SearchHit) => void
-  onDetails: (hit: SearchHit) => void
-  onSuggested: (hit: SearchHit) => void
-}) {
-  const [impact, setImpact] = useState<string[] | null>(null)
-  const [impactError, setImpactError] = useState('')
-  const [checking, setChecking] = useState(false)
-
-  async function checkImpact() {
-    setChecking(true)
-    setImpactError('')
-    try {
-      setImpact(await featureImpact(hit.object_ref, hit.catalog_source))
-    } catch (err) {
-      setImpact(null)
-      setImpactError(err instanceof ApiError ? err.detail : String(err))
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  const aggregation = hit.additivity
-    ? `${hit.additivity}${hit.unit ? ` · ${hit.unit}` : ''}${hit.currency ? ` (${hit.currency})` : ''}`
-    : null
-  const meta = [
-    hit.data_type ?? hit.kind,
-    hit.catalog_source,
-    hit.concept,
-    hit.domain,
-    hit.entity,
-    aggregation,
-  ]
-    .filter((part): part is string => Boolean(part))
-    .join(' · ')
-  return (
-    <li className="row">
-      <div style={{ display: 'grid', gap: 2, minWidth: 0, flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-          <code>{hit.object_ref}</code>
-          {hit.kind === 'table' && <span className="badge kindtable">table</span>}
-          {hit.is_grain && <span className="badge grain">grain</span>}
-          {hit.is_as_of && <span className="badge asof">as-of</span>}
-          {hit.sensitivity && <span className="badge sensitivity">{hit.sensitivity}</span>}
-          {/* The projected display label, its OWN badge — never merged with the tag above: the two
-              speak different vocabularies ('pii' vs 'restricted'), and on a catalog that declares
-              no tag this is the only sensitivity a column has. */}
-          {hit.sensitivity_display && (
-            <span className="badge sensitivity">{hit.sensitivity_display}</span>
-          )}
-        </div>
-        {hit.definition && <p style={{ color: 'var(--ink-soft)' }}>{hit.definition}</p>}
-        <p className="hint">{meta}</p>
-        {checking && <p className="hint">Checking feature impact…</p>}
-        {impactError && (
-          <p role="alert" className="error">
-            Impact check failed: {impactError}
-          </p>
-        )}
-        {impact?.length === 0 && (
-          <p className="hint" role="status">
-            No features derive from this column.
-          </p>
-        )}
-        {impact && impact.length > 0 && (
-          <div>
-            <p className="micro-label" style={{ marginTop: 4 }}>
-              Derived features
-            </p>
-            <ul className="mono" style={{ marginTop: 2, paddingLeft: 18, display: 'grid', gap: 2 }}>
-              {impact.map(id => (
-                <li key={id}>{id}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Details for ${hit.object_ref}`}
-        onClick={() => onDetails(hit)}
-      >
-        Details
-      </button>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Suggested features for ${hit.table}`}
-        onClick={() => onSuggested(hit)}
-      >
-        Suggested features
-      </button>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Graph for ${hit.object_ref}`}
-        onClick={() => onGraph(hit)}
-      >
-        Graph
-      </button>
-      <button
-        type="button"
-        className="btn"
-        aria-label={`Impact for ${hit.object_ref}`}
-        disabled={checking}
-        onClick={() => void checkImpact()}
-      >
-        Impact
-      </button>
-    </li>
   )
 }
