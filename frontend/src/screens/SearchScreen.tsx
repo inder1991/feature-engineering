@@ -11,8 +11,9 @@ import {
 } from '../api'
 import { useHashRoute } from '../nav'
 import { LineageView } from './LineageView'
-import { SearchFacetPanel, facetLabel } from './SearchFacetPanel'
+import { SearchFacetPanel } from './SearchFacetPanel'
 import { SearchHitRow } from './SearchHitRow'
+import { facetLabel } from './searchFacetLabels'
 
 function paramsToFilters(params: URLSearchParams): SearchFilters {
   const filters: SearchFilters = {}

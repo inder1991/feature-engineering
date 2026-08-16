@@ -241,6 +241,24 @@ describe('search screen — facet sidebar', () => {
     await userEvent.click(domain().getByRole('button', { name: 'Show all 9' }))
     expect(domain().getAllByRole('checkbox')).toHaveLength(9)
     expect(domain().getByRole('checkbox', { name: 'domain_8 1' })).toBeInTheDocument()
+    // Reversible: the disclosure is a toggle, so a group opened by accident can be closed again.
+    await userEvent.click(domain().getByRole('button', { name: 'Show fewer' }))
+    expect(domain().getAllByRole('checkbox')).toHaveLength(6)
+  })
+
+  // A deep link can apply a filter on a value that sits past the collapsed window. The group must
+  // render it checked without expanding, or it reports itself as unfiltered while filtering.
+  it('shows a deep-linked value from past the collapsed window, already checked', async () => {
+    window.location.hash = '#/search?domain=domain_8'
+    searchCatalog.mockResolvedValue(result([HIT], {
+      ...FACETS,
+      domain: Array.from({ length: 9 }, (_, i) => ({ value: `domain_${i}`, count: 9 - i })),
+    }, 1))
+    render(<SearchScreen />)
+    await findRow('public.accounts.balance')
+    const domain = within(screen.getByRole('group', { name: 'Domain' }))
+    expect(domain.getAllByRole('checkbox')).toHaveLength(6)
+    expect(domain.getByRole('checkbox', { name: 'domain_8 1' })).toBeChecked()
   })
 
   it('omits a facet group the response does not carry', async () => {

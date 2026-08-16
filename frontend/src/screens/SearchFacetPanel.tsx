@@ -1,29 +1,10 @@
 import { useState } from 'react'
 import { SEARCH_FACET_KEYS, type FacetBucket, type SearchFacetKey, type SearchFilters } from '../api'
+import { facetLabel } from './searchFacetLabels'
 
-// The label a facet key wears in the sidebar. A key that is not here still renders — humanized —
-// because the server is allowed to grow a facet without the UI shipping first.
-const FACET_LABELS: Record<string, string> = {
-  source: 'Source',
-  kind: 'Kind',
-  domain: 'Domain',
-  sub_domain: 'Sub-domain',
-  entity: 'Entity',
-  // The backend's `data_role` is the TABLE role projection (crosswalk, reference, event…). The
-  // column axis — grain / as-of — is the flags group below, titled "Column role". Two different
-  // questions must not share one word.
-  data_role: 'Table role',
-  authority_role: 'Authority role',
-  temporal_storage_model: 'Temporal storage',
-  additivity: 'Additivity',
-  // The projected display axis a user means by "sensitivity", and the raw tag a source file
-  // declared, which is empty on catalogs that declare none. Named apart on purpose.
-  sensitivity_display: 'Sensitivity',
-  sensitivity: 'Declared tag',
-  bian_path: 'BIAN path',
-  process_path: 'Business process',
-}
-
+// FACET_ORDER stays here, unlike the labels: ORDERING the groups is something only this panel
+// does, while NAMING a facet is shared with the screen's chips. A constant with one consumer
+// belongs next to that consumer.
 // Known keys lead, in reading order; anything the server adds later follows, alphabetically.
 const FACET_ORDER: string[] = [
   'source', 'kind', 'domain', 'sub_domain', 'entity', 'data_role', 'authority_role',
@@ -38,18 +19,6 @@ const FLAG_OPTIONS: { key: 'grain' | 'as_of'; label: string }[] = [
   { key: 'grain', label: 'Grain key' },
   { key: 'as_of', label: 'As-of field' },
 ]
-
-/**
- * The sidebar label for a facet key. EXPORTED because the screen's active-filter chips name the
- * same facets: without one owner of this vocabulary a chip reads "sensitivity display: restricted"
- * while the group above it reads "Sensitivity".
- */
-export function facetLabel(key: string): string {
-  const known = FACET_LABELS[key]
-  if (known) return known
-  const spaced = key.replace(/_/g, ' ')
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1)
-}
 
 function isFacetKey(key: string): key is SearchFacetKey {
   return (SEARCH_FACET_KEYS as readonly string[]).includes(key)
@@ -98,13 +67,22 @@ export function SearchFacetPanel({
     <aside className="facet-panel" aria-label="Filters">
       {valueKeys.map(key => {
         const buckets = facets[key] ?? []
+        const selected = isFacetKey(key) ? (filters[key] ?? []) : []
         // The server orders by count desc; the NULL bucket is pulled out of that order entirely.
         const named = buckets.filter(bucket => bucket.value !== NONE)
         const none = buckets.find(bucket => bucket.value === NONE)
+        // A SELECTED value is hoisted to the front. The counts are exclude-own-facet, so choosing a
+        // value does not float it up the server's count-desc order: without this, deep-linking the
+        // ninth value of a group renders six unchecked boxes and the group reads as unfiltered
+        // while that filter is applied — the group misstating its own state. Both partitions keep
+        // the server's relative order.
+        const chosen = named.filter(bucket => selected.includes(bucket.value))
+        const ranked = [...chosen, ...named.filter(bucket => !selected.includes(bucket.value))]
         const isOpen = expanded[key] ?? false
-        const shown = isOpen ? named : named.slice(0, COLLAPSED)
-        const hidden = named.length - shown.length
-        const selected = isFacetKey(key) ? (filters[key] ?? []) : []
+        // The window is six, or wider if more than six values are selected — a checked box must
+        // never be the thing hiding behind the disclosure.
+        const shown = isOpen ? ranked : ranked.slice(0, Math.max(COLLAPSED, chosen.length))
+        const hidden = ranked.length - shown.length
         return (
           <fieldset className="facet-group" key={key}>
             <legend className="facet-group-title">{facetLabel(key)}</legend>
@@ -128,15 +106,21 @@ export function SearchFacetPanel({
                 </label>
               )
             })}
-            {!isOpen && hidden > 0 && (
+            {/* A two-way toggle, not a one-shot reveal. A button that unmounts itself on
+                activation drops keyboard focus to <body>, throwing the user to the top of the
+                document with no way back; staying mounted keeps focus where it was and lets
+                aria-expanded announce the state. Same disclosure shape as the row's `···`
+                overflow (292237ac). */}
+            {(isOpen || hidden > 0) && (
               <button
                 type="button"
                 className="facet-more"
-                onClick={() => setExpanded(state => ({ ...state, [key]: true }))}
+                aria-expanded={isOpen}
+                onClick={() => setExpanded(state => ({ ...state, [key]: !isOpen }))}
               >
                 {/* The count names the whole group, NULL bucket included, because that is what
                     expanding reveals. */}
-                Show all {named.length + (none ? 1 : 0)}
+                {isOpen ? 'Show fewer' : `Show all ${ranked.length + (none ? 1 : 0)}`}
               </button>
             )}
           </fieldset>

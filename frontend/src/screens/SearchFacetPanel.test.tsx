@@ -67,6 +67,29 @@ it('shows six values and expands the rest on request', async () => {
   expect(group('Domain').getAllByRole('checkbox')).toHaveLength(9)
 })
 
+// A disclosure that unmounts itself on activation drops keyboard focus to <body> — the user is
+// thrown to the top of the document and cannot undo the expansion. As a two-way toggle the button
+// survives its own click, so focus stays put and aria-expanded says which state it is in. Same
+// shape as the row's `···` overflow (292237ac).
+it('expands and collapses from the same button, keeping focus on it', async () => {
+  renderPanel({
+    domain: Array.from({ length: 9 }, (_, i) => ({ value: `d${i}`, count: 9 - i })),
+  })
+  const collapsed = group('Domain').getByRole('button', { name: 'Show all 9' })
+  expect(collapsed).toHaveAttribute('aria-expanded', 'false')
+
+  await userEvent.click(collapsed)
+  expect(group('Domain').getAllByRole('checkbox')).toHaveLength(9)
+  const opened = group('Domain').getByRole('button', { name: 'Show fewer' })
+  expect(opened).toHaveAttribute('aria-expanded', 'true')
+  expect(document.activeElement).toBe(opened)
+
+  await userEvent.click(opened)
+  expect(group('Domain').getAllByRole('checkbox')).toHaveLength(6)
+  expect(group('Domain').getByRole('button', { name: 'Show all 9' }))
+    .toHaveAttribute('aria-expanded', 'false')
+})
+
 it('keeps "Not classified" out of the collapsed window but still reachable', () => {
   renderPanel({
     domain: [
@@ -81,6 +104,33 @@ it('keeps "Not classified" out of the collapsed window but still reachable', () 
   expect(labels).toHaveLength(7)
   expect(labels?.slice(0, 6).some(text => text?.includes('Not classified'))).toBe(false)
   expect(labels?.[6]).toMatch(/Not classified/)
+  expect(group('Domain').getByRole('button', { name: 'Show all 9' })).toBeInTheDocument()
+})
+
+// A checked box hidden behind the disclosure is worse than a long group: the group renders six
+// unchecked options while its filter IS applied, so it misstates its own state. Exclude-own-facet
+// counting means a selected value does not float up the server's count-desc order on its own.
+it('keeps a selected value visible without expanding, however far down the group it sits', () => {
+  renderPanel(
+    { domain: Array.from({ length: 9 }, (_, i) => ({ value: `d${i}`, count: 9 - i })) },
+    { domain: ['d8'] },
+  )
+  const boxes = group('Domain').getAllByRole('checkbox')
+  expect(boxes).toHaveLength(6)
+  // Hoisted to the FRONT, not merely present somewhere in the window.
+  expect(boxes[0]).toBeChecked()
+  expect(group('Domain').getByRole('checkbox', { name: 'd8 1' })).toBeChecked()
+  expect(group('Domain').getByRole('button', { name: 'Show all 9' })).toBeInTheDocument()
+})
+
+it('widens the collapsed window rather than hiding a checked box', () => {
+  renderPanel(
+    { domain: Array.from({ length: 9 }, (_, i) => ({ value: `d${i}`, count: 9 - i })) },
+    { domain: ['d2', 'd3', 'd4', 'd5', 'd6', 'd7', 'd8'] },
+  )
+  const boxes = group('Domain').getAllByRole('checkbox')
+  expect(boxes).toHaveLength(7)
+  expect(boxes.every(box => (box as HTMLInputElement).checked)).toBe(true)
   expect(group('Domain').getByRole('button', { name: 'Show all 9' })).toBeInTheDocument()
 })
 

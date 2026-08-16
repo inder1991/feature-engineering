@@ -7749,3 +7749,16 @@ button.stat:hover {
 }
 
 .facet-more:hover { color: var(--accent-hover); text-decoration: underline; }
+
+/* The panel renders NOTHING when the server returned no facets — the loading hint on every initial
+   load, and the alert after a failed search (`setResult(null)`), both reach that state. `.facet-cols`
+   is `224px minmax(0, 1fr)` and `.search-results` declares no `grid-column` anywhere in this file,
+   so as the only grid item it auto-places into column ONE and the results get squeezed into 224px
+   with an empty 1fr beside them.
+
+   Keyed on `:has()` rather than a modifier class from `SearchScreen.tsx`, so the panel remains the
+   single owner of when it renders and the layout cannot drift out of step with it. */
+.facet-cols:not(:has(.facet-panel)) {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
