@@ -176,7 +176,7 @@ export function SearchHitRow({
  * The row's overflow. A DISCLOSURE, not an ARIA menu: `role="menu"` promises arrow-key roving
  * that a three-item popover does not need and we would not implement honestly. What it does
  * promise it keeps — Escape closes and returns focus, a pointer elsewhere closes, and choosing an
- * item closes.
+ * item closes AND returns focus.
  */
 function RowOverflow({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false)
@@ -216,7 +216,19 @@ function RowOverflow({ label, children }: { label: string; children: ReactNode }
       {open && (
         // Choosing anything closes the popover: the click bubbles to this wrapper, so one handler
         // covers every item without each item having to remember to close.
-        <div className="hit-overflow-items" onClick={() => setOpen(false)}>
+        //
+        // Focus goes back to the trigger for the same reason Escape sends it back. The chosen
+        // button is about to unmount, and a keyboard user who pressed Enter on it would otherwise
+        // be dropped on <body> — losing their place in a long result list at the exact moment the
+        // row has something new to say, since Feature impact and Copy reference both render their
+        // result INTO this row. Harmless for Suggested features, which navigates away.
+        <div
+          className="hit-overflow-items"
+          onClick={() => {
+            setOpen(false)
+            trigger.current?.focus()
+          }}
+        >
           {children}
         </div>
       )}

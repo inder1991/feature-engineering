@@ -171,8 +171,40 @@ it('closes the overflow on Escape and returns focus to its trigger', async () =>
   renderRow()
   const trigger = screen.getByRole('button', { name: 'More actions for public.accounts.balance' })
   await userEvent.click(trigger)
+
+  // Tab INTO the popover before pressing Escape. Without this the trigger still holds the focus
+  // that opening it gave (userEvent.click focuses its target on mousedown), so the final
+  // assertion would hold whether or not Escape returns focus at all — the test would stay green
+  // with the component's `trigger.current?.focus()` deleted. The contract only bites when focus
+  // is inside the popover, which is the keyboard user's actual path.
+  await userEvent.tab()
+  const firstItem = screen.getByRole('button', { name: 'Suggested features for accounts' })
+  expect(firstItem).toHaveFocus()
+
   await userEvent.keyboard('{Escape}')
   expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+  expect(trigger).toHaveFocus()
+})
+
+it('returns focus to the trigger when an item is activated from the keyboard', async () => {
+  const writeText = vi.fn().mockResolvedValue(undefined)
+  Object.assign(navigator, { clipboard: { writeText } })
+  renderRow()
+  const trigger = screen.getByRole('button', { name: 'More actions for public.accounts.balance' })
+  await userEvent.click(trigger)
+
+  // Three tabs walks the popover's DOM order: Suggested features, Feature impact, Copy reference.
+  await userEvent.tab()
+  await userEvent.tab()
+  await userEvent.tab()
+  expect(
+    screen.getByRole('button', { name: 'Copy reference for public.accounts.balance' }),
+  ).toHaveFocus()
+
+  await userEvent.keyboard('{Enter}')
+  // The row is still on screen and has just gained something to read, so focus must land back on
+  // the trigger rather than falling to <body> when the chosen button unmounts.
+  expect(await screen.findByRole('status')).toHaveTextContent('Reference copied')
   expect(trigger).toHaveFocus()
 })
 
