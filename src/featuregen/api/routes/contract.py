@@ -377,6 +377,30 @@ def considered_option_detail(considered_revision_id: str, option_id: str,
                 "code": "DECISION_RECORD_TAMPERED",
                 "message": "the stored decision's manifest disagrees with its own request "
                            "identity — the record cannot be served"})
+        # C-D11 — the SECOND, INDEPENDENT source. The check above compares two values written
+        # from one in-memory object in one statement, so it cannot fire through the production
+        # write path. This one recomputes the hash from the stored payload's own bytes, so a
+        # corrupted payload, a corrupted hash or a drifted reference all refuse.
+        from featuregen.overlay.upload.planning_request_store import (
+            DecisionRecordTampered,
+            LegacyPlanningRequestUnavailable,
+            load_verified_planning_request,
+        )
+        try:
+            load_verified_planning_request(
+                conn, considered_revision_id=considered_revision_id, option_id=option_id,
+                decision_record_reference=record["planning_request_hash"])
+            detail["planning_request_verified"] = True
+        except LegacyPlanningRequestUnavailable:
+            # NOT tampering: the row predates the typed store, so there is nothing to verify
+            # against. Reporting it as tampered would accuse the system of something it did not
+            # do, and would train whoever reads the alert to ignore it.
+            detail["planning_request_verified"] = False
+        except DecisionRecordTampered as tampered:
+            raise HTTPException(status_code=409, detail={
+                "code": "DECISION_RECORD_TAMPERED",
+                "message": str(tampered)}) from tampered
+
         detail["decision_record"] = record
         # The exact-linked observation (never newest-row): the run's raw binder output.
         if record.get("observation_id"):

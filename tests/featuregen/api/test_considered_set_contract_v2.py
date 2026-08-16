@@ -217,3 +217,51 @@ def test_v1_never_carries_the_section_keys(make_client, conn, monkeypatch):
     for key in ("recommended_options", "actionable_options", "rejected_outputs",
                 "contract_version", "semantic_planning_mode"):
         assert key not in body
+
+
+# ══ C-D11 — the 409 gate, made real and then FIRED through the production route ══════════════════
+def test_A_TAMPERED_TYPED_PLANNING_REQUEST_RETURNS_409(make_client, conn, monkeypatch):
+    """The gate had exactly one occurrence in the repo, no test, and no way to fire: the two values
+    it compares are written from ONE in-memory object in one statement.
+
+    C-D11 adds a SECOND, INDEPENDENT source whose hash is recomputed from the stored payload's own
+    bytes. This inserts a deliberately inconsistent row and drives the REAL route — a legitimate
+    synthetic corruption test, because it exercises the production reader and handler rather than
+    asserting that `!=` works.
+    """
+    import json
+
+    from featuregen.overlay.upload.feature_planning_contracts import (
+        planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.planning_request_store import (
+        canonical_planning_request_payload,
+    )
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    _bank(conn)
+    client = make_client(llm_client=_fake())
+    body = _post(client, contract_version=2)
+    revision_id = body["considered_revision_id"]
+    option_ids = [f["option_id"] for s in body["alternatives"] for f in s["features"]]
+    assert option_ids
+
+    # serves cleanly first — a legacy row is NOT tampering, so the route still answers 200
+    clean = client.get(
+        f"/contract/considered-revisions/{revision_id}/options/{option_ids[0]}", headers=AUTH)
+    assert clean.status_code == 200, clean.text
+    assert clean.json().get("planning_request_verified") is False, "no typed row stored yet"
+
+    # now store a payload whose bytes do not hash to the identity stored beside them
+    request = planning_request_from_recipe(v2_recipe_by_id("posted_debit_amount"))
+    payload = canonical_planning_request_payload(request)
+    payload["source_content_hash"] = "sha256:not-what-was-hashed"
+    conn.execute(
+        "INSERT INTO typed_planning_request (considered_revision_id, option_id, request_payload, "
+        "planning_request_hash) VALUES (%s, %s, %s::jsonb, %s)",
+        (revision_id, option_ids[0], json.dumps(payload), "sha256:claimed-but-wrong"))
+
+    res = client.get(
+        f"/contract/considered-revisions/{revision_id}/options/{option_ids[0]}", headers=AUTH)
+    assert res.status_code == 409, res.text
+    assert res.json()["detail"]["code"] == "DECISION_RECORD_TAMPERED"
