@@ -1890,6 +1890,36 @@ def _feature_ideas_with_grounding() -> dict:
 
 _SCHEMAS[("feature_ideas", 5)] = _feature_ideas_with_grounding()
 
+# C-C11 — the S4 policy producer's output. A proposal for how ONE governed policy is realized over
+# ONE bound column: which column carries it, and what the source's physical spelling of each
+# semantic token is (`debit` → `D`). `additionalProperties: False` at EVERY level is the fail-closed
+# property the task's gate names — a model that invents `confidence` or `notes` is refused rather
+# than having the extra silently dropped, because a field nobody declared is a field nobody governs.
+# The CLOSED TAXONOMY (`semantic_value` must be a token of the occurrence's kind) is deliberately
+# NOT here: JSON Schema cannot express "one of the tokens for the kind THIS call is about", so it
+# rides `validate_semantics` inside the repair loop — see `formula/policy_producer.py`.
+_SCHEMAS[("policy_realization", 1)] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "policy_column_ref": {"type": "string"},
+        "value_map": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "semantic_value": {"type": "string"},
+                    "physical_value": {"type": "string"},
+                },
+                "required": ["semantic_value", "physical_value"],
+            },
+        },
+        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["policy_column_ref", "value_map", "evidence_refs"],
+}
+
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads
 # the real (authenticated) upload actor from ingest.
