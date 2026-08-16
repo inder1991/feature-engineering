@@ -323,22 +323,20 @@ export function SearchScreen() {
               before the canvas began. */}
           {!error && hasHits && effectiveView === 'list' && (
             <div className="results-toolbar">
+              {/* The COUNT only. The slice is stated once, by the pager — the control that
+                  navigates it — rather than twice in adjacent lines: the toolbar's slice note
+                  rendered exactly when `total > hits.length`, which is exactly when the pager
+                  renders too, so it was redundant in 100% of the states it could appear in. */}
               <p className="micro-label tabular-nums result-count" role="status">
                 <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
                 {result.total === 1 ? 'asset' : 'assets'}
-                {result.total > result.hits.length && (
-                  // The SLICE, not just a count: with paging, "showing the first 20" stopped being
-                  // true the moment the user moved forward, and a bare count gives no way to tell
-                  // which 20 are on screen.
-                  <span className="result-count-note">
-                    {' '}· showing {offset + 1}–{offset + result.hits.length}
-                  </span>
-                )}
               </p>
               {/* The projection marker, finally rendered. Search reads the projected display
                   columns, so a lagged projection means these rows may not reflect the newest
-                  resolved semantics — and until now the screen said nothing at all about it. */}
-              {result.projection.status === 'ready' && (
+                  resolved semantics — and until now the screen said nothing at all about it.
+                  Optional-chained: an older backend (or a frontend-first deploy) omits the field,
+                  and absence must render as absence rather than throw inside render. */}
+              {result.projection?.status === 'ready' && (
                 <p className="projection-ok" data-testid="search-projection">
                   Catalog projection current
                 </p>
@@ -346,13 +344,19 @@ export function SearchScreen() {
             </div>
           )}
 
-          {/* A disclosure, never a refusal: the rows below stay on screen either way. */}
-          {!error && hasHits && effectiveView === 'list'
-            && result.projection.status === 'lagged' && (
-            <div className="callout callout--warn" role="status">
+          {/* A disclosure, never a refusal: whatever is below stays on screen either way.
+              Deliberately NOT gated on list view. The toolbar above is chrome about a list slice,
+              but this is a statement about the truth of data that is still on screen in EITHER
+              view: a user already in Graph can submit a new query from the search bar, and
+              LineageView renders the anchor's concept, entity, grain and as-of — precisely the
+              projected display fields this marker qualifies. */}
+          {!error && hasHits && result.projection?.status === 'lagged' && (
+            <div className="callout callout--warn" role="status" data-testid="search-projection-lag">
+              {/* The house warn triangle. Circle+X is danger and circle+check is ok in this
+                  stylesheet's vocabulary, so a circle here would have spoken a third dialect. */}
               <CalloutGlyph>
-                <circle cx="8" cy="8" r="6.25" />
-                <path d="M8 4.75v4M8 11.25v.01" />
+                <path d="M8 2.75 14 13.25H2z" />
+                <path d="M8 6.75v2.75M8 11.5v.01" />
               </CalloutGlyph>
               <div className="callout-body">
                 <p>
@@ -368,10 +372,16 @@ export function SearchScreen() {
           {!error && hasHits && effectiveView === 'list'
             && (offset > 0 || offset + result.hits.length < result.total) && (
             <nav className="pager" aria-label="Result pages">
-              {/* The pager only renders when there is more than one page, so this line appears
-                  exactly when paging is possible — which is when it earns its space. */}
+              {/* The ONE statement of the slice, in the control that navigates it. The pager only
+                  renders when there is more than one page, so this line appears exactly when
+                  paging is possible — which is when it earns its space.
+
+                  "matching", not "permitted": `total` counts the rows matching THIS query and
+                  THESE facets. "permitted" would claim the read-scoped universe is 42, which is
+                  false whenever a filter is active, and would quietly absorb freshness-withheld
+                  assets — which are permitted, and which the empty state names separately. */}
               <span className="pager-copy tabular-nums">
-                Showing {offset + 1}–{offset + result.hits.length} of {result.total} permitted assets
+                Showing {offset + 1}–{offset + result.hits.length} of {result.total} matching assets
               </span>
               <button
                 type="button"

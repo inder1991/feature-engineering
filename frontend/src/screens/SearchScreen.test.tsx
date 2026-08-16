@@ -140,7 +140,7 @@ describe('search screen — results and rows', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('2 assets')
   })
 
-  it('uses the singular for a single result', async () => {
+  it('uses the singular for a single asset', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     // Word-bounded: "1 assets" CONTAINS "1 asset", so a plain substring match would go green on a
@@ -148,14 +148,16 @@ describe('search screen — results and rows', () => {
     expect(await screen.findByRole('status')).toHaveTextContent(/\b1 asset\b/)
   })
 
-  it('counts the permitted set and names the slice on screen', async () => {
+  it('counts the matching set and states the slice once, in the pager', async () => {
     // total counts tables + columns and can exceed the returned (limit-capped) hit page.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 42))
     render(<SearchScreen />)
-    const status = await screen.findByRole('status')
-    expect(status).toHaveTextContent('42 assets')
-    expect(status).toHaveTextContent('showing 1–1')
-    expect(screen.getByText('Showing 1–1 of 42 permitted assets')).toBeInTheDocument()
+    // The count line carries the COUNT only. It said the slice too, and the pager below always
+    // co-renders with it, so the same range was stated twice in adjacent lines every time.
+    expect(await screen.findByRole('status')).toHaveTextContent('42 assets')
+    expect(screen.getByRole('status')).not.toHaveTextContent(/showing/i)
+    // Exact match, not a substring: "showing 1–1" is a prefix of "showing 1–10".
+    expect(screen.getByText('Showing 1–1 of 42 matching assets')).toBeInTheDocument()
   })
 
   it('says the projection is current when the server says it is', async () => {
@@ -174,6 +176,40 @@ describe('search screen — results and rows', () => {
     // The rows are still served: a disclosure, never a refusal.
     expect(screen.getByTestId('hit-name')).toHaveTextContent('balance')
     expect(screen.queryByTestId('search-projection')).toBeNull()
+  })
+
+  // The search FORM renders in graph mode too, so a user already in Graph can commit a new query
+  // and land a lagged read there. Gating the disclosure on list view hid it exactly where the
+  // projected display fields are most prominent: LineageView renders the anchor's concept,
+  // entity, grain and as-of.
+  it('discloses a lagged projection in graph view too', async () => {
+    searchCatalog.mockResolvedValue({
+      hits: [HIT], facets: FACETS, total: 1,
+      projection: { status: 'lagged', code: 'CATALOG_PROJECTION_BEHIND', detail: 'overlay is behind' },
+    })
+    render(<SearchScreen />)
+    await findRow('public.accounts.balance')
+    const toggle = screen.getByRole('group', { name: 'Result view' })
+    await userEvent.click(within(toggle).getByRole('button', { name: 'Graph' }))
+    // Genuinely in graph view — the canvas is up and the list is gone.
+    expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
+    expect(screen.queryByTestId('hit-name')).toBeNull()
+    expect(screen.getByTestId('search-projection-lag'))
+      .toHaveTextContent(/catalog projection was behind/i)
+  })
+
+  // The frontend maps projection CODES to display text, so a response that predates the field must
+  // degrade rather than throw inside render — and claim neither state.
+  it('claims nothing either way when the response carries no projection marker', async () => {
+    // Destructured away rather than deleted: `projection` is a required field on the type, so this
+    // builds the older wire shape without lying about the type of what the screen receives.
+    const { projection, ...legacy } = result([HIT], FACETS, 1)
+    void projection
+    searchCatalog.mockResolvedValue(legacy as api.SearchResult)
+    render(<SearchScreen />)
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
+    expect(screen.queryByTestId('search-projection')).toBeNull()
+    expect(screen.queryByTestId('search-projection-lag')).toBeNull()
   })
 
   it('omits absent enrichment fields and includes them when present', async () => {

@@ -7785,8 +7785,11 @@ button.stat:hover {
   font-size: 11px;
 }
 
+/* `flex: none` for the same reason `.hit-capabilities li::before` and `.facet-pii-dot` declare it:
+   as a flex item a 6px square is shrinkable, and a dot compressed on one axis is an oval. */
 .projection-ok::before {
   content: '';
+  flex: none;
   width: 6px;
   height: 6px;
   border-radius: 50%;

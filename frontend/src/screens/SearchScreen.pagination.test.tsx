@@ -148,10 +148,18 @@ it('says which slice of the whole set is on screen', async () => {
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
   await screen.findByText('c20')
-  // The range is interpolated from several JSX expressions, so assert on the element's text
-  // rather than on a single matching text node.
-  const line = screen.getAllByRole('status').map(n => n.textContent ?? '').join(' | ')
-  expect(line).toMatch(/21/)
-  expect(line).toMatch(/40/)
-  expect(line).toMatch(/45/)
+  // The pager is now the ONE statement of the slice, and this is the only test that exercises its
+  // arithmetic anywhere but the first page. Exact text, not /21/ + /40/ + /45/ over the joined
+  // status nodes: those loose patterns were satisfiable by a row name or by the bare total, and
+  // "of 45" quietly stopped being what matched /45/ once the count line read "45 assets".
+  expect(screen.getByText('Showing 21–40 of 45 matching assets')).toBeInTheDocument()
+  // The total is a property of the query, not of the page: it must not drift as the user walks.
+  expect(screen.getByRole('status')).toHaveTextContent(/\b45 assets\b/)
+
+  // One more page, because a FULL page cannot tell `offset + hits.length` from `offset + 20`.
+  // The last page is short (5 of 45), so only the honest expression reads 41–45 here.
+  searchCatalog.mockResolvedValue(page(40, 5, 45))
+  await userEvent.click(screen.getByRole('button', { name: /next/i }))
+  await screen.findByText('c40')
+  expect(screen.getByText('Showing 41–45 of 45 matching assets')).toBeInTheDocument()
 })
