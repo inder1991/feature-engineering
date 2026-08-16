@@ -838,7 +838,12 @@ def _published_by_this_run(conn: psycopg.Connection, request: MaterializationReq
     """
     if request.run_id is None:
         return None
-    revision = read_active_revision(conn, request.logical_group_name)
+    # C-D6 — the LEGACY scope, explicitly. `MaterializationRequestV1` carries no environment
+    # (request_store.py:212-215), so this route can only ask about rows written before environments
+    # were recorded. That is truthful today and becomes WRONG the moment generations start carrying
+    # one, which is why the parameter is passed rather than defaulted: the day it must change, this
+    # line is what a reader greps for.
+    revision = read_active_revision(conn, request.logical_group_name, environment_id=None)
     return revision if revision is not None and revision.run_id == request.run_id else None
 
 

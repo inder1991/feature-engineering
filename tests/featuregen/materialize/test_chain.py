@@ -1434,7 +1434,8 @@ def test_publication_without_a_matching_attestation_is_still_refused(
     assert outcome.terminal_event is RunEventKind.PUBLICATION_REFUSED
     assert outcome.refusal.code is PublicationRefusalCode.CAPABILITY_UNPROVEN
     assert swap.calls == [], "the publish step ran on evidence select_publisher rejected"
-    assert read_active_revision(catalog, outcome.logical_group_name) is None
+    assert read_active_revision(catalog, outcome.logical_group_name,
+                                environment_id=INVENTORY.environment_id) is None
     assert published_generation_ids(catalog) == frozenset()
 
 
@@ -1456,7 +1457,8 @@ def test_the_pointer_swap_is_recorded_before_it_is_claimed(
         _run(catalog, request_id, work_items, tmp_path, execution=_execution(swap=swap))
 
     assert swap.calls, "the record was written and the swap was never attempted"
-    assert read_active_revision(catalog, _GROUP) is None
+    assert read_active_revision(catalog, _GROUP,
+                                environment_id=INVENTORY.environment_id) is None
     assert catalog.execute(
         "SELECT count(*) FROM materialization_run_event").fetchone()[0] == 0
     assert catalog.execute(
@@ -1494,7 +1496,9 @@ def test_the_terminal_cannot_be_retracted(catalog, monkeypatch, l0_passes, tmp_p
         record_active_revision(catalog, dataclasses.replace(
             revision, revision_id="frev_second", recorded_at=None))
 
-    assert read_active_revision(catalog, _GROUP).revision_id == revision.revision_id
+    assert read_active_revision(
+        catalog, _GROUP,
+        environment_id=INVENTORY.environment_id).revision_id == revision.revision_id
 
 
 def test_an_UNPROVEN_capability_still_terminates_PUBLICATION_REFUSED_and_prepares_nothing(

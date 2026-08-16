@@ -754,6 +754,12 @@ class ActiveRevision:
     mechanism: PublishMechanism
     seq: int
     activated_at: str
+    #: C-D6 — WHERE this pointer holds. ``None`` is the LEGACY scope: rows written before
+    #: environments were recorded. Defaulted only so legacy rows read back without a rewrite; every
+    #: new publication carries the selection's own environment, because a capability is attested for
+    #: one environment and a pointer sequenced against another scope is a pointer for a cluster
+    #: nobody proved anything on.
+    environment_id: str | None = None
     recorded_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -776,23 +782,33 @@ class ActiveRevision:
                 f"nothing")
 
 
-def read_active_revision(conn: DbConn, logical_group_name: str) -> ActiveRevision | None:
+def read_active_revision(conn: DbConn, logical_group_name: str, *,
+                         environment_id: str | None) -> ActiveRevision | None:
     """The revision a reader of this group is seeing NOW, or ``None`` when it has never published.
 
     The newest ``seq``, read through the ``(logical_group_name, seq DESC)`` index. ``None`` is the
     ordinary answer for a group whose runs all terminated ``PUBLICATION_REFUSED`` — it means *"not
     published yet"*, never *"published, target unknown"*, and any surface reporting it must say so
     rather than inventing a table name.
+
+    ``environment_id`` is REQUIRED and has no default (C-D6). A default would make the blind read
+    the easy one to write, and the blind read is the defect: without it environment B is handed a
+    row belonging to environment A. ``None`` is legal and means the LEGACY scope — rows written
+    before environments were recorded — which is why the comparison is ``IS NOT DISTINCT FROM``
+    rather than ``=``: ``NULL = NULL`` is NULL, so ``=`` would match no legacy row at all.
     """
     row = conn.execute(
         "SELECT revision_id, logical_group_name, generation_id, run_id, published_object, "
-        "capability_attestation_id, publication_mechanism, seq, activated_at, recorded_at "
-        "FROM feature_active_revision WHERE logical_group_name = %s ORDER BY seq DESC LIMIT 1",
-        (logical_group_name,)).fetchone()
+        "capability_attestation_id, publication_mechanism, seq, activated_at, environment_id, "
+        "recorded_at FROM feature_active_revision "
+        "WHERE logical_group_name = %s AND environment_id IS NOT DISTINCT FROM %s "
+        "ORDER BY seq DESC LIMIT 1",
+        (logical_group_name, environment_id)).fetchone()
     return None if row is None else ActiveRevision(*row)
 
 
-def next_revision_seq(conn: DbConn, logical_group_name: str) -> int:
+def next_revision_seq(conn: DbConn, logical_group_name: str, *,
+                      environment_id: str | None) -> int:
     """The ``seq`` the next publication of this group must carry.
 
     Read-then-write, and that is safe here for the reason ``append_run_event``'s caller-supplied seq
@@ -800,10 +816,16 @@ def next_revision_seq(conn: DbConn, logical_group_name: str) -> int:
     the group, so two publishers that both computed the same next value cannot both win — the loser
     raises and its whole transaction rolls back. Computing it inside the INSERT would hide that
     check behind a value the database chose for itself.
+
+    ``environment_id`` is REQUIRED and has no default, and this is the site where its absence was
+    most dangerous: computing ``max(seq)`` across every environment returns a value that DOES
+    strictly extend an empty environment's sequence, so 1055's trigger passes and the wrong seq
+    becomes invisible. The trigger is what would otherwise have caught it.
     """
     row = conn.execute(
-        "SELECT max(seq) FROM feature_active_revision WHERE logical_group_name = %s",
-        (logical_group_name,)).fetchone()
+        "SELECT max(seq) FROM feature_active_revision "
+        "WHERE logical_group_name = %s AND environment_id IS NOT DISTINCT FROM %s",
+        (logical_group_name, environment_id)).fetchone()
     return 0 if row is None or row[0] is None else int(row[0]) + 1
 
 
@@ -825,10 +847,12 @@ def record_active_revision(conn: DbConn, revision: ActiveRevision) -> ActiveRevi
     inserted = conn.execute(
         "INSERT INTO feature_active_revision (revision_id, logical_group_name, generation_id, "
         "run_id, published_object, capability_attestation_id, publication_mechanism, seq, "
-        "activated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING recorded_at",
+        "activated_at, environment_id) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "RETURNING recorded_at",
         (revision.revision_id, revision.logical_group_name, revision.generation_id,
          revision.run_id, revision.published_object, revision.capability_attestation_id,
-         revision.mechanism.value, revision.seq, revision.activated_at)).fetchone()
+         revision.mechanism.value, revision.seq, revision.activated_at,
+         revision.environment_id)).fetchone()
     return replace(revision, recorded_at=inserted[0] if inserted is not None else None)
 
 
@@ -887,8 +911,12 @@ def publish_generation(
         published_object=published_object,
         capability_attestation_id=selection.capability_attestation_id,
         mechanism=selection.mechanism,
-        seq=next_revision_seq(conn, group_plan.logical_group_name),
-        activated_at=activated_at))
+        # C-D6 — the selection's OWN environment. It is the environment the capability was
+        # attested for, so a publication cannot be sequenced against a scope it was not proved in.
+        seq=next_revision_seq(conn, group_plan.logical_group_name,
+                              environment_id=selection.environment_id),
+        activated_at=activated_at,
+        environment_id=selection.environment_id))
     swap.swap(published_object=published_object, generation_id=generation_id, columns=columns,
               staging_root=staging_root)
     return revision
