@@ -3,6 +3,22 @@ import { ApiError, type SearchHit, featureImpact } from '../api'
 import { hitBreadcrumb, hitCapabilities, hitDisplayName, hitMeta } from './searchHitDisplay'
 
 /**
+ * How long the copy acknowledgement stays on the row.
+ *
+ * It is an acknowledgement of an action, not a property of the asset, so it has to leave. Without
+ * this every row a reader ever copied from stayed one line taller for the rest of the session, and
+ * a refused copy left the full object_ref printed in the row permanently.
+ *
+ * A timer rather than "clear when the popover closes": choosing Copy reference IS what closes the
+ * popover, so a close-driven clear would race the clipboard promise that sets the message — the
+ * acknowledgement would appear or not depending on which settled first.
+ *
+ * Eight seconds: long enough to read the refusal sentence and select the reference out of it,
+ * short enough that a row does not carry the line into the reader's next query.
+ */
+export const COPY_STATUS_MS = 8000
+
+/**
  * One search result.
  *
  * Anatomy, top to bottom: the name the reader is looking for, the physical address that name
@@ -25,15 +41,29 @@ export function SearchHitRow({
   const [impactError, setImpactError] = useState('')
   const [checking, setChecking] = useState(false)
   const [copyStatus, setCopyStatus] = useState('')
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // The row can be unmounted by the next query landing while the acknowledgement is still up.
+  useEffect(() => () => {
+    if (copyTimer.current !== null) clearTimeout(copyTimer.current)
+  }, [])
+
+  // Every announcement replaces the one before it AND its timer: copying twice in a row must give
+  // the second message a full window, not whatever was left of the first one's.
+  function announceCopy(message: string) {
+    if (copyTimer.current !== null) clearTimeout(copyTimer.current)
+    setCopyStatus(message)
+    copyTimer.current = setTimeout(() => setCopyStatus(''), COPY_STATUS_MS)
+  }
 
   async function copyReference() {
     try {
       await navigator.clipboard.writeText(hit.object_ref)
-      setCopyStatus('Reference copied')
+      announceCopy('Reference copied')
     } catch {
       // A browser may refuse clipboard access outright. Saying "copied" would be a lie, and
       // saying only "failed" leaves the reader with nothing, so hand them the reference itself.
-      setCopyStatus(`Could not copy. The reference is ${hit.object_ref}`)
+      announceCopy(`Could not copy. The reference is ${hit.object_ref}`)
     }
   }
 
@@ -105,8 +135,14 @@ export function SearchHitRow({
         {impactError && (
           <p role="alert" className="error">Impact check failed: {impactError}</p>
         )}
+        {/* The noun follows the HIT, not the wording that suited the commonest row. Feature impact
+            is offered on every row and the unfiltered browse leads with tables, so a fixed "column"
+            told the reader a table hit was a column the catalog does not hold — an asserted fact
+            with nothing behind it, on a screen whose first rule is that it never has one. */}
         {impact?.length === 0 && (
-          <p className="hint" role="status">No features derive from this column.</p>
+          <p className="hint" role="status">
+            {`No features derive from this ${hit.column ? 'column' : 'table'}.`}
+          </p>
         )}
         {impact && impact.length > 0 && (
           <div className="hit-impact">

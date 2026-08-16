@@ -90,12 +90,21 @@ export function SearchFacetPanel({
               // The declared pii tag keeps its danger dot. It is decoration on top of the label,
               // which is what actually carries the meaning — hence aria-hidden.
               const isPii = key === 'sensitivity' && bucket.value === 'pii'
+              // A facet the client cannot SEND. It is shown — the server returned it, and hiding a
+              // group the catalog holds is its own dishonesty — but it must LOOK unavailable, not
+              // merely refuse the click: the same class the flag options below use, for the same
+              // reason. Unreachable while the client's thirteen keys match the server's active
+              // set, which is exactly the condition this panel is server-driven in order to break.
+              const unsendable = !isFacetKey(key)
               return (
-                <label className="facet-option" key={bucket.value}>
+                <label
+                  className={unsendable ? 'facet-option facet-option--disabled' : 'facet-option'}
+                  key={bucket.value}
+                >
                   <input
                     type="checkbox"
                     checked={selected.includes(bucket.value)}
-                    disabled={!isFacetKey(key)}
+                    disabled={unsendable}
                     onChange={() => isFacetKey(key) && onToggleFacet(key, bucket.value)}
                   />
                   {isPii && <span className="facet-pii-dot" aria-hidden="true" />}

@@ -154,9 +154,12 @@ it('says which slice of the whole set is on screen', async () => {
   // "of 45" quietly stopped being what matched /45/ once the count line read "45 assets".
   expect(screen.getByText('Showing 21–40 of 45 matching assets')).toBeInTheDocument()
   // The total is a property of the query, not of the page: it must not drift as the user walks.
-  // Addressed by its testid, not by role=status: the live region moved to the pager copy (the
-  // only text on this screen that changes as the reader pages), and the count line is now a plain
-  // statement. Anchored, so a count line that also restated the slice would not match.
+  // Addressed by its testid, not by role=status, and NOT because the count line stopped being a
+  // live region: this screen carries TWO on purpose — the count line, which speaks when a query
+  // lands (a one-page result renders no pager at all, so it is the only region that exists in the
+  // commonest result shape there is), and the pager copy, which speaks as the reader pages. Both
+  // are present here, so role=status is ambiguous and the testid is what pins THIS line.
+  // Anchored, so a count line that also restated the slice would not match.
   expect(screen.getByTestId('result-count')).toHaveTextContent(/^45 assets$/)
 
   // One more page, because a FULL page cannot tell `offset + hits.length` from `offset + 20`.

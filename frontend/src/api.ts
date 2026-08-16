@@ -256,8 +256,9 @@ export type SearchFilters = {
   as_of?: boolean
 }
 
-// GET /search response. `facets` is keyed by group name (the six above plus grain/as_of, which
-// always emit a single "true" bucket that may be count 0); each list is capped 50, count desc.
+// GET /search response. `facets` is keyed by group name — the thirteen SEARCH_FACET_KEYS above,
+// plus grain/as_of, which always emit a single "true" bucket that may be count 0. The server may
+// also return a group the client cannot yet send; each list is capped 50, count desc.
 // `total` counts tables AND columns (kind is a facet), so render honest "N result(s)" copy.
 /**
  * Whether a load-bearing catalog projection was BEHIND when a read was served (semantic Task 6).

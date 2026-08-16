@@ -70,6 +70,22 @@ export function hitCapabilities(hit: SearchHit): HitCapability[] {
 }
 
 /**
+ * The data type the catalog actually attests, or nothing.
+ *
+ * `graph_node.data_type` holds the literal string "unknown" for a large share of the deployed
+ * catalog: it is the ingest's canonical placeholder for a column whose type nobody has established
+ * (type attestation fills it in later from the engine). It is not a fabricated value — but it is an
+ * ABSENCE of a type wearing the costume of one, and a meta line reading "unknown · Customer" states
+ * a type where the catalog holds none. Absence renders as absence, so it does not ride.
+ *
+ * Only the one sentinel that is actually in the data. An empty string is already dropped by the
+ * caller's truthiness filter; no other placeholder is guessed at.
+ */
+function attestedDataType(dataType: string | null): string | null {
+  return dataType && dataType.toLowerCase() !== 'unknown' ? dataType : null
+}
+
+/**
  * The quiet meta line: what the row still owes the reader after name, definition and capability.
  *
  * `concept` rides WITHOUT an authority claim. It is advisory enrichment (migration 0951), but the
@@ -82,7 +98,7 @@ export function hitMeta(hit: SearchHit): string[] {
   const namedByCapability = hit.is_grain && Boolean(hit.entity)
   return [
     // The kind is deliberately absent: the row badges a table as `table` already.
-    hit.data_type,
+    attestedDataType(hit.data_type),
     hit.domain,
     hit.entity && !namedByCapability ? `entity: ${hit.entity}` : null,
     hit.concept ? `concept: ${hit.concept}` : null,

@@ -1,8 +1,8 @@
-import { render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
-import { SearchHitRow } from './SearchHitRow'
+import { COPY_STATUS_MS, SearchHitRow } from './SearchHitRow'
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
@@ -15,6 +15,13 @@ const HIT: api.SearchHit = {
   data_type: 'numeric', definition: 'end-of-day ledger balance', is_grain: false, is_as_of: false,
   catalog_source: 'deposits', concept: null, domain: null, sensitivity: null,
   sensitivity_display: null, additivity: null, unit: null, currency: null, entity: null, score: 1,
+}
+
+// A TABLE hit. The unfiltered browse lists tables first, so this is the row a reader meets before
+// any column — and every action the row offers is offered on it too.
+const TABLE_HIT: api.SearchHit = {
+  ...HIT, object_ref: 'public.accounts', column: null, kind: 'table', data_type: null,
+  definition: 'customer account master',
 }
 
 function renderRow(hit: api.SearchHit = HIT) {
@@ -48,6 +55,10 @@ const clipboardBefore = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
 afterEach(() => {
   if (clipboardBefore) Object.defineProperty(navigator, 'clipboard', clipboardBefore)
   else Reflect.deleteProperty(navigator, 'clipboard')
+  // Same lesson as the clipboard, and worse: a fake clock left installed by a test that TIMED OUT
+  // (its own try/finally never runs — the runner abandons the promise) hangs every test after it.
+  // Restoring here is unconditional and runs whatever happened.
+  vi.useRealTimers()
 })
 
 // What a screen reader is handed: the accessibility tree drops an aria-hidden element AND its
@@ -148,6 +159,18 @@ it('says plainly when nothing derives from the column', async () => {
   expect(await screen.findByText('No features derive from this column.')).toBeInTheDocument()
   // The label heads a list; an empty result must not print a heading over nothing.
   expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
+})
+
+// The same sentence on a TABLE row. Feature impact is offered on every row and tables reach this
+// component (the unfiltered browse lists them first), so a hardcoded "column" told the reader the
+// catalog holds a column called `public.accounts` — a fact asserted with nothing behind it.
+it('says table, not column, when the empty result is a table’s', async () => {
+  featureImpact.mockResolvedValue([])
+  renderRow(TABLE_HIT)
+  await userEvent.click(screen.getByRole('button', { name: 'More actions for public.accounts' }))
+  await userEvent.click(screen.getByRole('button', { name: 'Feature impact for public.accounts' }))
+  expect(await screen.findByText('No features derive from this table.')).toBeInTheDocument()
+  expect(screen.queryByText('No features derive from this column.')).toBeNull()
 })
 
 it('surfaces an impact failure as an alert without losing the row', async () => {
@@ -264,6 +287,65 @@ it('shows the reference when the browser refuses to copy it', async () => {
   )
   expect(await screen.findByRole('status'))
     .toHaveTextContent('Could not copy. The reference is public.accounts.balance')
+})
+
+// The acknowledgement is TRANSIENT: it acknowledges an action, it is not a property of the asset.
+// Left standing, every row a reader had ever copied from stayed one line taller for the rest of
+// the session, and the refusal fallback printed the reader's object_ref in the row permanently.
+//
+// Fake timers, because the real wait is eight seconds. Two constraints shape how:
+//
+// `toFake` is setTimeout and clearTimeout ONLY. The default set takes `setImmediate` with it,
+// which is one of the yields React's async act() uses — the clock nobody is advancing then
+// swallows act's own resumption and the test hangs until the runner kills it.
+//
+// fireEvent, not userEvent, and act() rather than findBy: BOTH of the library's async paths drain
+// the microtask queue with a real `setTimeout(…, 0)` and advance the clock afterwards only if they
+// can see JEST's fake timers (`typeof jest !== 'undefined'`). Under Vitest they cannot, so every
+// await hangs on a timer nobody will fire. The user-level path through these same two clicks is
+// covered by the two tests above, which run on a real clock; what is under test here is the timer.
+function freezeTheClock() {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+}
+
+async function copyUnderFakeClock(writeText: ReturnType<typeof vi.fn>) {
+  // defineProperty rather than Object.assign, matching what the tests above rely on: navigator's
+  // clipboard can be a getter-only property, and assigning over one throws. The shared afterEach
+  // puts the original descriptor back either way.
+  Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+  renderRow()
+  fireEvent.click(screen.getByRole('button', { name: 'More actions for public.accounts.balance' }))
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Copy reference for public.accounts.balance' }),
+  )
+  // Lets the clipboard promise settle and its state update commit, without touching the clock.
+  await act(async () => {})
+}
+
+it('takes the copy acknowledgement back down once it has been read', async () => {
+  freezeTheClock()
+  await copyUnderFakeClock(vi.fn().mockResolvedValue(undefined))
+  expect(screen.getByRole('status')).toHaveTextContent('Reference copied')
+  // One tick short of the window it is still there — so the assertion below is the timer firing,
+  // not the message having never rendered.
+  await act(async () => { vi.advanceTimersByTime(COPY_STATUS_MS - 1) })
+  expect(screen.getByRole('status')).toHaveTextContent('Reference copied')
+
+  await act(async () => { vi.advanceTimersByTime(1) })
+  expect(screen.queryByRole('status')).toBeNull()
+})
+
+// The refusal fallback is the one that matters most: it is the row printing the full object_ref,
+// and it must still be handed to the reader while it is up — then taken down like any other.
+it('takes the refusal fallback down too, reference and all', async () => {
+  freezeTheClock()
+  await copyUnderFakeClock(vi.fn().mockRejectedValue(new Error('denied')))
+  expect(screen.getByRole('status'))
+    .toHaveTextContent('Could not copy. The reference is public.accounts.balance')
+
+  await act(async () => { vi.advanceTimersByTime(COPY_STATUS_MS) })
+  expect(screen.queryByRole('status')).toBeNull()
+  expect(screen.queryByText(/Could not copy/)).toBeNull()
 })
 
 it('walks the row’s controls in priority order on Tab', async () => {

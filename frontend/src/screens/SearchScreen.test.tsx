@@ -137,8 +137,11 @@ describe('search screen — results and rows', () => {
         FACETS, 2),
     )
     render(<SearchScreen />)
-    // By testid, not by role=status: the count line is no longer the screen's live region — the
-    // pager copy is, being the only text that changes as the reader pages.
+    // By testid, not by role=status, and NOT because the count line stopped being a live region:
+    // it IS one, deliberately (SearchScreen.tsx), and so is the pager copy. A multi-page result
+    // renders both, so role=status is ambiguous there — the testid is what addresses this line and
+    // only this line. Anyone tidying the "redundant" role off the count should read the test below
+    // first: dropping it leaves every result set of 20 or fewer with no status region at all.
     expect(await screen.findByTestId('result-count')).toHaveTextContent('2 assets')
   })
 

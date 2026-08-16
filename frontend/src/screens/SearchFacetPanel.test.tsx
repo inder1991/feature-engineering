@@ -183,6 +183,10 @@ it('shows an unsendable facet without pretending it can be selected', () => {
   const { onToggleFacet } = renderPanel({ risk_tier: [{ value: 'high', count: 1 }] })
   const box = group('Risk tier').getByRole('checkbox', { name: 'high 1' })
   expect(box).toBeDisabled()
+  // Disabled is not enough on its own: without the class the option keeps full opacity and a
+  // pointer cursor, so it LOOKS live and the reader learns it is not by clicking it. The flag
+  // options carry the same class for the same reason.
+  expect(box.closest('label')).toHaveClass('facet-option--disabled')
   expect(onToggleFacet).not.toHaveBeenCalled()
 })
 

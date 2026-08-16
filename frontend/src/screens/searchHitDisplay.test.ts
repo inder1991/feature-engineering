@@ -113,4 +113,18 @@ describe('hitMeta', () => {
   it('drops every field the catalog does not hold', () => {
     expect(hitMeta({ ...COLUMN, data_type: null })).toEqual([])
   })
+
+  // The live cluster reads `unknown · Customer · concept: as_of_date` on real rows: the ingest's
+  // canonical placeholder for a column whose type nobody has established yet. Not a fabricated
+  // value, but an absence dressed as a fact — and this line may only carry what the catalog holds.
+  it('drops the "unknown" placeholder rather than printing it as a type', () => {
+    expect(hitMeta({ ...COLUMN, data_type: 'unknown' })).toEqual([])
+    expect(hitMeta({ ...COLUMN, data_type: 'UNKNOWN' })).toEqual([])
+    expect(hitMeta({ ...COLUMN, data_type: 'unknown', domain: 'retail' })).toEqual(['retail'])
+  })
+
+  // Only that one word, and only as the WHOLE value. A type that merely contains it is a type.
+  it('keeps a real type that happens to read like the placeholder', () => {
+    expect(hitMeta({ ...COLUMN, data_type: 'unknown_enum' })).toEqual(['unknown_enum'])
+  })
 })
