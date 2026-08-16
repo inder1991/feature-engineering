@@ -81,7 +81,7 @@ def _v2_ir(v1: FormulaExecutionIRV1, *, name: str = "posted_debit_amount_30d",
         feature_name=name, formula_content_hash=f"sha256:{name}",
         final_operation=FinalOperationV2.IDENTITY, zero_denominator=None,
         grain_entity=v1.grain_entity, grain_keys=v1.grain_keys,
-        expressions=v1.expressions,
+        expressions=v1.expressions, policies=(),
         row_selections=((SelectedRowsV2(expr_path=path, selections=(DEBIT,)),)
                         if selections is None else selections),
         spine=v1.spine, output_policy=_output_v2(currency), authoring_run_id="run-v2-0001")
@@ -191,7 +191,7 @@ def test_the_authoring_run_id_is_NOT_in_the_identity(v1_ir):
 
 # ══ C-C2: the ordering is expressed in TYPES ═════════════════════════════════════════════════════
 def test_planning_derives_the_read_set_through_the_shared_walk(v1_ir):
-    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir))
+    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir), policy_reads=())
     assert planned.read_set == physical_read_set([v1_ir], v1_ir.spine)
     assert planned.read_set, "a real feature reads something"
 
@@ -202,7 +202,7 @@ def test_a_FORGED_narrow_read_set_cannot_be_constructed(v1_ir):
     ir = _v2_ir(v1_ir)
     full = physical_read_set_of([(ir.feature_name, ir.expressions)], ir.spine)
     with pytest.raises(ValueError, match="MISSING"):
-        PlannedFormulaExecutionIRV2(ir=ir, read_set=full[:1])
+        PlannedFormulaExecutionIRV2(ir=ir, policy_reads=(), read_set=full[:1])
 
 
 def test_authorization_is_TYPED_on_planned_irs_not_bare_ones():
@@ -224,7 +224,7 @@ def test_a_bare_ir_cannot_be_authorized(v1_ir):
 def test_authorization_refuses_refs_the_group_actually_reads(v1_ir):
     """A token naming fewer refs than the compilation reads is the exact shape of an authorization
     bypass."""
-    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir))
+    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir), policy_reads=())
     with pytest.raises(ValueError, match="does not authorize"):
         AuthorizedCompilationV2(planned=(planned,), spine=v1_ir.spine,
                                 authorized_refs=planned.read_set[:1], roles_used=_ROLES)
@@ -237,7 +237,7 @@ def test_an_empty_group_is_refused(v1_ir):
 
 
 def test_the_token_covers_the_read_set_and_names_its_ir_hashes(v1_ir):
-    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir))
+    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir), policy_reads=())
     token = AuthorizedCompilationV2(planned=(planned,), spine=v1_ir.spine,
                                     authorized_refs=planned.read_set, roles_used=_ROLES)
     assert token.ir_hashes == (ir_hash_v2(planned.ir),)
@@ -291,7 +291,7 @@ def test_the_group_plan_refuses_the_ordinal_too():
 def test_the_identity_pairs_hashes_FROM_THE_TOKEN(v1_ir):
     """The identity names what Gate 2 admitted, so a caller cannot build one over features the gate
     never saw — and the two hash lists are paired one per feature by construction."""
-    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir))
+    planned = PlannedFormulaExecutionIRV2.plan(_v2_ir(v1_ir), policy_reads=())
     token = AuthorizedCompilationV2(planned=(planned,), spine=v1_ir.spine,
                                     authorized_refs=planned.read_set, roles_used=_ROLES)
     plan = FeatureGroupPlanV2(

@@ -37,12 +37,14 @@ module refuses a blank or ordinal-shaped id rather than inventing one.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
 from featuregen.formula.schema import ZeroDenominator
-from featuregen.formula.schema_v2 import FinalOperationV2
+from featuregen.formula.schema_v2 import AuthorityRefsV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.contract import (
@@ -60,11 +62,15 @@ from featuregen.materialize.spine import SpineSourceDeclarationV1, SpineSpec
 __all__ = [
     "AuthorizedCompilationV2",
     "CompilationIdentityV2",
+    "DeclaredPoliciesV2",
     "FeatureGroupPlanV2",
     "FormulaExecutionIRV2",
+    "KnowledgeTimeBasisV2",
     "MaterializationContractV2",
     "PlannedFormulaExecutionIRV2",
+    "PolicyReadV2",
     "SelectedRowsV2",
+    "TemporalReadV2",
     "contract_hash_v2",
     "group_plan_hash_v2",
     "ir_hash_v2",
@@ -130,6 +136,112 @@ class SelectedRowsV2:
 
 
 @dataclass(frozen=True, slots=True)
+class DeclaredPoliciesV2:
+    """The governed policies ONE expression declared — :class:`AuthorityRefsV2` carried verbatim.
+
+    Without this the IR has no record of which policies a formula depends on, and C-C4's
+    read-set union has nothing to check its coverage against: a feature could declare an FX
+    conversion and plan zero policy reads, and the gate would authorize a compilation that reads a
+    rate table nobody authorized. The refs are the formula's own declaration, so this is a carry,
+    not a re-derivation.
+    """
+
+    expr_path: str
+    refs: AuthorityRefsV2
+
+    def __post_init__(self) -> None:
+        if not self.expr_path.strip():
+            raise ValueError("declared policies must name the expression that declared them")
+
+    def declared_refs(self) -> tuple[tuple[str, str], ...]:
+        """``(role, ref)`` for every NON-BLANK declared ref, in a fixed role order.
+
+        Blank is how ``AuthorityRefsV2`` spells "this expression declares no policy of this kind",
+        so a blank is not a policy to cover — and treating it as one would demand a read for a
+        policy that does not exist.
+        """
+        return tuple(
+            (role, ref) for role, ref in (
+                ("status", self.refs.status_policy_ref),
+                ("direction", self.refs.direction_policy_ref),
+                ("reversal", self.refs.reversal_policy_ref),
+                ("currency_conversion", self.refs.currency_conversion_ref),
+            ) if ref.strip()
+        )
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "expr_path": self.expr_path,
+            "status_policy_ref": self.refs.status_policy_ref,
+            "direction_policy_ref": self.refs.direction_policy_ref,
+            "reversal_policy_ref": self.refs.reversal_policy_ref,
+            "currency_conversion_ref": self.refs.currency_conversion_ref,
+        }
+
+
+class KnowledgeTimeBasisV2(StrEnum):
+    """WHEN a read's knowledge is taken — the axis C-C5 keeps separate from the T+N promise.
+
+    ``LATEST_AVAILABLE`` is the dangerous one and is named rather than left implicit: a reversal
+    flag or an FX rate read at current state tells you something that became true AFTER the cutoff,
+    which the model being trained could not have known. That is leakage, and it looks identical to a
+    correct read unless the basis is a fact the plan carries.
+    """
+
+    AS_OF_CUTOFF = "as_of_cutoff"
+    EVENT_TIME = "event_time"
+    LATEST_AVAILABLE = "latest_available"
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalReadV2:
+    """One read's temporal semantics, and — SEPARATELY — the promise declared over it (C-C5).
+
+    Two fields, deliberately, because they answer different questions and conflating them hides
+    leakage. ``basis`` is what the read actually SEES. ``declared_promise`` is the T+N availability
+    the contract PROMISES for that data. A post-cutoff read under a generous promise still reads
+    post-cutoff data; a plan that stored only the promise would call it fine.
+    """
+
+    basis: KnowledgeTimeBasisV2
+    declared_promise: AvailabilityPromiseV1 | None
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {
+            "basis": self.basis.value,
+            "declared_promise": (None if self.declared_promise is None
+                                 else self.declared_promise.identity_payload()),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyReadV2:
+    """One physical column a POLICY reads, attributed to the policy that made it a read.
+
+    The attribution is the point. Gate 2's read set is derived, so a policy read that named no
+    policy would be an unexplained ref in the union — and C-C4's restatement is precisely that there
+    is no separate list to add or forget: every read traces to something the formula declared.
+    """
+
+    policy_ref: str
+    role: str
+    logical_ref: str
+    temporal: TemporalReadV2
+
+    def __post_init__(self) -> None:
+        for value, what in ((self.policy_ref, "policy_ref"), (self.role, "role"),
+                            (self.logical_ref, "logical_ref")):
+            if not value.strip():
+                raise ValueError(
+                    f"a policy read with a blank {what} cannot be attributed to anything, and an "
+                    f"unattributed ref in Gate 2's union is exactly the separate list C-C4 removes")
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {"policy_ref": self.policy_ref, "role": self.role,
+                "logical_ref": self.logical_ref, "temporal": self.temporal.identity_payload()}
+
+
+@dataclass(frozen=True, slots=True)
 class FormulaExecutionIRV2:
     """One V2 feature's complete compiled plan — and nothing about a given run.
 
@@ -149,6 +261,7 @@ class FormulaExecutionIRV2:
     grain_keys: tuple[str, ...]
     expressions: tuple[ExpressionExecutionIR, ...]
     row_selections: tuple[SelectedRowsV2, ...]
+    policies: tuple[DeclaredPoliciesV2, ...]
     spine: SpineSpec
     output_policy: FormulaOutputPolicyV2
     authoring_run_id: str
@@ -176,6 +289,30 @@ class FormulaExecutionIRV2:
                     f"{self.feature_name} carries two row-selection entries for "
                     f"{selected.expr_path!r}: which one applies is then a tuple-order accident")
             seen.add(selected.expr_path)
+        declared: set[str] = set()
+        for policies in self.policies:
+            if policies.expr_path not in set(paths):
+                raise ValueError(
+                    f"{self.feature_name} declares policies for {policies.expr_path!r}, which is "
+                    f"not one of its expressions ({', '.join(sorted(paths))}): a policy attached to "
+                    f"no expression is one the read-set union would demand a read for and the "
+                    f"renderer would never apply")
+            if policies.expr_path in declared:
+                raise ValueError(
+                    f"{self.feature_name} carries two policy declarations for "
+                    f"{policies.expr_path!r}: which set governs is then a tuple-order accident")
+            declared.add(policies.expr_path)
+
+    def declared_policy_refs(self) -> tuple[tuple[str, str, str], ...]:
+        """``(expr_path, role, ref)`` for every non-blank policy this formula declared, sorted.
+
+        The list C-C4's coverage check is written against — derived from the formula's own
+        declaration, so there is nothing separate to keep in step with it.
+        """
+        return tuple(sorted(
+            (policies.expr_path, role, ref)
+            for policies in self.policies
+            for role, ref in policies.declared_refs()))
 
     def identity_payload(self) -> dict[str, Any]:
         """What this feature IS — no provenance, no run-time value.
@@ -198,6 +335,8 @@ class FormulaExecutionIRV2:
             "row_selections": [selected.identity_payload()
                                for selected in sorted(self.row_selections,
                                                       key=lambda s: s.expr_path)],
+            "policies": [policies.identity_payload()
+                         for policies in sorted(self.policies, key=lambda p: p.expr_path)],
             "spine": self.spine.identity_payload(),
             "output_policy": {
                 "output_type": self.output_policy.output_type,
@@ -233,10 +372,11 @@ class PlannedFormulaExecutionIRV2:
     """
 
     ir: FormulaExecutionIRV2
+    policy_reads: tuple[PolicyReadV2, ...]
     read_set: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        derived = physical_read_set_of([(self.ir.feature_name, self.ir.expressions)], self.ir.spine)
+        derived = self.derive_read_set(self.ir, self.policy_reads)
         if tuple(self.read_set) != derived:
             missing = sorted(set(derived) - set(self.read_set))
             extra = sorted(set(self.read_set) - set(derived))
@@ -246,12 +386,69 @@ class PlannedFormulaExecutionIRV2:
                 + (f"; UNREAD {extra}" if extra else "")
                 + ". A planned read set is not an assertion a caller makes about an IR, it is a "
                   "fact the IR determines")
+        self._check_policy_coverage()
+
+    def _check_policy_coverage(self) -> None:
+        """C-C4's restatement, enforced: every DECLARED policy has at least one read.
+
+        The gate's read set is derived from what the formula declares, so there is no separate list
+        to keep in step — but a declaration with no read is the same hole by another route: the
+        compilation would apply a governed policy whose columns nobody authorized. The converse is
+        checked too, because a policy read attributed to a policy the formula never declared is a
+        read with no reason to exist.
+        """
+        declared = {ref for _, _, ref in self.ir.declared_policy_refs()}
+        read_for = {read.policy_ref for read in self.policy_reads}
+        uncovered = sorted(declared - read_for)
+        if uncovered:
+            raise ValueError(
+                f"{self.ir.feature_name} declares {uncovered} and plans no read for them: a "
+                f"governed policy is applied by reading its columns, so a declared policy with no "
+                f"policy read would be applied on data Gate 2 never authorized")
+        undeclared = sorted(read_for - declared)
+        if undeclared:
+            raise ValueError(
+                f"{self.ir.feature_name} plans policy reads for {undeclared}, which it never "
+                f"declared: a read attributed to a policy the formula does not use has no reason to "
+                f"be in the union, and widening a read set is exactly what the union prevents")
+
+    @property
+    def structural_read_set(self) -> tuple[str, ...]:
+        """The expression and spine half of the union, WITHOUT the policy reads.
+
+        Not a second derivation — the same shared walk, asked a narrower question. The leakage gate
+        needs it because a ref can be read BOTH as an operand and as a policy column, and reporting
+        only one of the two would send an author to fix one path while the other still leaks.
+        """
+        return physical_read_set_of([(self.ir.feature_name, self.ir.expressions)], self.ir.spine)
+
+    @staticmethod
+    def derive_read_set(
+        ir: FormulaExecutionIRV2, policy_reads: Sequence[PolicyReadV2],
+    ) -> tuple[str, ...]:
+        """The COMPLETE V2 read set: expression and spine reads, UNIONED with policy reads (C-C4).
+
+        The expression and spine half goes through V1's shared walk unchanged. Policy reads are the
+        V2 addition, and they are unioned here rather than kept beside the read set because §5.2
+        classifies sensitivity over "what this feature reads" — a policy column outside that union
+        would be read at run time and absent from the classification.
+        """
+        structural = physical_read_set_of([(ir.feature_name, ir.expressions)], ir.spine)
+        return tuple(sorted({*structural, *(read.logical_ref for read in policy_reads)}))
 
     @classmethod
-    def plan(cls, ir: FormulaExecutionIRV2) -> PlannedFormulaExecutionIRV2:
-        """Derive the read set and pair it with ``ir`` — the ONLY sane way to build one."""
-        return cls(ir=ir, read_set=physical_read_set_of(
-            [(ir.feature_name, ir.expressions)], ir.spine))
+    def plan(
+        cls, ir: FormulaExecutionIRV2, *, policy_reads: Sequence[PolicyReadV2],
+    ) -> PlannedFormulaExecutionIRV2:
+        """Derive the read set and pair it with ``ir`` — the ONLY sane way to build one.
+
+        ``policy_reads`` is REQUIRED, with no default. A default of ``()`` would mean "this feature
+        reads no policy columns", which is a claim, and the wrong one for every feature that
+        declares a status, direction, reversal or conversion policy. Making the caller state it is
+        what turns C-C4 from a list somebody maintains into a fact the type demands.
+        """
+        reads = tuple(policy_reads)
+        return cls(ir=ir, policy_reads=reads, read_set=cls.derive_read_set(ir, reads))
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,10 +475,11 @@ class AuthorizedCompilationV2:
             raise ValueError(
                 "an authorized compilation names no feature: an empty group compiles nothing, and "
                 "a token for it would authorize every empty group equally")
-        required = physical_read_set_of(
-            [(planned.ir.feature_name, planned.ir.expressions) for planned in self.planned],
-            self.spine)
-        unauthorized = sorted(set(required) - set(self.authorized_refs))
+        # The group's union, INCLUDING policy reads (C-C4). Built from the planned members' own
+        # read sets rather than re-walked, so the gate authorizes exactly what planning derived.
+        required = {ref for planned in self.planned for ref in planned.read_set}
+        required |= set(physical_read_set_of([], self.spine))
+        unauthorized = sorted(required - set(self.authorized_refs))
         if unauthorized:
             raise ValueError(
                 f"the group reads {unauthorized} which the token does not authorize: a token that "
