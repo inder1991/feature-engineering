@@ -129,3 +129,34 @@ def test_the_refusal_detail_names_the_consequence(monkeypatch):
     assert "ftr::public.txns.txn_amt" in detail
     assert "two live decisions" in detail
     assert "silence" in detail
+
+
+# ── the DISCRIMINATING half: the real C1 path, not a stub ────────────────────────────────────────
+# `seed_not_operational` seeds source-ATTESTED `unit` evidence through the REAL
+# evidence -> decision -> projection machinery. Its own docstring records the situation this module
+# exists for: *"the decision is live and load-bearing, but ``read_column_facts`` governs ``unit``
+# only as a HINT ... so C1 refuses governed authority while carrying the decision"*. That is the
+# column whose unit the old path answered `""` for.
+
+def test_a_live_source_attested_unit_is_never_answered_as_absent(db):
+    """THE invariant. For a live, load-bearing, source-attested unit decision the reader may READ
+    the value or REFUSE — both are honest. What it must never do is answer ABSENT, because absent
+    is indistinguishable from "this column has no unit" and is exactly how a monetary operand came
+    to look non-monetary.
+    """
+    from tests.featuregen.formula.c1_fixtures import seed_not_operational
+
+    from featuregen.overlay.upload.operational_facts import read_operational_value
+
+    col = seed_not_operational(db)
+
+    # the old path, pinned here so this test fails loudly if the premise ever stops being true
+    assert read_operational_value(db, col.logical_ref, "unit").status == "not_operational"
+
+    out = read_measure_facts(db, col.logical_ref)
+    if isinstance(out, MeasureFactsUnreadable):
+        assert out.field == "unit"          # refused — honest
+    else:
+        assert out.unit.disposition is not MeasureReadDisposition.ABSENT, (
+            "a live source-attested unit decision was reported ABSENT — the silent downgrade "
+            "C-A3c exists to end")

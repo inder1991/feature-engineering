@@ -68,6 +68,10 @@ from featuregen.formula.authoring import (
 )
 from featuregen.formula.capability_v2 import classify_formula_capability_v2
 from featuregen.formula.critic import CRITIC_POLICY_VERSION, CriticFinding, critique
+from featuregen.formula.measure_facts import (
+    MeasureFactsUnreadable,
+    read_measure_facts,
+)
 from featuregen.formula.output_authority_v2 import (
     FormulaOutputPolicyV2,
     InvalidOutputV2,
@@ -137,6 +141,13 @@ _OPERAND_FACT_FIELDS: tuple[tuple[str, str], ...] = (
     ("unit", "unit"),
     ("currency", "currency"),
 )
+
+#: The one slot ``read_operational_value`` still answers for an operand. ``_OPERAND_FACT_FIELDS``
+#: above is deliberately KEPT: ``recipe_authoring``'s frozen reader imports it, and that reader
+#: projects a SNAPSHOT (no connection), so it cannot use the verified-decision seam. Its measure
+#: facts are still hint-shaped — the frozen half of C-A3c is a separate step, because the snapshot
+#: builder would have to record a verified status and that moves ``snapshot_item_hash``.
+_LOGICAL_TYPE_FIELD = "logical_representation"
 
 _GRAIN_FIELD = "is_grain"
 
@@ -426,14 +437,32 @@ def _read_c1_facts_v2(conn, proposal: TypedFormulaProposalV2
         for ref in (expr.operand, expr.second_operand):
             if ref is None or ref in facts_by_ref:
                 continue
-            reads = {slot: read_operational_value(conn, ref, field)
-                     for slot, field in _OPERAND_FACT_FIELDS}
-            facts_by_ref[ref] = OperandFactsV2(**{
-                slot: _fact_text(value) for slot, value in reads.items()})
-            for slot, field in _OPERAND_FACT_FIELDS:
-                failure = _hard_failure(reads[slot], ref, field)
-                if failure is not None:
-                    failures.append(failure)
+            # `logical_representation` is a GOVERNED DECISION field, which `read_operational_value`
+            # answers correctly. `unit`/`currency` are not: they are measure ANNOTATIONS, load-
+            # bearing under `_SOURCE_OR_HUMAN`, and that reader's only `resolved` arms are the
+            # decision-field and specialized-fact sets — neither contains them — so it returned
+            # `not_operational` for EVERY unit and currency, `_fact_text` turned that into `""`,
+            # and `not_operational` is not a hard-fail status. A per-row-currency monetary operand
+            # therefore reached `resolve_output_v2` looking NON-MONETARY with nothing recorded, so
+            # BR-6's `CURRENCY_CONVERSION_UNDECLARED` tooth could not fire and a mixed-currency
+            # population was summed across currencies in silence. `read_measure_facts` reads them
+            # through the verified-decision seam instead, and REFUSES an unreadable one rather
+            # than answering with the empty fact that hid the problem (C-A3c).
+            logical = read_operational_value(conn, ref, _LOGICAL_TYPE_FIELD)
+            measures = read_measure_facts(conn, ref)
+            if isinstance(measures, MeasureFactsUnreadable):
+                facts_by_ref[ref] = OperandFactsV2(logical_type=_fact_text(logical))
+                failures.append(AuthorityFailure(
+                    reason=measures.reason or measures.status,
+                    operand=ref, field=measures.field))
+            else:
+                facts_by_ref[ref] = OperandFactsV2(
+                    logical_type=_fact_text(logical),
+                    unit=measures.unit.value,
+                    currency=measures.currency.value)
+            failure = _hard_failure(logical, ref, _LOGICAL_TYPE_FIELD)
+            if failure is not None:
+                failures.append(failure)
     for key in proposal.grain.keys:
         failure = _hard_failure(read_operational_value(conn, key, _GRAIN_FIELD), key, _GRAIN_FIELD)
         if failure is not None:
