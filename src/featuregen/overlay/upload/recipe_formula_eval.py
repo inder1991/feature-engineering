@@ -22,8 +22,8 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
-from featuregen.formula.schema import OPERATION_GRAMMAR_VERSION, OUTPUT_POLICY_VERSION
 from featuregen.formula.replay_trace import load_verified_checkpoint
+from featuregen.formula.schema import OPERATION_GRAMMAR_VERSION, OUTPUT_POLICY_VERSION
 from featuregen.idgen import mint_id
 from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
 from featuregen.overlay.upload.recipe_formula_authority import (

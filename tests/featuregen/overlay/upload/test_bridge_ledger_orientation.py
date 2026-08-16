@@ -26,7 +26,6 @@ from tests.featuregen.overlay.upload.test_bridge_orientation_identity import (
 )
 
 from featuregen.overlay.identity import CatalogObjectRef, EntityBridgeRef, fact_key
-from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.bridge_projection import project_verified_bridge
 from featuregen.overlay.upload.bridge_propose import propose_bridge

@@ -23,8 +23,9 @@ moves the hash — the SE-1 requirement) inside a registered `contract_hash_v1` 
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any
 
 from featuregen.canonical import contract_hash_v1
 from featuregen.contracts.contract_versions import register_contract_version
@@ -40,6 +41,7 @@ from featuregen.overlay.upload.recipe_contract_v2 import (
     RecipeDefinitionV2,
     TemporalSpecV2,
 )
+
 # The same private canonicalizer canonical-recipe-v2 uses — mechanism identity is the point:
 # two canonicalizers that could disagree about a nested tuple would fork plan identity.
 from featuregen.overlay.upload.recipe_grounding_context import _canonical_dataclass

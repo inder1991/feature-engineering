@@ -13,9 +13,16 @@ two-round review baked in:
 from __future__ import annotations
 
 from featuregen.overlay.upload.passc.identifiers import (
-    ColMeta, _canon, _synonym_canons, normalized_identifier_concept)
+    ColMeta,
+    _canon,
+    _synonym_canons,
+    normalized_identifier_concept,
+)
 from featuregen.overlay.upload.passc.types import (
-    DEFAULT_CONFIG, NamespaceCompatibility, PassCConfig)
+    DEFAULT_CONFIG,
+    NamespaceCompatibility,
+    PassCConfig,
+)
 
 
 def classify_namespace(

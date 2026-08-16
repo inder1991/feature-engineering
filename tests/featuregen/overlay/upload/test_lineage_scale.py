@@ -18,7 +18,6 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from tests.featuregen.overlay.upload._bridge_fixtures import govern_bridge_fact
 
 from featuregen.contracts.envelopes import IdentityEnvelope

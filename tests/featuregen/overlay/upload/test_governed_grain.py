@@ -73,8 +73,9 @@ def _verified_grain_not_unique(db, source: str, table: str, columns: list[str], 
     for a near-unique candidate ("proposed, but with ``is_unique=False`` so a human decides"), and
     the shape a table whose key is unique only within some scope has to take, since the governed
     grain value has nowhere to record the scoping predicate."""
-    from featuregen.overlay.commands import confirm_fact
     from tests.featuregen.overlay.upload.conftest import _open_grain_task
+
+    from featuregen.overlay.commands import confirm_fact
 
     value = {"columns": columns, "is_unique": False}
     _propose_grain(db, source, table, columns, actor=service_actor, is_unique=False)

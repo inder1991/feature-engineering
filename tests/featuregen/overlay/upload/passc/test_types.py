@@ -1,6 +1,13 @@
 from featuregen.overlay.upload.passc.types import (
-    NamespaceCompatibility, CardinalityInferenceStatus, SignalEvidence,
-    JoinCandidateEvidenceV1, DEFAULT_CONFIG, CONFIG_VERSION, ALGORITHM_VERSION)
+    ALGORITHM_VERSION,
+    CONFIG_VERSION,
+    DEFAULT_CONFIG,
+    CardinalityInferenceStatus,
+    JoinCandidateEvidenceV1,
+    NamespaceCompatibility,
+)
+
+
 def test_enums_and_config_defaults():
     assert NamespaceCompatibility.COMPATIBLE == "compatible"
     assert set(NamespaceCompatibility) >= {NamespaceCompatibility.COMPATIBLE, NamespaceCompatibility.POSSIBLE,

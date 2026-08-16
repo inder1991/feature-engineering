@@ -406,12 +406,11 @@ def test_the_batched_fold_is_byte_identical_to_the_per_request_path(db):
     """Golden equality: every candidate's verdicts + eligibility from the batched run match
     the single-request wrapper exactly — the batch changed WHERE the read happens, never a
     single decision."""
-    from featuregen.overlay.upload.generation_semantic_context import (
-        build_generation_semantic_context,
-    )
-
     from featuregen.overlay.upload.feature_planning_contracts import (
         planning_request_from_recipe,
+    )
+    from featuregen.overlay.upload.generation_semantic_context import (
+        build_generation_semantic_context,
     )
     from featuregen.overlay.upload.recipe_operand_policy import bind_planning_request
 
@@ -491,7 +490,6 @@ def test_a_bound_single_source_candidate_carries_a_real_plan(db):
 
 
 def test_divergence_and_cross_dataset_refuse_the_plan_never_substitute():
-    from types import SimpleNamespace
 
     from featuregen.overlay.upload import semantic_eligibility_reasons as R
     from featuregen.overlay.upload.feature_planning_contracts import (

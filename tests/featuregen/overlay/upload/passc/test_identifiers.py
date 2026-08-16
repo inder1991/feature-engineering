@@ -1,5 +1,8 @@
 from featuregen.overlay.upload.passc.identifiers import (
-    ColMeta, is_join_key_eligible, normalized_identifier_concept)
+    ColMeta,
+    is_join_key_eligible,
+    normalized_identifier_concept,
+)
 
 
 def _c(**kw):

@@ -145,8 +145,8 @@ def test_disposition_fields_constant_is_the_total_field_contract():
     """The [F12] totalizer and the accept write the SAME fields, from ONE constant — the five
     STRUCTURAL ones plus (profile Task 4) the four PROFILE suggestions."""
     from featuregen.overlay.upload.table_synth import (
-        PROFILE_DISPOSITION_FIELDS,
         _STRUCTURAL_DISPOSITION_FIELDS,
+        PROFILE_DISPOSITION_FIELDS,
     )
     assert _STRUCTURAL_DISPOSITION_FIELDS == ("grain", "availability_time", "table_role",
                                               "primary_entity", "event_or_snapshot")

@@ -8,7 +8,6 @@ import pytest
 from featuregen.overlay.upload.feature_planning_contracts import (
     FeaturePlanningRequestV1,
     PlanningContractError,
-    RequiredOperandV1,
     planning_request_from_feature_intent,
     planning_request_from_recipe,
     planning_request_from_user_definition,

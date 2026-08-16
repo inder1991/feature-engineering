@@ -38,7 +38,6 @@ from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.identity import fact_key
-from featuregen.overlay.store import append_overlay_event
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
