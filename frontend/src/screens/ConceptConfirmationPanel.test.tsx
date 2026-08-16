@@ -57,8 +57,9 @@ beforeEach(() => {
 describe('ConceptConfirmationPanel', () => {
   it('renders groups load-bearing first with the funnel and the omission named', async () => {
     render(<ConceptConfirmationPanel />)
-    expect(await screen.findByText(/3 of.*proposals settled|0 of 3 proposals settled/))
-      .toBeInTheDocument()
+    // The share names its own denominator now: it counts the whole catalog, not this queue.
+    expect(await screen.findByTestId('ccq-share')).toHaveTextContent(/0 of 3 settled/)
+    expect(screen.getByTestId('ccq-share')).toHaveTextContent(/every proposal on this catalog/i)
     expect(screen.getByText('customer_id')).toBeInTheDocument()
     expect(screen.getByText(/used by 214 recipe operands/)).toBeInTheDocument()
     expect(screen.getByText(/1 concept group\(s\) not referenced/)).toBeInTheDocument()
@@ -116,5 +117,48 @@ describe('ConceptConfirmationPanel', () => {
     render(<ConceptConfirmationPanel />)
     expect(await screen.findByText(/every load-bearing proposal on this catalog is\s+settled/))
       .toBeInTheDocument()
+  })
+
+  it('explains the share rather than contradicting the empty state with it', async () => {
+    // LIVE on cib: "37 of 82 proposals settled (45%)" rendered directly above "Nothing awaiting
+    // confirmation". Both are true — the share counts EVERY active proposal, the queue lists only
+    // the ones a governed recipe operand references — but printed as neighbours they read as a
+    // contradiction, and the progress figure came first, so the answer arrived second.
+    getConceptConfirmations.mockResolvedValue({
+      catalog_source: 'bank', unreferenced_groups_omitted: 16,
+      funnel: { active: 82, human_confirmed: 37, confirmed_share: 0.45 }, groups: [],
+    })
+    render(<ConceptConfirmationPanel />)
+    const settled = await screen.findByTestId('ccq-settled')
+
+    // The answer to "is anything waiting on me" comes first.
+    const share = screen.getByTestId('ccq-share')
+    expect(settled.compareDocumentPosition(share) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // And the share says what it is counting, so 45% next to "nothing waiting" is no longer a
+    // contradiction the reader has to resolve on their own.
+    expect(share).toHaveTextContent(/every proposal on this catalog/i)
+    expect(share).toHaveTextContent(/37 of 82/)
+    expect(share).toHaveTextContent(/45%/)
+  })
+
+  it('filters catalogs with the same chips the queue above it uses', async () => {
+    // Two idioms for one axis, forty pixels apart: the governance queue filters catalogs with
+    // pressed chips and this panel used a native <select>. Same question, same control.
+    listCatalogs.mockResolvedValue({ catalogs: [
+      { source: 'bank', tables: 3, columns: 9 } as api.VisibleCatalog,
+      { source: 'ftr', tables: 2, columns: 4 } as api.VisibleCatalog] })
+    render(<ConceptConfirmationPanel />)
+    const chips = within(await screen.findByTestId('ccq-catalog-filter'))
+
+    expect(screen.queryByRole('combobox', { name: /catalog/i })).toBeNull()
+    // `.gj-chip--on` fills with --danger by default, because its other use is picking a rejection
+    // reason. Narrowing a list carries no severity, so a filter group must opt into the accent
+    // treatment the governance queue's own chips use — this class is that opt-in.
+    expect(screen.getByTestId('ccq-catalog-filter').className).toMatch(/\bccq-filter\b/)
+    const bank = chips.getByRole('button', { name: 'bank' })
+    expect(bank).toHaveAttribute('aria-pressed', 'true')
+    await userEvent.click(chips.getByRole('button', { name: 'ftr' }))
+    await waitFor(() => expect(getConceptConfirmations).toHaveBeenCalledWith('ftr'))
+    expect(chips.getByRole('button', { name: 'ftr' })).toHaveAttribute('aria-pressed', 'true')
   })
 })
