@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
@@ -183,4 +184,20 @@ it('shows an unsendable facet without pretending it can be selected', () => {
   const box = group('Risk tier').getByRole('checkbox', { name: 'high 1' })
   expect(box).toBeDisabled()
   expect(onToggleFacet).not.toHaveBeenCalled()
+})
+
+// `.facet-group` is NOT search's alone: WorkbenchScreen's candidate filter bar renders its groups
+// with the same class. So a rule filed under the catalog-search banner that selects a bare
+// `.facet-group` restyles a screen this work never touched — and at a narrow viewport the search
+// rail's rules turn a group into a horizontal row, which is not what that bar is.
+//
+// Structural because jsdom computes no styles and never applies a media query: the class
+// assignment is correct on both screens either way, so no DOM assertion could catch this. The
+// stylesheet is the artifact under test.
+it('keeps the redesign’s facet rules off every other screen’s .facet-group', () => {
+  const css = readFileSync('src/index.css', 'utf8')
+  const redesign = css.slice(css.indexOf('catalog search (2026-08-16 redesign)'))
+  expect(redesign).toBeTruthy()
+  expect(redesign).not.toMatch(/^\s*\.facet-group(-title)?\s*[,{]/m)
+  expect(redesign).toMatch(/\.facet-panel \.facet-group \{/)
 })

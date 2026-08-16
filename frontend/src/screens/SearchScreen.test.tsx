@@ -137,7 +137,9 @@ describe('search screen — results and rows', () => {
         FACETS, 2),
     )
     render(<SearchScreen />)
-    expect(await screen.findByRole('status')).toHaveTextContent('2 assets')
+    // By testid, not by role=status: the count line is no longer the screen's live region — the
+    // pager copy is, being the only text that changes as the reader pages.
+    expect(await screen.findByTestId('result-count')).toHaveTextContent('2 assets')
   })
 
   it('uses the singular for a single asset', async () => {
@@ -145,7 +147,7 @@ describe('search screen — results and rows', () => {
     render(<SearchScreen />)
     // Word-bounded: "1 assets" CONTAINS "1 asset", so a plain substring match would go green on a
     // broken plural and pin nothing.
-    expect(await screen.findByRole('status')).toHaveTextContent(/\b1 asset\b/)
+    expect(await screen.findByTestId('result-count')).toHaveTextContent(/\b1 asset\b/)
   })
 
   it('counts the matching set and states the slice once, in the pager', async () => {
@@ -154,8 +156,9 @@ describe('search screen — results and rows', () => {
     render(<SearchScreen />)
     // The count line carries the COUNT only. It said the slice too, and the pager below always
     // co-renders with it, so the same range was stated twice in adjacent lines every time.
-    expect(await screen.findByRole('status')).toHaveTextContent('42 assets')
-    expect(screen.getByRole('status')).not.toHaveTextContent(/showing/i)
+    // Anchored rather than "contains 42 assets" + "not /showing/i": with the live region now on
+    // the pager, an anchored read of this one element is the whole claim in one assertion.
+    expect(await screen.findByTestId('result-count')).toHaveTextContent(/^42 assets$/)
     // Exact match, not a substring: "showing 1–1" is a prefix of "showing 1–10".
     expect(screen.getByText('Showing 1–1 of 42 matching assets')).toBeInTheDocument()
   })
@@ -320,6 +323,26 @@ describe('search screen — the search field', () => {
     expect(facet).toHaveFocus()
     await userEvent.keyboard('/')
     expect(field).toHaveFocus()
+  })
+
+  // The shortcut and the row's overflow popover meet here: "/" moves focus out of an open popover
+  // without a key press the popover listens for and without a pointerdown anywhere, so its two
+  // original exits both missed and it stayed open, floating over a row the reader had left.
+  it('does not leave a row’s overflow popover open behind the "/" shortcut', async () => {
+    render(<SearchScreen />)
+    const field = await screen.findByRole('searchbox', { name: 'Query' })
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'More actions for public.accounts.balance' }),
+    )
+    // Focus must be INSIDE the popover when "/" fires — that is the path that orphaned it, and a
+    // test that pressed "/" with focus still on the trigger would prove nothing about the items.
+    await userEvent.tab()
+    const item = screen.getByRole('button', { name: 'Suggested features for accounts' })
+    expect(item).toHaveFocus()
+
+    await userEvent.keyboard('/')
+    expect(field).toHaveFocus()
+    expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
   })
 })
 

@@ -373,8 +373,13 @@ export function SearchScreen() {
               {/* The COUNT only. The slice is stated once, by the pager — the control that
                   navigates it — rather than twice in adjacent lines: the toolbar's slice note
                   rendered exactly when `total > hits.length`, which is exactly when the pager
-                  renders too, so it was redundant in 100% of the states it could appear in. */}
-              <p className="micro-label tabular-nums result-count" role="status">
+                  renders too, so it was redundant in 100% of the states it could appear in.
+
+                  NOT a live region any more. Once the slice moved to the pager this line reads
+                  the same "45 assets" on every page of a result set, so announcing it said
+                  nothing about what changed; the announcement now sits on the pager copy, which
+                  is the text that actually changes. */}
+              <p className="micro-label tabular-nums result-count" data-testid="result-count">
                 <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
                 {result.total === 1 ? 'asset' : 'assets'}
               </p>
@@ -427,7 +432,12 @@ export function SearchScreen() {
                   THESE facets. "permitted" would claim the read-scoped universe is 42, which is
                   false whenever a filter is active, and would quietly absorb freshness-withheld
                   assets — which are permitted, and which the empty state names separately. */}
-              <span className="pager-copy tabular-nums">
+              {/* The live region, because this is the one line on the screen whose text changes
+                  as the reader pages. It sits in the pager rather than on the count line above:
+                  a `role="status"` whose text is identical on every page announces nothing, so
+                  paging was silent for a screen reader. One status node, on the changing text —
+                  the screen does not gain a third. */}
+              <span className="pager-copy tabular-nums" role="status">
                 Showing {offset + 1}–{offset + result.hits.length} of {result.total} matching assets
               </span>
               <button

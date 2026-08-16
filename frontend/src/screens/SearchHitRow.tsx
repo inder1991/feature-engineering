@@ -175,8 +175,8 @@ export function SearchHitRow({
 /**
  * The row's overflow. A DISCLOSURE, not an ARIA menu: `role="menu"` promises arrow-key roving
  * that a three-item popover does not need and we would not implement honestly. What it does
- * promise it keeps — Escape closes and returns focus, a pointer elsewhere closes, and choosing an
- * item closes AND returns focus.
+ * promise it keeps — Escape closes and returns focus, a pointer elsewhere closes, focus leaving
+ * the popover closes, and choosing an item closes AND returns focus.
  */
 function RowOverflow({ label, children }: { label: string; children: ReactNode }) {
   const [open, setOpen] = useState(false)
@@ -202,7 +202,25 @@ function RowOverflow({ label, children }: { label: string; children: ReactNode }
   }, [open])
 
   return (
-    <div className="hit-overflow" ref={wrap}>
+    <div
+      className="hit-overflow"
+      ref={wrap}
+      // The third exit: focus leaving the popover. Escape and an outside pointerdown miss every
+      // path that moves focus without a key press here or a click there — the search screen's "/"
+      // shortcut focuses the query field from anywhere on the page, which left this popover open
+      // and floating over a row the reader had already left.
+      //
+      // React's onBlur IS `focusout`, so it reaches this wrapper from any descendant, and
+      // `relatedTarget` is where focus is GOING: a hop between the popover's own items (or back to
+      // the trigger) stays inside `wrap` and must not close it. A null relatedTarget is focus
+      // leaving the DOCUMENT — the window losing focus — which is not the reader deciding they are
+      // done with the popover, so it stays open for their return. Focus is NOT sent back to the
+      // trigger here, unlike Escape: it has deliberately gone somewhere else.
+      onBlur={event => {
+        const next: Node | null = event.relatedTarget
+        if (next && !wrap.current?.contains(next)) setOpen(false)
+      }}
+    >
       <button
         type="button"
         ref={trigger}

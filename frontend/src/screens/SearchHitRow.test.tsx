@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { beforeEach, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { SearchHitRow } from './SearchHitRow'
 
@@ -38,6 +38,16 @@ async function openOverflow() {
 // nobody awaiting it, and a rejecting mock would then fail the test it just passed.
 beforeEach(() => {
   featureImpact.mockReset()
+})
+
+// The clipboard tests below install their mock straight onto the SHARED `navigator` and never take
+// it off, so the last one installed — a REJECTING writeText — stayed in place for every test that
+// ran afterwards, including any test appended to the end of this file. Restore whatever was there
+// before (jsdom implements no clipboard, so usually: nothing at all).
+const clipboardBefore = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+afterEach(() => {
+  if (clipboardBefore) Object.defineProperty(navigator, 'clipboard', clipboardBefore)
+  else Reflect.deleteProperty(navigator, 'clipboard')
 })
 
 // What a screen reader is handed: the accessibility tree drops an aria-hidden element AND its
@@ -254,4 +264,65 @@ it('shows the reference when the browser refuses to copy it', async () => {
   )
   expect(await screen.findByRole('status'))
     .toHaveTextContent('Could not copy. The reference is public.accounts.balance')
+})
+
+it('walks the row’s controls in priority order on Tab', async () => {
+  renderRow()
+  await userEvent.tab()
+  expect(screen.getByRole('button', { name: 'Open asset public.accounts.balance' })).toHaveFocus()
+  await userEvent.tab()
+  expect(
+    screen.getByRole('button', { name: 'Explore relationships for public.accounts.balance' }),
+  ).toHaveFocus()
+  await userEvent.tab()
+  expect(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  ).toHaveFocus()
+})
+
+// The popover's THIRD exit. Escape and an outside pointerdown were its only two, so anything that
+// moved focus without a key or a click left it open and floating over the row — the search screen's
+// "/" shortcut, which focuses the query field from anywhere on the page, does exactly that.
+it('closes the overflow when focus leaves it', async () => {
+  renderRow()
+  // A control outside the row, appended AFTER it so a Tab off the popover's last item reaches it.
+  const outside = document.createElement('button')
+  outside.textContent = 'Elsewhere'
+  document.body.append(outside)
+  try {
+    await userEvent.click(
+      screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+    )
+    // Three tabs walks the popover's items; the fourth leaves the row entirely.
+    await userEvent.tab()
+    await userEvent.tab()
+    await userEvent.tab()
+    expect(
+      screen.getByRole('button', { name: 'Copy reference for public.accounts.balance' }),
+    ).toHaveFocus()
+
+    await userEvent.tab()
+    expect(outside).toHaveFocus()
+    expect(screen.queryByRole('button', { name: 'Suggested features for accounts' })).toBeNull()
+  } finally {
+    outside.remove()
+  }
+})
+
+// The guard on that exit: `focusout` fires on every hop BETWEEN the popover's own items too, so a
+// handler that closed on any focus loss would shut the popover the moment a keyboard user tabbed
+// from the first item to the second — one Tab after opening it.
+it('stays open while focus moves between its own items', async () => {
+  renderRow()
+  await userEvent.click(
+    screen.getByRole('button', { name: 'More actions for public.accounts.balance' }),
+  )
+  await userEvent.tab()
+  await userEvent.tab()
+  expect(
+    screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
+  ).toHaveFocus()
+  expect(
+    screen.getByRole('button', { name: 'Suggested features for accounts' }),
+  ).toBeInTheDocument()
 })

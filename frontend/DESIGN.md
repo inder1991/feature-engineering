@@ -113,6 +113,12 @@ packages (no CDN). Engineered, legible, unmistakably a tool; deliberately not In
 - **Field**: 32px input, hairline border, surface background; label 12px/600 above; focus ring as
   buttons. Inline validation text in `--danger`, 13px.
 - **Table/list row**: 40px min height, hairline separators, mono for refs, right-aligned numerics.
+- **Overflow disclosure** (a row's tertiary actions behind one `···` trigger): a panel anchored to
+  the trigger — `--surface`, hairline border, 10px panel radius, `--shadow` — holding full-width
+  item lines at 32px min height, 13px, left-aligned, 6px radius, `--surface-2` on hover. A
+  DISCLOSURE, never an ARIA menu: `role="menu"` promises arrow-key roving this does not implement.
+  Four exits, all of them kept: Escape, a pointer elsewhere, focus leaving the panel, and choosing
+  an item; Escape and choosing an item return focus to the trigger.
 - **Callout** (result states, honesty notes): full hairline border + semantic-soft background,
   10px radius, leading glyph; copy states the fact and the next action. No side-stripes.
 - **Toast/status**: inline, role=status/alert as appropriate; no modal-first patterns.

@@ -154,7 +154,10 @@ it('says which slice of the whole set is on screen', async () => {
   // "of 45" quietly stopped being what matched /45/ once the count line read "45 assets".
   expect(screen.getByText('Showing 21–40 of 45 matching assets')).toBeInTheDocument()
   // The total is a property of the query, not of the page: it must not drift as the user walks.
-  expect(screen.getByRole('status')).toHaveTextContent(/\b45 assets\b/)
+  // Addressed by its testid, not by role=status: the live region moved to the pager copy (the
+  // only text on this screen that changes as the reader pages), and the count line is now a plain
+  // statement. Anchored, so a count line that also restated the slice would not match.
+  expect(screen.getByTestId('result-count')).toHaveTextContent(/^45 assets$/)
 
   // One more page, because a FULL page cannot tell `offset + hits.length` from `offset + 20`.
   // The last page is short (5 of 45), so only the honest expression reads 41–45 here.
@@ -162,4 +165,23 @@ it('says which slice of the whole set is on screen', async () => {
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
   await screen.findByText('c40')
   expect(screen.getByText('Showing 41–45 of 45 matching assets')).toBeInTheDocument()
+})
+
+// Paging is a SILENT change for a screen reader unless the text that changes sits in a live
+// region. Collapsing the two slice statements into one left the survivor — the pager copy —
+// outside any live region, while the count line that still carried role=status read the same
+// "45 assets" on every page. The announcement has to live where the changing text lives.
+it('announces the new slice to a screen reader when the reader pages', async () => {
+  await mount()
+  const region = screen.getByRole('status')
+  expect(region).toHaveTextContent('Showing 1–20 of 45 matching assets')
+
+  searchCatalog.mockResolvedValue(page(20, 20, 45))
+  await userEvent.click(screen.getByRole('button', { name: /next/i }))
+  await screen.findByText('c20')
+
+  // The SAME node, re-read: a live region that unmounts and remounts is not reliably announced,
+  // so node identity is part of the contract, not an incidental detail of this render.
+  expect(screen.getByRole('status')).toBe(region)
+  expect(region).toHaveTextContent('Showing 21–40 of 45 matching assets')
 })

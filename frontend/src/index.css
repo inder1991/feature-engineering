@@ -7875,3 +7875,76 @@ button.stat:hover {
    of them (ConnectorPanel's "Go to Integrations") already renders a `.btn` inside one. An unscoped
    rule filed under the catalog-search banner would silently restyle those. */
 .search-results .empty .btn { margin-top: 12px; }
+
+/* ---- responsive density ---------------------------------------------------------------------
+   Three widths, narrowest last so each block appends to the one above rather than fighting it. */
+
+/* Laptop: the capability column stops competing with the definition for width and moves under it.
+   The actions keep their own column and span both rows, so a hit WITHOUT capability lines (most
+   of them) is unchanged — the second row is simply never created by anything but this span. */
+@media (max-width: 1180px) {
+  .rows .row.hit { grid-template-columns: minmax(0, 1fr) auto; }
+  .hit-capabilities { grid-column: 1; grid-row: 2; }
+  .hit-actions { grid-column: 2; grid-row: 1 / 3; align-items: start; }
+}
+
+/* Narrow: one column, actions wrap under the content, facets become a horizontal tray.
+   900px, NOT a new breakpoint: index.css:3994 already unsticks the sidebar and collapses
+   .facet-cols to one column at exactly this width. This block appends to that decision (equal
+   specificity, later in the file) rather than introducing a second, competing narrow width. */
+@media (max-width: 900px) {
+  .rows .row.hit { grid-template-columns: minmax(0, 1fr); }
+  .hit-capabilities,
+  .hit-actions { grid-column: 1; grid-row: auto; }
+  .hit-actions { flex-wrap: wrap; }
+
+  .facet-panel {
+    flex-direction: row;
+    gap: 8px;
+    overflow-x: auto;
+  }
+
+  /* Scoped to `.facet-panel`, not bare `.facet-group`: that class is NOT search's alone —
+     WorkbenchScreen renders the candidate filter bar's groups with it too (WorkbenchScreen.tsx,
+     `<div className="facet-group">` around a micro-label + `.facet-chips`). An unscoped rule filed
+     under the catalog-search banner would silently flip that bar to a horizontal row on every
+     narrow viewport. The workbench renders no `.facet-panel`, so this reaches search only. */
+  .facet-panel .facet-group {
+    display: flex;
+    flex: none;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 0;
+  }
+  .facet-panel .facet-group-title { margin-bottom: 0; white-space: nowrap; }
+  .facet-panel .facet-option { white-space: nowrap; }
+  .facet-panel .facet-more { margin-top: 0; white-space: nowrap; }
+}
+
+/* Phone: the overflow popover cannot hang off the right edge of a 360px screen. */
+@media (max-width: 620px) {
+  .hit-overflow-items { right: auto; left: 0; min-width: min(240px, calc(100vw - 48px)); }
+  .results-toolbar { flex-direction: column; align-items: flex-start; gap: 4px; }
+}
+
+/* The search field's wrap basis. The rule above set `.search-field { flex: 1 }` (= `1 1 0%`),
+   which never wraps and shrinks the field instead; the basis it replaced put the field's
+   hypothetical size at 320px so the Search button wrapped onto its own line on a narrow
+   container. Restore the basis — this is the only reason the row wraps at all, and
+   `.search-input`'s old `flex: 1 1 320px` (index.css:3727) is now inert because the input is no
+   longer a flex child. */
+.search-field { flex: 1 1 320px; }
+
+/* Motion: the popover is the only thing on this screen that animates, and only when motion is
+   welcome. `--dur` (160ms) and `--ease-out-quart` are the sheet's own motion tokens and sit
+   inside DESIGN.md's 150-200ms ease-out-quart band; opacity + transform only, no layout property.
+
+   The `no-preference` gate is belt and braces — the global reduce block at index.css:116 already
+   caps every animation-duration — and follows the precedent `.path` set at index.css:1202. */
+@media (prefers-reduced-motion: no-preference) {
+  .hit-overflow-items { animation: hit-overflow-in var(--dur) var(--ease-out-quart); }
+  @keyframes hit-overflow-in {
+    from { opacity: 0; transform: translateY(-2px); }
+    to { opacity: 1; transform: none; }
+  }
+}
