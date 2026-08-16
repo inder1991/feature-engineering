@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import get_args
 
 from featuregen.formula.canonical_v2 import proposal_content_hash_v2
+from featuregen.formula.canonical_v3 import proposal_content_hash_v3
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
 from featuregen.formula.result import (
     AuthoringAxes,
@@ -47,6 +48,7 @@ from featuregen.formula.result import (
     TechnicalStatus,
 )
 from featuregen.formula.schema_v2 import TypedFormulaProposalV2
+from featuregen.formula.schema_v3 import TypedFormulaProposalV3
 
 __all__ = [
     "DISPOSITION_POLICY_VERSION_V2",
@@ -86,9 +88,10 @@ class AuthoringResultV2:
     authoring_disposition: AuthoringDisposition
     disposition_policy_version: int
     authoring_run_id: str
-    #: The validated proposal — the structural half of the v2 artifact. Present on every outcome
-    #: that produced one; ``None`` when nothing parsed.
-    candidate_proposal: TypedFormulaProposalV2 | None
+    #: The validated proposal — the structural half of the artifact. Present on every outcome that
+    #: produced one; ``None`` when nothing parsed. **v2 OR v3** (C-A2): v3 is the same LANGUAGE at
+    #: wire schema 3, so one result type carries either, and the hash below dispatches on which.
+    candidate_proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3 | None
     candidate_proposal_hash: str | None
     #: The AUTHORITATIVE output policy, the second half of the pair. Present ONLY when the output
     #: actually resolved (see the module docstring's three coherence rules).
@@ -131,11 +134,24 @@ def _fold_v2(axes: AuthoringAxes) -> AuthoringDisposition:
     return "RESOLVED"
 
 
+def _content_hash(proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3) -> str:
+    """The proposal's content identity, by VERSION — never by the caller's say-so.
+
+    Each wire schema owns its own canonical projection and its own hash lineage, so hashing a v3
+    proposal with v2's canonicalizer would mint an identity under a projection that never saw
+    ``row_selections``. Dispatching on the type is what keeps the two lineages separate while one
+    result type carries either.
+    """
+    if isinstance(proposal, TypedFormulaProposalV3):
+        return proposal_content_hash_v3(proposal)
+    return proposal_content_hash_v2(proposal)
+
+
 def derive_disposition_v2(
     axes: AuthoringAxes,
     *,
     authoring_run_id: str,
-    candidate_proposal: TypedFormulaProposalV2 | None = None,
+    candidate_proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3 | None = None,
     candidate_output: FormulaOutputPolicyV2 | None = None,
     output_requirements: tuple[str, ...] = (),
     authority_failures: tuple[AuthorityFailure, ...] = (),
@@ -192,7 +208,7 @@ def derive_disposition_v2(
         authoring_run_id=authoring_run_id,
         candidate_proposal=candidate_proposal,
         candidate_proposal_hash=(
-            None if candidate_proposal is None else proposal_content_hash_v2(candidate_proposal)),
+            None if candidate_proposal is None else _content_hash(candidate_proposal)),
         candidate_output=candidate_output,
         output_requirements=tuple(output_requirements),
         authority_failures=tuple(authority_failures),

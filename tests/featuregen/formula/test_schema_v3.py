@@ -159,3 +159,54 @@ def test_the_v3_projection_is_field_exhaustive():
                 walk(item, item_s)
 
     walk(proposal, body)
+
+
+# ── C-A2's consumers: the result union, the critic, and replay restoration ──────────────────────
+def test_the_result_carries_a_v3_proposal_and_hashes_it_with_v3():
+    """The candidate union widened, and the hash DISPATCHES.
+
+    Each wire schema owns its own canonical projection and hash lineage, so hashing a v3 proposal
+    with v2's canonicalizer would mint an identity under a projection that never saw
+    `row_selections` — two different formulas could then share one hash.
+    """
+    from featuregen.formula.result import AuthoringAxes
+    from featuregen.formula.result_v2 import derive_disposition_v2
+
+    proposal = parse_proposal_v3(_v3_raw())
+    axes = AuthoringAxes(
+        structural_status="ok", capability_status="ok", output_status="external_requirement",
+        expectation_status="not_provided", critic_status="clean", technical_status="ok")
+    result = derive_disposition_v2(
+        axes, authoring_run_id="run_v3", candidate_proposal=proposal,
+        output_requirements=("EXTERNAL_TYPE_VALIDATION_REQUIRED",))
+    assert result.candidate_proposal is proposal
+    assert result.candidate_proposal_hash == proposal_content_hash_v3(proposal)
+    assert result.candidate_proposal_hash != proposal_content_hash_v2(
+        parse_proposal_v2(json.loads((_GOLD_V2 / "01_avg_txn_amt_90d.json").read_text())["proposal"]))
+
+
+def test_replay_restoration_reaches_v3_through_the_version_dispatch():
+    """Restoration was already correct: it parses through `parse_versioned` rather than a hardcoded
+    v2 parser, so extending the dispatch covered it. This pins that — a restorer that ever
+    hardcoded `parse_proposal_v2` would silently reject every v3 trace."""
+    import inspect
+
+    from featuregen.formula import replay_authoring_v2
+
+    source = inspect.getsource(replay_authoring_v2)
+    assert "parse_versioned" in source
+    assert "parse_proposal_v2(" not in source, (
+        "restoration must route through the version dispatch, never a pinned v2 parser")
+    assert isinstance(parse_versioned(_v3_raw()), TypedFormulaProposalV3)
+
+
+def test_the_critic_accepts_a_v3_proposal():
+    """The critic's type gate stays CLOSED and admits one more PARSED type — never a raw dict. A
+    reviewer told a formula sums DEBIT rows judges it differently from one told only that it sums
+    an amount, so the selection must reach the critic."""
+    from featuregen.formula.critic import _proposal_plain
+
+    plain = _proposal_plain(parse_proposal_v3(_v3_raw()))
+    assert plain["body"]["expr"]["row_selections"][0]["semantic_value"] == "debit"
+    with pytest.raises(SchemaError, match="TypedFormulaProposalV3"):
+        _proposal_plain({"not": "a parsed proposal"})

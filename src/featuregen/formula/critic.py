@@ -60,6 +60,14 @@ from featuregen.formula.schema_v2 import (
     UnaryBodyV2,
     body_expressions_v2,
 )
+from featuregen.formula.schema_v3 import (
+    CompositeBodyV3,
+    DiffBodyV3,
+    RatioBodyV3,
+    TypedFormulaProposalV3,
+    UnaryBodyV3,
+    body_expressions_v3,
+)
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.column_authority import read_column_facts
@@ -240,7 +248,9 @@ _COLUMN_FACT_FIELDS: tuple[str, ...] = (
 )
 
 
-def proposal_column_refs(proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2) -> tuple[
+def proposal_column_refs(
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2 | TypedFormulaProposalV3,
+) -> tuple[
         str, ...]:
     """Every column logical_ref the proposal stands on — grain keys plus, per body expression,
     the operand, the window's event-time ref, the row-level second operand (v2), and every
@@ -273,6 +283,8 @@ def _body_expressions(body):
         return (body.minuend, body.subtrahend)
     if isinstance(body, (UnaryBodyV2, RatioBodyV2, DiffBodyV2, CompositeBodyV2)):
         return body_expressions_v2(body)
+    if isinstance(body, (UnaryBodyV3, RatioBodyV3, DiffBodyV3, CompositeBodyV3)):
+        return body_expressions_v3(body)
     raise SchemaError(f"body must be UnaryBody | RatioBody | DiffBody, got {type(body).__name__}")
 
 
@@ -313,18 +325,23 @@ def _column_context(conn, ref: str, roles: tuple[str, ...]) -> dict:
             "data_type": row[0], "facts": facts}
 
 
-def _proposal_plain(proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2) -> dict:
+def _proposal_plain(
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2 | TypedFormulaProposalV3,
+) -> dict:
     """The proposal as plain JSON types (the authored ARTIFACT under review — enums to their
     string values, tuples to lists). Never the author's reasoning: only the proposal itself.
 
-    The type gate stays CLOSED, it just admits two members now: an arbitrary object reaching a
-    provider payload is exactly what this guard exists to stop, and widening it to
-    ``TypedFormulaProposalV2`` admits one more PARSED, semantically-validated type — never a raw
-    dict."""
-    if not isinstance(proposal, (TypedFormulaProposalV1, TypedFormulaProposalV2)):
+    The type gate stays CLOSED, it just admits three members now: an arbitrary object reaching a
+    provider payload is exactly what this guard exists to stop, and each addition admits one more
+    PARSED, semantically-validated type — never a raw dict. v3 carries ``row_selections``, which the
+    critic SHOULD see: a reviewer told a formula sums "debit" rows judges it differently from one
+    told only that it sums an amount."""
+    if not isinstance(
+            proposal,
+            (TypedFormulaProposalV1, TypedFormulaProposalV2, TypedFormulaProposalV3)):
         raise SchemaError(
-            "critique covers TypedFormulaProposalV1 | TypedFormulaProposalV2 only, "
-            f"got {type(proposal).__name__}")
+            "critique covers TypedFormulaProposalV1 | TypedFormulaProposalV2 | "
+            f"TypedFormulaProposalV3 only, got {type(proposal).__name__}")
     # StrEnums are str subclasses and every literal value is already a canonical string, so a
     # JSON round-trip yields exactly the plain document the wire/audit layers expect.
     return json.loads(json.dumps(dataclasses.asdict(proposal)))
@@ -333,7 +350,7 @@ def _proposal_plain(proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2) -
 def build_critic_metadata(
     conn,
     intent: AuthoringIntent,
-    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2,
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2 | TypedFormulaProposalV3,
     *,
     roles: tuple[str, ...],
     column_loader: Callable[[str], dict] | None = None,
@@ -410,7 +427,7 @@ def _parse_findings(output: dict | None) -> tuple[list[CriticFinding], bool, lis
 def critique(
     conn,
     intent: AuthoringIntent,
-    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2,
+    proposal: TypedFormulaProposalV1 | TypedFormulaProposalV2 | TypedFormulaProposalV3,
     client: LLMClient,
     *,
     roles: tuple[str, ...] | list[str] | tuple[()] = (),
