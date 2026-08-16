@@ -99,16 +99,18 @@ const KIND_LABEL_ONE: Record<string, string> = {
 // What each kind IS, for the section lead-in — including the fact that a discovered join lives
 // inside ONE catalog: `list_open_approved_join_proposals` filters on `from_ref.catalog_source` only
 // and is not endpoint-symmetric, so a join must never be presented as a cross-catalog finding.
+// A lead-in earns its place ONLY by stating a consequence the rows cannot state for themselves.
+// The definitional ones are gone: "The same business entity in two different catalogs" sat
+// directly above a card reading "2 candidate links for the same branch, between CIB and FTR" —
+// the abstraction printed above its own worked example — and "these are the decisions no
+// per-catalog screen could show you" explained the system's architecture to someone who only
+// wants to know what they are approving. What survives here says something new.
 const KIND_ABOUT: Record<string, string> = {
-  entity_bridge: 'The same business entity in two different catalogs. These are the decisions no '
-    + 'per-catalog screen could show you.',
-  approved_join: 'A join between two tables inside one catalog, discovered from metadata and '
-    + 'listed under the catalog it starts in.',
-  grain: 'What one row of a table is — the key every feature on it aggregates to.',
-  availability_time: 'Which column carries the as-of date point-in-time features read.',
-  currency_binding: 'What currency an amount column is in — a fixed code, or the column on the '
-    + 'same table that names it per row. Features that sum money are refused until this is decided.',
-  entity_assignment: 'Which business entity an identifier column denotes.',
+  // NOT symmetric: `list_open_approved_join_proposals` filters on from_ref.catalog_source only, so
+  // which catalog a join is filed under is a real surprise the rows never mention.
+  approved_join: 'A discovered join is listed under the catalog it starts in, not under both.',
+  // A refusal elsewhere in the product, caused by this decision. Nothing on the card says it.
+  currency_binding: 'Features that sum money are refused until this is decided.',
 }
 
 function kindLabel(kind: string): string {
@@ -121,13 +123,6 @@ function kindLabelOne(kind: string): string {
 
 function categoryLabel(category: string): string {
   return category.replaceAll('_', ' ')
-}
-
-// "a, b and c" — an English list, because a comma-joined run of kind names reads as a fragment
-// where the settled line has to read as a sentence.
-function listWords(words: string[]): string {
-  if (words.length <= 1) return words[0] ?? ''
-  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
 }
 
 // No display name exists anywhere in this system: `graph_node` carries no per-catalog label and the
@@ -1585,10 +1580,8 @@ function Purpose(): ReactNode {
     <div className="callout callout--accent gq-purpose" data-testid="gq-purpose">
       <div className="callout-body">
         <p>
-          <strong>Decisions only a person can make.</strong> The system proposes and you dispose:
-          everything below was derived automatically, and what it needs from you is a judgement
-          about meaning. Confirming records that a human agrees with a relationship — who agreed,
-          and when. It is not a switch, and nothing here is held back pending your say-so.
+          <strong>The platform is already using these relationships.</strong> Confirming records
+          that a person checked one, and who; it does not switch anything on.
         </p>
       </div>
     </div>
@@ -1751,6 +1744,9 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
     items.every(item => item.kind !== kind)
     && !queue.unreadable.some(entry => unreadableListings(kind).includes(entry.listing)))
   const workingKinds = shownKinds.filter(kind => !settledKinds.includes(kind))
+  // How many decisions belong to more than one catalog — the reason the catalog chips sum to more
+  // than the queue length. Zero on a single-catalog queue, where there is nothing to explain.
+  const spanning = items.filter(item => item.catalogs.length > 1).length
   // WHAT ACTUALLY NEEDS A PERSON is not the list length: the bridge listing also carries VERIFIED
   // facts, and those offer no action at all (`reject_fact` denies them). Counting them as waiting
   // would overstate the work, so the headline counts only rows the server still offers an action on.
@@ -1815,12 +1811,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
           </div>
         )}
       </div>
-      <p className="hint" data-testid="gq-scope-note">
-        Across {queue.catalogs.length} catalog{queue.catalogs.length === 1 ? '' : 's'} you can see
-        {queue.catalogs.length > 0 ? `: ${queue.catalogs.map(catalogLabel).join(', ')}` : ''}. Every
-        count here is scope-relative — it describes what you can see, never a catalog total.
-      </p>
-
       <div className="gq-filters">
         <div className="gj-chips" role="group" aria-label="Catalog" data-testid="gq-catalog-filter">
           <button
@@ -1869,21 +1859,27 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
             </button>
           ))}
         </div>
+        {/* THE ARITHMETIC THAT IS ACTUALLY CONFUSING. A cross-catalog link belongs to both of its
+            catalogs and is counted in each, so on the live queue the chips read CIB (13) and
+            FTR (16) over sixteen decisions. That sum is what a reviewer stops on. What sat here
+            instead was a disclaimer that the counts are "scope-relative — never a catalog total":
+            a misreading nobody makes, phrased in the read-scope subsystem's own vocabulary, one
+            line above chips that already named the catalogs. Computed, so it appears only when
+            something genuinely spans two. */}
+        {spanning > 0 && (
+          <p className="hint gq-catalog-arith" data-testid="gq-catalog-arith">
+            {spanning} of these decisions {spanning === 1 ? 'belongs' : 'belong'} to both catalogs
+            and {spanning === 1 ? 'is' : 'are'} counted in each, so the catalog chips add up to
+            more than the {items.length} decisions below.
+          </p>
+        )}
       </div>
 
-      {/* SETTLED KINDS, SAID ONCE. Four of the six kinds are empty on the live queue, and each one
-          used to render a heading, a lead-in, a count chip and a 35-word paragraph — four sections
-          of nothing between the two that hold the work, plus four role="status" regions all
-          announcing "nothing to review" on load. A kind we could not READ is a different claim and
-          keeps its own section below; only the genuinely settled ones collapse here. */}
-      {settledKinds.length > 0 && (
-        <p className="empty gq-settled" data-testid="gq-settled-kinds" role="status">
-          Nothing is waiting on you in {listWords(settledKinds.map(kind => kindLabel(kind)))}
-          {catalog === null ? '' : ` in ${catalogLabel(catalog)}`}. Everything proposed there has
-          already been decided, and the platform keeps working either way.
-        </p>
-      )}
-
+      {/* A kind with nothing waiting renders NOTHING: its chip carries the zero, which is the whole
+          honest statement. The prose that used to stand here also claimed more than the payload
+          knows — `items_visible_to_you_by_kind` counts OPEN items, so a zero cannot tell
+          "everything was decided" from "nothing was ever proposed". A kind we could not READ is a
+          different claim entirely and keeps its own section below. */}
       {workingKinds.map(kind => {
         const forKind = items.filter(item => item.kind === kind)
         const entries = byUrgency(entriesFor(kind, forKind))
@@ -1898,7 +1894,9 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
             <h2 className="gq-kind-head">
               {kindLabel(kind)} <span className="tabular-nums">{forKind.length}</span>
             </h2>
-            {KIND_ABOUT[kind] && <p className="hint gq-kind-about">{KIND_ABOUT[kind]}</p>}
+            {KIND_ABOUT[kind] && (
+              <p className="hint gq-kind-about" data-testid="gq-kind-about">{KIND_ABOUT[kind]}</p>
+            )}
             {forKind.length === 0 && broken.length > 0 && (
               <p className="empty gq-broken">
                 We could not look here.{' '}
