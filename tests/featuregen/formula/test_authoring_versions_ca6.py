@@ -22,6 +22,7 @@ from tests.featuregen.formula.test_replay_authoring_v2 import (
     _scripted_author,
 )
 
+from featuregen.formula.author import run_tool
 from featuregen.formula.authoring_v2 import AUTHORING_ORCHESTRATOR_VERSION_V2
 from featuregen.formula.authoring_versions import (
     LEGACY_RESTART_REQUIRED,
@@ -241,7 +242,7 @@ def test_A_CHANGED_INTENT_STILL_REFUSES_ON_THE_LEGACY_PATH(db, monkeypatch):
     with pytest.raises(RecoveryRequiresReconciliation, match="identity changed"):
         run_authoring_v2_replay(
             db, other, None, None, actor=None, authoring_run_id=run_id,
-            facts_reader=_monetary_facts,
+            facts_reader=_monetary_facts, tool_runner=run_tool,
             critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref})
 
 

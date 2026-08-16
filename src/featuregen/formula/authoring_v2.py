@@ -52,7 +52,7 @@ is what ``run_status`` derives from the absence of a terminal event, and exactly
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -226,10 +226,29 @@ def authoring_intent_hash_v2(intent: AuthoringIntent) -> str:
 
 # ── the orchestrator ─────────────────────────────────────────────────────────────────────────────
 
+def _require_tool_runner_v2(tool_runner) -> None:
+    """Refuse a missing runner instead of falling back to V1 tools (C-A8).
+
+    Kept in step with ``replay_authoring_v2``'s guard: both orchestrators reach the same
+    ``author_formula`` default, so a seam that failed closed in one and open in the other would
+    just move the defect to whichever entry point a caller happened to use.
+    """
+    if tool_runner is None:
+        raise ToolRunnerRequiredV2(
+            "run_authoring_v2 requires a tool_runner. Omitting it does not disable tools — "
+            "`author_formula` falls back to `run_tool`, the V1 set — so a v2 run would author "
+            "against the wrong catalog surface with nothing in the trace to say so")
+
+
+class ToolRunnerRequiredV2(ValueError):
+    """A v2 authoring run was given no tool runner. A caller bug, so it raises."""
+
+
 def run_authoring_v2(conn, intent: AuthoringIntent, author_client: LLMClient,
                      critic_client: LLMClient, *,
                      roles: tuple[str, ...] | list[str] | tuple[()],
-                     actor: IdentityEnvelope) -> AuthoringResultV2:
+                     actor: IdentityEnvelope,
+                     tool_runner: Callable[..., dict] | None = None) -> AuthoringResultV2:
     """Author ONE Formula-v2 proposal for ``intent`` and return the folded result.
 
     ``author_client`` and ``critic_client`` are DELIBERATELY separate: LLM-2 reviews the proposal
@@ -259,9 +278,13 @@ def run_authoring_v2(conn, intent: AuthoringIntent, author_client: LLMClient,
         "formula_schema_version": FORMULA_SCHEMA_VERSION_V2,
     })
 
+    # C-A8 — the tool set is STATED. `author_formula` defaults to `run_tool` (the V1 set), so
+    # omitting this would author a v2 formula against v1 tools with nothing in the trace saying so.
+    _require_tool_runner_v2(tool_runner)
     raw_proposal, turns = author_formula(
         conn, intent, author_client, roles=role_tuple, max_turns=AUTHORING_MAX_TURNS,
-        actor=actor, authoring_run_id=run_id, turn_contract=AUTHOR_TURN_CONTRACT_V2)
+        actor=actor, authoring_run_id=run_id, turn_contract=AUTHOR_TURN_CONTRACT_V2,
+        tool_runner=tool_runner)
     _trace_turns(trace, turns)
 
     if raw_proposal is None:

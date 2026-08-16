@@ -364,6 +364,28 @@ def _technical_failure(conn, run_id: str, seq: int, reason: str, *,
     return result
 
 
+class ToolRunnerRequired(ValueError):
+    """C-A8 — a v2 authoring run was given no tool runner.
+
+    A caller bug rather than a governed outcome, so it RAISES: there is no formula to dispose, and
+    folding a refusal here would record a verdict about a formula that was never authored.
+    """
+
+
+def _require_tool_runner(tool_runner) -> None:
+    """Refuse a missing runner instead of falling back to V1 tools.
+
+    ``author_formula``'s ``tool_runner`` defaults to ``run_tool`` — the V1 tool set. Omitting the
+    kwarg therefore did not disable tools, it QUIETLY SWAPPED them: a v2 formula authored against v1
+    tools reads the catalog through the wrong surface and the trace records nothing about it.
+    """
+    if tool_runner is None:
+        raise ToolRunnerRequired(
+            "run_authoring_v2_replay requires a tool_runner. Omitting it does not disable tools — "
+            "`author_formula` falls back to `run_tool`, the V1 set — so a v2 run would author "
+            "against the wrong catalog surface with nothing in the trace to say so")
+
+
 def _stored_versions(conn, run_id: str) -> dict | None:
     """The version bundle a run was OPENED under, read back from its immutable manifest row.
 
@@ -404,6 +426,7 @@ def run_authoring_v2_replay(
     Same parameters as ``replay_authoring.run_authoring``, because the live worker's call site is
     the same call site; the types they carry are v2's.
     """
+    _require_tool_runner(tool_runner)
     versions: dict[str, Any] = {
         "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
         # C-A6 — RECORDED, not hardcoded. A v3 run must not inherit `2`: the manifest would then
@@ -530,7 +553,10 @@ def run_authoring_v2_replay(
                 lease_fence=lease_fence,
                 resume_turns=checkpoint.author_turns,
                 turn_contract=AUTHOR_TURN_CONTRACT_V2,
-                **({} if tool_runner is None else {"tool_runner": tool_runner}),
+                # C-A8 — ALWAYS passed, never omitted. `author_formula`'s own default is `run_tool`,
+                # the V1 tool set, so omitting this kwarg silently authored a v2 formula against v1
+                # tools. `_require_tool_runner` refuses above rather than letting that happen.
+                tool_runner=tool_runner,
             )
         except FormulaControlFlow:
             raise
