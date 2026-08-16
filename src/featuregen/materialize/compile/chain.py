@@ -429,6 +429,11 @@ class CompiledGroup:
     #: :attr:`validation_report`, and a caller must read ``stopped_at`` rather than infer a
     #: successful run from ``refusal is None``.
     refusal: MaterializationRefused | None
+    #: The PUBLISHER's verdict, present whenever selection refused — INDEPENDENTLY of where this run
+    #: stopped. ``refusal`` names what stopped the run; this names what publication decided, and a
+    #: run that stops at L0 still has a publication verdict worth reading. Before this field the
+    #: two were fused into one, so a refused publisher plus a failed build reported neither.
+    publication_refusal: MaterializationRefused | None
     terminal_event: RunEventKind | None
     lifecycle_state: RequestLifecycle
     generation_id: str | None
@@ -760,7 +765,7 @@ def _commit(
             built = report.status is ValidationStatus.PASSED
 
             if not built:
-                attempt = _RunAttempt.build_unproven(report, l0=l0)
+                attempt = _RunAttempt.build_unproven(report, l0=l0, selection=selection)
             elif isinstance(selection, PublisherSelection):
                 attempt = _execute_the_run(
                     conn, staging, request=request, project=project, authorized=authorized,
@@ -795,6 +800,7 @@ def _commit(
         materialization_contract_hash=plan.materialization_contract_hash,
         group_plan_hash=group_plan_hash(plan),
         generated_project_hash=project.identity.generated_project_hash, project_root=str(root),
+        publication_refusal=attempt.publication_refusal,
         validation_report=report, l1_report=attempt.l1_report, submission=attempt.submission,
         sandbox_execution_hash=attempt.sandbox_execution_hash,
         active_revision=attempt.active_revision)
@@ -815,6 +821,12 @@ class _RunAttempt:
     terminal: RunEventKind
     detail: str
     refusal: MaterializationRefused | None = None
+    #: The PUBLISHER's verdict, preserved wherever the chain stopped. Separate from ``refusal``
+    #: (which names what STOPPED this run) because the two answer different questions: a run
+    #: can stop at L0 and still have a publication verdict worth recording. Before this field
+    #: that verdict was discarded — `if not built:` is tested first, so a refused publisher
+    #: plus a failed build reported nothing and the publication question looked unasked.
+    publication_refusal: MaterializationRefused | None = None
     l1_report: ValidationReportV1 | None = None
     submission: SubmissionOutcome | None = None
     sandbox_execution_hash: str | None = None
@@ -822,14 +834,19 @@ class _RunAttempt:
 
     @classmethod
     def build_unproven(cls, report: ValidationReportV1, *,
-                       l0: L0Interpreter | None) -> _RunAttempt:
+                       l0: L0Interpreter | None,
+                       selection: PublisherSelection | MaterializationRefused | None = None,
+                       ) -> _RunAttempt:
         """L0 failed or never ran — the run stops there and NOTHING downstream is attempted.
 
         Not a skip of G-2: a run whose project was not proved to build has no artifact to prepare
         inputs for, and preparing one would resolve partitions for bytes nobody validated.
         """
         return cls(stopped_at=ChainStage.VALIDATE_L0, terminal=RunEventKind.RUN_FAILED,
-                   detail=_unproven_detail(report, configured=l0 is not None))
+                   detail=_unproven_detail(report, configured=l0 is not None),
+                   publication_refusal=(selection
+                                        if isinstance(selection, MaterializationRefused)
+                                        else None))
 
     @classmethod
     def refused_publication(cls, refusal: MaterializationRefused) -> _RunAttempt:
@@ -842,7 +859,8 @@ class _RunAttempt:
         identify. The reason is the terminal's own detail, already carrying the refusal code.
         """
         return cls(stopped_at=ChainStage.PUBLISHER, terminal=RunEventKind.PUBLICATION_REFUSED,
-                   detail=f"{refusal.code.value}: {refusal.detail}", refusal=refusal)
+                   detail=f"{refusal.code.value}: {refusal.detail}", refusal=refusal,
+                   publication_refusal=refusal)
 
     @classmethod
     def published(cls, revision: ActiveRevision, *, l1_report: ValidationReportV1,
@@ -1180,7 +1198,10 @@ class _Stop:
         return CompiledGroup(
             request_id=self.request.request_id,
             logical_group_name=self.request.logical_group_name,
-            stopped_at=stage, refusal=refusal, terminal_event=None,
+            # `publication_refusal` is None and that is TRUTHFUL here: this path records a stage
+            # that RAISED its refusal, and publisher selection returns its refusal rather than
+            # raising, so publication was never reached and has no verdict to preserve.
+            stopped_at=stage, refusal=refusal, publication_refusal=None, terminal_event=None,
             lifecycle_state=moved.lifecycle_state, generation_id=None, run_id=None,
             materialization_contract_hash=None, group_plan_hash=None,
             generated_project_hash=None, project_root=None)
@@ -1228,7 +1249,11 @@ def _replayed(conn: DbConn, request: MaterializationRequestV1) -> CompiledGroup:
     events = read_run_events(conn, request.run_id) if request.run_id else ()
     return CompiledGroup(
         request_id=request.request_id, logical_group_name=request.logical_group_name,
-        stopped_at=None, refusal=None,
+        # A replay reconstructs from recorded EVENTS, which carry the terminal but not the
+        # publisher's own refusal object; None here says "this replay does not know", not "there
+        # was no refusal". Reading the terminal event is how a caller learns publication was
+        # refused on a replayed run.
+        stopped_at=None, refusal=None, publication_refusal=None,
         terminal_event=events[-1].event_kind if events and events[-1].is_terminal() else None,
         lifecycle_state=request.lifecycle_state, generation_id=request.generation_id,
         run_id=request.run_id, materialization_contract_hash=None, group_plan_hash=None,
