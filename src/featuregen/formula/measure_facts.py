@@ -46,6 +46,7 @@ __all__ = [
     "MeasureFactsUnreadable",
     "MeasureReadDisposition",
     "disposition_of",
+    "project_measure_read",
     "read_measure_facts",
 ]
 
@@ -192,3 +193,35 @@ def _reason_of(value: OperationalValue) -> str | None:
     it is the thing reporting a failure.
     """
     return getattr(value, "conflict_status", None)
+
+
+# ── the projection BOTH readers use ──────────────────────────────────────────────────────────────
+
+def project_measure_read(
+    value: object | None, logical_ref: str, field: str
+) -> tuple[str, MeasureFactsUnreadable | None]:
+    """One measure read → ``(fact_text, refusal)``, for the LIVE and FROZEN readers alike.
+
+    Exists because ``_fact_text`` alone does not fail closed for a measure field: it turns EVERY
+    non-``resolved`` read into ``""``, while ``_hard_failure`` recognises only ``fork`` /
+    ``hash_mismatch`` / ``projection_unavailable``. Between them, ``conflict``, ``retired`` and
+    ``not_operational`` became the empty fact with no attribution — silently non-monetary.
+
+    Takes anything ``GovernedRead``-shaped (the live ``OperationalValue`` and the frozen
+    ``FrozenOperationalValue`` both qualify) so the frozen path cannot drift from the live one: a
+    second copy of this rule is exactly how the two readers would come to disagree about what a
+    fact is.
+    """
+    status = getattr(value, "status", None)
+    if value is None or not isinstance(status, str):
+        # No item sealed for this field at all — the snapshot simply does not carry it.
+        return "", None
+    disposition = disposition_of(status)
+    if disposition is MeasureReadDisposition.UNREADABLE:
+        return "", MeasureFactsUnreadable(
+            logical_ref=logical_ref, field=field, status=status,
+            reason=getattr(value, "conflict_status", None))
+    raw = getattr(value, "value", None)
+    if disposition is MeasureReadDisposition.RESOLVED and raw is not None:
+        return str(raw), None
+    return "", None

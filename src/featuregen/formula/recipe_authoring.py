@@ -40,6 +40,12 @@ from featuregen.formula.authoring_v2 import (
 from featuregen.formula.authoring_v2 import (
     _hard_failure as _hard_failure_v2,
 )
+from featuregen.formula.measure_facts import (
+    MEASURE_FIELDS as _MEASURE_FIELDS_V2,
+)
+from featuregen.formula.measure_facts import (
+    project_measure_read,
+)
 from featuregen.formula.operations_v2 import operation_rule
 from featuregen.formula.output_authority import ExprFacts
 from featuregen.formula.output_authority_v2 import OperandFactsV2
@@ -213,12 +219,29 @@ class FrozenRecipeReadContext:
                     continue
                 fields = self._items.get(ref, {})
                 reads = {slot: fields.get(field) for slot, field in _OPERAND_FACT_FIELDS_V2}
-                facts_by_ref[ref] = OperandFactsV2(**{
-                    slot: _fact_text_v2(value) for slot, value in reads.items()})
+                # C-A3c. `_fact_text_v2` alone does NOT fail closed for a measure field: it turns
+                # every non-`resolved` read into `""`, while `_hard_failure_v2` recognises only
+                # fork / hash_mismatch / projection_unavailable. Between them `conflict`,
+                # `retired` and `not_operational` became the empty fact with no attribution — the
+                # silent non-monetary downgrade. Measure slots therefore go through
+                # `project_measure_read`, the SAME rule the live reader applies, so the frozen and
+                # live paths cannot disagree about what a measure fact is.
+                texts: dict[str, str] = {}
                 for slot, field in _OPERAND_FACT_FIELDS_V2:
-                    failure = _hard_failure_v2(reads[slot], ref, field)
+                    read = reads[slot]
+                    if field in _MEASURE_FIELDS_V2:
+                        text, refusal = project_measure_read(read, ref, field)
+                        texts[slot] = text
+                        if refusal is not None:
+                            failures.append(AuthorityFailure(
+                                reason=refusal.reason or refusal.status,
+                                operand=ref, field=field))
+                        continue
+                    texts[slot] = _fact_text_v2(read)
+                    failure = _hard_failure_v2(read, ref, field)
                     if failure is not None:
                         failures.append(failure)
+                facts_by_ref[ref] = OperandFactsV2(**texts)
         for key in proposal.grain.keys:
             failure = _hard_failure_v2(
                 self._items.get(key, {}).get(_GRAIN_FIELD_V2), key, _GRAIN_FIELD_V2)

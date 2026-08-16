@@ -205,9 +205,17 @@ def test_snapshot_seals_c1_status_resolved_and_hint(conn) -> None:
     # a GOVERNED, hash-verified additivity seals status="resolved" / authority="governed"
     assert by_field["additivity"].status == "resolved"
     assert by_field["additivity"].authority == "governed"
-    # a hint-by-policy field never seals governed — it seals "not_operational"
-    assert by_field["unit"].status == "not_operational"
+    # A hint-by-policy field never seals GOVERNED — `authority` is unchanged. But C-A3c stopped it
+    # sealing a blanket `status="not_operational"`: `unit`/`currency` are measure ANNOTATIONS,
+    # load-bearing under `_SOURCE_OR_HUMAN`, so they are read through the VERIFIED-decision seam and
+    # seal what is actually true of the decision. This column has NO unit decision, so the honest
+    # status is `no_decision` — previously indistinguishable from a column whose attested unit the
+    # old reader simply refused to serve, which is how a monetary operand read as non-monetary.
+    assert by_field["unit"].status == "no_decision"
     assert by_field["unit"].authority == "hint"
+    # `entity` is a hint that is NOT a measure annotation — it still seals the blanket status,
+    # which is what scopes the change to `_MEASURE_FIELDS`.
+    assert by_field["entity"].status == "not_operational"
     # the sealed status rides in the persisted authority_json (and is part of the item_hash)
     (status_json,) = conn.execute(
         "SELECT authority_json->>'status' FROM catalog_metadata_snapshot_item "

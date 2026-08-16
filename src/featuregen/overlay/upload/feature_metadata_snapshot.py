@@ -66,6 +66,12 @@ _FACT_FIELDS: frozenset[str] = frozenset({"is_grain", "is_as_of"})
 # so a drifted graph value seals as NON-governed. The rest (unit/currency/entity/declared_type) are
 # hints by policy and stay on read_column_facts.
 _C1_GOVERNED_FIELDS: frozenset[str] = _DECISION_FIELDS | _FACT_FIELDS
+# C-A3c: the measure ANNOTATIONS. Not C1-governed (no decision-id column, so `read_operational_value`
+# can never resolve them), but load-bearing under `field_policies`' `_SOURCE_OR_HUMAN` rule — so they
+# are read through the VERIFIED-decision seam and seal their real status. Duplicated as literals
+# rather than imported from `formula.measure_facts` because `operational_facts` imports this module
+# (cycle); a test pins the two definitions equal.
+_MEASURE_FIELDS: frozenset[str] = frozenset({"unit", "currency"})
 
 _ISOLATION_LEVEL = "repeatable read"
 
@@ -457,6 +463,31 @@ def _build_item(
         authority = "governed" if governed else "hint"
         status = ov.status
         provenance = facts.provenance if governed else None
+    elif field in _MEASURE_FIELDS:
+        # C-A3c. These used to seal `status="not_operational"` UNCONDITIONALLY — "hint by policy —
+        # never governed" — which is a statement about `read_column_facts`, not about whether a
+        # load-bearing decision exists. It does: `field_policies` gives unit/currency
+        # `operational_rule=_SOURCE_OR_HUMAN`, so a source-ATTESTED or human-CONFIRMED decision IS
+        # load-bearing. Sealing "not_operational" over it made every downstream reader blank the
+        # value, so a per-row-currency operand looked NON-MONETARY and the mixed-currency
+        # protection never engaged. The VALUE was already in the sealed item; only the status lied.
+        #
+        # `authority` deliberately stays "hint": that is `column_authority`'s classification of the
+        # field and it is unchanged. What moves is `status`, which is the axis every fact reader
+        # actually gates on. A measure item may therefore now be `authority="hint"` with
+        # `status="resolved"` — a combination the governed branch above cannot produce, and which
+        # is exactly what a verified measure ANNOTATION is.
+        from featuregen.overlay.upload.operational_facts import read_verified_decision_value
+        ov = read_verified_decision_value(conn, logical_ref, field)
+        if ov.status == "projection_unavailable":
+            raise CatalogProjectionUnavailable(
+                CATALOG_PROJECTION_UNAVAILABLE,
+                ov.conflict_status or "load-bearing catalog projection unavailable")
+        verified = ov.status == "resolved"
+        value = ov.value if verified else facts.value
+        authority = facts.authority
+        status = ov.status
+        provenance = facts.provenance
     else:
         value = facts.value
         authority = facts.authority
