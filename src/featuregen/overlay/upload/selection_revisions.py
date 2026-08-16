@@ -181,7 +181,11 @@ class TargetReadingRevisionV1:
     revision_id: str
     intent_id: str
     reading: TargetReadingV1
-    provenance: TargetProvenanceV1
+    #: ``None`` ONLY for a migrated legacy exploration row. The old schema wrote ``exploring`` into
+    #: the provenance column, which destroyed the declarer, so there is genuinely nobody to name —
+    #: and inventing ``HUMAN_CONFIRMED`` would manufacture an attribution nobody made. Every reading
+    #: this build records names a person.
+    provenance: TargetProvenanceV1 | None
     confirmed_by: str | None = None
     supersedes_revision_id: str | None = None
     acknowledged_human_loss_by: str | None = None
@@ -194,6 +198,11 @@ class TargetReadingRevisionV1:
         # No provenance/reading cross-check remains, and its absence is the point of C-D12: a
         # person CAN declare "no target", so a human provenance beside an exploration reading is
         # now an ordinary, representable fact rather than a contradiction.
+        if self.provenance is None and isinstance(self.reading, PredictionTargetV1):
+            raise ValueError(
+                f"revision {self.revision_id} names a prediction target with NO provenance. A "
+                f"missing declarer is legal only for a migrated legacy exploration row, where the "
+                f"old schema destroyed it; a prediction always had somebody who chose the column")
 
     @property
     def mode(self) -> TargetModeV1:
@@ -212,7 +221,7 @@ class TargetReadingRevisionV1:
             "intent_id": self.intent_id,
             "reading": self.reading.identity_payload(),
             "mode": self.mode.value,
-            "provenance": self.provenance.value,
+            "provenance": self.provenance.value if self.provenance is not None else None,
             "confirmed_by": self.confirmed_by,
             "supersedes_revision_id": self.supersedes_revision_id,
             "acknowledged_human_loss_by": self.acknowledged_human_loss_by,
@@ -244,7 +253,8 @@ def supersede_target_reading(
         if not (acknowledged_human_loss_by or "").strip():
             raise ValueError(
                 f"revision {previous.revision_id} was confirmed by a person "
-                f"({previous.provenance.value}) and this would replace its target with an exploration "
+                f"({previous.provenance.value if previous.provenance else 'legacy'}) and this "
+                f"would replace its target with an exploration "
                 f"declaration, removing the target entirely. Name who acknowledged that: a "
                 f"governed run losing its subject between one screen and the next is exactly what "
                 f"an append-only chain exists to make visible")
