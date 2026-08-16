@@ -1,8 +1,11 @@
 # V2 as the feature language, on shared execution
 
-**Date:** 2026-08-16 · **Revision 14** — an eighth review found **10 functional blockers and 8 major
-gaps**, all validated. Two are self-contradictions in revision 13's own text. One finding is about
-this document's nature and is adopted:
+**Date:** 2026-08-16 · **Revision 15** — a **plan-vs-code audit**: every factual claim in §0.1 was
+checked mechanically against the tree rather than re-read. **39 claims tested; 33 held as written;
+2 blockers and 4 accuracy errors were found and are fixed below.** The audit method and its results
+are recorded in §0.0 so the next review can re-run it rather than re-derive it.
+
+Revision 14's own framing stands and is repeated, because it is the most important sentence here:
 
 > **This file is the PROGRAMME, not an implementation plan.** It has no per-stage file ownership,
 > migration numbers, contract schemas, backfills or test commands. **S0.5 becomes its own
@@ -16,6 +19,24 @@ this document's nature and is adopted:
 **Do not reduce V2 to V1. Do not build a second V2 platform.** The V2 execution boundary is an
 **adapter** onto language-neutral machinery — rendered nodes, wiring validation, sealing, staging,
 output gates, publication.
+
+## 0.0 Audit provenance *(new [R15])*
+
+Every claim in §0.1 was turned into a mechanical check against the working tree — a grep, a parse or
+a count — and run. **33 of 39 held exactly as written.** What the audit found:
+
+| # | Finding | Class |
+|---|---|---|
+| A1 | **Operand facts gate the entire currency thread, and no stage named them.** | **blocker** |
+| A2 | **The ref namespace is a FOURTH disagreeing axis; `authored::` is test-only.** | **blocker** |
+| A3 | `materialization_group_binding` **does not exist** — the table is `group_binding`. | accuracy |
+| A4 | **Gate 2 already unions the spine read set**; only policy reads are missing. | accuracy |
+| A5 | **`GENERATED.lock` already exists** and carries `generated_project_hash`. | accuracy |
+| A6 | **`empty_window` already decides nullability** in V1 physical typing. | accuracy |
+
+Two checks initially reported failure and were **wrong about the plan, not the code** — a malformed
+`sed` range over `TERMINAL_RUN_EVENT_KINDS`, and a regex matching the word *filename* in a comment.
+Both claims re-verified by direct parse. **A failing check is investigated, never accepted.**
 
 ## 0. Position
 
@@ -33,6 +54,24 @@ Iceberg-grade snapshots · operations beyond the pilot family · effective-dated
 ## 0.1 Verified before planning
 
 Re-checked against this tree. **Baseline `29f3b8ac`; targeted suite 2,827 passed, 1 skipped.**
+
+**The entire currency thread is gated by facts no stage named [R15 — blocker A1]**
+
+- `output_authority_v2`'s conversion tooth fires **only** under
+  `if facts.unit == "monetary" and facts.currency == "per_row"`. Those come from
+  `OperandFactsV2`, built by `_read_c1_facts_v2(conn, proposal)` out of **governed C1 metadata**.
+- **If the pilot's `txn_amt` does not carry governed `unit=monetary, currency=per_row`, the tooth
+  never fires**: `CURRENCY_CONVERSION_UNDECLARED` never raises, no FX policy is ever required,
+  resolved or consumed — and S0's FX branch, S3's typed booking-FX realization, S5's FX operators,
+  S6's duplicate-rate gate and S7's FX mutations all test **nothing**.
+- Fourteen revisions built an FX thread on an unstated precondition.
+
+**The ref namespace is a FOURTH disagreeing axis [R15 — blocker A2]**
+
+- The gold exemplar's refs are `authored::public.txns.txn_amt`. **`authored::` appears in `tests/`
+  only — production emits no `xxx::` prefix at all.**
+- So the frozen exemplar uses a ref format production does not produce, on top of the timezone,
+  boundary and length disagreements. S0's reconciliation had three axes and needs four.
 
 **Output authority certifies a currency it never resolved [R14]**
 
@@ -96,8 +135,12 @@ Re-checked against this tree. **Baseline `29f3b8ac`; targeted suite 2,827 passed
 - `runprep` states input snapshots are *"prepared EVIDENCE, not an enforced read scope"*.
 - `next_revision_seq` is read-then-write; 1055's trigger stops concurrent double-wins, **not** a
   stale verification published later.
-- `materialization_group_binding` is `UNIQUE(logical_group_name)` — no environment key. Hive
-  identifiers ≤ **128 chars**.
+- **`group_binding`** *(not `materialization_group_binding`, which does not exist [R15 — A3])* is
+  `UNIQUE(logical_group_name)`, and `feature_active_revision` (migration 1055) is keyed
+  `(logical_group_name, seq)`. **Environment is already first-class in the schema** —
+  `publication_capability_attestation` and `pipeline_validation_report` both carry `environment_id`
+  — **it is absent precisely from the two tables that decide what is current.** Hive identifiers
+  ≤ **128 chars**.
 - `materialization_compiled_artifact` stores `group_plan` and `materialization_contract` jsonb —
   **no generated source files**.
 - `_gold_evaluation_recorded()` returns `False` for every recipe; `engine_capability` derives from
@@ -118,7 +161,9 @@ Re-checked against this tree. **Baseline `29f3b8ac`; targeted suite 2,827 passed
 
 **Two standing instructions**
 
-1. **Grep for the thing before designing it.** Eight prior instances.
+1. **Grep for the thing before designing it.** **Ten** prior instances — the newest two are
+   A4 (Gate 2 already unions the spine) and A5 (`GENERATED.lock` already exists). **§0.0's audit is
+   the mechanical form of this instruction; re-run it before the next revision.**
 2. **Every acceptance criterion must be satisfiable with only what exists at its own stage.**
 
 ## 0.2 Invariants
@@ -213,6 +258,18 @@ authoritative: **eligible status values and null handling** · **unknown-directi
 **target currency** · **FX missing-rate behaviour** · **quote convention and whether inversion is
 permitted** · **conversion before or after aggregation** · **rate rounding**.
 
+**Confirm the pilot's governed operand facts FIRST [R15 — blocker A1].** Before any FX work is
+scheduled, establish that `txn_amt` carries governed C1 facts of `unit=monetary` **and**
+`currency=per_row`. **If it does not, the currency thread is inert and the FX branch decision is
+premature** — the conversion tooth never fires, so nothing downstream is exercised. Either govern
+the facts, or record that the pilot proves status/direction/reversal only and move FX to its own
+pilot.
+
+**Reconcile FOUR axes, not three [R15 — blocker A2]** — timezone, boundary, length **and the ref
+namespace**. The exemplar's `authored::public.txns.txn_amt` uses a prefix that exists only in
+`tests/`; production emits none. Decide the canonical production ref format and restate the
+exemplar in it.
+
 **Author the expected rows** for one coherent parameterized exemplar covering: zero-eligible spine
 account · unknown-transaction account · post-cutoff reversal · duplicate and missing FX rates ·
 post-cutoff FX knowledge time — **with real availability timestamps**.
@@ -222,10 +279,13 @@ post-cutoff FX knowledge time — **with real availability timestamps**.
 
 Also: the migration ledger.
 
-> **Acceptance:** every decision has a record naming who decided; expected rows stored and hashed
-> with availability timestamps; each numeric decision above appears in the frozen exemplar; the FX
-> branch chosen and its tasks written; the ledger's CI test fails on the seven collisions unless
-> grandfathered.
+> **Acceptance:** every decision has a record naming who decided; **`txn_amt`'s governed C1 facts
+> are read and recorded, and a test asserts that the pilot proposal WITHOUT a
+> `currency_conversion_ref` refuses `CURRENCY_CONVERSION_UNDECLARED`** — proof the tooth fires at all
+> **[A1]**; **the exemplar's refs are in the production format and no `authored::` prefix survives**
+> **[A2]**; expected rows stored and hashed with availability timestamps; each numeric decision
+> appears in the frozen exemplar; the FX branch chosen and its tasks written; the ledger's CI test
+> fails on the seven collisions unless grandfathered.
 
 ### S0.5 — freeze the load-bearing contracts *(→ its own plan file [R14])*
 
@@ -279,13 +339,19 @@ interface that did not fit.
 - **`FullReadSetLeakageGateV2` [R14]**, deterministic, **after policy planning and before Gate 2**,
   inspecting formula operands and filters · policy reads · join keys · reversal and FX inputs ·
   temporal and availability columns · population-spine reads.
-- **The complete Gate-2 read set** — formula + policy + spine.
+- **The complete Gate-2 read set.** **`SpineSpec.read_set` is already unioned into Gate 2** —
+  *"Gate 2 (§1.3) authorizes it together with every expression's read set, as one group-wide
+  decision"* **[R15 — A4]**. Revision 14 said "formula + policy + spine" as if all three were
+  missing; **only the policy reads are.**
 - **Per-read temporal semantics** (rule 15); input snapshots derive independently for transaction,
   reversal and FX reads; contract availability is their union.
 - **The pilot physical-type policy, defined** — `formula-v2/physical-types@1` must state
   `SUM(amount × booking_rate)` completely: amount precision and scale · intermediate precision ·
   where rounding occurs · SUM precision growth · overflow · whether float operands refuse ·
-  nullability after the empty-window policy.
+  nullability after the empty-window policy. **`empty_window` already decides nullability in V1**
+  (`physical_types.py`: `if expr.window.empty_window is EmptyWindowResult.NULL`), so V2 **mirrors an
+  existing rule rather than inventing one [R15 — A6]**, and `ExecutableOutputPolicyV2` carries the
+  resulting nullability.
 - **`BuildDeclarationV1` split from `EnvironmentInventoryObservationV1` [R14]** — an environment id
   is a **declaration**; cluster inventory is a **captured observation**. Only the observation enters
   artifact and execution identity.
@@ -331,16 +397,23 @@ interface that did not fit.
   feature-null rules from the output policy · spine completeness and uniqueness · join
   orphan/amplification · **which external requirement each check may satisfy** · the check-set hash.
 - **`VerifiedOutputRevisionV1`**, including `verification_check_set_hash` and validator versions.
-- **The artifact file manifest's byte contract [R14]** — ordered path · SHA-256 · byte length ·
-  media type · overall artifact hash · immutable blob pointer · **byte verification before retrieval
-  and before execution**.
+- **The artifact file manifest's byte contract, extending `GENERATED.lock` [R15 — A5].**
+  `GENERATED.lock` already carries `generated_project_hash` computed over the rendered bytes, and
+  §7 deliberately excludes it from every other generated file. **Extend that discipline to
+  per-file entries** — ordered path · SHA-256 · byte length · media type — plus an immutable blob
+  pointer and **byte verification before retrieval and before execution**. Do not invent a second
+  hashing scheme beside it.
 - **`OperatorExecutionProofV1` pins its world [R14]:** capability/subgraph signature and its
   version · **compiler and renderer versions** · physical-type policy · operator-topology
   requirement version · **gold corpus hash** · mutation/check-set version · **development runtime
   family and versions**. At use time a **separate environment-compatibility decision** checks the
   target inventory.
-- **Environment scoping** — either scope this release explicitly to one sandbox environment, or key
-  bindings and publications by `(environment_id, logical_group_name)`.
+- **Environment scoping, on the two tables that decide what is current [R15 — A3]** —
+  **`group_binding`** (migration 1034, `UNIQUE(logical_group_name)`) and
+  **`feature_active_revision`** (migration 1055, `(logical_group_name, seq)`). Environment is
+  already first-class elsewhere in 1034, so this is **extending an existing concept to two tables
+  that lack it**, not introducing one. Either scope this release explicitly to one sandbox
+  environment, or key both by `(environment_id, logical_group_name)`.
 - **The group-name allocator, completely** — truncation, reserved suffix length, collision extension,
   ≤ 128 chars.
 - **Active-revision compare-and-set.**
@@ -411,7 +484,9 @@ production.
 
 > **Acceptance:** an unresolvable reference refuses by name; a formula omitting a required occurrence
 > refuses; an unsupported reversal mode refuses and names it; a realization whose as-of rule would
-> read post-cutoff FX refuses; a country filter does **not** require a reversal policy; **a known
+> read post-cutoff FX refuses; **an operand whose C1 facts are not `monetary`/`per_row` requires no
+> currency occurrence, and the plan says so rather than silently skipping it [A1]**; a country
+> filter does **not** require a reversal policy; **a known
 > effective policy change intersecting the window refuses `POLICY_INTERVAL_UNSUPPORTED`**; **source
 > evidence beats a conflicting LLM proposal with the conflict retained and visible, while two
 > conflicting governed declarations refuse** (rule 16); no V2 path writes through the mutable
@@ -608,4 +683,12 @@ leaves `_contract_blockers` refusing anyway. S2 narrows to generation; S8 owns s
 verification. Execution proofs pin their toolchain and runtime. And rule 16's conflict semantics are
 no longer self-contradictory.
 
-**No duration estimate.** Eleven revisions have now carried one that a review invalidated.
+**What the audit changed.** Two blockers reached the stages, not just the findings list: S0 now
+confirms the pilot's governed operand facts **before** any FX work is scheduled, because the
+conversion tooth is silent without `unit=monetary` / `currency=per_row` and every FX task downstream
+would test nothing; and S0's reconciliation gains a fourth axis, the ref namespace, because the
+exemplar is written in a prefix that exists only in tests. Four accuracy errors were corrected
+against the tree — a table name that does not exist, a Gate-2 union that is already half-built, a
+file-hash discipline that already exists, and a nullability rule V2 should mirror rather than invent.
+
+**No duration estimate.** Twelve revisions have now carried one that a review invalidated.
