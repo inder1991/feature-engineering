@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
   type BridgeRealizationView,
@@ -1573,21 +1573,6 @@ function CandidateGroup({ entry, onDone, onConflict, outcome }: {
   )
 }
 
-// The page's own reason for existing, stated before any row: these are the judgements a machine
-// cannot make on its own behalf.
-function Purpose(): ReactNode {
-  return (
-    <div className="callout callout--accent gq-purpose" data-testid="gq-purpose">
-      <div className="callout-body">
-        <p>
-          <strong>The platform is already using these relationships.</strong> Confirming records
-          that a person checked one, and who; it does not switch anything on.
-        </p>
-      </div>
-    </div>
-  )
-}
-
 // ── the screen ───────────────────────────────────────────────────────────────────────────────────
 
 // initialSource: the governance dashboard -> review handoff rides the URL (?source=). It is a
@@ -1677,7 +1662,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (errorStatus === 403) {
     return (
       <section className="gq">
-        <Purpose />
         <div className="callout gq-not-yours" data-testid="gq-not-yours" role="status">
           <div className="callout-body">
             <p>
@@ -1703,7 +1687,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (error) {
     return (
       <section className="gq">
-        <Purpose />
         <p role="alert" className="error">
           {error}
         </p>
@@ -1714,7 +1697,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (!queue) {
     return (
       <section className="gq">
-        <Purpose />
         <p className="empty" role="status">
           {loading ? 'Loading every decision waiting for you…' : 'Nothing loaded.'}
         </p>
@@ -1744,9 +1726,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
     items.every(item => item.kind !== kind)
     && !queue.unreadable.some(entry => unreadableListings(kind).includes(entry.listing)))
   const workingKinds = shownKinds.filter(kind => !settledKinds.includes(kind))
-  // How many decisions belong to more than one catalog — the reason the catalog chips sum to more
-  // than the queue length. Zero on a single-catalog queue, where there is nothing to explain.
-  const spanning = items.filter(item => item.catalogs.length > 1).length
   // WHAT ACTUALLY NEEDS A PERSON is not the list length: the bridge listing also carries VERIFIED
   // facts, and those offer no action at all (`reject_fact` denies them). Counting them as waiting
   // would overstate the work, so the headline counts only rows the server still offers an action on.
@@ -1764,8 +1743,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
 
   return (
     <section className="gq">
-      <Purpose />
-
       {banner && (
         <p role="status" className="callout callout--accent gq-notice" data-testid="gq-notice">
           {banner}
@@ -1859,20 +1836,11 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
             </button>
           ))}
         </div>
-        {/* THE ARITHMETIC THAT IS ACTUALLY CONFUSING. A cross-catalog link belongs to both of its
-            catalogs and is counted in each, so on the live queue the chips read CIB (13) and
-            FTR (16) over sixteen decisions. That sum is what a reviewer stops on. What sat here
-            instead was a disclaimer that the counts are "scope-relative — never a catalog total":
-            a misreading nobody makes, phrased in the read-scope subsystem's own vocabulary, one
-            line above chips that already named the catalogs. Computed, so it appears only when
-            something genuinely spans two. */}
-        {spanning > 0 && (
-          <p className="hint gq-catalog-arith" data-testid="gq-catalog-arith">
-            {spanning} of these decisions {spanning === 1 ? 'belongs' : 'belong'} to both catalogs
-            and {spanning === 1 ? 'is' : 'are'} counted in each, so the catalog chips add up to
-            more than the {items.length} decisions below.
-          </p>
-        )}
+        {/* NOTHING ANNOTATES THE CHIPS. They are filters; nobody sums a filter's counts against the
+            queue length, so the fact that a cross-catalog link is counted under both its catalogs
+            needs no defending. A note here would be the same species as the "scope-relative"
+            disclaimer it replaced — the interface apologising for its own display. If a number
+            needs a paragraph to defend it, the fix is the number's presentation. */}
       </div>
 
       {/* A kind with nothing waiting renders NOTHING: its chip carries the zero, which is the whole

@@ -363,27 +363,21 @@ describe('governance review — the decision queue', () => {
     )
   })
 
-  it('opens by saying why this is worth doing today, not what confirming philosophically means',
-    async () => {
-      // The old preamble spent 65 words establishing that confirming "is not a switch" and that
-      // "nothing here is held back pending your say-so" — i.e. it opened by telling the reviewer
-      // their decision changes nothing and nothing waits on it, then asked for fifteen decisions.
-      // The fact underneath is real and is the REASON to act, not a disclaimer: the platform is
-      // already using every one of these links, unreviewed. That is what goes at the top. What
-      // confirming records is said in the confirm panel, at the moment it is being done.
-      getGovernanceQueue.mockResolvedValue(FULL)
-      render(<GovernanceReviewScreen />)
-      await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
-      const purpose = screen.getByTestId('gq-purpose')
+  it('opens on the work, with no standing prose above it', async () => {
+    // NO PREAMBLE AT ALL. Every clause a page-level callout could carry is already on screen where
+    // it is actionable: "the platform may use this link now" is the LINK AVAILABILITY axis on the
+    // row, and "this records that a person agrees, and who — it does not change whether the
+    // platform may use it" is in the confirm panel, at the moment of confirming. A banner
+    // restating them is the interface explaining itself instead of presenting the work.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
 
-      expect(purpose).toHaveTextContent(/already using these relationships/i)
-      expect(purpose).toHaveTextContent(/does not switch anything on/i)
-      // The archaic half of "the system proposes and you dispose" is gone: to a modern reader
-      // "dispose" reads as "throw away", so the sentence explaining the reviewer's role suggested
-      // they discard things.
-      expect(purpose.textContent ?? '').not.toMatch(/dispose/i)
-      expect(purpose.textContent ?? '').not.toMatch(/held back pending/i)
-    })
+    expect(screen.queryByTestId('gq-purpose')).toBeNull()
+    // The facts survive where they are used, and only there.
+    expect(within(row(FULL.items[0])).getByTestId('axis-availability'))
+      .toHaveTextContent(/the platform may use this link now/i)
+  })
 
   it('answers "what needs me" in a summary strip before any detail', async () => {
     getGovernanceQueue.mockResolvedValue(FULL)
@@ -393,29 +387,23 @@ describe('governance review — the decision queue', () => {
     expect(summary).toHaveTextContent(/waiting for a person/i)
   })
 
-  it('explains the catalog arithmetic that is actually confusing, and nothing else', async () => {
-    // The old note spent 22 words on "every count here is scope-relative — never a catalog total",
-    // a misreading nobody makes, in the read-scope subsystem's own vocabulary, one line above chips
-    // that already named the catalogs. Meanwhile the real trap sat unexplained underneath it: a
-    // cross-catalog link belongs to BOTH its catalogs, so on the live queue the chips read
-    // CIB (13) and FTR (16) over sixteen decisions. 13 + 16 = 29.
+  it('does not annotate its own chip counts', async () => {
+    // The chips are FILTERS. Nobody sums a filter's counts against the queue length, so the fact
+    // that a cross-catalog link is counted under both its catalogs needs no defending — it only
+    // looks wrong if you perform arithmetic no reviewer performs. The note that used to sit here
+    // was the same species as the "scope-relative" disclaimer it replaced: the interface
+    // apologising for its own display. If a number needs a paragraph to defend it, the fix is the
+    // number's presentation, not the paragraph.
     getGovernanceQueue.mockResolvedValue(FULL)
     render(<GovernanceReviewScreen />)
     await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
 
     expect(screen.queryByText(/scope-relative/i)).toBeNull()
-    const note = screen.getByTestId('gq-catalog-arith')
-    expect(note).toHaveTextContent(/belongs to both/i)
-    expect(note).toHaveTextContent(/3 decisions/i)
-  })
-
-  it('says nothing about catalog arithmetic when no decision spans two catalogs', async () => {
-    getGovernanceQueue.mockResolvedValue(queue({
-      items: [grain()], items_visible_to_you_by_kind: { grain: 1 },
-    }))
-    render(<GovernanceReviewScreen />)
-    await screen.findByTestId(`row-${grain().fact_key}`)
     expect(screen.queryByTestId('gq-catalog-arith')).toBeNull()
+    expect(screen.queryByText(/belong to both catalogs/i)).toBeNull()
+    // Nothing between the filter bar and the first decision.
+    const filters = screen.getByTestId('gq-catalog-filter').closest('.gq-filters')
+    expect(filters?.nextElementSibling).toBe(screen.getByTestId('kind-entity_bridge'))
   })
 
   it('keeps the summary strip to one question, and leaves the kinds to the chips', async () => {
