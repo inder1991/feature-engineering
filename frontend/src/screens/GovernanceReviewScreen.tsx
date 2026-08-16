@@ -27,6 +27,7 @@ import {
 } from '../api'
 import { ConceptConfirmationPanel } from './ConceptConfirmationPanel'
 import { DataUsePolicyPanel } from './DataUsePolicyPanel'
+import { varyingParts } from './candidateDiff'
 
 // GOVERNANCE REVIEW — a decision queue, not a search box.
 //
@@ -120,6 +121,13 @@ function kindLabelOne(kind: string): string {
 
 function categoryLabel(category: string): string {
   return category.replaceAll('_', ' ')
+}
+
+// "a, b and c" — an English list, because a comma-joined run of kind names reads as a fragment
+// where the settled line has to read as a sentence.
+function listWords(words: string[]): string {
+  if (words.length <= 1) return words[0] ?? ''
+  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`
 }
 
 // No display name exists anywhere in this system: `graph_node` carries no per-catalog label and the
@@ -443,9 +451,34 @@ function entriesFor(kind: string, items: GovernanceQueueItem[]): Entry[] {
           entity: asStr(bucket[0].detail.entity_id) || '(unnamed entity)',
           catalogs: bucket[0].catalogs,
         },
-        items: bucket,
+        items: byStrength(bucket),
       }
     : { key: bucket[0].fact_key, group: null, items: bucket })
+}
+
+// WHAT YOU CAN DECIDE, FIRST. Payload order is insertion order, so endorsed facts and rows waiting
+// on somebody else sat interleaved with the reviewer's own work: the summary said "12 you can
+// decide" and the list gave no clue where they were. Three tiers — yours, someone else's, settled —
+// and the sort is stable, so within a tier the strongest-first order set by `byStrength` survives.
+// This orders ENTRIES, never the members inside a group: those are ranked by evidence, and
+// reordering them by what the server will let you press would hide the strongest candidate.
+function byUrgency(entries: Entry[]): Entry[] {
+  const tier = (entry: Entry): number => {
+    if (entry.items.some(item => item.available_actions.includes('confirm'))) return 0
+    return entry.items.some(item => item.available_actions.length > 0) ? 1 : 2
+  }
+  return [...entries].sort((a, b) => tier(a) - tier(b))
+}
+
+// Strongest first. Payload order is insertion order and carries no judgement, so a reviewer
+// scanning a cross-product top-down would meet the candidates in an order the ranker did not
+// choose. Sorted ONCE here so the comparison table and the dossiers behind the disclosure can
+// never disagree about which candidate is first. A missing strength sorts last rather than as a
+// zero: "not recorded" is not a low score. The sort is stable, so ties keep payload order.
+function byStrength(items: GovernanceQueueItem[]): GovernanceQueueItem[] {
+  const rank = (item: GovernanceQueueItem): number =>
+    (typeof item.detail.strength === 'number' ? item.detail.strength : -Infinity)
+  return [...items].sort((a, b) => rank(b) - rank(a))
 }
 
 // ── small presentational pieces ──────────────────────────────────────────────────────────────────
@@ -541,11 +574,49 @@ function groupUsages(items: GovernanceQueueItem[]): GovernanceQueueUsage[] {
 function Usage({ usages, note }: { usages: GovernanceQueueUsage[]; note?: string }) {
   // Bridges only. A join or table fact has no bridge anchor to count from, so there is nothing to
   // render — and an absent anchor is never "0 dependencies".
+  const [why, setWhy] = useState(false)
   if (usages.length === 0) return null
+  // NOT ONE MEASUREMENT ANYWHERE. This is the live state on every bridge in both catalogs: five
+  // categories, five "not tracked yet", five paragraphs of store-level rationale, repeated on the
+  // group card and on each of its members — 85 times across the page, carrying one fact. The fact
+  // is worth saying; saying it five times per card is what made the page unreadable. It is still
+  // never a zero: nothing recorded and nothing depending on it are different claims.
+  const measured = usages.some(usage => usage.state === 'counted' && usage.count !== null)
+  const unreadable = usages.some(usage => usage.state === 'unreadable')
+  // The group `note` explains how figures are AGGREGATED across the members. Above a block
+  // reporting no figures at all it answers a question nobody asked, so it goes with them.
+  if (!measured && !unreadable) {
+    return (
+      <div className="gq-usage" data-testid="usage" data-state="none-tracked">
+        <p className="gq-usage-head">Already depended on by</p>
+        <p className="gq-usage-none" data-testid="usage-untracked">
+          Nothing is recorded either way. None of the {usages.length} places a dependency could
+          have been counted keeps a record of one yet, so this says nothing about what uses it.
+        </p>
+        <button
+          type="button"
+          className="btn q-ghost gq-usage-why-btn"
+          aria-expanded={why}
+          onClick={() => setWhy(open => !open)}
+        >
+          {why ? 'Hide why nothing is counted' : 'Why nothing is counted'}
+        </button>
+        {why && <UsageList usages={usages} />}
+      </div>
+    )
+  }
   return (
     <div className="gq-usage" data-testid="usage">
       <p className="gq-usage-head">Already depended on by</p>
       {note && <p className="gq-usage-note">{note}</p>}
+      <UsageList usages={usages} />
+    </div>
+  )
+}
+
+function UsageList({ usages }: { usages: GovernanceQueueUsage[] }) {
+  return (
+    <>
       <dl className="gq-usage-list">
         {usages.map(usage => (
           <div className="gq-usage-item" key={usage.category} data-state={usage.state}>
@@ -560,7 +631,7 @@ function Usage({ usages, note }: { usages: GovernanceQueueUsage[]; note?: string
           </div>
         ))}
       </dl>
-    </div>
+    </>
   )
 }
 
@@ -1007,12 +1078,19 @@ function projectionNote(projection: string, kind: Outcome['projectionKind']): st
 
 interface RowProps {
   item: GovernanceQueueItem
-  onDone: (message: string) => void
+  // The fact_key is passed back so the screen can land the outcome on the row that produced it.
+  onDone: (message: string, factKey?: string) => void
   onConflict: (detail: string) => void
+  // The message this row's own last decision produced, if the fact is still in the queue.
+  outcome?: string
+  // Which panel the row opens on. A candidate reached from the comparison table opens straight
+  // onto its confirmation — the reviewer already chose it there, so making them press Confirm a
+  // second time to reach the same gate is a step that decides nothing.
+  initialPanel?: 'none' | 'confirm' | 'reject'
 }
 
-function QueueRow({ item, onDone, onConflict }: RowProps) {
-  const [panel, setPanel] = useState<'none' | 'confirm' | 'reject'>('none')
+function QueueRow({ item, onDone, onConflict, initialPanel = 'none', outcome }: RowProps) {
+  const [panel, setPanel] = useState<'none' | 'confirm' | 'reject'>(initialPanel)
   const [agreed, setAgreed] = useState(false)
   const [note, setNote] = useState('')
   const [category, setCategory] = useState<string | null>(null)
@@ -1029,7 +1107,7 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
     setBusy(true)
     setRowError('')
     try {
-      onDone(await action())
+      onDone(await action(), item.fact_key)
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         // The fact moved under the reviewer (a concurrent decision, a stale CAS target). Never
@@ -1061,18 +1139,34 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
       <Advisory item={item} />
       {provenance.length > 0 && <p className="gq-prov">{provenance.join(' · ')}</p>}
       <Usage usages={item.already_depended_on_by} />
-      <BridgeEvidence item={item} onDone={onDone} onConflict={onConflict} />
+      <BridgeEvidence
+        item={item}
+        onDone={message => onDone(message, item.fact_key)}
+        onConflict={onConflict}
+      />
 
+      {outcome && (
+        <p className="gq-row-outcome" data-testid="gq-row-outcome" role="status">
+          {outcome}
+        </p>
+      )}
+
+      {/* An action the server does not offer is not an action. It used to render as a DIMMED
+          PRIMARY button — the loudest control on the card, at 55% opacity, doing nothing — and on
+          the live catalogs every currency binding withholds confirm, so the three most prominent
+          controls on the page were all dead. The row now shows what the reviewer can do, and says
+          why the rest is not there. */}
       <div className="gj-actions gq-actions">
-        <button
-          type="button"
-          className="btn btn--primary"
-          disabled={!canConfirm || busy}
-          aria-describedby={canConfirm ? undefined : whyId}
-          onClick={() => setPanel(p => (p === 'confirm' ? 'none' : 'confirm'))}
-        >
-          {panel === 'confirm' ? 'Cancel' : 'Confirm…'}
-        </button>
+        {canConfirm && (
+          <button
+            type="button"
+            className="btn btn--primary"
+            disabled={busy}
+            onClick={() => setPanel(p => (p === 'confirm' ? 'none' : 'confirm'))}
+          >
+            {panel === 'confirm' ? 'Cancel' : 'Confirm…'}
+          </button>
+        )}
         {canReject && (
           <button
             type="button"
@@ -1173,18 +1267,120 @@ function QueueRow({ item, onDone, onConflict }: RowProps) {
   )
 }
 
+// The group as a COMPARISON, which is what the reviewer is actually being asked for: the members
+// of a cross-product differ in one place and agree everywhere else, so the shared head and tail of
+// the subject are said once on the card and each row carries only the part that varies. Stacking
+// the members instead makes the choice a memory exercise — on the live catalogs two branch
+// candidates differ by `pref` against `prim`, four characters, 640px apart.
+function CandidateComparison({ items, chosen, onChoose }: {
+  items: GovernanceQueueItem[]
+  chosen: string | null
+  onChoose: (factKey: string) => void
+}) {
+  const parts = varyingParts(items.map(item => item.subject))
+  const shared = parts.prefix || parts.suffix
+  // Every candidate scoring the same, on the same basis, is the ordinary case on the live
+  // catalogs: the five `bank` candidates all rank 0 and are all declared-only. That is not a tie
+  // to be broken by reading further — it is the recorded evidence saying nothing, and a reviewer
+  // is owed that before they scroll five dossiers looking for a discriminator that is not there.
+  const ranks = new Set(items.map(item =>
+    (typeof item.detail.strength === 'number' ? String(item.detail.strength) : 'none')))
+  const bases = new Set(items.map(item => asStr(item.detail.type_basis)))
+  const tied = items.length > 1 && ranks.size === 1 && bases.size === 1
+  return (
+    <div className="gq-compare">
+      {shared && (
+        <p className="mono gq-compare-shared" data-testid="gq-compare-shared">
+          {parts.prefix}
+          <span className="gq-compare-slot" aria-hidden="true">…</span>
+          {parts.suffix}
+        </p>
+      )}
+      <div className="gq-compare-scroll">
+        <table className="gq-compare-table" data-testid="gq-compare">
+          <thead>
+            <tr>
+              <th scope="col">{shared ? 'Differs by' : 'Candidate'}</th>
+              <th scope="col">Rank</th>
+              <th scope="col">Type match</th>
+              <th scope="col">Human review</th>
+              <th scope="col">Decide</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item, i) => (
+              <tr key={item.fact_key} data-testid={`gq-compare-row-${item.fact_key}`}>
+                <td className="mono gq-compare-varies" data-testid="gq-compare-varies">
+                  {parts.middles[i]}
+                </td>
+                {/* The one field that ranks one candidate over another. It is not a probability
+                    and the column says so once, in the caption, rather than on every row. */}
+                <td className="gq-compare-rank" data-testid="gq-compare-rank">
+                  {typeof item.detail.strength === 'number'
+                    ? item.detail.strength
+                    : 'not recorded'}
+                </td>
+                <td className="gq-compare-basis" data-testid="gq-compare-basis">
+                  {TYPE_BASIS[asStr(item.detail.type_basis)]?.label
+                    ?? (asStr(item.detail.type_basis)
+                      ? asStr(item.detail.type_basis).replaceAll('_', ' ')
+                      : 'not recorded')}
+                </td>
+                <td className="gq-compare-review" data-testid="gq-compare-review">
+                  {item.state}
+                </td>
+                {/* The table is where the choice is made, never a second way to make it: choosing
+                    here opens THAT candidate's confirmation, and the agreement is still ticked
+                    explicitly there. A row the server withholds confirm on offers nothing and
+                    says why, exactly as the dossier does. */}
+                <td className="gq-compare-decide">
+                  {item.available_actions.includes('confirm') ? (
+                    <button
+                      type="button"
+                      className="btn q-ghost gq-compare-btn"
+                      aria-expanded={chosen === item.fact_key}
+                      onClick={() => onChoose(item.fact_key)}
+                    >
+                      {chosen === item.fact_key ? 'Close' : 'Confirm…'}
+                    </button>
+                  ) : (
+                    <span className="gq-why" data-testid="gq-compare-why">
+                      {withheldReason(item)}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {tied && (
+        <p className="gq-compare-tied" data-testid="gq-compare-tied">
+          Nothing on file separates these {items.length}: they rank the same and their types were
+          matched the same way. If one of them is the right pair, the recorded evidence does not
+          say which.
+        </p>
+      )}
+    </div>
+  )
+}
+
 // ── one candidate group ──────────────────────────────────────────────────────────────────────────
 
 // Several bridges proposing the SAME entity between the SAME two catalogs are the cross-product of
 // two facts, not several findings, so they get one card and one judgement. Reject-all fans out to
 // one governed command per key server-side (each with its own audit row and its own savepoint),
 // which is why partial outcomes are ordinary and the result is reported as a split.
-function CandidateGroup({ entry, onDone, onConflict }: {
+function CandidateGroup({ entry, onDone, onConflict, outcome }: {
   entry: Entry
-  onDone: (message: string) => void
+  onDone: (message: string, factKey?: string) => void
   onConflict: (detail: string) => void
+  outcome: { factKey: string; message: string } | null
 }) {
   const [open, setOpen] = useState(false)
+  // The single candidate chosen from the comparison table, opened on its confirmation. Independent
+  // of `open` (which shows every dossier), so choosing one does not dump the other four on screen.
+  const [chosen, setChosen] = useState<string | null>(null)
   const [rejecting, setRejecting] = useState(false)
   const [category, setCategory] = useState<string | null>(null)
   const [note, setNote] = useState('')
@@ -1258,8 +1454,8 @@ function CandidateGroup({ entry, onDone, onConflict }: {
           : ''}
       </p>
       <p className="gq-group-note">
-        These are the cross-product of the same two facts — one judgement settles the set. Open them
-        if one of the pairs is the right one.
+        These are the cross-product of the same two facts — one judgement settles the set. Compare
+        them below; open one for the full evidence behind it.
       </p>
       {skipped > 0 && (
         <p className="gq-group-note" data-testid="gq-group-settled">
@@ -1268,23 +1464,19 @@ function CandidateGroup({ entry, onDone, onConflict }: {
           {rejectable.length} and leaves {one ? 'that one as it is' : 'those as they are'}.
         </p>
       )}
-      <dl className="gq-axes">
-        <Axis
-          testid="axis-execution"
-          code="group"
-          tone="quiet"
-          label="Automatic execution safety"
-          value={shared(item => item.production_eligibility
-            ?? EXECUTION_ABSENT[item.production_eligibility_code] ?? 'Not reported')}
-        />
-        <Axis
-          testid="axis-review"
-          code="group"
-          tone="quiet"
-          label="Human review"
-          value={shared(item => item.state)}
-        />
-      </dl>
+      <CandidateComparison
+        items={items}
+        chosen={chosen}
+        onChoose={key => setChosen(current => (current === key ? null : key))}
+      />
+      {/* The automatic axis, once, in a sentence. Human review is NOT here: the comparison table
+          carries it per candidate, and a card-level box saying the same thing again was one of the
+          56 axis panels on this page that between them held six distinct values. */}
+      <p className="hint gq-group-exec" data-testid="gq-group-exec">
+        Automatic execution safety, across all {count}:{' '}
+        {shared(item => item.production_eligibility
+          ?? EXECUTION_ABSENT[item.production_eligibility_code] ?? 'Not reported')}
+      </p>
 
       <Usage
         usages={groupUsages(items)}
@@ -1359,12 +1551,18 @@ function CandidateGroup({ entry, onDone, onConflict }: {
         </div>
       )}
 
-      {open && (
+      {(open || chosen !== null) && (
         <div role="group" aria-label={`The ${count} candidate links in this group`}>
           <ul className="rows gq-members">
-            {items.map(item => (
+            {(open ? items : items.filter(item => item.fact_key === chosen)).map(item => (
               <li className="row q-item gq-member" key={item.fact_key}>
-                <QueueRow item={item} onDone={onDone} onConflict={onConflict} />
+                <QueueRow
+                  item={item}
+                  onDone={onDone}
+                  onConflict={onConflict}
+                  initialPanel={item.fact_key === chosen ? 'confirm' : 'none'}
+                  outcome={outcome?.factKey === item.fact_key ? outcome.message : undefined}
+                />
               </li>
             ))}
           </ul>
@@ -1411,6 +1609,8 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   const [errorStatus, setErrorStatus] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [notice, setNotice] = useState('')
+  // The last row-scoped outcome, kept by fact_key so it survives the reload that follows it.
+  const [outcome, setOutcome] = useState<{ factKey: string; message: string } | null>(null)
   const [limit, setLimit] = useState(100)
   const [catalog, setCatalog] = useState<string | null>(initialSource.trim().toLowerCase() || null)
   const [kindFilter, setKindFilter] = useState<string | null>(null)
@@ -1450,12 +1650,24 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
     setCatalog(initialSource.trim().toLowerCase() || null)
   }, [initialSource])
 
-  function onDone(message: string) {
-    setNotice(message)
+  // WHERE THE OUTCOME LANDS. A row decision reports back on its own row: this banner used to be
+  // the only feedback and it renders directly under the page purpose, so confirming something near
+  // the foot of the queue painted the result thousands of pixels above the viewport, where nobody
+  // who just clicked would see it. A GROUP decision spans many facts and has no single row, so it
+  // still uses the banner — as does a row decision whose fact has since left the open list.
+  function onDone(message: string, factKey?: string) {
+    if (factKey) {
+      setOutcome({ factKey, message })
+      setNotice('')
+    } else {
+      setOutcome(null)
+      setNotice(message)
+    }
     void load()
   }
 
   function onConflict(detail: string) {
+    setOutcome(null)
     setNotice(detail)
     void load()
   }
@@ -1523,7 +1735,22 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   // The kind list comes from the payload (order included), never from a hardcoded set — an unknown
   // kind from a newer backend gets a chip, a section and a readable label.
   const kinds = Object.keys(queue.items_visible_to_you_by_kind)
+  // WHICH chips exist comes from the payload (so a kind this client has never seen still gets one);
+  // what each chip COUNTS is computed over the other axis's filter. The counts used to come
+  // straight from the payload maps while the summary counted the filtered list, so one click on a
+  // catalog put the same quantity on screen twice with two different values.
+  const kindCount = (kind: string): number => queue.items.filter(item =>
+    item.kind === kind && (catalog === null || item.catalogs.includes(catalog))).length
+  const catalogCount = (slug: string): number => queue.items.filter(item =>
+    item.catalogs.includes(slug) && (kindFilter === null || item.kind === kindFilter)).length
   const shownKinds = kindFilter === null ? kinds : kinds.filter(kind => kind === kindFilter)
+  // A kind with nothing waiting AND nothing we failed to read is settled: it collapses into one
+  // named line. A kind we could not look at is not settled and keeps its own section, because
+  // "nobody is waiting on you" and "we could not see" must never render as the same sentence.
+  const settledKinds = shownKinds.filter(kind =>
+    items.every(item => item.kind !== kind)
+    && !queue.unreadable.some(entry => unreadableListings(kind).includes(entry.listing)))
+  const workingKinds = shownKinds.filter(kind => !settledKinds.includes(kind))
   // WHAT ACTUALLY NEEDS A PERSON is not the list length: the bridge listing also carries VERIFIED
   // facts, and those offer no action at all (`reject_fact` denies them). Counting them as waiting
   // would overstate the work, so the headline counts only rows the server still offers an action on.
@@ -1532,14 +1759,20 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   const elsewhere = items.filter(item =>
     item.available_actions.length > 0 && !item.available_actions.includes('confirm')).length
   const endorsed = items.filter(item => item.available_actions.length === 0).length
+  // A row outcome shows on its row. If that fact has left the list — a rejection usually takes it
+  // out — there is no row to carry it, and dropping it would leave the reviewer with no answer at
+  // all, so the banner picks it up instead.
+  const outcomeOnScreen = outcome !== null
+    && items.some(item => item.fact_key === outcome.factKey)
+  const banner = outcomeOnScreen ? '' : (notice || outcome?.message || '')
 
   return (
     <section className="gq">
       <Purpose />
 
-      {notice && (
+      {banner && (
         <p role="status" className="callout callout--accent gq-notice" data-testid="gq-notice">
-          {notice}
+          {banner}
         </p>
       )}
 
@@ -1562,26 +1795,25 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
         </div>
       )}
 
+      {/* ONE QUESTION: what needs me. This strip used to run ten identical tiles over TWO
+          denominators — four counting decisions by status and six counting the same decisions by
+          kind — so reading across and adding produced a number that means nothing, and six of the
+          ten read zero. The kinds are one row lower, on chips that also filter. */}
       <div className="stats gq-summary" data-testid="gq-summary">
-        <div className="stat">
+        <div className="stat" data-testid="gq-stat">
           <b>{waiting}</b> waiting for a person
         </div>
-        <div className="stat">
+        <div className="stat" data-testid="gq-stat">
           <b>{yours}</b> you can decide
         </div>
-        <div className="stat">
+        <div className="stat" data-testid="gq-stat">
           <b>{elsewhere}</b> need a different reviewer
         </div>
         {endorsed > 0 && (
-          <div className="stat">
+          <div className="stat" data-testid="gq-stat">
             <b>{endorsed}</b> already endorsed
           </div>
         )}
-        {shownKinds.map(kind => (
-          <div className="stat" key={kind}>
-            <b>{items.filter(item => item.kind === kind).length}</b> {kindLabel(kind).toLowerCase()}
-          </div>
-        ))}
       </div>
       <p className="hint" data-testid="gq-scope-note">
         Across {queue.catalogs.length} catalog{queue.catalogs.length === 1 ? '' : 's'} you can see
@@ -1607,7 +1839,7 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
               aria-pressed={catalog === slug}
               onClick={() => setCatalog(slug)}
             >
-              {catalogLabel(slug)} ({queue.items_visible_to_you_by_catalog[slug] ?? 0})
+              {catalogLabel(slug)} ({catalogCount(slug)})
             </button>
           ))}
         </div>
@@ -1633,23 +1865,39 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
               aria-pressed={kindFilter === kind}
               onClick={() => setKindFilter(kind)}
             >
-              {kindLabel(kind)} ({queue.items_visible_to_you_by_kind[kind] ?? 0})
+              {kindLabel(kind)} ({kindCount(kind)})
             </button>
           ))}
         </div>
       </div>
 
-      {shownKinds.map(kind => {
+      {/* SETTLED KINDS, SAID ONCE. Four of the six kinds are empty on the live queue, and each one
+          used to render a heading, a lead-in, a count chip and a 35-word paragraph — four sections
+          of nothing between the two that hold the work, plus four role="status" regions all
+          announcing "nothing to review" on load. A kind we could not READ is a different claim and
+          keeps its own section below; only the genuinely settled ones collapse here. */}
+      {settledKinds.length > 0 && (
+        <p className="empty gq-settled" data-testid="gq-settled-kinds" role="status">
+          Nothing is waiting on you in {listWords(settledKinds.map(kind => kindLabel(kind)))}
+          {catalog === null ? '' : ` in ${catalogLabel(catalog)}`}. Everything proposed there has
+          already been decided, and the platform keeps working either way.
+        </p>
+      )}
+
+      {workingKinds.map(kind => {
         const forKind = items.filter(item => item.kind === kind)
-        const entries = entriesFor(kind, forKind)
+        const entries = byUrgency(entriesFor(kind, forKind))
         const broken = queue.unreadable.filter(entry =>
           unreadableListings(kind).includes(entry.listing))
         const where = catalog === null ? 'the catalogs you can see' : catalogLabel(catalog)
         return (
           <section className="gq-kind" key={kind} data-testid={`kind-${kind}`}>
-            <h3 className="gq-kind-head">
+            {/* h2, not h3. The kind sections are top-level regions of this screen, exactly like
+                the two panels below them — at h3 they read as subsections of a heading that does
+                not exist, and the outline jumped back UP to h2 partway down the page. */}
+            <h2 className="gq-kind-head">
               {kindLabel(kind)} <span className="tabular-nums">{forKind.length}</span>
-            </h3>
+            </h2>
             {KIND_ABOUT[kind] && <p className="hint gq-kind-about">{KIND_ABOUT[kind]}</p>}
             {forKind.length === 0 && broken.length > 0 && (
               <p className="empty gq-broken">
@@ -1671,12 +1919,22 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
                 {entries.map(entry => (
                   <li className="row q-item" key={entry.key} data-testid="queue-entry">
                     {entry.group
-                      ? <CandidateGroup entry={entry} onDone={onDone} onConflict={onConflict} />
+                      ? (
+                          <CandidateGroup
+                            entry={entry}
+                            onDone={onDone}
+                            onConflict={onConflict}
+                            outcome={outcome}
+                          />
+                        )
                       : (
                           <QueueRow
                             item={entry.items[0]}
                             onDone={onDone}
                             onConflict={onConflict}
+                            outcome={outcome?.factKey === entry.items[0].fact_key
+                              ? outcome.message
+                              : undefined}
                           />
                         )}
                   </li>

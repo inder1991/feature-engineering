@@ -105,10 +105,27 @@ export function ConceptConfirmationPanel() {
         confirm it — confirm each batch, untick the exceptions. Groups are ordered by how many
         governed recipe operands depend on the concept, so the load-bearing decisions come first.
       </p>
+      {/* The same chips the governance queue above uses. This was a native <select> asking the
+          same question forty pixels lower — one axis, two idioms. */}
       {sources.length > 1 && (
-        <select aria-label="Catalog" value={source} onChange={e => setSource(e.target.value)}>
-          {sources.map(s => <option key={s} value={s}>{s}</option>)}
-        </select>
+        <div
+          className="gj-chips ccq-filter"
+          role="group"
+          aria-label="Catalog"
+          data-testid="ccq-catalog-filter"
+        >
+          {sources.map(s => (
+            <button
+              type="button"
+              key={s}
+              className={s === source ? 'gj-chip gj-chip--on' : 'gj-chip'}
+              aria-pressed={s === source}
+              onClick={() => setSource(s)}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
       )}
       {loadError && <p className="field-error">{loadError}</p>}
       {lastOutcome && <p className="hint ccq-outcome">{lastOutcome}</p>}
@@ -123,19 +140,25 @@ export function ConceptConfirmationPanel() {
       )}
       {queue && (
         <>
-          <p className="hint">
-            {queue.funnel.human_confirmed} of {queue.funnel.active} proposals settled
+          {/* THE ANSWER FIRST, THE SHARE AS CONTEXT. Live on cib these two rendered the other way
+              round — "37 of 82 proposals settled (45%)" directly above "Nothing awaiting
+              confirmation" — and read as a contradiction. Both are true: the share counts every
+              active proposal on the catalog, while this queue lists only the ones a governed
+              recipe operand references. The share now says which it is counting. */}
+          {queue.groups.length === 0 && (
+            <p className="hint" data-testid="ccq-settled">
+              Nothing awaiting confirmation — every load-bearing proposal on this catalog is
+              settled.
+            </p>
+          )}
+          <p className="hint" data-testid="ccq-share">
+            Across every proposal on this catalog, load-bearing or not:{' '}
+            {queue.funnel.human_confirmed} of {queue.funnel.active} settled
             {' '}({Math.round(queue.funnel.confirmed_share * 100)}%).
             {queue.unreferenced_groups_omitted > 0
               && ` ${queue.unreferenced_groups_omitted} concept group(s) not referenced by any`
               + ' recipe operand are omitted here.'}
           </p>
-          {queue.groups.length === 0 && (
-            <p className="hint">
-              Nothing awaiting confirmation — every load-bearing proposal on this catalog is
-              settled.
-            </p>
-          )}
           {queue.groups.map(group => {
             const checked = group.columns.filter(c => !unticked.has(c.object_ref)).length
             return (
