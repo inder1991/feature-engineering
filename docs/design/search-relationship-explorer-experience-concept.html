@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FeatureGen — Search and Relationship Explorer Concept</title>
+  <style>
+    :root {
+      --ground: #eaf2f3;
+      --surface: #fbfdfd;
+      --surface-2: #f3f8f8;
+      --surface-3: #edf5f6;
+      --ink: #142d32;
+      --ink-soft: #52696e;
+      --ink-faint: #74878b;
+      --line: #d0dde0;
+      --line-strong: #b4c7ca;
+      --rail: #04373f;
+      --rail-deep: #032d34;
+      --accent: #007e90;
+      --accent-dark: #006675;
+      --accent-soft: #dceff2;
+      --good: #08775f;
+      --good-soft: #ddf3e9;
+      --warn: #96600e;
+      --warn-soft: #fff2d8;
+      --purple: #65509a;
+      --purple-soft: #eee9f8;
+      --danger: #9c4646;
+      --danger-soft: #f8e9e7;
+      --shadow: 0 1px 2px rgba(8,43,49,.04), 0 12px 30px rgba(8,43,49,.07);
+      --sans: "IBM Plex Sans", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--ground); }
+    body { min-height: 100vh; margin: 0; background: var(--ground); color: var(--ink); font: 14px/1.45 var(--sans); -webkit-font-smoothing: antialiased; }
+    button, input, a { font: inherit; }
+    button { color: inherit; cursor: pointer; }
+    a { color: inherit; }
+    code, .mono { font-family: var(--mono); }
+    .hidden { display: none !important; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+
+    .shell { display: grid; min-height: 100vh; grid-template-columns: 220px minmax(0, 1fr); }
+    .rail { position: sticky; top: 0; display: flex; height: 100vh; min-width: 0; flex-direction: column; border-right: 1px solid rgba(255,255,255,.08); background: var(--rail); color: #aac4c8; }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 19px 17px 16px; color: #86d8df; }
+    .brand-mark { display: grid; width: 22px; height: 22px; flex: none; place-items: center; border: 1px solid #75d1d9; border-radius: 6px; font: 700 11px var(--mono); }
+    .brand strong { display: block; font-size: 14px; line-height: 1.05; }
+    .brand small { display: block; margin-top: 3px; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+    .nav { display: grid; gap: 2px; padding: 7px 8px; }
+    .nav-item { display: flex; align-items: center; gap: 10px; height: 36px; padding: 0 11px; border-radius: 8px; color: #aac4c8; text-decoration: none; }
+    .nav-item:hover { background: rgba(255,255,255,.05); }
+    .nav-item.active { background: #0a5661; color: #93e0e6; font-weight: 650; }
+    .nav-icon { width: 17px; flex: none; color: #82adb3; font-family: var(--mono); text-align: center; }
+    .session { margin-top: auto; padding: 14px 15px; border-top: 1px solid rgba(255,255,255,.08); background: var(--rail-deep); }
+    .session-label { margin-bottom: 7px; color: #779ba0; font-size: 9px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+    .user { padding: 7px 9px; border: 1px solid #18515a; border-radius: 7px; color: #c8dcdf; }
+    .role { display: inline-block; margin: 7px 4px 0 0; padding: 4px 8px; border: 1px solid #1b5962; border-radius: 99px; font: 10px var(--mono); }
+    .role.active { border-color: #76d5dc; background: #0a4a54; color: #d8f7f9; }
+
+    main { min-width: 0; padding: 22px 28px 46px; }
+    .page { width: min(1320px, 100%); margin: 0 auto; }
+    .crumb { color: var(--accent-dark); font: 700 10px var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+    .page-head { display: flex; align-items: start; justify-content: space-between; gap: 20px; margin: 7px 0 18px; }
+    .page-head h1 { margin: 0; font-size: 27px; line-height: 1.15; letter-spacing: -.025em; }
+    .page-head p { max-width: 720px; margin: 5px 0 0; color: var(--ink-soft); }
+    .prototype-tools { display: flex; align-items: center; gap: 8px; }
+
+    .button { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 7px; padding: 0 13px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--ink); font-weight: 650; text-decoration: none; white-space: nowrap; }
+    .button:hover { border-color: var(--accent); }
+    .button.primary { border-color: var(--accent); background: var(--accent); color: white; }
+    .button.primary:hover { background: var(--accent-dark); }
+    .button.quiet { border-color: transparent; background: transparent; color: var(--accent-dark); }
+    .button.icon { width: 38px; padding: 0; }
+    .button.small { min-height: 32px; padding-inline: 10px; font-size: 12px; }
+
+    .badge { display: inline-flex; min-height: 22px; align-items: center; padding: 2px 8px; border-radius: 99px; font: 700 9px var(--mono); letter-spacing: .045em; text-transform: uppercase; white-space: nowrap; }
+    .badge.info { background: var(--accent-soft); color: var(--accent-dark); }
+    .badge.good { background: var(--good-soft); color: var(--good); }
+    .badge.warn { background: var(--warn-soft); color: var(--warn); }
+    .badge.purple { background: var(--purple-soft); color: var(--purple); }
+    .badge.muted { border: 1px solid var(--line); background: var(--surface-2); color: var(--ink-soft); }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+    /* Search state ----------------------------------------------------------------------- */
+    .search-box { display: grid; grid-template-columns: minmax(260px, 1fr) auto; gap: 9px; padding: 10px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: var(--shadow); }
+    .search-input { min-width: 0; height: 42px; padding: 0 13px; border: 1px solid var(--line-strong); border-radius: 8px; background: white; color: var(--ink); font-size: 14px; outline: none; }
+    .search-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,126,144,.12); }
+    .filterbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 13px 0 16px; }
+    .filter-label { margin-right: 2px; color: var(--ink-faint); font-size: 12px; font-weight: 650; }
+    .filter { display: inline-flex; min-height: 32px; align-items: center; gap: 7px; padding: 0 10px; border: 1px solid var(--line); border-radius: 99px; background: var(--surface); font-size: 12px; }
+    .filter.active { border-color: #add4da; background: var(--accent-soft); color: var(--accent-dark); }
+    .filter .x { color: var(--ink-faint); }
+    .result-head { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 9px; }
+    .result-head h2 { margin: 0; font-size: 15px; }
+    .result-head p { margin: 2px 0 0; color: var(--ink-faint); font-size: 12px; }
+    .results { display: grid; gap: 9px; }
+    .result { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; padding: 16px 17px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: 0 1px 2px rgba(8,43,49,.03); }
+    .result:hover { border-color: var(--line-strong); box-shadow: var(--shadow); }
+    .result-title { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+    .result-title h3 { margin: 0; font-size: 16px; }
+    .result-ref { margin-top: 3px; color: var(--ink-faint); font: 11px var(--mono); overflow-wrap: anywhere; }
+    .result-def { max-width: 760px; margin: 8px 0; color: var(--ink-soft); font-size: 13px; }
+    .result-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--ink-faint); font-size: 11.5px; }
+    .result-meta span { display: inline-flex; align-items: center; gap: 5px; }
+    .result-actions { display: flex; align-items: center; gap: 8px; }
+    .overflow { position: relative; }
+    .menu { position: absolute; top: 43px; right: 0; z-index: 20; width: 190px; padding: 6px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); box-shadow: var(--shadow); }
+    .menu button { display: block; width: 100%; min-height: 34px; padding: 0 9px; border: 0; border-radius: 6px; background: transparent; text-align: left; }
+    .menu button:hover { background: var(--surface-2); }
+
+    /* Relationship Explorer -------------------------------------------------------------- */
+    .explorer-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px; align-items: start; margin-bottom: 12px; }
+    .back { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 7px; border: 0; background: transparent; color: var(--accent-dark); font-weight: 650; padding: 0; }
+    .asset-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .asset-heading h1 { margin: 0; font-size: 25px; letter-spacing: -.025em; }
+    .asset-ref { margin: 3px 0 0; color: var(--ink-faint); font: 11px var(--mono); overflow-wrap: anywhere; }
+    .explorer-actions { display: flex; gap: 8px; padding-top: 23px; }
+
+    .cap-summary { display: grid; grid-template-columns: 1.15fr 1fr 1fr 1.15fr; margin-bottom: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 11px; background: var(--surface); box-shadow: 0 1px 2px rgba(8,43,49,.03); }
+    .cap-stat { min-width: 0; padding: 12px 14px; }
+    .cap-stat + .cap-stat { border-left: 1px solid var(--line); }
+    .cap-stat small { display: block; color: var(--ink-faint); font: 700 9px var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .cap-stat strong { display: block; margin-top: 4px; font-size: 15px; }
+    .cap-stat p { margin: 2px 0 0; color: var(--ink-soft); font-size: 10.5px; }
+    .cap-stat.warn { background: #fffbf2; }
+    .cap-stat.warn strong { color: var(--warn); }
+
+    .workspace { display: grid; grid-template-columns: 184px minmax(0, 1fr) 330px; min-height: 650px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+    .tools { padding: 14px 13px; overflow: auto; border-right: 1px solid var(--line); background: var(--surface-2); }
+    .tool-section + .tool-section { margin-top: 17px; padding-top: 15px; border-top: 1px solid var(--line); }
+    .micro { margin: 0 0 8px; color: var(--ink-faint); font: 700 9px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .layer { display: grid; width: 100%; grid-template-columns: 15px minmax(0, 1fr) auto; gap: 8px; align-items: start; padding: 7px 3px; border: 0; border-radius: 7px; background: transparent; text-align: left; }
+    .layer:hover { background: var(--surface); }
+    .layer-mark { width: 13px; height: 13px; margin-top: 2px; border: 1px solid currentColor; border-radius: 4px; background: currentColor; box-shadow: inset 0 0 0 3px var(--surface-2); }
+    .layer strong { display: block; font-size: 11.5px; }
+    .layer small { display: block; margin-top: 1px; color: var(--ink-faint); font-size: 9.5px; line-height: 1.3; }
+    .layer-count { min-width: 22px; padding: 2px 5px; border-radius: 99px; background: var(--surface); color: var(--ink-soft); font: 9px var(--mono); text-align: center; }
+    .scope-note { padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--ink-soft); font-size: 10px; }
+    .scope-note strong { display: block; margin-bottom: 3px; color: var(--ink); }
+
+    .canvas { position: relative; min-width: 0; min-height: 650px; overflow: hidden; background-color: #fbfdfd; background-image: radial-gradient(#d8e3e5 .75px, transparent .75px); background-size: 22px 22px; }
+    .canvas-toolbar { position: absolute; inset: 13px 13px auto 13px; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 10px; pointer-events: none; }
+    .map-label { display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: rgba(251,253,253,.94); color: var(--ink-soft); font-size: 10px; pointer-events: auto; }
+    .map-label b { color: var(--ink); }
+    .canvas-controls { display: flex; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); pointer-events: auto; }
+    .canvas-controls button { width: 34px; height: 32px; border: 0; border-left: 1px solid var(--line); background: transparent; }
+    .canvas-controls button:first-child { border-left: 0; }
+    .canvas-controls button:hover { background: var(--surface-2); }
+    .map { position: absolute; inset: 0; min-width: 720px; min-height: 650px; }
+    .wires { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .wire { fill: none; stroke-width: 2; }
+    .wire.contain { stroke: #a9bdc0; stroke-dasharray: 3 6; }
+    .wire.map-weak { stroke: #d3a354; stroke-dasharray: 7 6; }
+    .wire.map-strong { stroke: #b97612; stroke-dasharray: 7 5; stroke-width: 2.5; }
+    .wire.opportunity { stroke: var(--purple); stroke-dasharray: 3 6; opacity: .7; }
+    .edge-label { position: absolute; z-index: 3; display: inline-flex; min-height: 23px; align-items: center; padding: 2px 7px; border: 1px solid var(--line); border-radius: 99px; background: rgba(251,253,253,.96); color: var(--ink-soft); font: 9px var(--mono); box-shadow: 0 1px 2px rgba(8,43,49,.04); }
+    .edge-label:hover { border-color: var(--accent); }
+    .edge-label.weak { left: 42%; top: 31%; border-color: #e2c58d; color: var(--warn); }
+    .edge-label.strong { left: 43%; top: 37%; border-color: #d7aa62; color: var(--warn); }
+    .edge-label.belongs { left: 43%; top: 58%; }
+    .edge-label.opp { left: 33%; top: 75%; border-color: #cfc4e8; color: var(--purple); }
+
+    .node { position: absolute; z-index: 2; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface); box-shadow: 0 7px 18px rgba(8,43,49,.08); text-align: left; }
+    .node:hover, .node[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(0,126,144,.12), 0 9px 20px rgba(8,43,49,.09); }
+    .node.anchor { left: 5%; top: 40%; width: 250px; }
+    .node.transactions { left: 55%; top: 16%; width: 270px; border-color: #d8b46e; }
+    .node.customer-table { left: 55%; top: 57%; width: 270px; }
+    .node.feature-opportunity { left: 22%; top: 79%; width: 300px; border-color: #c8bae4; background: #fcfaff; }
+    .node-head { display: flex; min-height: 40px; align-items: center; gap: 7px; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    .node.anchor .node-head { background: var(--accent-soft); }
+    .node.feature-opportunity .node-head { background: var(--purple-soft); }
+    .node-kind { color: var(--ink-faint); font: 700 8px var(--mono); letter-spacing: .07em; text-transform: uppercase; }
+    .node-title { min-width: 0; overflow: hidden; font-size: 12px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+    .node-head .badge { margin-left: auto; min-height: 18px; padding-inline: 6px; font-size: 7.5px; }
+    .node-tech { padding: 6px 10px; color: var(--ink-faint); font: 9.5px var(--mono); border-bottom: 1px solid var(--line); }
+    .node-row { display: flex; min-height: 34px; align-items: center; gap: 7px; padding: 6px 10px; font: 10px var(--mono); }
+    .node-row + .node-row { border-top: 1px solid var(--line); }
+    .node-row .badge { margin-left: auto; min-height: 18px; padding-inline: 5px; font-size: 7px; }
+    .node-copy { padding: 8px 10px; color: var(--ink-soft); font-size: 10.5px; }
+
+    .inspector { display: flex; min-width: 0; flex-direction: column; overflow: auto; border-left: 1px solid var(--line); background: var(--surface); }
+    .inspector-body { padding: 16px; }
+    .inspector-label { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .inspector h2 { margin: 8px 0 0; font-size: 19px; }
+    .inspector-ref { margin: 3px 0 0; color: var(--ink-faint); font: 9.5px var(--mono); overflow-wrap: anywhere; }
+    .inspector-def { margin: 10px 0 12px; color: var(--ink-soft); font-size: 12px; }
+    .fact-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 12px; }
+    .fact { min-width: 0; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-2); }
+    .fact span { display: block; color: var(--ink-faint); font-size: 8px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+    .fact strong { display: block; margin-top: 2px; font-size: 10.5px; overflow-wrap: anywhere; }
+    .inspector-section { margin-top: 15px; padding-top: 14px; border-top: 1px solid var(--line); }
+    .capability { padding: 11px; border: 1px solid #b7d9de; border-radius: 9px; background: #f0fafb; }
+    .capability h3 { margin: 0; font-size: 12px; }
+    .capability p { margin: 5px 0 0; color: var(--ink-soft); font-size: 11px; }
+    .use-list { display: grid; gap: 7px; margin: 8px 0 0; padding: 0; list-style: none; }
+    .use-list li { display: grid; grid-template-columns: 18px 1fr; gap: 7px; color: var(--ink-soft); font-size: 11px; }
+    .use-icon { display: grid; width: 17px; height: 17px; place-items: center; border-radius: 50%; background: var(--good-soft); color: var(--good); font-size: 10px; font-weight: 800; }
+    .use-icon.no { background: var(--danger-soft); color: var(--danger); }
+    .blocker { margin-top: 10px; padding: 10px; border-left: 3px solid var(--warn); border-radius: 6px; background: var(--warn-soft); }
+    .blocker strong { display: block; color: var(--warn); font-size: 11px; }
+    .blocker p { margin: 3px 0 0; color: #75531e; font-size: 10.5px; }
+    .recommendations { display: grid; gap: 7px; }
+    .recommendation { display: block; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); text-decoration: none; }
+    .recommendation:hover { border-color: var(--purple); }
+    .recommendation strong { display: block; font-size: 11px; }
+    .recommendation span { display: block; margin-top: 2px; color: var(--ink-faint); font-size: 9.5px; }
+    .inspector-actions { display: grid; grid-template-columns: 1fr 1.25fr; gap: 8px; margin-top: auto; padding: 13px 16px; border-top: 1px solid var(--line); background: var(--surface-2); }
+    .inspector-actions .button { min-width: 0; padding-inline: 8px; white-space: normal; text-align: center; }
+
+    .text-view { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .text-view summary { padding: 11px 13px; cursor: pointer; font-weight: 650; }
+    .text-view ul { margin: 0; padding: 0 30px 13px; color: var(--ink-soft); font: 11px/1.55 var(--mono); }
+
+    /* Design-note overlay ---------------------------------------------------------------- */
+    .notes { position: fixed; inset: 12px 12px 12px auto; z-index: 50; width: min(380px, calc(100vw - 24px)); overflow: auto; padding: 17px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: 0 18px 50px rgba(5,42,48,.22); }
+    .notes-head { display: flex; align-items: start; justify-content: space-between; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+    .notes h2 { margin: 0; font-size: 16px; }
+    .notes-head p { margin: 3px 0 0; color: var(--ink-faint); font-size: 10.5px; }
+    .note { display: grid; grid-template-columns: 23px 1fr; gap: 9px; padding: 12px 0; }
+    .note + .note { border-top: 1px solid var(--line); }
+    .note-number { display: grid; width: 22px; height: 22px; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent-dark); font: 700 10px var(--mono); }
+    .note strong { display: block; font-size: 11px; }
+    .note p { margin: 3px 0 0; color: var(--ink-soft); font-size: 10.5px; }
+
+    @media (max-width: 1300px) {
+      .workspace { grid-template-columns: 58px minmax(0, 1fr) 300px; }
+      .tools { padding-inline: 9px; }
+      .tool-section { text-align: center; }
+      .tool-section .micro, .scope-note, .layer-copy { display: none; }
+      .layer { grid-template-columns: 1fr; justify-items: center; padding: 9px 0; }
+      .layer-count { margin-top: 2px; }
+      .node.transactions, .node.customer-table { left: 54%; }
+    }
+
+    @media (max-width: 1180px) {
+      .shell { grid-template-columns: 72px minmax(0, 1fr); }
+      .brand { justify-content: center; padding-inline: 10px; }
+      .brand-copy, .nav-label, .session-label, .session .role { display: none; }
+      .nav-item { justify-content: center; padding: 0; }
+      .nav-icon { width: auto; }
+      .session { padding: 10px 8px; }
+      .user { padding-inline: 4px; overflow: hidden; text-align: center; text-overflow: ellipsis; }
+      main { padding-inline: 18px; }
+      .cap-summary { grid-template-columns: repeat(2, 1fr); }
+      .cap-stat:nth-child(3) { border-left: 0; border-top: 1px solid var(--line); }
+      .cap-stat:nth-child(4) { border-top: 1px solid var(--line); }
+    }
+
+    @media (max-width: 1050px) {
+      .workspace { grid-template-columns: minmax(0, 1fr); }
+      .tools { display: flex; align-items: center; gap: 7px; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .tool-section, .tool-section + .tool-section { display: contents; margin: 0; padding: 0; border: 0; }
+      .layer { width: auto; min-width: 55px; grid-template-columns: 15px auto; justify-items: start; padding: 7px 9px; border: 1px solid var(--line); background: var(--surface); }
+      .layer-count { margin: 0; }
+      .canvas { min-height: 560px; }
+      .map { min-height: 560px; }
+      .inspector { border-top: 1px solid var(--line); border-left: 0; }
+      .inspector-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(260px, .8fr); gap: 16px; }
+      .inspector-section { margin-top: 0; padding-top: 0; border-top: 0; }
+      .inspector-actions { grid-template-columns: auto auto; justify-content: end; }
+      .node.feature-opportunity { top: 77%; }
+    }
+
+    @media (max-width: 760px) {
+      .shell { display: block; }
+      .rail { position: static; width: 100%; height: auto; flex-direction: row; align-items: center; }
+      .brand { padding: 11px 13px; }
+      .nav { display: flex; margin-left: auto; }
+      .nav-item:not(.active) { display: none; }
+      .session { display: none; }
+      main { padding: 16px 12px 36px; }
+      .page-head, .explorer-head { grid-template-columns: 1fr; flex-direction: column; }
+      .prototype-tools, .explorer-actions { padding-top: 0; }
+      .search-box { grid-template-columns: 1fr; }
+      .result { grid-template-columns: 1fr; }
+      .result-actions { flex-wrap: wrap; }
+      .cap-summary { grid-template-columns: 1fr; }
+      .cap-stat + .cap-stat { border-top: 1px solid var(--line); border-left: 0; }
+      .canvas { overflow-x: auto; }
+      .inspector-body { grid-template-columns: 1fr; }
+      .fact-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="Primary navigation">
+      <div class="brand">
+        <span class="brand-mark">+</span>
+        <span class="brand-copy"><strong>FeatureGen</strong><small>Feature catalog</small></span>
+      </div>
+      <nav class="nav">
+        <a class="nav-item" href="#"><span class="nav-icon">◉</span><span class="nav-label">Overview</span></a>
+        <a class="nav-item" href="#"><span class="nav-icon">⊕</span><span class="nav-label">Generate features</span></a>
+        <a class="nav-item" href="#"><span class="nav-icon">?</span><span class="nav-label">Ask a question</span></a>
+        <a class="nav-item" href="#"><span class="nav-icon">⌘</span><span class="nav-label">Registry</span></a>
+        <a class="nav-item active" href="#"><span class="nav-icon">⌕</span><span class="nav-label">Search</span></a>
+        <a class="nav-item" href="#"><span class="nav-icon">⇧</span><span class="nav-label">Ingest</span></a>
+        <a class="nav-item" href="#"><span class="nav-icon">⌁</span><span class="nav-label">Governance</span></a>
+      </nav>
+      <div class="session">
+        <div class="session-label">Session</div>
+        <div class="user">dev</div>
+        <span class="role active">data_owner</span><span class="role">feature_engineer</span>
+      </div>
+    </aside>
+
+    <main>
+      <div class="page">
+        <section id="search-view" class="hidden" aria-labelledby="search-title">
+          <div class="crumb">Catalog · Search</div>
+          <header class="page-head">
+            <div>
+              <h1 id="search-title">Find trusted data</h1>
+              <p>Search by business term, physical name or concept. Then open the asset, explore its relationships, or review recommended features.</p>
+            </div>
+            <button class="button small" type="button" data-open-notes>Design notes</button>
+          </header>
+
+          <form class="search-box" onsubmit="return false" role="search">
+            <label class="sr-only" for="catalog-search">Search the catalog</label>
+            <input id="catalog-search" class="search-input" value="cust_num" />
+            <button class="button primary" type="submit">Search</button>
+          </form>
+          <div class="filterbar" aria-label="Active search filters">
+            <span class="filter-label">Filters</span>
+            <button class="filter active" type="button">Source: CIB <span class="x">×</span></button>
+            <button class="filter active" type="button">Asset type: Columns <span class="x">×</span></button>
+            <button class="filter" type="button">More filters <span>3</span></button>
+          </div>
+
+          <div class="result-head">
+            <div><h2>1 matching asset</h2><p>Business meaning is shown before implementation detail.</p></div>
+            <span class="badge good"><span class="dot"></span>&nbsp; Catalog projection current</span>
+          </div>
+
+          <div class="results">
+            <article class="result">
+              <div>
+                <div class="result-title">
+                  <h3>Customer Number</h3>
+                  <span class="badge info">Customer key</span>
+                  <span class="badge good">Grain</span>
+                </div>
+                <div class="result-ref">cib › public.bo_cib_customer › cust_num</div>
+                <p class="result-def">Unique customer number used to identify a corporate or institutional customer across CIB systems.</p>
+                <div class="result-meta">
+                  <span>Customer domain</span><span>varchar(150) · source declared</span><span>Business term · source attested</span>
+                </div>
+              </div>
+              <div class="result-actions">
+                <a class="button primary" href="http://localhost:8080/#/asset?source=cib&amp;object_ref=public.bo_cib_customer.cust_num" target="_blank">Open asset</a>
+                <button class="button" type="button" data-open-explorer>Explore relationships</button>
+                <div class="overflow">
+                  <button class="button icon" type="button" aria-label="More actions" data-menu>•••</button>
+                  <div class="menu hidden" data-menu-panel>
+                    <button type="button" data-recommendations>Recommended features</button>
+                    <button type="button">Downstream impact</button>
+                    <button type="button">Copy technical reference</button>
+                  </div>
+                </div>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section id="explorer-view" aria-labelledby="explorer-title">
+          <div class="crumb">Catalog · Search · Relationship Explorer</div>
+          <header class="explorer-head">
+            <div>
+              <button class="back" type="button" data-open-search>← Back to 1 result</button>
+              <div class="asset-heading">
+                <h1 id="explorer-title">Customer Number</h1>
+                <span class="badge info">Customer key</span>
+                <span class="badge good">Grain</span>
+              </div>
+              <p class="asset-ref">cib › public.bo_cib_customer › cust_num</p>
+            </div>
+            <div class="explorer-actions">
+              <button class="button small" type="button" data-open-notes>Design notes</button>
+              <a class="button" href="http://localhost:8080/#/asset?source=cib&amp;object_ref=public.bo_cib_customer.cust_num" target="_blank">Open asset</a>
+            </div>
+          </header>
+
+          <section class="cap-summary" aria-label="Capability summary">
+            <div class="cap-stat"><small>Safe role</small><strong>Customer entity key</strong><p>Grouping and customer-level grain</p></div>
+            <div class="cap-stat"><small>Relationships</small><strong>2 proposed mappings</strong><p>Across CIB and transaction catalogs</p></div>
+            <div class="cap-stat"><small>Feature potential</small><strong>3 recommendations</strong><p>Discovery candidates, not lineage</p></div>
+            <div class="cap-stat warn"><small>Execution readiness</small><strong>0 executable paths</strong><p>Relationship governance required</p></div>
+          </section>
+
+          <div class="workspace">
+            <aside class="tools" aria-label="Relationship layers">
+              <section class="tool-section">
+                <h2 class="micro">Show on map</h2>
+                <button class="layer" type="button" aria-pressed="true"><span class="layer-mark" style="color:#8da3a7"></span><span class="layer-copy"><strong>Structure</strong><small>Table membership</small></span><span class="layer-count">1</span></button>
+                <button class="layer" type="button" aria-pressed="true"><span class="layer-mark" style="color:#b97612"></span><span class="layer-copy"><strong>Entity mappings</strong><small>Same business entity</small></span><span class="layer-count">2</span></button>
+                <button class="layer" type="button" aria-pressed="true"><span class="layer-mark" style="color:#65509a"></span><span class="layer-copy"><strong>Feature opportunities</strong><small>Recommended, not registered</small></span><span class="layer-count">3</span></button>
+                <button class="layer" type="button" aria-pressed="true"><span class="layer-mark" style="color:#08775f"></span><span class="layer-copy"><strong>Registered lineage</strong><small>Production use</small></span><span class="layer-count">0</span></button>
+              </section>
+              <section class="tool-section">
+                <h2 class="micro">Scope</h2>
+                <div class="scope-note"><strong>One-hop neighborhood</strong>Expand a table to inspect its next neighborhood.</div>
+              </section>
+              <section class="tool-section">
+                <h2 class="micro">Visibility</h2>
+                <div class="scope-note">Only assets permitted for this session are included.</div>
+              </section>
+            </aside>
+
+            <section class="canvas" aria-label="Relationship map">
+              <div class="canvas-toolbar">
+                <div class="map-label"><b>Customer neighborhood</b><span>3 assets · 2 mappings · 3 opportunities</span></div>
+                <div class="canvas-controls" aria-label="Map controls"><button type="button" aria-label="Zoom in">+</button><button type="button" aria-label="Zoom out">−</button><button type="button" aria-label="Reset map">⌖</button></div>
+              </div>
+              <div class="map">
+                <svg class="wires" viewBox="0 0 900 650" preserveAspectRatio="none" aria-hidden="true">
+                  <path class="wire map-weak" d="M255 305 C410 305, 430 165, 560 165" />
+                  <path class="wire map-strong" d="M255 315 C420 335, 430 215, 560 215" />
+                  <path class="wire contain" d="M255 330 C390 380, 455 440, 560 440" />
+                  <path class="wire opportunity" d="M255 345 C300 420, 340 490, 390 530" />
+                </svg>
+
+                <button class="edge-label weak" type="button" data-edge="weak">customer · weak</button>
+                <button class="edge-label strong" type="button" data-edge="strong">customer · strong</button>
+                <button class="edge-label belongs" type="button" data-edge="belongs">belongs to</button>
+                <button class="edge-label opp" type="button" data-edge="opportunity">recommended use</button>
+
+                <button class="node anchor" type="button" aria-pressed="true" data-node="anchor">
+                  <span class="node-head"><span class="node-kind">Column</span><span class="node-title">Customer Number</span><span class="badge good">Grain</span></span>
+                  <span class="node-tech">cust_num · customer_id</span>
+                  <span class="node-copy">Customer entity key · varchar(150)</span>
+                </button>
+
+                <button class="node transactions" type="button" aria-pressed="false" data-node="transactions">
+                  <span class="node-head"><span class="node-kind">Table</span><span class="node-title">Financial Transactions</span><span class="badge warn">Stale</span></span>
+                  <span class="node-tech">ftr · comp_financial_tran_repos_dly</span>
+                  <span class="node-row">cif_id <span class="badge warn">Mapped</span></span>
+                  <span class="node-row">counter_party_cif_id <span class="badge warn">Mapped</span></span>
+                  <span class="node-row">pstd_date <span class="badge info">As-of</span></span>
+                  <span class="node-row">tran_id <span class="badge good">Grain</span></span>
+                </button>
+
+                <button class="node customer-table" type="button" aria-pressed="false" data-node="customer-table">
+                  <span class="node-head"><span class="node-kind">Table</span><span class="node-title">CIB Customer Snapshot</span></span>
+                  <span class="node-tech">cib · bo_cib_customer · 2 relevant columns</span>
+                  <span class="node-row">business_dt <span class="badge info">As-of</span></span>
+                </button>
+
+                <button class="node feature-opportunity" type="button" aria-pressed="false" data-node="opportunity">
+                  <span class="node-head"><span class="node-kind">Opportunity</span><span class="node-title">Transaction activity recency</span><span class="badge purple">Recommended</span></span>
+                  <span class="node-copy">Blocked until a governed customer-to-transaction path exists.</span>
+                </button>
+              </div>
+            </section>
+
+            <aside class="inspector" aria-label="Selected map item">
+              <div class="inspector-body" id="inspector-content">
+                <div>
+                  <div class="inspector-label"><span class="micro">Selected column</span><span class="badge info">Source-attested term</span></div>
+                  <h2>Customer Number</h2>
+                  <p class="inspector-ref">public.bo_cib_customer.cust_num</p>
+                  <p class="inspector-def">Unique customer number used to identify a corporate or institutional customer across CIB systems.</p>
+                  <div><span class="badge info">customer_id · AI proposed</span> <span class="badge muted">varchar(150)</span></div>
+                  <div class="fact-grid">
+                    <div class="fact"><span>Business term</span><strong>Customer Number</strong></div>
+                    <div class="fact"><span>Domain</span><strong>Customer</strong></div>
+                    <div class="fact"><span>Entity</span><strong>customer · subject</strong></div>
+                    <div class="fact"><span>Identifier</span><strong>CIF · issuer unresolved</strong></div>
+                  </div>
+                </div>
+                <div>
+                  <section class="inspector-section">
+                    <div class="capability">
+                      <h3>What this column can support</h3>
+                      <ul class="use-list">
+                        <li><span class="use-icon">✓</span><span>Customer entity key and customer-level grouping.</span></li>
+                        <li><span class="use-icon">✓</span><span>Retrieval of customer-scoped feature recommendations.</span></li>
+                        <li><span class="use-icon no">×</span><span>Not a measure, amount or transaction timestamp.</span></li>
+                      </ul>
+                    </div>
+                    <div class="blocker"><strong>Cross-catalog computation is not ready</strong><p>Two customer mappings exist, but neither provides a governed, execution-validated relationship to transaction history.</p></div>
+                  </section>
+                  <section class="inspector-section">
+                    <h3 class="micro">Recommended features using this key</h3>
+                    <div class="recommendations">
+                      <a class="recommendation" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer&amp;column=cust_num" target="_blank"><strong>Customer transaction activity recency</strong><span>Needs an executable transaction relationship and event history.</span></a>
+                      <a class="recommendation" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer&amp;column=cust_num" target="_blank"><strong>Customer transaction frequency</strong><span>Uses Customer Number as the entity key, never as the measure.</span></a>
+                    </div>
+                  </section>
+                </div>
+              </div>
+              <div class="inspector-actions">
+                <a class="button" href="http://localhost:8080/#/asset?source=cib&amp;object_ref=public.bo_cib_customer.cust_num" target="_blank">Open asset</a>
+                <a class="button primary" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer&amp;column=cust_num" target="_blank">Recommended features</a>
+              </div>
+            </aside>
+          </div>
+
+          <details class="text-view">
+            <summary>View relationships as text</summary>
+            <ul>
+              <li>Customer Number belongs to CIB Customer Snapshot.</li>
+              <li>cust_num maps to ftr.comp_financial_tran_repos_dly.cif_id for customer — weak match, advisory, not execution-validated.</li>
+              <li>cust_num maps to ftr.comp_financial_tran_repos_dly.counter_party_cif_id for customer — strong match, not reviewed, not execution-validated.</li>
+              <li>Transaction activity recommendations are discovery candidates and are not registered production lineage.</li>
+            </ul>
+          </details>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <aside class="notes hidden" id="notes" aria-label="Design notes">
+    <div class="notes-head"><div><h2>Experience decisions</h2><p>This panel explains the prototype; it is not part of the production screen.</p></div><button class="button icon small" type="button" data-close-notes aria-label="Close design notes">×</button></div>
+    <div class="note"><span class="note-number">1</span><div><strong>Search and exploration are separate tasks</strong><p>The global List/Graph toggle is removed. A user chooses an asset, then opens a dedicated, shareable explorer.</p></div></div>
+    <div class="note"><span class="note-number">2</span><div><strong>Business meaning precedes implementation detail</strong><p>“Customer Number” is primary. The physical reference remains visible as supporting evidence.</p></div></div>
+    <div class="note"><span class="note-number">3</span><div><strong>Capability is the narrative</strong><p>The inspector states safe roles, prohibited roles, recommendations and the exact condition blocking execution.</p></div></div>
+    <div class="note"><span class="note-number">4</span><div><strong>Recommendations are not registered lineage</strong><p>Feature opportunities use a separate visual treatment and open the existing Recommended Features page.</p></div></div>
+    <div class="note"><span class="note-number">5</span><div><strong>Trust has independent axes</strong><p>Match strength, human review and execution validation are not collapsed into a misleading “governed” badge.</p></div></div>
+    <div class="note"><span class="note-number">6</span><div><strong>One inspector, one selected object</strong><p>Selecting a node or relationship replaces the inspector content. No drawer is stacked over a second selected-asset panel.</p></div></div>
+    <div class="note"><span class="note-number">7</span><div><strong>Laptop widths do not clip content</strong><p>Below 1050px, controls become a horizontal toolbar and the inspector moves below the canvas.</p></div></div>
+  </aside>
+
+  <script>
+    const searchView = document.getElementById('search-view');
+    const explorerView = document.getElementById('explorer-view');
+    const notes = document.getElementById('notes');
+    const inspector = document.getElementById('inspector-content');
+
+    const anchorInspector = inspector.innerHTML;
+    const inspectorViews = {
+      transactions: `
+        <div>
+          <div class="inspector-label"><span class="micro">Selected table</span><span class="badge warn">Stale source</span></div>
+          <h2>Financial Transactions</h2>
+          <p class="inspector-ref">ftr › public.comp_financial_tran_repos_dly</p>
+          <p class="inspector-def">Transaction history containing customer identifiers, posting date and transaction identity.</p>
+          <div class="fact-grid">
+            <div class="fact"><span>Relevant columns</span><strong>4</strong></div>
+            <div class="fact"><span>Customer mappings</span><strong>2 proposed</strong></div>
+            <div class="fact"><span>Temporal evidence</span><strong>Posting date only</strong></div>
+            <div class="fact"><span>Execution</span><strong>Not validated</strong></div>
+          </div>
+        </div>
+        <div>
+          <section class="inspector-section">
+            <div class="capability"><h3>Potential event source</h3><p>This table could supply transaction events, but stale-source status, relationship realization, event-time semantics and status policy must be resolved first.</p></div>
+            <div class="blocker"><strong>Do not treat posting date as sufficient proof</strong><p>The feature still needs a governed event definition, cutoff policy and valid customer relationship.</p></div>
+          </section>
+        </div>`,
+      'customer-table': `
+        <div>
+          <div class="inspector-label"><span class="micro">Selected table</span><span class="badge info">Customer snapshot</span></div>
+          <h2>CIB Customer Snapshot</h2>
+          <p class="inspector-ref">cib › public.bo_cib_customer</p>
+          <p class="inspector-def">Customer master snapshot containing the customer grain and business cutoff date.</p>
+          <div class="fact-grid">
+            <div class="fact"><span>Primary entity</span><strong>Customer</strong></div>
+            <div class="fact"><span>Table shape</span><strong>Snapshot</strong></div>
+            <div class="fact"><span>Grain key</span><strong>cust_num</strong></div>
+            <div class="fact"><span>As-of candidate</span><strong>business_dt</strong></div>
+          </div>
+        </div>
+        <div><section class="inspector-section"><div class="capability"><h3>Population source</h3><p>This table can define the customer population and cutoff. It cannot establish transaction activity without a historical event source.</p></div></section></div>`,
+      opportunity: `
+        <div>
+          <div class="inspector-label"><span class="micro">Selected opportunity</span><span class="badge purple">Recommended, not registered</span></div>
+          <h2>Transaction activity recency</h2>
+          <p class="inspector-def">Measure how recently each customer had an eligible transaction before the prediction cutoff.</p>
+          <div class="fact-grid">
+            <div class="fact"><span>Entity key</span><strong>cust_num</strong></div>
+            <div class="fact"><span>Event source</span><strong>Unresolved</strong></div>
+            <div class="fact"><span>Event time</span><strong>Needs confirmation</strong></div>
+            <div class="fact"><span>Readiness</span><strong>Blocked</strong></div>
+          </div>
+        </div>
+        <div><section class="inspector-section"><div class="blocker"><strong>Relationship governance required</strong><p>This recommendation is useful, but it cannot become a physical feature until the customer-to-transaction path and event semantics are validated.</p></div><p><a class="button primary" target="_blank" href="http://localhost:8080/#/suggested?source=cib&amp;table=bo_cib_customer&amp;column=cust_num">Open recommendation</a></p></section></div>`,
+    };
+
+    const edgeViews = {
+      weak: ['Weak customer mapping', 'cust_num → ftr.comp_financial_tran_repos_dly.cif_id', 'Advisory mapping. The identifiers look related, but the match is weak and no executable realization has been validated.'],
+      strong: ['Strong customer mapping', 'cust_num → ftr.comp_financial_tran_repos_dly.counter_party_cif_id', 'Strong semantic match, but it has not been reviewed by a person and is not execution-validated.'],
+      belongs: ['Structural membership', 'cust_num belongs to bo_cib_customer', 'This is a catalog containment fact. It does not establish a cross-table join.'],
+      opportunity: ['Recommended use', 'Customer Number can fill the customer-key role', 'The recommendation may use this column as an entity key. It must not use it as the transaction measure or event timestamp.'],
+    };
+
+    function showSearch() { searchView.classList.remove('hidden'); explorerView.classList.add('hidden'); location.hash = 'view=search'; window.scrollTo(0, 0); }
+    function showExplorer() { explorerView.classList.remove('hidden'); searchView.classList.add('hidden'); location.hash = 'view=explorer'; window.scrollTo(0, 0); }
+    document.querySelectorAll('[data-open-search]').forEach(el => el.addEventListener('click', showSearch));
+    document.querySelectorAll('[data-open-explorer]').forEach(el => el.addEventListener('click', showExplorer));
+    document.querySelectorAll('[data-open-notes]').forEach(el => el.addEventListener('click', () => notes.classList.remove('hidden')));
+    document.querySelector('[data-close-notes]').addEventListener('click', () => notes.classList.add('hidden'));
+    document.querySelector('[data-menu]').addEventListener('click', () => document.querySelector('[data-menu-panel]').classList.toggle('hidden'));
+    document.querySelector('[data-recommendations]').addEventListener('click', () => window.open('http://localhost:8080/#/suggested?source=cib&table=bo_cib_customer&column=cust_num', '_blank'));
+
+    document.querySelectorAll('[data-node]').forEach(node => node.addEventListener('click', () => {
+      document.querySelectorAll('[data-node]').forEach(n => n.setAttribute('aria-pressed', 'false'));
+      node.setAttribute('aria-pressed', 'true');
+      inspector.innerHTML = node.dataset.node === 'anchor' ? anchorInspector : inspectorViews[node.dataset.node];
+    }));
+    document.querySelectorAll('[data-edge]').forEach(edge => edge.addEventListener('click', () => {
+      const [title, ref, copy] = edgeViews[edge.dataset.edge];
+      document.querySelectorAll('[data-node]').forEach(n => n.setAttribute('aria-pressed', 'false'));
+      inspector.innerHTML = `
+        <div>
+          <div class="inspector-label"><span class="micro">Selected relationship</span><span class="badge warn">Not execution-validated</span></div>
+          <h2>${title}</h2><p class="inspector-ref">${ref}</p><p class="inspector-def">${copy}</p>
+          <div class="fact-grid"><div class="fact"><span>Match</span><strong>${edge.dataset.edge === 'strong' ? 'Strong' : edge.dataset.edge === 'weak' ? 'Weak' : 'Not applicable'}</strong></div><div class="fact"><span>Human review</span><strong>${edge.dataset.edge === 'weak' ? 'Advisory only' : 'Not reviewed'}</strong></div><div class="fact"><span>Execution</span><strong>Not validated</strong></div><div class="fact"><span>Action</span><strong>Review evidence</strong></div></div>
+        </div>
+        <div><section class="inspector-section"><div class="blocker"><strong>What must happen next</strong><p>Review the relationship, verify directional cardinality and create an executable realization before feature generation can rely on it.</p></div></section></div>`;
+    }));
+
+    if (location.hash === '#view=search') showSearch();
+  </script>
+</body>
+</html>
