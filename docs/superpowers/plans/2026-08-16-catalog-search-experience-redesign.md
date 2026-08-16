@@ -255,8 +255,18 @@ describe('hitMeta', () => {
       .toEqual(['numeric', 'retail', 'concept: account_balance'])
   })
 
-  it('labels a table hit by kind rather than a missing data type', () => {
-    expect(hitMeta(TABLE)).toEqual(['table'])
+  // The row renders a `table` badge of its own, so repeating the word here would print it twice.
+  it('omits the kind — the row badges it', () => {
+    expect(hitMeta(TABLE)).toEqual([])
+  })
+
+  it('names the entity when no grain line already does', () => {
+    expect(hitMeta({ ...COLUMN, entity: 'Account' })).toEqual(['numeric', 'entity: Account'])
+  })
+
+  // "Grain key for Account" already names it; saying it twice on one row is noise.
+  it('leaves the entity to the grain capability line when there is one', () => {
+    expect(hitMeta({ ...COLUMN, is_grain: true, entity: 'Account' })).toEqual(['numeric'])
   })
 
   it('drops every field the catalog does not hold', () => {
@@ -353,9 +363,15 @@ export function hitCapabilities(hit: SearchHit): HitCapability[] {
  * hit carries no authority marker, so search can prove neither "AI proposed" nor "confirmed".
  */
 export function hitMeta(hit: SearchHit): string[] {
+  // The grain capability line reads "Grain key for Account", so repeating the entity here would
+  // say it twice. On every OTHER row the entity has nowhere else to go — and `entity` is a facet
+  // people filter by, so a row that matched `entity=Account` has to be able to say so.
+  const namedByCapability = hit.is_grain && Boolean(hit.entity)
   return [
-    hit.kind === 'table' ? 'table' : hit.data_type,
+    // The kind is deliberately absent: the row badges a table as `table` already.
+    hit.data_type,
     hit.domain,
+    hit.entity && !namedByCapability ? `entity: ${hit.entity}` : null,
     hit.concept ? `concept: ${hit.concept}` : null,
   ].filter((part): part is string => Boolean(part))
 }
