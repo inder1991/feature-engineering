@@ -142,6 +142,24 @@ describe('search screen — results and rows', () => {
     expect(await screen.findByTestId('result-count')).toHaveTextContent('2 assets')
   })
 
+  // A result set that fits on one page renders NO pager, so the pager's live region does not
+  // exist — and if the count line is not one either, submitting a query is silent for a screen
+  // reader in the commonest result shape there is (WCAG 4.1.3). Two live regions is the right
+  // number here: a region whose text does not change does not announce, so the count line cannot
+  // double-announce on paging, and the one overlap — a new query that changes the total AND has a
+  // pager — is redundancy, which is strictly better than silence.
+  it('announces the count when the whole result set fits on one page', async () => {
+    searchCatalog.mockResolvedValue(
+      result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }],
+        FACETS, 2),
+    )
+    render(<SearchScreen />)
+    // Unscoped getByRole: with no pager there is exactly one status region on the screen, and
+    // getBy throws on more than one — so this also pins that the count IS that region.
+    expect(await screen.findByRole('status')).toHaveTextContent(/^2 assets$/)
+    expect(screen.queryByRole('navigation', { name: 'Result pages' })).toBeNull()
+  })
+
   it('uses the singular for a single asset', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)

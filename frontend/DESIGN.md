@@ -22,7 +22,10 @@ saturation, and depth were all under-committed. No pure #000/#fff anywhere.
   --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
   --ink:          oklch(0.25 0.025 225);
   --ink-soft:     oklch(0.44 0.02 222);
-  --ink-faint:    oklch(0.58 0.015 220);
+  /* tertiary text AND placeholders: 5.89:1 on --surface, 5.56:1 on --surface-2, 5.25:1 on
+     --ground — >= 4.5:1 everywhere it renders. Darkened from an earlier 0.58, which measured
+     4.20:1 on --surface and failed. */
+  --ink-faint:    oklch(0.50 0.015 220);
   --line:         oklch(0.86 0.012 212);
   --line-strong:  oklch(0.76 0.018 212);
   --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
@@ -107,7 +110,9 @@ packages (no CDN). Engineered, legible, unmistakably a tool; deliberately not In
   (no left-stripe accents, banned). Icon 16px inline SVG, 1.5px stroke.
 - **Button**: primary = `--accent` fill, paper text, 8px radius, 32px height; secondary = hairline
   border + ink text; destructive/confirm variants use semantic colors. Focus: 2px outline
-  `--accent-line`, 2px offset.
+  `--accent`, 2px offset — 6.43:1 on `--surface`, clearing the 3:1 non-text floor (WCAG 1.4.11).
+  Not `--accent-line`, which is 2.56:1 and would fail; the ring is set once, on bare
+  `:focus-visible`, so every control in the app inherits it.
 - **Badge**: 20px pill, 11px caps label, soft background + strong text of its semantic pair, plus
   a glyph or text (never color alone): `grain`, `as-of`, `pii`, `stale`, `proposal`, `held`…
 - **Field**: 32px input, hairline border, surface background; label 12px/600 above; focus ring as

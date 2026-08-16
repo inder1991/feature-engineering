@@ -196,8 +196,20 @@ it('shows an unsendable facet without pretending it can be selected', () => {
 // stylesheet is the artifact under test.
 it('keeps the redesign’s facet rules off every other screen’s .facet-group', () => {
   const css = readFileSync('src/index.css', 'utf8')
-  const redesign = css.slice(css.indexOf('catalog search (2026-08-16 redesign)'))
-  expect(redesign).toBeTruthy()
-  expect(redesign).not.toMatch(/^\s*\.facet-group(-title)?\s*[,{]/m)
-  expect(redesign).toMatch(/\.facet-panel \.facet-group \{/)
+  const BANNER = 'catalog search (2026-08-16 redesign)'
+  // Asserted BEFORE slicing: indexOf returns -1 when the banner is gone or renamed, and
+  // `css.slice(-1)` is a one-character string that is truthy and matches no selector — every
+  // assertion below would then pass while checking nothing at all.
+  expect(css).toContain(BANNER)
+  // Comments are stripped first: the block DISCUSSES this class in prose (it has to — the reason
+  // for the scoping is the point), and prose is not a selector.
+  const rules = css.slice(css.indexOf(BANNER)).replace(/\/\*[\s\S]*?\*\//g, '')
+
+  // Anywhere in a selector list, not just at the start of a line: `.hit-actions, .facet-group {`
+  // leaks exactly as badly as a bare rule does, and a start-of-line anchor would wave it through.
+  // The lookbehind is what keeps the SCOPED forms out of the match — an ancestor or a combinator
+  // immediately before the class is the only legitimate way this block may name it, which also
+  // covers `.facet-panel .facet-group-title`.
+  expect(rules).not.toMatch(/(?<![\w.>+~-] )\.facet-group\b/)
+  expect(rules).toMatch(/\.facet-panel \.facet-group \{/)
 })

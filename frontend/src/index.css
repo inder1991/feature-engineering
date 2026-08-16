@@ -7880,12 +7880,17 @@ button.stat:hover {
    Three widths, narrowest last so each block appends to the one above rather than fighting it. */
 
 /* Laptop: the capability column stops competing with the definition for width and moves under it.
-   The actions keep their own column and span both rows, so a hit WITHOUT capability lines (most
-   of them) is unchanged — the second row is simply never created by anything but this span. */
+   The actions keep a column of their own and stay on row 1.
+
+   NO `grid-row: 1 / 3` on the actions. A span DECLARES the second track, so grid creates it on
+   every hit — and `gap: 16px` is charged between adjacent tracks whether or not either holds
+   anything, which would put 16px of dead space under every capability-less row (the common case:
+   no grain, no as-of, no additivity). The span bought nothing anyway, because the row already
+   sets `align-items: start`. With it gone, row 2 exists only when `.hit-capabilities` renders. */
 @media (max-width: 1180px) {
   .rows .row.hit { grid-template-columns: minmax(0, 1fr) auto; }
   .hit-capabilities { grid-column: 1; grid-row: 2; }
-  .hit-actions { grid-column: 2; grid-row: 1 / 3; align-items: start; }
+  .hit-actions { grid-column: 2; }
 }
 
 /* Narrow: one column, actions wrap under the content, facets become a horizontal tray.

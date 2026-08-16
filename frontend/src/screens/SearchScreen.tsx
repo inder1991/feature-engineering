@@ -375,11 +375,19 @@ export function SearchScreen() {
                   rendered exactly when `total > hits.length`, which is exactly when the pager
                   renders too, so it was redundant in 100% of the states it could appear in.
 
-                  NOT a live region any more. Once the slice moved to the pager this line reads
-                  the same "45 assets" on every page of a result set, so announcing it said
-                  nothing about what changed; the announcement now sits on the pager copy, which
-                  is the text that actually changes. */}
-              <p className="micro-label tabular-nums result-count" data-testid="result-count">
+                  Still a live region, and it has to be: a result set that fits on one page renders
+                  NO pager, so the pager's region does not exist and dropping this one left the
+                  commonest result shape of all announcing nothing when a query lands (WCAG 4.1.3).
+                  It does not compete with the pager's region either — a live region whose text is
+                  unchanged does not announce, and this line reads the same "45 assets" on every
+                  page, so paging speaks only through the pager. The one overlap is a new query
+                  that changes the total AND pages: the reader hears the count and then the slice,
+                  which is redundancy rather than silence. */}
+              <p
+                className="micro-label tabular-nums result-count"
+                role="status"
+                data-testid="result-count"
+              >
                 <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
                 {result.total === 1 ? 'asset' : 'assets'}
               </p>
@@ -432,11 +440,11 @@ export function SearchScreen() {
                   THESE facets. "permitted" would claim the read-scoped universe is 42, which is
                   false whenever a filter is active, and would quietly absorb freshness-withheld
                   assets — which are permitted, and which the empty state names separately. */}
-              {/* The live region, because this is the one line on the screen whose text changes
-                  as the reader pages. It sits in the pager rather than on the count line above:
-                  a `role="status"` whose text is identical on every page announces nothing, so
-                  paging was silent for a screen reader. One status node, on the changing text —
-                  the screen does not gain a third. */}
+              {/* A live region, because this is the one line on the screen whose text changes as
+                  the reader pages: the count line above cannot carry that announcement, since its
+                  text is identical on every page and an unchanged region announces nothing. The
+                  two regions are complementary, not competing — this one speaks on a page change,
+                  that one on a new query. */}
               <span className="pager-copy tabular-nums" role="status">
                 Showing {offset + 1}–{offset + result.hits.length} of {result.total} matching assets
               </span>

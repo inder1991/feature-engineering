@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -169,11 +169,19 @@ it('says which slice of the whole set is on screen', async () => {
 
 // Paging is a SILENT change for a screen reader unless the text that changes sits in a live
 // region. Collapsing the two slice statements into one left the survivor — the pager copy —
-// outside any live region, while the count line that still carried role=status read the same
-// "45 assets" on every page. The announcement has to live where the changing text lives.
+// outside any live region, while the count line reads the same "45 assets" on every page. The
+// announcement has to live where the changing text lives.
+//
+// Scoped to the pager: a multi-page result set carries TWO live regions (the count, which speaks
+// on a new query, and this one, which speaks on a page change), so an unscoped getByRole('status')
+// would throw on the ambiguity rather than pin either of them.
+function pagerRegion(): HTMLElement {
+  return within(screen.getByRole('navigation', { name: 'Result pages' })).getByRole('status')
+}
+
 it('announces the new slice to a screen reader when the reader pages', async () => {
   await mount()
-  const region = screen.getByRole('status')
+  const region = pagerRegion()
   expect(region).toHaveTextContent('Showing 1–20 of 45 matching assets')
 
   searchCatalog.mockResolvedValue(page(20, 20, 45))
@@ -182,6 +190,18 @@ it('announces the new slice to a screen reader when the reader pages', async () 
 
   // The SAME node, re-read: a live region that unmounts and remounts is not reliably announced,
   // so node identity is part of the contract, not an incidental detail of this render.
-  expect(screen.getByRole('status')).toBe(region)
+  expect(pagerRegion()).toBe(region)
   expect(region).toHaveTextContent('Showing 21–40 of 45 matching assets')
+})
+
+// The count line keeps its own region, and keeps it UNCONDITIONALLY: a role that appeared only on
+// a multi-page set would mount a fresh region at the single-page → multi-page transition, and a
+// region that arrives already populated is not reliably announced at all.
+it('keeps the count line a live region beside the pager’s', async () => {
+  await mount()
+  const count = screen.getByTestId('result-count')
+  expect(count).toHaveAttribute('role', 'status')
+  expect(count).toHaveTextContent(/^45 assets$/)
+  // Two, and exactly two, in the successful multi-page state — the count and the pager copy.
+  expect(screen.getAllByRole('status')).toHaveLength(2)
 })
