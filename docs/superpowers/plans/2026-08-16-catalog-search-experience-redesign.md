@@ -2030,6 +2030,13 @@ Append to the search block in `frontend/src/index.css`:
   .results-toolbar { flex-direction: column; align-items: flex-start; gap: 4px; }
 }
 
+/* The search field's wrap basis. Task 6 set `.search-field { flex: 1 }` (= `1 1 0%`), which never
+   wraps and shrinks the field instead; the basis it replaced put the field's hypothetical size at
+   320px so the Search button wrapped onto its own line on a narrow container. Restore the basis —
+   this is the only reason the row wraps at all, and `.search-input`'s old `flex: 1 1 320px`
+   (index.css:3727) is now inert because the input is no longer a flex child. */
+.search-field { flex: 1 1 320px; }
+
 /* Motion: the popover is the only thing that animates, and only when motion is welcome. */
 @media (prefers-reduced-motion: no-preference) {
   .hit-overflow-items { animation: hit-overflow-in 150ms cubic-bezier(0.22, 1, 0.36, 1); }
@@ -2039,6 +2046,31 @@ Append to the search block in `frontend/src/index.css`:
   }
 }
 ```
+
+- [ ] **Step 3b: Close the three accessibility items routed here from earlier tasks**
+
+Each was found by an earlier task's review, judged to belong in this sweep rather than mid-task, and
+would otherwise be lost — they are not optional.
+
+1. **Paging is no longer announced.** Task 5's ruling collapsed two duplicate slice statements into
+   one, which left the surviving statement — `.pager-copy`, inside `<nav aria-label="Result pages">`
+   — with no live region, while the `role="status"` count line now reads the same "45 assets" on
+   every page. Before the collapse the live region's text changed per page and was announced. Move
+   the announcement to where the changing text now lives: put `role="status"` on the pager copy
+   (dropping it from the count line, so the screen does not gain a third status node). Write the
+   test first: page forward and assert the announced text names the new slice.
+
+2. **`/` orphans an open row-overflow popover.** `RowOverflow` (`SearchHitRow.tsx`) closes on Escape
+   and on an outside `pointerdown`, but not on focus loss — so pressing `/` with focus inside an
+   open popover moves focus to the search field while the popover stays open, floating over the row.
+   Add close-on-`focusout` (guard it so moving focus *between* items inside the popover does not
+   close it), and update the component's contract docblock, which currently names only two exits.
+
+3. **The overflow pattern is undocumented.** Tasks 1 and 2 each amended `frontend/DESIGN.md` when
+   they introduced a durable rule; Task 3 introduced a reusable overflow disclosure (panel radius,
+   `--shadow`, 32px/13px item lines, deliberately NOT an ARIA menu) and documented nothing. Add one
+   entry to DESIGN.md's `## Components` in the existing voice, including the reason it is a
+   disclosure rather than a menu: `role="menu"` promises arrow-key roving this does not implement.
 
 - [ ] **Step 4: Verify the contrast and focus claims by hand**
 
