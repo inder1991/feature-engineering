@@ -1,16 +1,17 @@
 # V2 as the feature language, on shared execution
 
-**Date:** 2026-08-16 · **Revision 15** — a **plan-vs-code audit**: every factual claim in §0.1 was
+**Date:** 2026-08-16 · **Revision 16** — S0.5 folded in at task level. Revision 15's **plan-vs-code audit**: every factual claim in §0.1 was
 checked mechanically against the tree rather than re-read. **39 claims tested; 33 held as written;
 2 blockers and 4 accuracy errors were found and are fixed below.** The audit method and its results
 are recorded in §0.0 so the next review can re-run it rather than re-derive it.
 
 Revision 14's own framing stands and is repeated, because it is the most important sentence here:
 
-> **This file is the PROGRAMME, not an implementation plan.** It has no per-stage file ownership,
-> migration numbers, contract schemas, backfills or test commands. **S0.5 becomes its own
-> contract-freeze plan; only when that lands does S1 get a task-level plan.** Nothing below is
-> executable as written, and it should not pretend to be.
+> **S0.5 is now task-level; S1–S12 remain programme-level [R16].** The eighth review asked for a
+> separate contract-freeze plan. It is folded in here instead, as **§S0.5's fourteen tasks with file
+> paths, reserved migrations and the repo's own gate commands** — one document, so a contract and
+> the stage that consumes it cannot drift apart. **S1–S12 are still programme-level and are not
+> executable as written**; each gets a task-level pass when S0.5 lands.
 
 > **V1 remains the stable compatibility language. V2 becomes the intelligent, policy-aware language
 > for all new features. LLMs create and enrich V2 formulas; a deterministic V2 compiler resolves
@@ -287,145 +288,88 @@ Also: the migration ledger.
 > appears in the frozen exemplar; the FX branch chosen and its tasks written; the ledger's CI test
 > fails on the seven collisions unless grandfathered.
 
-### S0.5 — freeze the load-bearing contracts *(→ its own plan file [R14])*
+### S0.5 — freeze the load-bearing contracts *(task level [R16])*
 
-**Do not begin S1 until these are frozen.** Eight revisions have each designed a stage against an
+**Do not begin S1 until every task here is green.** Ten revisions each designed a stage against an
 interface that did not fit.
+
+**Conventions, from this repo:** Python gate `make test` (`uv run pytest -q`), plus `make lint`,
+`make format-check`, `make typecheck`. Frontend gate — from `frontend/` — `npm run typecheck`
+(`tsc -b`, **never** `tsc --noEmit`), `npm test` (`vitest run`), `npx oxlint`. JSON Schemas follow
+`src/featuregen/formula/proposal_v{n}.schema.json`.
+
+**Migration reservations.** Highest today is **1071**; prefixes already collide at 0973, 0974, 1034,
+1036, 1037, 1038, 1040. S0 records these in the ledger; **the stage that needs the table writes it**:
+
+| # | Table | Written at |
+|---|---|---|
+| 1072 | feature definition · selection revision · build declaration | S1 |
+| 1073 | authoring work item (generalized) + backfill | S1 |
+| 1074 | build set · derived group · staged group output | S2 |
+| 1075 | policy realization revision + current pointer | S3 |
+| 1076 | artifact file manifest | S6 |
+| 1077 | operator execution proof | S7 |
+| 1078 | verification request/attempt/result · verified output revision | S8 |
+| 1079 | publication request/attempt | S9 |
 
 #### A · Authoring contracts
 
-- **Schema-2 compatibility** — its own parser, model and canonical projection emitting the **exact
-  old bytes**.
-- **Schema-3, with the complete producer/reader matrix [R14].** Revision 13 named parser, model and
-  canonicalizer. Also required: `parse_versioned` dispatch (it accepts **1 and 2 only**) · the author
-  prompt · turn schema · frozen configuration · replay restoration · result candidate union · recipe
-  egress · expectation schema · **WORM trace compatibility**.
-- **`SemanticRowSelectionV1(kind, role, semantic_value)`** on `AggregateExpressionV2` — the artifact
-  the compiler reads — and on the expectation types. **No `policy_ref`** (rule 14);
-  `AuthorityRefsV2.direction_policy_ref` is sole owner, with a schema-3 coherence rule requiring a
-  direction policy whenever a selection exists.
-- **`ReviewOutcomeV2`, a sum type [R14]:**
-  ```
-  ReviewOutcomeV2 = CriticExecutedV2(status, findings_hash)
-                  | ReviewedBlueprintBypassV2(blueprint_revision, expectation_hash)
-  ```
-  With **V2-specific axes and result** rather than reusing `AuthoringResultV2`'s mandatory
-  `critic_status`. The existing fold is preserved for critic-executed cases; a bypass is neutral
-  **only when the exact blueprint revision and expectation match**. Add the replay transition and
-  checkpoint reconstruction; **bump disposition, orchestrator and replay protocol versions**; keep
-  old trace readers compatible.
-- **Three identity records, not one [R14]** — revision 13's `SelectedFeatureRevision` owned an
-  `executable_revision_id` before executable semantics existed, which is circular:
-
-  | Record | Owns | Created |
-  |---|---|---|
-  | `FeatureDefinitionV1` | stable semantic key · stable physical output column name · **target-neutral** | first authoring |
-  | `FeatureSelectionRevisionV1` | exact suggestion/option **+ `intent_id` · target logical ref · target window days and type · target-reading provenance · immutable target-reading content hash** — immutable | user selection |
-  | `ExecutableFeatureRevisionV2` | authored formula · **executable** output policy · physical bindings · realization set · compilation identity | after S4/S5 |
-
-  The definition stays **target-neutral** so one reusable feature serves many use cases; the
-  selection is **target-specific**. A governed contract may reference the executable revision later.
-  **Executable work is never identified by "latest feature with this name".**
-- **Output authority splits in two (rule 2) [R14]:** S1 emits **`AuthoredOutputIntentV2`** — expected
-  unit, additivity, whether conversion is required, the declared ref. S4 emits
-  **`ExecutableOutputPolicyV2`** — actual target currency, logical and physical type, precision,
-  scale, rounding, nullability, additivity. **Expectation preservation is re-checked against the
-  executable output, and only the S4 policy may enter the materialization contract.**
+| Task | Deliverable | Gate |
+|---|---|---|
+| **C-A1** | `proposal_v2.schema.json` **frozen**: its own parser, model and canonical projection emitting the exact pre-change bytes. `_plain_v2` walks every dataclass field, so v2 gets a projection that ignores v3-only fields. | a test serializes every `tests/featuregen/formula/gold_fixtures/*.json` and `gold_v2/*.json` and asserts **byte equality** with the committed file |
+| **C-A2** | `proposal_v3.schema.json` + `parse_v3`, and `parse_versioned` extended — it accepts **1 and 2 only** today | `parse_versioned({"formula_schema_version": 3, …})` returns a v3 proposal; an unknown version still refuses loudly |
+| **C-A3** | `SemanticRowSelectionV1(kind, role, semantic_value)` on **`AggregateExpressionV2`** *(schema_v2.py — the artifact the compiler reads)* and on `ExpressionRoleExpectationV2` / `BoundExpressionExpectationV2` *(recipe_formula_contracts_v2.py)*. **No `policy_ref`** | a v3 proposal with a selection parses; the same selection on a v2 proposal refuses; `UNAUTHORED_FILTER` behaviour is unchanged for `filter` |
+| **C-A4** | Schema-3 coherence rule: **a direction selection requires `AuthorityRefsV2.direction_policy_ref`** (rule 14 — one owner) | a selection without the ref refuses by name; a selection whose ref is present passes |
+| **C-A5** | `ReviewOutcomeV2 = CriticExecutedV2(status, findings_hash) \| ReviewedBlueprintBypassV2(blueprint_revision, expectation_hash)`, with **V2-specific axes** — `AuthoringResultV2` carries a mandatory three-member `critic_status` and cannot say the critic did not run | a bypass round-trips the replay trace **with no `CRITIC_COMPLETED` event and no `critic_status`**; a critic-executed run folds exactly as today |
+| **C-A6** | `REVIEW_BYPASSED` replay transition + checkpoint reconstruction; **bump disposition, orchestrator and replay protocol versions**; old trace readers still read old traces | an existing recorded trace replays unchanged; a bypass trace replays; version constants moved and asserted |
+| **C-A7** | Three identity records — `FeatureDefinitionV1` (stable key + stable output column, **target-neutral**), `FeatureSelectionRevisionV1` (**immutable**; `intent_id` · target logical ref · target window days and type · target-reading provenance · target-reading content hash), `ExecutableFeatureRevisionV2` (created after S4/S5) | a selection is constructible **without** an executable revision; the definition carries no target; a governed contract is optional |
+| **C-A8** | Output authority splits: `AuthoredOutputIntentV2` (S1) vs `ExecutableOutputPolicyV2` (S4). **Only the executable policy may enter the contract** | a non-empty `currency_conversion_ref` yields an **intent**, never a certified `converted:<ref>` currency |
 
 #### B · Execution contracts
 
-- **`AuthorizedCompilationV2` · `MaterializationContractV2` · `FeatureGroupPlanV2` ·
-  `CompilationIdentityV2`**, and a **V2 renderer entry point** onto language-neutral machinery.
-- **`FullReadSetLeakageGateV2` [R14]**, deterministic, **after policy planning and before Gate 2**,
-  inspecting formula operands and filters · policy reads · join keys · reversal and FX inputs ·
-  temporal and availability columns · population-spine reads.
-- **The complete Gate-2 read set.** **`SpineSpec.read_set` is already unioned into Gate 2** —
-  *"Gate 2 (§1.3) authorizes it together with every expression's read set, as one group-wide
-  decision"* **[R15 — A4]**. Revision 14 said "formula + policy + spine" as if all three were
-  missing; **only the policy reads are.**
-- **Per-read temporal semantics** (rule 15); input snapshots derive independently for transaction,
-  reversal and FX reads; contract availability is their union.
-- **The pilot physical-type policy, defined** — `formula-v2/physical-types@1` must state
-  `SUM(amount × booking_rate)` completely: amount precision and scale · intermediate precision ·
-  where rounding occurs · SUM precision growth · overflow · whether float operands refuse ·
-  nullability after the empty-window policy. **`empty_window` already decides nullability in V1**
-  (`physical_types.py`: `if expr.window.empty_window is EmptyWindowResult.NULL`), so V2 **mirrors an
-  existing rule rather than inventing one [R15 — A6]**, and `ExecutableOutputPolicyV2` carries the
-  resulting nullability.
-- **`BuildDeclarationV1` split from `EnvironmentInventoryObservationV1` [R14]** — an environment id
-  is a **declaration**; cluster inventory is a **captured observation**. Only the observation enters
-  artifact and execution identity.
-- **The exact refusal vocabulary**, including `POLICY_INTERVAL_UNSUPPORTED`.
+| Task | Deliverable | Gate |
+|---|---|---|
+| **C-B1** | `AuthorizedCompilationV2` · `MaterializationContractV2` · `FeatureGroupPlanV2` · `CompilationIdentityV2` *(new modules beside `materialize/ir.py`, `contract.py`, `group_plan.py`)*. V1's `physical_type_policy_version` is an `int` and its Gate-2 token carries `FormulaExecutionIRV1` | V1 types, signatures and canonical bytes **unchanged**; a V2 IR cannot construct a V1 token |
+| **C-B2** | V2 renderer entry point reusing language-neutral machinery — rendered nodes, wiring validation, sealing, staging, output gates | the V2 path reaches sealed bytes; **no V1 renderer signature changes** |
+| **C-B3** | `FullReadSetLeakageGateV2` — deterministic, **after policy planning, before Gate 2** — over formula operands and filters · policy reads · join keys · reversal and FX inputs · temporal and availability columns · spine reads. Today `feature_assist` screens `target_ref in derives` **only** | a mutation replacing a policy status or direction column with the target ref **refuses compilation** |
+| **C-B4** | Gate-2 union extended with **policy reads**. `SpineSpec.read_set` is **already** unioned *(A4)* — this adds the missing half | removing the FX table from authorization while retaining it in the operator graph refuses |
+| **C-B5** | Per-read temporal semantics: the formula window stays on the expression; **every physical read/operator edge carries its own spec**; snapshots derive independently for transaction, reversal and FX; contract availability is their **union** | a post-cutoff FX knowledge time refuses; a post-cutoff reversal refuses; the three snapshot sets are separately addressable |
+| **C-B6** | `formula-v2/physical-types@1` — a truth table defining **`SUM(amount × booking_rate)` completely**: amount precision and scale · intermediate precision · where rounding occurs · SUM precision growth · overflow · whether float operands refuse · nullability. **`empty_window` already decides nullability in V1** *(A6)* — mirror it | every row of the table is asserted; a float operand refuses; the V1 rule and the V2 rule agree where they overlap |
+| **C-B7** | `BuildDeclarationV1` (declaration) split from `EnvironmentInventoryObservationV1` (**captured observation**). Only the observation enters artifact and execution identity | a declaration is constructible without an inventory; identity moves when the observation moves, not when the declaration does |
+| **C-B8** | The refusal vocabulary, including `POLICY_INTERVAL_UNSUPPORTED` | every new refusal has a name, a test and a message naming the remedy |
 
 #### C · Policy contracts
 
-- **`derive_policy_occurrences(formula, bound_inputs)`**, replacing the wiring of
-  `required_policy_kinds()` — whose broad booleans assert rules that are not generally true and which
-  cannot name an expression path, physical source or semantic role.
-- **Realization identity, separated from currency [R14]:**
-  ```
-  family key      = policy ref + physical dataset binding + environment/source
-  revision        = immutable executable content hash
-  current pointer = CAS-managed, SEPARATE from revision identity
-  applicability   = the pilot revision is explicitly TIMELESS for that binding
-  ```
-  **If a known effective change intersects the requested window, refuse
-  `POLICY_INTERVAL_UNSUPPORTED`** rather than silently picking one. Effective-dated realization sets
-  are deferred, not assumed. **The mutable `eligibility_store` upsert cannot sit on the V2 execution
-  path** — it clears prior confirmations and overwrites history.
-- **LLM proposal admissibility** (rule 16's four-way table).
-- **Policy-literal evidence [R14]** — `D`, `POSTED`, reversal flags and currency codes are linked to
-  bounded profile or source evidence **where available**; where only the LLM supports them they stay
-  usable but explicitly `LLM_PROPOSED` and **are not called evidence-validated**.
-- **Typed operator-subgraph requirements:**
-  ```
-  FX:               as-of/temporal join · duplicate-rate gate · missing-rate gate
-                    · optional inversion · decimal conversion · connected result path
-  LINKED_REVERSAL:  as-of row population · original/reversal linkage · ambiguity gate
-                    · survivor/neutralization operator · connected result path
-  ```
-- **Topology-derived coverage validation** over them.
+| Task | Deliverable | Gate |
+|---|---|---|
+| **C-C1** | `derive_policy_occurrences(formula, bound_inputs)` from the authored selection · explicit authority ref · bound physical source · expression path · grain transition · **actual** need for conversion. `required_policy_kinds()` stays a compatibility helper | a country filter requires **no** reversal policy; an end-of-day balance requires **no** direction policy; **an operand whose C1 facts are not `monetary`/`per_row` requires no currency occurrence** *(A1)* |
+| **C-C2** | Realization identity split — **family key** (`policy ref + dataset binding + environment/source`) · **revision** (immutable content hash) · **current pointer** (CAS, separate). Pilot revisions are **timeless**; a window intersecting a known change refuses `POLICY_INTERVAL_UNSUPPORTED`. **The mutable `eligibility_store` upsert is off the V2 path** — it clears prior confirmations | two revisions with identical executable fields produce one `ir_hash`; a pointer move does not; no V2 path writes through the upsert |
+| **C-C3** | LLM admissibility (rule 16's four-way table) | source beats LLM with a **retained visible conflict**; two governed declarations refuse; two LLM-only refuse; one valid LLM-only is usable and marked `LLM_PROPOSED` |
+| **C-C4** | Policy-literal evidence — `D`, `POSTED`, reversal flags, currency codes linked to bounded profile/source evidence where available, else `LLM_PROPOSED` and **not called evidence-validated** | a literal with no supporting evidence is labelled, not silently accepted |
+| **C-C5** | Typed operator-subgraph requirements — **FX**: as-of join · duplicate-rate gate · missing-rate gate · optional inversion · decimal conversion · connected path. **LINKED_REVERSAL**: as-of row population · linkage · ambiguity gate · survivor operator · connected path | each requirement is a named constant with a test |
+| **C-C6** | Topology-derived coverage validation over C-C5 (rule 3) | **deleting the duplicate-rate gate refuses even with `realizes_occurrences` intact on the multiplication operator** |
 
 #### D · Verification and publication contracts
 
-- **`VerificationExecutionIdentityV1`:** generated project hash · compilation and group identity ·
-  environment and inventory · `business_dt` · exact run parameters · input observations ·
-  `verification_check_set_hash`. **No publication attestation.** Identity, generated system columns,
-  run parameters and persistence change **together**.
-- **Staging system columns and manifests.**
-- **The versioned check set** — exact result schema per check · which columns must be non-null ·
-  feature-null rules from the output policy · spine completeness and uniqueness · join
-  orphan/amplification · **which external requirement each check may satisfy** · the check-set hash.
-- **`VerifiedOutputRevisionV1`**, including `verification_check_set_hash` and validator versions.
-- **The artifact file manifest's byte contract, extending `GENERATED.lock` [R15 — A5].**
-  `GENERATED.lock` already carries `generated_project_hash` computed over the rendered bytes, and
-  §7 deliberately excludes it from every other generated file. **Extend that discipline to
-  per-file entries** — ordered path · SHA-256 · byte length · media type — plus an immutable blob
-  pointer and **byte verification before retrieval and before execution**. Do not invent a second
-  hashing scheme beside it.
-- **`OperatorExecutionProofV1` pins its world [R14]:** capability/subgraph signature and its
-  version · **compiler and renderer versions** · physical-type policy · operator-topology
-  requirement version · **gold corpus hash** · mutation/check-set version · **development runtime
-  family and versions**. At use time a **separate environment-compatibility decision** checks the
-  target inventory.
-- **Environment scoping, on the two tables that decide what is current [R15 — A3]** —
-  **`group_binding`** (migration 1034, `UNIQUE(logical_group_name)`) and
-  **`feature_active_revision`** (migration 1055, `(logical_group_name, seq)`). Environment is
-  already first-class elsewhere in 1034, so this is **extending an existing concept to two tables
-  that lack it**, not introducing one. Either scope this release explicitly to one sandbox
-  environment, or key both by `(environment_id, logical_group_name)`.
-- **The group-name allocator, completely** — truncation, reserved suffix length, collision extension,
-  ≤ 128 chars.
-- **Active-revision compare-and-set.**
-- **The action matrix of §0.3**, frozen here and implemented in S2.
+| Task | Deliverable | Gate |
+|---|---|---|
+| **C-D1** | `VerificationExecutionIdentityV1` — generated project hash · compilation and group identity · environment and inventory · `business_dt` · run parameters · input observations · `verification_check_set_hash`. **No publication attestation.** Decide `__verification_execution_hash` vs a versioned alias — `prepare_run` requires `capability_attestation_id` and generated outputs carry `__sandbox_execution_hash`, so identity, system columns, run parameters and persistence change **together** | the identity is constructible with **no attestation**; a V1 `sandbox_execution_hash` still requires one |
+| **C-D2** | The versioned check set — result schema per check · non-null columns · feature-null rules from the output policy · spine completeness and uniqueness · join orphan/amplification · **which of the eight external requirements each check may satisfy** · the check-set hash | a keys/types check does **not** satisfy `JOIN_CONNECTIVITY`; the hash moves when any check changes |
+| **C-D3** | `VerifiedOutputRevisionV1` incl. `verification_check_set_hash` and validator versions | a pass whose check-set hash predates the current validator reads **stale** |
+| **C-D4** | Artifact file manifest **extending `GENERATED.lock`** *(A5)* — ordered path · SHA-256 · byte length · media type · immutable blob pointer · **byte verification before retrieval and before execution** | a file whose digest does not match is neither served nor executed; `generated_project_hash` is unchanged |
+| **C-D5** | `OperatorExecutionProofV1` pins capability/subgraph signature and version · **compiler and renderer versions** · physical-type policy · topology requirement version · **gold corpus hash** · check-set version · **development runtime family and versions** (inventory records **eight**: hive, spark, metastore, python, java, pyspark, kedro, kedro_datasets). Environment compatibility is a **separate use-time decision** | a renderer version bump invalidates the proof; a development proof never satisfies a user verification |
+| **C-D6** | Environment scoping on the two tables that decide what is current — **`group_binding`** (1034) and **`feature_active_revision`** (1055). `environment_id` is already first-class elsewhere in 1034 | either one declared sandbox environment, or both keyed `(environment_id, logical_group_name)`, asserted |
+| **C-D7** | Group-name allocator — truncation · reserved suffix length · collision extension · **≤ 128 chars** (Hive) | a pathological base name still yields a legal, collision-free, deterministic name |
+| **C-D8** | Active-revision **compare-and-set** — `publish_sandbox(verified_output_revision_id, expected_active_revision_id)`. 1055's trigger stops concurrent double-wins, **not** a stale verification published later | publishing an **older** verified output over a newer active revision refuses |
+| **C-D9** | The §0.3 action matrix, frozen — and **`RECIPE_REVIEW_NOT_CURRENT` / `PROPOSED_METADATA_ONLY` / `EXECUTION_AUTHORITY_UNMET` removed from generate and verify**. Removing `require_confirmer` alone leaves a non-admin refused | a non-admin with `feature:generate` and AI-proposed metadata generates; the same identity cannot publish |
 
-> **Acceptance:** every contract has a frozen schema with a pinned hash and a test that fails if a
-> field is added without updating it; **schema-2 fixtures serialize byte-for-byte identically**; a
-> reviewed-blueprint bypass round-trips through the replay trace **without a critic event and without
-> a fabricated `critic_status`**; V1 hashes, canonical bytes, signatures and contract types
-> untouched; the `posted_debit_amount` blueprint derives a direction-selecting expectation and
-> blueprint, fixture and expected rows agree; `EXPECTED_OUTCOMES` re-measured and re-pinned with the
-> delta explained.
+> **Acceptance (S0.5 as a whole):** every contract has a frozen schema with a pinned hash and a test
+> that fails if a field is added without updating it; **`make test`, `make lint`, `make typecheck`
+> green, and from `frontend/` `npm run typecheck`, `npm test`, `npx oxlint` green**; schema-2
+> fixtures serialize **byte-for-byte** identically; V1 hashes, canonical bytes, signatures and
+> contract types untouched; the `posted_debit_amount` blueprint derives a **direction-selecting**
+> expectation and blueprint, fixture and expected rows agree in the **production ref format**;
+> `EXPECTED_OUTCOMES` re-measured and re-pinned with the delta explained.
 
 ### S1 — deterministic V2 authoring
 
@@ -690,5 +634,9 @@ would test nothing; and S0's reconciliation gains a fourth axis, the ref namespa
 exemplar is written in a prefix that exists only in tests. Four accuracy errors were corrected
 against the tree — a table name that does not exist, a Gate-2 union that is already half-built, a
 file-hash discipline that already exists, and a nullability rule V2 should mirror rather than invent.
+
+**S0.5 is folded in rather than spun out**, so a contract and the stage consuming it live in one
+file and cannot drift. Its 31 tasks carry file paths, reserved migrations 1072–1079 and this repo's
+own gate commands. **S1–S12 stay programme-level** and each needs its own task-level pass.
 
 **No duration estimate.** Twelve revisions have now carried one that a review invalidated.
