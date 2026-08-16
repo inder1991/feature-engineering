@@ -45,6 +45,7 @@ from featuregen.formula.author import (
     AUTHOR_TASK,
     AUTHOR_TURN_CONTRACT_V1,
     AUTHOR_TURN_CONTRACT_V2,
+    run_tool,
 )
 from featuregen.formula.authoring_v2 import (
     AUTHORING_VERSIONS_V2,
@@ -140,7 +141,10 @@ def _run(db, raw: dict | None = None, *, findings=None, intent: AuthoringIntent 
         db, intent,
         author if author is not None else _author_client(raw if raw is not None else _raw_v2()),
         critic if critic is not None else _critic_client(findings),
-        roles=roles, actor=_ACTOR)
+        # C-A8 — STATED, not inherited. These tests reached `run_tool` (the V1 set) by omitting the
+        # kwarg; the seam now refuses omission, so the tool set is written down. Behaviour is
+        # unchanged — what changed is that it is visible.
+        roles=roles, actor=_ACTOR, tool_runner=run_tool)
 
 
 def _events(db, run_id: str) -> list[tuple]:

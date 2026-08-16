@@ -248,6 +248,26 @@ const BRANCH = Array.from({ length: 8 }, (_, i) => bridge({
   production_eligibility_code: 'cardinality_unresolved',
 }))
 
+// Three candidates for the same entity that the ranker CAN separate. Shaped after the live
+// `customer` group, where cif_id scores 11, counter_party_cif_id scores 10, and one member is
+// already endorsed — the ordinary end state of a settled cross-product.
+const RANKED: api.GovernanceQueueItem[] = [
+  { key: 'cif_id', strength: 11, endorsed: false },
+  { key: 'counter_party_cif_id', strength: 10, endorsed: false },
+  { key: 'legacy_cif_id', strength: 0, endorsed: true },
+].map(({ key, strength, endorsed }) => bridge({
+  fact_key: `fact:entity_bridge:customer:${key}`,
+  subject: `cib.cust_dly.cust_num <-> ftr.tran_dly.${key}`,
+  detail: bridgeDetail({
+    entity_id: 'customer',
+    right: { catalog_source: 'ftr', schema: 'public', table: 'tran_dly', column: key },
+    strength,
+  }),
+  ...(endorsed
+    ? { state: 'Human endorsed', state_code: 'human_endorsed', available_actions: [] }
+    : {}),
+}))
+
 beforeEach(() => {
   getGovernanceQueue.mockReset()
   getGovernanceQueue.mockResolvedValue(queue())
@@ -343,17 +363,27 @@ describe('governance review — the decision queue', () => {
     )
   })
 
-  it('opens with the purpose line: the system proposes, a person disposes', async () => {
-    getGovernanceQueue.mockResolvedValue(FULL)
-    render(<GovernanceReviewScreen />)
-    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
-    const purpose = screen.getByTestId('gq-purpose')
-    expect(purpose).toHaveTextContent(/only a person can make/i)
-    expect(purpose).toHaveTextContent(/proposes/i)
-    expect(purpose).toHaveTextContent(/dispose/i)
-    // Confirmation means agreement with a semantic relationship, never permission to execute.
-    expect(purpose).toHaveTextContent(/agrees/i)
-  })
+  it('opens by saying why this is worth doing today, not what confirming philosophically means',
+    async () => {
+      // The old preamble spent 65 words establishing that confirming "is not a switch" and that
+      // "nothing here is held back pending your say-so" — i.e. it opened by telling the reviewer
+      // their decision changes nothing and nothing waits on it, then asked for fifteen decisions.
+      // The fact underneath is real and is the REASON to act, not a disclaimer: the platform is
+      // already using every one of these links, unreviewed. That is what goes at the top. What
+      // confirming records is said in the confirm panel, at the moment it is being done.
+      getGovernanceQueue.mockResolvedValue(FULL)
+      render(<GovernanceReviewScreen />)
+      await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+      const purpose = screen.getByTestId('gq-purpose')
+
+      expect(purpose).toHaveTextContent(/already using these relationships/i)
+      expect(purpose).toHaveTextContent(/does not switch anything on/i)
+      // The archaic half of "the system proposes and you dispose" is gone: to a modern reader
+      // "dispose" reads as "throw away", so the sentence explaining the reviewer's role suggested
+      // they discard things.
+      expect(purpose.textContent ?? '').not.toMatch(/dispose/i)
+      expect(purpose.textContent ?? '').not.toMatch(/held back pending/i)
+    })
 
   it('answers "what needs me" in a summary strip before any detail', async () => {
     getGovernanceQueue.mockResolvedValue(FULL)
@@ -361,9 +391,68 @@ describe('governance review — the decision queue', () => {
     const summary = await screen.findByTestId('gq-summary')
     expect(summary).toHaveTextContent('3')
     expect(summary).toHaveTextContent(/waiting for a person/i)
-    // Scope-honest: the counts describe what THIS operator can see, never a catalog total.
-    expect(screen.getByTestId('gq-scope-note'))
-      .toHaveTextContent(/scope-relative|what you can see/i)
+  })
+
+  it('explains the catalog arithmetic that is actually confusing, and nothing else', async () => {
+    // The old note spent 22 words on "every count here is scope-relative — never a catalog total",
+    // a misreading nobody makes, in the read-scope subsystem's own vocabulary, one line above chips
+    // that already named the catalogs. Meanwhile the real trap sat unexplained underneath it: a
+    // cross-catalog link belongs to BOTH its catalogs, so on the live queue the chips read
+    // CIB (13) and FTR (16) over sixteen decisions. 13 + 16 = 29.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+
+    expect(screen.queryByText(/scope-relative/i)).toBeNull()
+    const note = screen.getByTestId('gq-catalog-arith')
+    expect(note).toHaveTextContent(/belongs to both/i)
+    expect(note).toHaveTextContent(/3 decisions/i)
+  })
+
+  it('says nothing about catalog arithmetic when no decision spans two catalogs', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [grain()], items_visible_to_you_by_kind: { grain: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId(`row-${grain().fact_key}`)
+    expect(screen.queryByTestId('gq-catalog-arith')).toBeNull()
+  })
+
+  it('keeps the summary strip to one question, and leaves the kinds to the chips', async () => {
+    // Ten identical tiles used to sit here over TWO denominators: four counting decisions by
+    // status (15 waiting) and six counting them by kind (13 + 3), so reading across the row and
+    // adding produced a number that means nothing. Six of the ten read zero. The strip answers
+    // "what needs me"; the chips already answer "of what kind", right below it.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    const summary = await screen.findByTestId('gq-summary')
+
+    expect(within(summary).getAllByTestId('gq-stat')).toHaveLength(3)
+    expect(summary).toHaveTextContent(/waiting for a person/i)
+    expect(summary).toHaveTextContent(/you can decide/i)
+    // No kind names in the strip — that is the chips' job, and duplicating it is what put the
+    // same number on screen twice with two different values.
+    expect(summary).not.toHaveTextContent(/cross-catalog identifier links/i)
+    expect(summary).not.toHaveTextContent(/discovered joins/i)
+    // The chips still carry every kind, including the ones with nothing waiting.
+    expect(within(screen.getByTestId('gq-kind-filter'))
+      .getByRole('button', { name: /as-of date \(0\)/i })).toBeInTheDocument()
+  })
+
+  it('counts the chips over what the filter is showing, not over the whole payload', async () => {
+    // The tiles counted the FILTERED list and the chips counted the unfiltered payload, so one
+    // click made the same quantity appear twice on screen with two different values.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    render(<GovernanceReviewScreen />)
+    const kinds = within(await screen.findByTestId('gq-kind-filter'))
+    expect(kinds.getByRole('button', { name: /discovered joins \(1\)/i })).toBeInTheDocument()
+
+    // FTR holds the bridge and the grain fact; the discovered join is CIB-only.
+    await userEvent.click(
+      within(screen.getByTestId('gq-catalog-filter')).getByRole('button', { name: /^ftr/i }))
+    expect(kinds.getByRole('button', { name: /discovered joins \(0\)/i })).toBeInTheDocument()
+    expect(kinds.getByRole('button', { name: /cross-catalog identifier links \(1\)/i }))
+      .toBeInTheDocument()
   })
 
   it('builds the filter chips from the payload — never from a hardcoded slug list', async () => {
@@ -671,15 +760,18 @@ describe('governance review — available_actions drives the buttons', () => {
     }))
     render(<GovernanceReviewScreen />)
     const blocked = within(await screen.findByTestId('row-fact:entity_bridge:mine'))
-    const confirmButton = blocked.getByRole('button', { name: /^confirm/i })
-    expect(confirmButton).toBeDisabled()
-    // The REASON is on screen, not just an inert grey button.
+    // NOT a dimmed primary button. A withheld confirm used to render as the loudest control on the
+    // card at 55% opacity — on the live catalogs every currency binding is withheld, so the three
+    // most prominent controls on the page were all dead. An action the server does not offer is
+    // not an action, so it is absent and the reason takes its place.
+    expect(blocked.queryByRole('button', { name: /^confirm/i })).toBeNull()
     const why = blocked.getByTestId('gq-action-why')
     expect(why).toHaveTextContent(/proposer/i)
     expect(why).toHaveTextContent('alice@bank')
-    expect(confirmButton).toHaveAttribute('aria-describedby', why.id)
-    // Reject is still offered, because the server still offers it.
+    // Reject is still offered, because the server still offers it — and it is now the only
+    // control here, so what the reviewer CAN do is what they see.
     expect(blocked.getByRole('button', { name: /^reject/i })).toBeEnabled()
+    expect(blocked.getAllByRole('button')).toHaveLength(1)
     // And a row the server DOES offer confirm on is enabled — the difference comes from the
     // payload, never from anything computed here.
     expect(within(screen.getByTestId('row-fact:entity_bridge:customer'))
@@ -694,9 +786,9 @@ describe('governance review — available_actions drives the buttons', () => {
     }))
     render(<GovernanceReviewScreen />)
     const endorsed = within(await screen.findByTestId('row-fact:entity_bridge:customer'))
-    expect(endorsed.getByRole('button', { name: /^confirm/i })).toBeDisabled()
+    // Nothing is on offer, so the row offers nothing — not one dead button and one absent one.
+    expect(endorsed.queryAllByRole('button')).toHaveLength(0)
     expect(endorsed.getByTestId('gq-action-why')).toHaveTextContent(/nothing left to decide/i)
-    expect(endorsed.queryByRole('button', { name: /^reject/i })).toBeNull()
     // And it is NOT counted as work: the bridge listing carries VERIFIED facts too, so a summary
     // built from the list length would claim a decision is waiting when none is.
     const summary = screen.getByTestId('gq-summary')
@@ -718,7 +810,28 @@ describe('governance review — available_actions drives the buttons', () => {
     await waitFor(() => expect(confirmEntityBridge)
       .toHaveBeenCalledWith(FULL.items[0].fact_key, {}))
     await waitFor(() => expect(getGovernanceQueue).toHaveBeenCalledTimes(2))
-    expect(await screen.findByTestId('gq-notice')).toBeInTheDocument()
+    // The outcome lands ON THE ROW that produced it. It used to render directly under the page
+    // purpose — so confirming something near the bottom of an eighteen-screen page painted the
+    // only feedback about twelve thousand pixels above the viewport.
+    expect(await bridgeRow.findByTestId('gq-row-outcome')).toHaveTextContent(/recorded/i)
+    expect(screen.queryByTestId('gq-notice')).toBeNull()
+  })
+
+  it('falls back to the page banner when the decided row has left the queue', async () => {
+    // Rejecting can take the fact out of the open list entirely. There is then no row to carry the
+    // outcome, and silently dropping it would leave the reviewer with no confirmation at all.
+    getGovernanceQueue.mockResolvedValueOnce(FULL).mockResolvedValue(queue({
+      items: [FULL.items[1], FULL.items[2]],
+      items_visible_to_you_by_kind: { entity_bridge: 0, approved_join: 1, grain: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const bridgeRow = within(await screen.findByTestId(`row-${FULL.items[0].fact_key}`))
+    await userEvent.click(bridgeRow.getByRole('button', { name: /^reject/i }))
+    await userEvent.click(bridgeRow.getByRole('button', { name: /not the same entity/i }))
+    await userEvent.click(bridgeRow.getByRole('button', { name: /record my rejection/i }))
+
+    expect(await screen.findByTestId('gq-notice')).toHaveTextContent(/not the same entity/i)
+    expect(screen.queryByTestId(`row-${FULL.items[0].fact_key}`)).toBeNull()
   })
 
   it('routes each kind to its own command and its own reject vocabulary', async () => {
@@ -760,6 +873,10 @@ describe('governance review — the low-value candidate cluster', () => {
     expect(group).toHaveTextContent(/8 candidate links/i)
     expect(group).toHaveTextContent(/branch/i)
     expect(group).toHaveTextContent(/same two facts/i)
+    // The card used to say "Open them if one of the pairs is the right one" — written when the
+    // members were a stack you had to open. They are a comparison now, already on screen.
+    expect(group).toHaveTextContent(/compare them below/i)
+    expect(group.textContent ?? '').not.toMatch(/open them if one of the pairs/i)
     // Collapsed by default: eight rows would BE eight findings on screen.
     expect(within(group).queryAllByTestId(/^row-fact:entity_bridge:branch:/)).toHaveLength(0)
     // Grouped, not hidden — the individual candidates stay reachable in one click.
@@ -877,6 +994,168 @@ describe('governance review — the low-value candidate cluster', () => {
     expect(group.getByRole('button', { name: /show the 8 candidates/i })).toBeInTheDocument()
   })
 
+  it('lays the candidates out as a comparison, not as a stack to scroll', async () => {
+    // A group is a CHOICE. On the live catalogs its members are identical on 51 of 52 rendered
+    // lines, so a reviewer stacking them vertically is diffing 96-character strings from memory.
+    // The card carries one comparison row per candidate, on the closed card, with the shared head
+    // of the subject said once and only the varying part in the row.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+
+    // Visible without opening anything — the full dossiers stay behind "Show the 8 candidates".
+    const table = within(group.getByTestId('gq-compare'))
+    expect(group.queryAllByTestId(/^row-fact:entity_bridge:branch:/)).toHaveLength(0)
+    expect(table.getAllByRole('row')).toHaveLength(BRANCH.length + 1) // + the header row
+
+    // The shared head is context, stated once on the card and never repeated per row.
+    expect(group.getByTestId('gq-compare-shared')).toHaveTextContent('cib.acct_dly.branch_')
+    const first = within(group.getByTestId(`gq-compare-row-${BRANCH[0].fact_key}`))
+    expect(first.getByTestId('gq-compare-varies'))
+      .toHaveTextContent('0 <-> ftr.branch_dly.branch_id')
+    expect(first.getByTestId('gq-compare-varies')).not.toHaveTextContent('cib.acct_dly.branch_')
+  })
+
+  it('puts the fields that separate the candidates in the comparison, not in each dossier',
+    async () => {
+      // `strength` is the ONLY field that ranks one candidate above another, and today it is the
+      // third item of a sub-panel inside each member — so the card a reviewer actually reads shows
+      // only the fields that are identical across the set. The discriminators belong in the table.
+      getGovernanceQueue.mockResolvedValue(queue({
+        items: RANKED, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+      }))
+      render(<GovernanceReviewScreen />)
+      const group = within(await screen.findByTestId('queue-entry'))
+
+      const strong = within(group.getByTestId(`gq-compare-row-${RANKED[0].fact_key}`))
+      expect(strong.getByTestId('gq-compare-rank')).toHaveTextContent(/^11$/)
+      expect(strong.getByTestId('gq-compare-basis')).toHaveTextContent(/declared in two spreadsheets/i)
+      expect(strong.getByTestId('gq-compare-review')).toHaveTextContent(/unreviewed/i)
+
+      const endorsed = within(group.getByTestId(`gq-compare-row-${RANKED[2].fact_key}`))
+      expect(endorsed.getByTestId('gq-compare-rank')).toHaveTextContent(/^0$/)
+      expect(endorsed.getByTestId('gq-compare-review')).toHaveTextContent(/human endorsed/i)
+    })
+
+  it('presents the candidates strongest first, in the table and in the dossiers alike', async () => {
+    // Payload order is insertion order and says nothing about which candidate is likelier. If the
+    // reviewer has to read all five to find the ranked one, the rank column has not helped.
+    const shuffled = [RANKED[2], RANKED[0], RANKED[1]]
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: shuffled, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+
+    const ranks = group.getAllByTestId('gq-compare-rank').map(cell => cell.textContent)
+    expect(ranks).toEqual(['11', '10', '0'])
+
+    // The dossiers behind the disclosure agree with the table, or opening one lands the reviewer
+    // somewhere the comparison did not point.
+    await userEvent.click(group.getByRole('button', { name: /show the 3 candidates/i }))
+    const dossiers = group.getAllByTestId(/^row-fact:entity_bridge:customer:/)
+      .map(node => node.dataset.testid)
+    expect(dossiers).toEqual([
+      `row-${RANKED[0].fact_key}`, `row-${RANKED[1].fact_key}`, `row-${RANKED[2].fact_key}`,
+    ])
+  })
+
+  it('decides a candidate from the comparison, through the same gate as the dossier', async () => {
+    // The table is where the choice is made, so the decision has to start there — but it must not
+    // become a second, ungated way to endorse a semantic claim. Choosing from the table opens that
+    // candidate's confirmation; the agreement it records is still ticked explicitly.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: RANKED, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+
+    const strongest = within(group.getByTestId(`gq-compare-row-${RANKED[0].fact_key}`))
+    await userEvent.click(strongest.getByRole('button', { name: /confirm/i }))
+
+    // Only the chosen candidate opens — the other two stay closed.
+    const opened = within(screen.getByTestId(`row-${RANKED[0].fact_key}`))
+    expect(screen.queryByTestId(`row-${RANKED[1].fact_key}`)).toBeNull()
+
+    // Still gated: the record button is dead until the agreement is ticked.
+    const record = opened.getByRole('button', { name: /record my confirmation/i })
+    expect(record).toBeDisabled()
+    await userEvent.click(opened.getByRole('checkbox'))
+    await userEvent.click(record)
+    await waitFor(() => expect(confirmEntityBridge)
+      .toHaveBeenCalledWith(RANKED[0].fact_key, {}))
+  })
+
+  it('offers no decision in a comparison row the server withholds one on', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: RANKED, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+
+    const endorsed = within(group.getByTestId(`gq-compare-row-${RANKED[2].fact_key}`))
+    expect(endorsed.queryByRole('button', { name: /confirm/i })).toBeNull()
+    expect(endorsed.getByTestId('gq-compare-why')).toHaveTextContent(/already endorsed/i)
+  })
+
+  it('says so when the recorded evidence cannot separate the candidates', async () => {
+    // The live `bank` group is five candidates that all rank 0, all declared, all the same type
+    // family — the ranker genuinely cannot tell them apart, and the honest reading is that the
+    // evidence does not name a winner. Today that verdict takes four screens of reading to reach.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    const tied = group.getByTestId('gq-compare-tied')
+    expect(tied).toHaveTextContent(/nothing on file separates these 8/i)
+    // Stated as an absence of evidence, never as a verdict the machine reached.
+    expect(tied).toHaveTextContent(/does not say which/i)
+  })
+
+  it('stays quiet about ties when the ranking does separate the candidates', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: RANKED, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    expect(group.queryByTestId('gq-compare-tied')).toBeNull()
+  })
+
+  it('does not repeat, as a card-level box, what the comparison already says per candidate',
+    async () => {
+      // The card used to carry two bordered axis boxes above the members. Human review is now a
+      // COLUMN, so the box restated it; and the automatic axis is one value across the set, which
+      // is a sentence rather than a panel. 56 axis boxes carrying six distinct values is what made
+      // absence look like substance.
+      getGovernanceQueue.mockResolvedValue(queue({
+        items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+      }))
+      render(<GovernanceReviewScreen />)
+      const group = within(await screen.findByTestId('queue-entry'))
+
+      expect(group.queryByTestId('axis-review')).toBeNull()
+      expect(group.queryByTestId('axis-execution')).toBeNull()
+      // The automatic axis is still reported — once, in words, with its scope named.
+      expect(group.getByTestId('gq-group-exec'))
+        .toHaveTextContent(/all 8.*cardinality unresolved/i)
+    })
+
+  it('says so when the automatic axis is not one answer across the group', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map((item, i) => (i === 0
+        ? { ...item, production_eligibility: 'Automatically validated for production',
+            production_eligibility_code: 'deterministically_validated' }
+        : item)),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+    expect(group.getByTestId('gq-group-exec')).toHaveTextContent(/mixed across the 8/i)
+  })
+
   it('keeps a lone candidate an ordinary row, never a group of one', async () => {
     getGovernanceQueue.mockResolvedValue(queue({
       items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
@@ -889,14 +1168,69 @@ describe('governance review — the low-value candidate cluster', () => {
 })
 
 describe('governance review — honest emptiness and honest counts', () => {
-  it('reads an empty kind as settled, not as a failure', async () => {
+  it('says nothing at all about a kind with nothing waiting', async () => {
+    // A zero is not news, and the chip already carries it. This used to be four sections of prose,
+    // then one line of prose; it is now the chip, which is the whole honest statement.
+    //
+    // The prose also CLAIMED MORE THAN THE PAYLOAD KNOWS. `items_visible_to_you_by_kind` counts
+    // OPEN items, so a zero cannot tell "everything was decided" from "nothing was ever proposed" —
+    // and on the live catalogs Pass C has produced no discovered join at all. Saying "everything
+    // proposed there has already been decided" invented a history the screen cannot see.
     getGovernanceQueue.mockResolvedValue(FULL) // availability_time is 0
     render(<GovernanceReviewScreen />)
-    const settled = within(await screen.findByTestId('kind-availability_time'))
-    expect(settled.getByRole('status')).toHaveTextContent(/nothing to review/i)
-    // And it says WHY there is nothing, rather than showing a bare "(0)".
-    expect(settled.getByRole('status')).toHaveTextContent(/no .* is waiting/i)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+
+    expect(screen.queryByTestId('gq-settled-kinds')).toBeNull()
+    expect(screen.queryByText(/already been decided/i)).toBeNull()
+    expect(screen.queryByText(/keeps working either way/i)).toBeNull()
+    // The zero is on its chip, where it is a fact rather than a claim.
+    expect(within(screen.getByTestId('gq-kind-filter'))
+      .getByRole('button', { name: /as-of date \(0\)/i })).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('renders no section and no prose for the kinds with nothing waiting', async () => {
+    // The live queue has FOUR kinds at zero. Each rendered a heading, a lead-in, a count chip and
+    // a 35-word paragraph; then one collapsed line of prose. Neither earned the space — the chips
+    // carry the zeros, and prose about an empty section is prose about nothing.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()],
+      items_visible_to_you_by_kind: {
+        entity_bridge: 1, approved_join: 0, grain: 0, availability_time: 0, entity_assignment: 0,
+      },
+    }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('kind-entity_bridge')
+
+    for (const kind of ['approved_join', 'grain', 'availability_time', 'entity_assignment']) {
+      expect(screen.queryByTestId(`kind-${kind}`)).toBeNull()
+    }
+    expect(screen.queryByTestId('gq-settled-kinds')).toBeNull()
+    expect(screen.queryByText(/nothing is waiting on you in/i)).toBeNull()
+  })
+
+  it('leads a section only where there is a consequence the rows do not carry', async () => {
+    // A lead-in that DEFINES the kind sits directly above a card instantiating it: "The same
+    // business entity in two different catalogs" over "2 candidate links for the same branch,
+    // between CIB and FTR". The abstraction is redundant with its own example. What survives is
+    // only a lead-in stating something the rows cannot say for themselves.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge(), currencyBinding()],
+      items_visible_to_you_by_kind: { entity_bridge: 1, currency_binding: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const bridges = within(await screen.findByTestId('kind-entity_bridge'))
+
+    expect(bridges.queryByText(/the same business entity in two different catalogs/i)).toBeNull()
+    expect(bridges.queryByText(/no per-catalog screen could show you/i)).toBeNull()
+
+    // The currency lead-in states a real consequence — money features are refused until it is
+    // decided — which no row on the card says. That half stays; the definition goes.
+    const currency = within(screen.getByTestId('kind-currency_binding'))
+    expect(currency.getByTestId('gq-kind-about'))
+      .toHaveTextContent(/features that sum money are refused until this is decided/i)
+    expect(currency.getByTestId('gq-kind-about').textContent)
+      .not.toMatch(/a fixed code, or the column on the same table/i)
   })
 
   it('distinguishes "nothing is waiting" from "we could not look"', async () => {
@@ -937,6 +1271,62 @@ describe('governance review — honest emptiness and honest counts', () => {
     expect(usage.getByText(/current governed contract/i)).toBeInTheDocument()
   })
 
+  it('states a wholly unmeasured usage once, instead of five times per card', async () => {
+    // The live catalogs record NOTHING in any of the five categories, so every bridge rendered a
+    // five-column grid of "not tracked yet" plus its per-category rationale — 85 times across the
+    // page, on the group card AND again on every member. When no category has a measurement, the
+    // grid carries no information: it is one fact, so it is said once.
+    const untracked = USAGE.map(usage => ({
+      ...usage, state: 'not_tracked_yet' as const, count: null, display: 'not tracked yet',
+    }))
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge({ already_depended_on_by: untracked })],
+      items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const usage = within(within(await screen.findByTestId('row-fact:entity_bridge:customer'))
+      .getByTestId('usage'))
+
+    expect(usage.getByTestId('usage-untracked')).toHaveTextContent(/nothing is recorded either way/i)
+    // The five cells are gone, not merely restyled.
+    expect(usage.queryByTestId('usage-value-generated_artifacts')).toBeNull()
+    // Never a zero. "Nobody recorded it" and "it is used nowhere" are different claims.
+    expect(usage.getByTestId('usage-untracked').textContent).not.toMatch(/\b0\b/)
+
+    // Nothing is lost: why each store cannot answer is one click away, and still in its own words.
+    await userEvent.click(usage.getByRole('button', { name: /why nothing is counted/i }))
+    expect(usage.getByTestId('usage-value-generated_artifacts')).toHaveTextContent('not tracked yet')
+    expect(usage.getByText(/control plane identifies a generation/i)).toBeInTheDocument()
+  })
+
+  it('drops the how-it-was-counted note when nothing was counted', async () => {
+    // "A category is only ever a number when every one of the links was measured" explains how
+    // figures are aggregated across a group. Above a block that reports no figures at all, it is
+    // 40 words answering a question nobody asked.
+    const untracked = USAGE.map(usage => ({
+      ...usage, state: 'not_tracked_yet' as const, count: null, display: 'not tracked yet',
+    }))
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH.map(item => ({ ...item, already_depended_on_by: untracked })),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const usage = within(within(await screen.findByTestId('queue-entry')).getByTestId('usage'))
+    expect(usage.getByTestId('usage-untracked')).toBeInTheDocument()
+    expect(usage.queryByText(/counted once per link/i)).toBeNull()
+  })
+
+  it('keeps the how-it-was-counted note when the group does report figures', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const usage = within(within(await screen.findByTestId('queue-entry')).getByTestId('usage'))
+    expect(usage.getByText(/counted once per link/i)).toBeInTheDocument()
+    expect(usage.getByTestId('usage-value-generated_artifacts')).toHaveTextContent('not tracked yet')
+    expect(usage.getByText(/control plane identifies a generation/i)).toBeInTheDocument()
+  })
+
   it('renders no usage block for a kind with no bridge anchor', async () => {
     getGovernanceQueue.mockResolvedValue(FULL)
     render(<GovernanceReviewScreen />)
@@ -956,6 +1346,72 @@ describe('governance review — honest emptiness and honest counts', () => {
     expect(within(joinRow).getByTestId('gq-catalog')).toHaveTextContent('CIB')
     // The bridge, by contrast, is the cross-catalog decision this surface exists for.
     expect(row(FULL.items[0]).textContent ?? '').toMatch(/cross-catalog/i)
+  })
+
+  it('has a heading outline a screen reader can navigate', async () => {
+    // The outline ran H1 -> H3 x6 -> H2 -> H2 -> H3: the kind sections sat two levels below the
+    // page title while the panels below them sat one, so a rotor read the queue as a subsection of
+    // nothing and the panels as peers of the page. Every top-level region of this screen is one
+    // level, and no level is skipped.
+    getGovernanceQueue.mockResolvedValue(FULL)
+    getDataUsePolicies.mockResolvedValue({
+      concepts: [{
+        concept_name: 'pep_flag', description: 'Politically exposed person marker.', group: 'flag',
+        status: 'none', pointer_version: 0, purpose: null, revision_id: null, approved_by: null,
+        approved_at: null, declared_by: null, updated_at: null,
+      }],
+      purpose_bounds: { min: 8, max: 300 },
+    })
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('data-use-policies')
+
+    // The page's h1 belongs to the App shell, so this screen's own regions start at h2.
+    const levels = [...document.querySelectorAll('h1, h2, h3, h4')]
+      .map(node => Number(node.tagName[1]))
+    expect(levels[0]).toBe(2)
+    // No jump of more than one level anywhere in the document order.
+    for (let i = 1; i < levels.length; i += 1) {
+      expect(levels[i] - levels[i - 1]).toBeLessThanOrEqual(1)
+    }
+    // The kinds are regions of this page, at the same level as the panels that follow them.
+    expect(screen.getByRole('heading', { name: /cross-catalog identifier links/i, level: 2 }))
+      .toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /data-use policies/i, level: 2 }))
+      .toBeInTheDocument()
+  })
+
+  it('puts what you can decide above what you cannot', async () => {
+    // Payload order is insertion order. A reviewer scrolling a kind section met endorsed facts and
+    // withheld ones interleaved with their own work, so "12 you can decide" gave no clue WHERE.
+    // Decidable first, then rows needing someone else, then the settled ones — the queue reads
+    // top-down as the order to work in.
+    const endorsed = bridge({
+      fact_key: 'fact:entity_bridge:endorsed', available_actions: [],
+      state: 'Human endorsed', state_code: 'human_endorsed',
+      detail: bridgeDetail({ entity_id: 'account' }),
+    })
+    const others = bridge({
+      fact_key: 'fact:entity_bridge:others', available_actions: ['reject'],
+      detail: bridgeDetail({ entity_id: 'product' }),
+    })
+    const mine = bridge({
+      fact_key: 'fact:entity_bridge:mine', available_actions: ['confirm', 'reject'],
+      detail: bridgeDetail({ entity_id: 'merchant' }),
+    })
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [endorsed, others, mine],
+      items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('row-fact:entity_bridge:mine')
+
+    const order = [...document.querySelectorAll('[data-testid^="row-fact:entity_bridge:"]')]
+      .map(node => node.getAttribute('data-testid'))
+    expect(order).toEqual([
+      'row-fact:entity_bridge:mine',
+      'row-fact:entity_bridge:others',
+      'row-fact:entity_bridge:endorsed',
+    ])
   })
 
   it('surfaces a load failure as the server said it, not as an empty queue', async () => {
@@ -1215,12 +1671,12 @@ describe('governance review — state travels as an attribute, never as colour a
         expect(document.activeElement).toBe(control)
       }
     }
-    // The one control that cannot take focus is a withheld confirm, disabled by the SERVER's own
-    // action list — with its reason on screen and wired to it, so the row still reads.
+    // Every control on screen took focus above, because there is no longer an unfocusable one: a
+    // confirm the SERVER's action list withholds is absent rather than dimmed, and its reason
+    // stands in the space the button used to occupy.
     const withheld = within(screen.getByTestId('row-fact:entity_bridge:w'))
-    const confirm = withheld.getByRole('button', { name: /^confirm/i })
-    expect(confirm).toBeDisabled()
-    expect(confirm).toHaveAttribute('aria-describedby', withheld.getByTestId('gq-action-why').id)
+    expect(withheld.queryByRole('button', { name: /^confirm/i })).toBeNull()
+    expect(withheld.getByTestId('gq-action-why')).toHaveTextContent('alice@bank')
   })
 })
 
@@ -1322,17 +1778,20 @@ describe('semantic bindings in the queue', () => {
       'fact:currency:tran_amt', { category: 'wrong_currency_column' }))
   })
 
-  it('an uploader whose confirm the server would 409 gets a DISABLED confirm, not a live one', async () => {
+  it('an uploader whose confirm the server would 409 is not offered one at all', async () => {
     // The queue projects four-eyes into available_actions (backend: the uploading principal's
-    // confirm is dropped). The screen's existing pattern for an unsanctioned action is a
-    // disabled button — never a live button that invites a guaranteed 409.
+    // confirm is dropped). The property is that the reviewer is never invited into a guaranteed
+    // 409 — absence protects it more strictly than a dimmed button, which still reads as the
+    // card's primary call to action. On the live catalogs this is EVERY currency binding, so a
+    // dimmed primary here made the loudest control on three consecutive cards a dead one.
     getGovernanceQueue.mockResolvedValue(queue({
       items: [currencyBinding({ available_actions: ['reject'] })],
       items_visible_to_you_by_kind: { currency_binding: 1 },
     }))
     render(<GovernanceReviewScreen />)
     const row = within(await screen.findByTestId('row-fact:currency:tran_amt'))
-    expect(row.getByRole('button', { name: /^confirm/i })).toBeDisabled()
+    expect(row.queryByRole('button', { name: /^confirm/i })).toBeNull()
+    expect(row.getByTestId('gq-action-why')).toHaveTextContent(/proposer of a fact/i)
     expect(row.getByRole('button', { name: /^reject/i })).toBeEnabled()
   })
 

@@ -5286,6 +5286,22 @@ button.stat:hover {
   margin-bottom: 4px;
 }
 
+/* ---- line measure ----
+
+   Every prose block on this screen ran the full 1200px column: 148ch to 154ch as rendered, roughly
+   double what stays readable, and only one block on the page set a max-width. Capped here rather
+   than on the global `.hint` so the rule cannot reach other screens. Blocks that are DATA (subject
+   refs, comparison cells, monospace identifiers) are deliberately excluded — wrapping a column ref
+   at 72ch would break the thing a reviewer is reading character by character. */
+.gq .hint,
+.gq-purpose p,
+.gq-kind-about,
+.gq-group-note,
+.gq-usage-note,
+.dup-desc {
+  max-width: 74ch;
+}
+
 .gq-notice {
   margin: 0;
 }
@@ -5308,7 +5324,8 @@ button.stat:hover {
    "Cross-catalog identifier links") plus a scope-relative count, so they take the sans face, with
    tabular figures so a count does not jitter as the filter narrows. Scoped to .gq-filters, so the
    reject chips in this screen's panels — and AssetDetailScreen's — keep the mono treatment. */
-.gq-filters .gj-chip {
+.gq-filters .gj-chip,
+.ccq-filter .gj-chip {
   font-family: var(--font-sans);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
@@ -5320,13 +5337,15 @@ button.stat:hover {
    --chip-ink on --accent is 6.25:1; the fill is 6.07:1 against the --surface-2 filter bar, and the
    :focus-visible ring lands on that same fill-free 2px gap at 6.07:1. `aria-pressed` remains the
    non-visual carrier of "selected", exactly as before. */
-.gq-filters .gj-chip--on {
+.gq-filters .gj-chip--on,
+.ccq-filter .gj-chip--on {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--chip-ink);
 }
 
-.gq-filters button.gj-chip--on:hover {
+.gq-filters button.gj-chip--on:hover,
+.ccq-filter button.gj-chip--on:hover {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
 }
@@ -5337,12 +5356,38 @@ button.stat:hover {
   margin-top: 18px;
 }
 
+/* ---- sticky section context ----
+
+   Nothing on this page was sticky, so at six thousand pixels down there was no indication of which
+   kind you were in. The eyebrow is small and quiet enough to pin without stealing the row's weight,
+   and it sits on the ground colour so rows scroll cleanly under it. Honoured only where the
+   viewport is tall enough for a pinned strip to be worth its space. */
+@media (min-height: 560px) {
+  .gq-kind > .gq-kind-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding-block: 8px;
+    background: var(--ground);
+  }
+}
+
+/* A SECTION LABEL, not a headline. At 15px/700 it outweighed the decision inside it
+   (.gq-row-headline, 15.5px/400) — the category shouting over its own content. The page's type
+   scale ran 22 / 15.5 / 15 / 13 / 12.5 / 12 / 11.5 / 11: seven steps inside 4.5px, so nothing was
+   ranked by size at all. Three roles now do the work — the eyebrow here, the decision at 18/600,
+   supporting text at 13 — and each step clears a 1.25 ratio. */
 .gq-kind-head {
   display: flex;
   align-items: baseline;
   gap: 8px;
   margin: 0;
-  font-size: 15px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
 }
 
 /* the per-kind count: a figure, not prose, so the mono face is right — and the markup adds
@@ -5412,10 +5457,17 @@ button.stat:hover {
   font-family: var(--font-mono);
 }
 
+/* THE DECISION. The largest thing inside a card, because it is the thing being decided — it used
+   to sit at regular weight, one half-pixel above body text, under a bolder section label. */
 .gq-row-headline {
   margin: 0;
-  font-size: 15.5px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.012em;
   color: var(--ink);
+  max-width: 62ch;
+  text-wrap: balance;
 }
 
 .gq-row-subject {
@@ -5657,6 +5709,151 @@ button.stat:hover {
 
 .gq-member {
   background: var(--surface-2);
+}
+
+/* ---- the candidate comparison ----
+
+   The group is a CHOICE, so its members are laid out as one table rather than stacked as dossiers.
+   The subjects in a cross-product agree on everything but one slice: the shared head and tail are
+   stated once above the table, and the row carries only what varies — which is what makes `pref`
+   against `prim` legible at all. The table scrolls inside its own box so a long column name never
+   pushes the page sideways. */
+
+.gq-compare-shared {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--ink-faint);
+  word-break: break-all;
+}
+
+/* Where the varying slice sits in the shared string. Faint, and aria-hidden in the markup: it is
+   a position marker, not a value. */
+.gq-compare-slot {
+  padding: 0 3px;
+  color: var(--accent);
+}
+
+.gq-compare-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.gq-compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.gq-compare-table th,
+.gq-compare-table td {
+  padding: 7px 10px;
+  text-align: left;
+  vertical-align: middle;
+}
+
+.gq-compare-table thead th {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line);
+}
+
+.gq-compare-table tbody tr + tr td {
+  border-top: 1px solid var(--surface-2);
+}
+
+/* The one cell the reviewer is actually comparing, so it is the only one at full ink weight. */
+.gq-compare-varies {
+  font-size: 13px;
+  color: var(--ink);
+  word-break: break-all;
+}
+
+.gq-compare-rank {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
+.gq-compare-basis,
+.gq-compare-review {
+  color: var(--ink-faint);
+}
+
+.gq-compare-decide {
+  white-space: nowrap;
+}
+
+.gq-compare-decide .gq-why {
+  white-space: normal;
+  display: inline-block;
+  max-width: 34ch;
+}
+
+.gq-compare-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+/* Absence of evidence, said as an absence. Quiet ink and no state colour: the ranker reporting a
+   dead heat is not a warning, and painting it as one would invent a verdict the data lacks. */
+.gq-compare-tied {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+  max-width: 78ch;
+}
+
+/* The automatic axis for the whole group: one sentence where two bordered panels used to sit. */
+.gq-group-exec {
+  margin: 0;
+  max-width: 78ch;
+}
+
+/* ---- the outcome of a decision, on the row that made it ----
+
+   This used to render only under the page purpose, so a confirmation near the foot of the queue
+   painted its result thousands of pixels above the viewport. Success tone, low saturation: the
+   reviewer already knows they clicked, so this confirms rather than announces. */
+.gq-row-outcome {
+  margin: 0;
+  padding: 8px 11px;
+  border: 1px solid var(--ok);
+  border-radius: var(--radius);
+  background: var(--ok-soft);
+  font-size: 12.5px;
+  color: var(--ink);
+  max-width: 78ch;
+}
+
+/* ---- usage with nothing measured anywhere ----
+
+   The live state on every bridge. Said once, in a sentence, with the per-store reasons behind a
+   disclosure — the reasons are real and stay reachable, they are just not five columns of them on
+   every card. */
+
+.gq-usage-none {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  max-width: 78ch;
+}
+
+.gq-usage-why-btn {
+  margin-top: 7px;
+  padding: 3px 10px;
+  font-size: 12px;
+}
+
+.gq-usage[data-state='none-tracked'] .gq-usage-list {
+  margin-top: 9px;
 }
 
 /* ---- how the match was established (bridges) ----

@@ -364,7 +364,17 @@ def _verify_stage_transition(
             value is not None and value.startswith("AUTHOR_TURN_")),
         "EXPECTATION_VALIDATED": lambda value: value == "AUTHOR_PROPOSAL_PARSED",
         "CRITIC_COMPLETED": lambda value: value == "EXPECTATION_VALIDATED",
-        "OUTPUT_POLICY_RESOLVED": lambda value: value == "CRITIC_COMPLETED",
+        # C-A6 — the deterministic path's stage. It sits exactly where CRITIC_COMPLETED sits and is
+        # its ALTERNATIVE, never its successor: a run either ran the critic or stood on a reviewed
+        # blueprint, and a trace carrying both would claim two different reviews of one formula.
+        "REVIEW_BYPASSED": lambda value: value == "EXPECTATION_VALIDATED",
+        # C-A7 — the PROVISIONAL intent. Legal after either review path, and deliberately NOT a
+        # prerequisite of anything: a V3 run is terminal here, because resolving the intent against
+        # C1's governed facts is S5's and a stage that has not run must not look like it agreed.
+        "OUTPUT_INTENT_CAPTURED": lambda value: value in {
+            "CRITIC_COMPLETED", "REVIEW_BYPASSED"},
+        "OUTPUT_POLICY_RESOLVED": lambda value: value in {
+            "CRITIC_COMPLETED", "REVIEW_BYPASSED", "OUTPUT_INTENT_CAPTURED"},
         "TERMINAL": lambda _value: True,
     }
     predicate = allowed_prior.get(stage)

@@ -67,6 +67,11 @@ from featuregen.formula.authoring_v2 import (
     classify_output_policy_v2,
     forbids_authored_artifact_v2,
 )
+from featuregen.formula.authoring_versions import (
+    LEGACY_RESTART_REQUIRED,
+    BundleClassV2,
+    classify_version_bundle,
+)
 from featuregen.formula.capability_v2 import classify_formula_capability_v2
 from featuregen.formula.control import (
     FormulaControlFlow,
@@ -99,12 +104,19 @@ from featuregen.formula.result import (
     AuthoringAxes,
     AuthorityFailure,
 )
-from featuregen.formula.result_v2 import DISPOSITION_POLICY_VERSION_V2, derive_disposition_v2
+from featuregen.formula.result_v2 import (
+    DISPOSITION_POLICY_VERSION_V2,
+    AuthoringAxesV2,
+    CriticExecutedV2,
+    ReviewedBlueprintBypassV2,
+    derive_disposition_v2,
+)
 from featuregen.formula.schema import AdditivityClass, SchemaError
 from featuregen.formula.schema_v2 import (
     OPERATION_GRAMMAR_VERSION_V2,
     TypedFormulaProposalV2,
 )
+from featuregen.formula.schema_v3 import TypedFormulaProposalV3
 from featuregen.overlay.field_evidence import canonical_hash
 
 if TYPE_CHECKING:
@@ -120,7 +132,7 @@ __all__ = [
 #: The wiring version of THIS orchestrator (stage order, resume points, axis mapping). Its own
 #: number beside ``authoring_v2``'s: the two modules can be re-wired independently, and a frozen
 #: run's manifest must name the one that decided it.
-AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 1
+AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 2   # C-A6: see `authoring_versions` for the policy
 
 #: The facts reader's contract: one v2 proposal in, the ref-keyed bundle plus the governed reads
 #: that failed CLOSED out. The worker injects ``FrozenRecipeReadContext.formula_facts_v2``.
@@ -175,6 +187,11 @@ def _terminal_payload(result) -> dict:
         "output_status": result.output_status,
         "expectation_status": result.expectation_status,
         "critic_status": result.critic_status,
+        # C-A5: HOW review was obtained. Without it a bypass-authored run cannot be restored at all
+        # (`critic_status` is None and the v1-shaped axes builder rejects it), and an
+        # executed-critic run silently loses the axis on restore — so deterministic recipe
+        # authoring, the bypass's whole use case, would be the one path that is unrecoverable.
+        "review": _plain(result.review) if result.review is not None else None,
         "technical_status": result.technical_status,
         "result": _plain(result),
     }
@@ -206,6 +223,28 @@ def _axes(
     )
 
 
+def _restore_review(material: object):
+    """Rebuild the C-A5 review axis from persisted material, or refuse.
+
+    An UNRECOGNISED shape is reconciliation, never a silent fall-through to the v1 path: a run that
+    recorded HOW review was obtained and comes back unable to say so is exactly the drift replay
+    exists to catch.
+    """
+    if material is None:
+        return None
+    if not isinstance(material, dict):
+        raise RecoveryRequiresReconciliation("terminal review material is not an object")
+    if "findings_hash" in material and "status" in material:
+        return CriticExecutedV2(status=material["status"],
+                                findings_hash=material["findings_hash"])
+    if "blueprint_revision" in material and "expectation_hash" in material:
+        return ReviewedBlueprintBypassV2(
+            blueprint_revision=material["blueprint_revision"],
+            expectation_hash=material["expectation_hash"])
+    raise RecoveryRequiresReconciliation(
+        f"terminal review material is neither an executed critic nor a bypass: {sorted(material)}")
+
+
 def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
     """Rebuild a terminal v2 result from its own trace, through the SAME fold that wrote it.
 
@@ -221,21 +260,37 @@ def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
             "terminal v2 authoring result is not replayable")
     material = terminal["result"]
     try:
-        axes = _axes(
-            structural_status=material["structural_status"],
-            capability_status=material["capability_status"],
-            output_status=material["output_status"],
-            expectation_status=material["expectation_status"],
-            critic_status=material["critic_status"],
-            technical_status=material["technical_status"],
-        )
+        review = _restore_review(material.get("review"))
+        axes: AuthoringAxes | AuthoringAxesV2
+        if review is not None:
+            # C-A5: restore through the V2 axes. Feeding a bypass's `critic_status=None` into the
+            # v1-shaped builder makes `_validate_axes` reject it, so the run would be permanently
+            # unreplayable — and an executed-critic run would silently lose the axis, leaving a
+            # restored result whose `review=None` claims it was folded from v1-shaped axes.
+            axes = AuthoringAxesV2(
+                structural_status=material["structural_status"],
+                capability_status=material["capability_status"],
+                output_status=material["output_status"],
+                expectation_status=material["expectation_status"],
+                review=review,
+                technical_status=material["technical_status"],
+            )
+        else:
+            axes = _axes(
+                structural_status=material["structural_status"],
+                capability_status=material["capability_status"],
+                output_status=material["output_status"],
+                expectation_status=material["expectation_status"],
+                critic_status=material["critic_status"],
+                technical_status=material["technical_status"],
+            )
         proposal = None
         if isinstance(material.get("candidate_proposal"), dict):
             source = (checkpoint.raw_proposal
                       if isinstance(checkpoint.raw_proposal, dict)
                       else material["candidate_proposal"])
             parsed = parse_versioned(source)
-            if not isinstance(parsed, TypedFormulaProposalV2):
+            if not isinstance(parsed, TypedFormulaProposalV2 | TypedFormulaProposalV3):
                 raise RecoveryRequiresReconciliation(
                     "terminal v2 result carries a proposal of another generation")
             proposal = parsed
@@ -309,6 +364,43 @@ def _technical_failure(conn, run_id: str, seq: int, reason: str, *,
     return result
 
 
+class ToolRunnerRequired(ValueError):
+    """C-A8 — a v2 authoring run was given no tool runner.
+
+    A caller bug rather than a governed outcome, so it RAISES: there is no formula to dispose, and
+    folding a refusal here would record a verdict about a formula that was never authored.
+    """
+
+
+def _require_tool_runner(tool_runner) -> None:
+    """Refuse a missing runner instead of falling back to V1 tools.
+
+    ``author_formula``'s ``tool_runner`` defaults to ``run_tool`` — the V1 tool set. Omitting the
+    kwarg therefore did not disable tools, it QUIETLY SWAPPED them: a v2 formula authored against v1
+    tools reads the catalog through the wrong surface and the trace records nothing about it.
+    """
+    if tool_runner is None:
+        raise ToolRunnerRequired(
+            "run_authoring_v2_replay requires a tool_runner. Omitting it does not disable tools — "
+            "`author_formula` falls back to `run_tool`, the V1 set — so a v2 run would author "
+            "against the wrong catalog surface with nothing in the trace to say so")
+
+
+def _stored_versions(conn, run_id: str) -> dict | None:
+    """The version bundle a run was OPENED under, read back from its immutable manifest row.
+
+    Read rather than assumed, because for an existing run the bundle this build would write is not
+    the bundle that decided it — which is the whole question C-A6 asks.
+    """
+    row = conn.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id=%s", (run_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    versions = row[0]
+    return dict(versions) if versions else None
+
+
 def run_authoring_v2_replay(
     conn,
     intent,
@@ -326,6 +418,7 @@ def run_authoring_v2_replay(
     critic_metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
+    formula_schema_version: int = 2,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
     resumably, under a lease, against a frozen configuration.
@@ -333,9 +426,12 @@ def run_authoring_v2_replay(
     Same parameters as ``replay_authoring.run_authoring``, because the live worker's call site is
     the same call site; the types they carry are v2's.
     """
+    _require_tool_runner(tool_runner)
     versions: dict[str, Any] = {
         "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
-        "formula_schema": 2,
+        # C-A6 — RECORDED, not hardcoded. A v3 run must not inherit `2`: the manifest would then
+        # say a v2 formula was authored, and every later reader keyed on it would agree.
+        "formula_schema": formula_schema_version,
         "operation_grammar": OPERATION_GRAMMAR_VERSION_V2,
         "critic": CRITIC_POLICY_VERSION,
         "disposition": DISPOSITION_POLICY_VERSION_V2,
@@ -348,6 +444,39 @@ def run_authoring_v2_replay(
             frozen_configuration.configuration_policy_version)
         versions["frozen_configuration_hash"] = frozen_configuration.configuration_hash
     intent_hash = canonical_hash(_intent_material(intent))
+
+    # C-A6 — classify the STORED manifest BEFORE opening the run. `open_authoring_run` compares
+    # `(intent_hash, versions, actor)` against the existing row and raises on any difference, so a
+    # legacy run would be refused there with a bare identity error before any adapter could be
+    # chosen. The manifest is written once (the run table is write-once by trigger), so for a run
+    # that already exists this is what the software that decided it declared — not what this build
+    # would declare now.
+    stored_versions = _stored_versions(conn, authoring_run_id) if authoring_run_id else None
+    if stored_versions is not None:
+        bundle = classify_version_bundle(stored_versions, current=versions)
+        if bundle is BundleClassV2.UNKNOWN:
+            raise RecoveryRequiresReconciliation(
+                f"authoring run {authoring_run_id} carries a version bundle this build does not "
+                f"recognise ({sorted(stored_versions.items())}): a partial match is not close "
+                f"enough, because the key it differs on is precisely the one that decided "
+                f"something differently")
+        if bundle is BundleClassV2.LEGACY:
+            # READ-ONLY, and the run is NOT re-opened: the row exists, and opening it under the
+            # current bundle is exactly the identity conflict this branch avoids.
+            # `load_verified_checkpoint` is handed the STORED bundle so the trace verifies against
+            # the manifest it was written under — the intent hash is still compared, so a changed
+            # intent refuses here exactly as it would on the current path.
+            legacy = load_verified_checkpoint(
+                conn, authoring_run_id, intent_hash=intent_hash, versions=stored_versions)
+            if legacy.terminal_result is not None:
+                return _restore_terminal_result(legacy, authoring_run_id)
+            raise RecoveryRequiresReconciliation(
+                f"{LEGACY_RESTART_REQUIRED}: authoring run {authoring_run_id} was opened under the "
+                f"pre-C-A6 orchestrator and did not reach a terminal result. Resuming would append "
+                f"new-orchestrator events — including REVIEW_BYPASSED, a transition the old stage "
+                f"table never allowed — under a manifest saying version 1 decided this run. "
+                f"Restart the run instead; the existing trace is left exactly as it is")
+
     run_id = open_authoring_run(
         conn,
         intent_hash=intent_hash,
@@ -424,7 +553,10 @@ def run_authoring_v2_replay(
                 lease_fence=lease_fence,
                 resume_turns=checkpoint.author_turns,
                 turn_contract=AUTHOR_TURN_CONTRACT_V2,
-                **({} if tool_runner is None else {"tool_runner": tool_runner}),
+                # C-A8 — ALWAYS passed, never omitted. `author_formula`'s own default is `run_tool`,
+                # the V1 tool set, so omitting this kwarg silently authored a v2 formula against v1
+                # tools. `_require_tool_runner` refuses above rather than letting that happen.
+                tool_runner=tool_runner,
             )
         except FormulaControlFlow:
             raise

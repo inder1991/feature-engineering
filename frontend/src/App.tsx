@@ -288,9 +288,11 @@ const PAGES: PageHead[] = [
     // One cross-catalog decision queue now (it used to be three source-keyed tabs behind a text
     // input): the header names the judgement being asked for, not the fact types it spans.
     title: 'Governance review',
-    description:
-      'Every relationship waiting on a person, across every catalog you can see. The system '
-      + 'proposes; you decide whether it means what it says.',
+    // Says what the page HOLDS, like every sibling here. The second sentence ("The system
+    // proposes; you decide whether it means what it says") was a second framing statement stacked
+    // directly above the callout that frames the page, and the callout does it with the fact that
+    // actually motivates the work — that these relationships are already in use.
+    description: 'Every relationship waiting on a person, across every catalog you can see.',
   },
   {
     route: 'recipes',
