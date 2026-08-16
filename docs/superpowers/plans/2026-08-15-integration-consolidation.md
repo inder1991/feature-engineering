@@ -248,6 +248,59 @@ the ledger; the stage that needs a table writes it.**
 
 ### S0 — pilot semantics, numerics, **and pilot data reality** *(hard STOP: humans decide)*
 
+> ## S0 DECISIONS — TAKEN 2026-08-16 by the product owner. The decision half of S0 is CLOSED.
+>
+> **D1 · The first executable feature is `posted_debit_amount_30d`.** Window
+> **`(2026-05-31, 2026-06-30]`**, expected **`ACC1 = 300.00 AED`**; the 2026-05-20 row is excluded,
+> as are failed, credit and reversed rows. **The frozen V2 90-day exemplar is NOT modified** — it
+> stays as historical V2. A **new V3 30-day exemplar** is created and approved. 90 days lands later
+> as a second case with `ACC1 = 330.00`.
+>
+> **D2 · Kind-prefixed policy references** — `eligible_status:foundation-posted-events` ·
+> `direction_sign:foundation-signed-by-indicator` · `reversal_correction:foundation-flag-or-code` ·
+> later `currency_conversion:foundation-base-currency`. This is what lets the compiler catch a
+> direction policy assigned to the status field. The `policy:*` V2 exemplar stays frozen as
+> historical V2; the active reviewed **V3** exemplar carries the corrected namespace and a **new
+> reviewed hash**.
+>
+> **D3 · FX execution is DEFERRED — sequencing, not scope reduction.** The first execution runs on an
+> **explicitly fixed-AED input relation or source binding**. It must **never** take the existing
+> mixed-currency population and quietly filter ACC2 out. Required behaviour:
+>
+> | Source | Outcome |
+> |---|---|
+> | fixed-AED | **executes** |
+> | per-row or mixed currency, no executable FX | **refuses `CURRENCY_CONVERSION_UNDECLARED`** |
+> | any | **never silently omits USD rows or accounts** |
+>
+> The `ACC2 = 93.50` mixed-currency gold case is **kept unchanged as the next FX pilot**. Deferred
+> together: C-A7's target-currency work · C-C6's FX arithmetic · C-C10's FX graph · the related S8
+> mutations.
+>
+> **This makes C-A3c load-bearing rather than optional.** The refusal D3 requires **cannot fire
+> today**: unit and currency return `not_operational` and degrade silently to non-monetary, which is
+> precisely the "silently omit" failure D3 forbids. **D3 is unimplementable until C-A3c lands.**
+>
+> **D4 · The spine is an explicit account-population snapshot** — accounts active as of
+> **2026-06-30**, manually bound, containing at least **ACC1** (returns 300.00) and **ACC_ZERO**
+> (returns 0.00). Execution **starts from the population**, left-joins transactions, and coalesces an
+> empty window to **zero**. **A transaction belonging to an unknown account must not invent a
+> population row.**
+>
+> **Settled by the fixture, confirmed:** amounts are positive magnitudes with a separate `D`/`C`
+> indicator, and output debit magnitude is **positive**. The reversal mode is **linked**
+> (`r06.reversal_of = r05`), so **`_CORRECTION_LINK` becomes `required=True`** for this recipe and
+> `eligibility_store`'s flag/code shape cannot serve it.
+>
+> **Taken as the cheap option, no row being within a day of an edge:** timezone **UTC** and boundary
+> **`(start, end]`** — the existing derivation constants, so no blueprint moves and
+> `EXPECTED_OUTCOMES` is not re-pinned.
+>
+> **Still open (engineering half of S0):** the fixed-AED relation and the population snapshot as real
+> bound relations; the currency operand *(deferred with FX, but the REFUSAL path is not)*; the
+> migration ledger.
+
+
 **Make the pilot physically executable [R18].** Three tasks without which S8 proves nothing:
 
 - **Declare a per-row currency operand** on `posted_debit_amount` (and the rate relation's binding).
