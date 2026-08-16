@@ -384,6 +384,11 @@ def bind_formula_expectation_v2(
             window=expression.window,
             aggregation_argument=expression.aggregation_argument,
             authority_refs=expression.authority_refs,
+            # C-A3b: carried through binding UNCHANGED. Binding resolves ROLES to refs; a semantic
+            # selection names neither — it says which rows the expression wants, and the recipe
+            # already declared that. Dropping it here silently returned the pilot to inferring
+            # "debit" from the recipe name, which is the defect C-A3b exists to remove.
+            row_selections=expression.row_selections,
             term_name=expression.term_name,
             term_sign=expression.term_sign))
     if len(relation_keys) != 1:

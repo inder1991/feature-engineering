@@ -99,12 +99,19 @@ from featuregen.formula.result import (
     AuthoringAxes,
     AuthorityFailure,
 )
-from featuregen.formula.result_v2 import DISPOSITION_POLICY_VERSION_V2, derive_disposition_v2
+from featuregen.formula.result_v2 import (
+    DISPOSITION_POLICY_VERSION_V2,
+    AuthoringAxesV2,
+    CriticExecutedV2,
+    ReviewedBlueprintBypassV2,
+    derive_disposition_v2,
+)
 from featuregen.formula.schema import AdditivityClass, SchemaError
 from featuregen.formula.schema_v2 import (
     OPERATION_GRAMMAR_VERSION_V2,
     TypedFormulaProposalV2,
 )
+from featuregen.formula.schema_v3 import TypedFormulaProposalV3
 from featuregen.overlay.field_evidence import canonical_hash
 
 if TYPE_CHECKING:
@@ -175,6 +182,11 @@ def _terminal_payload(result) -> dict:
         "output_status": result.output_status,
         "expectation_status": result.expectation_status,
         "critic_status": result.critic_status,
+        # C-A5: HOW review was obtained. Without it a bypass-authored run cannot be restored at all
+        # (`critic_status` is None and the v1-shaped axes builder rejects it), and an
+        # executed-critic run silently loses the axis on restore — so deterministic recipe
+        # authoring, the bypass's whole use case, would be the one path that is unrecoverable.
+        "review": _plain(result.review) if result.review is not None else None,
         "technical_status": result.technical_status,
         "result": _plain(result),
     }
@@ -206,6 +218,28 @@ def _axes(
     )
 
 
+def _restore_review(material: object):
+    """Rebuild the C-A5 review axis from persisted material, or refuse.
+
+    An UNRECOGNISED shape is reconciliation, never a silent fall-through to the v1 path: a run that
+    recorded HOW review was obtained and comes back unable to say so is exactly the drift replay
+    exists to catch.
+    """
+    if material is None:
+        return None
+    if not isinstance(material, dict):
+        raise RecoveryRequiresReconciliation("terminal review material is not an object")
+    if "findings_hash" in material and "status" in material:
+        return CriticExecutedV2(status=material["status"],
+                                findings_hash=material["findings_hash"])
+    if "blueprint_revision" in material and "expectation_hash" in material:
+        return ReviewedBlueprintBypassV2(
+            blueprint_revision=material["blueprint_revision"],
+            expectation_hash=material["expectation_hash"])
+    raise RecoveryRequiresReconciliation(
+        f"terminal review material is neither an executed critic nor a bypass: {sorted(material)}")
+
+
 def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
     """Rebuild a terminal v2 result from its own trace, through the SAME fold that wrote it.
 
@@ -221,21 +255,37 @@ def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
             "terminal v2 authoring result is not replayable")
     material = terminal["result"]
     try:
-        axes = _axes(
-            structural_status=material["structural_status"],
-            capability_status=material["capability_status"],
-            output_status=material["output_status"],
-            expectation_status=material["expectation_status"],
-            critic_status=material["critic_status"],
-            technical_status=material["technical_status"],
-        )
+        review = _restore_review(material.get("review"))
+        axes: AuthoringAxes | AuthoringAxesV2
+        if review is not None:
+            # C-A5: restore through the V2 axes. Feeding a bypass's `critic_status=None` into the
+            # v1-shaped builder makes `_validate_axes` reject it, so the run would be permanently
+            # unreplayable — and an executed-critic run would silently lose the axis, leaving a
+            # restored result whose `review=None` claims it was folded from v1-shaped axes.
+            axes = AuthoringAxesV2(
+                structural_status=material["structural_status"],
+                capability_status=material["capability_status"],
+                output_status=material["output_status"],
+                expectation_status=material["expectation_status"],
+                review=review,
+                technical_status=material["technical_status"],
+            )
+        else:
+            axes = _axes(
+                structural_status=material["structural_status"],
+                capability_status=material["capability_status"],
+                output_status=material["output_status"],
+                expectation_status=material["expectation_status"],
+                critic_status=material["critic_status"],
+                technical_status=material["technical_status"],
+            )
         proposal = None
         if isinstance(material.get("candidate_proposal"), dict):
             source = (checkpoint.raw_proposal
                       if isinstance(checkpoint.raw_proposal, dict)
                       else material["candidate_proposal"])
             parsed = parse_versioned(source)
-            if not isinstance(parsed, TypedFormulaProposalV2):
+            if not isinstance(parsed, TypedFormulaProposalV2 | TypedFormulaProposalV3):
                 raise RecoveryRequiresReconciliation(
                     "terminal v2 result carries a proposal of another generation")
             proposal = parsed

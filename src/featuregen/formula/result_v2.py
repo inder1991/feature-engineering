@@ -83,7 +83,11 @@ class AuthoringResultV2:
     capability_status: CapabilityStatus
     output_status: OutputStatus
     expectation_status: ExpectationStatus
-    critic_status: CriticStatus
+    #: ``None`` ONLY for a reviewed-blueprint bypass — see :attr:`review`.
+    critic_status: CriticStatus | None
+    #: HOW review was obtained (C-A5). ``None`` on results folded from v1-shaped axes, which have
+    #: no concept of a bypass.
+    review: ReviewOutcomeV2 | None
     technical_status: TechnicalStatus
     authoring_disposition: AuthoringDisposition
     disposition_policy_version: int
@@ -102,6 +106,95 @@ class AuthoringResultV2:
     authority_failures: tuple[AuthorityFailure, ...]
     capability_reason: str | None
     critic_findings_hash: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CriticExecutedV2:
+    """The critic RAN. ``status`` is the shared §F vocabulary; the findings hash is its evidence."""
+
+    status: CriticStatus
+    findings_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewedBlueprintBypassV2:
+    """The critic did NOT run, because a REVIEWED blueprint is the authority (C-A5).
+
+    Deterministic recipe authoring instantiates a blueprint a human already reviewed. Asking an LLM
+    critic to re-judge it would spend a provider call to re-derive a verdict the review already
+    carries — but recording ``critic_status="clean"`` would state that the critic ran and found
+    nothing, which is false. This variant says what actually happened, and names the exact blueprint
+    revision and expectation it stood on, so "the review covered THIS" is checkable rather than
+    asserted.
+
+    Neutrality is earned at CONSTRUCTION, not in the fold: only a producer that has verified the
+    blueprint revision and expectation hash may build one.
+    """
+
+    blueprint_revision: str
+    expectation_hash: str
+
+    def __post_init__(self) -> None:
+        # A bypass with nothing to check is strictly WORSE than the `"clean"` lie C-A5 removed: it
+        # also carries a false claim of checkability.
+        for name in ("blueprint_revision", "expectation_hash"):
+            if not str(getattr(self, name)).strip():
+                raise IncoherentResultError(
+                    f"ReviewedBlueprintBypassV2.{name} is empty — a bypass names the exact "
+                    "blueprint it stood on, or it is an assertion of neutrality with no evidence")
+
+
+#: How review was obtained for one v2/v3 authoring run.
+ReviewOutcomeV2 = CriticExecutedV2 | ReviewedBlueprintBypassV2
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoringAxesV2:
+    """v2's six axes, with ``review`` where v1 has a bare ``critic_status``.
+
+    V1's :class:`AuthoringAxes` is deliberately untouched: its ``critic_status`` is mandatory and
+    three-valued, and widening it would let a v1 run claim a bypass it has no concept of.
+    """
+
+    structural_status: StructuralStatus
+    capability_status: CapabilityStatus
+    output_status: OutputStatus
+    expectation_status: ExpectationStatus
+    review: ReviewOutcomeV2
+    technical_status: TechnicalStatus
+
+    def shared_axes(self) -> AuthoringAxes:
+        """The v1-shaped projection the SHARED §F precedence folds.
+
+        A bypass projects to ``"clean"`` **for folding only** — it is neutral, exactly as a clean
+        critic is. The projection never reaches the artifact: the result records the real
+        :class:`ReviewOutcomeV2` and leaves ``critic_status`` ``None``, so nothing downstream can
+        read a bypass as "the critic ran and found nothing".
+
+        **The variant check FAILS CLOSED, and that is load-bearing.** An ``else`` that mapped every
+        non-``CriticExecutedV2`` value to ``"clean"`` would make ``review=None`` — or any object at
+        all — fold as neutral, which is the exact fail-open :func:`_validate_axes` exists to
+        prevent ("an unrecognized status would fall through every arm and reach RESOLVED"), and the
+        exact confusion this whole type exists to end: a non-answer reading as "the critic ran and
+        found nothing".
+        """
+        if isinstance(self.review, CriticExecutedV2):
+            critic_status: CriticStatus = self.review.status
+        elif isinstance(self.review, ReviewedBlueprintBypassV2):
+            critic_status = "clean"
+        else:
+            raise IncoherentResultError(
+                f"axes.review={self.review!r} is neither CriticExecutedV2 nor "
+                "ReviewedBlueprintBypassV2 — review must say HOW it was obtained, and an "
+                "unrecognized value must never fold as neutral")
+        return AuthoringAxes(
+            structural_status=self.structural_status,
+            capability_status=self.capability_status,
+            output_status=self.output_status,
+            expectation_status=self.expectation_status,
+            critic_status=critic_status,
+            technical_status=self.technical_status,
+        )
 
 
 def _validate_axes(axes: AuthoringAxes) -> None:
@@ -148,7 +241,7 @@ def _content_hash(proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3) -> 
 
 
 def derive_disposition_v2(
-    axes: AuthoringAxes,
+    axes: AuthoringAxes | AuthoringAxesV2,
     *,
     authoring_run_id: str,
     candidate_proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3 | None = None,
@@ -157,11 +250,38 @@ def derive_disposition_v2(
     authority_failures: tuple[AuthorityFailure, ...] = (),
     capability_reason: str | None = None,
     critic_findings_hash: str | None = None,
+    reviewed_expectation_hash: str | None = None,
 ) -> AuthoringResultV2:
     """Fold the six axes into ONE :class:`AuthoringResultV2` (pure — no I/O).
 
     Artifact coherence is ENFORCED, not documented: an artifact set that contradicts the folded
     disposition raises :class:`~featuregen.formula.result.IncoherentResultError`."""
+    review = axes.review if isinstance(axes, AuthoringAxesV2) else None
+    if isinstance(axes, AuthoringAxesV2):
+        axes = axes.shared_axes()
+
+    if isinstance(review, ReviewedBlueprintBypassV2):
+        # NEUTRALITY IS EARNED, NOT ASSERTED. Without this the same bypass value folds ANY formula
+        # neutral — one value was measured being accepted verbatim on two proposals with different
+        # content hashes, both RESOLVED. The caller must name the expectation the run was opened
+        # for, and it must be the one the bypass stood on.
+        if not str(reviewed_expectation_hash or "").strip():
+            raise IncoherentResultError(
+                "a ReviewedBlueprintBypassV2 requires reviewed_expectation_hash — a bypass whose "
+                "coverage nobody checked is an unreviewed formula folding as neutral")
+        if review.expectation_hash != reviewed_expectation_hash:
+            raise IncoherentResultError(
+                f"bypass expectation_hash {review.expectation_hash!r} does not match the run's "
+                f"reviewed expectation {reviewed_expectation_hash!r} — the review covered a "
+                "different formula")
+        if critic_findings_hash is not None:
+            raise IncoherentResultError(
+                "a bypass carries no critic_findings_hash — the critic did not run, so evidence "
+                "of its findings contradicts the fold")
+    if isinstance(review, CriticExecutedV2):
+        # DERIVED here, never caller-supplied — the same rule `candidate_proposal_hash` obeys. Two
+        # independent copies of one piece of evidence are two things that can disagree.
+        critic_findings_hash = review.findings_hash
     _validate_axes(axes)
     disposition = _fold_v2(axes)
 
@@ -201,7 +321,11 @@ def derive_disposition_v2(
         capability_status=axes.capability_status,
         output_status=axes.output_status,
         expectation_status=axes.expectation_status,
-        critic_status=axes.critic_status,
+        # C-A5: a BYPASS reports no critic status at all. `"clean"` would say the critic ran and
+        # found nothing; `None` says it did not run, and `review` says why.
+        critic_status=(None if isinstance(review, ReviewedBlueprintBypassV2)
+                       else axes.critic_status),
+        review=review,
         technical_status=axes.technical_status,
         authoring_disposition=disposition,
         disposition_policy_version=DISPOSITION_POLICY_VERSION_V2,

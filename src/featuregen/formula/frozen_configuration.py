@@ -470,6 +470,7 @@ def freeze_current_configuration_v2(
     )
     from featuregen.formula.result_v2 import (
         DISPOSITION_POLICY_VERSION_V2,
+        AuthoringAxesV2,
         _fold_v2,
         derive_disposition_v2,
     )
@@ -523,6 +524,12 @@ def freeze_current_configuration_v2(
         "fold_sha256": _hash_bytes(
             inspect.getsource(derive_disposition_v2).encode("utf-8")),
         "precedence_sha256": _hash_bytes(inspect.getsource(_fold_v2).encode("utf-8")),
+        # C-A5 added a THIRD half: the critic axis for a v2 run is now decided in
+        # `AuthoringAxesV2.shared_axes()`, so a change there — reinstating a fail-open `else`, or
+        # altering what a bypass folds to — would change what a frozen run decides while the seal
+        # stayed byte-identical.
+        "review_projection_sha256": _hash_bytes(
+            inspect.getsource(AuthoringAxesV2.shared_axes).encode("utf-8")),
     }))
     version_vector = {
         "formula_schema": FORMULA_SCHEMA_VERSION_V2,
