@@ -10,6 +10,7 @@ import {
   searchCatalog,
 } from '../api'
 import { useHashRoute } from '../nav'
+import { CalloutGlyph } from './IngestResultCallout'
 import { LineageView } from './LineageView'
 import { SearchFacetPanel } from './SearchFacetPanel'
 import { SearchHitRow } from './SearchHitRow'
@@ -321,18 +322,45 @@ export function SearchScreen() {
               workspace that has its own anchor bar, and it was a third of the 300px of dead space
               before the canvas began. */}
           {!error && hasHits && effectiveView === 'list' && (
-            <p className="micro-label tabular-nums result-count" role="status">
-              <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
-              {result.total === 1 ? 'result' : 'results'}
-              {result.total > result.hits.length && (
-                // The SLICE, not just a count: with paging, "showing the first 20" stopped being
-                // true the moment the user moved forward, and a bare count gives no way to tell
-                // which 20 are on screen.
-                <span className="result-count-note">
-                  {' '}· showing {offset + 1}–{offset + result.hits.length} of {result.total}
-                </span>
+            <div className="results-toolbar">
+              <p className="micro-label tabular-nums result-count" role="status">
+                <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
+                {result.total === 1 ? 'asset' : 'assets'}
+                {result.total > result.hits.length && (
+                  // The SLICE, not just a count: with paging, "showing the first 20" stopped being
+                  // true the moment the user moved forward, and a bare count gives no way to tell
+                  // which 20 are on screen.
+                  <span className="result-count-note">
+                    {' '}· showing {offset + 1}–{offset + result.hits.length}
+                  </span>
+                )}
+              </p>
+              {/* The projection marker, finally rendered. Search reads the projected display
+                  columns, so a lagged projection means these rows may not reflect the newest
+                  resolved semantics — and until now the screen said nothing at all about it. */}
+              {result.projection.status === 'ready' && (
+                <p className="projection-ok" data-testid="search-projection">
+                  Catalog projection current
+                </p>
               )}
-            </p>
+            </div>
+          )}
+
+          {/* A disclosure, never a refusal: the rows below stay on screen either way. */}
+          {!error && hasHits && effectiveView === 'list'
+            && result.projection.status === 'lagged' && (
+            <div className="callout callout--warn" role="status">
+              <CalloutGlyph>
+                <circle cx="8" cy="8" r="6.25" />
+                <path d="M8 4.75v4M8 11.25v.01" />
+              </CalloutGlyph>
+              <div className="callout-body">
+                <p>
+                  The catalog projection was behind when these results were read, so they may not
+                  yet reflect the newest resolved semantics.
+                </p>
+              </div>
+            </div>
           )}
 
           {/* A1: paging the RESULT LIST while a graph is on screen is chrome for a view that is
@@ -340,6 +368,11 @@ export function SearchScreen() {
           {!error && hasHits && effectiveView === 'list'
             && (offset > 0 || offset + result.hits.length < result.total) && (
             <nav className="pager" aria-label="Result pages">
+              {/* The pager only renders when there is more than one page, so this line appears
+                  exactly when paging is possible — which is when it earns its space. */}
+              <span className="pager-copy tabular-nums">
+                Showing {offset + 1}–{offset + result.hits.length} of {result.total} permitted assets
+              </span>
               <button
                 type="button"
                 className="ghost"

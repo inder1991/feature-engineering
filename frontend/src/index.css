@@ -7762,3 +7762,46 @@ button.stat:hover {
   grid-template-columns: minmax(0, 1fr);
   gap: 0;
 }
+
+/* The results toolbar: the count and the slice on the left, the projection state on the right.
+   Both are facts about the SAME read, so they share one baseline rather than stacking. */
+.results-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* The projection marker the screen never rendered. Quiet by construction: `ready` is the normal
+   case, so it states the fact at micro-label size and gets out of the way. The `lagged` case is
+   NOT this element — it composes the house .callout--warn, which already carries its own styles. */
+.projection-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 11px;
+}
+
+.projection-ok::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+}
+
+/* `.pager` carried no layout rule at all, so its two buttons sat edge to edge (JSX drops the
+   whitespace between them) and `.pager-copy`'s `margin-right: auto` would have been inert. One
+   flex line: the slice copy reads first, the controls sit at the far end. */
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 13px is the documented secondary size; the row's ramp is 14/13/11 and 12px is not a tier. */
+.pager-copy { color: var(--ink-faint); font-size: 13px; margin-right: auto; }

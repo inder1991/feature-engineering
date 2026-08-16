@@ -131,28 +131,49 @@ describe('search screen — results and rows', () => {
     expect(within(row).getByText('numeric')).toBeInTheDocument()
   })
 
-  it('counts results with honest "N result(s)" copy from the total', async () => {
+  it('counts results with honest "N asset(s)" copy from the total', async () => {
     searchCatalog.mockResolvedValue(
       result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }],
         FACETS, 2),
     )
     render(<SearchScreen />)
-    expect(await screen.findByRole('status')).toHaveTextContent('2 results')
+    expect(await screen.findByRole('status')).toHaveTextContent('2 assets')
   })
 
   it('uses the singular for a single result', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    expect(await screen.findByRole('status')).toHaveTextContent('1 result')
+    // Word-bounded: "1 assets" CONTAINS "1 asset", so a plain substring match would go green on a
+    // broken plural and pin nothing.
+    expect(await screen.findByRole('status')).toHaveTextContent(/\b1 asset\b/)
   })
 
-  it('states the total honestly and names the slice on screen', async () => {
+  it('counts the permitted set and names the slice on screen', async () => {
     // total counts tables + columns and can exceed the returned (limit-capped) hit page.
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 42))
     render(<SearchScreen />)
     const status = await screen.findByRole('status')
-    expect(status).toHaveTextContent('42 results')
-    expect(status).toHaveTextContent('showing 1–1 of 42')
+    expect(status).toHaveTextContent('42 assets')
+    expect(status).toHaveTextContent('showing 1–1')
+    expect(screen.getByText('Showing 1–1 of 42 permitted assets')).toBeInTheDocument()
+  })
+
+  it('says the projection is current when the server says it is', async () => {
+    render(<SearchScreen />)
+    expect(await screen.findByTestId('search-projection'))
+      .toHaveTextContent('Catalog projection current')
+  })
+
+  it('discloses a lagged projection above the results without hiding them', async () => {
+    searchCatalog.mockResolvedValue({
+      hits: [HIT], facets: FACETS, total: 1,
+      projection: { status: 'lagged', code: 'CATALOG_PROJECTION_BEHIND', detail: 'overlay is behind' },
+    })
+    render(<SearchScreen />)
+    expect(await screen.findByText(/catalog projection was behind/i)).toBeInTheDocument()
+    // The rows are still served: a disclosure, never a refusal.
+    expect(screen.getByTestId('hit-name')).toHaveTextContent('balance')
+    expect(screen.queryByTestId('search-projection')).toBeNull()
   })
 
   it('omits absent enrichment fields and includes them when present', async () => {
