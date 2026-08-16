@@ -50,7 +50,7 @@ disclosure, while the asset page discloses exactly that condition.
 | Per-row "Explore relationships"; no global Graph toggle | A lineage graph needs an anchor; a global toggle has none |
 | Capability lines ("Grain key for Account") | Says what the asset can *do*, which is the actual question |
 | Filters in user language; "not classified" demoted | `(none)` dominating every group is noise, not information |
-| "permitted assets" in the pager copy | Names read-scope honestly |
+| Naming the scope in the pager copy | The concept says "permitted assets"; we ship "matching assets" — see D8 for why "permitted" overclaims |
 | Search affordances: examples, clear button, `/` to focus | Cheap, standard, missing today |
 
 **Refused — the mockup writes cheques our data cannot cash:**
@@ -104,8 +104,14 @@ The concept's "Data role" group is one of them. A server-driven panel gets all s
   toolbar. `lagged` → a warn callout above the rows: *"The catalog projection was behind when these
   results were read, so they may not yet reflect the newest resolved semantics."* Rows are always
   still served — disclosure, never refusal.
-- **D8 — Count copy.** Status line: "221 assets · showing 1–20". Pager line: "Showing 1–20 of 221
-  permitted assets".
+- **D8 — Count copy.** Status line: "221 assets". Pager line: "Showing 1–20 of 221 matching assets".
+  Two corrections landed during review. The status line originally carried "· showing 1–20" as
+  well, but the two slice statements provably always co-occur — the toolbar's appears iff
+  `total > hits.length`, which implies the pager renders — so the slice is stated once, in the
+  control that navigates it. And the pager said "permitted assets", which overclaims: `total`
+  counts rows matching *this* query and *these* facets, so "permitted" asserts a universe size that
+  is false whenever a filter is active, and it silently absorbs freshness-withheld assets, which
+  *are* permitted. The empty state still tells the read-scope and freshness story in full.
 - **D9 — Empty state** keeps today's fail-closed sentence and gains a "Clear search and filters"
   button.
 - **D10 — File split.** `searchHitDisplay.ts` (pure rules + unit tests), `SearchHitRow.tsx`,
