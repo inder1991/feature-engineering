@@ -1,4 +1,4 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -45,6 +45,31 @@ function result(
   return { hits, facets, total, projection: { status: 'ready', code: '', detail: '' } }
 }
 
+// Task 2 rebuilt the row: the NAME leads and the physical address is a breadcrumb, so an
+// object_ref is no longer one text node anywhere in the DOM. A row is addressed here the way the
+// row itself spells it — source › schema.table › column, minus the leading source.
+function trailRef(trail: HTMLElement): string {
+  return (trail.textContent ?? '').split('›').map(part => part.trim()).slice(1).join('.')
+}
+
+function queryRow(ref: string): HTMLElement | null {
+  const trail = screen.queryAllByTestId('hit-breadcrumb').find(t => trailRef(t) === ref)
+  return trail ? (trail.closest('li') as HTMLElement) : null
+}
+
+// waitFor, not findAllByTestId + find: a re-search leaves the PREVIOUS rows on screen, so a query
+// that settles as soon as any breadcrumb exists would resolve against the stale set.
+async function findRow(ref: string): Promise<HTMLElement> {
+  return await waitFor(() => {
+    const row = queryRow(ref)
+    if (!row) {
+      const seen = screen.queryAllByTestId('hit-breadcrumb').map(trailRef).join(', ')
+      throw new Error(`no result row for ${ref}; on screen: ${seen || '(none)'}`)
+    }
+    return row
+  })
+}
+
 beforeEach(() => {
   window.location.hash = '#/search'
   searchCatalog.mockReset()
@@ -79,30 +104,37 @@ beforeEach(() => {
 describe('search screen — results and rows', () => {
   it('auto-browses on mount (empty query returns the whole set)', async () => {
     render(<SearchScreen />)
-    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
     expect(searchCatalog).toHaveBeenCalledWith('', {}, SEARCH_PAGE_SIZE, 0)
   })
 
-  it('renders context-rich result rows (badges, definition, meta line)', async () => {
+  it('renders context-rich result rows (name, breadcrumb, badges, definition, capabilities)', async () => {
     searchCatalog.mockResolvedValue(
       result([{ ...HIT, is_grain: true, is_as_of: true, sensitivity: 'pii' }],
         { source: [{ value: 'deposits', count: 1 }] }, 1),
     )
     render(<SearchScreen />)
-    const list = await screen.findByRole('list')
-    expect(within(list).getByText('public.accounts.balance')).toBeInTheDocument()
-    expect(within(list).getByText('grain')).toBeInTheDocument()
-    expect(within(list).getByText('as-of')).toBeInTheDocument()
-    expect(within(list).getByText('pii')).toBeInTheDocument()
-    expect(screen.getByText('end-of-day ledger balance')).toBeInTheDocument()
-    expect(
-      screen.getByText('numeric · deposits · Account · semi_additive · dollars (USD)'),
-    ).toBeInTheDocument()
+    const row = await findRow('public.accounts.balance')
+    // The name leads; the physical address is demoted to the breadcrumb under it.
+    expect(within(row).getByTestId('hit-name')).toHaveTextContent('balance')
+    expect(within(row).getByTestId('hit-breadcrumb')).toHaveTextContent('deposits')
+    expect(within(row).getByTestId('hit-breadcrumb')).toHaveTextContent('public.accounts')
+    expect(within(row).getByText('grain')).toBeInTheDocument()
+    expect(within(row).getByText('as-of')).toBeInTheDocument()
+    expect(within(row).getByText('pii')).toBeInTheDocument()
+    expect(within(row).getByText('end-of-day ledger balance')).toBeInTheDocument()
+    // What the asset can DO, off the hit's own fields. The entity is named by the grain line, so
+    // the quiet meta remainder is only the data type.
+    expect(within(row).getByText('Grain key for Account')).toBeInTheDocument()
+    expect(within(row).getByText('As-of field')).toBeInTheDocument()
+    expect(within(row).getByText('Semi-additive · USD')).toBeInTheDocument()
+    expect(within(row).getByText('numeric')).toBeInTheDocument()
   })
 
   it('counts results with honest "N result(s)" copy from the total', async () => {
     searchCatalog.mockResolvedValue(
-      result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at' }], FACETS, 2),
+      result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }],
+        FACETS, 2),
     )
     render(<SearchScreen />)
     expect(await screen.findByRole('status')).toHaveTextContent('2 results')
@@ -126,14 +158,17 @@ describe('search screen — results and rows', () => {
   it('omits absent enrichment fields and includes them when present', async () => {
     searchCatalog.mockResolvedValue(result([
       HIT,
-      { ...HIT, object_ref: 'public.customers.email', concept: 'contact', domain: 'retail' },
+      {
+        ...HIT, object_ref: 'public.customers.email', table: 'customers', column: 'email',
+        concept: 'contact', domain: 'retail',
+      },
     ], FACETS, 2))
     render(<SearchScreen />)
+    // The source moved to the breadcrumb and the additivity to a capability line, so the meta
+    // remainder is data type, domain, entity, concept — each named, none invented.
+    expect(await screen.findByText('numeric · entity: Account')).toBeInTheDocument()
     expect(
-      await screen.findByText('numeric · deposits · Account · semi_additive · dollars (USD)'),
-    ).toBeInTheDocument()
-    expect(
-      screen.getByText('numeric · deposits · contact · retail · Account · semi_additive · dollars (USD)'),
+      screen.getByText('numeric · retail · entity: Account · concept: contact'),
     ).toBeInTheDocument()
   })
 
@@ -153,7 +188,7 @@ describe('search screen — results and rows', () => {
     expect(screen.getByText('Searching the catalog…')).toBeInTheDocument()
     expect(screen.queryByText(/no results match/i)).not.toBeInTheDocument()
     await act(async () => { resolve(result([HIT], FACETS, 1)); await Promise.resolve() })
-    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
   })
 })
 
@@ -161,7 +196,7 @@ describe('search screen — facet sidebar', () => {
   it('renders facet groups and labeled value+count checkboxes from the response', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     for (const group of ['Source', 'Domain', 'Sensitivity', 'Declared tag', 'Additivity',
                          'Entity', 'Kind', 'Flags']) {
       expect(screen.getByText(group)).toBeInTheDocument()
@@ -176,7 +211,7 @@ describe('search screen — facet sidebar', () => {
     void domain
     searchCatalog.mockResolvedValue(result([HIT], rest, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.queryByText('Domain')).not.toBeInTheDocument()
     expect(screen.getByText('Source')).toBeInTheDocument()
   })
@@ -184,7 +219,7 @@ describe('search screen — facet sidebar', () => {
   it('checking a facet re-fetches with the right params and re-renders counts from the response', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).not.toBeChecked()
 
     // the fresh response narrows the same value's count — the sidebar must reflect it, not guess.
@@ -201,7 +236,7 @@ describe('search screen — facet sidebar', () => {
   it('encodes multi-select (OR within a group) and a flag as repeated shareable params', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     await userEvent.click(screen.getByRole('checkbox', { name: 'deposits 3' }))
     await userEvent.click(screen.getByRole('checkbox', { name: 'cards 1' }))
     await userEvent.click(screen.getByRole('checkbox', { name: 'Grain 2' }))
@@ -214,7 +249,7 @@ describe('search screen — facet sidebar', () => {
   it('renders the pii sensitivity value with a danger dot (label carries the meaning)', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     const pii = screen.getByRole('checkbox', { name: 'pii 1' })
     expect(pii.closest('label')?.querySelector('.facet-pii-dot')).toBeInTheDocument()
   })
@@ -224,7 +259,7 @@ describe('search screen — facet sidebar', () => {
       result([HIT], { ...FACETS, sensitivity: [{ value: '(none)', count: 4 }] }, 1),
     )
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.getByText('Declared tag')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: '(none) 4' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: 'pii 1' })).not.toBeInTheDocument()
@@ -235,7 +270,7 @@ describe('search screen — facet sidebar', () => {
       result([HIT], { ...FACETS, grain: [{ value: 'true', count: 0 }] }, 1),
     )
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.getByRole('checkbox', { name: 'Grain 0' })).toBeDisabled()
     expect(screen.getByRole('checkbox', { name: 'As-of 1' })).toBeEnabled()
   })
@@ -246,7 +281,7 @@ describe('search screen — active filters and URL state', () => {
     window.location.hash = '#/search?source=deposits'
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.getByText('source: deposits')).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).toBeChecked()
 
@@ -260,7 +295,7 @@ describe('search screen — active filters and URL state', () => {
     window.location.hash = '#/search?q=balance&source=deposits&grain=true'
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     expect(screen.getByText('source: deposits')).toBeInTheDocument()
     expect(screen.getByText('grain')).toBeInTheDocument()
 
@@ -277,7 +312,7 @@ describe('search screen — active filters and URL state', () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     expect(screen.getByLabelText('Query')).toHaveValue('balance')
-    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
     expect(searchCatalog).toHaveBeenCalledWith(
       'balance',
       { source: ['deposits', 'cards'], additivity: ['semi_additive'], grain: true },
@@ -294,7 +329,7 @@ describe('search screen — active filters and URL state', () => {
     window.location.hash = '#/search?source=deposits'
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     await userEvent.type(screen.getByLabelText('Query'), 'balance')
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
     expect(searchCatalog).toHaveBeenLastCalledWith('balance', { source: ['deposits'] }, SEARCH_PAGE_SIZE, 0)
@@ -308,19 +343,19 @@ describe('search screen — errors, ordering, keys', () => {
   it('replaces results with an alert on failure and recovers on the next search', async () => {
     searchCatalog.mockResolvedValueOnce(result([HIT], FACETS, 1))
     render(<SearchScreen />)
-    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
 
     searchCatalog.mockRejectedValueOnce(new api.ApiError(500, 'search backend unavailable'))
     await userEvent.type(screen.getByLabelText('Query'), 'x')
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('search backend unavailable')
-    expect(screen.queryByText('public.accounts.balance')).not.toBeInTheDocument()
+    expect(queryRow('public.accounts.balance')).toBeNull()
     expect(screen.queryByText(/no results match/i)).not.toBeInTheDocument()
 
     searchCatalog.mockResolvedValueOnce(result([HIT], FACETS, 1))
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(await findRow('public.accounts.balance')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
@@ -333,18 +368,19 @@ describe('search screen — errors, ordering, keys', () => {
     let resolveFirst!: (r: api.SearchResult) => void
     searchCatalog.mockImplementationOnce(() => new Promise(res => { resolveFirst = res }))
     searchCatalog.mockResolvedValueOnce(
-      result([{ ...HIT, object_ref: 'public.customers.email' }], FACETS, 1),
+      result([{ ...HIT, object_ref: 'public.customers.email', table: 'customers', column: 'email' }],
+        FACETS, 1),
     )
     await userEvent.type(screen.getByLabelText('Query'), 'balance')
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
     await userEvent.clear(screen.getByLabelText('Query'))
     await userEvent.type(screen.getByLabelText('Query'), 'email')
     await userEvent.click(screen.getByRole('button', { name: 'Search' }))
-    expect(await screen.findByText('public.customers.email')).toBeInTheDocument()
+    expect(await findRow('public.customers.email')).toBeInTheDocument()
 
     await act(async () => { resolveFirst(result([HIT], FACETS, 1)); await Promise.resolve() })
-    expect(screen.getByText('public.customers.email')).toBeInTheDocument()
-    expect(screen.queryByText('public.accounts.balance')).not.toBeInTheDocument()
+    expect(queryRow('public.customers.email')).not.toBeNull()
+    expect(queryRow('public.accounts.balance')).toBeNull()
   })
 
   // object_ref alone is not unique across catalog sources; keys must be composite.
@@ -356,7 +392,14 @@ describe('search screen — errors, ordering, keys', () => {
         { ...HIT, catalog_source: 'deposits_eu' },
       ], FACETS, 2))
       render(<SearchScreen />)
-      expect(await screen.findAllByText('public.accounts.balance')).toHaveLength(2)
+      const trails = await screen.findAllByTestId('hit-breadcrumb')
+      // Same ref, two sources — and the breadcrumb leads with the source, so the two rows are
+      // distinguishable on screen as well as in the key.
+      expect(trails.map(trailRef)).toEqual(['public.accounts.balance', 'public.accounts.balance'])
+      expect(trails.map(t => t.textContent)).toEqual([
+        'deposits › public.accounts › balance',
+        'deposits_eu › public.accounts › balance',
+      ])
       const duplicateKeyErrors = errorSpy.mock.calls.filter(args =>
         String(args[0]).includes('same key'),
       )
@@ -367,44 +410,10 @@ describe('search screen — errors, ordering, keys', () => {
   })
 })
 
-describe('search screen — impact and graph', () => {
-  it('lists derived feature ids inline when Impact finds features', async () => {
-    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
-    featureImpact.mockResolvedValue(['feat_01', 'feat_02'])
-    render(<SearchScreen />)
-    await userEvent.click(
-      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
-    )
-    expect(featureImpact).toHaveBeenCalledWith('public.accounts.balance', 'deposits')
-    expect(await screen.findByText('feat_01')).toBeInTheDocument()
-    expect(screen.getByText('feat_02')).toBeInTheDocument()
-    expect(screen.getByText('Derived features')).toBeInTheDocument()
-  })
-
-  it('states plainly when no features derive from the column', async () => {
-    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
-    featureImpact.mockResolvedValue([])
-    render(<SearchScreen />)
-    await userEvent.click(
-      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
-    )
-    expect(await screen.findByText('No features derive from this column.')).toBeInTheDocument()
-    expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
-  })
-
-  it('shows a small alert when the impact check fails', async () => {
-    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
-    featureImpact.mockRejectedValue(new api.ApiError(503, 'graph unavailable'))
-    render(<SearchScreen />)
-    await userEvent.click(
-      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
-    )
-    const alert = await screen.findByRole('alert')
-    expect(alert).toHaveTextContent('Impact check failed: graph unavailable')
-    expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
-    expect(screen.getByText('public.accounts.balance')).toBeInTheDocument()
-  })
-
+// The Feature impact behaviour itself (the id list, the empty statement, the failure alert) now
+// belongs to the row and is pinned in SearchHitRow.test.tsx. What stays here is the WIRING: which
+// route each action navigates to, and which row the graph anchors on.
+describe('search screen — row actions and graph', () => {
   it('keeps the view toggle disabled with a hint while a search returns nothing', async () => {
     searchCatalog.mockResolvedValue(result([], {}, 0))
     render(<SearchScreen />)
@@ -416,10 +425,11 @@ describe('search screen — impact and graph', () => {
 
   it('flips to the graph anchored on the first (facet-narrowed) hit, and back to the list', async () => {
     searchCatalog.mockResolvedValue(
-      result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at' }], FACETS, 2),
+      result([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }],
+        FACETS, 2),
     )
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
 
     const toggle = screen.getByRole('group', { name: 'Result view' })
     await userEvent.click(within(toggle).getByRole('button', { name: 'Graph' }))
@@ -432,21 +442,21 @@ describe('search screen — impact and graph', () => {
     )
     expect(await screen.findByText('Relationship layers')).toBeInTheDocument()
     expect(
-      screen.queryByRole('button', { name: 'Impact for public.accounts.balance' }),
+      screen.queryByRole('button', { name: 'Feature impact for public.accounts.balance' }),
     ).not.toBeInTheDocument()
 
     await userEvent.click(within(toggle).getByRole('button', { name: 'List' }))
     expect(
-      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
+      await screen.findByRole('button', { name: 'Feature impact for public.accounts.balance' }),
     ).toBeInTheDocument()
     expect(screen.queryByText('Relationship layers')).not.toBeInTheDocument()
   })
 
-  it('Details action navigates to the asset route with the hit\'s source and object_ref', async () => {
+  it('Open asset navigates to the asset route with the hit\'s source and object_ref', async () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Details for public.accounts.balance' }),
+      await screen.findByRole('button', { name: 'Open asset public.accounts.balance' }),
     )
     // The hit's own catalog_source is the registration lineage key — it rides the asset route,
     // never a client-side default; object_ref's dots survive as query-string chars.
@@ -469,14 +479,14 @@ describe('search screen — impact and graph', () => {
       .toBe('#/suggested?source=deposits&table=accounts&column=balance')
   })
 
-  it('jumps to the graph anchored on the row whose Graph action was clicked', async () => {
+  it('jumps to the graph anchored on the row whose Explore relationships action was clicked', async () => {
     searchCatalog.mockResolvedValue(result([
       HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' },
     ], FACETS, 2))
     render(<SearchScreen />)
-    await screen.findByText('public.accounts.balance')
+    await findRow('public.accounts.balance')
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+      await screen.findByRole('button', { name: 'Explore relationships for public.accounts.opened_at' }),
     )
     expect(lineageGraph).toHaveBeenCalledWith(
       'public.accounts.opened_at', 'deposits',
@@ -494,7 +504,7 @@ describe('search screen — impact and graph', () => {
     ], FACETS, 2))
     render(<SearchScreen />)
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+      await screen.findByRole('button', { name: 'Explore relationships for public.accounts.opened_at' }),
     )
     // The hint sentence was replaced by the graph's own context bar, which names the anchor with
     // its kind chip, full ref and wording rather than a parenthetical.
@@ -509,9 +519,11 @@ describe('search screen — impact and graph', () => {
       HIT,
     ], FACETS, 2))
     render(<SearchScreen />)
-    const tableRow = (await screen.findByText('public.accounts')).closest('li') as HTMLElement
+    const tableRow = await findRow('public.accounts')
     expect(within(tableRow).getByText('table')).toHaveClass('badge')
-    const colRow = screen.getByText('public.accounts.balance').closest('li') as HTMLElement
+    // The badge is the ONLY place the kind is stated — the meta line leaves it to the badge — so
+    // a column row says "table" nowhere.
+    const colRow = await findRow('public.accounts.balance')
     expect(within(colRow).queryByText('table')).not.toBeInTheDocument()
   })
 
@@ -523,7 +535,7 @@ describe('search screen — impact and graph', () => {
     searchCatalog.mockResolvedValue(result(hits, FACETS, 2))
     render(<SearchScreen />)
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+      await screen.findByRole('button', { name: 'Explore relationships for public.accounts.opened_at' }),
     )
     expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     // Re-search (same result set): the anchor must NOT silently reset to the first hit (the table).
@@ -536,7 +548,7 @@ describe('search screen — impact and graph', () => {
     searchCatalog.mockResolvedValue(result([HIT, colHit], FACETS, 2))
     render(<SearchScreen />)
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+      await screen.findByRole('button', { name: 'Explore relationships for public.accounts.opened_at' }),
     )
     expect(await screen.findByRole('region', { name: /graph anchor/i })).toHaveTextContent('public.accounts.opened_at')
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))

@@ -7,11 +7,11 @@ import {
   type SearchFilters,
   type SearchHit,
   type SearchResult,
-  featureImpact,
   searchCatalog,
 } from '../api'
 import { useHashRoute } from '../nav'
 import { LineageView } from './LineageView'
+import { SearchHitRow } from './SearchHitRow'
 
 const FACET_GROUPS: { key: SearchFacetKey; label: string }[] = [
   { key: 'source', label: 'Source' },
@@ -433,11 +433,11 @@ export function SearchScreen() {
           {!error && hasHits && effectiveView === 'list' && (
             <ul className="rows">
               {result.hits.map(hit => (
-                <HitRow
+                <SearchHitRow
                   key={`${hit.catalog_source}:${hit.object_ref}`}
                   hit={hit}
-                  onGraph={jumpToGraph}
-                  onDetails={openDetails}
+                  onOpen={openDetails}
+                  onExplore={jumpToGraph}
                   onSuggested={openSuggested}
                 />
               ))}
@@ -462,125 +462,5 @@ export function SearchScreen() {
         </div>
       </div>
     </section>
-  )
-}
-
-function HitRow({
-  hit,
-  onGraph,
-  onDetails,
-  onSuggested,
-}: {
-  hit: SearchHit
-  onGraph: (hit: SearchHit) => void
-  onDetails: (hit: SearchHit) => void
-  onSuggested: (hit: SearchHit) => void
-}) {
-  const [impact, setImpact] = useState<string[] | null>(null)
-  const [impactError, setImpactError] = useState('')
-  const [checking, setChecking] = useState(false)
-
-  async function checkImpact() {
-    setChecking(true)
-    setImpactError('')
-    try {
-      setImpact(await featureImpact(hit.object_ref, hit.catalog_source))
-    } catch (err) {
-      setImpact(null)
-      setImpactError(err instanceof ApiError ? err.detail : String(err))
-    } finally {
-      setChecking(false)
-    }
-  }
-
-  const aggregation = hit.additivity
-    ? `${hit.additivity}${hit.unit ? ` · ${hit.unit}` : ''}${hit.currency ? ` (${hit.currency})` : ''}`
-    : null
-  const meta = [
-    hit.data_type ?? hit.kind,
-    hit.catalog_source,
-    hit.concept,
-    hit.domain,
-    hit.entity,
-    aggregation,
-  ]
-    .filter((part): part is string => Boolean(part))
-    .join(' · ')
-  return (
-    <li className="row">
-      <div style={{ display: 'grid', gap: 2, minWidth: 0, flex: 1 }}>
-        <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
-          <code>{hit.object_ref}</code>
-          {hit.kind === 'table' && <span className="badge kindtable">table</span>}
-          {hit.is_grain && <span className="badge grain">grain</span>}
-          {hit.is_as_of && <span className="badge asof">as-of</span>}
-          {hit.sensitivity && <span className="badge sensitivity">{hit.sensitivity}</span>}
-          {/* The projected display label, its OWN badge — never merged with the tag above: the two
-              speak different vocabularies ('pii' vs 'restricted'), and on a catalog that declares
-              no tag this is the only sensitivity a column has. */}
-          {hit.sensitivity_display && (
-            <span className="badge sensitivity">{hit.sensitivity_display}</span>
-          )}
-        </div>
-        {hit.definition && <p style={{ color: 'var(--ink-soft)' }}>{hit.definition}</p>}
-        <p className="hint">{meta}</p>
-        {checking && <p className="hint">Checking feature impact…</p>}
-        {impactError && (
-          <p role="alert" className="error">
-            Impact check failed: {impactError}
-          </p>
-        )}
-        {impact?.length === 0 && (
-          <p className="hint" role="status">
-            No features derive from this column.
-          </p>
-        )}
-        {impact && impact.length > 0 && (
-          <div>
-            <p className="micro-label" style={{ marginTop: 4 }}>
-              Derived features
-            </p>
-            <ul className="mono" style={{ marginTop: 2, paddingLeft: 18, display: 'grid', gap: 2 }}>
-              {impact.map(id => (
-                <li key={id}>{id}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Details for ${hit.object_ref}`}
-        onClick={() => onDetails(hit)}
-      >
-        Details
-      </button>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Suggested features for ${hit.table}`}
-        onClick={() => onSuggested(hit)}
-      >
-        Suggested features
-      </button>
-      <button
-        type="button"
-        className="btn btn--ghost"
-        aria-label={`Graph for ${hit.object_ref}`}
-        onClick={() => onGraph(hit)}
-      >
-        Graph
-      </button>
-      <button
-        type="button"
-        className="btn"
-        aria-label={`Impact for ${hit.object_ref}`}
-        disabled={checking}
-        onClick={() => void checkImpact()}
-      >
-        Impact
-      </button>
-    </li>
   )
 }

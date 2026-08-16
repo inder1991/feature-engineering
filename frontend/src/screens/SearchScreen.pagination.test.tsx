@@ -54,9 +54,11 @@ beforeEach(() => {
   searchCatalog.mockResolvedValue(page(0, 20, 45))
 })
 
+// Rows are addressed by the COLUMN NAME they now lead with: Task 2's row demoted the object_ref
+// to a breadcrumb, so `public.t.c0` is no longer one text node anywhere in the DOM.
 async function mount() {
   render(<SearchScreen />)
-  await screen.findByText('public.t.c0')
+  await screen.findByText('c0')
 }
 
 // ── the control exists and is honest about where it can go ──────────────────────────────────────
@@ -69,7 +71,7 @@ it('offers Next when more results exist than this page shows', async () => {
 it('does not offer a way forward when this page is the whole result set', async () => {
   searchCatalog.mockResolvedValue(page(0, 5, 5))
   render(<SearchScreen />)
-  await screen.findByText('public.t.c0')
+  await screen.findByText('c0')
   expect(screen.queryByRole('button', { name: /next/i })).toBeNull()
 })
 
@@ -86,14 +88,14 @@ it('Next asks the server for the rows after this page', async () => {
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(20))
-  expect(await screen.findByText('public.t.c20')).toBeInTheDocument()
+  expect(await screen.findByText('c20')).toBeInTheDocument()
 })
 
 it('Previous returns to the page before', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
   searchCatalog.mockResolvedValue(page(0, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /previous/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(0))
@@ -105,10 +107,10 @@ it('stops offering Next on the last page', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
   searchCatalog.mockResolvedValue(page(40, 5, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c40')
+  await screen.findByText('c40')
   expect(screen.queryByRole('button', { name: /next/i })).toBeNull()
   expect(screen.getByRole('button', { name: /previous/i })).toBeEnabled()
 })
@@ -119,20 +121,20 @@ it('returns to the first page when a facet changes', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
 
   // A facet toggle narrows the set — carrying offset=20 into a 3-row result would show nothing.
   searchCatalog.mockResolvedValue(page(0, 3, 3))
   await userEvent.click(screen.getByRole('checkbox', { name: /wide/i }))
   await waitFor(() => expect(offsetOf(searchCatalog.mock.calls.at(-1)!)).toBe(0))
-  expect(await screen.findByText('public.t.c0')).toBeInTheDocument()
+  expect(await screen.findByText('c0')).toBeInTheDocument()
 })
 
 it('returns to the first page when a new query is submitted', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
 
   searchCatalog.mockResolvedValue(page(0, 2, 2))
   await userEvent.type(screen.getByLabelText('Query'), 'balance{Enter}')
@@ -145,7 +147,7 @@ it('says which slice of the whole set is on screen', async () => {
   await mount()
   searchCatalog.mockResolvedValue(page(20, 20, 45))
   await userEvent.click(screen.getByRole('button', { name: /next/i }))
-  await screen.findByText('public.t.c20')
+  await screen.findByText('c20')
   // The range is interpolated from several JSX expressions, so assert on the element's text
   // rather than on a single matching text node.
   const line = screen.getAllByRole('status').map(n => n.textContent ?? '').join(' | ')

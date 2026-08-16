@@ -7591,3 +7591,89 @@ button.stat:hover {
 }
 
 .ccq-outcome { color: var(--ok); }
+
+/* ---- catalog search (2026-08-16 redesign) --------------------------------------------------
+   The result row: meaning leads, the physical address is a breadcrumb, one primary action.
+   Existing tokens only; composes the .row / .badge / .btn vocabulary. Nothing above is modified. */
+
+.rows .row.hit {
+  display: grid;
+  /* The capability column is fit-content, not a fixed minmax(0, 210px), and the actions are
+     placed explicitly. Most hits carry no capability at all (no grain, no as-of, no additivity),
+     and a fixed second track would have grown into 210px of blank space on those rows during
+     grid's maximize-tracks step — then auto-placed the actions INTO it, squeezing four buttons
+     into a 210px box. fit-content collapses an empty track to 0 and still caps a populated one. */
+  grid-template-columns: minmax(0, 1fr) fit-content(210px) auto;
+  gap: 16px;
+  align-items: start;
+  padding: 14px 16px;
+}
+
+.hit-main { min-width: 0; display: grid; gap: 4px; }
+
+.hit-title { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* The name leads, so it takes the body size rather than .mono's 13px — this rule follows .mono
+   in the cascade at equal specificity, which is what makes that win. */
+.hit-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+/* The physical address, demoted under the name but never hidden. --ink-faint is 5.89:1 on
+   --surface (see the token comment), so it clears 4.5:1 at this size. */
+.hit-breadcrumb {
+  margin: 0;
+  font-size: 11px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.hit-definition {
+  margin: 4px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-soft);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.hit-meta { margin: 2px 0 0; }
+
+.hit-capabilities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  align-content: start;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.hit-capabilities li { display: flex; align-items: baseline; gap: 7px; }
+
+.hit-capabilities li::before {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent-line);
+}
+
+.hit-actions {
+  grid-column: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.hit-impact { margin-top: 6px; }
+.hit-impact ul { margin: 2px 0 0; padding-left: 18px; display: grid; gap: 2px; }
