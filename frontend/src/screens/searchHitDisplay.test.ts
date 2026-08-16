@@ -96,8 +96,18 @@ describe('hitMeta', () => {
       .toEqual(['numeric', 'retail', 'concept: account_balance'])
   })
 
-  it('labels a table hit by kind rather than a missing data type', () => {
-    expect(hitMeta(TABLE)).toEqual(['table'])
+  // The row renders a `table` badge of its own, so repeating the word here would print it twice.
+  it('omits the kind — the row badges it', () => {
+    expect(hitMeta(TABLE)).toEqual([])
+  })
+
+  it('names the entity when no grain line already does', () => {
+    expect(hitMeta({ ...COLUMN, entity: 'Account' })).toEqual(['numeric', 'entity: Account'])
+  })
+
+  // "Grain key for Account" already names it; saying it twice on one row is noise.
+  it('leaves the entity to the grain capability line when there is one', () => {
+    expect(hitMeta({ ...COLUMN, is_grain: true, entity: 'Account' })).toEqual(['numeric'])
   })
 
   it('drops every field the catalog does not hold', () => {
