@@ -9,9 +9,9 @@ The load-bearing rules (baked in by a two-round review):
 """
 from featuregen.overlay.upload.passc.candidates import CandidatePair, block_candidates, score
 from featuregen.overlay.upload.passc.identifiers import ColMeta
-from featuregen.overlay.upload.passc.types import (
-    ALGORITHM_VERSION, CONFIG_VERSION, CardinalityInferenceStatus as S,
-    NamespaceCompatibility as N)
+from featuregen.overlay.upload.passc.types import ALGORITHM_VERSION, CONFIG_VERSION
+from featuregen.overlay.upload.passc.types import CardinalityInferenceStatus as S
+from featuregen.overlay.upload.passc.types import NamespaceCompatibility as N
 
 
 def _c(table, column, **kw):

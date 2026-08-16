@@ -24,11 +24,23 @@ import hashlib
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.passc.identifiers import (
-    ColMeta, _canon, _words, is_join_key_eligible, normalized_identifier_concept)
+    ColMeta,
+    _canon,
+    _words,
+    is_join_key_eligible,
+    normalized_identifier_concept,
+)
 from featuregen.overlay.upload.passc.namespace import classify_namespace
 from featuregen.overlay.upload.passc.types import (
-    ALGORITHM_VERSION, CONFIG_VERSION, CardinalityInferenceStatus, DEFAULT_CONFIG,
-    JoinCandidateEvidenceV1, NamespaceCompatibility, PassCConfig, SignalEvidence)
+    ALGORITHM_VERSION,
+    CONFIG_VERSION,
+    DEFAULT_CONFIG,
+    CardinalityInferenceStatus,
+    JoinCandidateEvidenceV1,
+    NamespaceCompatibility,
+    PassCConfig,
+    SignalEvidence,
+)
 
 _ADMITTED = frozenset({NamespaceCompatibility.COMPATIBLE, NamespaceCompatibility.POSSIBLE})
 

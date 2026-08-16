@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import StrEnum
+
 CONFIG_VERSION = "passc-config-v1"
 ALGORITHM_VERSION = "passc-algo-v1"
 # Keep in sync with ftr_adapter.KNOWN_TERM_TYPES; drives conservative Pass C eligibility — an

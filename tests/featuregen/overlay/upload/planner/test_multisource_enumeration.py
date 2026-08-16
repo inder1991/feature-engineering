@@ -29,12 +29,12 @@ from featuregen.overlay.identity import fact_key
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.planner import multisource_assembly
 from featuregen.overlay.upload.planner.contracts import (
     MAX_PATHS_PER_OPERAND,
     AdditivityClass,
     CatalogScopeV1,
 )
-from featuregen.overlay.upload.planner import multisource_assembly
 from featuregen.overlay.upload.planner.multisource_assembly import (
     OperandEnumerationResultV1,
     enumerate_operand_paths,

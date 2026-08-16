@@ -2,13 +2,14 @@
 #   transaction_id -> entity_link "transaction"; customer_id -> "customer"; monetary_flow is entity-neutral.
 #   "transaction"->"account" is DERIVABLE and "account"->"account" is EXACT in ENTITY_GRAPH (38 entities).
 #   EntityCompatibility members are UPPERCASE (EXACT/DERIVABLE/AMBIGUOUS/UNKNOWN).
+from tests.featuregen.overlay.upload._bridge_fixtures import (
+    seed_verified_bridge as _seed_verified_bridge_fact,
+)
+
 from featuregen.overlay.upload.planner.assembly import ingredient_eligibility, semantic_rollup_paths
 from featuregen.overlay.upload.planner.contracts import ReasonCode
 from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
 from featuregen.overlay.upload.templates import Need, Template
-from tests.featuregen.overlay.upload._bridge_fixtures import (
-    seed_verified_bridge as _seed_verified_bridge_fact,
-)
 
 
 def _tmpl(needs, *, source_entity_need_role=None):

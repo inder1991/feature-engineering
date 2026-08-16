@@ -1,10 +1,14 @@
 import pytest
+
 from featuregen.overlay.catalog import (
-    current_catalog_adapter, register_catalog_adapter, _clear_catalog_adapter,
+    _clear_catalog_adapter,
+    current_catalog_adapter,
+    register_catalog_adapter,
 )
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.upload.upload_catalog import (
-    UploadContextAdapter, ensure_upload_catalog_adapter,
+    UploadContextAdapter,
+    ensure_upload_catalog_adapter,
 )
 
 

@@ -553,6 +553,7 @@ def test_a_forged_producer_ref_in_the_provenance_json_is_caught_on_read(db):
     content hash. The revision attestation now seals the whole provenance payload, so the
     duplicate can no longer silently disagree with the sealed approved_by."""
     import pytest
+
     from featuregen.overlay.upload.pii_policy_store import PolicyStoreConflict
     revision_id, _version = approve_pii_use_policy(
         db, concept_name="pep_flag", purpose="AML screening exposure features",

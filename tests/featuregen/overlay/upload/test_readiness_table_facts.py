@@ -9,6 +9,8 @@ indistinguishable from never-proposed).
 Flow per the Task 7 helpers: ``_propose_table_facts`` (service actor) opens the gate task,
 ``_confirm_grain`` / ``_reject_grain`` (platform-admin human) resolve it and drain the projection.
 """
+from tests.featuregen.overlay.upload.conftest import _confirm_grain, _reject_grain
+
 from featuregen.overlay.upload.readiness import (
     CAUSE_FACT_EXPIRED,
     CAUSE_FACT_REJECTED,
@@ -17,7 +19,6 @@ from featuregen.overlay.upload.readiness import (
     _table_fact_status,
 )
 from featuregen.overlay.upload.table_synth import _propose_table_facts
-from tests.featuregen.overlay.upload.conftest import _confirm_grain, _reject_grain
 
 
 def _propose_grain(conn, columns, *, actor):

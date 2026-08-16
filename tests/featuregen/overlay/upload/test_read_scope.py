@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.search import search

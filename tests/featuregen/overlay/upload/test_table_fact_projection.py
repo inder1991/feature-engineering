@@ -9,9 +9,10 @@ Flow per the Task 7 helpers: ``_propose_table_facts`` (service actor) opens the 
 ``_confirm_grain`` (platform-admin human) confirms it -> VERIFIED and drains the projection so
 ``resolve_fact`` sees the read model.
 """
+from tests.featuregen.overlay.upload.conftest import _confirm_grain, _reconfirm_grain
+
 from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.table_synth import _propose_table_facts
-from tests.featuregen.overlay.upload.conftest import _confirm_grain, _reconfirm_grain
 
 
 def _propose_grain(conn, columns, *, actor):

@@ -14,12 +14,12 @@ its own authority), and it is written from the metadata rather than replacing it
 """
 from __future__ import annotations
 
-from featuregen.intake.llm import PROVIDER_OK, LLMResult
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.intake.llm import PROVIDER_OK, LLMResult
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.enrich import _summary_targets, draft_summaries
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+from featuregen.overlay.upload.ingest import ingest_upload
 
 
 class _EchoLLM:
@@ -62,6 +62,7 @@ def _glossary(definition: str) -> GlossaryUpload:
 
 
 from datetime import UTC, datetime
+
 _NOW = datetime(2026, 7, 29, tzinfo=UTC)
 _ACTOR = IdentityEnvelope(subject="o", actor_kind="human", authenticated=True,
                           auth_method="oidc", role_claims=("data_owner",))

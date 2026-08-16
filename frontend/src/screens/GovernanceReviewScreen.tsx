@@ -1,4 +1,4 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
   type BridgeRealizationView,
@@ -569,37 +569,19 @@ function groupUsages(items: GovernanceQueueItem[]): GovernanceQueueUsage[] {
 function Usage({ usages, note }: { usages: GovernanceQueueUsage[]; note?: string }) {
   // Bridges only. A join or table fact has no bridge anchor to count from, so there is nothing to
   // render — and an absent anchor is never "0 dependencies".
-  const [why, setWhy] = useState(false)
   if (usages.length === 0) return null
-  // NOT ONE MEASUREMENT ANYWHERE. This is the live state on every bridge in both catalogs: five
-  // categories, five "not tracked yet", five paragraphs of store-level rationale, repeated on the
-  // group card and on each of its members — 85 times across the page, carrying one fact. The fact
-  // is worth saying; saying it five times per card is what made the page unreadable. It is still
-  // never a zero: nothing recorded and nothing depending on it are different claims.
+  // NOT ONE MEASUREMENT ANYWHERE — so there is nothing to render. This block once listed five
+  // "not tracked yet" cells with a paragraph of store-level rationale on each, repeated on the
+  // group card AND every member: 85 times across the page. Collapsing that to one sentence was
+  // still the wrong shape, because the sentence said "this says nothing about what uses it" — text
+  // that disclaims its own informational value, which an absent block does in no words. On the
+  // live catalogs none of the five stores records a bridge dependency at all, so this was a
+  // permanent placeholder for a capability that does not exist. The moment any category returns a
+  // real measurement the block is back, with a number in it.
   const measured = usages.some(usage => usage.state === 'counted' && usage.count !== null)
   const unreadable = usages.some(usage => usage.state === 'unreadable')
-  // The group `note` explains how figures are AGGREGATED across the members. Above a block
-  // reporting no figures at all it answers a question nobody asked, so it goes with them.
-  if (!measured && !unreadable) {
-    return (
-      <div className="gq-usage" data-testid="usage" data-state="none-tracked">
-        <p className="gq-usage-head">Already depended on by</p>
-        <p className="gq-usage-none" data-testid="usage-untracked">
-          Nothing is recorded either way. None of the {usages.length} places a dependency could
-          have been counted keeps a record of one yet, so this says nothing about what uses it.
-        </p>
-        <button
-          type="button"
-          className="btn q-ghost gq-usage-why-btn"
-          aria-expanded={why}
-          onClick={() => setWhy(open => !open)}
-        >
-          {why ? 'Hide why nothing is counted' : 'Why nothing is counted'}
-        </button>
-        {why && <UsageList usages={usages} />}
-      </div>
-    )
-  }
+  if (!measured && !unreadable) return null
+
   return (
     <div className="gq-usage" data-testid="usage">
       <p className="gq-usage-head">Already depended on by</p>
@@ -1274,14 +1256,10 @@ function CandidateComparison({ items, chosen, onChoose }: {
 }) {
   const parts = varyingParts(items.map(item => item.subject))
   const shared = parts.prefix || parts.suffix
-  // Every candidate scoring the same, on the same basis, is the ordinary case on the live
-  // catalogs: the five `bank` candidates all rank 0 and are all declared-only. That is not a tie
-  // to be broken by reading further — it is the recorded evidence saying nothing, and a reviewer
-  // is owed that before they scroll five dossiers looking for a discriminator that is not there.
-  const ranks = new Set(items.map(item =>
-    (typeof item.detail.strength === 'number' ? String(item.detail.strength) : 'none')))
-  const bases = new Set(items.map(item => asStr(item.detail.type_basis)))
-  const tied = items.length > 1 && ranks.size === 1 && bases.size === 1
+  // A tie used to be narrated here ("nothing on file separates these N: they rank the same and
+  // their types were matched the same way"). The Rank and Type match columns sit side by side one
+  // line below, identical, for anyone to see. Prose restating two adjacent columns is not a
+  // finding — it is the interface reading its own table aloud.
   return (
     <div className="gq-compare">
       {shared && (
@@ -1349,13 +1327,6 @@ function CandidateComparison({ items, chosen, onChoose }: {
           </tbody>
         </table>
       </div>
-      {tied && (
-        <p className="gq-compare-tied" data-testid="gq-compare-tied">
-          Nothing on file separates these {items.length}: they rank the same and their types were
-          matched the same way. If one of them is the right pair, the recorded evidence does not
-          say which.
-        </p>
-      )}
     </div>
   )
 }
@@ -1448,10 +1419,9 @@ function CandidateGroup({ entry, onDone, onConflict, outcome }: {
           ? `, between ${group.catalogs.map(catalogLabel).join(' and ')}`
           : ''}
       </p>
-      <p className="gq-group-note">
-        These are the cross-product of the same two facts — one judgement settles the set. Compare
-        them below; open one for the full evidence behind it.
-      </p>
+      {/* No explanatory note. "The cross-product of the same two facts" is internal vocabulary,
+          and "compare them below" narrates a table already on screen with a Confirm on every row.
+          The headline names the choice; the table is the comparison. */}
       {skipped > 0 && (
         <p className="gq-group-note" data-testid="gq-group-settled">
           {skipped} of these {count} {one ? 'is' : 'are'} already endorsed. The server offers no
@@ -1464,14 +1434,18 @@ function CandidateGroup({ entry, onDone, onConflict, outcome }: {
         chosen={chosen}
         onChoose={key => setChosen(current => (current === key ? null : key))}
       />
-      {/* The automatic axis, once, in a sentence. Human review is NOT here: the comparison table
-          carries it per candidate, and a card-level box saying the same thing again was one of the
-          56 axis panels on this page that between them held six distinct values. */}
-      <p className="hint gq-group-exec" data-testid="gq-group-exec">
-        Automatic execution safety, across all {count}:{' '}
-        {shared(item => item.production_eligibility
-          ?? EXECUTION_ABSENT[item.production_eligibility_code] ?? 'Not reported')}
-      </p>
+      {/* The automatic axis, once, and ONLY when there is a verdict to state. `production_
+          eligibility` is null when the payload has nothing to derive it from, and a card-level
+          line reading "Not evaluated" is an absence rendered as standing text — exactly what made
+          this page read as substance while reporting nothing. The per-ROW axis still states the
+          absence explicitly, because there the distinction between "not assessed" and "passed"
+          is the whole point; a group card repeating the null is not. */}
+      {items.some(item => !(item.production_eligibility_code in EXECUTION_ABSENT)) && (
+        <p className="hint gq-group-exec" data-testid="gq-group-exec">
+          Automatic execution safety, across all {count}:{' '}
+          {shared(item => item.production_eligibility ?? 'not evaluated')}
+        </p>
+      )}
 
       <Usage
         usages={groupUsages(items)}
@@ -1573,21 +1547,6 @@ function CandidateGroup({ entry, onDone, onConflict, outcome }: {
   )
 }
 
-// The page's own reason for existing, stated before any row: these are the judgements a machine
-// cannot make on its own behalf.
-function Purpose(): ReactNode {
-  return (
-    <div className="callout callout--accent gq-purpose" data-testid="gq-purpose">
-      <div className="callout-body">
-        <p>
-          <strong>The platform is already using these relationships.</strong> Confirming records
-          that a person checked one, and who; it does not switch anything on.
-        </p>
-      </div>
-    </div>
-  )
-}
-
 // ── the screen ───────────────────────────────────────────────────────────────────────────────────
 
 // initialSource: the governance dashboard -> review handoff rides the URL (?source=). It is a
@@ -1677,7 +1636,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (errorStatus === 403) {
     return (
       <section className="gq">
-        <Purpose />
         <div className="callout gq-not-yours" data-testid="gq-not-yours" role="status">
           <div className="callout-body">
             <p>
@@ -1703,7 +1661,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (error) {
     return (
       <section className="gq">
-        <Purpose />
         <p role="alert" className="error">
           {error}
         </p>
@@ -1714,7 +1671,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
   if (!queue) {
     return (
       <section className="gq">
-        <Purpose />
         <p className="empty" role="status">
           {loading ? 'Loading every decision waiting for you…' : 'Nothing loaded.'}
         </p>
@@ -1744,17 +1700,11 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
     items.every(item => item.kind !== kind)
     && !queue.unreadable.some(entry => unreadableListings(kind).includes(entry.listing)))
   const workingKinds = shownKinds.filter(kind => !settledKinds.includes(kind))
-  // How many decisions belong to more than one catalog — the reason the catalog chips sum to more
-  // than the queue length. Zero on a single-catalog queue, where there is nothing to explain.
-  const spanning = items.filter(item => item.catalogs.length > 1).length
-  // WHAT ACTUALLY NEEDS A PERSON is not the list length: the bridge listing also carries VERIFIED
-  // facts, and those offer no action at all (`reject_fact` denies them). Counting them as waiting
-  // would overstate the work, so the headline counts only rows the server still offers an action on.
-  const waiting = items.filter(item => item.available_actions.length > 0).length
   const yours = items.filter(item => item.available_actions.includes('confirm')).length
   const elsewhere = items.filter(item =>
     item.available_actions.length > 0 && !item.available_actions.includes('confirm')).length
   const endorsed = items.filter(item => item.available_actions.length === 0).length
+  const total = items.length
   // A row outcome shows on its row. If that fact has left the list — a rejection usually takes it
   // out — there is no row to carry it, and dropping it would leave the reviewer with no answer at
   // all, so the banner picks it up instead.
@@ -1764,8 +1714,6 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
 
   return (
     <section className="gq">
-      <Purpose />
-
       {banner && (
         <p role="status" className="callout callout--accent gq-notice" data-testid="gq-notice">
           {banner}
@@ -1791,26 +1739,43 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
         </div>
       )}
 
-      {/* ONE QUESTION: what needs me. This strip used to run ten identical tiles over TWO
-          denominators — four counting decisions by status and six counting the same decisions by
-          kind — so reading across and adding produced a number that means nothing, and six of the
-          ten read zero. The kinds are one row lower, on chips that also filter. */}
-      <div className="stats gq-summary" data-testid="gq-summary">
-        <div className="stat" data-testid="gq-stat">
-          <b>{waiting}</b> waiting for a person
-        </div>
-        <div className="stat" data-testid="gq-stat">
-          <b>{yours}</b> you can decide
-        </div>
-        <div className="stat" data-testid="gq-stat">
-          <b>{elsewhere}</b> need a different reviewer
-        </div>
-        {endorsed > 0 && (
-          <div className="stat" data-testid="gq-stat">
-            <b>{endorsed}</b> already endorsed
+      {/* A BURN-DOWN, NOT A SCOREBOARD.
+          This began as ten identical tiles over two denominators — four counting decisions by
+          status and six counting the same decisions by kind — so reading across and adding
+          produced a number that means nothing, and six of the ten read zero. Cutting it to four
+          tiles fixed the arithmetic but kept the shape wrong: three of the four numbers were one
+          fact decomposed (yours + elsewhere = waiting), the fourth was not work at all, and all
+          four sat at identical weight.
+          This is a queue a person works THROUGH, and `onDone` refetches, so the counts move as
+          they go. The bar is the one thing four tiles could not show — the proportion — and it
+          retreats as the work is done. */}
+      {total > 0 && (
+        <div className="gq-summary" data-testid="gq-summary">
+          <p className="gq-burn-count" data-testid="gq-burn-count">
+            <b>{yours}</b> to decide
+          </p>
+          <div className="gq-burn">
+            {/* Below four items a segmented bar is a solid block claiming to visualise a split
+                that has no shape, so it is simply absent and the legend carries everything. */}
+            {total >= 4 && (
+              <div className="gq-burn-bar" data-testid="gq-burn-bar" aria-hidden="true">
+                <span className="gq-seg" data-seg="yours" style={{ flexGrow: yours }} />
+                <span className="gq-seg" data-seg="elsewhere" style={{ flexGrow: elsewhere }} />
+                <span className="gq-seg" data-seg="endorsed" style={{ flexGrow: endorsed }} />
+              </div>
+            )}
+            {/* Every segment's number in words: the bar is aria-hidden, so this is the ONLY
+                carrier for anyone who cannot see it, and colour is never the signal on its own. */}
+            <p className="gq-burn-legend" data-testid="gq-burn-legend">
+              <span className="gq-key" data-seg="yours">{yours} yours</span>
+              <span className="gq-key" data-seg="elsewhere">
+                {elsewhere} need{elsewhere === 1 ? 's' : ''} someone else
+              </span>
+              <span className="gq-key" data-seg="endorsed">{endorsed} endorsed</span>
+            </p>
           </div>
-        )}
-      </div>
+        </div>
+      )}
       <div className="gq-filters">
         <div className="gj-chips" role="group" aria-label="Catalog" data-testid="gq-catalog-filter">
           <button
@@ -1859,20 +1824,11 @@ export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?:
             </button>
           ))}
         </div>
-        {/* THE ARITHMETIC THAT IS ACTUALLY CONFUSING. A cross-catalog link belongs to both of its
-            catalogs and is counted in each, so on the live queue the chips read CIB (13) and
-            FTR (16) over sixteen decisions. That sum is what a reviewer stops on. What sat here
-            instead was a disclaimer that the counts are "scope-relative — never a catalog total":
-            a misreading nobody makes, phrased in the read-scope subsystem's own vocabulary, one
-            line above chips that already named the catalogs. Computed, so it appears only when
-            something genuinely spans two. */}
-        {spanning > 0 && (
-          <p className="hint gq-catalog-arith" data-testid="gq-catalog-arith">
-            {spanning} of these decisions {spanning === 1 ? 'belongs' : 'belong'} to both catalogs
-            and {spanning === 1 ? 'is' : 'are'} counted in each, so the catalog chips add up to
-            more than the {items.length} decisions below.
-          </p>
-        )}
+        {/* NOTHING ANNOTATES THE CHIPS. They are filters; nobody sums a filter's counts against the
+            queue length, so the fact that a cross-catalog link is counted under both its catalogs
+            needs no defending. A note here would be the same species as the "scope-relative"
+            disclaimer it replaced — the interface apologising for its own display. If a number
+            needs a paragraph to defend it, the fix is the number's presentation. */}
       </div>
 
       {/* A kind with nothing waiting renders NOTHING: its chip carries the zero, which is the whole

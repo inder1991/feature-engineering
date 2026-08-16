@@ -363,59 +363,97 @@ describe('governance review — the decision queue', () => {
     )
   })
 
-  it('opens by saying why this is worth doing today, not what confirming philosophically means',
-    async () => {
-      // The old preamble spent 65 words establishing that confirming "is not a switch" and that
-      // "nothing here is held back pending your say-so" — i.e. it opened by telling the reviewer
-      // their decision changes nothing and nothing waits on it, then asked for fifteen decisions.
-      // The fact underneath is real and is the REASON to act, not a disclaimer: the platform is
-      // already using every one of these links, unreviewed. That is what goes at the top. What
-      // confirming records is said in the confirm panel, at the moment it is being done.
-      getGovernanceQueue.mockResolvedValue(FULL)
-      render(<GovernanceReviewScreen />)
-      await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
-      const purpose = screen.getByTestId('gq-purpose')
-
-      expect(purpose).toHaveTextContent(/already using these relationships/i)
-      expect(purpose).toHaveTextContent(/does not switch anything on/i)
-      // The archaic half of "the system proposes and you dispose" is gone: to a modern reader
-      // "dispose" reads as "throw away", so the sentence explaining the reviewer's role suggested
-      // they discard things.
-      expect(purpose.textContent ?? '').not.toMatch(/dispose/i)
-      expect(purpose.textContent ?? '').not.toMatch(/held back pending/i)
-    })
-
-  it('answers "what needs me" in a summary strip before any detail', async () => {
+  it('opens on the work, with no standing prose above it', async () => {
+    // NO PREAMBLE AT ALL. Every clause a page-level callout could carry is already on screen where
+    // it is actionable: "the platform may use this link now" is the LINK AVAILABILITY axis on the
+    // row, and "this records that a person agrees, and who — it does not change whether the
+    // platform may use it" is in the confirm panel, at the moment of confirming. A banner
+    // restating them is the interface explaining itself instead of presenting the work.
     getGovernanceQueue.mockResolvedValue(FULL)
     render(<GovernanceReviewScreen />)
-    const summary = await screen.findByTestId('gq-summary')
-    expect(summary).toHaveTextContent('3')
-    expect(summary).toHaveTextContent(/waiting for a person/i)
+    await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
+
+    expect(screen.queryByTestId('gq-purpose')).toBeNull()
+    // The facts survive where they are used, and only there.
+    expect(within(row(FULL.items[0])).getByTestId('axis-availability'))
+      .toHaveTextContent(/the platform may use this link now/i)
   })
 
-  it('explains the catalog arithmetic that is actually confusing, and nothing else', async () => {
-    // The old note spent 22 words on "every count here is scope-relative — never a catalog total",
-    // a misreading nobody makes, in the read-scope subsystem's own vocabulary, one line above chips
-    // that already named the catalogs. Meanwhile the real trap sat unexplained underneath it: a
-    // cross-catalog link belongs to BOTH its catalogs, so on the live queue the chips read
-    // CIB (13) and FTR (16) over sixteen decisions. 13 + 16 = 29.
+  it('answers "what needs me" as a burn-down, not as a row of equal tiles', async () => {
+    // This is a queue you WORK THROUGH, and the counts refetch after every decision — so the shape
+    // that fits it is one that visibly retreats as you go, not four boxes at equal weight leaving
+    // the reader to work out that 12 + 3 = 15 and that "1 endorsed" is not work at all.
+    const mixed = queue({
+      items: [
+        bridge({ fact_key: 'b1' }),
+        bridge({ fact_key: 'b2', detail: bridgeDetail({ entity_id: 'a' }) }),
+        bridge({ fact_key: 'b3', detail: bridgeDetail({ entity_id: 'b' }) }),
+        bridge({ fact_key: 'b4', available_actions: ['reject'],
+                 detail: bridgeDetail({ entity_id: 'c' }) }),
+        bridge({ fact_key: 'b5', available_actions: [], state_code: 'human_endorsed',
+                 state: 'Human endorsed', detail: bridgeDetail({ entity_id: 'd' }) }),
+      ],
+      items_visible_to_you_by_kind: { entity_bridge: 5 },
+    })
+    getGovernanceQueue.mockResolvedValue(mixed)
+    render(<GovernanceReviewScreen />)
+    const summary = within(await screen.findByTestId('gq-summary'))
+
+    // The number you act on leads, at its own weight.
+    expect(summary.getByTestId('gq-burn-count')).toHaveTextContent(/^3\s*to decide$/i)
+
+    // The bar carries the SPLIT, which is the thing four tiles could not show.
+    const bar = summary.getByTestId('gq-burn-bar')
+    expect(bar.querySelector('[data-seg="yours"]')).toHaveStyle({ flexGrow: '3' })
+    expect(bar.querySelector('[data-seg="elsewhere"]')).toHaveStyle({ flexGrow: '1' })
+    expect(bar.querySelector('[data-seg="endorsed"]')).toHaveStyle({ flexGrow: '1' })
+
+    // Colour is never the only carrier: every segment's number is also written out.
+    const legend = summary.getByTestId('gq-burn-legend')
+    expect(legend).toHaveTextContent(/3 yours/i)
+    expect(legend).toHaveTextContent(/1 needs? someone else/i)
+    expect(legend).toHaveTextContent(/1 endorsed/i)
+    // ...so the bar itself is decoration to a screen reader and must not be announced twice.
+    expect(bar).toHaveAttribute('aria-hidden', 'true')
+  })
+
+  it('drops the bar when there is too little to show a proportion', async () => {
+    // At one or two items a segmented bar is a solid block that says nothing — it would claim to
+    // visualise a split that has no shape. The counts still read.
+    getGovernanceQueue.mockResolvedValue(queue({
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const summary = within(await screen.findByTestId('gq-summary'))
+
+    expect(summary.queryByTestId('gq-burn-bar')).toBeNull()
+    expect(summary.getByTestId('gq-burn-count')).toHaveTextContent(/^1\s*to decide$/i)
+  })
+
+  it('says nothing at all when the whole queue is empty', async () => {
+    getGovernanceQueue.mockResolvedValue(queue({ items: [] }))
+    render(<GovernanceReviewScreen />)
+    await screen.findByTestId('gq-kind-filter')
+    expect(screen.queryByTestId('gq-summary')).toBeNull()
+  })
+
+  it('does not annotate its own chip counts', async () => {
+    // The chips are FILTERS. Nobody sums a filter's counts against the queue length, so the fact
+    // that a cross-catalog link is counted under both its catalogs needs no defending — it only
+    // looks wrong if you perform arithmetic no reviewer performs. The note that used to sit here
+    // was the same species as the "scope-relative" disclaimer it replaced: the interface
+    // apologising for its own display. If a number needs a paragraph to defend it, the fix is the
+    // number's presentation, not the paragraph.
     getGovernanceQueue.mockResolvedValue(FULL)
     render(<GovernanceReviewScreen />)
     await screen.findByTestId(`row-${FULL.items[0].fact_key}`)
 
     expect(screen.queryByText(/scope-relative/i)).toBeNull()
-    const note = screen.getByTestId('gq-catalog-arith')
-    expect(note).toHaveTextContent(/belongs to both/i)
-    expect(note).toHaveTextContent(/3 decisions/i)
-  })
-
-  it('says nothing about catalog arithmetic when no decision spans two catalogs', async () => {
-    getGovernanceQueue.mockResolvedValue(queue({
-      items: [grain()], items_visible_to_you_by_kind: { grain: 1 },
-    }))
-    render(<GovernanceReviewScreen />)
-    await screen.findByTestId(`row-${grain().fact_key}`)
     expect(screen.queryByTestId('gq-catalog-arith')).toBeNull()
+    expect(screen.queryByText(/belong to both catalogs/i)).toBeNull()
+    // Nothing between the filter bar and the first decision.
+    const filters = screen.getByTestId('gq-catalog-filter').closest('.gq-filters')
+    expect(filters?.nextElementSibling).toBe(screen.getByTestId('kind-entity_bridge'))
   })
 
   it('keeps the summary strip to one question, and leaves the kinds to the chips', async () => {
@@ -427,9 +465,7 @@ describe('governance review — the decision queue', () => {
     render(<GovernanceReviewScreen />)
     const summary = await screen.findByTestId('gq-summary')
 
-    expect(within(summary).getAllByTestId('gq-stat')).toHaveLength(3)
-    expect(summary).toHaveTextContent(/waiting for a person/i)
-    expect(summary).toHaveTextContent(/you can decide/i)
+    expect(summary).toHaveTextContent(/to decide/i)
     // No kind names in the strip — that is the chips' job, and duplicating it is what put the
     // same number on screen twice with two different values.
     expect(summary).not.toHaveTextContent(/cross-catalog identifier links/i)
@@ -792,8 +828,8 @@ describe('governance review — available_actions drives the buttons', () => {
     // And it is NOT counted as work: the bridge listing carries VERIFIED facts too, so a summary
     // built from the list length would claim a decision is waiting when none is.
     const summary = screen.getByTestId('gq-summary')
-    expect(summary).toHaveTextContent(/0 waiting for a person/i)
-    expect(summary).toHaveTextContent(/1 already endorsed/i)
+    expect(within(summary).getByTestId('gq-burn-count')).toHaveTextContent(/^0\s*to decide$/i)
+    expect(within(summary).getByTestId('gq-burn-legend')).toHaveTextContent(/1 endorsed/i)
   })
 
   it('confirms a bridge behind an explicit agreement, then refetches the queue', async () => {
@@ -872,11 +908,12 @@ describe('governance review — the low-value candidate cluster', () => {
     const group = section.getByTestId('queue-entry')
     expect(group).toHaveTextContent(/8 candidate links/i)
     expect(group).toHaveTextContent(/branch/i)
-    expect(group).toHaveTextContent(/same two facts/i)
-    // The card used to say "Open them if one of the pairs is the right one" — written when the
-    // members were a stack you had to open. They are a comparison now, already on screen.
-    expect(group).toHaveTextContent(/compare them below/i)
-    expect(group.textContent ?? '').not.toMatch(/open them if one of the pairs/i)
+    // NO EXPLANATORY NOTE. "The cross-product of the same two facts" is internal vocabulary, and
+    // "compare them below; open one for the full evidence" narrates a table that is already on
+    // screen with a Confirm on every row. The headline names the choice; the table IS the compare.
+    expect(group.textContent ?? '').not.toMatch(/cross-product/i)
+    expect(group.textContent ?? '').not.toMatch(/compare them below/i)
+    expect(group.textContent ?? '').not.toMatch(/one judgement settles the set/i)
     // Collapsed by default: eight rows would BE eight findings on screen.
     expect(within(group).queryAllByTestId(/^row-fact:entity_bridge:branch:/)).toHaveLength(0)
     // Grouped, not hidden — the individual candidates stay reachable in one click.
@@ -1100,60 +1137,38 @@ describe('governance review — the low-value candidate cluster', () => {
     expect(endorsed.getByTestId('gq-compare-why')).toHaveTextContent(/already endorsed/i)
   })
 
-  it('says so when the recorded evidence cannot separate the candidates', async () => {
-    // The live `bank` group is five candidates that all rank 0, all declared, all the same type
-    // family — the ranker genuinely cannot tell them apart, and the honest reading is that the
-    // evidence does not name a winner. Today that verdict takes four screens of reading to reach.
+  it('narrates nothing the comparison table already shows', async () => {
+    // Two removals, one reason. The tie verdict ("nothing on file separates these 2: they rank the
+    // same and their types were matched the same way") restated two adjacent columns a reader can
+    // see are identical. And the group-level automatic-safety line said "Not evaluated" — an
+    // absence rendered as standing text on every card, which is what made the original page read
+    // as substance when it was reporting nothing.
+    getGovernanceQueue.mockResolvedValue(queue({
+      // EXACTLY as the backend sends it: `production_eligibility` is the STRING "Not evaluated",
+      // not null. The absence lives in the CODE, which is the contract this screen binds to — a
+      // guard written against the label passes on a fixture and fails on the live payload.
+      items: BRANCH.map(item => ({ ...item, production_eligibility: 'Not evaluated',
+                                   production_eligibility_code: 'not_evaluated' })),
+      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+    }))
+    render(<GovernanceReviewScreen />)
+    const group = within(await screen.findByTestId('queue-entry'))
+
+    expect(group.queryByTestId('gq-compare-tied')).toBeNull()
+    expect(group.queryByTestId('gq-group-exec')).toBeNull()
+    // The columns that carried it are still there, doing the job themselves.
+    expect(group.getAllByTestId('gq-compare-rank')).toHaveLength(8)
+  })
+
+  it('states the automatic axis at group level only when there is a verdict to state', async () => {
+    // The distinction the per-row axis was built on: an absence is never a pass and never a
+    // failure. A REAL verdict is worth one line on the card; "not evaluated" is not.
     getGovernanceQueue.mockResolvedValue(queue({
       items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
     }))
     render(<GovernanceReviewScreen />)
     const group = within(await screen.findByTestId('queue-entry'))
-    const tied = group.getByTestId('gq-compare-tied')
-    expect(tied).toHaveTextContent(/nothing on file separates these 8/i)
-    // Stated as an absence of evidence, never as a verdict the machine reached.
-    expect(tied).toHaveTextContent(/does not say which/i)
-  })
-
-  it('stays quiet about ties when the ranking does separate the candidates', async () => {
-    getGovernanceQueue.mockResolvedValue(queue({
-      items: RANKED, items_visible_to_you_by_kind: { entity_bridge: 3, approved_join: 0 },
-    }))
-    render(<GovernanceReviewScreen />)
-    const group = within(await screen.findByTestId('queue-entry'))
-    expect(group.queryByTestId('gq-compare-tied')).toBeNull()
-  })
-
-  it('does not repeat, as a card-level box, what the comparison already says per candidate',
-    async () => {
-      // The card used to carry two bordered axis boxes above the members. Human review is now a
-      // COLUMN, so the box restated it; and the automatic axis is one value across the set, which
-      // is a sentence rather than a panel. 56 axis boxes carrying six distinct values is what made
-      // absence look like substance.
-      getGovernanceQueue.mockResolvedValue(queue({
-        items: BRANCH, items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
-      }))
-      render(<GovernanceReviewScreen />)
-      const group = within(await screen.findByTestId('queue-entry'))
-
-      expect(group.queryByTestId('axis-review')).toBeNull()
-      expect(group.queryByTestId('axis-execution')).toBeNull()
-      // The automatic axis is still reported — once, in words, with its scope named.
-      expect(group.getByTestId('gq-group-exec'))
-        .toHaveTextContent(/all 8.*cardinality unresolved/i)
-    })
-
-  it('says so when the automatic axis is not one answer across the group', async () => {
-    getGovernanceQueue.mockResolvedValue(queue({
-      items: BRANCH.map((item, i) => (i === 0
-        ? { ...item, production_eligibility: 'Automatically validated for production',
-            production_eligibility_code: 'deterministically_validated' }
-        : item)),
-      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
-    }))
-    render(<GovernanceReviewScreen />)
-    const group = within(await screen.findByTestId('queue-entry'))
-    expect(group.getByTestId('gq-group-exec')).toHaveTextContent(/mixed across the 8/i)
+    expect(group.getByTestId('gq-group-exec')).toHaveTextContent(/cardinality unresolved/i)
   })
 
   it('keeps a lone candidate an ordinary row, never a group of one', async () => {
@@ -1271,11 +1286,12 @@ describe('governance review — honest emptiness and honest counts', () => {
     expect(usage.getByText(/current governed contract/i)).toBeInTheDocument()
   })
 
-  it('states a wholly unmeasured usage once, instead of five times per card', async () => {
-    // The live catalogs record NOTHING in any of the five categories, so every bridge rendered a
-    // five-column grid of "not tracked yet" plus its per-category rationale — 85 times across the
-    // page, on the group card AND again on every member. When no category has a measurement, the
-    // grid carries no information: it is one fact, so it is said once.
+  it('renders no usage block at all when nothing anywhere was measured', async () => {
+    // The block said "Nothing is recorded either way ... so this says nothing about what uses it"
+    // — text that disclaims its own informational value. An ABSENT block says exactly as much,
+    // in no words. On the live catalogs none of the five stores records a bridge dependency, so
+    // this was a permanent placeholder for a capability that does not exist yet. When one of them
+    // starts counting, the block returns with a real number in it.
     const untracked = USAGE.map(usage => ({
       ...usage, state: 'not_tracked_yet' as const, count: null, display: 'not tracked yet',
     }))
@@ -1284,36 +1300,25 @@ describe('governance review — honest emptiness and honest counts', () => {
       items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
     }))
     render(<GovernanceReviewScreen />)
-    const usage = within(within(await screen.findByTestId('row-fact:entity_bridge:customer'))
-      .getByTestId('usage'))
+    const row = within(await screen.findByTestId('row-fact:entity_bridge:customer'))
 
-    expect(usage.getByTestId('usage-untracked')).toHaveTextContent(/nothing is recorded either way/i)
-    // The five cells are gone, not merely restyled.
-    expect(usage.queryByTestId('usage-value-generated_artifacts')).toBeNull()
-    // Never a zero. "Nobody recorded it" and "it is used nowhere" are different claims.
-    expect(usage.getByTestId('usage-untracked').textContent).not.toMatch(/\b0\b/)
-
-    // Nothing is lost: why each store cannot answer is one click away, and still in its own words.
-    await userEvent.click(usage.getByRole('button', { name: /why nothing is counted/i }))
-    expect(usage.getByTestId('usage-value-generated_artifacts')).toHaveTextContent('not tracked yet')
-    expect(usage.getByText(/control plane identifies a generation/i)).toBeInTheDocument()
+    expect(row.queryByTestId('usage')).toBeNull()
+    expect(row.queryByText(/already depended on by/i)).toBeNull()
+    expect(row.queryByText(/nothing is recorded either way/i)).toBeNull()
+    expect(row.queryByText(/not tracked yet/i)).toBeNull()
   })
 
-  it('drops the how-it-was-counted note when nothing was counted', async () => {
-    // "A category is only ever a number when every one of the links was measured" explains how
-    // figures are aggregated across a group. Above a block that reports no figures at all, it is
-    // 40 words answering a question nobody asked.
-    const untracked = USAGE.map(usage => ({
-      ...usage, state: 'not_tracked_yet' as const, count: null, display: 'not tracked yet',
-    }))
+  it('keeps the usage block the moment any category has a real measurement', async () => {
+    // USAGE mixes a genuine 0, two counts and two untracked categories. One real number is enough
+    // for the block to be worth its space, and the untracked ones still read as words, never 0.
     getGovernanceQueue.mockResolvedValue(queue({
-      items: BRANCH.map(item => ({ ...item, already_depended_on_by: untracked })),
-      items_visible_to_you_by_kind: { entity_bridge: 8, approved_join: 0 },
+      items: [bridge()], items_visible_to_you_by_kind: { entity_bridge: 1, approved_join: 0 },
     }))
     render(<GovernanceReviewScreen />)
-    const usage = within(within(await screen.findByTestId('queue-entry')).getByTestId('usage'))
-    expect(usage.getByTestId('usage-untracked')).toBeInTheDocument()
-    expect(usage.queryByText(/counted once per link/i)).toBeNull()
+    const usage = within(within(await screen.findByTestId('row-fact:entity_bridge:customer'))
+      .getByTestId('usage'))
+    expect(usage.getByTestId('usage-value-selected_plans')).toHaveTextContent(/^3$/)
+    expect(usage.getByTestId('usage-value-generated_artifacts')).toHaveTextContent('not tracked yet')
   })
 
   it('keeps the how-it-was-counted note when the group does report figures', async () => {
