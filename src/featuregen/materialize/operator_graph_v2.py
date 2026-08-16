@@ -176,18 +176,34 @@ class EligibleStatusFilterV2:
 
 @dataclass(frozen=True, slots=True)
 class LinkedReversalSurvivorV2:
-    """Keep the SURVIVOR of a linked reversal pair, under the governed reversal policy."""
+    """Keep the SURVIVOR of a linked reversal pair, under the governed reversal policy.
+
+    C-C10 requires four facts of a linked-reversal subgraph — as-of population, linkage, ambiguity
+    gate, survivor — and unlike FX they are not four nodes: the vocabulary has ONE reversal
+    operator, so they are payload facts and this type must carry all of them or the requirement is
+    unexpressible. (It did not, until C-C10 asked. Writing the requirement is what found the gap.)
+
+    ``ambiguity_refusal_code`` is the reversal twin of the duplicate-rate gate. When a reversal
+    links to more than one candidate the answer is a refusal, never a pick: choosing a survivor
+    among ambiguous links silently changes a balance, and does it consistently enough to look right.
+    """
 
     reversal_policy_ref: str
+    as_of_population_ref: str
     linkage_key_refs: tuple[str, ...]
+    ambiguity_refusal_code: str = "REVERSAL_LINK_AMBIGUOUS"
 
     def __post_init__(self) -> None:
         _ref(self.reversal_policy_ref, "reversal_policy_ref")
+        _ref(self.as_of_population_ref, "as_of_population_ref")
         _refs(self.linkage_key_refs, "linkage_key_refs")
+        _ref(self.ambiguity_refusal_code, "ambiguity_refusal_code")
 
     def identity_payload(self) -> dict[str, Any]:
         return {"reversal_policy_ref": self.reversal_policy_ref,
-                "linkage_key_refs": list(self.linkage_key_refs)}
+                "as_of_population_ref": self.as_of_population_ref,
+                "linkage_key_refs": list(self.linkage_key_refs),
+                "ambiguity_refusal_code": self.ambiguity_refusal_code}
 
 
 @dataclass(frozen=True, slots=True)
