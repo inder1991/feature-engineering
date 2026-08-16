@@ -242,14 +242,34 @@ describe('search screen — results and rows', () => {
 
   // The zero-state named the causes but offered no control: the only way back to a populated
   // catalog was to hand-edit the hash or clear facets one chip at a time.
-  it('gives the empty state a way out', async () => {
+  //
+  // Seeded with a real query AND a real facet on purpose. Mounted at the screen's default the
+  // hash is ALREADY '#/search' and searchCatalog has ALREADY been called with ('', {}), so every
+  // assertion below would hold for a button wired to a plain retry — the test would prove that a
+  // search re-ran, not that anything was cleared.
+  it('gives the empty state a way out that clears the query AND every facet', async () => {
+    window.location.hash = '#/search?q=balance&source=deposits'
     searchCatalog.mockResolvedValue(result([], FACETS, 0))
     render(<SearchScreen />)
     await screen.findByText(/no results match/i)
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     await userEvent.click(screen.getByRole('button', { name: 'Clear search and filters' }))
     expect(await screen.findByTestId('hit-name')).toHaveTextContent('balance')
+    // One commit, both halves: the query is gone from the wire call and so is the facet.
+    expect(searchCatalog).toHaveBeenLastCalledWith('', {}, SEARCH_PAGE_SIZE, 0)
+    expect(screen.getByLabelText('Query')).toHaveValue('')
+    expect(screen.queryByText('source: deposits')).not.toBeInTheDocument()
     expect(window.location.hash).toBe('#/search')
+  })
+
+  // The empty state also covers an empty catalog and a read scope that permits nothing. There the
+  // button would name an action it does not perform, which is the screen's own stated rule for the
+  // pager's Next control: a control that can never do anything is noise.
+  it('offers no reset in the empty state when there is nothing to reset', async () => {
+    searchCatalog.mockResolvedValue(result([], FACETS, 0))
+    render(<SearchScreen />)
+    await screen.findByText(/no results match/i)
+    expect(screen.queryByRole('button', { name: 'Clear search and filters' })).toBeNull()
   })
 
   it('shows a calm loading hint while the initial browse is in flight, not a zero-state', async () => {
@@ -286,6 +306,20 @@ describe('search screen — the search field', () => {
     const field = await screen.findByRole('searchbox', { name: 'Query' })
     await userEvent.type(field, 'a/b')
     expect(field).toHaveValue('a/b')
+  })
+
+  // A checkbox is an HTMLInputElement but accepts no typed text, and the facet rail is the most
+  // likely place for keyboard focus other than the field itself. Treating every input as "typing"
+  // made the shortcut inert there while the help line promised it worked from anywhere.
+  it('reaches the search field from a focused facet checkbox — a checkbox is not typing', async () => {
+    render(<SearchScreen />)
+    const field = await screen.findByRole('searchbox', { name: 'Query' })
+    const facet = await screen.findByRole('checkbox', { name: 'deposits 3' })
+    facet.focus()
+    // Focus genuinely left the field first, so the assertion below cannot pass by never moving.
+    expect(facet).toHaveFocus()
+    await userEvent.keyboard('/')
+    expect(field).toHaveFocus()
   })
 })
 

@@ -7839,7 +7839,10 @@ button.stat:hover {
   border-radius: 6px;
   background: transparent;
   color: var(--ink-faint);
-  font-size: 16px;
+  /* 15px, the size `.ln-drawer-close` uses — this control is that idiom (a 24px square glyph
+     button that dismisses something) declaration for declaration, so it takes that idiom's size
+     rather than introducing a second value for the same job. */
+  font-size: 15px;
   line-height: 1;
 }
 
@@ -7866,5 +7869,9 @@ button.stat:hover {
   font-size: 11px;
 }
 
-/* The zero-state's exit, set off from the paragraph that explains what withheld the rows. */
-.empty .btn { margin-top: 12px; }
+/* The zero-state's exit, set off from the paragraph that explains what withheld the rows.
+
+   Scoped to `.search-results`: `.empty` is shared vocabulary across ten screens, and at least one
+   of them (ConnectorPanel's "Go to Integrations") already renders a `.btn` inside one. An unscoped
+   rule filed under the catalog-search banner would silently restyle those. */
+.search-results .empty .btn { margin-top: 12px; }

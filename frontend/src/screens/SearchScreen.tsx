@@ -46,6 +46,24 @@ function canonicalHash(params: URLSearchParams): string {
   return buildSearchHash(params.get('q') ?? '', paramsToFilters(params))
 }
 
+// `<input>` types that accept no typed text, so a "/" reaching one of them is a shortcut and not a
+// character. Every checkbox on this screen is an HTMLInputElement — the facet values and flags,
+// the graph's layer toggles, the rail's role chips — so treating the whole class as "typing" made
+// "/" inert exactly where keyboard focus most often sits, while the help line under the bar
+// promises it works from anywhere on the page.
+const NON_TEXT_INPUT_TYPES = new Set([
+  'button', 'checkbox', 'color', 'file', 'image', 'radio', 'range', 'reset', 'submit',
+])
+
+// Is the focused element somewhere the user is entering text? `input.type` is normalized lowercase
+// and defaults to 'text', so an unknown or absent type is treated as text-entry — the safe way
+// round, since the cost of a false positive is only that the shortcut does not fire.
+function isTextEntry(element: Element | null): boolean {
+  if (element instanceof HTMLTextAreaElement) return true
+  if (element instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(element.type)
+  return element instanceof HTMLElement && element.isContentEditable
+}
+
 export function SearchScreen() {
   const { params, navigate } = useHashRoute()
   // Committed search state lives in React; the hash mirrors it (a shareable output) and seeds it
@@ -70,16 +88,14 @@ export function SearchScreen() {
   const appliedHash = useRef<string | null>(null)
   const queryField = useRef<HTMLInputElement>(null)
 
-  // "/" focuses search from anywhere on the page — except while the user is typing, where it is
-  // just a character (`a/b` must stay `a/b`).
+  // "/" focuses search from anywhere on the page — except while the user is entering text, where
+  // it is just a character (`a/b` must stay `a/b`). `shiftKey` is deliberately NOT in the modifier
+  // guard: on several keyboard layouts "/" IS Shift+something, and excluding it would kill the
+  // shortcut outright for those users.
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey) return
-      const active = document.activeElement
-      const typing = active instanceof HTMLInputElement
-        || active instanceof HTMLTextAreaElement
-        || (active instanceof HTMLElement && active.isContentEditable)
-      if (typing) return
+      if (isTextEntry(document.activeElement)) return
       event.preventDefault()
       queryField.current?.focus()
     }
@@ -183,8 +199,8 @@ export function SearchScreen() {
   }
 
   const hasHits = result !== null && result.hits.length > 0
-  // With no results there is nothing to anchor a graph on: fall back to list behavior (empty
-  // states, alerts) and disable the toggle.
+  // With no results there is nothing to anchor a graph on, so the screen falls back to list
+  // behavior (the empty state, the alert) even when an earlier anchor left `view` on 'graph'.
   const effectiveView = hasHits ? view : 'list'
   const graphAnchor = hasHits ? (anchor ?? result.hits[0]) : null
 
@@ -335,10 +351,17 @@ export function SearchScreen() {
               </p>
               {/* The exit. The zero-state named the causes but offered no control, so the only way
                   back to a populated catalog was hand-editing the hash or removing chips one at a
-                  time. `apply('', {})` clears the query AND every facet in one commit. */}
-              <button type="button" className="btn" onClick={() => apply('', {})}>
-                Clear search and filters
-              </button>
+                  time. `apply('', {})` clears the query AND every facet in one commit.
+
+                  Rendered only when there IS a query or a facet to clear. The empty state also
+                  covers an empty catalog and a read scope that permits nothing, where this button
+                  would name an action it does not perform — the same reason the pager below drops
+                  its Next control rather than disabling it. */}
+              {(q || hasFilters) && (
+                <button type="button" className="btn" onClick={() => apply('', {})}>
+                  Clear search and filters
+                </button>
+              )}
             </div>
           )}
 
