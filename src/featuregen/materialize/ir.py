@@ -743,9 +743,24 @@ def _step_predicate_refs(step: Any) -> tuple[str, ...]:
 
 def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_ReadElement, ...]:
     """The COMPLETE physical read set of the group (§1.3), from every structural source there is."""
+    return _union_elements([(ir.feature_name, ir.expressions) for ir in irs], spine)
+
+
+def _union_elements(
+    features: Sequence[tuple[str, Sequence[ExpressionExecutionIR]]], spine: SpineSpec,
+) -> tuple[_ReadElement, ...]:
+    """The same union over ``(feature_name, expressions)`` pairs — the LANGUAGE-NEUTRAL core.
+
+    Split out so the V2 execution boundary unions a group's reads through THIS walk rather than a
+    second one of its own. ``physical_read_set``'s warning — that deriving a read set twice gives
+    the group two answers to "what does this feature read", and the narrower answer is the one the
+    sensitivity class gets computed from — does not stop being true because the second deriver is a
+    different formula version. Nothing here names a formula version; it sees only
+    :class:`ExpressionExecutionIR`, which both boundaries reuse verbatim.
+    """
     union = _Union()
-    for ir in irs:
-        for expression in ir.expressions:
+    for feature_name, expressions in features:
+        for expression in expressions:
             for ref in expression.physical_read_set:
                 union.add(ref.logical_ref, ReadElementKind.EXPRESSION_READ)
 
@@ -757,7 +772,7 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
                 catalog_source = _catalog_of(expression)
                 if catalog_source is None:
                     raise ValueError(
-                        f"{ir.feature_name}/{expression.expr_path} carries "
+                        f"{feature_name}/{expression.expr_path} carries "
                         f"{len(expression.join_plan.steps)} join step(s) and an EMPTY physical read "
                         f"set, so the catalog its endpoints belong to is unknowable: the IR was "
                         f"assembled wrongly, and guessing a catalog would authorize nodes in one "
@@ -826,6 +841,19 @@ def physical_read_set(
             :func:`authorize_compilation`).
     """
     return _sorted_refs(_union_of(irs, spine))
+
+
+def physical_read_set_of(
+    features: Sequence[tuple[str, Sequence[ExpressionExecutionIR]]], spine: SpineSpec,
+) -> tuple[str, ...]:
+    """:func:`physical_read_set` over ``(feature_name, expressions)`` pairs — version-neutral.
+
+    The V2 execution boundary has no ``FormulaExecutionIRV1`` to hand this function and must not
+    walk the expressions a second way to compensate. It unions through here: same core, same
+    refusals, same sorted refs, so a V1 group and a V2 group of the same expressions produce the
+    same read set by construction rather than by two implementations agreeing.
+    """
+    return _sorted_refs(_union_elements(features, spine))
 
 
 def _hidden(
