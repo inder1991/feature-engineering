@@ -51,6 +51,28 @@ describe('api client', () => {
     expect(init.headers['X-Roles']).toBe('data_owner,pii_reader')
   })
 
+  it('carries the dataset-profile facets on the wire', async () => {
+    fetchMock.mockImplementation(ok({ hits: [], facets: {}, total: 0 }))
+    // The six dataset-profile facets were missing from SEARCH_FACET_KEYS, so the groups the server
+    // returns for them could not be SENT at all. The route accepts them unconditionally and applies
+    // them only while its flag is on, so this is safe on every deployment. Order is the contract
+    // order, which is the key list's order.
+    await searchCatalog('', {
+      data_role: ['crosswalk'],
+      authority_role: ['system_of_record'],
+      temporal_storage_model: ['snapshot'],
+      bian_path: ['Customer Offer'],
+      process_path: ['onboarding'],
+      sub_domain: ['deposits'],
+    })
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/search?q=&data_role=crosswalk&authority_role=system_of_record'
+      + '&temporal_storage_model=snapshot&bian_path=Customer+Offer&process_path=onboarding'
+      + '&sub_domain=deposits&limit=20',
+    )
+  })
+
   it('omits empty facet groups and unset flags, and honors a custom limit and empty q', async () => {
     fetchMock.mockImplementation(ok({ hits: [], facets: {}, total: 0 }))
     // Empty q browses all; an empty facet array and an unset flag never reach the wire.

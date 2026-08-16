@@ -197,13 +197,50 @@ describe('search screen — facet sidebar', () => {
     searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
     render(<SearchScreen />)
     await findRow('public.accounts.balance')
+    // getByRole('group'), not getByText: the assertion is that a labelled SIDEBAR GROUP exists,
+    // and a bare text match would also be satisfied by a badge or a meta line elsewhere on screen.
     for (const group of ['Source', 'Domain', 'Sensitivity', 'Declared tag', 'Additivity',
-                         'Entity', 'Kind', 'Flags']) {
-      expect(screen.getByText(group)).toBeInTheDocument()
+                         'Entity', 'Kind', 'Column role']) {
+      expect(screen.getByRole('group', { name: group })).toBeInTheDocument()
     }
     expect(screen.getByRole('checkbox', { name: 'deposits 3' })).not.toBeChecked()
     expect(screen.getByRole('checkbox', { name: 'cards 1' })).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: 'Grain 2' })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Grain key 2' })).toBeInTheDocument()
+  })
+
+  // The reason this task exists: the six dataset-profile facets were absent from the client's key
+  // list, so the groups the server returns for them could not even be SENT. This walks one of them
+  // end to end — rendered from the response, selected, and on the wire.
+  it('sends a dataset-profile facet the client previously could not carry', async () => {
+    searchCatalog.mockResolvedValue(
+      result([HIT], { ...FACETS, data_role: [{ value: 'crosswalk', count: 2 }] }, 1),
+    )
+    render(<SearchScreen />)
+    await findRow('public.accounts.balance')
+    // "Table role", not "Column role": data_role is the TABLE axis, the flags are the column axis.
+    const tableRole = within(screen.getByRole('group', { name: 'Table role' }))
+    await userEvent.click(tableRole.getByRole('checkbox', { name: 'crosswalk 2' }))
+    expect(searchCatalog).toHaveBeenLastCalledWith(
+      '', { data_role: ['crosswalk'] }, SEARCH_PAGE_SIZE, 0,
+    )
+    expect(window.location.hash).toBe('#/search?data_role=crosswalk')
+  })
+
+  // A group with more values than the collapsed window hides the tail behind one disclosure, and
+  // expanding reveals the whole group rather than a second page of it.
+  it('collapses a long facet group to six values and expands it on request', async () => {
+    searchCatalog.mockResolvedValue(result([HIT], {
+      ...FACETS,
+      domain: Array.from({ length: 9 }, (_, i) => ({ value: `domain_${i}`, count: 9 - i })),
+    }, 1))
+    render(<SearchScreen />)
+    await findRow('public.accounts.balance')
+    const domain = () => within(screen.getByRole('group', { name: 'Domain' }))
+    expect(domain().getAllByRole('checkbox')).toHaveLength(6)
+    expect(domain().queryByRole('checkbox', { name: 'domain_8 1' })).not.toBeInTheDocument()
+    await userEvent.click(domain().getByRole('button', { name: 'Show all 9' }))
+    expect(domain().getAllByRole('checkbox')).toHaveLength(9)
+    expect(domain().getByRole('checkbox', { name: 'domain_8 1' })).toBeInTheDocument()
   })
 
   it('omits a facet group the response does not carry', async () => {
@@ -239,7 +276,7 @@ describe('search screen — facet sidebar', () => {
     await findRow('public.accounts.balance')
     await userEvent.click(screen.getByRole('checkbox', { name: 'deposits 3' }))
     await userEvent.click(screen.getByRole('checkbox', { name: 'cards 1' }))
-    await userEvent.click(screen.getByRole('checkbox', { name: 'Grain 2' }))
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Grain key 2' }))
     expect(window.location.hash).toBe('#/search?source=deposits&source=cards&grain=true')
     expect(searchCatalog).toHaveBeenLastCalledWith(
       '', { source: ['deposits', 'cards'], grain: true }, SEARCH_PAGE_SIZE, 0,
@@ -260,8 +297,10 @@ describe('search screen — facet sidebar', () => {
     )
     render(<SearchScreen />)
     await findRow('public.accounts.balance')
-    expect(screen.getByText('Declared tag')).toBeInTheDocument()
-    expect(screen.getByRole('checkbox', { name: '(none) 4' })).toBeInTheDocument()
+    expect(screen.getByRole('group', { name: 'Declared tag' })).toBeInTheDocument()
+    // The NULL bucket reads as "Not classified" — the server's own `(none)` token is a wire value,
+    // not sidebar copy.
+    expect(screen.getByRole('checkbox', { name: 'Not classified 4' })).toBeInTheDocument()
     expect(screen.queryByRole('checkbox', { name: 'pii 1' })).not.toBeInTheDocument()
   })
 
@@ -271,8 +310,8 @@ describe('search screen — facet sidebar', () => {
     )
     render(<SearchScreen />)
     await findRow('public.accounts.balance')
-    expect(screen.getByRole('checkbox', { name: 'Grain 0' })).toBeDisabled()
-    expect(screen.getByRole('checkbox', { name: 'As-of 1' })).toBeEnabled()
+    expect(screen.getByRole('checkbox', { name: 'Grain key 0' })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: 'As-of field 1' })).toBeEnabled()
   })
 })
 
@@ -289,6 +328,27 @@ describe('search screen — active filters and URL state', () => {
     expect(searchCatalog).toHaveBeenLastCalledWith('', {}, SEARCH_PAGE_SIZE, 0)
     expect(screen.queryByText('source: deposits')).not.toBeInTheDocument()
     expect(window.location.hash).toBe('#/search')
+  })
+
+  // One owner of the facet vocabulary. Before this the chips carried their own label table, so a
+  // chip could read "sensitivity: restricted" under a group titled "Sensitivity" while the raw
+  // declared tag sat under "Declared tag" — two names for two facets, mixed up on screen.
+  it('names a chip exactly as the sidebar group above it names the facet', async () => {
+    window.location.hash = '#/search?sensitivity=(none)&sensitivity_display=restricted'
+    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
+    render(<SearchScreen />)
+    await findRow('public.accounts.balance')
+    expect(screen.getByText('declared tag: not classified')).toBeInTheDocument()
+    expect(screen.getByText('sensitivity: restricted')).toBeInTheDocument()
+    // The displayed name is display only: the selection still round-trips on the server's own
+    // `(none)` token, in the sidebar and on the wire.
+    expect(
+      within(screen.getByRole('group', { name: 'Declared tag' }))
+        .getByRole('checkbox', { name: 'Not classified 3' }),
+    ).toBeChecked()
+    expect(searchCatalog).toHaveBeenLastCalledWith(
+      '', { sensitivity: ['(none)'], sensitivity_display: ['restricted'] }, SEARCH_PAGE_SIZE, 0,
+    )
   })
 
   it('Clear all resets every filter but keeps the committed query', async () => {

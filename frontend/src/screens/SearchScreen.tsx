@@ -11,26 +11,8 @@ import {
 } from '../api'
 import { useHashRoute } from '../nav'
 import { LineageView } from './LineageView'
+import { SearchFacetPanel, facetLabel } from './SearchFacetPanel'
 import { SearchHitRow } from './SearchHitRow'
-
-const FACET_GROUPS: { key: SearchFacetKey; label: string }[] = [
-  { key: 'source', label: 'Source' },
-  { key: 'domain', label: 'Domain' },
-  // Two sensitivity facets, deliberately named apart. `sensitivity_display` is the projected
-  // restriction label the asset page shows and the one a user means by "sensitivity";
-  // `sensitivity` is the raw tag a source file declared, which is empty on catalogs that declare
-  // none. Labelling both "Sensitivity" would put two different vocabularies under one word.
-  { key: 'sensitivity_display', label: 'Sensitivity' },
-  { key: 'sensitivity', label: 'Declared tag' },
-  { key: 'additivity', label: 'Additivity' },
-  { key: 'entity', label: 'Entity' },
-  { key: 'kind', label: 'Kind' },
-]
-
-const FLAG_OPTIONS: { key: 'grain' | 'as_of'; label: string }[] = [
-  { key: 'grain', label: 'Grain' },
-  { key: 'as_of', label: 'As-of' },
-]
 
 function paramsToFilters(params: URLSearchParams): SearchFilters {
   const filters: SearchFilters = {}
@@ -209,15 +191,17 @@ export function SearchScreen() {
     })
   }
 
-  // Active-filter chips, in facet-group order, then flags.
+  // Active-filter chips, in the order the facet keys ride the query string, then flags. The chip
+  // wears the SAME label the sidebar group wears — `facetLabel` is the one owner of that
+  // vocabulary, so a chip can never read "sensitivity display" under a group reading "Sensitivity".
   const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
-  for (const group of FACET_GROUPS) {
-    for (const value of filters[group.key] ?? []) {
+  for (const key of SEARCH_FACET_KEYS) {
+    for (const value of filters[key] ?? []) {
       chips.push({
-        id: `${group.key}:${value}`,
-        label: `${group.label.toLowerCase()}: ${value}`,
-        pii: group.key === 'sensitivity' && value === 'pii',
-        remove: () => toggleFacet(group.key, value),
+        id: `${key}:${value}`,
+        label: `${facetLabel(key).toLowerCase()}: ${value === '(none)' ? 'not classified' : value}`,
+        pii: key === 'sensitivity' && value === 'pii',
+        remove: () => toggleFacet(key, value),
       })
     }
   }
@@ -228,11 +212,6 @@ export function SearchScreen() {
     chips.push({ id: 'as_of', label: 'as-of', pii: false, remove: () => toggleFlag('as_of') })
   }
   const hasFilters = chips.length > 0
-
-  const flagBuckets = result
-    ? { grain: result.facets.grain?.[0], as_of: result.facets.as_of?.[0] }
-    : null
-  const showFlags = Boolean(flagBuckets && (flagBuckets.grain || flagBuckets.as_of))
 
   return (
     <section className="search-screen">
@@ -307,59 +286,12 @@ export function SearchScreen() {
 
       <div className={effectiveView === 'graph' ? 'facet-cols facet-cols--graph' : 'facet-cols'}>
         {effectiveView === 'list' && (
-        <aside className="facet-panel" aria-label="Filters">
-          {FACET_GROUPS.map(group => {
-            const buckets = result?.facets[group.key] ?? []
-            if (buckets.length === 0) return null
-            return (
-              <fieldset className="facet-group" key={group.key}>
-                <legend className="facet-group-title">{group.label}</legend>
-                {buckets.map(bucket => {
-                  const checked = (filters[group.key] ?? []).includes(bucket.value)
-                  const isPii = group.key === 'sensitivity' && bucket.value === 'pii'
-                  return (
-                    <label className="facet-option" key={bucket.value}>
-                      <input
-                        type="checkbox"
-                        checked={checked}
-                        onChange={() => toggleFacet(group.key, bucket.value)}
-                      />
-                      {isPii && <span className="facet-pii-dot" aria-hidden="true" />}
-                      <span className="facet-name">{bucket.value}</span>{' '}
-                      <span className="facet-count tabular-nums">{bucket.count}</span>
-                    </label>
-                  )
-                })}
-              </fieldset>
-            )
-          })}
-          {showFlags && (
-            <fieldset className="facet-group">
-              <legend className="facet-group-title">Flags</legend>
-              {FLAG_OPTIONS.map(flag => {
-                const count = flagBuckets?.[flag.key]?.count ?? 0
-                const checked = Boolean(filters[flag.key])
-                // A flag with no matching rows and not already picked cannot narrow further.
-                const disabled = count === 0 && !checked
-                return (
-                  <label
-                    className={disabled ? 'facet-option facet-option--disabled' : 'facet-option'}
-                    key={flag.key}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={disabled}
-                      onChange={() => toggleFlag(flag.key)}
-                    />
-                    <span className="facet-name">{flag.label}</span>{' '}
-                    <span className="facet-count tabular-nums">{count}</span>
-                  </label>
-                )
-              })}
-            </fieldset>
-          )}
-        </aside>
+          <SearchFacetPanel
+            facets={result?.facets ?? {}}
+            filters={filters}
+            onToggleFacet={toggleFacet}
+            onToggleFlag={toggleFlag}
+          />
         )}
 
         <div className="search-results">

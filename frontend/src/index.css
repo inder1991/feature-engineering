@@ -7724,3 +7724,28 @@ button.stat:hover {
 
 .hit-overflow-items button:hover:not(:disabled) { background: var(--surface-2); }
 .hit-overflow-items button:disabled { color: var(--ink-faint); cursor: not-allowed; }
+
+/* The facet group's "Show all N" disclosure. A group collapses to six named values, so the tail of
+   a fifty-value group sits behind this one control rather than becoming a wall.
+
+   13px — the documented secondary tier — not a 12px of its own. The base button rule centres its
+   content and pins a 32px height, so `justify-content` and `height` are declared here for the same
+   reason `.hit-overflow-items button` declares them: without them `text-align: left` is silently
+   defeated and the link cannot sit tight under the last option. */
+.facet-more {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  height: auto;
+  min-height: 0;
+  margin-top: 4px;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: left;
+}
+
+.facet-more:hover { color: var(--accent-hover); text-decoration: underline; }

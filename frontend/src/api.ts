@@ -234,8 +234,16 @@ export const SEARCH_PAGE_SIZE = 20
 
 // The repeated-value facet groups, in the order they ride the /search query string. AND across
 // groups, OR within one. grain/as_of are boolean flags carried separately (=true restricts).
+//
+// The last six are the dataset-profile facets. The route ACCEPTS them unconditionally and applies
+// them only while `FEATUREGEN_DATASET_PROFILES` is on (`column_facets()` is the one definition of
+// what is active), so sending them is safe on every deployment: with the flag off the server
+// ignores them exactly as it ignores any facet it does not have. Before this they were absent from
+// the client entirely, which made the groups the server returns for them un-selectable.
 export const SEARCH_FACET_KEYS = [
   'source', 'domain', 'sensitivity', 'sensitivity_display', 'additivity', 'entity', 'kind',
+  'data_role', 'authority_role', 'temporal_storage_model', 'bian_path', 'process_path',
+  'sub_domain',
 ] as const
 export type SearchFacetKey = (typeof SEARCH_FACET_KEYS)[number]
 
