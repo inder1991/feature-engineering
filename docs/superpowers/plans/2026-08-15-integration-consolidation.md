@@ -1,6 +1,8 @@
 # V2 as the feature language, on shared execution
 
-**Date:** 2026-08-16 · **Revision 18** — a ten-lens plan-vs-code audit (ordering cycles · acceptance
+**Date:** 2026-08-16 · **Revision 19** — an eleventh review, verified in parallel with an
+adversarial refutation pass. **It corrected the plan on nine blockers and eight majors; the
+verification corrected the REVIEW on three.** Revision 18's ten-lens audit (ordering cycles · acceptance
 satisfiability · already-exists · three claim-verification passes · internal consistency · coverage
 gaps · S0.5 premises · pilot executability), each finding adversarially refuted before acceptance.
 **Nine blockers and nineteen majors survived.** Two are corrections to revision 17's *own* audit
@@ -72,6 +74,24 @@ Baseline `29f3b8ac`. Every claim below was mechanically re-checked for revision 
   operator.
 - **The exemplar's policy refs and the recipe's are different strings**, so preservation fails by
   name (`AUTHORITY_REFS_NOT_PRESERVED`).
+- **Logical refs MUST carry a `source::` prefix — revision 18 said the opposite [R19].**
+  `schema.py`: *"logical_ref … must be 'source::schema.table[.column]'"*, enforced for **V1 and V2
+  alike** through one `_split_logical_ref`. The rule is **"replace `authored::` with the selected
+  real catalog source"**, never "strip the prefix". Revision 18 inferred "no prefix" from a grep of
+  one module — the same over-generalisation that produced the `repr()` error.
+- **The recipe does not structurally declare `debit` [R19].** It appears only in the recipe NAME and
+  prose; blueprint derivation builds the expression with **no semantic selection**. The reviewed
+  exemplar carries direction as a **physical `filter` predicate** — the thing the plan intends to
+  replace — so a deterministic author could only infer `debit`.
+- **Unit and currency are unreadable through the V2 authoring path [R19].** `authoring_v2` reads
+  operand facts via `read_operational_value`, and `field_policies` classifies unit/currency so the
+  reader returns **`not_operational` even for source-attested or human-confirmed decisions**;
+  `_fact_text` then yields empty strings. **`CURRENCY_CONVERSION_UNDECLARED` can never fire through
+  today's authoring path.** A usable seam exists: **`read_verified_decision_value`** re-resolves the
+  value from selected evidence and verifies its hash, with **no governed-field restriction**.
+- **No materialization module consumes any V2 formula type [R19]** — zero references to
+  `TypedFormulaProposalV2` / `AuthorityRefsV2` / `FormulaBodyV2` under `materialize/`, and the V1 IR
+  has **no closed operator vocabulary**, only `ExpressionExecutionIR` fields.
 - **Timezone and boundary are shared derivation CONSTANTS, not pilot data** —
   `recipe_formula_blueprint_derivation.DERIVED_TIMEZONE = "UTC"` and a hardcoded
   `start_inclusive=Inclusivity.EXCLUSIVE`. **Changing them moves every derived blueprint**, which is
@@ -206,7 +226,7 @@ the ledger; the stage that needs a table writes it.**
 | # | Table | Stage |
 |---|---|---|
 | 1072 | target-reading revision (append-only) · feature selection revision | S1 |
-| 1073 | feature definition · authoring work item + backfill · typed planning request | S2 |
+| 1073 | feature definition · authoring work item **+ compatibility reader, NOT an in-place backfill: the existing table is write-once by trigger with `UPDATE`/`DELETE` revoked from the app role [R19]** · typed planning request | S2 |
 | 1074 | generation inventory observation · bound input set revision | S3 |
 | 1075 | policy realization revision + current pointer + conflict findings | S4 |
 | 1076 | bound formula revision · executable output policy | S5 |
@@ -235,7 +255,15 @@ the ledger; the stage that needs a table writes it.**
 **Numeric decisions:** eligible status values and null handling · unknown-direction behaviour ·
 target currency · **base-currency identity rate** (AED rows have only a sentinel `"always": 1.0`, and
 a mandatory missing-rate gate would refuse them) · FX missing-rate behaviour · quote convention and
-inversion · **conversion before or after aggregation** · rate rounding.
+inversion · rate rounding — **and the amount-sign convention [R19]**: positive magnitude plus a
+`D`/`C` indicator, or an already-signed amount; and whether the output debit magnitude is positive
+or negative.
+
+**Conversion happens BEFORE aggregation — settled, not open [R19].** C-C6 defines
+`SUM(amount × booking_rate)` and S8 requires a mutation moving conversion after aggregation to
+**fail**. With per-row currencies and per-booking rates, "after" is only meaningful if the
+computation first groups by currency and separately defines which period-level rate converts each
+subtotal — a different feature.
 
 **Reconcile four axes** — timezone, boundary, length, **ref namespace**. Two of these land on
 **shared derivation constants** (`DERIVED_TIMEZONE`, the hardcoded `start_inclusive`), so the change
@@ -251,9 +279,9 @@ availability timestamps**.
 
 > **Acceptance — branch A (FX in the pilot):** every decision recorded with its decider; the pilot
 > relation exists and the formula binds it; a currency operand is declared and bound; **the pilot
-> proposal WITHOUT a `currency_conversion_ref` refuses `CURRENCY_CONVERSION_UNDECLARED`**; base-
-> currency rows resolve at rate 1 without tripping the missing-rate gate; refs are in the production
-> namespace with no `authored::` surviving; expected rows stored and hashed with availability
+> C1 facts for `txn_amt` are read and recorded** — **the refusal test itself moves to C-A3c [R19]**, since it needs a reader that does not exist during a human-decision-only stage, and a green test asserting exactly this already exists over a hand-built literal (**instance 14**); base-
+> currency rows resolve at rate 1 without tripping the missing-rate gate; refs carry the **selected real catalog source** in place of `authored::` — the `source::`
+> prefix is mandatory and is never stripped **[R19]**; expected rows stored and hashed with availability
 > timestamps.
 >
 > **Acceptance — branch B (FX deferred to its own pilot):** as above **minus** every FX clause;
@@ -279,12 +307,14 @@ stale reference**. So:
 | Task | Deliverable | Gate (S0.5) | Gate (deferred) |
 |---|---|---|---|
 | **C-A1** | **The v2 SERIALIZER keeps emitting pre-change bytes for a v2 proposal** (invariant 7) — its own parser, model and canonical projection. **This is not "gold_v2 files never change"; S0 re-authors them.** `gold_fixtures/*.json` are **schema 1** and belong to rule 6's V1 test, not here | a v2 proposal round-trips **byte-identically** through the frozen projection, asserted on a **committed snapshot copy** taken before S0's re-authoring | — |
-| **C-A2** | `proposal_v3.schema.json` + `parse_v3`; extend `parse_versioned` (accepts 1 and 2). Packaging needs no change (`*.schema.json` glob) | a v3 proposal parses; an unknown version refuses loudly | — |
-| **C-A3** | `SemanticRowSelectionV1(kind, role, semantic_value)` on **`AggregateExpressionV2`** and the expectation types, **`semantic_value` a closed enum per `kind`** (invariant 13) — which is what makes the refusal decidable. **v3 gets its own dataclasses**; `_plain_v2` walks every field, so a shared dataclass would rehash every stored v2 artifact | `direction` accepts `debit`/`credit` and **refuses `D`**; a v2 proposal is unaffected by v3's field | — |
+| **C-A2** | **A COMPLETE V3 TYPE FAMILY, leaving every V2 dataclass untouched [R19]** — `AggregateExpressionV3`, V3 body types, `TypedFormulaProposalV3`, `schema_v3.py`, `canonical_v3.py`, `parse_v3.py`, `proposal_v3.schema.json`, version dispatch — **plus the consumers**: author turns · recipe expectations · critic · egress · result candidate union · replay restoration · frozen configuration. A schema and a parser alone are not sufficient. **V3 is the Formula-V2 language at wire version 3** | a v3 proposal parses and canonicalizes; **every V2 dataclass is byte-identical to its pre-change definition**; an unknown version refuses loudly | — |
+| **C-A3** | **`SemanticRowSelectionV1` on `AggregateExpressionV3` — NEVER on V2 [R19].** Revision 18 said "v3 gets its own dataclasses" and then named `AggregateExpressionV2` as the target, which would have rehashed every stored V2 artifact through `_plain_v2`. Selections are a **tuple, unique by `(kind, role)`**, over a **closed kind→token matrix** (`direction → debit \| credit`, `eligibility → eligible`) | `direction` accepts `debit`/`credit` and **refuses `D`**; two selections sharing `(kind, role)` refuse; **every V2 hash is unchanged** | — |
+| **C-A3b** | **[R19] Structured semantic selections on `RecipeDefinitionV2`**, not only the formula — `posted_debit_amount` declares `debit` **only in its name and prose** today. The recipe declares `direction/debit` explicitly; the V3 exemplar's **physical `filter` predicate is removed**; **`SELECTION_FILTER_CONFLICT`** refuses a filter and a selection governing the same role | the reviewed recipe yields a direction-selecting blueprint **with no prose inference**; a leftover filter on the same role refuses | S2: the derived blueprint matches the re-authored exemplar |
+| **C-A3c** | **[R19] `MeasureFactsReaderV1`** — unit and currency through **`read_verified_decision_value`** (no governed-field restriction), logical type and grain through the existing readers. Pin producer · strength · decision id · policy version · evidence hash into bound-input/occurrence provenance. **Without this the conversion tooth cannot fire at all** | a source-attested `per_row` currency on `txn_amt` is READ, and the pilot proposal without a conversion ref refuses `CURRENCY_CONVERSION_UNDECLARED` **through the authoring path**, not a hand-built literal | S4: the provenance is pinned on the occurrence |
 | **C-A4** | Schema-3 coherence: a direction selection **requires** `AuthorityRefsV2.direction_policy_ref` | a selection without the ref refuses by name | — |
 | **C-A5** | `ReviewOutcomeV2 = CriticExecutedV2 \\| ReviewedBlueprintBypassV2` with V2-specific axes | the sum type round-trips; a bypass carries **no `critic_status`** | S2: a bypass replays **with no `CRITIC_COMPLETED` event** |
 | **C-A6** | `REVIEW_BYPASSED` transition; **bump disposition, orchestrator and replay protocol versions**; old readers still read old traces | version constants moved and asserted | S2: an existing recorded trace replays unchanged |
-| **C-A7** | **CREATE `AuthoredOutputIntentV2`** (derived from `FormulaOutputPolicyV2`) carrying unit, additivity, conversion-required, declared ref **and desired target currency and numeric shape** — the fields its own test compares. **The type exists nowhere today**, so revision 17's present-tense §0.1 claim about it is deleted | the type is constructible and its field set covers every field S5's refusal compares | **S5** (not S4 — the refusal moved): the refusal compares only fields the intent records |
+| **C-A7** | **CREATE `AuthoredOutputIntentV2`, DERIVED from the proposal/recipe output expectation** — never a second declaration that can disagree with `expected_output`. Carries unit, additivity, conversion-required, declared ref **and desired target currency and numeric shape**. **Plus a V3 authoring result** whose terminal artifact is *validated proposal + review outcome + provisional intent*, with an **`OUTPUT_INTENT_CAPTURED`** stage and **no `OUTPUT_POLICY_RESOLVED` until S5**. *(Verification note [R19]: `AuthoringResultV2` does have a legal no-policy shape — `NEEDS_REVIEW` with an unresolved `output_status` — so this is chosen for clarity, not forced.)* | the intent is derivable from the expectation alone; a V3 result is terminal **without** `OUTPUT_POLICY_RESOLVED` | **S5**: the refusal compares only fields the intent records |
 | **C-A8** | **Tool-seam repair**: `run_authoring_v2` gains a `tool_runner` parameter; **`run_authoring_v2_replay`'s `tool_runner=None` default removed or fail-closed**; the schema-3 matrix covers **tool behaviour** with prompt, turn schema, frozen configuration, replay restoration, candidate union, recipe egress, expectation schema, WORM trace | omitting a runner **refuses** rather than falling back to v1 tools | S13: a v3 proposal through the shared tools is not reported invalid-because-v1 |
 | **C-A9** | **[R18]** The **reviewed-expectation re-pin is a gated human act** — S0's re-authoring changes the exemplar's canonical hash and therefore the pinned registry entry. Name the owner, the required reviewer roles and the `recipe_review_event` at the current `canonical_recipe_v2_hash` | the re-pin task exists with an owner and reviewer roles named | S2: the registry entry matches the re-authored exemplar |
 
@@ -292,13 +322,14 @@ stale reference**. So:
 
 | Task | Deliverable | Gate (S0.5) | Gate (deferred) |
 |---|---|---|---|
-| **C-B1** | **`TargetReadingRevisionV1`, append-only** — catalog source · target ref · type · horizon · **the existing closed provenance vocabulary `human_confirmed \| user_typed \| exploring`** · canonical content hash. Today `record_target_reading` UPDATEs in place with no provenance guard and drops `catalog_source` | the type round-trips; two catalogs with the same `public.t.c` are distinguishable | S1 (1072): a second reading creates a **new revision**; a `human_confirmed` reading is never silently overwritten |
-| **C-B2** | **`FeatureSelectionRevisionV1` is the ROOT record**, immutable, referencing an exact target reading. **`FeatureDefinitionV1` is created or resolved at authoring** with an append-only selection→definition link | a selection is constructible **with no definition** | S1/S2 (1072/1073): the link is append-only |
+| **C-B1** | **`TargetReadingRevisionV1`, append-only and a DISCRIMINATED UNION [R19]** — `PREDICTION` (ref/type/horizon required) \| `EXPLORATION` (those fields forbidden; leakage result `NOT_APPLICABLE_EXPLORATION`). Since a canonical ref already contains its source, **either store only `target_logical_ref` or enforce that its parsed source equals `catalog_source`** — never two facts that can disagree. Carries the existing closed provenance vocabulary `human_confirmed \| user_typed \| exploring` and a canonical content hash. Today `record_target_reading` UPDATEs in place with no provenance guard and drops `catalog_source` | the type round-trips; two catalogs with the same `public.t.c` are distinguishable | S1 (1072): a second reading creates a **new revision**; a `human_confirmed` reading is never silently overwritten |
+| **C-B2** | **`FeatureSelectionRevisionV1`**, immutable, referencing an exact target reading and pinning **which served option was selected — `considered_revision_id` · `option_id` · `decision_id` · `planning_request_hash` · `binding_plan_hash` [R19]**. *(Verification note: migration 1063 records every option SERVED, not a selection, so the selection record is genuinely new — it pins 1063's identity rather than inventing one.)* Under `BuildSetRevisionV1` (C-B5b). **`FeatureDefinitionV1` is created or resolved at authoring** with an append-only selection→definition link | a selection is constructible **with no definition** | S1/S2 (1072/1073): the link is append-only |
 | **C-B3** | **`ExecutableFeatureRevisionV2`** — **defined here over opaque content hashes** for the bound formula and executable output policy, whose *types* are also frozen here (C-C6a) and whose *instances* S5 produces **[R18 — revision 17 froze it over types S5 delivered]** | constructible from hashes alone | S6 (1077) |
 | **C-B4** | **`DerivedGroupRevisionV2`** — members · contract · plan · `CompilationIdentityV2`. **The first durable group→member map**: nothing maps a group to its members today | the type carries membership and a group-wide identity | S6 (1077): membership is queryable without replaying a request |
-| **C-B5** | **`GenerationAuthorizationRevisionV2`** — selection · exact target reading · leakage-policy version · verdict · **the planned IR hashes that verdict screened** · Gate-2 authorization (invariant 17) | the envelope binds all five | S6 (1077): an artifact authorized for one target cannot be reused for another |
+| **C-B5** | **`GenerationAuthorizationRevisionV2`** — derived group · **ALL member selection revisions (a group has many features; revision 18 named one) [R19]** · exact target binding/revision · leakage-policy version · verdict · **the planned IR hashes that verdict screened** · Gate-2 token | the envelope binds every member | S6 (1077): an artifact authorized for one target cannot be reused for another |
+| **C-B5b** | **[R19] `BuildSetRevisionV1` — the missing root.** The UI requires a build-set/child-group hierarchy and none exists. It carries **ordered `FeatureSelectionRevision` ids · the exact `TargetReadingRevision` · one `BuildDeclarationV1`**. **One declaration per BUILD SET (not per derived group, which does not exist until S6), and multiple grains REFUSE**; derived access/sensitivity differences may still split it into several groups | the graph `BuildSet → selections → definitions`, and `DerivedGroup → BuildSet + ordered executable revisions`, is expressible with no forward reference | S11 (1082): a two-grain build set refuses |
 | **C-B6** | **`BoundInputSetRevisionV2`**, before occurrence derivation | constructible independently of any policy | S3 (1074) |
-| **C-B7** | **`GenerationInventoryObservationV1`, captured BEFORE binding** — `inventory` is required by `compile_feature_group` and `compile_ir`. Pin **`environment_id` and the inventory content hash**; `captured_at` is provenance. **`environment_id` enters `sandbox_execution_hash`** | both are pinned and identity moves when either moves | S3 (1074): compilation is unreachable without an inventory |
+| **C-B7** | **`GenerationInventoryObservationV1`, captured BEFORE binding** — `inventory` is required by `compile_feature_group` and `compile_ir`. **Identity covers `environment_id` · engine versions · the logical-schema mappings ACTUALLY USED · the physical layouts for the EXACT read set — never the whole observation [R19]**, which the inventory already separates from provenance; otherwise an unrelated table or a mere re-capture would invalidate a feature. Store the complete observation; hash only that subset. **`environment_id` enters `sandbox_execution_hash`** | an identical re-capture with a new observation id and capture time leaves identity unchanged; an unrelated table added to the inventory leaves it unchanged | S3 (1074): compilation is unreachable without an inventory |
 | **C-B8** | **`VerificationInventoryObservationV1`** + an explicit compatibility algorithm over **all eight** runtime versions (hive, spark, metastore, python, java, pyspark, kedro, kedro_datasets) **and every physical input layout** | a comparison rule and a test **per dimension, eight of eight** | S9 (1080) |
 
 #### C · Execution and policy contracts *(ordered so no task precedes its inputs [R18])*
@@ -309,10 +340,11 @@ stale reference**. So:
 | **C-C2** | **`PlannedFormulaExecutionIRV2` FIRST**, then read set → leakage → Gate 2 → authorization **wrapping those exact planned IRs**; never rebuilt after | the ordering is expressed in types (authorization cannot be constructed without planned IRs) | S6: authorization names the IR hashes the renderer consumes |
 | **C-C6a** | **`BoundFormulaRevisionV2` and `ExecutableOutputPolicyV2` TYPES** *(moved here so C-B3 has them)* | both types frozen | S5 (1076) |
 | **C-C6** | `formula-v2/physical-types@1` defining **`SUM(amount × booking_rate)` completely** — precision, scale, intermediate precision, rounding site, SUM growth, overflow, float refusal, nullability. `empty_window` already decides V1 nullability — mirror it | every row of the truth table asserted; V1 and V2 agree where they overlap | S5 |
-| **C-C7** | `derive_policy_occurrences(formula, bound_input_set)` replacing `required_policy_kinds()` wiring | a country filter needs no reversal policy; an operand whose C1 facts are not `monetary`/`per_row` needs no currency occurrence | S4 (1075) |
-| **C-C8** | Realization identity — family key · **unique revision id PLUS a separate `executable_content_hash`** so a source and an LLM proposal with identical semantics stay distinct · CAS pointer · retained conflict findings · **and `realizes_occurrences`, which exists nowhere and is created here** [R18]. **Pilot realizations are TIMELESS; validity-interval detection is NOT BUILT** — `POLICY_INTERVAL_UNSUPPORTED` was never implemented, so there is nothing to remove | two proposals with identical semantics keep separate revisions; `realizes_occurrences` exists on the type | S4 (1075). **The withdrawal is scoped to POLICY VALIDITY INTERVALS — it does not touch the load-bearing mid-window FX RATE test (3.65→3.70 ⇒ 73.50)** [R18] |
+| **C-C7** | `derive_policy_occurrences(formula, bound_input_set)` replacing `required_policy_kinds()` wiring, emitting a durable **`PolicyOccurrenceSetV1`** — expression path · policy-ref field · kind/ref · semantic role · bound physical dataset/column · environment · occurrence hash **[R19]** | a country filter needs no reversal policy; an operand whose C1 facts are not `monetary`/`per_row` needs no currency occurrence | S4 (1075) |
+| **C-C8** | Realization identity — the **family key frozen explicitly as policy kind/ref + physical dataset binding + environment + semantic role [R19]**, or the "current" pointer would merge policies applying to different sources · **unique revision id PLUS a separate `executable_content_hash`** so a source and an LLM proposal with identical semantics stay distinct · CAS pointer · retained conflict findings · **and `realizes_occurrences`, which exists nowhere and is created here** [R18]. **Pilot realizations are TIMELESS; validity-interval detection is NOT BUILT** — `POLICY_INTERVAL_UNSUPPORTED` was never implemented, so there is nothing to remove | two proposals with identical semantics keep separate revisions; `realizes_occurrences` exists on the type | S4 (1075). **The withdrawal is scoped to POLICY VALIDITY INTERVALS — it does not touch the load-bearing mid-window FX RATE test (3.65→3.70 ⇒ 73.50)** [R18] |
 | **C-C9** | LLM admissibility (invariant 16); policy literals evidence-linked where available, else `LLM_PROPOSED` and **not called evidence-validated** | the four-way table is a total function over its inputs | S4 |
-| **C-C10** | Typed operator-subgraph requirements — **FX**: as-of join · duplicate-rate gate · missing-rate gate · **base-currency identity-rate bypass** · optional inversion · decimal conversion · connected path. **LINKED_REVERSAL**: as-of population · linkage · ambiguity gate · survivor operator · connected path. Plus topology-derived coverage | each requirement is a named constant with a test over a **stubbed** graph | S7: deleting the duplicate-rate gate refuses with `realizes_occurrences` intact |
+| **C-C10a** | **[R19] THE CLOSED PILOT OPERATOR GRAPH — without it none of the topology questions are decidable.** No materialization module consumes a V2 formula type and the V1 IR has no operator vocabulary at all. Freeze exactly: governed scan · PIT/availability filter · semantic selection · eligible-status filter · linked-reversal survivor · as-of FX join · duplicate-rate gate · missing-rate gate · quote inversion · decimal multiplication · aggregate · spine left join · group assembly. **Every node: typed payload · stable node id · ordered inputs · canonical identity** | the vocabulary is closed and each node's identity payload is pinned | S6: the pilot compiles to exactly these node kinds |
+| **C-C10** | Subgraph requirements over C-C10a — **FX**: as-of join · duplicate-rate gate · missing-rate gate · **base-currency identity-rate bypass** · optional inversion · decimal multiplication · connected path. **LINKED_REVERSAL**: as-of population · linkage · ambiguity gate · survivor · connected path. Plus topology-derived coverage | each requirement is a named constant with a test over a **stubbed** graph | S7: deleting the duplicate-rate gate refuses with `realizes_occurrences` intact |
 | **C-C3** | `FullReadSetLeakageGateV2` over formula operands and filters · policy reads · join keys · reversal and FX inputs · temporal and availability columns · spine reads. **Claim stated narrowly** (invariant 18) | the gate runs over a **stubbed realization fixture** | S6: a mutation replacing a policy status/direction column with the target ref refuses |
 | **C-C4** | Gate-2 union extended with **policy reads** — `SpineSpec.read_set` is already unioned. **The gate is restated [R18]: Gate 2's read set is DERIVED from the IRs and spine, so there is no separate list to "remove the FX table from"** | — | S6: **an FX rate column the supplied roles cannot read refuses `READ_SCOPE_INSUFFICIENT`; an ungoverned FX column refuses by its own code** |
 | **C-C5** | Per-read temporal semantics; the declared T+N promise a **separate** field | the two are separate fields on the type | S6: post-cutoff FX and post-cutoff reversal refuse |
@@ -322,11 +354,12 @@ stale reference**. So:
 
 | Task | Deliverable | Gate (S0.5) | Gate (deferred) |
 |---|---|---|---|
+| **C-D0** | **[R19] Four explicit extractions from the monolithic chain** — `generate_artifact()` · `request_verification()` · `execute_verification()` · `publish_verified_output()`. Today the chain selects the publisher **before** running and compiles, renders, validates, submits and publishes in one call; an identity type alone does not separate them. *(Verification note: a missing publisher does not short-circuit — it falls through to an unproven build rather than returning.)* | the four signatures exist and no one of them can reach another's side effects | S7/S9/S10 |
 | **C-D1** | `VerificationExecutionIdentityV1` — **no publication attestation**; decide `__verification_execution_hash` vs a versioned alias, changing identity, system columns, run parameters and persistence **together** | constructible with **no attestation**; V1's hash still requires one | S9 (1080) |
 | **C-D2** | The versioned check set — result schema per check · non-null columns · feature-null rules from the output policy · spine completeness and uniqueness · join orphan/amplification · **which of the eight external requirements each may satisfy** · the check-set hash | the mapping is explicit and total | S9: a keys/types check does not satisfy `JOIN_CONNECTIVITY` |
 | **C-D3** | `VerifiedOutputRevisionV1` — check-set hash · validator versions · pinned executable policy hashes · **`input_observation_strength`** · **retention/expiry state [R18 — dropped in revision 17]**, reusing **`runtime/blob_gc`'s `marked_orphan → quarantined → swept`** discipline rather than inventing one | the type carries all five | S9: a policy changed after verification makes the pass stale; an expired staged output is swept |
-| **C-D4** | Artifact file manifest **extending `GENERATED.lock`** — ordered path · SHA-256 · byte length · media type · **the content store the bytes actually live in [R18]** (DB blob, shared volume or object store — decided here, migration 1078) · byte verification before retrieval **and** before execution | the manifest type and the store choice are recorded | S7 (1078): a mismatched digest is neither served nor executed |
-| **C-D5** | `OperatorExecutionProofV1` pinning signature and version · compiler and renderer versions · physical-type policy · topology version · gold corpus hash · **the exact generated gold-project hash** · check-set version · the eight runtime versions | the type refuses construction with any field absent | S8 (1079): changed bytes invalidate a proof even with no version bump |
+| **C-D4** | **An EXTERNAL control-plane manifest — `GENERATED.lock` left unchanged [R19].** The lock is excluded from `generated_project_hash`, `read_lock` enforces a strict **two-key** top level, and a blob pointer known only *after* storage would create a second cycle. The manifest carries artifact id · path · SHA-256 · byte length · media type · immutable content reference, and **for the first slice the generated text files live in PostgreSQL** rather than a new object-store subsystem. Bytes verified on **write, retrieval and execution**. *(Verification note: extending the lock would break `read_lock`, not V1 generated bytes — and `read_lock` already has an optional-key pattern one level down. An external manifest is still the cleaner cut.)* | the manifest type and the Postgres store are frozen; `GENERATED.lock` and `read_lock` untouched | S7 (1078): a mismatched digest is neither served nor executed |
+| **C-D5** | `OperatorExecutionProofV1` pinning signature and version · compiler and renderer versions · physical-type policy · topology version · gold corpus hash · **the exact generated gold-project hash** · **the MUTATION-set version — NOT S9's verification check-set, which does not exist at S8 and is a deliberately separate concept [R19]** · the eight runtime versions | the type refuses construction with any field absent and **carries no S9 check-set version** | S8 (1079): changed bytes invalidate a proof even with no version bump |
 | **C-D6** | Environment scoping on **`group_binding`** and **`feature_active_revision`** — **migration 1083 reserved [R18]**: ADD COLUMN + backfill + constraint swap. **Also reconcile the flat V1/V2 `logical_group_name` namespace**, which has no language discriminator | the target schema and backfill are written | S10 (1083) |
 | **C-D7** | Group-name allocator. **[R18] Either it IS `hive_identifier` extended — one normalizer for feature columns and group names — or it is scoped to group names with a stated proof of non-collision with names already bound.** `hive_identifier` deliberately refuses to truncate | the choice is stated and the ≤128 bound proved | S6 |
 | **C-D8** | Active-revision **CAS** — `publish_sandbox(verified_output_revision_id, expected_active_revision_id)`; 1055's trigger stops concurrent double-wins, not a stale publish | the signature carries both | S10 (1081): an older verified output over a newer active revision refuses |
@@ -343,7 +376,7 @@ stale reference**. So:
 > contract types untouched.
 
 ### S1 — immutable selection + target-reading revision *(1072)*
-> **Acceptance:** a selection exists with no definition and no executable revision; a re-read creates
+> **Acceptance:** **a selection is CONSTRUCTIBLE before any definition exists** (the vacuous "no executable revision" half moves to S6, where that record first exists) **[R19]**; a re-read creates
 > a new revision and the old stays readable; a `human_confirmed` reading is never silently
 > overwritten; legacy `exploring` rows map onto the mode axis.
 
@@ -387,19 +420,36 @@ duplicate-rate-gate deletion. **Generation is authorized here; it has no user su
 
 ### S9 — on-demand sandbox verification *(1080)*
 > **Acceptance:** verification executes with **no publication capability present**; two attempts do
-> not share a staging path; a changed input flips a pass to stale and names it; observation strength
-> is never `PINNED` without enforced reads.
+> not share a staging path; **staleness is three-way [R19]** — a comparable `OBSERVED` input that
+> changed ⇒ **stale**, an identical observation ⇒ **current**, `UNPINNED` ⇒ **neither**, remaining
+> labelled unverifiable and never claimed current or stale on content; observation strength is never
+> `PINNED` without enforced reads.
 
 ### S10 — exact-output CAS publication *(1081, 1083)*
-> **Acceptance:** an older verified output over a newer active revision refuses; a partial group never
-> becomes visible; environment keying is in place.
+**Publication reselects the mechanism against the CURRENT environment and records the exact
+capability attestation — verification must not require one, publication must [R19].** The
+implementation documents a cross-plane window where the Hive swap succeeds and the database
+transaction later rolls back; rather than a distributed transaction, an attempt ends in
+**`STARTED` · `SUCCEEDED` · `FAILED` · `UNKNOWN_RECONCILIATION_REQUIRED`**, and an uncertain attempt
+is reconciled against the published generation marker **before** any retry.
 
-### S11 — complete API and UI workflow *(1082)*
+> **Acceptance:** an older verified output over a newer active revision refuses; a partial group never
+> becomes visible; environment keying is in place; **an interrupted swap lands
+> `UNKNOWN_RECONCILIATION_REQUIRED` and blocks retry until reconciled**.
+
+### S11 — consolidation and polish *(1082)*
+
+**[R19] The surfaces ship with their capabilities, not all at the end** — the Generate endpoint,
+code-view API and top-of-workspace stage UI land at **S8**; Verify request/results UI at **S9**;
+Publish UI at **S10**. S11 consolidates the build-set/child-group hierarchy and the full UX.
 Endpoints incl. **an explicit generate endpoint** · the derived group split before verification ·
 policy provenance with `LLM_PROPOSED` visible · **goal, target, stage and output at the top of the
 workspace**.
-> **Acceptance:** generation is reachable by a user for the first time; no path reaches execution
-> without an explicit click; results sit above intake.
+> **Acceptance [R19 — bounded, since "no path" is not observable from a UI test]:** the verification
+> and publication handlers appear in **no relay route map and no timer**, and the only callers of
+> `evaluate_verify` / `evaluate_publish_sandbox` are their two request endpoints — asserted by an
+> enumeration test over the route table — plus a UI test that the buttons are the only client-side
+> callers; results sit above intake.
 
 ### S12 — corpus generation *(generation only)*
 Under the target **mode** axis and a declared default `BuildDeclarationV1` set.
@@ -432,6 +482,22 @@ S0 semantics + numerics + PILOT DATA REALITY ─► S0.5 contracts ⟨A · B · 
   ─► S12 corpus ─► S13 build free-form + expand
 ```
 
+**What changed in revision 19.** V3 becomes a **complete type family** — `AggregateExpressionV3`,
+body types, proposal, `schema_v3`/`canonical_v3`/`parse_v3` and every consumer — because revision 18
+said "v3 gets its own dataclasses" and then named `AggregateExpressionV2` as the target, which would
+have rehashed every stored V2 artifact. The recipe gains **structured semantic selections**, since
+`posted_debit_amount` declares `debit` only in its name and prose today. A **`MeasureFactsReaderV1`**
+is added because unit and currency come back `not_operational` through the current reader, so the
+currency requirement could never fire at all. The **closed pilot operator graph** is frozen, without
+which no topology question is decidable — no materialization module consumes a V2 formula type and
+the V1 IR has no operator vocabulary. `BuildSetRevisionV1` becomes the missing root, generation
+authorization covers **all** member selections, the artifact manifest moves **out** of
+`GENERATED.lock`, and the chain gets four named extractions. Conversion-before-aggregation is
+recorded as **settled**, staleness becomes three-way so `UNPINNED` is neither current nor stale, and
+publication gains `UNKNOWN_RECONCILIATION_REQUIRED`. **Logical refs must carry a `source::` prefix** —
+revision 18 claimed the opposite from a single-module grep, the same over-generalisation that
+produced the `repr()` error two revisions earlier.
+
 **What changed in revision 18.** The deadlock is gone: S0.5's gates were behavioural over tables its
 own ledger reserved for later stages, so every task now has a contract gate satisfiable with **no
 migration** and a deferred behavioural gate carried by the owning stage. S0 gains **pilot data
@@ -444,4 +510,10 @@ verification attempts get their own staging path. `exploring` and `blob_gc` are 
 thirteenth things this plan proposed to build that already exist. And **§0.5 was renamed §0.6**
 because a section number collided with a stage name.
 
-**No duration estimate.** Fourteen revisions have now carried one that a review invalidated.
+**Three review claims were corrected by verification [R19]:** `AuthoringResultV2` *does* have a
+legal no-policy shape (`NEEDS_REVIEW` with an unresolved output status), so the V3 result is a
+clarity choice rather than a forced one; extending `GENERATED.lock` would break `read_lock`, **not**
+V1 generated bytes, and an optional-key precedent already exists one level down; and migration 1063
+records every option **served**, not a selection, so the selection record is genuinely new.
+
+**No duration estimate.** Fifteen revisions have now carried one that a review invalidated.
