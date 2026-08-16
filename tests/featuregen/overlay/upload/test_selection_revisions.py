@@ -16,8 +16,10 @@ from featuregen.overlay.upload.selection_revisions import (
     ExplorationTargetV1,
     FeatureSelectionRevisionV1,
     PredictionTargetV1,
+    TargetModeV1,
     TargetProvenanceV1,
     TargetReadingRevisionV1,
+    map_legacy_provenance,
     refuse_multi_grain,
     supersede_target_reading,
 )
@@ -91,17 +93,52 @@ def test_a_prediction_target_requires_all_three_fields():
         PredictionTargetV1(target_logical_ref=CHURN, target_type="boolean", horizon_days=0)
 
 
-def test_the_PROVENANCE_and_the_READING_cannot_disagree():
-    with pytest.raises(ValueError, match="a reader cannot tell which is true"):
-        _reading(provenance=TargetProvenanceV1.EXPLORING)
-    with pytest.raises(ValueError, match="this reading has none"):
-        _reading(reading=ExplorationTargetV1())
+# ══ C-D12 — MODE and PROVENANCE are separate axes ════════════════════════════════════════════════
+def test_A_PERSON_CAN_DECLARE_NO_TARGET():
+    """C-D12's whole point. Under the old shipped vocabulary this was unrepresentable: writing
+    `exploring` into the provenance column ERASED who declared it — `contract.py` literally does
+    `provenance = "exploring" if … else "human_confirmed"`."""
+    exploring = _reading(reading=ExplorationTargetV1())
+    assert exploring.mode is TargetModeV1.EXPLORATION
+    assert exploring.provenance is TargetProvenanceV1.HUMAN_CONFIRMED
+    assert exploring.confirmed_by == "alice@bank.example"
+
+
+def test_the_MODE_is_DERIVED_from_the_union_discriminant():
+    """The discriminated union already IS the mode axis; storing mode beside it would be the
+    two-facts-that-can-disagree problem over again."""
+    import dataclasses
+
+    assert "mode" not in {f.name for f in dataclasses.fields(TargetReadingRevisionV1)}
+    assert _reading().mode is TargetModeV1.PREDICTION
+    assert _reading(reading=ExplorationTargetV1()).mode is TargetModeV1.EXPLORATION
+
+
+def test_the_provenance_vocabulary_no_longer_carries_EXPLORING():
+    """One field, one owner: `exploring` answers "what kind of build", not "who said so"."""
+    assert {p.value for p in TargetProvenanceV1} == {"human_confirmed", "user_typed"}
+    assert {m.value for m in TargetModeV1} == {"prediction", "exploration"}
+
+
+def test_LEGACY_EXPLORING_ROWS_MAP_WITH_NO_LOSS():
+    """S1's migration gate. `None` for the provenance is TRUTHFUL, not lossy: the legacy schema
+    never recorded a separate declarer for an exploring row, because writing `exploring` into the
+    provenance column is what destroyed that information."""
+    assert map_legacy_provenance("exploring") == (TargetModeV1.EXPLORATION, None)
+    assert map_legacy_provenance("human_confirmed") == (
+        TargetModeV1.PREDICTION, TargetProvenanceV1.HUMAN_CONFIRMED)
+    assert map_legacy_provenance("user_typed") == (
+        TargetModeV1.PREDICTION, TargetProvenanceV1.USER_TYPED)
+
+
+def test_an_unknown_legacy_provenance_refuses_by_name():
+    with pytest.raises(ValueError, match="unknown legacy target provenance"):
+        map_legacy_provenance("something_else")
 
 
 def test_exploration_names_its_own_leakage_result():
     """"No leakage found" and "there was nothing to look for" are different answers."""
-    exploring = _reading(reading=ExplorationTargetV1(),
-                         provenance=TargetProvenanceV1.EXPLORING, confirmed_by=None)
+    exploring = _reading(reading=ExplorationTargetV1())
     assert exploring.reading.leakage_result == NOT_APPLICABLE_EXPLORATION
     assert exploring.catalog_source is None
 
@@ -127,28 +164,26 @@ def test_A_HUMAN_CONFIRMED_READING_IS_NEVER_SILENTLY_ERASED():
     with pytest.raises(ValueError, match="Name who acknowledged that"):
         supersede_target_reading(
             confirmed, revision_id="trr-2", reading=ExplorationTargetV1(),
-            provenance=TargetProvenanceV1.EXPLORING)
+            provenance=TargetProvenanceV1.HUMAN_CONFIRMED)
 
 
 def test_the_loss_may_be_ACKNOWLEDGED_and_is_then_recorded():
     acknowledged = supersede_target_reading(
         _reading(), revision_id="trr-2", reading=ExplorationTargetV1(),
-        provenance=TargetProvenanceV1.EXPLORING, acknowledged_human_loss_by="alice@bank.example")
+        provenance=TargetProvenanceV1.HUMAN_CONFIRMED,
+        acknowledged_human_loss_by="alice@bank.example")
     assert acknowledged.acknowledged_human_loss_by == "alice@bank.example"
     assert acknowledged.identity_payload()["acknowledged_human_loss_by"] == "alice@bank.example"
 
 
-def test_user_typed_is_ALSO_human_origin():
-    """The person literally named the column — human-origin by construction, per the existing
-    vocabulary's own docstring."""
-    assert TargetProvenanceV1.USER_TYPED.is_human_origin
-    assert TargetProvenanceV1.HUMAN_CONFIRMED.is_human_origin
-    assert not TargetProvenanceV1.EXPLORING.is_human_origin
+def test_EVERY_remaining_provenance_is_human():
+    """Which is why the guard below keys on the MODE change, not on the provenance."""
+    assert all(p.is_human_origin for p in TargetProvenanceV1)
 
     typed = _reading(provenance=TargetProvenanceV1.USER_TYPED)
     with pytest.raises(ValueError, match="Name who acknowledged that"):
         supersede_target_reading(typed, revision_id="trr-2", reading=ExplorationTargetV1(),
-                                 provenance=TargetProvenanceV1.EXPLORING)
+                                 provenance=TargetProvenanceV1.USER_TYPED)
 
 
 def test_replacing_one_prediction_with_another_needs_no_acknowledgement():
@@ -195,8 +230,14 @@ def test_the_selection_pins_1063s_identity_rather_than_inventing_one():
 
 
 # ══ C-B5b — the missing root ═════════════════════════════════════════════════════════════════════
-def _declaration(entity="account", keys=("acct_id",)) -> BuildDeclarationV1:
-    return BuildDeclarationV1(entity=entity, grain_keys=keys, purpose="attrition model")
+def _declaration(entity="account", keys=("acct_id",), **overrides) -> BuildDeclarationV1:
+    kwargs = dict(entity=entity, grain_keys=keys, purpose="attrition model",
+                  base_name="account_attrition", cadence="daily",
+                  availability_promise_days=1,
+                  spine_source_ref="hdfc::public.account_population",
+                  environment_id="hdfc-local")
+    kwargs.update(overrides)
+    return BuildDeclarationV1(**kwargs)
 
 
 def _build_set(**overrides) -> BuildSetRevisionV1:
@@ -245,9 +286,49 @@ def test_A_TWO_GRAIN_BUILD_SET_REFUSES():
 
 def test_a_declaration_needs_an_entity_and_grain_keys():
     with pytest.raises(ValueError, match="must name the entity"):
-        BuildDeclarationV1(entity=" ", grain_keys=("acct_id",), purpose="p")
+        _declaration(entity=" ")
     with pytest.raises(ValueError, match="describes no population"):
-        BuildDeclarationV1(entity="account", grain_keys=(), purpose="p")
+        _declaration(keys=())
+
+
+# ══ C-D10 — the declaration is FROZEN with its operational terms ═════════════════════════════════
+@pytest.mark.parametrize("blank", ["base_name", "cadence", "spine_source_ref", "environment_id"])
+def test_every_operational_term_is_required(blank):
+    """Each one decides something a published table is judged against."""
+    with pytest.raises(ValueError, match="states an operational term nobody chose"):
+        _declaration(**{blank: "  "})
+
+
+def test_a_negative_availability_promise_is_refused():
+    with pytest.raises(ValueError, match="promises data before it exists"):
+        _declaration(availability_promise_days=-1)
+
+
+def test_a_parameter_bound_twice_is_refused():
+    with pytest.raises(ValueError, match="decided by tuple order"):
+        _declaration(parameter_bindings=(("window", "30"), ("window", "90")))
+
+
+def test_parameter_bindings_are_ORDER_INDEPENDENT_in_identity():
+    """Which order a caller listed bindings in is not a fact about the build."""
+    a = _declaration(parameter_bindings=(("window", "30"), ("ccy", "AED")))
+    b = _declaration(parameter_bindings=(("ccy", "AED"), ("window", "30")))
+    assert a.identity_payload() == b.identity_payload()
+
+
+def test_the_declaration_carries_ALL_SIX_c_d10_terms():
+    payload = _declaration().identity_payload()
+    assert {"cadence", "availability_promise_days", "spine_source_ref", "environment_id",
+            "parameter_bindings", "base_name"} <= set(payload)
+
+
+def test_the_PLANNING_REQUEST_HASH_IS_DELIBERATELY_ABSENT():
+    """The request-identity split is intentional and has its own named test. Folding the hash in
+    would make every re-declaration a new request and every re-request a new declaration."""
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(BuildDeclarationV1)}
+    assert "planning_request_hash" not in names
 
 
 def test_ONE_DECLARATION_LIVES_ON_THE_BUILD_SET_not_a_derived_group():

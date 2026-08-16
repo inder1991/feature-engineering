@@ -40,7 +40,9 @@ __all__ = [
     "FeatureSelectionRevisionV1",
     "PredictionTargetV1",
     "refuse_multi_grain",
+    "TargetModeV1",
     "TargetProvenanceV1",
+    "map_legacy_provenance",
     "TargetReadingRevisionV1",
     "supersede_target_reading",
 ]
@@ -50,19 +52,58 @@ __all__ = [
 NOT_APPLICABLE_EXPLORATION = "NOT_APPLICABLE_EXPLORATION"
 
 
+class TargetModeV1(StrEnum):
+    """WHAT kind of target this build has — C-D12's axis, independent of who declared it."""
+
+    PREDICTION = "prediction"
+    EXPLORATION = "exploration"
+
+
 class TargetProvenanceV1(StrEnum):
-    """The existing closed vocabulary, carried verbatim from ``record_target_reading``."""
+    """WHO declared it. Two values, both human — see :func:`map_legacy_provenance`.
+
+    The shipped vocabulary also carries ``exploring``, which answers a different question: it says
+    the build has no target, not who said so. C-D12 moves it onto :class:`TargetModeV1` — one field,
+    one owner. Leaving it here meant a person who explicitly declared "no target" had their identity
+    overwritten by the fact of the declaration (``contract.py`` literally does
+    ``provenance = "exploring" if … else "human_confirmed"``), so the two axes were not merely
+    conflated, one erased the other.
+    """
 
     #: The fuzzy path — a person clicked.
     HUMAN_CONFIRMED = "human_confirmed"
     #: The person literally named the column: human-origin by construction, recorded without a click.
     USER_TYPED = "user_typed"
-    #: An explicit no-target declaration.
-    EXPLORING = "exploring"
 
     @property
     def is_human_origin(self) -> bool:
-        return self is not TargetProvenanceV1.EXPLORING
+        """Every remaining provenance is human. Kept as a property because callers ask the question
+        and the answer should not become a literal ``True`` scattered across them."""
+        return True
+
+
+#: The legacy value that was never a provenance.
+_LEGACY_EXPLORING = "exploring"
+
+
+def map_legacy_provenance(
+    stored: str,
+) -> tuple[TargetModeV1, TargetProvenanceV1 | None]:
+    """A legacy ``target_provenance`` value as ``(mode, provenance)`` — S1's migration, no loss.
+
+    ``exploring`` maps to ``(EXPLORATION, None)``. The ``None`` is truthful rather than lossy: the
+    legacy schema never recorded a separate declarer for an exploring row, because writing
+    ``exploring`` into the provenance column is what destroyed that information in the first place.
+    Inventing ``HUMAN_CONFIRMED`` here would manufacture an attribution nobody made.
+    """
+    if stored == _LEGACY_EXPLORING:
+        return TargetModeV1.EXPLORATION, None
+    try:
+        return TargetModeV1.PREDICTION, TargetProvenanceV1(stored)
+    except ValueError as exc:
+        raise ValueError(
+            f"unknown legacy target provenance {stored!r}: the closed vocabulary is "
+            f"{[*(p.value for p in TargetProvenanceV1), _LEGACY_EXPLORING]}") from exc
 
 
 def _split_ref(logical_ref: str) -> tuple[str, str]:
@@ -150,15 +191,16 @@ class TargetReadingRevisionV1:
             raise ValueError(
                 "a target reading revision must name itself and the intent it governs, or it "
                 "cannot be superseded by anything or found again")
-        exploring = self.provenance is TargetProvenanceV1.EXPLORING
-        if exploring and isinstance(self.reading, PredictionTargetV1):
-            raise ValueError(
-                "provenance 'exploring' with a prediction target: the declaration says no target "
-                "was chosen and the reading names one, and a reader cannot tell which is true")
-        if not exploring and isinstance(self.reading, ExplorationTargetV1):
-            raise ValueError(
-                f"provenance {self.provenance.value!r} with an exploration reading: a human-origin "
-                f"provenance claims a person named a target, and this reading has none")
+        # No provenance/reading cross-check remains, and its absence is the point of C-D12: a
+        # person CAN declare "no target", so a human provenance beside an exploration reading is
+        # now an ordinary, representable fact rather than a contradiction.
+
+    @property
+    def mode(self) -> TargetModeV1:
+        """DERIVED from the reading's own type — the discriminated union already is the mode axis,
+        so storing it beside the union would be the two-facts-that-can-disagree problem again."""
+        return (TargetModeV1.PREDICTION if isinstance(self.reading, PredictionTargetV1)
+                else TargetModeV1.EXPLORATION)
 
     @property
     def catalog_source(self) -> str | None:
@@ -169,6 +211,7 @@ class TargetReadingRevisionV1:
         return {
             "intent_id": self.intent_id,
             "reading": self.reading.identity_payload(),
+            "mode": self.mode.value,
             "provenance": self.provenance.value,
             "confirmed_by": self.confirmed_by,
             "supersedes_revision_id": self.supersedes_revision_id,
@@ -197,11 +240,11 @@ def supersede_target_reading(
         ValueError: ``previous`` is human-origin and this supersedes it with an exploration
             declaration without naming who acknowledged the loss.
     """
-    if previous.provenance.is_human_origin and provenance is TargetProvenanceV1.EXPLORING:
+    if previous.mode is TargetModeV1.PREDICTION and isinstance(reading, ExplorationTargetV1):
         if not (acknowledged_human_loss_by or "").strip():
             raise ValueError(
                 f"revision {previous.revision_id} was confirmed by a person "
-                f"({previous.provenance.value}) and this would replace it with an exploration "
+                f"({previous.provenance.value}) and this would replace its target with an exploration "
                 f"declaration, removing the target entirely. Name who acknowledged that: a "
                 f"governed run losing its subject between one screen and the next is exactly what "
                 f"an append-only chain exists to make visible")
@@ -271,15 +314,30 @@ class FeatureSelectionRevisionV1:
 
 @dataclass(frozen=True, slots=True)
 class BuildDeclarationV1:
-    """What a build set is FOR — one declaration per build set.
+    """What a build set is FOR, and under what operational terms — FROZEN (C-D10).
 
-    Per build set and not per derived group, because a derived group does not exist until S6 and a
-    declaration that could only be attached to one would have nowhere to live during selection.
+    **One declaration per BUILD SET, with an explicit one-grain restriction.** C-D10 offered "one
+    per derived group, or an explicit one-grain restriction"; the second is what this takes, because
+    a derived group does not exist until S6 and a declaration that could only attach to one would
+    have nowhere to live during selection. :func:`refuse_multi_grain` is that restriction made
+    executable. Derived access or sensitivity differences may still split one build set into several
+    groups later — that splits the GROUPS, not the declaration.
+
+    **Reconciliation with the request-identity split.** ``planning_request_hash`` is deliberately
+    NOT a field here. A build declaration says what to build; a planning request records what was
+    asked for, and the split between them is intentional and has its own named test. Folding the
+    hash in would make every re-declaration a new request and every re-request a new declaration.
     """
 
     entity: str
     grain_keys: tuple[str, ...]
     purpose: str
+    base_name: str
+    cadence: str
+    availability_promise_days: int
+    spine_source_ref: str
+    environment_id: str
+    parameter_bindings: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.entity.strip():
@@ -290,10 +348,35 @@ class BuildDeclarationV1:
                 "the set would be computed at a grain nobody stated")
         if len(set(self.grain_keys)) != len(self.grain_keys):
             raise ValueError(f"grain_keys repeats a key: {self.grain_keys!r}")
+        for value, what in ((self.base_name, "base_name"), (self.cadence, "cadence"),
+                            (self.spine_source_ref, "spine_source_ref"),
+                            (self.environment_id, "environment_id")):
+            if not value.strip():
+                raise ValueError(
+                    f"a build declaration with no {what} states an operational term nobody chose; "
+                    f"every one of these decides something a published table is judged against")
+        if self.availability_promise_days < 0:
+            raise ValueError(
+                f"availability_promise_days={self.availability_promise_days} promises data before "
+                f"it exists")
+        names = [name for name, _ in self.parameter_bindings]
+        if len(set(names)) != len(names):
+            raise ValueError(
+                f"a parameter is bound twice ({sorted(names)}): which binding applies would be "
+                f"decided by tuple order")
 
     def identity_payload(self) -> dict[str, Any]:
-        return {"entity": self.entity, "grain_keys": list(self.grain_keys),
-                "purpose": self.purpose}
+        return {
+            "entity": self.entity,
+            "grain_keys": list(self.grain_keys),
+            "purpose": self.purpose,
+            "base_name": self.base_name,
+            "cadence": self.cadence,
+            "availability_promise_days": self.availability_promise_days,
+            "spine_source_ref": self.spine_source_ref,
+            "environment_id": self.environment_id,
+            "parameter_bindings": [list(pair) for pair in sorted(self.parameter_bindings)],
+        }
 
 
 @dataclass(frozen=True, slots=True)
