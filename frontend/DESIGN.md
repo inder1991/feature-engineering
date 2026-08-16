@@ -83,7 +83,11 @@ packages (no CDN). Engineered, legible, unmistakably a tool; deliberately not In
 - Headings: 22px/600 page titles, 15px/600 section titles. Scale ratio ≥1.25, hierarchy through
   weight + size together.
 - `font-variant-numeric: tabular-nums` on all counts and tables.
-- Every `object_ref`, column name, feature id renders in Plex Mono 13px.
+- Every `object_ref`, column name, feature id renders in Plex Mono 13px where it appears inline.
+- A result-row title (a column or table name) renders in Plex Mono 14px/600 — the one place an
+  identifier outranks body text, because it is the row's heading.
+- A result-row address line (`source › table › column`) renders in Plex Mono 11px, lowercase and
+  untracked — a tertiary address, not a micro-label.
 
 ## Layout
 

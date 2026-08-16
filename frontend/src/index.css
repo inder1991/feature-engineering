@@ -7645,6 +7645,8 @@ button.stat:hover {
 
 .hit-meta { margin: 2px 0 0; }
 
+/* Secondary size, not a 12px tier of its own: capability lines are meaningful content ("Grain key
+   for Account"), not micro-labels. With this the row uses only 14 / 13 / 11 — all documented. */
 .hit-capabilities {
   margin: 0;
   padding: 0;
@@ -7652,7 +7654,7 @@ button.stat:hover {
   display: grid;
   gap: 6px;
   align-content: start;
-  font-size: 12px;
+  font-size: 13px;
   color: var(--ink-soft);
 }
 

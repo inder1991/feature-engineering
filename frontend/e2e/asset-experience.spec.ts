@@ -62,7 +62,7 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
     expect(body.status, JSON.stringify(body)).toBe('ingested')
   })
 
-  test('search -> Details renders the real asset detail, a nonblank graph, and no overflow', async ({
+  test('search -> Open asset renders the real asset detail, a nonblank graph, and no overflow', async ({
     page,
   }) => {
     // --- search for the seeded asset (REAL GET /search) ---
@@ -72,11 +72,11 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
     // to the search FORM's own submit, not the nav entry.
     await page.locator('main').getByRole('button', { name: 'Search', exact: true }).click()
 
-    // A real hit for the seeded asset surfaces its Details action (aria-label carries the object_ref,
-    // e.g. "Details for public.e2e_accounts.balance").
-    const details = page.getByRole('button', { name: new RegExp(`^Details for .*${TABLE}`) })
-    await expect(details.first()).toBeVisible()
-    await details.first().click()
+    // A real hit for the seeded asset surfaces its Open asset action — the row's ONE primary
+    // (aria-label carries the object_ref, e.g. "Open asset public.e2e_accounts.balance").
+    const openAsset = page.getByRole('button', { name: new RegExp(`^Open asset .*${TABLE}`) })
+    await expect(openAsset.first()).toBeVisible()
+    await openAsset.first().click()
 
     // --- navigation: the asset route + the REAL asset detail rendered ---
     // The hash carries the hit's own catalog_source; the detail heading is the asset's table[.column]

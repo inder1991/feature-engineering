@@ -61,11 +61,21 @@ export function SearchHitRow({
 
         {/* Keyed by position, not by value: the trail is positional and never reordered, and a
             catalog source that shares its name with the table it feeds (source `accounts`,
-            table `accounts`) would otherwise collide on a value key. */}
+            table `accounts`) would otherwise collide on a value key.
+
+            The separator's SPACES live outside the aria-hidden span, deliberately. aria-hidden
+            removes the element AND its subtree from the accessibility tree, so spacing held
+            inside the glyph span is not merely silent — it is gone, and a screen reader reads
+            the three parts as one run-on token ("depositspublic.accountsbalance"). */}
         <p className="hit-breadcrumb mono" data-testid="hit-breadcrumb">
           {breadcrumb.map((part, i) => (
             <Fragment key={i}>
-              {i > 0 && <span aria-hidden="true"> › </span>}
+              {i > 0 && (
+                <>
+                  {' '}
+                  <span aria-hidden="true">›</span>{' '}
+                </>
+              )}
               {part}
             </Fragment>
           ))}

@@ -32,12 +32,29 @@ beforeEach(() => {
   featureImpact.mockReset()
 })
 
+// What a screen reader is handed: the accessibility tree drops an aria-hidden element AND its
+// whole subtree, so anything living inside the hidden separator — spaces included — is simply not
+// there. toHaveTextContent reads textContent, which still sees it, and cannot catch this.
+function accessibleText(el: HTMLElement): string {
+  const clone = el.cloneNode(true) as HTMLElement
+  for (const hidden of clone.querySelectorAll('[aria-hidden="true"]')) hidden.remove()
+  return (clone.textContent ?? '').replace(/\s+/g, ' ').trim()
+}
+
 it('leads with the column name and demotes the physical ref to a breadcrumb', () => {
   renderRow()
   expect(screen.getByTestId('hit-name')).toHaveTextContent('balance')
   const trail = screen.getByTestId('hit-breadcrumb')
   expect(trail).toHaveTextContent('deposits')
   expect(trail).toHaveTextContent('public.accounts')
+})
+
+it('keeps the address readable once the separator glyph is hidden', () => {
+  renderRow()
+  // With the spaces inside the aria-hidden span this reads "depositspublic.accountsbalance" —
+  // one run-on token where the old row had a single readable <code>.
+  expect(accessibleText(screen.getByTestId('hit-breadcrumb')))
+    .toBe('deposits public.accounts balance')
 })
 
 it('puts the definition in the reading position', () => {
@@ -98,6 +115,7 @@ it('lists derived feature ids inline when impact finds features', async () => {
   expect(featureImpact).toHaveBeenCalledWith('public.accounts.balance', 'deposits')
   expect(await screen.findByText('feat_01')).toBeInTheDocument()
   expect(screen.getByText('feat_02')).toBeInTheDocument()
+  expect(screen.getByText('Derived features')).toBeInTheDocument()
 })
 
 it('says plainly when nothing derives from the column', async () => {
@@ -107,6 +125,8 @@ it('says plainly when nothing derives from the column', async () => {
     screen.getByRole('button', { name: 'Feature impact for public.accounts.balance' }),
   )
   expect(await screen.findByText('No features derive from this column.')).toBeInTheDocument()
+  // The label heads a list; an empty result must not print a heading over nothing.
+  expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
 })
 
 it('surfaces an impact failure as an alert without losing the row', async () => {
@@ -117,4 +137,6 @@ it('surfaces an impact failure as an alert without losing the row', async () => 
   )
   expect(await screen.findByRole('alert')).toHaveTextContent('Impact check failed: graph unavailable')
   expect(screen.getByTestId('hit-name')).toHaveTextContent('balance')
+  // A failed check is not an empty result: no heading over a list that was never fetched.
+  expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
 })
