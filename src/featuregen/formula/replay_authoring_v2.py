@@ -72,6 +72,7 @@ from featuregen.formula.authoring_versions import (
     BundleClassV2,
     classify_version_bundle,
 )
+from featuregen.formula.canonical_v3 import proposal_content_hash_v3
 from featuregen.formula.capability_v2 import classify_formula_capability_v2
 from featuregen.formula.control import (
     FormulaControlFlow,
@@ -98,6 +99,12 @@ from featuregen.formula.output_authority_v2 import (
     FormulaOutputPolicyV2,
     OperandFactsV2,
     resolve_output_v2,
+)
+from featuregen.formula.output_intent_v2 import (
+    OUTPUT_INTENT_CAPTURED,
+    AuthoredOutputIntentV2,
+    NumericShapeV2,
+    derive_output_intent_v2,
 )
 from featuregen.formula.parse_v2 import parse_versioned
 from featuregen.formula.replay_trace import (
@@ -250,6 +257,39 @@ def _restore_review(material: object):
         f"terminal review material is neither an executed critic nor a bypass: {sorted(material)}")
 
 
+def _restore_output_intent(material) -> object | None:
+    """Rebuild C-A7's provisional intent from its own trace, or refuse.
+
+    Rebuilt rather than trusted as a dict, for the reason every other restore in this module is:
+    the type's own `__post_init__` re-checks that `conversion_required` and
+    `declared_conversion_ref` agree, so a trace whose two halves drifted is caught on the way back
+    in rather than serving a result nobody could have folded.
+    """
+    if material is None:
+        return None
+    if not isinstance(material, dict):
+        raise RecoveryRequiresReconciliation(
+            f"terminal output intent is {type(material).__name__}, not an object")
+    try:
+        shape = material["numeric_shape"]
+        additivity = material.get("additivity")
+        return AuthoredOutputIntentV2(
+            unit=material["unit"],
+            additivity=AdditivityClass(additivity) if additivity is not None else None,
+            conversion_required=bool(material["conversion_required"]),
+            declared_conversion_ref=str(material["declared_conversion_ref"]),
+            target_currency=material["target_currency"],
+            numeric_shape=NumericShapeV2(
+                precision=int(shape["precision"]), scale=int(shape["scale"]),
+                rounding=str(shape["rounding"]), overflow=str(shape["overflow"])),
+            authored_expectation_present=bool(material["authored_expectation_present"]),
+            derived_from_proposal_hash=str(material["derived_from_proposal_hash"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RecoveryRequiresReconciliation(
+            f"terminal output intent does not reconstruct: {exc}") from exc
+
+
 def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
     """Rebuild a terminal v2 result from its own trace, through the SAME fold that wrote it.
 
@@ -338,6 +378,7 @@ def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
             reviewed_expectation_hash=(
                 review.expectation_hash
                 if isinstance(review, ReviewedBlueprintBypassV2) else None),
+            output_intent=_restore_output_intent(material.get("output_intent")),
         )
     except RecoveryRequiresReconciliation:
         raise
@@ -786,6 +827,58 @@ def run_authoring_v2_replay(
             critic_findings_hash=findings_hash,
         )
         _terminal(conn, run_id, seq, "failed", result, lease_fence=lease_fence)
+        return result
+
+    if isinstance(proposal, TypedFormulaProposalV3):
+        # C-A7 — a V3 run CAPTURES the author's intent and stops. Resolving the output policy
+        # against C1's governed facts is S5's, and emitting `OUTPUT_POLICY_RESOLVED` here would
+        # represent a stage that has not run as having run and agreed. The result is terminal with
+        # no `candidate_output`, which is the truthful state rather than a gap.
+        try:
+            intent = derive_output_intent_v2(
+                proposal, proposal_hash=proposal_content_hash_v3(proposal))
+        except ValueError as exc:
+            result = derive_disposition_v2(
+                _axes(structural_status="invalid_formula"), authoring_run_id=run_id)
+            _terminal(conn, run_id, seq, "failed", result,
+                      lease_fence=lease_fence, extra={"reason": str(exc)})
+            return result
+        intent_payload = intent.identity_payload()
+        if checkpoint.output_policy_result is None:
+            append_event(
+                conn, run_id, "validation_result", seq=seq,
+                idempotency_key=f"{run_id}:output-intent",
+                payload={"intent": intent_payload},
+                stage=OUTPUT_INTENT_CAPTURED,
+                canonical_output_hash=canonical_hash(intent_payload),
+                lease_fence=lease_fence,
+            )
+            seq += 1
+        elif checkpoint.output_policy_result != {"intent": intent_payload}:
+            raise RecoveryRequiresReconciliation("replayed v3 output intent changed")
+
+        axes_v3: AuthoringAxes | AuthoringAxesV2
+        if reviewed_blueprint is not None:
+            axes_v3 = AuthoringAxesV2(
+                structural_status="ok", capability_status="ok",
+                # The output is UNRESOLVED and says so. S5 resolves it; claiming "resolved" here
+                # would assert an authority nobody consulted.
+                output_status="needs_authority", expectation_status="not_provided",
+                review=bypass_for(reviewed_blueprint), technical_status="ok")
+        else:
+            axes_v3 = _axes(output_status="needs_authority",
+                            critic_status=_critic_status(list(findings)))
+        result = derive_disposition_v2(
+            axes_v3,
+            authoring_run_id=run_id,
+            candidate_proposal=proposal,
+            critic_findings_hash=findings_hash,
+            output_intent=intent,
+            reviewed_expectation_hash=(
+                reviewed_blueprint.blueprint_content_hash
+                if reviewed_blueprint is not None else None),
+        )
+        _terminal(conn, run_id, seq, "completed", result, lease_fence=lease_fence)
         return result
 
     try:

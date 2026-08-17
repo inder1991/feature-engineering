@@ -106,6 +106,11 @@ class AuthoringResultV2:
     authority_failures: tuple[AuthorityFailure, ...]
     capability_reason: str | None
     critic_findings_hash: str | None
+    #: C-A7 — what the AUTHOR intended the output to be, captured at S2 and PROVISIONAL. Present on
+    #: a v3 result, whose terminal artifact is *validated proposal + review outcome + provisional
+    #: intent*; resolving it against C1's governed facts is S5's, so a v3 run is terminal with no
+    #: `candidate_output` and that is the truthful state rather than a gap.
+    output_intent: object | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +256,7 @@ def derive_disposition_v2(
     capability_reason: str | None = None,
     critic_findings_hash: str | None = None,
     reviewed_expectation_hash: str | None = None,
+    output_intent: object | None = None,
 ) -> AuthoringResultV2:
     """Fold the six axes into ONE :class:`AuthoringResultV2` (pure — no I/O).
 
@@ -334,6 +340,7 @@ def derive_disposition_v2(
         candidate_proposal_hash=(
             None if candidate_proposal is None else _content_hash(candidate_proposal)),
         candidate_output=candidate_output,
+        output_intent=output_intent,
         output_requirements=tuple(output_requirements),
         authority_failures=tuple(authority_failures),
         capability_reason=capability_reason,

@@ -198,3 +198,60 @@ def test_OMITTING_the_blueprint_still_takes_the_AUTHORED_path(db, monkeypatch):
 
     assert reached == ["author"], "the authored path was taken"
     assert result.authoring_disposition == "TECHNICAL_FAILURE"
+
+
+# ══ C-A7 — the provisional intent, captured and terminal ═════════════════════════════════════════
+def test_A_V3_RUN_IS_TERMINAL_WITHOUT_OUTPUT_POLICY_RESOLVED(db, monkeypatch):
+    """C-A7's gate. Resolving the output policy against C1's governed facts is S5's; emitting
+    `OUTPUT_POLICY_RESOLVED` here would represent a stage that has not run as having run and
+    agreed."""
+    result = _run(db, "far_s2_intent", monkeypatch)
+    stages = _stages(db, "far_s2_intent")
+
+    assert "OUTPUT_INTENT_CAPTURED" in stages
+    assert "OUTPUT_POLICY_RESOLVED" not in stages
+    assert stages[-1] == "TERMINAL"
+    assert result.candidate_output is None, "no policy was resolved, and the result says so"
+
+
+def test_A_NON_EMPTY_CURRENCY_CONVERSION_REF_YIELDS_AN_INTENT(db, monkeypatch):
+    """S2's acceptance, verbatim. The pilot recipe declares a conversion; S2 records that the
+    author intended one rather than resolving or refusing it."""
+    result = _run(db, "far_s2_conversion", monkeypatch)
+
+    assert result.output_intent is not None
+    assert result.output_intent.conversion_required is True
+    assert result.output_intent.declared_conversion_ref.startswith("currency_conversion:")
+
+
+def test_the_intent_is_PROVISIONAL_and_the_output_says_so(db, monkeypatch):
+    """"needs_authority" is the truthful status: S5 resolves it, and claiming "resolved" here would
+    assert an authority nobody consulted."""
+    result = _run(db, "far_s2_provisional", monkeypatch)
+    assert result.output_status == "needs_authority"
+    assert result.candidate_proposal is not None, "the artifact is still carried"
+
+
+def test_the_intent_names_the_PROPOSAL_it_was_derived_from(db, monkeypatch):
+    from featuregen.formula.canonical_v3 import proposal_content_hash_v3
+
+    result = _run(db, "far_s2_derived_from", monkeypatch)
+    assert result.output_intent.derived_from_proposal_hash == proposal_content_hash_v3(
+        result.candidate_proposal)
+
+
+def test_a_deterministic_run_records_NO_AUTHORED_EXPECTATION(db, monkeypatch):
+    """C-A5's producer sets `expected_output=None`, and "the author expected nothing" is a fact
+    rather than a gap."""
+    result = _run(db, "far_s2_no_expectation", monkeypatch)
+    assert result.output_intent.authored_expectation_present is False
+    assert result.output_intent.unit is None
+
+
+def test_THE_INTENT_SURVIVES_A_REPLAY(db, monkeypatch):
+    """Rebuilt through the type's own `__post_init__`, so a trace whose two halves drifted is
+    caught on the way back in rather than served."""
+    first = _run(db, "far_s2_intent_replay", monkeypatch)
+    replayed = _run(db, "far_s2_intent_replay", monkeypatch)
+    assert replayed.output_intent == first.output_intent
+    assert replayed == first
