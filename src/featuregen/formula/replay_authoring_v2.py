@@ -85,6 +85,11 @@ from featuregen.formula.critic import (
     CriticReview,
     critique,
 )
+from featuregen.formula.deterministic_producer import (
+    DeterministicAuthoringRefused,
+    bypass_for,
+    proposal_from_bound_expectation,
+)
 from featuregen.formula.frozen_configuration import (
     FrozenAuthorCriticConfigurationV1,
     verify_frozen_configuration_v2,
@@ -324,6 +329,15 @@ def _restore_terminal_result(checkpoint, run_id: str) -> AuthoringResultV2:
             ),
             capability_reason=material.get("capability_reason"),
             critic_findings_hash=material.get("critic_findings_hash"),
+            # S2 — the coverage hash comes from the STORED bypass's own `expectation_hash`.
+            # Without it `derive_disposition_v2` refuses (a bypass whose coverage nobody checked is
+            # an unreviewed formula folding as neutral) and the run would be permanently
+            # unreplayable — the exact defect C-A5's review named. Re-asserting the bypass's own
+            # claim is not a weakening: the check is that the bypass covers the expectation it
+            # names, and a stored bypass names exactly one.
+            reviewed_expectation_hash=(
+                review.expectation_hash
+                if isinstance(review, ReviewedBlueprintBypassV2) else None),
         )
     except RecoveryRequiresReconciliation:
         raise
@@ -419,6 +433,7 @@ def run_authoring_v2_replay(
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
     formula_schema_version: int = 2,
+    reviewed_blueprint: Any | None = None,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
     resumably, under a lease, against a frozen configuration.
@@ -536,7 +551,21 @@ def run_authoring_v2_replay(
         )
         seq += 1
 
-    if checkpoint.raw_proposal is None:
+    if checkpoint.raw_proposal is None and reviewed_blueprint is not None:
+        # S2 — THE DETERMINISTIC PATH. A reviewed blueprint already determines the formula
+        # completely, so asking a provider to restate arithmetic the registry holds spends a call
+        # to re-derive a known answer and invites it to drift from the very expectation the run is
+        # then validated against. No author turns are emitted because none happened.
+        try:
+            raw = _plain(proposal_from_bound_expectation(reviewed_blueprint))
+        except DeterministicAuthoringRefused as exc:
+            result = derive_disposition_v2(
+                _axes(structural_status="invalid_formula"), authoring_run_id=run_id)
+            _terminal(conn, run_id, seq, "failed", result,
+                      lease_fence=lease_fence, extra={"reason": str(exc)})
+            return result
+        turns = ()
+    elif checkpoint.raw_proposal is None:
         try:
             raw, turns = author_formula(
                 conn,
@@ -585,7 +614,9 @@ def run_authoring_v2_replay(
         return result
     try:
         parsed = parse_versioned(material)
-        if not isinstance(parsed, TypedFormulaProposalV2):
+        # v3 is the v2 LANGUAGE at a later wire version, and the deterministic producer emits one
+        # because C-A3b's row selections live there. A v1 proposal is still the wrong contract.
+        if not isinstance(parsed, TypedFormulaProposalV2 | TypedFormulaProposalV3):
             # A run driven under the v2 turn contract that comes back declaring version 1 is the
             # WRONG CONTRACT, not a missing capability — the v1 generation is fully supported
             # elsewhere, so calling it "unsupported" would report a gap that does not exist.
@@ -605,7 +636,8 @@ def run_authoring_v2_replay(
             seq=seq,
             idempotency_key=f"{run_id}:proposal",
             payload={"proposal": raw, "proposal_hash": canonical_hash(raw)},
-            stage="AUTHOR_PROPOSAL_PARSED",
+            stage=("BLUEPRINT_PROPOSAL_DERIVED" if reviewed_blueprint is not None
+                   else "AUTHOR_PROPOSAL_PARSED"),
             canonical_output_hash=canonical_hash(raw),
             lease_fence=lease_fence,
         )
@@ -647,7 +679,30 @@ def run_authoring_v2_replay(
         _terminal(conn, run_id, seq, "completed", result, lease_fence=lease_fence)
         return result
 
-    if checkpoint.critic_result is None:
+    if reviewed_blueprint is not None:
+        # S2 — NO CRITIC RUNS, and the trace says so. `REVIEW_BYPASSED` sits exactly where
+        # `CRITIC_COMPLETED` sits and is its ALTERNATIVE: a run either ran the critic or stood on a
+        # reviewed blueprint, and recording `critic_status="clean"` here would claim the critic ran
+        # and found nothing, which is false.
+        bypass = bypass_for(reviewed_blueprint)
+        if checkpoint.critic_result is None:
+            append_event(
+                conn,
+                run_id,
+                "review_bypassed",
+                seq=seq,
+                idempotency_key=f"{run_id}:review-bypassed",
+                payload={"blueprint_revision": bypass.blueprint_revision,
+                         "expectation_hash": bypass.expectation_hash},
+                stage="REVIEW_BYPASSED",
+                canonical_output_hash=canonical_hash(_plain(bypass)),
+                lease_fence=lease_fence,
+            )
+            seq += 1
+        review = None
+        findings: tuple = ()
+        findings_hash = None
+    elif checkpoint.critic_result is None:
         try:
             review = critique(
                 conn,
@@ -688,9 +743,10 @@ def run_authoring_v2_replay(
             provider_calls=0,
             usage={},
         )
-    findings = review.findings
-    findings_hash = review.findings_hash
-    if checkpoint.critic_result is None:
+    if reviewed_blueprint is None:
+        findings = review.findings
+        findings_hash = review.findings_hash
+    if reviewed_blueprint is None and checkpoint.critic_result is None:
         append_event(
             conn,
             run_id,
@@ -721,7 +777,9 @@ def run_authoring_v2_replay(
             lease_fence=lease_fence,
         )
         seq += 1
-    if review.technical_failure:
+    # A bypassed review has no technical outcome to inspect — nothing ran. `review is None` is the
+    # deterministic path, and it reaches the fold directly.
+    if review is not None and review.technical_failure:
         result = derive_disposition_v2(
             _axes(technical_status="technical_failure"),
             authoring_run_id=run_id,
@@ -766,12 +824,20 @@ def run_authoring_v2_replay(
             "needs_authority", None, reason=authority_failures[0].reason)
     else:
         resolution = classify_output_policy_v2(resolved)
-    critic_status = _critic_status(list(findings))
-    axes = _axes(
-        output_status=resolution.status,
-        expectation_status=_expectation_status(proposal, resolution.policy),
-        critic_status=critic_status,
-    )
+    expectation_status = _expectation_status(proposal, resolution.policy)
+    if reviewed_blueprint is not None:
+        # C-A5's axes: `review` where v1 has `critic_status`. `critic_status` stays None on the
+        # result — never "clean", which would claim the critic ran and found nothing.
+        axes: AuthoringAxes | AuthoringAxesV2 = AuthoringAxesV2(
+            structural_status="ok", capability_status="ok",
+            output_status=resolution.status, expectation_status=expectation_status,
+            review=bypass_for(reviewed_blueprint), technical_status="ok")
+    else:
+        axes = _axes(
+            output_status=resolution.status,
+            expectation_status=expectation_status,
+            critic_status=_critic_status(list(findings)),
+        )
     # Artifact coherence is decided HERE and enforced THERE, exactly as ``authoring_v2._finish``
     # does it: the v2 artifact is the PAIR, and both halves are offered only when the output
     # actually resolved AND the folded disposition permits an artifact at all.
@@ -785,6 +851,10 @@ def run_authoring_v2_replay(
         output_requirements=resolution.requirements,
         authority_failures=authority_failures,
         critic_findings_hash=findings_hash,
+        # The bypass must COVER the expectation this run opened for, or `derive_disposition_v2`
+        # refuses it — neutrality is checked, not asserted.
+        reviewed_expectation_hash=(
+            reviewed_blueprint.blueprint_content_hash if reviewed_blueprint is not None else None),
     )
     _terminal(conn, run_id, seq, "completed", result, lease_fence=lease_fence)
     return result

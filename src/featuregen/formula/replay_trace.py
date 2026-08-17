@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 _KINDS = frozenset({
     "author_turn",
     "critic_result",
+    # S2 — the deterministic path's review record. A KIND of its own rather than a `critic_result`
+    # with empty findings, because "the critic ran and found nothing" and "no critic ran" are
+    # different facts and a reader must not have to infer which from an empty list.
+    "review_bypassed",
     "validation_result",
     "completed",
     "failed",
@@ -362,7 +366,14 @@ def _verify_stage_transition(
     allowed_prior = {
         "AUTHOR_PROPOSAL_PARSED": lambda value: (
             value is not None and value.startswith("AUTHOR_TURN_")),
-        "EXPECTATION_VALIDATED": lambda value: value == "AUTHOR_PROPOSAL_PARSED",
+        # S2 — the DETERMINISTIC proposal. A distinct stage rather than relaxing the rule above,
+        # for two reasons. A run authored from a reviewed blueprint has NO author turns, and
+        # emitting a synthetic one would record a provider turn that never happened. And keeping
+        # `AUTHOR_PROPOSAL_PARSED` strict means a trace still says, by its stages alone, whether a
+        # provider was involved — which is the question an auditor asks first.
+        "BLUEPRINT_PROPOSAL_DERIVED": lambda value: value is None,
+        "EXPECTATION_VALIDATED": lambda value: value in {
+            "AUTHOR_PROPOSAL_PARSED", "BLUEPRINT_PROPOSAL_DERIVED"},
         "CRITIC_COMPLETED": lambda value: value == "EXPECTATION_VALIDATED",
         # C-A6 — the deterministic path's stage. It sits exactly where CRITIC_COMPLETED sits and is
         # its ALTERNATIVE, never its successor: a run either ran the critic or stood on a reviewed

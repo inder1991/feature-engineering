@@ -301,6 +301,15 @@ def body_expressions_v2(body: FormulaBodyV2) -> tuple[AggregateExpressionV2, ...
         return (body.minuend, body.subtrahend)
     if isinstance(body, CompositeBodyV2):
         return tuple(term.expr for term in body.terms)
+    # A v3 body walks HERE rather than at each of the ten call sites, because v3 is the v2 LANGUAGE
+    # at a later wire version: its bodies have the same four shapes and its expressions carry every
+    # field a v2 consumer reads, plus `row_selections` which none of them looks at. Dispatching in
+    # ten places instead would be ten chances for one to be missed — and the one that was missed
+    # would refuse a valid formula with "unknown body shape", which reads like malformation.
+    from featuregen.formula.schema_v3 import body_expressions_v3, is_v3_body
+
+    if is_v3_body(body):
+        return body_expressions_v3(body)
     raise SchemaError(f"unknown v2 body shape: {type(body).__name__}")
 
 

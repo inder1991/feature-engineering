@@ -29,7 +29,6 @@ from featuregen.formula.schema_v2 import (
     CompositeBodyV2,
     DiffBodyV2,
     RatioBodyV2,
-    TypedFormulaProposalV2,
     UnaryBodyV2,
     body_expressions_v2,
 )
@@ -76,10 +75,14 @@ def _weakest(classes: list[AdditivityClass]) -> AdditivityClass:
 
 
 def resolve_output_v2(
-    proposal: TypedFormulaProposalV2,
+    proposal,
     facts_by_ref: Mapping[str, OperandFactsV2],
 ) -> FormulaOutputPolicyV2 | InvalidOutputV2:
-    """Resolve the output policy, or refuse. Total over valid proposals — a verdict either way."""
+    """Resolve the output policy, or refuse. Total over valid proposals — a verdict either way.
+
+    Takes a v2 OR v3 proposal: the output rules are about operands and declared conversions, and v3
+    changed neither.
+    """
     expressions = body_expressions_v2(proposal.body)
 
     # The conversion tooth runs per expression, FIRST — nothing downstream may launder it.
@@ -100,12 +103,23 @@ def resolve_output_v2(
     per_expr_additivity = [operation_rule(e.aggregation).additivity for e in expressions]
     per_expr_kinds = [operation_rule(e.aggregation).result_kind for e in expressions]
 
-    if isinstance(body, UnaryBodyV2):
+    # v2 OR v3 at each arm: v3 is the v2 LANGUAGE at a later wire version, so its four body shapes
+    # mean exactly what v2's do here — output authority reads aggregations and operands, and v3
+    # changed neither. Matching on v2 alone would refuse a valid v3 formula with an AssertionError,
+    # which reads as a bug in this module rather than as anything about the formula.
+    from featuregen.formula.schema_v3 import (
+        CompositeBodyV3,
+        DiffBodyV3,
+        RatioBodyV3,
+        UnaryBodyV3,
+    )
+
+    if isinstance(body, UnaryBodyV2 | UnaryBodyV3):
         additivity = per_expr_additivity[0]
         kind = per_expr_kinds[0]
-    elif isinstance(body, RatioBodyV2):
+    elif isinstance(body, RatioBodyV2 | RatioBodyV3):
         additivity, kind = AdditivityClass.NON_ADDITIVE, "dimensionless"
-    elif isinstance(body, (DiffBodyV2, CompositeBodyV2)):
+    elif isinstance(body, DiffBodyV2 | CompositeBodyV2 | DiffBodyV3 | CompositeBodyV3):
         units = set()
         for expr, expr_kind in zip(expressions, per_expr_kinds, strict=True):
             if expr_kind == "operand_valued" and expr.operand is not None:

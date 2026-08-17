@@ -269,3 +269,12 @@ def validate_semantics_v3(p: TypedFormulaProposalV3) -> None:
         path = f"body.expr[{index}]"
         _check_expression_v2(_as_v2_expression(expr), path, params)
         _check_selections(expr, path)
+
+
+def is_v3_body(body: object) -> bool:
+    """Whether ``body`` is one of v3's four body shapes.
+
+    Exists so ``body_expressions_v2`` can dispatch without importing four names, and so the
+    "is this v3" question has ONE answer rather than an isinstance tuple repeated at call sites.
+    """
+    return isinstance(body, UnaryBodyV3 | RatioBodyV3 | DiffBodyV3 | CompositeBodyV3)
