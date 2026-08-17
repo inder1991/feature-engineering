@@ -271,3 +271,46 @@ def test_EACH_S2_DELIVERABLE_HAS_ITS_OWN_MIGRATION_FILE():
     assert (migrations / "1088_generalized_authoring_work_item.sql").exists()
     assert not (migrations / "1073_.sql").exists()
     assert not list(migrations.glob("1073_*.sql")), "1073 is deliberately NOT written"
+
+
+# ══ S2 acceptance — a candidate OUTSIDE the shadow top 12 authors ════════════════════════════════
+def test_THE_TOP_12_GATE_IS_STRUCTURALLY_ABSENT_from_the_authoring_path():
+    """S2's acceptance: "a candidate outside the shadow top 12 authors and admits".
+
+    The legacy path creates work items for `capture_required` entries ONLY
+    (`recipe_formula_shadow.py:1265`), and `capture_required = selected_for_initial_view and
+    authorable` (`:593`) — so a candidate the initial view did not show never got a work item and
+    therefore never authored. The generalized item carries no such field: the gate is not relaxed
+    here, it does not exist, which is the difference between "we remembered to allow it" and "it
+    cannot be forbidden".
+    """
+    import dataclasses
+
+    names = {f.name for f in dataclasses.fields(AuthoringWorkItemV1)}
+    for shadow_only in ("capture_required", "selected_for_initial_view", "canonical_rank",
+                        "ranking_version"):
+        assert shadow_only not in names, shadow_only
+
+
+def test_A_CANDIDATE_RANKED_FAR_OUTSIDE_THE_INITIAL_VIEW_RECORDS_AND_READS_BACK(db):
+    """The behavioural half. Nothing about rank reaches this store, so a 99th-ranked candidate is
+    recorded and read back exactly as a 1st-ranked one is."""
+    record_work_item(
+        db, _item(work_item_id="wi-rank-99", option_id="opt-ranked-99"),
+        idempotency_key="idem-rank-99")
+
+    (item,) = read_work_items(db, considered_revision_id=REVISION)
+    assert item.work_item_id == "wi-rank-99"
+    assert item.origin is WorkItemOrigin.RECIPE
+
+
+def test_the_SHADOW_capture_rule_is_untouched():
+    """Scoped honestly: the shadow path keeps its own top-12 CAPTURE rule, which is a different
+    concern (what the initial view shows) from what may be authored. This changes the authoring
+    path only."""
+    import inspect
+
+    from featuregen.overlay.upload import recipe_formula_shadow
+
+    source = inspect.getsource(recipe_formula_shadow.build_capture_entries)
+    assert "item.selected_for_initial_view and authorable" in source
