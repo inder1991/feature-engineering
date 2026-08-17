@@ -45,8 +45,14 @@ function stubReads() {
   })
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.restoreAllMocks()
+  // `session.ts` keeps the dev session in a MODULE-LEVEL `let`, so a test that grants itself a role
+  // leaks that identity into every test after it — and an identity-change test then sets a value
+  // that is already current, sees no change, and fails for a reason that has nothing to do with the
+  // component. Reset to the module's own default so each test starts from a known caller.
+  const { setSession } = await import('../session')
+  setSession({ user: 'dev', roles: ['data_owner'] })
 })
 
 // ══ ACCEPTANCE — the buttons are the ONLY client-side callers ═══════════════════════════════════
@@ -229,6 +235,39 @@ it('re-fetches when the session identity changes, not only when the URL does', a
   setSession({ user: 'dev', roles: ['data_owner', 'platform-admin'] })
   await waitFor(() => expect(api.verifyEligibility).toHaveBeenCalledTimes(2))
 })
+
+it("clears the previous identity's refusal when the re-fetch succeeds", async () => {
+  // The third defect live testing found: the re-fetch worked, but the banner from the FIRST
+  // identity stayed on screen — reading as a fresh verdict about a request that had just
+  // succeeded. A stale error is worse than no error.
+  const { setSession } = await import('../session')
+  vi.spyOn(api, 'getPublicationStatus').mockResolvedValue({
+    environment_id: 'hdfc-local', logical_group_name: 'customer_txn_features',
+    blocked: false, blocking_attempt_id: null, blocking_outcome: null, detail: 'nothing',
+  })
+  vi.spyOn(api, 'getArtifactCode').mockRejectedValue(
+    new api.ApiError(403, 'requires the platform-admin role'))
+  vi.spyOn(api, 'verifyEligibility').mockRejectedValue(
+    new api.ApiError(403, 'requires the platform-admin role'))
+
+  const { container } = render(<FeatureExecutionScreen {...PROPS} />)
+  // Two banners carry it: the eligibility error and the code-view error.
+  await waitFor(() => expect(container.querySelectorAll('.error')).toHaveLength(2))
+
+  // Same screen, better claims — and now both reads succeed.
+  vi.spyOn(api, 'verifyEligibility').mockResolvedValue({
+    action: 'verify', allowed: true, blockers: [] })
+  vi.spyOn(api, 'getArtifactCode').mockResolvedValue({
+    artifact_id: 'art-1', environment_id: 'hdfc-local',
+    logical_group_name: 'customer_txn_features', project_digest: 'sha256:project',
+    files: [], policy_realizations: [],
+  })
+  setSession({ user: 'dev', roles: ['data_owner', 'platform-admin'] })
+
+  await waitFor(() => expect(api.verifyEligibility).toHaveBeenCalledTimes(2))
+  await waitFor(() => expect(container.querySelectorAll('.error')).toHaveLength(0))
+})
+
 
 it('names the identity in the effect dependencies', () => {
   // Structural as well as behavioural: the behavioural test above passes if the component happens

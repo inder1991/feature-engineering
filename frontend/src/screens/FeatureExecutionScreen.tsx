@@ -98,6 +98,13 @@ export function FeatureExecutionScreen(props: Props) {
   // enabled, and what already happened.
   useEffect(() => {
     let live = true
+    // CLEAR THE PREVIOUS ANSWER BEFORE ASKING AGAIN. Without this, a refusal from the identity the
+    // screen FIRST loaded under outlives the re-fetch that succeeded: grant yourself the role and
+    // the code view correctly switches to its new answer while the banner above it still says
+    // "requires the platform-admin role". A stale error is worse than no error, because it reads as
+    // a fresh verdict about the request that just succeeded.
+    setActionError(null)
+    setCodeError(null)
     void (async () => {
       try {
         const answer = await verifyEligibility(artifactId, inventoryObservationId, environmentId)
