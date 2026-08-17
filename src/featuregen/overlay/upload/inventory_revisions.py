@@ -91,6 +91,11 @@ class BoundInputSetRevisionV2:
             raise ValueError(
                 f"a logical ref is bound twice ({sorted(refs)}): one ref resolves to one place, and "
                 f"two bindings make which one applies a tuple-order accident")
+        # Sorted, because `identity_payload` already sorts: two sets differing only in the order a
+        # caller listed them ARE one bound set, and leaving the tuple unsorted would make them
+        # compare unequal while hashing the same — the worst of both.
+        object.__setattr__(
+            self, "inputs", tuple(sorted(self.inputs, key=lambda b: b.logical_ref)))
 
     @property
     def datasets(self) -> tuple[str, ...]:
