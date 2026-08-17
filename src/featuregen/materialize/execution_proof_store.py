@@ -38,6 +38,7 @@ __all__ = [
     "CapabilityV1",
     "MutationOutcomeV1",
     "ProofIncomplete",
+    "advertised_operators",
     "capability_of",
     "proof_for_bytes",
     "record_execution_proof",
@@ -230,6 +231,24 @@ def set_execution_proof(
             f"no capability row for ({engine_id!r}, {operator_kind!r}): a proof attached to an "
             f"operator with no dispatch record would claim an operator is proved for a renderer "
             f"that may not be able to emit it at all")
+
+
+def advertised_operators(conn: DbConn, *, engine_id: str) -> tuple[str, ...]:
+    """The operators this engine ADVERTISES — ``renderer-dispatchable ∩ execution-proved`` (S13).
+
+    The intersection, computed in ONE place, because that is what "supported" means (invariant 11)
+    and three surfaces computing it three ways is how one of them starts advertising an operator on
+    half the evidence. An operator with no capability row is absent, never assumed: this build has
+    not established either fact about it.
+
+    Deliberately NOT the union and not the dispatchable set. A renderer branch with no proof is a
+    branch nobody has run against reviewed gold; a proof for an operator this build cannot emit is a
+    proof about a different build. Advertising either would be advertising half a claim.
+    """
+    return tuple(row[0] for row in conn.execute(
+        "SELECT operator_kind FROM engine_operator_capability "
+        "WHERE engine_id = %s AND renderer_dispatchable AND execution_proof_hash IS NOT NULL "
+        "ORDER BY operator_kind", (engine_id,)).fetchall())
 
 
 def capability_of(

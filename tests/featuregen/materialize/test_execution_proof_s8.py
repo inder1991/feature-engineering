@@ -30,6 +30,7 @@ from featuregen.materialize.execution_proof_store import (
     PILOT_MUTATIONS,
     MutationOutcomeV1,
     ProofIncomplete,
+    advertised_operators,
     capability_of,
     proof_for_bytes,
     record_execution_proof,
@@ -366,3 +367,38 @@ def test_the_unresolved_reference_report_NAMES_the_family(db):
     assert len(reported) == 1
     for part in (DIR_REF, "direction", "public.transactions"):
         assert part in reported[0], part
+
+
+# ══ S13's second clause — the ADVERTISED SET is the INTERSECTION ════════════════════════════════
+def test_THE_ADVERTISED_SET_IS_DISPATCHABLE_INTERSECT_PROVED(db):
+    """Not the union, and not the dispatchable set. A renderer branch with no proof is a branch
+    nobody has run against reviewed gold; a proof for an operator this build cannot emit is a proof
+    about a different build. Advertising either would be advertising half a claim."""
+    _dispatch_all(db, except_kind="quote_inversion")
+    proof_hash = record_execution_proof(db, _proof(), _all_caught())
+
+    # proved AND dispatchable
+    set_execution_proof(db, engine_id=ENGINE, operator_kind="aggregate", proof_hash=proof_hash)
+    # proved but NOT dispatchable
+    set_execution_proof(db, engine_id=ENGINE, operator_kind="quote_inversion",
+                        proof_hash=proof_hash)
+    # dispatchable but NOT proved: every other kind, left alone
+
+    assert advertised_operators(db, engine_id=ENGINE) == ("aggregate",)
+
+
+def test_an_UNRECORDED_operator_is_not_advertised(db):
+    """Absent, never assumed: this build has established neither fact about it."""
+    assert advertised_operators(db, engine_id=ENGINE) == ()
+    assert advertised_operators(db, engine_id="an-engine-nobody-built") == ()
+
+
+def test_the_advertised_set_is_computed_in_ONE_place():
+    """Three surfaces computing the intersection three ways is how one of them starts advertising
+    an operator on half the evidence."""
+    import inspect
+
+    from featuregen.materialize import execution_proof_store
+
+    source = inspect.getsource(execution_proof_store)
+    assert source.count("renderer_dispatchable AND execution_proof_hash IS NOT NULL") == 1

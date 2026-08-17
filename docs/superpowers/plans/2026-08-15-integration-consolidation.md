@@ -825,14 +825,86 @@ workspace**.
 > enumeration test over the route table — plus a UI test that the buttons are the only client-side
 > callers; results sit above intake.
 
+**NOT BUILT — and it is the only stage of S1–S13 whose backend is complete and whose surface is
+absent.** Everything S11's endpoints would call now exists and is gate-green: `evaluate_generate`
+(S8), the sealed-artifact serve path (S7), `verification_store` (S9), `publication_attempt_store`
+(S10), and `advertised_operators` (S13's second clause). What is missing is the surface itself — an
+explicit generate endpoint, the code-view API, verify request/results, publish, and the
+goal/target/stage/output header — plus the React workspace they live in.
+
+**Why it stopped here rather than being half-built.** S11 is the FIRST user-reachable generation
+(§3's sequencing says so), and its acceptance is deliberately a set of NEGATIVE claims: the handlers
+appear in no relay route map and no timer, and the only callers of `evaluate_verify` /
+`evaluate_publish_sandbox` are their two request endpoints. Those are enumeration tests over a route
+table that does not exist yet, so they cannot be written before the routes — and writing the routes
+first would mean choosing the user-facing shape of generation, verification and publication without
+the product owner. The two evaluator Protocols S11 implements (`VerifyEvaluator`,
+`PublishSandboxEvaluator`) are still Protocols for the same reason C-D9 gave: *"a stub that returned
+a verdict would be an evaluator nobody wrote"*.
+
+**What an implementer needs, so nothing has to be re-derived:** the route table is
+`api/app.py:210-263` (34 `include_router` calls, no timer and no relay in the module — checked); the
+generate verdict is `materialize/evaluate_generate.evaluate_generate`; serving bytes is
+`materialize/seal_v2.serve_artifact` (refuses a non-servable artifact BEFORE fetching, so a code view
+cannot show an artifact the graph check refused); the verify request is
+`overlay/upload/verification_store.record_verification_attempt` (takes no capability, by design) and
+its label is `label_for` (three-way, "unverifiable" for the undecidable case); publish is
+`materialize/publication_attempt_store.record_publication_attempt`, which refuses while an
+unreconciled attempt is outstanding and needs a capability attestation. Policy provenance for the
+`LLM_PROPOSED` display comes from `formula/policy_store.resolve_policy_occurrence` →
+`revision.provenance`, with `claims_occurrence` distinguishing a purpose-built realization from a
+family-wide one.
+
 ### S12 — corpus generation *(generation only)*
 Under the target **mode** axis and a declared default `BuildDeclarationV1` set.
 > **Acceptance:** a coverage table with every refusal named; **the batch triggers no execution**.
+
+**DONE** — `materialize/corpus_generation.py`, `test_corpus_generation_s12.py` **15 passed**. No
+migration: S12 is generation only and stores nothing of its own.
+
+* **"Triggers no execution" is checked STRUCTURALLY**, because a runtime assertion can only prove
+  that ONE batch executed nothing and the claim is that no batch can. The module imports neither the
+  verification store nor the publication store nor `seal_v2`, asserted off its source; the writer
+  takes no capability and no staging root (asserted on its signature — the two arguments an
+  executing batch would need); and a behavioural test over a mixed corpus leaves all four execution
+  tables empty.
+* **Every refusal is NAMED, not counted.** The output is not "2 of 3 generated": `CorpusRowV1`
+  refuses at construction to be `generated=False` with no blockers — the one thing a coverage table
+  exists to say — and refuses to be generated WITH blockers, so its two columns cannot disagree.
+  `by_blocker` is built in one place so "why is coverage incomplete" is not computed three ways on
+  three surfaces, and `named_refusals` reads the prose from the evaluator's own disposition table so
+  a corpus report and the product surface explain a code the same way.
+* **Both execution-chain blockers appear** — `POLICY_REFERENCE_UNRESOLVABLE` and
+  `RENDERER_CANNOT_DISPATCH` — which are exactly the two the activation policy never sees, so the
+  table covers what generation can refuse for beyond candidate readiness.
+* **An unknown code STOPS the batch** rather than becoming a row: swallowing it would turn "a code
+  nobody decided about" into "this candidate was refused for reasons", the silent shrinking the
+  closed vocabulary exists to prevent.
+* **The target-mode axis is separable, not averaged.** An exploration build has no target to leak, so
+  its refusals are a different set of questions; `for_mode` keeps the two populations apart and the
+  environment rides on every row from the DECLARATION, so a row cannot claim one its build was not
+  declared for.
+* An EMPTY corpus is an empty table, not an error: a batch pointed at a filter that matched nothing
+  should say so.
 
 ### S13 — build free-form V2 authoring, then expand
 **There is no free-form V2 path in production — S13 BUILDS it**, then gates it live.
 > **Acceptance:** a free-form V2 run reaches admission through the **v2** tool seam; the advertised
 > set is `renderer-dispatchable ∩ execution-proved`.
+
+**SECOND CLAUSE DONE; FIRST NOT BUILT.** `execution_proof_store.advertised_operators` is the
+intersection, computed in ONE place (asserted: the predicate appears once in the module), because
+three surfaces computing it three ways is how one of them starts advertising an operator on half the
+evidence. Tested as an intersection rather than a union: proved-but-not-dispatchable and
+dispatchable-but-not-proved are both ABSENT from the advertised set, and an unrecorded operator is
+absent rather than assumed.
+
+**The free-form V2 authoring path is NOT built**, and it is the one place in S1–S13 where that is
+true. It is not a gap that can be closed by more of the same work: it needs an LLM authoring loop
+against the V3 tool seam, and the plan's own C-A2 note records why the adjacent halves were
+deliberately left out — *"pin with one producer and no consumer"*. S2 built the DETERMINISTIC
+producer; the free-form one is a separate charter with live LLM spend attached, and the worker still
+does not pass `reviewed_blueprint` (see S2's note), so the flip is an explicit operator decision.
 
 ## 2. Carried forward
 
