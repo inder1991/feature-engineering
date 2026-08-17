@@ -29,6 +29,7 @@ from featuregen.overlay.upload import semantic_eligibility_reasons as R
 
 __all__ = [
     "ACTIVATION_BLOCKER_DISPOSITIONS",
+    "EVALUATOR_ONLY_BLOCKERS",
     "BlockerDisposition",
     "EvaluatorAction",
     "EvaluatorVerdictV1",
@@ -68,6 +69,21 @@ ACTIVATION_BLOCKER_DISPOSITIONS: Mapping[str, tuple[BlockerDisposition, str]] = 
         BlockerDisposition.CARRIED,
         "Read scope. The caller may not read what the feature reads, and a governed formula does "
         "not grant permission it did not have"),
+    # ── CARRIED: the two EXECUTION-CHAIN facts (S4/S8) ───────────────────────────────────────────
+    # These two are gated by `evaluate_generate` and are NOT emitted by the activation policy —
+    # see `EVALUATOR_ONLY_BLOCKERS` below for why that is a property of what each layer can know,
+    # rather than a gap in either.
+    R.POLICY_REFERENCE_UNRESOLVABLE: (
+        BlockerDisposition.CARRIED,
+        "A governed policy the formula declares has no current realization, so the computation "
+        "cannot be EXECUTED at all: a policy is applied by reading its columns under a realization, "
+        "and there is none. Not a review preference — nothing about confirming a column's meaning "
+        "produces the missing realization"),
+    R.RENDERER_CANNOT_DISPATCH: (
+        BlockerDisposition.CARRIED,
+        "This build's renderer has no branch for an operator the graph contains, so generating "
+        "would emit a project that cannot run. Distinct from FORMULA_SCHEMA_UNSUPPORTED, which is "
+        "about the wire version rather than about what the renderer can emit"),
     R.EXECUTION_AUTHORITY_UNEVALUATED: (
         BlockerDisposition.CARRIED,
         "Read scope was never checked. Unevaluated is not permitted — an unasked question has no "
@@ -157,6 +173,23 @@ class EvaluatorVerdictV1:
                 f"blocker code(s) {unknown} have no disposition in this build. A code with no "
                 f"CARRIED/DROPPED decision is exactly what revision 17 shipped when it lost "
                 f"PERSONAL_DATA_POLICY_REQUIRED")
+
+
+#: The blockers `evaluate_generate` gates on that the ACTIVATION POLICY does not emit.
+#:
+#: Not a gap in either layer — a property of what each can know. The activation policy answers
+#: "is this CANDIDATE ready", from the catalog and the review state; whether a governed policy
+#: reference resolves and whether this build's renderer can emit an operator are facts about the
+#: EXECUTION CHAIN, discovered while compiling one. Asking the activation policy for them would
+#: mean compiling every candidate to answer a list query.
+#:
+#: Named as a constant so the exhaustiveness test can state the real rule — the table covers
+#: everything the activation policy emits PLUS exactly these — rather than being loosened to a
+#: superset check that would let a genuinely lost code back in.
+EVALUATOR_ONLY_BLOCKERS: frozenset[str] = frozenset({
+    R.POLICY_REFERENCE_UNRESOLVABLE,
+    R.RENDERER_CANNOT_DISPATCH,
+})
 
 
 def carried_blockers(codes: Mapping[str, Any] | tuple[str, ...]) -> tuple[str, ...]:

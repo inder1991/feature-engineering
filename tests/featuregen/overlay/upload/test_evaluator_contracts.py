@@ -16,6 +16,7 @@ import pytest
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.evaluator_contracts import (
     ACTIVATION_BLOCKER_DISPOSITIONS,
+    EVALUATOR_ONLY_BLOCKERS,
     BlockerDisposition,
     EvaluatorAction,
     EvaluatorVerdictV1,
@@ -38,11 +39,30 @@ def _codes_the_activation_policy_emits() -> set[str]:
 
 # ══ THE GATE — the table is complete over what the system emits ══════════════════════════════════
 def test_THE_TABLE_IS_COMPLETE_OVER_THE_CODES_THE_POLICY_EMITS():
-    """Sixteen, and every one accounted for."""
+    """Sixteen from the activation policy, plus exactly the two the EVALUATORS add — and no more.
+
+    Stated as an equality against a named set rather than loosened to "⊇ what the policy emits":
+    a superset check would let a genuinely lost code back in, which is the failure this test
+    exists to prevent. Adding an evaluator-only blocker therefore stays a deliberate act — the
+    constant has to be extended, and a reason written beside the disposition.
+    """
     emitted = _codes_the_activation_policy_emits()
     assert len(emitted) == 16, sorted(emitted)
-    assert emitted == set(ACTIVATION_BLOCKER_DISPOSITIONS), (
-        sorted(emitted ^ set(ACTIVATION_BLOCKER_DISPOSITIONS)))
+    assert emitted | EVALUATOR_ONLY_BLOCKERS == set(ACTIVATION_BLOCKER_DISPOSITIONS), (
+        sorted((emitted | EVALUATOR_ONLY_BLOCKERS) ^ set(ACTIVATION_BLOCKER_DISPOSITIONS)))
+    assert not emitted & EVALUATOR_ONLY_BLOCKERS, (
+        "an evaluator-only blocker is also emitted by the activation policy — it is not "
+        "evaluator-only, and the constant is now a lie about which layer answers it")
+
+
+def test_the_EVALUATOR_ONLY_blockers_are_EXECUTION_CHAIN_facts():
+    """Both are discovered while compiling, not while listing candidates. Asking the activation
+    policy for them would mean compiling every candidate to answer a list query."""
+    assert EVALUATOR_ONLY_BLOCKERS == {R.POLICY_REFERENCE_UNRESOLVABLE, R.RENDERER_CANNOT_DISPATCH}
+    for code in EVALUATOR_ONLY_BLOCKERS:
+        disposition, reason = ACTIVATION_BLOCKER_DISPOSITIONS[code]
+        assert disposition is BlockerDisposition.CARRIED, code
+        assert len(reason) > 40, code
 
 
 def test_PERSONAL_DATA_POLICY_REQUIRED_IS_CARRIED():

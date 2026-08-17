@@ -687,12 +687,82 @@ duplicate-rate-gate deletion. **Generation is authorized here; it has no user su
 > **Acceptance:** every case and mutation behaves; changed bytes invalidate a proof without a version
 > bump; capability is `renderer-dispatchable ∧ execution-proved`.
 
+**DONE** — `materialize/execution_proof_store.py` + `materialize/evaluate_generate.py` + migration
+`1079` (file only), `test_execution_proof_s8.py` **41 passed**.
+
+* **The seven mutations are a VALUE, not a list in a document.** `PILOT_MUTATIONS` is what
+  `record_execution_proof` checks completeness against, and the refusals are parametrized over all
+  seven in both directions — a set with a hole is refused (a hole proves nothing about the behaviour
+  it covers) and a mutation the corpus MISSED is refused (each is a wrong *number* rather than an
+  error, so a corpus that misses one would let that exact defect ship). The undetected outcome is
+  recorded as real: the corpus is what needs fixing, not the report.
+* **Clause 2 is a MECHANISM, not a check.** `generated_project_hash` is inside the proof's own
+  content hash, so `proof_for_bytes` finds a proof BY the bytes it was taken over and different
+  bytes simply do not find one. Tested by holding every version constant and moving one byte: two
+  different proofs, nothing incremented, and nothing an author could have forgotten to increment.
+  The proof still carries **no S9 check-set field** — asserted by absence over its field names.
+* **Clause 3 keeps the two facts in two columns.** `renderer_dispatchable` is a property of THIS
+  BUILD; `execution_proof_hash` is a property of a RUN, and it is **nullable on purpose**: `NULL`
+  means nobody took a proof, which is different from a proof that ran and failed. Both directions
+  tested — dispatchable-without-proof and proved-but-not-dispatchable are each `supported=False` —
+  so the conjunction is a rule rather than an inability to tell them apart. An operator this build
+  never recorded returns `None`, never a default.
+* **`evaluate_generate` gates per OPERATOR, not per engine.** An engine with a branch for twelve of
+  thirteen operators supports twelve, and a feature using the thirteenth refuses. An UNRECORDED
+  operator counts as undispatchable — treating it as renderable is how a project that cannot run
+  gets generated.
+* **It does NOT require an execution proof**, and that is deliberate: requiring one at generate time
+  would make a never-executed operator ungenerable, which is how it would never get proved. The
+  proof is what S9's verification and S10's publication rest on.
+* **Two codes joined the closed vocabulary, and the exhaustiveness test was made HONEST rather than
+  loosened.** `POLICY_REFERENCE_UNRESOLVABLE` (S4) and `RENDERER_CANNOT_DISPATCH` (S8) are
+  execution-chain facts the activation policy does not and should not compute — asking it for them
+  would mean compiling every candidate to answer a list query. They are named in a new
+  `EVALUATOR_ONLY_BLOCKERS` constant, and the test now asserts
+  `emitted | EVALUATOR_ONLY_BLOCKERS == set(DISPOSITIONS)` **as an equality**: a superset check
+  would have let a genuinely lost code back in, which is the exact failure revision 17 shipped.
+  Adding an evaluator-only blocker stays a deliberate act.
+* Activation blockers are **carried, never recomputed** — a second opinion about "is this bound"
+  would be free to disagree with the readiness the UI shows — and an unknown code **stops** the
+  evaluation rather than shrinking the blocker list.
+
 ### S9 — on-demand sandbox verification *(1080)*
 > **Acceptance:** verification executes with **no publication capability present**; two attempts do
 > not share a staging path; **staleness is three-way [R19]** — a comparable `OBSERVED` input that
 > changed ⇒ **stale**, an identical observation ⇒ **current**, `UNPINNED` ⇒ **neither**, remaining
 > labelled unverifiable and never claimed current or stale on content; observation strength is never
 > `PINNED` without enforced reads.
+
+**DONE** — `overlay/upload/verification_store.py` + migration `1080` (file only),
+`test_verification_store_s9.py` **28 passed**.
+
+* **"No publication capability present" is enforced by ABSENCE, three ways.** The writer's signature
+  has no such parameter (asserted as an exact set), neither table has a column matching `publi`/
+  `capab` (asserted against `information_schema`), and the module's comment-stripped CODE never
+  mentions publication — checked on the code rather than the file, since the module explains at
+  length what it does not take and a whole-file grep would read that explanation as the thing it
+  disclaims. A field would eventually be read as "may publish", which is the exact attestation
+  verification is defined to run without.
+* **Two attempts do not share a path, at three layers.** `attempt` is part of the EXECUTION IDENTITY
+  (not merely of the path — two attempts that hashed the same would be one execution with two
+  outputs), the path is DERIVED from the identity rather than accepted, and the database holds a
+  unique index so a caller bypassing the writer still collides. A collision REFUSES rather than
+  overwrites: the first attempt's output may already be being read.
+* **The third staleness value is where the trap is.** A two-way answer forces `UNPINNED` into
+  "current" or "stale" and BOTH are lies — "current" claims a check nobody could run, "stale" claims
+  a change nobody observed. So `UNPINNED` returns `NEITHER` **even when policies have drifted**, and
+  the test asserts exactly that, with the discriminator beside it (the same drift, `OBSERVED`, is
+  stale). `label_for` puts "unverifiable" in one place so two surfaces cannot describe one output
+  differently. Drifted policies are NAMED, not counted: a currency conversion changing is a
+  different conversation from a status policy changing.
+* **`PINNED` without enforced reads is refused by name AND by CHECK** — one of the two being absent
+  is how the other gets removed. `OBSERVED` and `UNPINNED` deliberately do NOT require enforcement:
+  an observed run that did not enforce its reads is honest, and refusing it would push authors to
+  over-claim.
+* **Retention is the one field that moves**, reusing `runtime/blob_gc`'s
+  `live → marked_orphan → quarantined → swept` verbatim. The trigger permits an UPDATE that changes
+  only that column and refuses every other edit, so retention cannot become a route to restating
+  what was verified.
 
 ### S10 — exact-output CAS publication *(1081, 1083)*
 **Publication reselects the mechanism against the CURRENT environment and records the exact

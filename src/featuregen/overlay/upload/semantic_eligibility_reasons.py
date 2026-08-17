@@ -53,6 +53,11 @@ STATUS_POLICY_UNRESOLVED = "STATUS_POLICY_UNRESOLVED"
 # operator the blanket answer when a resolver exists and found nothing hides which of the two
 # remedies applies (build the resolver vs publish a realization).
 POLICY_REFERENCE_UNRESOLVABLE = "POLICY_REFERENCE_UNRESOLVABLE"
+# S8: this build's renderer has no branch for an operator the feature's graph contains. Not a
+# governance question and not a data question — the platform cannot emit it, and no decision or
+# observation changes that for this build. Kept apart from FORMULA_SCHEMA_UNSUPPORTED, which is
+# about the WIRE VERSION rather than about what the renderer can emit.
+RENDERER_CANNOT_DISPATCH = "RENDERER_CANNOT_DISPATCH"
 # ambiguity
 REQUIRED_OPERAND_AMBIGUOUS = "REQUIRED_OPERAND_AMBIGUOUS"
 SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
@@ -110,6 +115,7 @@ REASON_FAMILIES: dict[str, str] = {
     PERSONAL_DATA_POLICY_REQUIRED: "needs_setup",
     STATUS_POLICY_UNRESOLVED: "needs_setup",
     POLICY_REFERENCE_UNRESOLVABLE: "needs_setup",
+    RENDERER_CANNOT_DISPATCH: "structurally_unsuitable",
     SOURCE_SELECTION_AMBIGUOUS: "undecided",
     IDENTIFIER_UNIQUENESS: "needs_data_check",
     EVENT_HISTORY_VERIFICATION: "needs_data_check",
