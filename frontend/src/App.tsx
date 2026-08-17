@@ -1,10 +1,17 @@
 import type { ReactElement } from 'react'
-import { entityMapEnabled, gateConsoleEnabled, materializationRunsEnabled, useHashRoute } from './nav'
+import {
+  entityMapEnabled,
+  featureExecutionEnabled,
+  gateConsoleEnabled,
+  materializationRunsEnabled,
+  useHashRoute,
+} from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
 import { AssetDetailScreen } from './screens/AssetDetailScreen'
 import { EntityMapScreen } from './screens/EntityMapScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
+import { FeatureExecutionScreen } from './screens/FeatureExecutionScreen'
 import { MaterializationRunScreen } from './screens/MaterializationRunScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
@@ -493,6 +500,24 @@ export default function App() {
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
         {route === 'materialization' && materializationRunsEnabled() && (
           <MaterializationRunScreen requestId={params.get('request_id') ?? ''} />
+        )}
+        {/* S11's execution workspace. A detail sheet reached with an artifact id, exactly as the
+            materialization sheet is reached with a request id — every field it needs identifies
+            WHICH artifact and WHICH environment, and none of them has a defensible default: a
+            missing artifact id must render an empty workspace that says so, not one silently
+            pointed at something else. */}
+        {route === 'feature-execution' && featureExecutionEnabled() && (
+          <FeatureExecutionScreen
+            artifactId={params.get('artifact_id') ?? ''}
+            environmentId={params.get('environment_id') ?? ''}
+            logicalGroupName={params.get('group') ?? ''}
+            inventoryObservationId={params.get('observation_id') ?? ''}
+            generationAuthorizationRevisionId={params.get('authorization_id') ?? ''}
+            checkSetHash={params.get('check_set_hash') ?? ''}
+            goal={params.get('goal') ?? ''}
+            targetMode={params.get('target_mode') ?? 'prediction'}
+            targetRef={params.get('target_ref')}
+          />
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}
         {route === 'workbench' && <WorkbenchScreen />}

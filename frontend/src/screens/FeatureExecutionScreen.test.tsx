@@ -211,3 +211,33 @@ it('shows policy provenance for the governed realizations that produced the numb
   expect(screen.getByText('rev-fx')).toBeTruthy()
   expect(screen.getByText('occ-fx')).toBeTruthy()
 })
+
+
+// ══ REACHABILITY — the gap this file did not close the first time ══════════════════════════════
+// Written after a deploy showed the screen's strings were ABSENT from the built bundle: the route
+// and its icon existed, `nav.ts` parsed the hash, every test above passed — and `App.tsx` never
+// rendered the component, so the whole screen was dead code. A component test cannot see that; only
+// a test that looks at the thing doing the routing can.
+describe('the screen is reachable from the app', () => {
+  const APP = readFileSync(join(SRC, 'App.tsx'), 'utf8')
+
+  it('App.tsx imports and renders FeatureExecutionScreen', () => {
+    expect(APP).toMatch(/import\s*\{\s*FeatureExecutionScreen\s*\}/)
+    expect(APP).toMatch(/<FeatureExecutionScreen/)
+  })
+
+  it('renders it behind its own flag, like every other detail sheet', () => {
+    expect(APP).toMatch(/route === 'feature-execution' && featureExecutionEnabled\(\)/)
+  })
+
+  it.each([
+    ['materialization', 'MaterializationRunScreen'],
+    ['feature-execution', 'FeatureExecutionScreen'],
+  ])('every flagged route in nav.ts has a renderer: %s', (route, component) => {
+    // Generalised deliberately: the defect was a route that parsed and rendered nothing, and
+    // pinning only the new one would leave the next addition free to repeat it.
+    const NAV = readFileSync(join(SRC, 'nav.ts'), 'utf8')
+    expect(NAV).toContain(`'${route}'`)
+    expect(APP).toContain(`<${component}`)
+  })
+})
