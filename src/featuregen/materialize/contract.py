@@ -613,7 +613,7 @@ def derive_contract(
     if isinstance(classification, MaterializationRefused):
         return classification
 
-    sensitivity_class, access_requirements = _tighten(classification, overrides)
+    sensitivity_class, access_requirements = tighten_classification(classification, overrides)
     if sensitivity_class == _REFUSING_RESTRICTION:
         return MaterializationRefused(
             CompilationRefusalCode.PROHIBITED_INPUT,
@@ -648,10 +648,13 @@ def derive_contract(
         physical_type_policy_version=PHYSICAL_TYPE_POLICY_VERSION)
 
 
-def _tighten(
+def tighten_classification(
     classification: Classification, overrides: ContractOverrides | None
 ) -> tuple[str, tuple[str, ...]]:
     """Apply a declared override MONOTONICALLY, or raise (§5.4).
+
+    Public because the V2 contract derivation (S6) applies the SAME rule, and a second copy of a
+    monotonicity check is a second chance to get "tightened but never relaxed" subtly wrong.
 
     The raise-only rule is the shipped one: ``apply_sensitivity_floor`` returns the maximum of the
     derived class and the declared one, so an override that comes back as something other than

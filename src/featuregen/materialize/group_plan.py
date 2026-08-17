@@ -61,6 +61,7 @@ __all__ = [
     "StagingStatus",
     "build_group_plan",
     "check_completeness",
+    "key_columns_from_refs",
     "expected_schema",
     "expected_schema_hash",
     "group_plan_hash",
@@ -248,15 +249,19 @@ class GateFailure:
 # ── building the plan ────────────────────────────────────────────────────────────────────────────
 
 
-def _key_columns(group: ContractGroup) -> tuple[str, ...]:
-    """The landing key's COLUMN names, from the contract's ordered key refs.
+def key_columns_from_refs(ordered_keys: Sequence[str]) -> tuple[str, ...]:
+    """The landing key's COLUMN names, from a contract's ordered key refs.
 
     The refs are the spine's (``hdfc::public.customers.cif_id``); the published table holds columns.
     They are normalized through the one Hive normalizer, so a catalog column that cannot be a Hive
     identifier is a plan error rather than a table that cannot be created.
+
+    Takes the REFS rather than a contract so S6's V2 plan uses this normalizer instead of a second
+    one — two spellings of "the published row is keyed by columns" is how a V2 group ends up keyed
+    differently from the V1 group beside it.
     """
     columns: list[str] = []
-    for ref in group.contract.ordered_keys:
+    for ref in ordered_keys:
         try:
             _source, _schema, _table, column = parse_ref(ref)
         except ValueError as exc:
@@ -326,7 +331,7 @@ def build_group_plan(
             f"with no planned column publishes nothing, and a planned column with no member is a "
             f"column no materialization contract covers")
 
-    keys = _key_columns(group)
+    keys = key_columns_from_refs(group.contract.ordered_keys)
     business_dt = hive_identifier(group.contract.pit_semantics.business_dt_column)
     _reject_collisions([
         *[(key, ColumnRole.ENTITY_KEY) for key in keys],

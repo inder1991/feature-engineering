@@ -113,12 +113,16 @@ __all__ = [
     "FormulaExecutionIRV1",
     "ReadElementKind",
     "authorize_compilation",
+    "authorized_refs_of",
     "authorize_execution_realizations",
     "bridge_realization_dependencies",
     "compile_ir",
     "crosswalk_execution_pins",
+    "decide_read_scope",
     "ir_hash",
     "physical_read_set",
+    "physical_read_set_of",
+    "union_read_elements",
 ]
 
 
@@ -137,6 +141,12 @@ class ReadElementKind(StrEnum):
     SPINE_SOURCE = "spine_source"         # the population's own table
     SPINE_KEY = "spine_key"               # an ordered key of the population
     SPINE_READ = "spine_read"             # any other column the spine itself reads
+    # S6/C-C4: a column read because a GOVERNED POLICY is applied — a status flag, a direction
+    # indicator, an FX rate. Never produced by a V1 group (V1 has no policy reads), and named
+    # separately from `expression_read` because the remedy differs: an operator told only "you may
+    # not read this column" cannot tell whether to change the formula or to grant access to a rate
+    # table the formula never mentions.
+    POLICY_READ = "policy_read"
 
 
 @dataclass(frozen=True, slots=True)
@@ -747,7 +757,9 @@ def _union_of(irs: Sequence[FormulaExecutionIRV1], spine: SpineSpec) -> tuple[_R
 
 
 def _union_elements(
-    features: Sequence[tuple[str, Sequence[ExpressionExecutionIR]]], spine: SpineSpec,
+    features: Sequence[tuple[str, Sequence[ExpressionExecutionIR]]],
+    spine: SpineSpec,
+    policy_reads: Sequence[str] = (),
 ) -> tuple[_ReadElement, ...]:
     """The same union over ``(feature_name, expressions)`` pairs — the LANGUAGE-NEUTRAL core.
 
@@ -757,8 +769,16 @@ def _union_elements(
     sensitivity class gets computed from — does not stop being true because the second deriver is a
     different formula version. Nothing here names a formula version; it sees only
     :class:`ExpressionExecutionIR`, which both boundaries reuse verbatim.
+
+    ``policy_reads`` are the logical refs a GOVERNED POLICY reads (C-C4). V1 passes none and cannot:
+    a V1 formula declares no policies, so the default is a fact about V1 rather than a convenience.
+    They fold into the SAME union as everything else, which is the whole point — a policy column
+    kept beside the read set would be read at run time and absent from Gate 2's decision and from
+    §5.2's sensitivity classification.
     """
     union = _Union()
+    for logical_ref in policy_reads:
+        union.add(logical_ref, ReadElementKind.POLICY_READ)
     for feature_name, expressions in features:
         for expression in expressions:
             for ref in expression.physical_read_set:
@@ -854,6 +874,75 @@ def physical_read_set_of(
     same read set by construction rather than by two implementations agreeing.
     """
     return _sorted_refs(_union_elements(features, spine))
+
+
+def union_read_elements(
+    features: Sequence[tuple[str, Sequence[ExpressionExecutionIR]]],
+    spine: SpineSpec,
+    *,
+    policy_reads: Sequence[str] = (),
+) -> tuple[_ReadElement, ...]:
+    """The group's read ELEMENTS — refs with the reasons they are read (S6).
+
+    Public because :func:`decide_read_scope` needs elements rather than refs: a refusal has to say
+    WHY a column is in the union, and the kind is the difference between "change the formula" and
+    "grant access to a rate table the formula never mentions". The elements themselves are opaque to
+    callers — they exist to be handed straight back.
+    """
+    return _union_elements(features, spine, policy_reads)
+
+
+def decide_read_scope(
+    conn: DbConn,
+    elements: Sequence[_ReadElement],
+    *,
+    roles: Sequence[str],
+    feature_count: int,
+) -> MaterializationRefused | None:
+    """Gate 2's VERDICT over an already-derived union: a refusal, or ``None`` for authorized.
+
+    Extracted from :func:`authorize_compilation` so V1 and the V2 boundary decide read scope with
+    ONE implementation. The order is the governed one and is not a detail: existence first, because
+    no grantable role can make an undescribed column readable, so a scope refusal would send the
+    operator after a privilege that cannot help. Both refusals are group-wide — a group is published
+    as one row per key, so one unreadable element refuses the whole compilation rather than dropping
+    a feature.
+
+    The messages are the SHIPPED ones, byte for byte. V1 delegates here rather than keeping a copy,
+    which is what makes "V1 bytes unchanged" a consequence of the structure instead of a promise.
+    """
+    roles_used = tuple(roles)
+    hidden, missing = _hidden(conn, elements, roles_used)
+    if missing:
+        described = ", ".join(
+            f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"
+            for element in missing)
+        return _refuse(
+            CompilationRefusalCode.COLUMN_NOT_GOVERNED,
+            f"the governed catalog does not describe {len(missing)} of {len(elements)} elements "
+            f"of the group's complete physical read set across {feature_count} feature(s): "
+            f"{described}. §11's L1 would report each of them as COLUMN_ABSENT against the live "
+            f"metastore, but L1 sits on no production path, so compile refuses rather than emit a "
+            f"read nobody governs. Existence is decided before read scope: no grantable role can "
+            f"make an undescribed column readable, so when a group carries both an undescribed "
+            f"ref and a hidden one, this refusal wins")
+    if hidden:
+        described = ", ".join(
+            f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"
+            for element in hidden)
+        return _refuse(
+            CompilationRefusalCode.READ_SCOPE_INSUFFICIENT,
+            f"the supplied read scope hides {len(hidden)} of {len(elements)} elements of the "
+            f"group's complete physical read set across {feature_count} feature(s): {described}. "
+            f"Gate 2 is group-wide: a group is published as one row per key, so one unreadable "
+            f"element refuses the whole compilation rather than dropping a feature — there is no "
+            f"partial authorization and no per-feature bypass")
+    return None
+
+
+def authorized_refs_of(elements: Sequence[_ReadElement]) -> tuple[str, ...]:
+    """The union's logical refs, sorted and de-duplicated — what a token authorizes."""
+    return _sorted_refs(elements)
 
 
 def _hidden(
@@ -974,31 +1063,11 @@ def authorize_compilation(
 
     roles_used = tuple(roles)
     elements = _union_of(group, spine)
-    hidden, missing = _hidden(conn, elements, roles_used)
-    if missing:
-        described = ", ".join(
-            f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"
-            for element in missing)
-        return _refuse(
-            CompilationRefusalCode.COLUMN_NOT_GOVERNED,
-            f"the governed catalog does not describe {len(missing)} of {len(elements)} elements "
-            f"of the group's complete physical read set across {len(group)} feature(s): "
-            f"{described}. §11's L1 would report each of them as COLUMN_ABSENT against the live "
-            f"metastore, but L1 sits on no production path, so compile refuses rather than emit a "
-            f"read nobody governs. Existence is decided before read scope: no grantable role can "
-            f"make an undescribed column readable, so when a group carries both an undescribed "
-            f"ref and a hidden one, this refusal wins")
-    if hidden:
-        described = ", ".join(
-            f"{element.logical_ref} ({'+'.join(kind.value for kind in element.kinds)})"
-            for element in hidden)
-        return _refuse(
-            CompilationRefusalCode.READ_SCOPE_INSUFFICIENT,
-            f"the supplied read scope hides {len(hidden)} of {len(elements)} elements of the "
-            f"group's complete physical read set across {len(group)} feature(s): {described}. "
-            f"Gate 2 is group-wide: a group is published as one row per key, so one unreadable "
-            f"element refuses the whole compilation rather than dropping a feature — there is no "
-            f"partial authorization and no per-feature bypass")
+    # The verdict is DELEGATED, not repeated: `decide_read_scope` is the one implementation the V2
+    # boundary uses too, so the two gates cannot drift into two orderings or two messages.
+    refusal = decide_read_scope(conn, elements, roles=roles_used, feature_count=len(group))
+    if refusal is not None:
+        return refusal
 
     return AuthorizedCompilation(
         irs=group, spine=spine, authorized_refs=_sorted_refs(elements), roles_used=roles_used)
