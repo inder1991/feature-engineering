@@ -48,6 +48,11 @@ JOIN_PATH_DENIED = "JOIN_PATH_DENIED"
 PERSONAL_DATA_POLICY_REQUIRED = "PERSONAL_DATA_POLICY_REQUIRED"
 PROTECTED_CHARACTERISTIC_BLOCKED = "PROTECTED_CHARACTERISTIC_BLOCKED"
 STATUS_POLICY_UNRESOLVED = "STATUS_POLICY_UNRESOLVED"
+# S4: the resolver RAN and nothing is current for the family this reference falls in. Distinct from
+# STATUS_POLICY_UNRESOLVED, which is the blanket "no resolver serves this kind at all" — telling an
+# operator the blanket answer when a resolver exists and found nothing hides which of the two
+# remedies applies (build the resolver vs publish a realization).
+POLICY_REFERENCE_UNRESOLVABLE = "POLICY_REFERENCE_UNRESOLVABLE"
 # ambiguity
 REQUIRED_OPERAND_AMBIGUOUS = "REQUIRED_OPERAND_AMBIGUOUS"
 SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
@@ -104,6 +109,7 @@ REASON_FAMILIES: dict[str, str] = {
     JOIN_PATH_DENIED: "structurally_unsuitable",
     PERSONAL_DATA_POLICY_REQUIRED: "needs_setup",
     STATUS_POLICY_UNRESOLVED: "needs_setup",
+    POLICY_REFERENCE_UNRESOLVABLE: "needs_setup",
     SOURCE_SELECTION_AMBIGUOUS: "undecided",
     IDENTIFIER_UNIQUENESS: "needs_data_check",
     EVENT_HISTORY_VERIFICATION: "needs_data_check",
@@ -137,7 +143,10 @@ REASON_PRECEDENCE: tuple[str, ...] = (
     SEMANTIC_AUTHORITY_INSUFFICIENT, PROPOSED_METADATA_ONLY,
     REQUIRED_OPERAND_AMBIGUOUS, SOURCE_SELECTION_AMBIGUOUS,
     POPULATION_DATASET_UNDECLARED, RELATIONSHIP_REQUIRED, DIRECTIONAL_CARDINALITY_UNPROVEN,
-    CURRENCY_POLICY_MISSING, STATUS_POLICY_UNRESOLVED,
+    CURRENCY_POLICY_MISSING,
+    # The specific answer before the blanket one: "the resolver found nothing for this family" is
+    # what an operator can act on, and it would be buried under "no resolver serves this kind".
+    POLICY_REFERENCE_UNRESOLVABLE, STATUS_POLICY_UNRESOLVED,
     EVENT_TIME_REQUIRED, AS_OF_TIME_REQUIRED, KNOWLEDGE_TIME_REQUIRED,
     TEMPORAL_POLICY_UNRESOLVED, PERSONAL_DATA_POLICY_REQUIRED,
     IDENTIFIER_UNIQUENESS, EVENT_HISTORY_VERIFICATION,
