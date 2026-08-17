@@ -258,7 +258,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # Imported HERE rather than added to the module-level `from featuregen.api.routes import (...)`
     # block: that block is being edited by a concurrent session, and this task is additive-only in
     # this file. `create_app` already uses local imports for the same reason elsewhere.
-    from featuregen.api.routes import feature_execution, materialization_runs
+    from featuregen.api.routes import feature_execution, formula_drafts, materialization_runs
 
     app.include_router(materialization_runs.router)
     # S11 — the user-reachable generate / code-view / verify / publish surface. Behind the SAME
@@ -266,6 +266,11 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # worker never runs. Registered here, next to the lane it belongs to, rather than in the
     # module-level import block that a concurrent session is editing.
     app.include_router(feature_execution.router)
+    # Draft formula (async). NOT behind the materialization switch: drafting a formula for
+    # inspection runs no cluster job and publishes nothing, so gating it on the materialization
+    # flag would tie "may I look at a formula" to "does this deployment materialize" — two
+    # unrelated questions. Its own cost control is the formula-identity idempotency.
+    app.include_router(formula_drafts.router)
 
     @app.get("/health")
     def health() -> dict:

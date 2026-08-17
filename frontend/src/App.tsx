@@ -221,7 +221,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'workbench',
-    label: 'Generate features',
+    label: 'Discover candidates',
     eyebrow: 'CATALOG · GENERATE',
     title: 'Feature generation',
     description:

@@ -1871,7 +1871,7 @@ describe('per-candidate feedback', () => {
     await renderAndGenerate([IDEA])
     await selectCandidate('avg_balance')
     // Fresh, the candidate is governable.
-    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Select and draft 1' })).toBeInTheDocument()
     // Approve a revision: approveRevision mutates the idea IN PLACE, so it no longer matches the
     // considered-set snapshot the server reconstructs the choice from. Governing it would 422 (name
     // changed) or silently mint pre-refine data (name kept) — bug_001. It must drop out of Govern.
@@ -1915,7 +1915,7 @@ describe('govern', () => {
     await screen.findByText('avg_balance')
     await selectCandidate('avg_balance')
     // Govern is offered because a governing intent exists and the pick is generated.
-    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Select and draft 1' }))
     expect(screen.getByText(
       'Governing runs the safety gauntlet and mints a signed contract per feature — a design '
       + 'check, not a proof it predicts well.',
@@ -1945,7 +1945,7 @@ describe('govern', () => {
     await renderAndGenerate([IDEA, OTHER_IDEA])
     await selectCandidate('avg_balance')
     // Before feedback: the governing intent from generate makes Govern available.
-    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Select and draft 1' })).toBeInTheDocument()
     // Feedback routes through considered-set and mints a FRESH intent ('int_1') over the guided set.
     contractConsideredSet.mockResolvedValueOnce(
       considered(singleSetRound([idea('inactivity_days')])))
@@ -1968,7 +1968,7 @@ describe('govern', () => {
     // the fresh one is governable (the kept one is not), so the button reads Govern 1.
     await selectCandidate('inactivity_days')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Select and draft 1' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
     expect(await screen.findByText(GOVERNED_MARK)).toBeInTheDocument()
     expect(screen.getByText('contract_2')).toBeInTheDocument()
@@ -1989,7 +1989,7 @@ describe('govern', () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     await selectCandidate('avg_balance')
-    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Select and draft 1' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
     // The failure surfaces on the candidate row; it is never marked governed and stays selectable.
     expect(
@@ -1998,7 +1998,7 @@ describe('govern', () => {
     expect(screen.queryByText(GOVERNED_MARK)).not.toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
     // The failed candidate stays selected, so Govern is offered again for a retry.
-    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Select and draft 1' })).toBeInTheDocument()
   })
 })
 
@@ -3442,7 +3442,7 @@ describe('Slice 2: the decision workspace', () => {
     // Governability is the SERVER's verdict, reported.
     expect(within(rail()).getByText('It can also be governed into a signed contract.'))
       .toBeInTheDocument()
-    expect(within(rail()).getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    expect(within(rail()).getByRole('button', { name: 'Select and draft 1' })).toBeInTheDocument()
 
     // Picking across sets names the mix, so the tray says where the picks came from.
     await userEvent.click(screen.getByRole('button', { name: /Ratio set/ }))
@@ -3480,7 +3480,7 @@ describe('Slice 2: the decision workspace', () => {
     expect(within(rail()).getByText(
       /1 of 2 can also be governed into signed contracts; the rest came from an earlier round/,
     )).toBeInTheDocument()
-    expect(within(rail()).getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    expect(within(rail()).getByRole('button', { name: 'Select and draft 1' })).toBeInTheDocument()
   })
 
   it('searches WITHIN the active set only, and leaves the sets and their counts alone', async () => {

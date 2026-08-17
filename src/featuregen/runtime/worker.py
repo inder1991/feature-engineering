@@ -36,6 +36,7 @@ from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
+from featuregen.overlay.upload.formula_draft_worker import process_formula_draft_once
 from featuregen.overlay.upload.ingestion_run import reconcile_ingestion_runs
 from featuregen.overlay.upload.recipe_formula_shadow import (
     RECIPE_FORMULA_SHADOW_HANDLER,
@@ -128,6 +129,8 @@ class WorkerTick:
     errors: int
     external_dispatched: int = 0
     formula_processed: int = 0
+    #: How many per-candidate "Draft formula" jobs this tick drove to a terminal state.
+    formula_drafts_processed: int = 0
     materialization_processed: int = 0
     #: Phase G §3.3 — how many stranded materialization requests this tick gave a terminal verdict.
     #: Candidates LEFT ALONE (a deliverable message, a live claim, a class with no legal terminal)
@@ -455,6 +458,21 @@ def run_worker_once(
 
     formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
+    def _drain_formula_drafts() -> int:
+        # ONE draft per tick, deliberately NOT `batch`. A tick is documented as one bounded
+        # non-blocking pass, and a draft is two provider calls in series; draining a backlog of them
+        # inside one tick would hold the timers, the relay, the projections and every poller for the
+        # sum of them. A queued backlog still drains — one per tick, on ticks a second apart — which
+        # costs nothing next to a draft's own duration.
+        #
+        # NO KILL SWITCH of its own, unlike the materialization lane below. A draft is queued only
+        # by an explicit per-candidate user action; there is no background producer that could fill
+        # this lane, so an idle deployment claims nothing and the stage costs one query per tick.
+        outcome = process_formula_draft_once(conn, owner=f"{owner}:draft")
+        return 0 if outcome.status == "idle" else 1
+
+    formula_drafts_processed = _stage("formula_draft")(_drain_formula_drafts, 0)
+
     def _drain_materialization() -> int:
         # THE KILL SWITCH (T9), read from the environment EVERY tick and BEFORE the claim. Nothing
         # caches it, so the first tick after this process's environment says otherwise obeys — and
@@ -608,6 +626,7 @@ def run_worker_once(
         errors=errors,
         external_dispatched=external_dispatched,
         formula_processed=formula_processed,
+        formula_drafts_processed=formula_drafts_processed,
         materialization_processed=materialization_processed,
         materialization_reconciled=materialization_reconciled,
     )

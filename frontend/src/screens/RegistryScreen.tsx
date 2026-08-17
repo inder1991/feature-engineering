@@ -51,7 +51,7 @@ function RegistryList({ navigate }: { navigate: Nav }) {
     return (
       <div className="empty" role="status">
         <p>No features registered yet.</p>
-        <p className="next">Generate features in the workbench, then confirm them into the registry.</p>
+        <p className="next">Discover candidates in the workbench, then confirm them into the registry.</p>
       </div>
     )
   return (

@@ -33,7 +33,7 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   // verification, publish. Behind the SAME server switch as /materialization-runs, and listed here
   // for the same reason — a missing prefix answers a POST with 405 from the SPA rather than a 404
   // anyone would recognise as routing.
-  '/feature-execution']
+  '/feature-execution', '/considered-revisions', '/formula-drafts']
 
 export default defineConfig({
   plugins: [react()],

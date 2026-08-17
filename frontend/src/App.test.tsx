@@ -54,7 +54,7 @@ describe('app shell', () => {
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
-      'Generate features',
+      'Discover candidates',
       'Ask a question',
       'Registry',
       'Search',
@@ -69,14 +69,14 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'The loop' })).toBeInTheDocument()
     expect(
-      screen.getByText(/once data is in, generate features is where the engine works for you/i),
+      screen.getByText(/once data is in, discover candidates is where the engine works for you/i),
     ).toBeInTheDocument()
   })
 
   it('nav click navigates and updates location.hash', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Generate features' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Discover candidates' }))
     expect(window.location.hash).toBe('#/workbench')
     expect(
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),
@@ -177,9 +177,9 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Review queue' })).toBeInTheDocument()
   })
 
-  it('overview loop Generate features link navigates to the workbench route', async () => {
+  it('overview loop Discover candidates link navigates to the workbench route', async () => {
     render(<App />)
-    await userEvent.click(screen.getByRole('link', { name: 'Generate features' }))
+    await userEvent.click(screen.getByRole('link', { name: 'Discover candidates' }))
     expect(window.location.hash).toBe('#/workbench')
     expect(
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),

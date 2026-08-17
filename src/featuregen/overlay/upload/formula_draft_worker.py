@@ -1,0 +1,547 @@
+"""The "Draft formula" lane: author ONE candidate's formula, then decide whether it may be used.
+
+**Nothing here holds a transaction across a model.** That is the whole reason this lane exists
+rather than the request thread or the general ``process_one`` consumer, both of which would. Every
+stage below commits before the next begins, so a crash leaves the row saying exactly how far it got
+and a client disconnect orphans nothing.
+
+**The stages are OBSERVED, not narrated.** ``formula_authoring_trace_event.kind`` is a closed
+four-word vocabulary written by the orchestrator as it goes (``author_turn``, ``critic_result``,
+``validation_result``, then a terminal), and :func:`_observed_state` maps it onto the draft's state
+machine. The alternative — moving the state to ``CRITIC_REVIEW`` around the call because that is
+roughly when a critic runs — would put a sentence on a user's screen that no event supports.
+
+**Progress only moves FORWARD.** A multi-turn run genuinely goes author → validate → author again,
+so the observed kind can go backwards; the draft's state does not follow it back. "Critic review has
+begun" stays true afterwards, and the state machine has exactly one path by design.
+
+**RETRY IS A SECOND BILL.** Everything this module can name, it fails PERMANENTLY. A retryable
+failure re-runs authoring, and a deterministic fault retried to the attempt budget would buy the
+same refusal ``max_attempts`` times. Only a genuinely transient fault — a lost lease, an
+unreachable database — is left retryable.
+
+**BLOCKED is a product result; FAILED is an outage.** A formula can be perfectly good and still name
+an operator this engine has never proved. Recording that as FAILED would send an operator to
+investigate an incident when the honest answer is "this needs a capability nobody has proved yet" —
+a different person, a different remedy, a different screen.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+import psycopg
+
+from featuregen.config import get_settings
+from featuregen.formula.control import LeaseFenceLost, RecoveryRequiresReconciliation
+from featuregen.formula.recipe_authoring import (
+    FrozenRecipeReadContext,
+    recipe_tool_runner_v2,
+)
+from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
+from featuregen.formula.turns import AuthoringIntent
+from featuregen.identity.current_principal import (
+    PrincipalResolutionStatus,
+    resolve_current_principal,
+)
+from featuregen.intake.llm import current_llm_client
+from featuregen.materialize.admission_v2 import ResolvedFeatureInputV2, admit_artifacts_v2
+from featuregen.materialize.codes import MaterializationRefused
+from featuregen.materialize.execution_proof_store import advertised_operators
+from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload.formula_draft_store import (
+    DraftStateV1,
+    InvalidTransition,
+    advance,
+    read_draft,
+    record_admission,
+)
+from featuregen.runtime.observability import counters, log
+from featuregen.runtime.queue import (
+    FormulaDraftQueueClaim,
+    claim_formula_draft,
+    complete_formula_draft,
+    fail_formula_draft,
+    renew_formula_draft,
+)
+
+__all__ = [
+    "FORMULA_DRAFT_ENGINE_ENV",
+    "FormulaDraftWorkerOutcome",
+    "process_formula_draft_once",
+]
+
+#: WHOSE advertised set a draft is admitted against. Read from the environment and never defaulted,
+#: for ``admit_artifacts_v2``'s stated reason: an engine this build has never heard of must be
+#: unsupported, and a default would quietly pick one. Unset is not an error — see
+#: :func:`_admit`, which lets the formula be READY and simply records no decision about an engine
+#: nobody named.
+FORMULA_DRAFT_ENGINE_ENV = "FEATUREGEN_FORMULA_DRAFT_ENGINE"
+
+#: The wire version this lane authors at. V3 is the Formula-V2 LANGUAGE at wire version 3 — the
+#: shape ``admission_v2`` accepts (``_V2_LANGUAGE_VERSIONS``) and the renderer dispatches.
+_DRAFT_FORMULA_SCHEMA_VERSION = 3
+
+#: ``formula_authoring_trace_event.kind`` → the state that kind PROVES has begun. The terminals
+#: (``completed``, ``failed``) are deliberately absent: what a finished run MEANS is decided below
+#: from the folded result and from admission, never from the fact that it stopped.
+_KIND_STATE: Mapping[str, DraftStateV1] = {
+    "author_turn": DraftStateV1.AUTHORING,
+    "critic_result": DraftStateV1.CRITIC_REVIEW,
+    "validation_result": DraftStateV1.VALIDATING,
+}
+
+#: The one legal path, in order, so a sync can walk from where the row is to where the trace says it
+#: has reached WITHOUT skipping a state. `advance` refuses a skip; this is how the caller obeys.
+_PATH: tuple[DraftStateV1, ...] = (
+    DraftStateV1.REQUESTED, DraftStateV1.AUTHORING, DraftStateV1.CRITIC_REVIEW,
+    DraftStateV1.VALIDATING, DraftStateV1.ADMISSION, DraftStateV1.READY,
+)
+
+#: A candidate set generated without a pinned catalog snapshot. Named as a BLOCKER rather than
+#: raised as a failure: there is nothing wrong with the platform, and the remedy — regenerate the
+#: candidates against a snapshot — belongs to whoever asked for them.
+_NO_SNAPSHOT = {
+    "code": "CATALOG_SNAPSHOT_UNPINNED",
+    "reason": "this candidate set was generated without a pinned catalog snapshot, so there is no "
+              "frozen catalog to author against; regenerate the candidates to draft a formula",
+}
+_NO_GROUNDED_REFS = {
+    "code": "CANDIDATE_UNGROUNDED",
+    "reason": "this candidate names no columns that exist in the catalog, so there is nothing to "
+              "author a formula over",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaDraftWorkerOutcome:
+    status: str
+    formula_draft_id: str | None = None
+    state: str | None = None
+
+
+def process_formula_draft_once(
+    conn: psycopg.Connection,
+    *,
+    owner: str,
+    lease_seconds: float = 600,
+) -> FormulaDraftWorkerOutcome:
+    """Claim at most one draft job and drive it to a terminal state.
+
+    ``conn`` is used for the claim and for the lane's own bookkeeping. Each STAGE opens its own
+    transaction and commits it, which is what keeps a provider call outside one.
+    """
+    claim = claim_formula_draft(conn, owner=owner, lease_seconds=lease_seconds)
+    if claim is None:
+        return FormulaDraftWorkerOutcome(status="idle")
+
+    draft_id = str(claim.payload.get("formula_draft_id") or "")
+    if not draft_id:
+        # A message with no subject cannot be retried into one.
+        fail_formula_draft(
+            conn, claim, error="formula draft message carries no formula_draft_id", permanent=True)
+        return FormulaDraftWorkerOutcome(status="permanent")
+
+    try:
+        state = _drive(conn, claim, draft_id, lease_seconds=lease_seconds)
+    except (LeaseFenceLost, RecoveryRequiresReconciliation) as exc:
+        # TRANSIENT by nature: the lease moved under us, or a run needs reconciling before it can be
+        # resumed. Neither is a statement about the candidate, so neither is written to the draft.
+        fail_formula_draft(conn, claim, error=f"{type(exc).__name__}: {exc}", permanent=False)
+        counters.incr("featuregen.formula_draft.retryable")
+        return FormulaDraftWorkerOutcome(status="retryable", formula_draft_id=draft_id)
+    except Exception as exc:  # noqa: BLE001 — bounded poison guard, as the shadow lane
+        # Everything else is named on the DRAFT so a user sees why, and failed PERMANENTLY on the
+        # queue so the same fault is not paid for again.
+        _terminalize(conn, draft_id, DraftStateV1.FAILED, failure_reason=f"{type(exc).__name__}: {exc}")
+        fail_formula_draft(conn, claim, error=f"{type(exc).__name__}: {exc}", permanent=True)
+        counters.incr("featuregen.formula_draft.failed")
+        log("featuregen.formula_draft.failed", level="error", formula_draft_id=draft_id,
+            error=f"{type(exc).__name__}: {exc}")
+        return FormulaDraftWorkerOutcome(
+            status="permanent", formula_draft_id=draft_id, state=DraftStateV1.FAILED.value)
+
+    complete_formula_draft(conn, claim)
+    counters.incr(f"featuregen.formula_draft.{state.value.lower()}")
+    log("featuregen.formula_draft.finished", formula_draft_id=draft_id, state=state.value)
+    return FormulaDraftWorkerOutcome(
+        status="ok", formula_draft_id=draft_id, state=state.value)
+
+
+def _drive(
+    conn: psycopg.Connection,
+    claim: FormulaDraftQueueClaim,
+    draft_id: str,
+    *,
+    lease_seconds: float,
+) -> DraftStateV1:
+    """The eight steps, each committing before the next."""
+    draft = read_draft(conn, draft_id)
+    if draft is None:
+        raise ValueError(f"formula draft {draft_id} does not exist")
+    if draft.state.is_terminal:
+        # A redelivery of a message whose work is done. Completing it is the whole handling — and it
+        # is why re-authoring is never triggered by a duplicate.
+        return draft.state
+
+    # ── 1. the FROZEN facts, and nothing else ────────────────────────────────────────────────────
+    requested_by = conn.execute(
+        "SELECT requested_by FROM formula_draft WHERE formula_draft_id = %s",
+        (draft_id,)).fetchone()[0]
+    facts = _frozen_facts(conn, draft.considered_revision_id, draft.option_id, requested_by)
+    if facts.get("blocker") is not None:
+        return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=[facts["blocker"]])
+
+    # ── 2-6. author, critique, parse, validate, persist ──────────────────────────────────────────
+    if draft.state is DraftStateV1.REQUESTED:
+        with conn.transaction():
+            advance(conn, draft_id, DraftStateV1.AUTHORING)
+
+    result = _author(conn, claim, draft_id, facts, lease_seconds=lease_seconds)
+
+    # A RUN THAT PARSED NOTHING HAS NO FORMULA, and must not be walked towards READY carrying an
+    # empty one. The database's CHECK requires a non-null `formula_json`, and `{}` satisfies NULL
+    # NOT — so an empty dict would have produced a READY draft with nothing in it, which every
+    # reader downstream would treat as a formula. It is BLOCKED with the disposition that explains
+    # why: the run happened, it was paid for, and it did not yield an artifact.
+    proposal = _proposal_material(result)
+    if not proposal:
+        return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=[{
+            "code": "NO_FORMULA_PRODUCED",
+            "reason": f"the authoring run finished as {result.authoring_disposition} without a "
+                      f"parseable formula"}])
+
+    # The run is folded. Walk the row to ADMISSION through whatever states the trace did not have
+    # time to report — the path is fixed, and `advance` refuses a skip.
+    #
+    # The hash is the RUN'S OWN `candidate_proposal_hash`, not one computed here. It is the identity
+    # every other stage of the platform keys on, and a second hashing of the same artifact is a
+    # second opinion about what that artifact IS.
+    _walk_to(conn, draft_id, DraftStateV1.ADMISSION,
+             authoring_run_id=result.authoring_run_id,
+             formula_content_hash=result.candidate_proposal_hash,
+             formula_json=proposal)
+
+    # ── 7-8. admission against the PINNED capability set ─────────────────────────────────────────
+    return _admit(conn, draft_id, facts["intent"], result)
+
+
+def _frozen_facts(
+    conn: psycopg.Connection, revision_id: str, option_id: str, requested_by: str,
+) -> dict[str, Any]:
+    """Only what was frozen: the option, its grounded refs, its snapshot, and the asked hypothesis.
+
+    Read here rather than carried on the queue message, because a payload is a copy and a copy can
+    describe a revision that has since been superseded. The revision itself is immutable, so reading
+    it late is reading the same bytes the request was validated against.
+    """
+    from featuregen.overlay.upload.contract.gate1 import (
+        Gate1Error,
+        UnknownConsideredOption,
+        _chosen_option_from_revision,
+    )
+
+    row = conn.execute(
+        "SELECT r.considered_json, r.metadata_snapshot_id, i.hypothesis, i.definition "
+        "FROM contract_considered_revision r "
+        "JOIN contract_intent i ON i.intent_id = r.intent_id "
+        "WHERE r.considered_revision_id = %s", (revision_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"considered revision {revision_id} does not exist")
+
+    # THE SNAPSHOT IS CHECKED FIRST, before the option is even resolved. With no frozen catalog
+    # there is no world to author against, so whether this particular candidate resolves is moot —
+    # and the answer a user needs ("regenerate the candidates") is the same either way.
+    snapshot_id = row[1]
+    if not snapshot_id:
+        return {"blocker": _NO_SNAPSHOT}
+
+    considered = row[0] if isinstance(row[0], dict) else {}
+    try:
+        idea, _source, _identity = _chosen_option_from_revision(considered, option_id)
+    except (Gate1Error, UnknownConsideredOption) as exc:
+        # A BLOCKER, not a failure — the same judgement the route makes when it answers 409/422
+        # rather than 500. A revision that cannot resolve exact option identity is a fact about
+        # what was STORED, with a remedy that belongs to whoever asked for the candidates.
+        # Recording it as FAILED would page an operator about an outage that is not happening.
+        return {"blocker": {"code": "CANDIDATE_UNRESOLVABLE", "reason": str(exc)}}
+
+    refs = frozenset(str(ref) for ref in (idea.derives_from or ()) if str(ref).strip())
+    if not refs:
+        return {"blocker": _NO_GROUNDED_REFS}
+
+    return {
+        "blocker": None,
+        "snapshot_id": str(snapshot_id),
+        "requested_by": requested_by,
+        "allowed_refs": refs,
+        "intent": AuthoringIntent(
+            name=idea.name,
+            hypothesis=row[2],
+            target_entity=idea.grain_table or "",
+            target_grain_keys=tuple(sorted(refs)) if idea.grain_ref is None else (
+                idea.grain_ref[1],),
+        ),
+    }
+
+
+def _author(
+    conn: psycopg.Connection,
+    claim: FormulaDraftQueueClaim,
+    draft_id: str,
+    facts: Mapping[str, Any],
+    *,
+    lease_seconds: float,
+):
+    """Steps 2-6, inside the orchestrator, with NO transaction of ours held around it.
+
+    ``run_authoring_v2_replay`` runs the bounded author, the critic, the typed parse, the
+    deterministic validation and the immutable trace write — resumably, checkpointing as it goes.
+    Reimplementing any of that here would be a second opinion about what a valid formula is.
+    """
+    principal = resolve_current_principal(
+        conn, facts["requested_by"], None, datetime.now(UTC))
+    if principal.status is not PrincipalResolutionStatus.CURRENT:
+        raise RuntimeError(
+            "formula drafting has no resolved principal: authoring reads catalog metadata under a "
+            "read scope, and an unauthenticated run would either read nothing or read too much")
+
+    frozen = FrozenRecipeReadContext.load(
+        conn, facts["snapshot_id"], facts["allowed_refs"])
+    client = current_llm_client()
+
+    def progress() -> None:
+        """Renew the lease, and move the row to whatever the TRACE says has begun.
+
+        Both on the same hook because both are things that must happen between stages and never
+        during one: at this point the orchestrator has committed its checkpoint and holds no
+        transaction of ours.
+        """
+        _renew(claim, lease_seconds=lease_seconds)
+        _sync_from_trace(draft_id)
+
+    return run_authoring_v2_replay(
+        conn,
+        facts["intent"],
+        client,
+        client,
+        roles=principal.principal.role_claims,
+        actor=principal.principal,
+        tool_runner=recipe_tool_runner_v2(facts["allowed_refs"], frozen_context=frozen),
+        authoring_run_id=_deterministic_run_id(draft_id),
+        facts_reader=frozen.formula_facts_v2,
+        critic_metadata_loader=frozen.get_column_metadata,
+        progress_callback=progress,
+        formula_schema_version=_DRAFT_FORMULA_SCHEMA_VERSION,
+    )
+
+
+def _admit(
+    conn: psycopg.Connection, draft_id: str, intent: AuthoringIntent, result,
+) -> DraftStateV1:
+    """Step 7-8 — decide admissibility against the advertised set, and record it separately.
+
+    The decision is written to ``formula_draft_admission`` under its OWN identity whether it admits
+    or refuses, so a later capability set can be compared against what was decided rather than
+    re-deciding blindly. That is what makes an engine gaining an operator free.
+    """
+    import os
+
+    engine_id = os.environ.get(FORMULA_DRAFT_ENGINE_ENV, "").strip()
+    draft = read_draft(conn, draft_id)
+    # LOUD, not skipped. By the time admission runs the walk to ADMISSION has stored the formula and
+    # its hash; if either is missing, something upstream is wrong and recording an admission "about"
+    # a formula nobody can name would file a decision against nothing. An earlier draft of this
+    # function guarded with `if formula_hash:` and silently skipped — which would have produced a
+    # READY draft with no admission row, indistinguishable from a deployment that names no engine.
+    if draft is None or not draft.formula_content_hash:
+        raise RuntimeError(
+            f"formula draft {draft_id} reached admission with no stored formula hash")
+    formula_hash = draft.formula_content_hash
+
+    if not engine_id:
+        # No engine named by this deployment. The FORMULA is still real and the user can read it —
+        # what is missing is a decision about where it could run, and that is exactly what the
+        # separate admission identity models. Recording an admission against an unnamed engine would
+        # be inventing the one fact `admit_artifacts_v2` refuses to default.
+        log("featuregen.formula_draft.admission_skipped", formula_draft_id=draft_id,
+            reason=f"{FORMULA_DRAFT_ENGINE_ENV} is unset")
+        return _terminalize(conn, draft_id, DraftStateV1.READY)
+
+    advertised = advertised_operators(conn, engine_id=engine_id)
+    try:
+        admit_artifacts_v2(
+            conn, [ResolvedFeatureInputV2(intent, result)], engine_id=engine_id)
+    except MaterializationRefused as exc:
+        # The code is TYPED on the exception by construction ("never a bare string"), so it is
+        # read rather than reconstructed — the same code the corpus report and the execution screen
+        # explain, which is what stops one refusal being described two ways.
+        blockers = [{"code": exc.code.value, "reason": exc.detail or str(exc)}]
+        with conn.transaction():
+            record_admission(
+                conn, formula_draft_id=draft_id, formula_content_hash=formula_hash,
+                engine_id=engine_id, advertised=advertised, admitted=False, blockers=blockers)
+        return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=blockers)
+
+    with conn.transaction():
+        record_admission(
+            conn, formula_draft_id=draft_id, formula_content_hash=formula_hash,
+            engine_id=engine_id, advertised=advertised, admitted=True)
+    return _terminalize(conn, draft_id, DraftStateV1.READY)
+
+
+# ── state movement ───────────────────────────────────────────────────────────────────────────────
+def _observed_state(conn: psycopg.Connection, run_id: str) -> DraftStateV1 | None:
+    """The FURTHEST state the trace proves has begun, or ``None`` if it proves nothing yet.
+
+    The furthest rather than the latest, because a multi-turn run genuinely revisits the author
+    after a validation and the draft's state does not walk backwards with it.
+    """
+    kinds = {row[0] for row in conn.execute(
+        "SELECT DISTINCT kind FROM formula_authoring_trace_event WHERE authoring_run_id = %s",
+        (run_id,)).fetchall()}
+    reached = [_KIND_STATE[kind] for kind in kinds if kind in _KIND_STATE]
+    if not reached:
+        return None
+    return max(reached, key=_PATH.index)
+
+
+def _walk_to(
+    conn: psycopg.Connection, draft_id: str, target: DraftStateV1, **payload: Any,
+) -> DraftStateV1:
+    """Advance one legal step at a time up to ``target``, committing each.
+
+    A loop rather than a jump because ``advance`` refuses a skip on purpose: a READY draft whose
+    trace never records a critic is exactly what that refusal exists to prevent, and a caller that
+    wanted to skip would be asking the state machine to lie. The result payload rides on the LAST
+    step, so a crash part-way leaves a row that has not yet claimed a formula it has not stored.
+    """
+    while True:
+        draft = read_draft(conn, draft_id)
+        if draft is None or draft.state.is_terminal:
+            return draft.state if draft else target
+        index = _PATH.index(draft.state)
+        if index >= _PATH.index(target):
+            return draft.state
+        step = _PATH[index + 1]
+        with conn.transaction():
+            advance(conn, draft_id, step, **(payload if step is target else {}))
+
+
+def _terminalize(
+    conn: psycopg.Connection,
+    draft_id: str,
+    state: DraftStateV1,
+    *,
+    blockers: Sequence[Mapping[str, str]] = (),
+    failure_reason: str | None = None,
+) -> DraftStateV1:
+    """Put the draft in a terminal state, walking the path first only when READY requires it.
+
+    ONLY READY needs the walk, and the asymmetry is deliberate. BLOCKED, FAILED and CANCELLED are
+    reachable from anywhere because each can be truthfully known early — a candidate with no pinned
+    catalog snapshot is blocked at REQUESTED, before a model is asked anything. READY may only be
+    declared after the run that produced the formula, so it walks the path and `advance` refuses any
+    skip: a READY draft whose trace records no critic stays impossible.
+    """
+    if state is DraftStateV1.READY:
+        _walk_to(conn, draft_id, DraftStateV1.ADMISSION)
+    try:
+        with conn.transaction():
+            advance(conn, draft_id, state, blockers=blockers, failure_reason=failure_reason)
+    except InvalidTransition:
+        # Already terminal — a redelivery, or a race with a cancellation. The stored verdict wins:
+        # overwriting it would let a retry silently replace a user's cancel with a READY.
+        current = read_draft(conn, draft_id)
+        return current.state if current else state
+    return state
+
+
+def _sync_from_trace(draft_id: str) -> None:
+    """Move the row to whatever the trace proves, on the lane's OWN connection.
+
+    Its own connection because the orchestrator's connection is mid-run and its checkpoint
+    transaction is not ours to join; a state update inside it would be rolled back with any turn
+    that is retried, and the user's screen would go backwards.
+
+    Best-effort by design: this is progress reporting. A failure here must never fail a draft that
+    the model is in the middle of authoring — the row simply reports the earlier stage a moment
+    longer, and the terminal write below is what the result actually depends on.
+    """
+    dsn = get_settings().dsn
+    if not dsn:
+        return
+    try:
+        with psycopg.connect(dsn, autocommit=True) as sync_conn:
+            draft = read_draft(sync_conn, draft_id)
+            if draft is None or draft.state.is_terminal or draft.authoring_run_id is None:
+                return
+            observed = _observed_state(sync_conn, draft.authoring_run_id)
+            if observed is None:
+                return
+            _walk_to(sync_conn, draft_id, observed)
+    except Exception as exc:  # noqa: BLE001 — progress reporting never fails a paid run
+        log("featuregen.formula_draft.progress_unavailable", level="warning",
+            formula_draft_id=draft_id, error=f"{type(exc).__name__}: {exc}")
+
+
+def _renew(claim: FormulaDraftQueueClaim, *, lease_seconds: float) -> None:
+    """Extend the lease durably, or lose the fence loudly.
+
+    On its own connection for the shadow lane's reason: the renewal has to be visible to every
+    other worker immediately, and a renewal inside the run's transaction would not be until it
+    commits — by which time the lease it was extending has already expired.
+    """
+    dsn = get_settings().dsn
+    if not dsn:
+        raise LeaseFenceLost("formula draft lease cannot be renewed durably")
+    try:
+        with psycopg.connect(dsn) as lease_conn:
+            renewed = renew_formula_draft(lease_conn, claim, lease_seconds=lease_seconds)
+    except Exception as exc:
+        raise LeaseFenceLost("formula draft lease renewal is unavailable") from exc
+    if not renewed:
+        raise LeaseFenceLost("formula draft lease was lost")
+
+
+def _deterministic_run_id(draft_id: str) -> str:
+    """One authoring run per draft, named from the draft.
+
+    Deterministic so a resumed job RESUMES rather than opening a second run: the orchestrator is
+    replay-shaped and will pick up its own checkpoints, which is the difference between a retry that
+    finishes the work and a retry that pays for it again.
+    """
+    return f"far-{canonical_hash({'formula_draft_id': draft_id})[:32]}"
+
+
+def _proposal_material(result) -> dict[str, Any]:
+    """The folded proposal as plain JSON, for storage.
+
+    ``candidate_proposal`` is ``None`` when nothing parsed — an outcome the caller turns into a
+    BLOCKED draft rather than a READY one holding ``{}``.
+    """
+    from dataclasses import asdict, is_dataclass
+
+    proposal = result.candidate_proposal
+    if proposal is None:
+        return {}
+    if is_dataclass(proposal):
+        return _plain(asdict(proposal))
+    if isinstance(proposal, Mapping):
+        return _plain(dict(proposal))
+    return {}
+
+
+def _plain(value: Any) -> Any:
+    """Enums to their values, tuples to lists — a shape ``jsonb`` and a hash both accept."""
+    from enum import Enum
+
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Mapping):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value

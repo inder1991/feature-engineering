@@ -14,8 +14,8 @@ const LOOP: { route: Route; name: string; line: string }[] = [
   { route: 'review', name: 'Review queue', line: 'Review what the catalog refused to trust.' },
   {
     route: 'workbench',
-    name: 'Generate features',
-    line: 'Generate features: the engine proposes, you approve and register.',
+    name: 'Discover candidates',
+    line: 'Discover candidates: the engine proposes, you approve and register.',
   },
 ]
 
@@ -74,7 +74,7 @@ export function OverviewScreen({
           <p>
             Upload <span className="mono">docs/examples/deposits.csv</span> as source{' '}
             <span className="mono">deposits</span>, then search for{' '}
-            <span className="mono">balance</span>. Once data is in, Generate features is where the
+            <span className="mono">balance</span>. Once data is in, Discover candidates is where the
             engine works for you.
           </p>
           <button type="button" className="btn btn--primary" onClick={() => navigate('upload')}>
@@ -103,7 +103,7 @@ export function OverviewScreen({
         <div className="callout-body">
           <p>This is a stub dev session. Roles switch in the rail.</p>
           <p>
-            AI assist depends on the deployment's LLM provider; the Generate features screen shows
+            AI assist depends on the deployment's LLM provider; the Discover candidates screen shows
             its live status.
           </p>
           <p>Search serves only freshness-vouched facts.</p>

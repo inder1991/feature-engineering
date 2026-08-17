@@ -1711,8 +1711,66 @@ export function contractConsideredSet(
   })
 }
 
+// ── Draft formula: ASYNC, and NOT a selection ────────────────────────────────────────────────────
+// Requesting a formula for one candidate. Returns 202 immediately with an id to poll — never a
+// formula, because producing one is two model calls plus validation plus admission and none of that
+// belongs on an HTTP request.
+//
+// **This does not select the candidate.** `contractDraft` below records a Gate-1 choice as its first
+// act; this deliberately does not, so a user can read a formula and THEN decide. Two functions
+// because they are two different acts, not one function with a flag.
+//
+// **A double-click costs nothing.** The server is idempotent on the formula identity, so a second
+// request returns the first draft with `created: false` — which is why the caller can report
+// "already drafting" instead of a spend that did not happen.
+export interface FormulaDraftRequested {
+  formula_draft_id: string
+  status: string
+  stage: string
+  created: boolean
+  detail: string
+}
+
+export interface FormulaDraftStatus {
+  formula_draft_id: string
+  considered_revision_id: string
+  option_id: string
+  state: 'REQUESTED' | 'AUTHORING' | 'CRITIC_REVIEW' | 'VALIDATING' | 'ADMISSION'
+       | 'READY' | 'BLOCKED' | 'FAILED' | 'CANCELLED'
+  // The words to SHOW. Server-owned, so the API and the screen cannot describe one state with two
+  // different sentences.
+  stage: string
+  terminal: boolean
+  formula_source: string
+  authoring_run_id: string | null
+  formula_content_hash: string | null
+  formula: Record<string, unknown> | null
+  // BLOCKED is a product result and these are the answer, not an error payload.
+  blockers: { code: string; reason: string }[]
+  failure_reason: string | null
+}
+
+export function requestFormulaDraft(
+  revisionId: string,
+  optionId: string,
+): Promise<FormulaDraftRequested> {
+  return post(
+    `/considered-revisions/${encodeURIComponent(revisionId)}`
+    + `/options/${encodeURIComponent(optionId)}/formula-drafts`,
+    {},
+  )
+}
+
+export function getFormulaDraft(formulaDraftId: string): Promise<FormulaDraftStatus> {
+  return request(`/formula-drafts/${encodeURIComponent(formulaDraftId)}`)
+}
+
 // Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
 // the draft. In confirmation-required mode chosen_option_id is the opaque option_id, never display name.
+//
+// SELECT AND DRAFT, in that order — its first act is to record a Gate-1 choice, so calling it IS
+// choosing. `requestFormulaDraft` above is the one that only drafts. Any control wired to this must
+// say so; a button labelled "Draft formula" on this call would select behind the user's back.
 export function contractDraft(
   intentId: string,
   chosenSource: 'anchor' | 'alternative',
