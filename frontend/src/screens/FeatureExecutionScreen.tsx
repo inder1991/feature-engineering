@@ -12,6 +12,7 @@ import {
   requestVerification,
   verifyEligibility,
 } from '../api'
+import { useIdentityKey } from '../session'
 
 // S11 — the first user-reachable generation surface: what this feature is FOR, what it would run,
 // and the two actions that reach a cluster.
@@ -85,6 +86,13 @@ export function FeatureExecutionScreen(props: Props) {
   const [actionError, setActionError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(1)
   const [capability, setCapability] = useState('')
+  // READ SCOPE IS AN EFFECT DEPENDENCY, not just the URL. `session.ts` states the rule outright:
+  // "a result fetched under one identity is not a valid answer under another." Every read below is
+  // read-scoped — `verifyEligibility` returns EXECUTION_AUTHORITY_UNMET from the caller's role
+  // claims, and `getArtifactCode` is confirmer-gated — so a screen keyed on the URL alone shows a
+  // refusal from the identity it first loaded under and never re-asks. Found by granting a role in
+  // the dev session bar and watching the 403 stay on screen.
+  const identity = useIdentityKey()
 
   // READS ONLY. Nothing in this effect executes anything: it asks whether the buttons should be
   // enabled, and what already happened.
@@ -116,7 +124,7 @@ export function FeatureExecutionScreen(props: Props) {
       }
     })()
     return () => { live = false }
-  }, [artifactId, environmentId, inventoryObservationId, logicalGroupName])
+  }, [artifactId, environmentId, inventoryObservationId, logicalGroupName, identity])
 
   const stage: Stage = publication?.blocked
     ? 'published'

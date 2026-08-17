@@ -34,10 +34,30 @@ kind get clusters 2>/dev/null | grep -qx "$CLUSTER" || kind create cluster --nam
 kubectl apply -f deploy/kind/k8s/00-namespace.yaml
 
 # ── 2. build + load the requested images (context = repo root, so COPY src picks up THIS checkout) ─
+# The frontend's feature flags are BUILD-TIME (Vite inlines `import.meta.env.VITE_*`), so unlike the
+# backend's runtime env they cannot be flipped with `kubectl set env` — they have to be baked in
+# here. Each is forwarded from THIS shell's environment when set, so:
+#
+#   VITE_FEATURE_EXECUTION=1 ./deploy/kind/deploy.sh frontend
+#
+# turns a surface on, and an unset one keeps the Dockerfile's default-OFF. Listed explicitly rather
+# than swept up with `env | grep VITE_`, so what a deployment can turn on is a reviewable list.
+FRONTEND_FLAGS="VITE_FEATURE_EXECUTION VITE_MATERIALIZATION_RUNS VITE_ENTITY_MAP \
+                VITE_INTENT_GATE_CONSOLE VITE_INTENT_RANKING VITE_INTENT_DISPOSITION_LENS"
+
 build_load() {  # $1 = short name (backend|frontend)
   local name="$1"
+  local args=()
+  if [ "$name" = "frontend" ]; then
+    for flag in $FRONTEND_FLAGS; do
+      # `${!flag}` is an indirect expansion: the VALUE of the variable NAMED by $flag.
+      [ -n "${!flag:-}" ] && args+=(--build-arg "${flag}=${!flag}")
+    done
+    [ ${#args[@]} -gt 0 ] && log "frontend build flags: ${args[*]}"
+  fi
   log "build featuregen-${name}:local (from $ROOT)"
-  docker build -t "featuregen-${name}:local" -f "deploy/kind/Dockerfile.${name}" .
+  docker build "${args[@]+"${args[@]}"}" -t "featuregen-${name}:local" \
+    -f "deploy/kind/Dockerfile.${name}" .
   log "load featuregen-${name}:local into kind"
   kind load docker-image "featuregen-${name}:local" --name "$CLUSTER"
 }

@@ -5,6 +5,26 @@ WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+
+# The Vite flags are BUILD-TIME, not runtime: Vite inlines `import.meta.env.VITE_*` into the bundle,
+# so a `kubectl set env` on the frontend pod changes nothing. They are declared here — with the
+# default-OFF value each gate expects — so a deployment can turn a surface on by passing
+# `--build-arg`, and so the list of what CAN be turned on is visible in one place rather than
+# discovered by grepping the SPA.
+ARG VITE_FEATURE_EXECUTION=0
+ARG VITE_MATERIALIZATION_RUNS=0
+ARG VITE_ENTITY_MAP=0
+ARG VITE_INTENT_GATE_CONSOLE=0
+ARG VITE_INTENT_RANKING=0
+ARG VITE_INTENT_DISPOSITION_LENS=0
+# `VITE_INTENT_CONFIRMATION_UI` is deliberately absent: its gate is `!== '0'`, i.e. ON unless
+# explicitly disabled, and declaring it here with a 0 default would silently turn it OFF.
+ENV VITE_FEATURE_EXECUTION=$VITE_FEATURE_EXECUTION \
+    VITE_MATERIALIZATION_RUNS=$VITE_MATERIALIZATION_RUNS \
+    VITE_ENTITY_MAP=$VITE_ENTITY_MAP \
+    VITE_INTENT_GATE_CONSOLE=$VITE_INTENT_GATE_CONSOLE \
+    VITE_INTENT_RANKING=$VITE_INTENT_RANKING \
+    VITE_INTENT_DISPOSITION_LENS=$VITE_INTENT_DISPOSITION_LENS
 RUN npm run build
 
 FROM nginx:1.27-alpine

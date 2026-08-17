@@ -213,6 +213,32 @@ it('shows policy provenance for the governed realizations that produced the numb
 })
 
 
+// ══ READ SCOPE is an effect dependency ════════════════════════════════════════════════════════
+// The second gap live testing found: every read here is read-scoped — `verifyEligibility` derives
+// EXECUTION_AUTHORITY_UNMET from the caller's role claims, `getArtifactCode` is confirmer-gated —
+// and the effect keyed on the URL alone, so granting yourself a role in the session bar left the
+// original 403 frozen on screen. `session.ts` states the rule in as many words: "a result fetched
+// under one identity is not a valid answer under another."
+it('re-fetches when the session identity changes, not only when the URL does', async () => {
+  const { setSession } = await import('../session')
+  stubReads()
+  render(<FeatureExecutionScreen {...PROPS} />)
+  await waitFor(() => expect(api.verifyEligibility).toHaveBeenCalledTimes(1))
+
+  // Same URL, same props — only the caller's claims moved.
+  setSession({ user: 'dev', roles: ['data_owner', 'platform-admin'] })
+  await waitFor(() => expect(api.verifyEligibility).toHaveBeenCalledTimes(2))
+})
+
+it('names the identity in the effect dependencies', () => {
+  // Structural as well as behavioural: the behavioural test above passes if the component happens
+  // to re-render for another reason, and the rule is about the DEPENDENCY.
+  const text = readFileSync(join(SRC, 'screens/FeatureExecutionScreen.tsx'), 'utf8')
+  expect(text).toMatch(/useIdentityKey\(\)/)
+  const deps = text.slice(text.lastIndexOf('}, ['), text.lastIndexOf('}, [') + 140)
+  expect(deps).toContain('identity')
+})
+
 // ══ REACHABILITY — the gap this file did not close the first time ══════════════════════════════
 // Written after a deploy showed the screen's strings were ABSENT from the built bundle: the route
 // and its icon existed, `nav.ts` parsed the hash, every test above passed — and `App.tsx` never
