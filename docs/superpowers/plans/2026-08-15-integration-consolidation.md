@@ -776,6 +776,41 @@ is reconciled against the published generation marker **before** any retry.
 > becomes visible; environment keying is in place; **an interrupted swap lands
 > `UNKNOWN_RECONCILIATION_REQUIRED` and blocks retry until reconciled**.
 
+**DONE** — `materialize/publication_attempt_store.py` + migration `1081` (file only; environment
+scoping is C-D6's `1085`, already written), `test_publication_attempt_s10.py` **33 passed**.
+
+* **The CAS precondition is checked FIRST and a refusal leaves NO ROW** — the attempt never began,
+  and a row would put something in the history that nothing attempted.
+  `check_publish_precondition` is CALLED rather than restated, so the rule has one implementation.
+  `expected_active_revision_id=None` means *there is no active revision*, never *I did not check*,
+  and expecting nothing when something is active refuses.
+* **The uncertain outcome is a state of KNOWLEDGE, not an error.** Publication crosses two planes and
+  the window where the Hive swap succeeds and the PostgreSQL transaction rolls back is real; the
+  alternative to admitting it is a distributed transaction this platform does not have and would not
+  want on the publish path.
+* **`STARTED` blocks retry too**, and that is the non-obvious half: a row that says `STARTED` and
+  never moved is the same uncertainty reached by crashing rather than by catching, so treating it as
+  retryable would be assuming that a crash means nothing happened. The block is a **partial unique
+  index** — at most one unreconciled blocking attempt per `(environment, group)` — so a retry cannot
+  even be RECORDED while one is outstanding, rather than being refused by a check somebody remembered
+  to run. Tested through the writer AND by bypassing it.
+* **Only reconciliation unblocks.** `reconcile_attempt` takes what the published generation marker
+  SHOWS, because the point is to look rather than to choose — "still unknown" is refused as a
+  reconciliation (it is the state the attempt is already in, and recording it would unblock a group
+  nobody checked), a settled attempt cannot be reconciled, and reconciling twice is refused so a
+  second look cannot override the first. A `SUCCEEDED` or `FAILED` attempt does **not** block: a
+  retry after a known failure is exactly what an operator should be able to do.
+* **"A partial group never becomes visible" is tested by ABSENCE**, which is the only way: there is
+  no per-feature field on the type and no per-feature column or child table in the schema, so
+  publishing part of a group is not expressible. The contract's `ATOMIC_GROUP` policy is the rule
+  the mechanism honours.
+* **Capability lives on the publication table and nowhere in S9's** — asserted on BOTH schemas,
+  because §0.3's asymmetry (verification must not require one, publication must) is the requirement
+  rather than a coincidence of two files.
+* What was published — the output, the artifact, the mechanism, the environment, the capability — is
+  frozen on arrival by trigger; only the outcome moves (once, out of `STARTED`) and the
+  reconciliation moves (once).
+
 ### S11 — consolidation and polish *(1082)*
 
 **[R19] The surfaces ship with their capabilities, not all at the end** — the Generate endpoint,
