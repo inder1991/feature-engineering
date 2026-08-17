@@ -58,6 +58,23 @@ POLICY_REFERENCE_UNRESOLVABLE = "POLICY_REFERENCE_UNRESOLVABLE"
 # observation changes that for this build. Kept apart from FORMULA_SCHEMA_UNSUPPORTED, which is
 # about the WIRE VERSION rather than about what the renderer can emit.
 RENDERER_CANNOT_DISPATCH = "RENDERER_CANNOT_DISPATCH"
+# S11: the four remaining EXECUTION-CHAIN facts, discovered while running a chain rather than while
+# listing candidates — so, like the two above, the activation policy neither emits nor could emit
+# them without compiling every candidate to answer a list query.
+#
+# The sealed artifact exists and its subgraph check REFUSED it. Structural for this build: no
+# decision and no observation makes a refused graph runnable, only a different compilation.
+ARTIFACT_NOT_SERVABLE = "ARTIFACT_NOT_SERVABLE"
+# The artifact was sealed for one environment and is being verified against another's inventory.
+# Also structural — an artifact rendered for a cluster it was not rendered against is the wrong
+# artifact, not an under-configured one.
+ENVIRONMENT_INCOMPATIBLE = "ENVIRONMENT_INCOMPATIBLE"
+# Publication needs a CURRENT passing verification. `needs_setup` because the remedy is to run one:
+# the candidate is not unsuitable and nobody has decided against it.
+VERIFICATION_NOT_CURRENT = "VERIFICATION_NOT_CURRENT"
+# Publication requires a capability attestation and verification must not (§0.3). `needs_setup`
+# because the remedy is a grant, which is governance work with an owner.
+PUBLICATION_CAPABILITY_MISSING = "PUBLICATION_CAPABILITY_MISSING"
 # ambiguity
 REQUIRED_OPERAND_AMBIGUOUS = "REQUIRED_OPERAND_AMBIGUOUS"
 SOURCE_SELECTION_AMBIGUOUS = "SOURCE_SELECTION_AMBIGUOUS"
@@ -116,6 +133,10 @@ REASON_FAMILIES: dict[str, str] = {
     STATUS_POLICY_UNRESOLVED: "needs_setup",
     POLICY_REFERENCE_UNRESOLVABLE: "needs_setup",
     RENDERER_CANNOT_DISPATCH: "structurally_unsuitable",
+    ARTIFACT_NOT_SERVABLE: "structurally_unsuitable",
+    ENVIRONMENT_INCOMPATIBLE: "structurally_unsuitable",
+    VERIFICATION_NOT_CURRENT: "needs_setup",
+    PUBLICATION_CAPABILITY_MISSING: "needs_setup",
     SOURCE_SELECTION_AMBIGUOUS: "undecided",
     IDENTIFIER_UNIQUENESS: "needs_data_check",
     EVENT_HISTORY_VERIFICATION: "needs_data_check",

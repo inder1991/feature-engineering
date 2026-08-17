@@ -258,9 +258,14 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # Imported HERE rather than added to the module-level `from featuregen.api.routes import (...)`
     # block: that block is being edited by a concurrent session, and this task is additive-only in
     # this file. `create_app` already uses local imports for the same reason elsewhere.
-    from featuregen.api.routes import materialization_runs
+    from featuregen.api.routes import feature_execution, materialization_runs
 
     app.include_router(materialization_runs.router)
+    # S11 — the user-reachable generate / code-view / verify / publish surface. Behind the SAME
+    # deployment switch, for the same reason: a flag-off deployment must not advertise paths whose
+    # worker never runs. Registered here, next to the lane it belongs to, rather than in the
+    # module-level import block that a concurrent session is editing.
+    app.include_router(feature_execution.router)
 
     @app.get("/health")
     def health() -> dict:

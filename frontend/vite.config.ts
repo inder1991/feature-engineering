@@ -28,7 +28,12 @@ const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', 
   // BR-23's recipe-review surface: the summary queue, the definition under review, and the
   // review history + decision POST (api.ts getRecipeReviewSummary/getRecipeDetail/
   // getRecipeReviews/postRecipeReview).
-  '/recipes']
+  '/recipes',
+  // S11's execution workspace: authorize a generation, read the generated code, request a sandbox
+  // verification, publish. Behind the SAME server switch as /materialization-runs, and listed here
+  // for the same reason — a missing prefix answers a POST with 405 from the SPA rather than a 404
+  // anyone would recognise as routing.
+  '/feature-execution']
 
 export default defineConfig({
   plugins: [react()],

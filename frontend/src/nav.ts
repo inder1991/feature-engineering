@@ -5,7 +5,7 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
   | 'integrations' | 'governance' | 'dashboard' | 'gate' | 'asset' | 'suggested'
-  | 'analysis' | 'entity-map' | 'recipes' | 'materialization'
+  | 'analysis' | 'entity-map' | 'recipes' | 'materialization' | 'feature-execution'
 
 // 'asset' is the catalog asset-detail screen (Delivery G). It carries source + object_ref via the
 // existing params mechanism (a Details action on a search hit navigates('asset', {source,
@@ -41,6 +41,15 @@ export function materializationRunsEnabled(): boolean {
   return import.meta.env.VITE_MATERIALIZATION_RUNS === '1'
 }
 
+// S11's execution workspace (generate / code view / verify / publish) rides the SAME server switch
+// as the materialization routes — `/feature-execution/...` 404s while
+// `FEATUREGEN_MATERIALIZE_ENABLED` is off — so it gets its own call-time Vite flag for the same
+// reason: a reachable screen with an unreachable API behind it is a surface that can only ever show
+// an error. Flag-off, '#/feature-execution' parses like any unknown hash: absent, not broken.
+export function featureExecutionEnabled(): boolean {
+  return import.meta.env.VITE_FEATURE_EXECUTION === '1'
+}
+
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')
   const q = raw.indexOf('?')
@@ -50,6 +59,7 @@ export function parseHash(hash: string): { route: Route; params: URLSearchParams
     || (path === 'gate' && gateConsoleEnabled())
     || (path === 'entity-map' && entityMapEnabled())
     || (path === 'materialization' && materializationRunsEnabled())
+    || (path === 'feature-execution' && featureExecutionEnabled())
   const route = known ? (path as Route) : 'overview'
   return { route, params: new URLSearchParams(query) }
 }

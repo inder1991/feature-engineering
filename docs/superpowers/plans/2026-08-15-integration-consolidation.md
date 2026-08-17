@@ -825,35 +825,63 @@ workspace**.
 > enumeration test over the route table — plus a UI test that the buttons are the only client-side
 > callers; results sit above intake.
 
-**NOT BUILT — and it is the only stage of S1–S13 whose backend is complete and whose surface is
-absent.** Everything S11's endpoints would call now exists and is gate-green: `evaluate_generate`
-(S8), the sealed-artifact serve path (S7), `verification_store` (S9), `publication_attempt_store`
-(S10), and `advertised_operators` (S13's second clause). What is missing is the surface itself — an
-explicit generate endpoint, the code-view API, verify request/results, publish, and the
-goal/target/stage/output header — plus the React workspace they live in.
+**DONE** — `api/routes/feature_execution.py` + `materialize/evaluate_execution.py` +
+`materialize/generation_authorization.py` + migration `1082` (file only) +
+`frontend/src/screens/FeatureExecutionScreen.tsx`, `test_feature_execution_s11.py` **26 passed**,
+`FeatureExecutionScreen.test.tsx` **14 passed**, frontend suite **985 passed**, `tsc -b` clean.
 
-**Why it stopped here rather than being half-built.** S11 is the FIRST user-reachable generation
-(§3's sequencing says so), and its acceptance is deliberately a set of NEGATIVE claims: the handlers
-appear in no relay route map and no timer, and the only callers of `evaluate_verify` /
-`evaluate_publish_sandbox` are their two request endpoints. Those are enumeration tests over a route
-table that does not exist yet, so they cannot be written before the routes — and writing the routes
-first would mean choosing the user-facing shape of generation, verification and publication without
-the product owner. The two evaluator Protocols S11 implements (`VerifyEvaluator`,
-`PublishSandboxEvaluator`) are still Protocols for the same reason C-D9 gave: *"a stub that returned
-a verdict would be an evaluator nobody wrote"*.
-
-**What an implementer needs, so nothing has to be re-derived:** the route table is
-`api/app.py:210-263` (34 `include_router` calls, no timer and no relay in the module — checked); the
-generate verdict is `materialize/evaluate_generate.evaluate_generate`; serving bytes is
-`materialize/seal_v2.serve_artifact` (refuses a non-servable artifact BEFORE fetching, so a code view
-cannot show an artifact the graph check refused); the verify request is
-`overlay/upload/verification_store.record_verification_attempt` (takes no capability, by design) and
-its label is `label_for` (three-way, "unverifiable" for the undecidable case); publish is
-`materialize/publication_attempt_store.record_publication_attempt`, which refuses while an
-unreconciled attempt is outstanding and needs a capability attestation. Policy provenance for the
-`LLM_PROPOSED` display comes from `formula/policy_store.resolve_policy_occurrence` →
-`revision.provenance`, with `claims_occurrence` distinguishing a purpose-built realization from a
-family-wide one.
+* **The acceptance is a set of NEGATIVES, so the tests are mostly negative.** `evaluate_verify` and
+  `evaluate_publish_sandbox` are enumerated over EVERY module in `src/featuregen` by AST walk — not
+  a maintained list, so a caller added anywhere fails without anyone remembering a fixture — and the
+  permitted set is exactly `{their own module, feature_execution.py}`. An **AST walk rather than a
+  grep**, because both modules' docstrings name the evaluators at length and a text search would
+  read the prose forbidding a thing as the thing. Separately: neither appears in
+  `_DEFAULT_RELAY_ROUTE`, in `CONTROL_SIGNAL_HANDLERS`, in `runtime/timers.py`, or **anywhere in
+  `runtime/worker.py` at all** — the worker drives every automatic stage, so an evaluator it cannot
+  name is one no timer can reach.
+* **Mutation-checked on both sides.** Adding a call in `runtime/worker.py` kills 2 backend tests;
+  adding one in another React screen kills the client-side enumeration.
+* **A GAP was found and closed: nothing minted a generation authorization.**
+  `verification_attempt` is keyed on `generation_authorization_revision_id`, `evaluate_generate`
+  refuses a blank one, and invariant 17 says a generation is authorized FOR a target — yet no row
+  anywhere produced one, so a verification could name an authorization that never existed and
+  nothing could tell. Migration `1082` and `generation_authorization.py` are that table:
+  content-addressed (a double-click is one authorization), environment-scoped, and `target_ref` is
+  NULL **exactly** when the mode is `exploration`, enforced by a CHECK so the two fields are one
+  statement rather than two that can disagree.
+* **The generate route deliberately does NOT call `evaluate_generate`, and says why.** That
+  evaluator needs the policy occurrences and the OPERATOR GRAPH; the graph is not persisted (S7
+  records that) and occurrences are derived over a bound input set. A route cannot compile —
+  `get_conn` holds one transaction and a compile is bounded in minutes — so the evaluation stays
+  where the compilation is. A weakened version at the route would be a second, laxer answer to a
+  governed question.
+* **§0.3's asymmetry is expressed at the WIRE.** `VerificationRequestIn` has no capability field at
+  all (asserted), `PublicationRequestIn` requires one (asserted), and `evaluate_verify` takes no
+  such parameter. The difference between the two actions is visible in what each is able to say.
+* **Code view serves through `serve_artifact`**, which refuses a non-servable artifact before
+  fetching a byte and re-derives every digest — so a code view cannot display an artifact the
+  subgraph check refused. A refused artifact answers **409, not 404**: it exists, and its findings
+  are the answer; a 404 would send an operator looking for a missing record instead of at the graph.
+* **UI: the buttons are the only client-side callers**, and the tests are structural — one caller
+  each, inside an `onClick`, absent from the effect, and **no `setInterval`/`setTimeout` in the file
+  at all**, because a poll that re-verified would run a cluster job every few seconds with nobody
+  asking. The reads are safe in an effect precisely because they change nothing, and that split is
+  the design of the file.
+* **Results sit above intake**, asserted with `compareDocumentPosition` rather than by reading the
+  source order. Goal · target · stage · output sit above both. An exploration build renders "no
+  target — this is an exploration build, which predicts nothing" rather than an empty box, and every
+  blocker carries the SERVER's sentence from the same disposition table the corpus report reads.
+* Four more codes joined the closed vocabulary and `EVALUATOR_ONLY_BLOCKERS`:
+  `ARTIFACT_NOT_SERVABLE`, `ENVIRONMENT_INCOMPATIBLE` (both `structurally_unsuitable`),
+  `VERIFICATION_NOT_CURRENT`, `PUBLICATION_CAPABILITY_MISSING` (both `needs_setup`).
+* **An existing guard test caught a real gap**: `test_nginx_proxy_covers_frontend_calls` failed
+  because `/feature-execution` had no ingress. Added to BOTH `deploy/kind/nginx.conf` and
+  `vite.config.ts` — a missing prefix answers a POST with 405 from the SPA rather than a 404 anyone
+  would recognise as routing, and the two lists must agree or dev and production disagree about
+  which calls reach the API at all.
+* Both non-current staleness answers refuse publication, and a **refused artifact does not ALSO
+  report an environment mismatch** — telling an operator to fix an environment on an artifact that
+  could not run in either would send them to the wrong place.
 
 ### S12 — corpus generation *(generation only)*
 Under the target **mode** axis and a declared default `BuildDeclarationV1` set.
@@ -899,8 +927,8 @@ evidence. Tested as an intersection rather than a union: proved-but-not-dispatch
 dispatchable-but-not-proved are both ABSENT from the advertised set, and an unrecorded operator is
 absent rather than assumed.
 
-**The free-form V2 authoring path is NOT built**, and it is the one place in S1–S13 where that is
-true. It is not a gap that can be closed by more of the same work: it needs an LLM authoring loop
+**The free-form V2 authoring path is NOT built**, and after S11 it is the ONE remaining item in
+S1–S13. It is not a gap that can be closed by more of the same work: it needs an LLM authoring loop
 against the V3 tool seam, and the plan's own C-A2 note records why the adjacent halves were
 deliberately left out — *"pin with one producer and no consumer"*. S2 built the DETERMINISTIC
 producer; the free-form one is a separate charter with live LLM spend attached, and the worker still

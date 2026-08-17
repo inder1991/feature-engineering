@@ -84,6 +84,26 @@ ACTIVATION_BLOCKER_DISPOSITIONS: Mapping[str, tuple[BlockerDisposition, str]] = 
         "This build's renderer has no branch for an operator the graph contains, so generating "
         "would emit a project that cannot run. Distinct from FORMULA_SCHEMA_UNSUPPORTED, which is "
         "about the wire version rather than about what the renderer can emit"),
+    R.ARTIFACT_NOT_SERVABLE: (
+        BlockerDisposition.CARRIED,
+        "The sealed artifact's subgraph check REFUSED it — a missing FX duplicate-rate gate, say — "
+        "so executing it would run a graph the check declined. Verifying it anyway would produce a "
+        "passing verification for a computation nobody was willing to seal"),
+    R.ENVIRONMENT_INCOMPATIBLE: (
+        BlockerDisposition.CARRIED,
+        "The artifact was sealed for one environment and is being run against another's inventory. "
+        "Environment is deployment placement, so this is the wrong ARTIFACT rather than an "
+        "under-configured run, and its physical targets belong to a cluster nobody rendered for"),
+    R.VERIFICATION_NOT_CURRENT: (
+        BlockerDisposition.CARRIED,
+        "Publication rests on a CURRENT passing verification (§0.3). A stale one vouches for an "
+        "artifact whose meaning moved, and an unverifiable one never vouched for anything on "
+        "content — neither is a basis for making something visible"),
+    R.PUBLICATION_CAPABILITY_MISSING: (
+        BlockerDisposition.CARRIED,
+        "Publication REQUIRES a capability attestation and verification must not (§0.3). It is the "
+        "single thing that separates the two actions, so a publish without one is an action nobody "
+        "was entitled to take"),
     R.EXECUTION_AUTHORITY_UNEVALUATED: (
         BlockerDisposition.CARRIED,
         "Read scope was never checked. Unevaluated is not permitted — an unasked question has no "
@@ -189,6 +209,10 @@ class EvaluatorVerdictV1:
 EVALUATOR_ONLY_BLOCKERS: frozenset[str] = frozenset({
     R.POLICY_REFERENCE_UNRESOLVABLE,
     R.RENDERER_CANNOT_DISPATCH,
+    R.ARTIFACT_NOT_SERVABLE,
+    R.ENVIRONMENT_INCOMPATIBLE,
+    R.VERIFICATION_NOT_CURRENT,
+    R.PUBLICATION_CAPABILITY_MISSING,
 })
 
 

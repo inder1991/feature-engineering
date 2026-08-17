@@ -58,7 +58,14 @@ def test_THE_TABLE_IS_COMPLETE_OVER_THE_CODES_THE_POLICY_EMITS():
 def test_the_EVALUATOR_ONLY_blockers_are_EXECUTION_CHAIN_facts():
     """Both are discovered while compiling, not while listing candidates. Asking the activation
     policy for them would mean compiling every candidate to answer a list query."""
-    assert EVALUATOR_ONLY_BLOCKERS == {R.POLICY_REFERENCE_UNRESOLVABLE, R.RENDERER_CANNOT_DISPATCH}
+    assert EVALUATOR_ONLY_BLOCKERS == {
+        # generate (S4/S8)
+        R.POLICY_REFERENCE_UNRESOLVABLE, R.RENDERER_CANNOT_DISPATCH,
+        # verify (S11)
+        R.ARTIFACT_NOT_SERVABLE, R.ENVIRONMENT_INCOMPATIBLE,
+        # publish sandbox (S11)
+        R.VERIFICATION_NOT_CURRENT, R.PUBLICATION_CAPABILITY_MISSING,
+    }
     for code in EVALUATOR_ONLY_BLOCKERS:
         disposition, reason = ACTIVATION_BLOCKER_DISPOSITIONS[code]
         assert disposition is BlockerDisposition.CARRIED, code

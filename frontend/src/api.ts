@@ -4198,3 +4198,163 @@ export interface MaterializationRunDetail {
 export function getMaterializationRun(requestId: string): Promise<MaterializationRunDetail> {
   return request(`/materialization-runs/${encodeURIComponent(requestId)}`)
 }
+
+// ── S11: the user-reachable execution surface ───────────────────────────────────────────────────
+// Generate authorizes, code view shows what would run, verify runs it in the sandbox, publish makes
+// it visible. Four ACTIONS with four different consequences, so four functions rather than one
+// parameterised call: a single `execute(action)` would put the difference between "read some text"
+// and "make a number visible to everyone downstream" in an argument.
+//
+// EVERY BLOCKER ARRIVES WITH ITS REASON, from the server's own disposition table. This client never
+// composes an explanation — a code with a locally-invented sentence is how two surfaces start
+// explaining the same refusal differently.
+
+export interface ExecutionBlocker {
+  code: string
+  reason: string
+}
+
+export interface ExecutionEligibility {
+  action: string
+  allowed: boolean
+  blockers: ExecutionBlocker[]
+}
+
+export interface GenerationAuthorization {
+  generation_authorization_revision_id: string
+  environment_id: string
+  logical_group_name: string
+  target_mode: string
+  // null exactly when the mode is 'exploration' — an exploration build HAS no target. Never
+  // rendered as an empty string, because "no target" and "a target nobody named" are different.
+  target_ref: string | null
+  detail: string
+}
+
+export interface ArtifactFile {
+  path: string
+  content: string
+}
+
+export interface PolicyRealizationLink {
+  revision_id: string
+  occurrence_hash: string
+}
+
+export interface ArtifactCode {
+  artifact_id: string
+  environment_id: string
+  logical_group_name: string
+  project_digest: string
+  files: ArtifactFile[]
+  // WHICH governed policies produced this number, and which occurrence each answered (S11's
+  // "policy provenance visible" deliverable).
+  policy_realizations: PolicyRealizationLink[]
+}
+
+export interface VerifiedOutputSummary {
+  revision_id: string
+  input_observation_strength: string
+  reads_enforced: boolean
+  retention_state: string
+}
+
+export interface VerificationResult {
+  execution_hash: string
+  sealed_artifact_id: string
+  attempt: number
+  staging_path: string
+  started_at: string
+  // null is the ORDINARY answer while a worker is still running — never an error, and never a
+  // fabricated pending output.
+  verified_output: VerifiedOutputSummary | null
+}
+
+export interface VerificationRequested {
+  execution_hash: string
+  sealed_artifact_id: string
+  attempt: number
+  staging_path: string
+  detail: string
+}
+
+export interface PublicationRequested {
+  attempt_id: string
+  logical_group_name: string
+  environment_id: string
+  outcome: string
+  detail: string
+}
+
+export interface PublicationStatus {
+  environment_id: string
+  logical_group_name: string
+  blocked: boolean
+  blocking_attempt_id: string | null
+  blocking_outcome: string | null
+  detail: string
+}
+
+export function authorizeGeneration(body: {
+  environment_id: string
+  logical_group_name: string
+  build_set_revision_id: string
+  target_mode: string
+  target_ref: string | null
+}): Promise<GenerationAuthorization> {
+  return post('/feature-execution/generations', body)
+}
+
+export function verifyEligibility(
+  artifactId: string, inventoryObservationId: string, environmentId: string,
+): Promise<ExecutionEligibility> {
+  const query = new URLSearchParams({
+    inventory_observation_id: inventoryObservationId,
+    environment_id: environmentId,
+  })
+  return request(
+    `/feature-execution/${encodeURIComponent(artifactId)}/verify-eligibility?${query}`)
+}
+
+export function getArtifactCode(artifactId: string): Promise<ArtifactCode> {
+  return request(`/feature-execution/${encodeURIComponent(artifactId)}/code`)
+}
+
+export function requestVerification(body: {
+  sealed_artifact_id: string
+  generation_authorization_revision_id: string
+  check_set_hash: string
+  inventory_observation_id: string
+  environment_id: string
+  attempt: number
+}): Promise<VerificationRequested> {
+  return post('/feature-execution/verifications', body)
+}
+
+export function getVerificationResult(executionHash: string): Promise<VerificationResult> {
+  return request(`/feature-execution/verifications/${encodeURIComponent(executionHash)}`)
+}
+
+export function requestPublication(body: {
+  verified_output_revision_id: string
+  staging_path: string
+  sealed_artifact_id: string
+  environment_id: string
+  logical_group_name: string
+  publish_mechanism: string
+  capability_attestation: string
+  expected_active_revision_id: string | null
+  observed_active_revision_id: string | null
+}): Promise<PublicationRequested> {
+  return post('/feature-execution/publications', body)
+}
+
+export function getPublicationStatus(
+  environmentId: string, logicalGroupName: string,
+): Promise<PublicationStatus> {
+  const query = new URLSearchParams({
+    environment_id: environmentId,
+    logical_group_name: logicalGroupName,
+  })
+  return request(`/feature-execution/publications?${query}`)
+}

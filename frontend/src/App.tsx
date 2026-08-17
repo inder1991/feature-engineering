@@ -185,6 +185,15 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M3 13.25h10" />
     </NavIcon>
   ),
+  // S11's execution workspace, reached with an artifact id and behind VITE_FEATURE_EXECUTION. A
+  // detail sheet rather than a nav tab, so it is absent from PAGES; the entry exists only because
+  // ICONS is an exhaustive Record<Route> (mirrors 'materialization' / 'asset' / 'gate').
+  'feature-execution': (
+    <NavIcon>
+      <path d="M6 3.5 2.75 8 6 12.5" />
+      <path d="M10 3.5 13.25 8 10 12.5" />
+    </NavIcon>
+  ),
   // Also a detail sheet, not a nav tab (absent from PAGES): one table's suggested features. The
   // entry exists only because ICONS is an exhaustive Record<Route> (mirrors 'asset' / 'gate').
   suggested: (
