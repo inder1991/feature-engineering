@@ -920,19 +920,56 @@ migration: S12 is generation only and stores nothing of its own.
 > **Acceptance:** a free-form V2 run reaches admission through the **v2** tool seam; the advertised
 > set is `renderer-dispatchable ∩ execution-proved`.
 
-**SECOND CLAUSE DONE; FIRST NOT BUILT.** `execution_proof_store.advertised_operators` is the
-intersection, computed in ONE place (asserted: the predicate appears once in the module), because
-three surfaces computing it three ways is how one of them starts advertising an operator on half the
-evidence. Tested as an intersection rather than a union: proved-but-not-dispatchable and
-dispatchable-but-not-proved are both ABSENT from the advertised set, and an unrecorded operator is
-absent rather than assumed.
+**DONE — both clauses.** `materialize/admission_v2.py`, `test_admission_v2_s13.py` **18 passed**.
+No migration: S13 admits, it stores nothing of its own.
 
-**The free-form V2 authoring path is NOT built**, and after S11 it is the ONE remaining item in
-S1–S13. It is not a gap that can be closed by more of the same work: it needs an LLM authoring loop
-against the V3 tool seam, and the plan's own C-A2 note records why the adjacent halves were
-deliberately left out — *"pin with one producer and no consumer"*. S2 built the DETERMINISTIC
-producer; the free-form one is a separate charter with live LLM spend attached, and the worker still
-does not pass `reviewed_blueprint` (see S2's note), so the flip is an explicit operator decision.
+* **The advertised set** (`execution_proof_store.advertised_operators`) is
+  `renderer-dispatchable ∩ execution-proved`, computed in ONE place — asserted: the predicate appears
+  once in the module — because three surfaces computing it three ways is how one starts advertising
+  an operator on half the evidence. Tested as an intersection: proved-but-not-dispatchable and
+  dispatchable-but-not-proved are both ABSENT, and an unrecorded operator is absent rather than
+  assumed.
+* **The first clause needed a DOOR, and finding which door was the work.** `admit_artifacts`'s check
+  4b refuses any formula that is not version 1 and says why in its own docstring — *"The v2 path
+  arrives with an engine that ADVERTISES it"* — so until the advertised set existed the refusal was
+  correct and a free-form v2 run had nowhere to go. `admit_artifacts_v2` is that door, and the
+  advertisement is a CHECK in it rather than a comment.
+* **Tested END TO END, with nothing hand-built**: a real `run_authoring_v2_replay` against a
+  scripted provider, through `recipe_tool_runner_v2` — the v2 tool seam the acceptance names —
+  folding to a real terminal trace event and admitted from that trace. A fixture assembled to look
+  like a run would prove only that the checks accept the shape the test happens to write.
+* **DRIVING A REAL RUN FOUND TWO THINGS READING COULD NOT.**
+  **(a) There are two trace lanes, and only one is admissible.** `run_authoring_v2` (1020's lane)
+  writes `authoring_trace_event`; `materialize.authoring_trace` reads `formula_authoring_trace_event`
+  (1022's). A run driven through the former can complete perfectly and never be admissible — "the
+  run completed" and "the run is admissible" are not the same claim, and the first test written
+  against the wrong orchestrator failed with `AUTHORING_RUN_INCOMPLETE` on a run that had plainly
+  finished.
+  **(b) `authoring_intent_hash_v2` is the WRONG hasher for that lane.** The intent carries no
+  grammar, so there is no "v2 projection" of it; what decides the digest is the recipe the 1022
+  MANIFEST was stamped with, and the replay lane stamps all FIVE fields including
+  `recipe_authoring_context`. The v2 hasher covers four — right for the lane it belongs to, and it
+  refused five otherwise-perfect end-to-end runs with `INTENT_HASH_MISMATCH`.
+* **Checks 1–3 are IMPORTED, not copied** (asserted by object identity): they read one trace row and
+  carry no grammar, and two readings of one record eventually disagree about what a tampered payload
+  looks like. What genuinely differs is four things, each a fact about the language rather than a
+  preference — the artifact is a PROPOSAL whose hash dispatches on wire version; the version gate is
+  a MEMBERSHIP test over `{2, 3}` (a floor would admit a version 4 nobody defined, and a v1 formula
+  here would be read under operations v1 never defined); the axes are SEVEN because v2 adds `review`;
+  and every implied operator must be advertised.
+* **`review` is checked as a PRESENCE, not a value.** A payload recording neither a critic status nor
+  a review is a run whose review provenance nobody can recover — and the deterministic recipe path is
+  precisely the one that folds `critic_status=None`, so a six-axis check would refuse the bypass's
+  whole use case while passing a run that lost the axis silently.
+* **No plan-envelope check, stated rather than defaulted.** B3's envelope is the recipe path's frozen
+  plan and a FREE-FORM run has none; requiring one would refuse every free-form artifact, and
+  inventing an empty one would claim a governed plan nobody wrote.
+* **The implied operators are DERIVED from the proposal**, never asserted beside it (C-C10's rule) —
+  a declared currency conversion implies the FX join AND its two gates, so a feature cannot be
+  admitted against an engine that advertises the join but not them. The admitted artifact carries the
+  kinds it was checked against, so a later stage does not re-derive the topology from a different
+  reading.
+* Mutation-checked: removing the advertised-set check kills 3 tests.
 
 ## 2. Carried forward
 
@@ -955,6 +992,14 @@ S0 semantics + numerics + PILOT DATA REALITY ─► S0.5 contracts ⟨A · B · 
   ─► S9 verify ─► S10 CAS publish ─► S11 UI ⟨first user-reachable generation⟩
   ─► S12 corpus ─► S13 build free-form + expand
 ```
+
+**EXECUTION STATUS (2026-08-17).** S1–S13 are all DONE and pushed. Each stage's section above
+records what was built, what it refuses and why, and what driving it found. Migrations **1072,
+1074–1082 are FILES ONLY** — none applied; applying them is an operator action, backend-first. The
+remaining work is operator-side rather than engineering: apply the migrations, top up provider
+billing for a live free-form run, and flip the deployment switches
+(`FEATUREGEN_MATERIALIZE_ENABLED`, `VITE_FEATURE_EXECUTION`), all of which are explicit decisions
+this plan does not make.
 
 **What changed in revision 19.** V3 becomes a **complete type family** — `AggregateExpressionV3`,
 body types, proposal, `schema_v3`/`canonical_v3`/`parse_v3` and every consumer — because revision 18
