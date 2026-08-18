@@ -202,10 +202,10 @@ def _drive(
     result = _author(conn, claim, draft_id, facts, lease_seconds=lease_seconds)
 
     # A RUN THAT PARSED NOTHING HAS NO FORMULA, and must not be walked towards READY carrying an
-    # empty one. The database's CHECK requires a non-null `formula_json`, and `{}` satisfies NULL
-    # NOT — so an empty dict would have produced a READY draft with nothing in it, which every
-    # reader downstream would treat as a formula. It is BLOCKED with the disposition that explains
-    # why: the run happened, it was paid for, and it did not yield an artifact.
+    # empty one. `{}` satisfies NOT NULL, so the original constraint let a READY draft carry nothing
+    # at all — which every reader downstream would treat as a formula. Found end to end; the
+    # constraint now forbids it too. It is BLOCKED with the disposition that explains why: the run
+    # happened, it was paid for, and it did not yield an artifact.
     proposal = _proposal_material(result)
     if not proposal:
         return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=[{

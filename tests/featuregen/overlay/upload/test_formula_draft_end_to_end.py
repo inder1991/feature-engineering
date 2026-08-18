@@ -122,20 +122,25 @@ def _seed_user(db):
 
 
 @pytest.fixture
-def lane(db, monkeypatch, _dsn):
+def lane(db, monkeypatch):
     """Everything a draft needs, and a scripted provider that COUNTS how often it is asked.
 
-    THE LEASE RENEWAL IS STUBBED, and only that. It writes on its OWN connection — deliberately, so
-    a renewal is visible to other workers the moment it happens rather than when the run commits —
-    and this suite runs inside one rolled-back transaction, so that second connection cannot see the
-    queue row it would renew. The same stub the shadow lane's tests use, for the same reason.
-    `_sync_from_trace` is left alone: it is best-effort by construction and its own connection
-    finding nothing is a path worth exercising rather than mocking away.
+    NO DSN IS SET, and that is the important part. Given one, the replay orchestrator opens its own
+    connection and commits the run, its trace and its provider records DURABLY — correctly, because
+    a checkpoint that vanished with a crash would not be a checkpoint, and `llm_call` is write-once
+    by trigger precisely so an audit record cannot be erased afterwards. But this suite rolls back,
+    so those rows would survive it: an earlier version of this fixture left twelve `llm_dispatch`
+    rows behind and failed `test_recipe_formula_worker`, which counts that table across the whole
+    database. Nothing here may write outside the transaction, so nothing here needs erasing — and
+    the audit table's write-once guarantee is left intact rather than worked around.
+
+    `_renew` is stubbed for the same reason: it renews on its own connection by design, so that a
+    renewal is visible to other workers the moment it happens rather than when the run commits.
+    Its production behaviour belongs to the lane's own tests, not to this one.
     """
-    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
     monkeypatch.setattr(
-        "featuregen.overlay.upload.formula_draft_worker.renew_formula_draft",
-        lambda *args, **kwargs: True)
+        "featuregen.overlay.upload.formula_draft_worker._renew", lambda *a, **k: None)
     seed_authoring_catalog(db)
     _seed_snapshot(db)
     _seed_candidate(db)
