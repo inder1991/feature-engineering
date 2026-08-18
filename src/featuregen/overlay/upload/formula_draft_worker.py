@@ -220,7 +220,13 @@ def _drive(
     # ── 2-6. author, critique, parse, validate, persist ──────────────────────────────────────────
     if draft.state is DraftStateV1.REQUESTED:
         with conn.transaction():
-            advance(conn, draft_id, DraftStateV1.AUTHORING)
+            # STAMP THE RUN ID BEFORE THE RUN, not after it. The id is derived from the draft, so it
+            # is known in advance — and recording it up front means it survives EVERY way the run
+            # can end, including the ones that never return a result at all. An earlier version set
+            # it only from the folded result, so a provider that refused outright produced a FAILED
+            # draft naming no run, and there was nothing for an operator to go and look at.
+            advance(conn, draft_id, DraftStateV1.AUTHORING,
+                    authoring_run_id=_deterministic_run_id(draft_id))
 
     result = _author(conn, claim, draft_id, facts, lease_seconds=lease_seconds)
 
@@ -231,6 +237,22 @@ def _drive(
     # happened, it was paid for, and it did not yield an artifact.
     proposal = _proposal_material(result)
     if not proposal:
+        # NO FORMULA — but the two reasons are not the same kind of thing, and the run says which.
+        #
+        # `technical_failure` means the platform could not complete: the provider refused, the
+        # network went, something broke. That IS an outage and belongs to whoever is on call. Found
+        # live — an expired API key surfaced as "this formula could not be produced", which reads as
+        # a fact about the candidate and sends the user to re-examine a feature that was never the
+        # problem. The run id rides along because an operator cannot investigate a run nobody named.
+        #
+        # Anything else — the model gave up, nothing parsed — is a product result about this
+        # candidate, and BLOCKED is the honest word for it.
+        if result.technical_status == "technical_failure":
+            return _terminalize(
+                conn, draft_id, DraftStateV1.FAILED,
+                failure_reason=f"the authoring run could not complete (run "
+                               f"{result.authoring_run_id}); this is a platform or provider fault, "
+                               f"not a problem with the candidate")
         return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=[{
             "code": "NO_FORMULA_PRODUCED",
             "reason": f"the authoring run finished as {result.authoring_disposition} without a "

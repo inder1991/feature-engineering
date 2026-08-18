@@ -342,3 +342,37 @@ def test_a_deployment_that_NAMES_NO_ENGINE_still_delivers_the_formula(db, lane, 
     # HONEST ABSENCE: no decision was made, so none is recorded.
     assert db.execute(
         "SELECT count(*) FROM formula_draft_admission").fetchone()[0] == 0
+
+
+# ══ AN OUTAGE IS NOT A PRODUCT RESULT ═══════════════════════════════════════════════════════════
+def test_A_PROVIDER_FAILURE_IS_AN_OUTAGE_AND_NAMES_ITS_RUN(db, lane, monkeypatch):
+    """A run the platform could not complete is FAILED, and carries the run id to investigate.
+
+    FOUND LIVE: an expired provider key surfaced as BLOCKED "this formula could not be produced" —
+    which reads as a fact about the candidate and sends the user to re-examine a feature that was
+    never the problem, while the person who can actually fix it is never told. The run's own
+    `technical_status` already distinguishes the two; this is the lane reading it.
+
+    The run id matters as much as the state: an operator cannot investigate a run nobody named, and
+    the earlier version discarded it on this path.
+    """
+    from featuregen.intake.llm import FakeLLM
+
+    # A provider that refuses, the way an unauthenticated one does.
+    def _refusing_client():
+        class _Refuses(FakeLLM):
+            def complete(self, *args, **kwargs):  # noqa: ANN002, ANN003
+                raise RuntimeError("provider auth failure")
+        return _Refuses(script={})
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.formula_draft_worker.current_llm_client", _refusing_client)
+    _request_and_enqueue(db, "fd-provider", "m-provider")
+
+    process_formula_draft_once(db, owner="w")
+
+    draft = read_draft(db, "fd-provider")
+    assert draft.state is DraftStateV1.FAILED, "a provider outage was reported as a product result"
+    assert draft.blockers == (), "an outage names no candidate blocker"
+    assert draft.failure_reason and "not a problem with the candidate" in draft.failure_reason
+    assert draft.authoring_run_id, "FAILED without naming the run leaves nothing to investigate"
