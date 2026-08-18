@@ -201,7 +201,8 @@ def _one_option_revision():
     from featuregen.overlay.upload.contract.gate1 import _candidate_identity, _idea_json
     from featuregen.overlay.upload.feature_assist import FeatureIdea
 
-    idea = FeatureIdea(name="f", description="d", derives_from=["src::public.t.c"],
+    idea = FeatureIdea(name="f", description="d", derives_from=["public.t.c"],
+                       derives_pairs=(("src", "public.t.c"),),
                        aggregation="sum", grain_table="t")
     identity = _candidate_identity(path="anchor", source="anchor", lens="anchor", feature=idea)
     return json.dumps({

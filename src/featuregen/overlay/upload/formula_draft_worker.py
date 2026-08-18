@@ -291,7 +291,34 @@ def _frozen_facts(
         # Recording it as FAILED would page an operator about an outage that is not happening.
         return {"blocker": {"code": "CANDIDATE_UNRESOLVABLE", "reason": str(exc)}}
 
-    refs = frozenset(str(ref) for ref in (idea.derives_from or ()) if str(ref).strip())
+    # THE REFS THE SNAPSHOT IS KEYED BY, which are not the refs the candidate carries.
+    #
+    # `derives_from` is a bare object_ref (`public.bo_cib_customer.business_dt`) and the graph stores
+    # object_refs PUBLIC-FLATTENED, while the snapshot is keyed by the SCHEMA-PRESERVING logical ref
+    # (`cib::bo_dpl_cib.bo_cib_customer.business_dt`). Two things have to be added: the catalog
+    # source, which `derives_pairs` carries precisely so downstream never re-derives it ambiguously,
+    # and the real schema, which only the graph row knows.
+    #
+    # `logical_ref_of` is the SHIPPED translation for exactly this and does both. Rebuilding it here
+    # by string concatenation is what produced the live failure this replaced: the refs looked
+    # plausible, matched nothing in the snapshot, and the loader refused the whole draft.
+    from featuregen.overlay.upload.column_authority import logical_ref_of
+
+    pairs = tuple(idea.derives_pairs or ())
+    if not pairs:
+        # No catalog source recorded, so no ref can be resolved. Not a failure — a candidate the
+        # generator produced before pairs were carried, which cannot be authored against a snapshot.
+        return {"blocker": _NO_GROUNDED_REFS}
+
+    refs: set[str] = set()
+    for source, object_ref in pairs:
+        refs.add(logical_ref_of(conn, str(source), str(object_ref)))
+        # The TABLE the column belongs to, because the tool runner gates the formula's
+        # `source_relation.table_ref` against this same set — a column-only set refuses the very
+        # relation the formula must name.
+        head, _, _tail = str(object_ref).rpartition(".")
+        if head:
+            refs.add(logical_ref_of(conn, str(source), head, kind="table"))
     if not refs:
         return {"blocker": _NO_GROUNDED_REFS}
 
@@ -343,8 +370,17 @@ def _author(
                 "read on its behalf"),
         })
 
-    frozen = FrozenRecipeReadContext.load(
-        conn, facts["snapshot_id"], facts["allowed_refs"])
+    try:
+        frozen = FrozenRecipeReadContext.load(
+            conn, facts["snapshot_id"], facts["allowed_refs"])
+    except ValueError as exc:
+        # The frozen catalog does not describe a column this candidate needs. A fact about what was
+        # SNAPSHOTTED, with a remedy (regenerate the candidates against a current snapshot) that
+        # belongs to whoever asked for them — so a blocker, not an outage. Found live, reported as
+        # FAILED, which sent an operator looking for an incident that was not happening.
+        raise _DraftBlocked({
+            "code": "SNAPSHOT_MISSING_REFS",
+            "reason": str(exc)}) from exc
     client = current_llm_client()
 
     def progress() -> None:

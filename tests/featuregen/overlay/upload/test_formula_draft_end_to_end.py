@@ -80,10 +80,18 @@ def _seed_candidate(db):
     from featuregen.overlay.upload.contract.gate1 import _candidate_identity, _idea_json
     from featuregen.overlay.upload.feature_assist import FeatureIdea
 
+    # `derives_pairs` is (catalog_source, object_ref) with the object_ref PUBLIC-FLATTENED — the
+    # shape the generator records and the graph stores. The worker resolves each through
+    # `logical_ref_of` to the schema-preserving key the snapshot is actually indexed by, and derives
+    # the TABLE ref from the column's parent. Written that way here so this test exercises the same
+    # translation production does; a fixture holding pre-resolved refs would have hidden the live
+    # defect where the two spellings did not match.
+    columns = [ref.split("::", 1) for ref in (REF_AMT, REF_DT, REF_CIF)]
     idea = FeatureIdea(
         name="posted_debit_amount_30d",
         description="recent debit volume",
-        derives_from=list(REFS),
+        derives_from=[ref for _src, ref in columns],
+        derives_pairs=tuple((src, ref) for src, ref in columns),
         aggregation="sum",
         grain_table="account",
         grain_ref=("authored", REF_CIF))
