@@ -47,9 +47,16 @@ from featuregen.identity.current_principal import (
     resolve_current_principal,
 )
 from featuregen.intake.llm import current_llm_client
-from featuregen.materialize.admission_v2 import ResolvedFeatureInputV2, admit_artifacts_v2
+from featuregen.materialize.admission_v2 import (
+    ResolvedFeatureInputV2,
+    admit_artifacts_v2,
+    implied_operator_signatures,
+)
 from featuregen.materialize.codes import MaterializationRefused
-from featuregen.materialize.execution_proof_store import advertised_operators
+from featuregen.materialize.execution_proof_store import (
+    renderer_supported_operators,
+    unqualified_operators,
+)
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.formula_draft_store import (
     DraftStateV1,
@@ -482,7 +489,11 @@ def _admit(
             reason=f"{FORMULA_DRAFT_ENGINE_ENV} is unset")
         return _terminalize(conn, draft_id, DraftStateV1.READY)
 
-    advertised = advertised_operators(conn, engine_id=engine_id)
+    # THE ADMISSION IDENTITY IS KEYED ON WHAT GATES IT — the renderer-supported set, since that is
+    # what admission now decides against. Keying it on the qualified set instead would re-decide
+    # every formula the first time a gold proof landed, buying nothing: proofs change whether the
+    # platform VOUCHES for an operator, not whether the formula may be compiled.
+    supported = renderer_supported_operators(conn, engine_id=engine_id)
     try:
         admit_artifacts_v2(
             conn, [ResolvedFeatureInputV2(intent, result)], engine_id=engine_id)
@@ -494,13 +505,29 @@ def _admit(
         with conn.transaction():
             record_admission(
                 conn, formula_draft_id=draft_id, formula_content_hash=formula_hash,
-                engine_id=engine_id, advertised=advertised, admitted=False, blockers=blockers)
+                engine_id=engine_id, advertised=supported, admitted=False, blockers=blockers)
         return _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=blockers)
 
     with conn.transaction():
         record_admission(
             conn, formula_draft_id=draft_id, formula_content_hash=formula_hash,
-            engine_id=engine_id, advertised=advertised, admitted=True)
+            engine_id=engine_id, advertised=supported, admitted=True)
+
+    # QUALIFICATION IS REPORTED, NOT REQUIRED. The formula compiles, so a user may read the code —
+    # but every operator nobody has proved against reviewed gold is named here, because "unverified"
+    # on its own tells a user nothing to act on and an operator nothing to go and prove.
+    #
+    # These are NOT blockers. A blocker means the draft could not be produced; this draft was
+    # produced and is readable. Recording them as blockers would refuse a formula for the platform's
+    # own incomplete evidence, which is the confusion this whole step exists to remove.
+    unqualified = unqualified_operators(
+        conn, engine_id=engine_id, signatures=implied_operator_signatures(result.candidate_proposal))
+    if unqualified:
+        log("featuregen.formula_draft.unqualified_operators", formula_draft_id=draft_id,
+            engine_id=engine_id,
+            operators=[f"{kind}:{variant}" for kind, variant in unqualified],
+            detail="the formula compiles and may be read; these operators have no gold proof yet, "
+                   "so the platform does not vouch for the numbers they would produce")
     return _terminalize(conn, draft_id, DraftStateV1.READY)
 
 

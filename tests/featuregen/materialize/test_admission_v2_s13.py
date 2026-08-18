@@ -47,6 +47,7 @@ from featuregen.materialize.execution_proof_store import (
     record_execution_proof,
     record_renderer_dispatch,
     set_execution_proof,
+    unqualified_operators,
 )
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.overlay.upload.publication_revisions import OperatorExecutionProofV1
@@ -141,6 +142,13 @@ def _free_form_run(db, raw: dict | None = None, *, intent: AuthoringIntent = _IN
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
         tool_runner=recipe_tool_runner_v2(
             frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})))
+
+
+def _dispatch_only(db):
+    """Renderer support recorded and NO proofs attached — the honest state of this platform today."""
+    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
+        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+        **{sig: True for sig in _PILOT_SIGNATURES}})
 
 
 def _proof_hash_for(db) -> str:
@@ -240,23 +248,54 @@ def test_THE_TOOL_SEAM_IS_THE_V2_ONE(catalog):
 
 # ══ the ADVERTISED-set gate (S13's two clauses meeting) ════════════════════════════════════════
 def test_AN_UNADVERTISED_OPERATOR_REFUSES_ADMISSION(catalog):
-    """The check v1's docstring promised. Nothing is advertised, so nothing is admitted."""
+    """The renderer has no branch for it, so there is nothing to compile and nothing to show."""
     result = _free_form_run(catalog)
     with pytest.raises(MaterializationRefused) as raised:
         admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
     assert raised.value.code is CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED
-    assert "does not advertise" in raised.value.detail
+    assert "cannot emit in this build" in raised.value.detail
 
 
-def test_DISPATCHABLE_WITHOUT_A_PROOF_IS_NOT_ENOUGH(catalog):
-    """Advertised means renderer-dispatchable AND execution-proved. A renderer branch with no gold
-    proof is a branch nobody ran against reviewed gold."""
-    record_renderer_dispatch(catalog, engine_id=ENGINE, dispatchable={
-        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
-        **{sig: True for sig in _PILOT_SIGNATURES}})
+def test_DISPATCHABLE_WITHOUT_A_PROOF_IS_ENOUGH_TO_GENERATE_CODE(catalog):
+    """The policy this step deliberately changed, and why.
+
+    This test previously asserted the opposite: dispatch without a gold proof refused admission.
+    That rule made admission unreachable in practice — nothing populates proofs until a gold harness
+    exists (step 6), so EVERY formula refused, and the shortest route to a working pipeline became
+    writing a proof record for a proof nobody ran. The rule intended to guarantee honesty was
+    manufacturing the exact dishonesty it existed to prevent.
+
+    The three claims are now separate. Renderer-support gates CODE GENERATION: the formula compiles
+    and a person may read what was produced. Execution-qualification is reported beside it, not
+    required. Artifact-verification gates PUBLICATION, and nothing here loosens that.
+
+    Showing someone unverified code while saying it is unverified is honest. Refusing to show it
+    until somebody forges a proof is not.
+    """
+    _dispatch_only(catalog)
     result = _free_form_run(catalog)
-    with pytest.raises(MaterializationRefused, match="does not advertise"):
-        admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
+
+    admitted = admit_artifacts_v2(
+        catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
+    assert admitted, "a compilable formula was refused for the platform's own missing evidence"
+
+    # And the gap is NAMED, so "unverified" is something a user and an operator can both act on.
+    unqualified = unqualified_operators(
+        catalog, engine_id=ENGINE,
+        signatures=implied_operator_signatures(result.candidate_proposal))
+    assert ("aggregate", "sum") in unqualified
+    assert set(unqualified) == set(implied_operator_signatures(result.candidate_proposal)), (
+        "nothing has been proved, so every implied operator should be reported unqualified")
+
+
+def test_a_PROVED_operator_stops_being_reported_as_unqualified(catalog):
+    """The other direction: qualification is a real state, not a permanent disclaimer."""
+    _advertise(catalog)
+    result = _free_form_run(catalog)
+
+    assert unqualified_operators(
+        catalog, engine_id=ENGINE,
+        signatures=implied_operator_signatures(result.candidate_proposal)) == ()
 
 
 def test_ONE_MISSING_OPERATOR_IS_ENOUGH_TO_REFUSE(catalog):

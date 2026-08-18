@@ -309,6 +309,50 @@ def advertised_operators(
         "ORDER BY operator_kind, operator_variant", (engine_id, build)).fetchall())
 
 
+def renderer_supported_operators(
+    conn: DbConn, *, engine_id: str, build_hash: str | None = None,
+) -> tuple[OperatorSignature, ...]:
+    """The signatures this build's renderer CAN EMIT — dispatch only, no proof required.
+
+    **This is the gate for CODE GENERATION, and it is deliberately weaker than
+    :func:`advertised_operators`.** The three claims a capability row can support are not the same
+    claim, and conflating them is what made the earlier model unusable:
+
+    * *renderer-supported* — this build can emit it. Decides whether a formula compiles into code a
+      person can READ. Derivable from the renderer, cheap, and true or false today.
+    * *execution-qualified* — someone ran it against reviewed gold and the number was right
+      (:func:`advertised_operators`). Decides whether the platform will vouch for it.
+    * *artifact-verified* — THIS generated artifact passed on-demand verification. Decides
+      publication, and is a fact about one artifact rather than about an operator.
+
+    Requiring the second before generating code made the first unreachable: the shortest path to a
+    green pipeline became writing a proof record for a proof nobody ran, which is the one lie the
+    whole structure exists to prevent. Showing a user unverified code and SAYING it is unverified is
+    honest; refusing to show it until someone forges a proof is not.
+    """
+    build = build_hash or renderer_build_hash()
+    return tuple((row[0], row[1]) for row in conn.execute(
+        "SELECT operator_kind, operator_variant FROM engine_operator_capability "
+        "WHERE engine_id = %s AND renderer_build_hash = %s AND renderer_dispatchable "
+        "ORDER BY operator_kind, operator_variant", (engine_id, build)).fetchall())
+
+
+def unqualified_operators(
+    conn: DbConn, *, engine_id: str, signatures: Sequence[OperatorSignature],
+    build_hash: str | None = None,
+) -> tuple[OperatorSignature, ...]:
+    """Which of ``signatures`` this build can emit but has NOT proved.
+
+    The gap between supported and qualified, named rather than inferred. A surface that shows
+    generated code needs this to say *what* is unverified about it — "unverified" alone tells a user
+    nothing they can act on, and tells an operator nothing to go and prove.
+    """
+    qualified = set(advertised_operators(conn, engine_id=engine_id, build_hash=build_hash))
+    supported = set(renderer_supported_operators(
+        conn, engine_id=engine_id, build_hash=build_hash))
+    return tuple(sorted((set(signatures) & supported) - qualified))
+
+
 def capability_of(
     conn: DbConn,
     *,

@@ -54,7 +54,7 @@ from featuregen.materialize.admission import (
 )
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
-from featuregen.materialize.execution_proof_store import advertised_operators
+from featuregen.materialize.execution_proof_store import renderer_supported_operators
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 
 __all__ = [
@@ -340,24 +340,34 @@ def _verify_advertised(
     conn: DbConn, proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3, run_id: str, *,
     engine_id: str,
 ) -> tuple[str, ...]:
-    """The check v1's docstring promised: the v2 path arrives with an engine that ADVERTISES it.
+    """The check v1's docstring promised, at the RENDERER-SUPPORT grain.
 
-    Advertised means ``renderer-dispatchable ∩ execution-proved`` — a renderer branch with no proof
-    is a branch nobody ran against reviewed gold, and a proof for an operator this build cannot emit
-    is a proof about a different build. Admitting on either half alone would let a feature into the
-    chain on half the evidence.
+    **Admission asks whether code can be produced, not whether anyone has proved it correct.** Those
+    are two different questions with two different answers and two different remedies, and this
+    function now answers only the first:
+
+    * *renderer-supported* gates CODE GENERATION — the user may read what was generated.
+    * *execution-qualified* (``advertised_operators``) is reported alongside, not required here.
+    * *artifact-verified* gates PUBLICATION, and is a fact about one artifact.
+
+    It used to require dispatch ∩ proof, which made admission unreachable in practice: nothing
+    populates proofs until a gold harness exists, so every formula refused, and the shortest route
+    to a working pipeline was to write a proof record for a proof nobody ran. Requiring less here
+    removes that temptation rather than relying on someone resisting it — and nothing is loosened
+    downstream, because publication still demands a current artifact verification.
     """
     implied = implied_operator_signatures(proposal)
-    advertised = set(advertised_operators(conn, engine_id=engine_id))
-    missing = sorted(set(implied) - advertised)
+    supported = set(renderer_supported_operators(conn, engine_id=engine_id))
+    missing = sorted(set(implied) - supported)
     if missing:
         named = ", ".join(f"{kind}:{variant}" for kind, variant in missing)
         raise MaterializationRefused(
             CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
-            f"authoring run {run_id} implies operators {named}, which {engine_id!r} does not "
-            f"advertise for this build. Advertised means renderer-dispatchable AND execution-proved: "
-            f"a renderer branch with no gold proof is a branch nobody ran, and a proof for an "
-            f"operator this build cannot emit is a proof about a different build",
+            f"authoring run {run_id} implies operators {named}, which {engine_id!r}'s renderer "
+            f"cannot emit in this build. This is the RENDERER-SUPPORT gate: it asks whether code "
+            f"can be produced at all, not whether anyone has proved it correct. An operator the "
+            f"renderer has no branch for cannot be compiled into anything, so there is nothing to "
+            f"show and nothing to verify",
         )
     return implied
 

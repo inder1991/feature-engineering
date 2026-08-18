@@ -376,3 +376,67 @@ def test_A_PROVIDER_FAILURE_IS_AN_OUTAGE_AND_NAMES_ITS_RUN(db, lane, monkeypatch
     assert draft.blockers == (), "an outage names no candidate blocker"
     assert draft.failure_reason and "not a problem with the candidate" in draft.failure_reason
     assert draft.authoring_run_id, "FAILED without naming the run leaves nothing to investigate"
+
+
+# ══ STEP 2: READY IS REACHABLE WITHOUT A FORGED PROOF ══════════════════════════════════════════
+def test_A_DRAFT_REACHES_READY_ON_RENDERER_SUPPORT_ALONE(db, lane):
+    """The point of separating the three states, demonstrated end to end.
+
+    Before step 2, admission required renderer-dispatch AND a gold execution proof. Nothing
+    populates proofs until the harness exists, so every draft blocked on capability — and the
+    shortest route to a working pipeline was to write a proof record for a proof nobody ran.
+
+    Now the renderer's own support is enough to produce code a person can read. No proof is written
+    here, and none is implied: the draft reaches READY, and what has NOT been proved is reported
+    separately rather than pretended away.
+    """
+    from featuregen.materialize.engine_capability import renderer_dispatch_surface
+    from featuregen.materialize.execution_proof_store import (
+        advertised_operators,
+        record_renderer_dispatch,
+    )
+
+    # THE PLATFORM'S REAL STATE TODAY: renderer support recorded, nothing proved. The shared
+    # fixture advertises with proofs because most tests need an admitting engine; this test is
+    # about the case where none exist, so it detaches them explicitly rather than relying on
+    # fixture ordering.
+    db.execute("UPDATE engine_operator_capability SET execution_proof_hash = NULL "
+               "WHERE engine_id = %s", (ENGINE,))
+    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable=renderer_dispatch_surface())
+    assert advertised_operators(db, engine_id=ENGINE) == (), "precondition: nothing is proved"
+
+    _request_and_enqueue(db, "fd-support", "m-support")
+    outcome = process_formula_draft_once(db, owner="w")
+
+    assert outcome.state == DraftStateV1.READY.value, outcome
+    draft = read_draft(db, "fd-support")
+    assert draft.formula_json, "READY without the formula it exists to deliver"
+    assert draft.blockers == (), "renderer support is not a blocker"
+
+    # The admission decision was recorded against what actually gated it.
+    admitted = db.execute(
+        "SELECT admitted FROM formula_draft_admission WHERE formula_draft_id='fd-support'"
+    ).fetchone()
+    assert admitted is not None and admitted[0] is True
+
+
+def test_an_operator_the_RENDERER_CANNOT_EMIT_still_blocks(db, lane):
+    """The gate that remains, so step 2 reads as a relocation rather than a removal.
+
+    Renderer support is weaker than the old rule, not absent. An operator with no branch compiles
+    into nothing, so there is nothing to show and nothing to verify — that is a genuine refusal and
+    it survives.
+    """
+    from featuregen.materialize.engine_capability import renderer_dispatch_surface
+    from featuregen.materialize.execution_proof_store import record_renderer_dispatch
+
+    surface = dict(renderer_dispatch_surface())
+    surface[("aggregate", "sum")] = False          # the one this formula needs
+    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable=surface)
+
+    _request_and_enqueue(db, "fd-unsupported", "m-unsupported")
+    process_formula_draft_once(db, owner="w")
+
+    draft = read_draft(db, "fd-unsupported")
+    assert draft.state is DraftStateV1.BLOCKED
+    assert "cannot emit in this build" in draft.blockers[0]["reason"]
