@@ -260,3 +260,86 @@ Only one remains, and it is a spec question rather than a decision:
 **The as-of FX join carries `rate_table_ref` in its own payload, and the policy realization also
 names a rate relation.** Which owns it? Two places naming the same table is how they come to
 disagree. This blocks step 12, not before.
+
+---
+
+## 8. Deletion inventory, and the corrections it forces upstream
+
+The V1-removal analysis finished after revision 2 was written. Most of it is step 15 detail, but
+four findings change **earlier** steps and one contradicts the original brief.
+
+### 8.1 ▲ `formula/schema.py` is not a V1 module — and this reorders step 15
+
+It is the **shared structural-leaf library** that V2 and V3 import verbatim: `FilterNode`,
+`NullInput`, `EmptyWindowResult`, windows, grains, parameters, decimal policy — 24 names. Deleting
+it breaks V2, not V1.
+
+**Consequence:** nothing can be safely deleted until those 24 names have a home that is not a V1
+module. So step 15 gains a prerequisite that is worth doing early and independently:
+
+> **Split `formula/schema.py` into shared leaves + `schema_v1`.**
+
+This is low-risk, mechanical, and it converts step 15 from "work out what breaks" into "delete
+`schema_v1`". Same reason the file already says the leaves "carry no versioned vocabulary" — the
+module name simply lies about its contents.
+
+### 8.2 ▲ The renderer goldens are the execution proof — regenerate, never delete
+
+The original brief lists "testing that V1 output remains unchanged" as removable work. Mostly true,
+with one exception that would be expensive to get wrong: the **renderer goldens** look like V1
+output-stability tests but they are the only thing pinning emitted Spark against reviewed expected
+output. They must be **regenerated against V2 output**, not deleted.
+
+Genuinely deletable: four explicit V1 byte/source-freeze assertions — two of which `sha256` the
+**source text** of V1 functions — plus roughly **187 test functions across ten files and an
+11-fixture gold corpus, about 3,435 lines.**
+
+### 8.3 ▲ `resolve_v2.py` does not exist — a missing link steps 4–5 assume
+
+`materialize/resolve.py` is privately bound to the V1 restorer, and there is no V2 equivalent. This
+is the concrete gap between an admitted V2 formula and a compilable one. Estimated ~200 lines and
+described as the smallest high-leverage item in the whole map — it belongs in step 4, named, rather
+than being discovered inside step 5.
+
+Related and equally unnamed: `physical_types_v2.py` is **not** the V2 replacement for
+`physical_types.py`; the V2 feature→type resolver does not exist. `PlannedFeature` hard-requires a
+resolved physical type, so step 4 cannot complete without it.
+
+### 8.4 ▲ `compile/wiring.py` reads `empty_window` / `null_input` off the admitted **V1** formula
+
+Because `PitSpec` deliberately excludes them. Easy to miss, and it means the V2 compile path needs
+its own carrier for those two values before step 8's renderer work can pass them. Neither IR carries
+them today.
+
+### 8.5 Cross-effect: step 1 touches user-visible recipe readiness
+
+The engine's advertised capability — derived from the V1 renderer's four aggregates — drives the
+readiness answer shown for **all 263 recipes**. Changing the capability model in step 1 changes that
+display. Not a blocker, but it must be deliberate: a capability refactor that silently re-labels 263
+recipes is a product change wearing an infrastructure commit message.
+
+### 8.6 Two things that look deletable and are not
+
+- **The recipe/shadow lane is DUAL**, chosen per work item from a declaration whose *absence* means
+  v1. The v1 arm cannot be retired by flipping a default — existing rows select it by saying nothing.
+- **The v1 egress byte-freeze exists because durable work-item rows were sealed against those exact
+  bytes**, and every dispatch re-validates against them. "No V1 data to preserve" is true of
+  *product* data; it is not true of the shadow lane's sealed work items. **Verify before deleting.**
+
+### 8.7 What is already V2 and already dead
+
+The S11 generate/code/verify/publish surface is V2 throughout — and unreachable, because `seal_v2`
+has no production caller. A whole V2 execution sub-chain is built, unit-tested, and has zero
+production callers. That is not V1 debt to remove; it is finished work waiting to be connected,
+which is the entire point of steps 3–9.
+
+### 8.8 One additional gate class, beyond the ten
+
+The join machinery dispatches by `isinstance` on the **V1 step classes**
+(`CrossCatalogJoinStepV1`, `CrosswalkJoinStepV1`) at four sites in `nodes_compute.py`. A V2 graph
+either reuses those step classes or needs an adapter producing them. This is separate from §2's ten
+enum/type gates and was not counted there.
+
+Corroborating the other direction: `OperatorGraphV2`'s `PitAvailabilityFilterV2` carries `PitSpec`
+**verbatim** — the V2 vocabulary already reuses the exact V1 execution type. The PIT renderer needs
+no change for the two supported window bases.
