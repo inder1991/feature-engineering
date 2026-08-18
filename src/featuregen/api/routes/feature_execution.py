@@ -39,8 +39,14 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
-from featuregen.api.deps import get_conn, get_identity, require_confirmer
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    require_feature_generate,
+    require_feature_read,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.permissions import FEATURE_GENERATE, has_permission
 from featuregen.materialize.evaluate_execution import (
     evaluate_publish_sandbox,
     evaluate_verify,
@@ -133,7 +139,7 @@ class GenerationRequestIn(BaseModel):
 
 
 @router.post("/feature-execution/generations", status_code=201,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def authorize_generation(
     body: GenerationRequestIn, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -182,7 +188,7 @@ def authorize_generation(
 
 # ── verify eligibility ───────────────────────────────────────────────────────────────────────────
 @router.get("/feature-execution/{artifact_id}/verify-eligibility",
-            dependencies=[Depends(require_confirmer)])
+            dependencies=[Depends(require_feature_read)])
 def verify_eligibility(
     artifact_id: str, inventory_observation_id: str, environment_id: str,
     conn: _Conn, identity: _Identity,
@@ -203,21 +209,40 @@ def verify_eligibility(
 def _may_execute(identity: IdentityEnvelope) -> bool:
     """Whether this caller may execute against a cluster.
 
-    Derived from the role claims the request arrived with, and NOT re-derived from the catalog: read
-    scope over the group's physical reads is Gate 2's decision and was made when the artifact was
-    authorized. This is the coarser "may this person run things at all".
+    Asked as a PERMISSION, not as a list of role names — the same question the route guard asks, so
+    the two cannot disagree. They used to: the routes demanded the raw ``platform-admin`` claim
+    while this function accepted ``feature_engineer``, so a feature engineer was rejected by the
+    guard before the function that would have authorised them ever ran. Three vocabularies for one
+    idea, and the narrowest of them won by accident of ordering.
+
+    Kept as a separate check even though the guard now asks the same thing: it is what produces the
+    EXPLAINED refusal (``EXECUTION_AUTHORITY_UNMET``) rather than a bare 403, and a later change
+    that widens the guard should not silently widen who may run a cluster job.
+
+    Derived from the claims the request arrived with, and NOT re-derived from the catalog: read
+    scope over the group's physical reads is Gate 2's decision, made when the artifact was
+    authorised. This is the coarser "may this person run things at all".
     """
-    return bool({"feature_engineer", "platform_admin"} & set(identity.role_claims))
+    return has_permission(identity.role_claims, FEATURE_GENERATE)
 
 
 def _may_publish(identity: IdentityEnvelope) -> bool:
     """Whether this caller may publish. STRICTLY narrower than execution: publication makes a number
-    visible to everyone downstream, and the two are separate grants for that reason."""
+    visible to everyone downstream, and the two are separate grants for that reason.
+
+    Still expressed as a ROLE rather than a permission because there is no ``feature:publish``
+    permission in the catalogue yet, and inventing one here — in a route module — would put a
+    second permission vocabulary next to the real one. The narrowing is deliberate and the
+    asymmetry is recorded rather than hidden: a feature engineer REACHES this route (the guard is
+    ``feature:generate``) and is refused by name, which is the answer they can act on. A bare 403
+    from the guard would have told them only that something, somewhere, said no.
+    """
     return "platform_admin" in set(identity.role_claims)
 
 
 # ── code view ────────────────────────────────────────────────────────────────────────────────────
-@router.get("/feature-execution/{artifact_id}/code", dependencies=[Depends(require_confirmer)])
+@router.get("/feature-execution/{artifact_id}/code",
+            dependencies=[Depends(require_feature_read)])
 def artifact_code(artifact_id: str, conn: _Conn) -> dict[str, Any]:
     """The generated project's files, verified on the way out.
 
@@ -277,7 +302,7 @@ class VerificationRequestIn(BaseModel):
 
 
 @router.post("/feature-execution/verifications", status_code=202,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def request_verification(
     body: VerificationRequestIn, response: Response, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -323,7 +348,7 @@ def request_verification(
 
 
 @router.get("/feature-execution/verifications/{execution_hash}",
-            dependencies=[Depends(require_confirmer)])
+            dependencies=[Depends(require_feature_read)])
 def verification_result(execution_hash: str, conn: _Conn) -> dict[str, Any]:
     """What became of one verification — and its THREE-WAY staleness, never a boolean.
 
@@ -382,7 +407,7 @@ class PublicationRequestIn(BaseModel):
 
 
 @router.post("/feature-execution/publications", status_code=202,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def request_publication(
     body: PublicationRequestIn, response: Response, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -436,7 +461,8 @@ def request_publication(
     }
 
 
-@router.get("/feature-execution/publications", dependencies=[Depends(require_confirmer)])
+@router.get("/feature-execution/publications",
+            dependencies=[Depends(require_feature_read)])
 def publication_status(
     environment_id: str, logical_group_name: str, conn: _Conn,
 ) -> dict[str, Any]:
@@ -475,10 +501,32 @@ def _staleness_of(conn: psycopg.Connection, verified_output_revision_id: str) ->
         return StalenessV1.NEITHER
     if row[0] == "unpinned":
         return StalenessV1.NEITHER
-    # The pinned policies are compared against what is CURRENT for each family. Until a caller
-    # supplies the current set this reports CURRENT for a pinned/observed output, which is what the
-    # stored record says; drift detection is the worker's, over the realization pointers.
-    return StalenessV1.CURRENT
+
+    # THE COMPARISON THIS FUNCTION IS NAMED FOR. An earlier version returned CURRENT for every
+    # pinned output without comparing anything — a positive assurance it had not earned, and the
+    # worst possible default: policy drift after a verification is EXACTLY the case this answers,
+    # and reporting it as current tells an operator the verification still holds when nobody
+    # checked. Found by review.
+    pinned = frozenset(row[1] or ())
+    if not pinned:
+        # A pinned output that names no policies cannot be compared against anything. The column is
+        # CHECKed non-empty at the schema, so this is unreachable for rows written through the
+        # store — it is here because "unreachable" is a claim about today's writers.
+        return StalenessV1.NEITHER
+
+    current = frozenset(r[0] for r in conn.execute(
+        "SELECT revision_id FROM policy_realization_current").fetchall())
+    if not current:
+        # NOTHING is recorded as current, so "has it moved?" has no answer — not "no, it has not".
+        # NEITHER is the vocabulary's word for undecidable-on-content, and `is_unverifiable` is what
+        # the surfaces render. This is the LIVE state today: no production code publishes a policy
+        # realization, so the pointer table is empty and every pinned output is honestly
+        # unverifiable rather than dishonestly current.
+        return StalenessV1.NEITHER
+
+    # A pinned realization that is no longer the current one for its family is drift, and drift is
+    # what makes a passed verification untrue. Any single one is enough.
+    return StalenessV1.CURRENT if pinned <= current else StalenessV1.STALE
 
 
 def _now(conn: psycopg.Connection) -> str:

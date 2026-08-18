@@ -306,3 +306,58 @@ describe('the screen is reachable from the app', () => {
     expect(APP).toContain(`<${component}`)
   })
 })
+
+// ══ AN UNCERTAIN PUBLICATION IS NEVER SHOWN AS A PUBLISHED ONE ═════════════════════════════════
+function drawWithPublication(over: Partial<api.PublicationStatus>) {
+  stubReads()
+  vi.spyOn(api, 'getPublicationStatus').mockResolvedValue({
+    environment_id: 'hdfc-local',
+    logical_group_name: 'customer_txn_features',
+    blocked: false,
+    blocking_attempt_id: null,
+    blocking_outcome: null,
+    detail: 'nothing is outstanding for this group',
+    ...over,
+  })
+  render(<FeatureExecutionScreen {...PROPS} />)
+}
+
+it('SHOWS AN UNRECONCILED ATTEMPT AS UNCERTAIN, NOT AS PUBLISHED', async () => {
+  // Found by review, and the worst kind of bug this screen could have: the ONE state meaning
+  // "nobody knows whether the swap landed" was mapped onto the word for success. An operator
+  // reading it would believe the feature was live and stop looking.
+  drawWithPublication({
+    blocked: true,
+    blocking_attempt_id: 'pubatt-1',
+    blocking_outcome: 'unknown_reconciliation_required',
+    detail: 'an unreconciled attempt is outstanding: nobody knows whether its swap landed',
+  })
+
+  await waitFor(() =>
+    expect(screen.getByTestId('stage').textContent).toBe('publication_uncertain'))
+  // An ALERT: this is the state a person has to resolve, and nothing else will.
+  const alert = await screen.findByRole('alert')
+  expect(alert).toHaveTextContent('nobody knows whether its swap landed')
+})
+
+it('distinguishes an in-flight publication from an uncertain one', async () => {
+  // STARTED and UNKNOWN_RECONCILIATION_REQUIRED both block a retry, but they are different facts:
+  // one is progress, one needs a human. Collapsing them loses the only distinction that matters.
+  drawWithPublication({
+    blocked: true, blocking_attempt_id: 'pubatt-2', blocking_outcome: 'started',
+    detail: 'an attempt is in flight',
+  })
+
+  await waitFor(() => expect(screen.getByTestId('stage').textContent).toBe('publishing'))
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+})
+
+it('NEVER CLAIMS PUBLISHED when no attempt is outstanding, because it is not told that', async () => {
+  // `blocked: false` covers never-attempted, succeeded and failed alike. The endpoint reports
+  // blocking attempts, not the active revision, so this screen cannot honestly say "published" —
+  // and says exactly that rather than implying the feature is live.
+  drawWithPublication({})
+
+  expect(await screen.findByText(/not the same as published/)).toBeInTheDocument()
+  expect(screen.getByTestId('stage').textContent).not.toBe('published')
+})

@@ -350,3 +350,154 @@ def _verify(db) -> str:
             input_observation_strength="observed"),
         reads_enforced=False)
     return identity.staging_path("hdfs://nn/staging")
+
+
+# ══ ONE AUTHORIZATION VOCABULARY ════════════════════════════════════════════════════════════════
+def test_A_FEATURE_ENGINEER_REACHES_THE_EXECUTION_ROUTES(client, conn, monkeypatch):
+    """The role that BUILDS features can reach the routes that build features.
+
+    Found by review. Every route here demanded the raw hyphenated `platform-admin` claim through
+    `require_confirmer` — the DUAL-OWNER GOVERNANCE gate, which is a different question entirely —
+    while `_may_execute` inside accepted `feature_engineer`. So a feature engineer was rejected by
+    the guard before the function that would have authorised them ever ran, and the narrowest of the
+    three vocabularies won by accident of ordering.
+
+    Asserted as NOT-403 rather than 200: what these routes answer depends on stored state this test
+    does not build. The bug was never about the answer, it was about never being allowed to ask.
+    """
+    monkeypatch.setenv("FEATUREGEN_MATERIALIZE_ENABLED", "1")
+    engineer = {"X-User": "sam", "X-Roles": "feature_engineer"}
+
+    for method, path in (
+        ("get", "/feature-execution/art-1/code"),
+        ("get", "/feature-execution/art-1/verify-eligibility"
+                "?inventory_observation_id=inv-1&environment_id=env-1"),
+        ("get", "/feature-execution/verifications/exec-1"),
+        ("get", "/feature-execution/publications?environment_id=e&logical_group_name=g"),
+    ):
+        response = getattr(client, method)(path, headers=engineer)
+        assert response.status_code != 403, f"{method.upper()} {path}: {response.text[:200]}"
+
+
+def test_the_guard_and_the_authorizer_ask_THE_SAME_QUESTION():
+    """They used to disagree, and the disagreement was invisible because each looked right alone.
+
+    `_may_execute` now asks for the same PERMISSION the route guard asks for, so the two cannot
+    drift into the state where one admits a caller the other rejects.
+    """
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.api.routes.feature_execution import _may_execute
+    from featuregen.identity.permissions import FEATURE_GENERATE, ROLE_PERMISSIONS
+
+    for role, permissions in ROLE_PERMISSIONS.items():
+        identity = mint_test_identity(subject="user:x", role_claims=(role,))
+        assert _may_execute(identity) == (FEATURE_GENERATE in permissions), role
+
+
+def test_PUBLISHING_STAYS_NARROWER_THAN_EXECUTING():
+    """The asymmetry is deliberate: publication makes a number visible to everyone downstream.
+
+    A feature engineer may execute and may NOT publish — and now learns that by name from the
+    governed refusal, having reached the route, rather than from a bare 403 that says only that
+    something somewhere said no.
+    """
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.api.routes.feature_execution import _may_execute, _may_publish
+
+    engineer = mint_test_identity(subject="user:e", role_claims=("feature_engineer",))
+    admin = mint_test_identity(subject="user:a", role_claims=("platform_admin",))
+
+    assert _may_execute(engineer) and not _may_publish(engineer)
+    assert _may_execute(admin) and _may_publish(admin)
+
+
+# ══ STALENESS IS COMPARED, NOT ASSUMED ══════════════════════════════════════════════════════════
+def _pinned_output(conn, revision_id: str, pinned: list[str]) -> None:
+    """A passed verification pinning some policy realizations.
+
+    Real rows through the real schema, including the attempt the output points at — the CHECKs and
+    the foreign key are part of what makes this a verified output rather than a shape, and a fake
+    connection would prove only that the function reads what a fake handed it.
+    """
+    import json
+
+    conn.execute(
+        "INSERT INTO verification_attempt (execution_hash, generation_authorization_revision_id, "
+        "check_set_hash, inventory_observation_id, attempt, run_parameters, staging_path, "
+        "sealed_artifact_id, started_at) VALUES (%s,'gar-1','cs-1','inv-1',1,'{}'::jsonb,%s,"
+        "'art-1','2026-08-18T00:00:00Z') ON CONFLICT DO NOTHING",
+        (f"exec-{revision_id}", f"hdfs://nn/staging/{revision_id}"))
+    conn.execute(
+        "INSERT INTO verified_output_revision (revision_id, execution_hash, check_set_hash, "
+        "validator_versions, pinned_policy_hashes, input_observation_strength, reads_enforced, "
+        "retention_state) VALUES (%s,%s,'cs-1','[]'::jsonb,%s::jsonb,'pinned',true,'live')",
+        (revision_id, f"exec-{revision_id}", json.dumps(pinned)))
+
+
+def _make_current(conn, revision_id: str, family: str) -> None:
+    """Record one policy realization as CURRENT for its family."""
+    conn.execute(
+        "INSERT INTO policy_realization_revision (revision_id, family_key_hash, policy_kind, "
+        "policy_ref, bound_dataset, environment_id, semantic_role, executable_content_hash, "
+        "cas_pointer, provenance) VALUES (%s,%s,'fx','ref','ds','env','role','ech','cas',"
+        "'source_derived') ON CONFLICT DO NOTHING", (revision_id, family))
+    conn.execute(
+        "INSERT INTO policy_realization_current (family_key_hash, revision_id, pointer_version, "
+        "declared_by) VALUES (%s,%s,1,'user:test') "
+        "ON CONFLICT (family_key_hash) DO UPDATE SET revision_id = EXCLUDED.revision_id",
+        (family, revision_id))
+
+
+def test_STALENESS_IS_UNVERIFIABLE_WHEN_NOTHING_IS_RECORDED_AS_CURRENT(conn):
+    """The live state today, and the one this function got wrong.
+
+    An earlier version returned CURRENT for every pinned output without comparing anything. Policy
+    drift after a verification is precisely what this answers, so a bare CURRENT told an operator
+    the verification still held when nobody had checked. With no realization pointers recorded,
+    "has it moved?" has no answer — and NEITHER is this vocabulary's word for that.
+    """
+    from featuregen.api.routes.feature_execution import _staleness_of
+    from featuregen.overlay.upload.verification_store import StalenessV1
+
+    _pinned_output(conn, "vor-unknown", ["pol-a"])
+    assert conn.execute("SELECT count(*) FROM policy_realization_current").fetchone()[0] == 0
+
+    verdict = _staleness_of(conn, "vor-unknown")
+    assert verdict is StalenessV1.NEITHER
+    assert verdict.is_unverifiable, "the surfaces render this flag; it must say unverifiable"
+
+
+def test_a_pinned_policy_that_is_no_longer_current_is_STALE(conn):
+    """Drift is what makes a passed verification untrue, and one moved policy is enough."""
+    from featuregen.api.routes.feature_execution import _staleness_of
+    from featuregen.overlay.upload.verification_store import StalenessV1
+
+    _pinned_output(conn, "vor-drifted", ["pol-old"])
+    _make_current(conn, "pol-new", "family-1")     # something IS current — just not what it pinned
+
+    assert _staleness_of(conn, "vor-drifted") is StalenessV1.STALE
+
+
+def test_a_pinned_policy_that_is_still_current_is_CURRENT(conn):
+    """The positive answer, now earned by a comparison rather than assumed."""
+    from featuregen.api.routes.feature_execution import _staleness_of
+    from featuregen.overlay.upload.verification_store import StalenessV1
+
+    _pinned_output(conn, "vor-fresh", ["pol-a"])
+    _make_current(conn, "pol-a", "family-1")
+
+    assert _staleness_of(conn, "vor-fresh") is StalenessV1.CURRENT
+
+
+def test_ONE_DRIFTED_POLICY_AMONG_MANY_IS_ENOUGH(conn):
+    """A verification is untrue if ANY policy it depended on moved — not most of them."""
+    from featuregen.api.routes.feature_execution import _staleness_of
+    from featuregen.overlay.upload.verification_store import StalenessV1
+
+    _pinned_output(conn, "vor-mixed", ["pol-a", "pol-b"])
+    _make_current(conn, "pol-a", "family-1")
+    _make_current(conn, "pol-moved", "family-2")   # pol-b is no longer current for its family
+
+    assert _staleness_of(conn, "vor-mixed") is StalenessV1.STALE
