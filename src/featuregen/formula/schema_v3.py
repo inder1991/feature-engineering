@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     DecimalPolicy,
     FilterNode,
     Grain,
