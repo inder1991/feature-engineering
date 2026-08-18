@@ -28,7 +28,10 @@ from featuregen.materialize.corpus_generation import (
     generate_corpus,
     named_refusals,
 )
-from featuregen.materialize.execution_proof_store import record_renderer_dispatch
+from featuregen.materialize.execution_proof_store import (
+    SOLE_VARIANT,
+    record_renderer_dispatch,
+)
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.selection_revisions import BuildDeclarationV1, TargetModeV1
@@ -68,7 +71,7 @@ def _candidate(
 
 def _dispatch_all(db, *, except_kind: str | None = None):
     record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: kind.value != except_kind for kind in OperatorKindV2})
+        (kind.value, SOLE_VARIANT): kind.value != except_kind for kind in OperatorKindV2})
 
 
 def _publish(db, dataset: str = "public.transactions"):

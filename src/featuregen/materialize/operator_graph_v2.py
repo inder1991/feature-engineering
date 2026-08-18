@@ -43,7 +43,7 @@ from enum import StrEnum
 from typing import Any
 
 from featuregen.formula.schema import DecimalPolicy
-from featuregen.formula.schema_v2 import AggregateFunctionV2
+from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.expression_ir import PitSpec
@@ -70,11 +70,19 @@ __all__ = [
 
 
 class OperatorKindV2(StrEnum):
-    """The CLOSED pilot vocabulary — exactly thirteen operators, frozen by C-C10a.
+    """The CLOSED vocabulary — fourteen operators.
 
     Ordered as the pilot reads: scan, restrict to the point-in-time window, select the rows the
     recipe declared, apply the governed status and reversal policies, convert currency, do the
-    arithmetic, aggregate, and land the result on the declared population.
+    arithmetic, aggregate, land the result on the declared population, and COMBINE the aggregates
+    into the feature's final value.
+
+    ``FINAL_COMBINE`` was added last, and its absence was a real gap rather than an oversight: with
+    thirteen kinds the graph could describe every step of a feature EXCEPT the one that produces its
+    value. A ratio's two aggregates had nowhere to be divided, so the graph could not claim to be
+    the executable form of any feature at all — not merely of exotic ones. Recording capability per
+    final operation also needs it: `ratio` and `signed_sum` are different renderer abilities, and
+    without a kind to hang them on there was nowhere to say which one an engine has.
     """
 
     GOVERNED_SCAN = "governed_scan"
@@ -90,6 +98,7 @@ class OperatorKindV2(StrEnum):
     AGGREGATE = "aggregate"
     SPINE_LEFT_JOIN = "spine_left_join"
     GROUP_ASSEMBLY = "group_assembly"
+    FINAL_COMBINE = "final_combine"
 
 
 def _refs(values: tuple[str, ...], what: str) -> tuple[str, ...]:
@@ -366,6 +375,57 @@ class GroupAssemblyV2:
         return {"column_names": list(self.column_names)}
 
 
+@dataclass(frozen=True, slots=True)
+class FinalCombineV2:
+    """Combine the body's aggregates into the feature's ONE value.
+
+    The last step of every feature, and the one the vocabulary previously could not express. An
+    IDENTITY takes a single term; a RATIO divides two under a declared zero-denominator policy; a
+    DIFFERENCE subtracts; a SIGNED_SUM adds N terms under their declared signs.
+
+    ``term_paths`` is ordered because the operations are not commutative — numerator before
+    denominator, minuend before subtrahend. A set here would render `a/b` and `b/a` identically.
+    """
+
+    final_operation: FinalOperationV2
+    term_paths: tuple[str, ...]
+    zero_denominator: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.term_paths:
+            raise ValueError(
+                "a final combination with no terms produces no value: the node names the step that "
+                "makes the feature, and one with nothing to combine is not that step")
+        arity = {FinalOperationV2.IDENTITY: 1, FinalOperationV2.RATIO: 2,
+                 FinalOperationV2.DIFFERENCE: 2}.get(self.final_operation)
+        if arity is not None and len(self.term_paths) != arity:
+            raise ValueError(
+                f"{self.final_operation} combines exactly {arity} term(s), not "
+                f"{len(self.term_paths)}: an arity the operation does not have would render as a "
+                f"different calculation from the one the formula declared")
+        if self.final_operation is FinalOperationV2.SIGNED_SUM and len(self.term_paths) < 2:
+            raise ValueError(
+                "a signed sum of one term is that term: recording it as a sum would claim a "
+                "combination the formula did not ask for")
+        # The zero-denominator policy belongs to division and to nothing else. Carrying one on an
+        # identity would suggest a divide-by-zero decision was made where no division happens.
+        if self.final_operation is FinalOperationV2.RATIO:
+            if not (self.zero_denominator or "").strip():
+                raise ValueError(
+                    "a ratio must declare its zero-denominator policy: what a feature does when the "
+                    "denominator is zero is a governed decision, and defaulting it silently picks "
+                    "an answer nobody reviewed")
+        elif self.zero_denominator is not None:
+            raise ValueError(
+                f"{self.final_operation} carries a zero-denominator policy but performs no "
+                f"division")
+
+    def identity_payload(self) -> dict[str, Any]:
+        return {"final_operation": str(self.final_operation),
+                "term_paths": list(self.term_paths),
+                "zero_denominator": self.zero_denominator}
+
+
 #: The ONE mapping from kind to payload type. ``OperatorNodeV2`` checks against it, so the
 #: vocabulary cannot be widened by passing a payload the enum never promised.
 _PAYLOAD_TYPE: dict[OperatorKindV2, type] = {
@@ -382,6 +442,7 @@ _PAYLOAD_TYPE: dict[OperatorKindV2, type] = {
     OperatorKindV2.AGGREGATE: AggregateV2,
     OperatorKindV2.SPINE_LEFT_JOIN: SpineLeftJoinV2,
     OperatorKindV2.GROUP_ASSEMBLY: GroupAssemblyV2,
+    OperatorKindV2.FINAL_COMBINE: FinalCombineV2,
 }
 
 

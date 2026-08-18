@@ -180,14 +180,21 @@ def formula_identity(
     })
 
 
-def capability_set_hash(advertised: Sequence[str]) -> str:
+def capability_set_hash(advertised: Sequence[str] | Sequence[tuple[str, str]]) -> str:
     """The identity of an ADVERTISED SET, sorted and de-duplicated.
 
     The set rather than the engine id: an engine that gains an operator is the same engine, and it
     is the set that moved. Sorted so the order a reader happened to receive them in is not part of
     the identity.
+
+    Members are typed SIGNATURES — ``("aggregate", "sum")`` — since capability became per-variant:
+    an engine that gains `avg` while keeping `sum` has genuinely moved, and a hash over bare kinds
+    could not see that. Normalised to strings so the two spellings cannot produce two identities for
+    the same set, which would re-buy an admission decision that had already been made.
     """
-    return jcs_sha256({"advertised": sorted(set(advertised))})
+    members = sorted(
+        {f"{item[0]}:{item[1]}" if isinstance(item, tuple) else str(item) for item in advertised})
+    return jcs_sha256({"advertised": members})
 
 
 def admission_identity(

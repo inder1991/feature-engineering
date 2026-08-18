@@ -61,7 +61,7 @@ __all__ = [
     "AdmittedFeatureV2",
     "ResolvedFeatureInputV2",
     "admit_artifacts_v2",
-    "implied_operator_kinds",
+    "implied_operator_signatures",
 ]
 
 #: The wire versions of the Formula-V2 LANGUAGE. Two members, not a floor: a version 4 nobody has
@@ -120,10 +120,14 @@ class AdmittedFeatureV2:
         self.operator_kinds = operator_kinds
 
 
-def implied_operator_kinds(
+def implied_operator_signatures(
     proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
-) -> tuple[str, ...]:
-    """The operator kinds this proposal's execution implies, sorted.
+) -> tuple[tuple[str, str], ...]:
+    """The operator SIGNATURES this proposal's execution implies, sorted.
+
+    A signature is ``(kind, variant)``. Kinds alone cannot express the truth this check exists to
+    enforce: `sum` is renderable and `avg` is not, and both are ``AGGREGATE``. Checking kinds would
+    admit a median against an engine that can only add up.
 
     DERIVED from what the proposal declares, never asserted beside it — the same rule C-C10 applies
     to subgraph requirements: an operator list a caller supplied is one that gets forgotten on the
@@ -136,19 +140,38 @@ def implied_operator_kinds(
     be checked against the advertised set instead of the real one.
     """
     from featuregen.formula.schema_v2 import body_expressions_v2
+    from featuregen.materialize.execution_proof_store import SOLE_VARIANT
 
-    kinds: set[str] = {OperatorKindV2.GOVERNED_SCAN.value, OperatorKindV2.AGGREGATE.value,
-                       OperatorKindV2.GROUP_ASSEMBLY.value}
+    signatures: set[tuple[str, str]] = {
+        (OperatorKindV2.GOVERNED_SCAN.value, SOLE_VARIANT),
+        (OperatorKindV2.GROUP_ASSEMBLY.value, SOLE_VARIANT),
+    }
+    # The FINAL COMBINATION is a variant too, and naming it here is what stops a `signed_sum` being
+    # admitted against a renderer that can only divide. The graph has no node for it yet (step 7),
+    # but the capability question is answerable now and the answer is load-bearing now.
+    signatures.add(("final_combine", str(getattr(proposal.body, "final_operation", "identity"))))
+
     for expression in body_expressions_v2(proposal.body):
+        # THE AGGREGATE'S OWN FUNCTION, not the bare kind. This is the whole point of the typed
+        # signature: `sum` and `avg` are both AGGREGATE and only one of them renders.
+        aggregation = getattr(expression, "aggregation", None)
+        signatures.add((OperatorKindV2.AGGREGATE.value,
+                        str(getattr(aggregation, "value", aggregation or "unknown"))))
+
         refs = getattr(expression, "authority_refs", None)
         if refs is not None and getattr(refs, "currency_conversion_ref", "").strip():
-            kinds |= {OperatorKindV2.AS_OF_FX_JOIN.value,
-                      OperatorKindV2.DUPLICATE_RATE_GATE.value,
-                      OperatorKindV2.MISSING_RATE_GATE.value,
-                      OperatorKindV2.DECIMAL_MULTIPLICATION.value}
-        if getattr(expression, "row_selections", ()):
-            kinds.add(OperatorKindV2.SEMANTIC_SELECTION.value)
-    return tuple(sorted(kinds))
+            signatures |= {
+                (OperatorKindV2.AS_OF_FX_JOIN.value, SOLE_VARIANT),
+                (OperatorKindV2.DUPLICATE_RATE_GATE.value, SOLE_VARIANT),
+                (OperatorKindV2.MISSING_RATE_GATE.value, SOLE_VARIANT),
+                (OperatorKindV2.DECIMAL_MULTIPLICATION.value, SOLE_VARIANT),
+            }
+        for selection in getattr(expression, "row_selections", ()) or ():
+            # Each selection names WHICH semantic rule, so each is its own capability question.
+            signatures.add((OperatorKindV2.SEMANTIC_SELECTION.value,
+                            str(getattr(selection, "kind", None)
+                                or getattr(selection, "selection_kind", SOLE_VARIANT))))
+    return tuple(sorted(signatures))
 
 
 def admit_artifacts_v2(
@@ -324,16 +347,17 @@ def _verify_advertised(
     is a proof about a different build. Admitting on either half alone would let a feature into the
     chain on half the evidence.
     """
-    implied = implied_operator_kinds(proposal)
+    implied = implied_operator_signatures(proposal)
     advertised = set(advertised_operators(conn, engine_id=engine_id))
     missing = sorted(set(implied) - advertised)
     if missing:
+        named = ", ".join(f"{kind}:{variant}" for kind, variant in missing)
         raise MaterializationRefused(
             CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
-            f"authoring run {run_id} implies operators {missing}, which {engine_id!r} does not "
-            f"advertise. Advertised means renderer-dispatchable AND execution-proved: a renderer "
-            f"branch with no gold proof is a branch nobody ran, and a proof for an operator this "
-            f"build cannot emit is a proof about a different build",
+            f"authoring run {run_id} implies operators {named}, which {engine_id!r} does not "
+            f"advertise for this build. Advertised means renderer-dispatchable AND execution-proved: "
+            f"a renderer branch with no gold proof is a branch nobody ran, and a proof for an "
+            f"operator this build cannot emit is a proof about a different build",
         )
     return implied
 

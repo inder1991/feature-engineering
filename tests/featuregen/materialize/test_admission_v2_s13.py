@@ -37,11 +37,12 @@ from featuregen.materialize.admission_v2 import (
     AdmittedFeatureV2,
     ResolvedFeatureInputV2,
     admit_artifacts_v2,
-    implied_operator_kinds,
+    implied_operator_signatures,
 )
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.execution_proof_store import (
     PILOT_MUTATIONS,
+    SOLE_VARIANT,
     MutationOutcomeV1,
     record_execution_proof,
     record_renderer_dispatch,
@@ -51,6 +52,14 @@ from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.overlay.upload.publication_revisions import OperatorExecutionProofV1
 
 ENGINE = "kedro-pyspark"
+#: What the pilot formulas actually need, as SIGNATURES. `sum` specifically — advertising the bare
+#: AGGREGATE kind would make the tests pass for a median too, which is exactly the confusion the
+#: typed signature removes.
+_PILOT_SIGNATURES = frozenset({
+    ("aggregate", "sum"), ("aggregate", "count_rows"), ("aggregate", "count_non_null"),
+    ("aggregate", "count_distinct"),
+    ("final_combine", "identity"), ("final_combine", "ratio"), ("final_combine", "difference"),
+})
 _ACTOR = make_actor()
 _INTENT = AuthoringIntent(
     "posted_debit_amount_30d",
@@ -134,10 +143,30 @@ def _free_form_run(db, raw: dict | None = None, *, intent: AuthoringIntent = _IN
             frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})))
 
 
-def _advertise(db, *, kinds: set[str] | None = None):
-    """Advertise operators: dispatchable AND execution-proved, which is what advertised MEANS."""
+def _proof_hash_for(db) -> str:
+    """One recorded proof, for tests that need something to attach rather than a whole advertisement."""
+    return record_execution_proof(
+        db,
+        OperatorExecutionProofV1(
+            signature="pilot-operator-graph", signature_version=1,
+            compiler_version="formula-compiler@1", renderer_version="kedro-renderer@1",
+            physical_type_policy="formula-v2/physical-types@1", topology_version=1,
+            gold_corpus_hash="sha256:gold", generated_project_hash="sha256:project",
+            mutation_set_version=1, engine_versions=RUNTIMES),
+        tuple(MutationOutcomeV1(mutation_name=name, detected=True) for name in PILOT_MUTATIONS))
+
+
+def _advertise(db, *, kinds: set[str] | None = None, signatures=None):
+    """Advertise operators: dispatchable AND execution-proved, which is what advertised MEANS.
+
+    Signatures now, not bare kinds — `("aggregate", "sum")` is advertised while
+    `("aggregate", "avg")` is not, and a fixture that advertised the KIND would let a median through
+    a check whose whole purpose is to stop one.
+    """
+    wanted = signatures if signatures is not None else _PILOT_SIGNATURES
     record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: True for kind in OperatorKindV2})
+        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+        **{sig: True for sig in wanted}})
     proof_hash = record_execution_proof(
         db,
         OperatorExecutionProofV1(
@@ -147,8 +176,13 @@ def _advertise(db, *, kinds: set[str] | None = None):
             gold_corpus_hash="sha256:gold", generated_project_hash="sha256:project",
             mutation_set_version=1, engine_versions=RUNTIMES),
         tuple(MutationOutcomeV1(mutation_name=name, detected=True) for name in PILOT_MUTATIONS))
-    for kind in (kinds if kinds is not None else {k.value for k in OperatorKindV2}):
-        set_execution_proof(db, engine_id=ENGINE, operator_kind=kind, proof_hash=proof_hash)
+    if kinds is not None:
+        proved = {(k, SOLE_VARIANT) for k in kinds}
+    else:
+        proved = {(k.value, SOLE_VARIANT) for k in OperatorKindV2} | set(wanted)
+    for kind, variant in sorted(proved):
+        set_execution_proof(db, engine_id=ENGINE, operator_kind=kind,
+                            operator_variant=variant, proof_hash=proof_hash)
 
 
 @pytest.fixture
@@ -218,17 +252,22 @@ def test_DISPATCHABLE_WITHOUT_A_PROOF_IS_NOT_ENOUGH(catalog):
     """Advertised means renderer-dispatchable AND execution-proved. A renderer branch with no gold
     proof is a branch nobody ran against reviewed gold."""
     record_renderer_dispatch(catalog, engine_id=ENGINE, dispatchable={
-        kind.value: True for kind in OperatorKindV2})
+        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+        **{sig: True for sig in _PILOT_SIGNATURES}})
     result = _free_form_run(catalog)
     with pytest.raises(MaterializationRefused, match="does not advertise"):
         admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
 
 
 def test_ONE_MISSING_OPERATOR_IS_ENOUGH_TO_REFUSE(catalog):
-    """Per operator, not per engine: a feature using the one unadvertised operator must refuse even
-    though every other one is advertised."""
-    every = {kind.value for kind in OperatorKindV2}
-    _advertise(catalog, kinds=every - {OperatorKindV2.AGGREGATE.value})
+    """Per SIGNATURE, not per engine and not per kind.
+
+    Sharpened by the typed capability model: the engine advertises the AGGREGATE kind and every
+    other operator, and is missing only `("aggregate", "sum")`. Under the old kind-level model this
+    feature would have been admitted — the kind was advertised — and rendered against a renderer
+    that cannot sum. That is the whole reason the variant exists.
+    """
+    _advertise(catalog, signatures=_PILOT_SIGNATURES - {("aggregate", "sum")})
     result = _free_form_run(catalog)
     with pytest.raises(MaterializationRefused) as raised:
         admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
@@ -248,8 +287,10 @@ def test_THE_OPERATORS_ARE_DERIVED_FROM_THE_PROPOSAL(catalog):
     """An operator list a caller supplied is one that gets forgotten on the feature it mattered
     for — C-C10's rule, applied here."""
     result = _free_form_run(catalog)
-    kinds = implied_operator_kinds(result.candidate_proposal)
-    assert set(kinds) == {"governed_scan", "aggregate", "group_assembly"}
+    signatures = implied_operator_signatures(result.candidate_proposal)
+    assert set(signatures) == {
+        ("governed_scan", SOLE_VARIANT), ("group_assembly", SOLE_VARIANT),
+        ("aggregate", "sum"), ("final_combine", "identity")}
 
 
 def test_a_DECLARED_CURRENCY_CONVERSION_implies_the_FX_operators_and_its_gates(catalog):
@@ -262,7 +303,7 @@ def test_a_DECLARED_CURRENCY_CONVERSION_implies_the_FX_operators_and_its_gates(c
     result = _free_form_run(catalog, raw)
     assert result.candidate_proposal is not None
 
-    kinds = set(implied_operator_kinds(result.candidate_proposal))
+    kinds = {kind for kind, _variant in implied_operator_signatures(result.candidate_proposal)}
     assert {"as_of_fx_join", "duplicate_rate_gate", "missing_rate_gate",
             "decimal_multiplication"} <= kinds
 
@@ -274,7 +315,7 @@ def test_the_admitted_artifact_CARRIES_the_kinds_it_was_checked_against(catalog)
     result = _free_form_run(catalog)
     admitted = admit_artifacts_v2(
         catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
-    assert admitted[0].operator_kinds == implied_operator_kinds(result.candidate_proposal)
+    assert admitted[0].operator_kinds == implied_operator_signatures(result.candidate_proposal)
 
 
 # ══ the checks that make admission a PROOF rather than a formality ════════════════════════════

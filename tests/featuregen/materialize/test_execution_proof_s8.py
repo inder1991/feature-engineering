@@ -28,6 +28,7 @@ from featuregen.materialize.evaluate_generate import (
 )
 from featuregen.materialize.execution_proof_store import (
     PILOT_MUTATIONS,
+    SOLE_VARIANT,
     MutationOutcomeV1,
     ProofIncomplete,
     advertised_operators,
@@ -162,7 +163,8 @@ def test_a_proof_is_APPEND_ONLY(db):
 # ══ ACCEPTANCE 3 — capability is renderer-dispatchable ∧ execution-proved ══════════════════════
 def _dispatch_all(db, *, dispatchable: bool = True, except_kind: str | None = None):
     record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: (dispatchable and kind.value != except_kind) for kind in OperatorKindV2})
+        (kind.value, SOLE_VARIANT): (dispatchable and kind.value != except_kind)
+        for kind in OperatorKindV2})
 
 
 def test_THE_TWO_FACTS_ARE_RECORDED_SEPARATELY(db):
@@ -213,13 +215,15 @@ def test_a_dispatch_record_must_cover_the_WHOLE_vocabulary(db):
     """The renderer either has a branch or it does not, so an omitted kind is not a third answer —
     it is a claim nobody made that a caller will read as one."""
     with pytest.raises(ValueError, match="omits"):
-        record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={"aggregate": True})
+        record_renderer_dispatch(db, engine_id=ENGINE,
+                                 dispatchable={("aggregate", SOLE_VARIANT): True})
 
 
 def test_a_dispatch_record_naming_a_NON_OPERATOR_is_refused(db):
     with pytest.raises(ValueError, match="not operator kinds"):
         record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-            **{kind.value: True for kind in OperatorKindV2}, "teleportation": True})
+            **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+            ("teleportation", SOLE_VARIANT): True})
 
 
 def test_a_proof_cannot_be_attached_where_there_is_NO_DISPATCH_RECORD(db):
@@ -384,7 +388,7 @@ def test_THE_ADVERTISED_SET_IS_DISPATCHABLE_INTERSECT_PROVED(db):
                         proof_hash=proof_hash)
     # dispatchable but NOT proved: every other kind, left alone
 
-    assert advertised_operators(db, engine_id=ENGINE) == ("aggregate",)
+    assert advertised_operators(db, engine_id=ENGINE) == (("aggregate", SOLE_VARIANT),)
 
 
 def test_an_UNRECORDED_operator_is_not_advertised(db):
