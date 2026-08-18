@@ -310,29 +310,48 @@ def _frozen_facts(
         # generator produced before pairs were carried, which cannot be authored against a snapshot.
         return {"blocker": _NO_GROUNDED_REFS}
 
-    refs: set[str] = set()
+    # TWO SETS, because they answer two different questions and live snapshots make the difference
+    # visible: a real snapshot holds `column_field` items and NO table items at all.
+    #
+    #   `column_refs` — what the frozen catalog is loaded for. Every ref here must EXIST in the
+    #      snapshot; the loader refuses the whole draft otherwise, and asking it for a table it was
+    #      never built to hold is asking it to fail.
+    #   `readable_refs` — what the model is permitted to NAME. The table belongs here: it is what a
+    #      formula's `source_relation` points at, and the set costs nothing to widen.
+    #
+    # An earlier version passed one combined set to both and blocked live on
+    # `SNAPSHOT_MISSING_REFS: ['cib::bo_dpl_cib.bo_cib_customer']` — a table the snapshot was never
+    # going to contain.
+    column_refs: set[str] = set()
+    readable_refs: set[str] = set()
     for source, object_ref in pairs:
-        refs.add(logical_ref_of(conn, str(source), str(object_ref)))
-        # The TABLE the column belongs to, because the tool runner gates the formula's
-        # `source_relation.table_ref` against this same set — a column-only set refuses the very
-        # relation the formula must name.
+        column = logical_ref_of(conn, str(source), str(object_ref))
+        column_refs.add(column)
+        readable_refs.add(column)
         head, _, _tail = str(object_ref).rpartition(".")
         if head:
-            refs.add(logical_ref_of(conn, str(source), head, kind="table"))
-    if not refs:
+            readable_refs.add(logical_ref_of(conn, str(source), head, kind="table"))
+    if not column_refs:
         return {"blocker": _NO_GROUNDED_REFS}
 
     return {
         "blocker": None,
         "snapshot_id": str(snapshot_id),
         "requested_by": requested_by,
-        "allowed_refs": refs,
+        # What the snapshot is loaded for (must exist in it) …
+        "column_refs": frozenset(column_refs),
+        # … and what the model may name (wider: includes the tables).
+        "allowed_refs": frozenset(readable_refs),
         "intent": AuthoringIntent(
             name=idea.name,
             hypothesis=row[2],
             target_entity=idea.grain_table or "",
-            target_grain_keys=tuple(sorted(refs)) if idea.grain_ref is None else (
-                idea.grain_ref[1],),
+            # The grain goes through the SAME resolution as everything else: `grain_ref` is a
+            # (catalog_source, object_ref) pair like the others, and handing the raw object_ref
+            # through would name a column in a spelling nothing downstream is keyed by.
+            target_grain_keys=(
+                tuple(sorted(column_refs)) if idea.grain_ref is None
+                else (logical_ref_of(conn, str(idea.grain_ref[0]), str(idea.grain_ref[1])),)),
         ),
     }
 
@@ -372,7 +391,7 @@ def _author(
 
     try:
         frozen = FrozenRecipeReadContext.load(
-            conn, facts["snapshot_id"], facts["allowed_refs"])
+            conn, facts["snapshot_id"], facts["column_refs"])
     except ValueError as exc:
         # The frozen catalog does not describe a column this candidate needs. A fact about what was
         # SNAPSHOTTED, with a remedy (regenerate the candidates against a current snapshot) that
