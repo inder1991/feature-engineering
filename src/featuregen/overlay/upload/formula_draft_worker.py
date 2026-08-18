@@ -115,6 +115,19 @@ _NO_GROUNDED_REFS = {
 }
 
 
+class _DraftBlocked(Exception):
+    """A governed refusal discovered mid-drive, carrying the blocker that names it.
+
+    An exception because the refusal is found deep inside authoring setup and has to unwind past
+    several stages — but it is NOT a failure, and :func:`_drive` turns it into a BLOCKED draft
+    rather than letting the poison guard record it as an outage.
+    """
+
+    def __init__(self, blocker: Mapping[str, str]) -> None:
+        super().__init__(blocker.get("reason", ""))
+        self.blocker = dict(blocker)
+
+
 @dataclass(frozen=True, slots=True)
 class FormulaDraftWorkerOutcome:
     status: str
@@ -146,6 +159,16 @@ def process_formula_draft_once(
 
     try:
         state = _drive(conn, claim, draft_id, lease_seconds=lease_seconds)
+    except _DraftBlocked as exc:
+        # A product result. The queue message is COMPLETED, not failed: there is nothing to retry
+        # and nothing for an operator to fix on this lane.
+        state = _terminalize(conn, draft_id, DraftStateV1.BLOCKED, blockers=[exc.blocker])
+        complete_formula_draft(conn, claim)
+        counters.incr("featuregen.formula_draft.blocked")
+        log("featuregen.formula_draft.blocked", formula_draft_id=draft_id,
+            code=exc.blocker.get("code"))
+        return FormulaDraftWorkerOutcome(
+            status="ok", formula_draft_id=draft_id, state=state.value)
     except (LeaseFenceLost, RecoveryRequiresReconciliation) as exc:
         # TRANSIENT by nature: the lease moved under us, or a run needs reconciling before it can be
         # resumed. Neither is a statement about the candidate, so neither is written to the draft.
@@ -303,10 +326,22 @@ def _author(
     """
     principal = resolve_current_principal(
         conn, facts["requested_by"], None, datetime.now(UTC))
-    if principal.status is not PrincipalResolutionStatus.CURRENT:
-        raise RuntimeError(
-            "formula drafting has no resolved principal: authoring reads catalog metadata under a "
-            "read scope, and an unauthenticated run would either read nothing or read too much")
+    if principal.status is not PrincipalResolutionStatus.CURRENT or principal.principal is None:
+        # A GOVERNED REFUSAL, not an outage — the judgement the shipped shadow lane already makes,
+        # which records the same condition on its AUTHORIZATION axis with `technical_axis: "OK"`
+        # and `authoring_axis: "NOT_RUN"`. Nothing is broken: the platform declined to read the
+        # catalog on behalf of a principal it cannot vouch for, which is the check working.
+        #
+        # Raised as a blocker rather than an exception because FAILED pages whoever is on call, and
+        # the remedy here belongs to whoever administers accounts. Found live: a draft requested
+        # under a header identity with no local account came back FAILED, sending an operator to
+        # look for an incident that was not happening.
+        raise _DraftBlocked({
+            "code": f"REQUESTER_{principal.status.value.upper()}",
+            "reason": principal.reason or (
+                "the account that requested this draft cannot be verified, so the catalog was not "
+                "read on its behalf"),
+        })
 
     frozen = FrozenRecipeReadContext.load(
         conn, facts["snapshot_id"], facts["allowed_refs"])

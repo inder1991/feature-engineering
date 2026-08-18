@@ -150,6 +150,73 @@ def test_A_STALE_REVISION_IS_A_BLOCKER_NOT_AN_OUTAGE(db, monkeypatch):
     assert draft.failure_reason is None, "a blocker is not a failure and must not carry one"
 
 
+def test_AN_UNRESOLVED_REQUESTER_IS_A_BLOCKER_NOT_AN_OUTAGE(db, monkeypatch):
+    """The platform declining to read a catalog for a principal it cannot vouch for is the CHECK
+    WORKING, not a fault.
+
+    The shipped recipe-formula shadow lane already makes exactly this judgement: it records the same
+    condition on its AUTHORIZATION axis with `technical_axis: "OK"` and `authoring_axis: "NOT_RUN"`.
+    Two lanes disagreeing about whether the same condition is an incident is how one of them starts
+    paging the wrong person.
+
+    FOUND LIVE: a draft requested under a header identity with no local account came back FAILED,
+    which reads as "the platform broke" and sends an operator hunting an outage that is not
+    happening. The remedy belongs to whoever administers accounts.
+    """
+    def _explode(*args, **kwargs):
+        raise AssertionError("an unverifiable requester must never reach a provider")
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.formula_draft_worker.current_llm_client", _explode)
+
+    db.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES ('int-1','h','hypothesis')")
+    db.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, metadata_snapshot_id, considered_json, considered_content_hash, "
+        "canonicalization_version) VALUES ('crev-1','int-1','run-1','snap-1', %s::jsonb, 'h', "
+        "'contract-considered-v2')", (_one_option_revision(),))
+    _request(db)
+    enqueue(db, message_id="m-1", partition_key="p-1", handler=HANDLER,
+            payload={"formula_draft_id": "fd-1"})
+
+    outcome = process_formula_draft_once(db, owner="w")
+
+    draft = read_draft(db, "fd-1")
+    assert draft.state is DraftStateV1.BLOCKED, "an unverifiable requester was reported as an outage"
+    assert draft.blockers[0]["code"].startswith("REQUESTER_")
+    assert draft.failure_reason is None, "a governed refusal is not a failure"
+    # The queue message is DONE, not dead: there is nothing to retry and nothing to page about.
+    assert db.execute("SELECT status FROM queue WHERE message_id='m-1'").fetchone()[0] == "done"
+    assert outcome.status == "ok"
+
+
+def _one_option_revision():
+    """A minimal v2 revision whose single option grounds on one ref, built with the shipped
+    helpers so the resolver's cross-check passes."""
+    import json
+
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.contract.gate1 import _candidate_identity, _idea_json
+    from featuregen.overlay.upload.feature_assist import FeatureIdea
+
+    idea = FeatureIdea(name="f", description="d", derives_from=["src::public.t.c"],
+                       aggregation="sum", grain_table="t")
+    identity = _candidate_identity(path="anchor", source="anchor", lens="anchor", feature=idea)
+    return json.dumps({
+        "version": "contract-considered-v2",
+        "public": {"anchor": {**_idea_json(idea), "option_id": "opt-a"}, "rejections": []},
+        "options_by_id": {"opt-a": {
+            "source": "anchor", "lens": "anchor",
+            "canonical_candidate_identity": identity,
+            "canonical_candidate_identity_hash": canonical_hash(identity),
+            "recipe_candidate_key": None}},
+        "recipe_grounding_context_by_candidate_key": {},
+        "recipe_candidate_keys_by_recipe_id": {},
+    })
+
+
 def test_a_message_with_no_subject_dies_rather_than_retrying(db):
     """A message naming no draft cannot be retried into one — retrying it would burn the attempt
     budget on a fault that is identical every time."""
