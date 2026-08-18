@@ -5,9 +5,12 @@ No V1/V2 router, no compatibility mode, no V1 migration, no byte-equivalence gua
 user-visible version choice. The product is not live. V1's *execution* machinery is reused; V1's
 *language* is not.
 
-**Revision 2**, after review. Two rulings adopted, two blocking contradictions fixed, three missing
-contracts added. Changes from revision 1 are marked ▲ and the reasons kept, because the corrections
-are the useful part.
+**Revision 3**, after two review rounds. Three rulings adopted (compile target, capability model, FX
+ownership), two blocking contradictions fixed, three missing contracts added, and the deletion
+inventory folded back into the earlier steps it changes. Changes are marked ▲ and the reasons kept,
+because the corrections are the useful part.
+
+**No open questions remain.** The plan is ready for task-level execution.
 
 **Verification standard:** every number here was produced by running the shipped code, not counted
 by eye. Revision 1 broke that standard once and the record is kept in §2.
@@ -231,21 +234,22 @@ Adopted from the review, with the verified detail attached.
 
 | # | Step | Notes |
 |---|---|---|
-| 1 | Typed capability signatures + build fingerprints | migration 1091; supersedes 1079's shape |
-| 2 | Separate admitted / execution-qualified / artifact-verified | unblocks §3's contradiction 2 |
+| **0** | **Extract the shared schema leaves** — split `formula/schema.py` into shared leaves + `schema_v1` | ▲ **new, and first.** 24 names V2/V3 import verbatim currently live in a module named for V1. Mechanical, low-risk, independent — and until it lands, nothing in step 15 can be deleted safely. Doing it first turns the last step from "work out what breaks" into "delete `schema_v1`". |
+| 1 | Typed capability signatures + build fingerprints | migration 1091; supersedes 1079's shape. Changes visible readiness for all 263 recipes — deliberate, not incidental. |
+| 2 | Separate admitted / execution-qualified / artifact-verified | resolves §3's contradiction 2 |
 | 3 | BuildSet + generation request + worker | §4.1; the product operation |
-| 4 | V2 physical binding + policy resolution | §4.2 payload store lands here |
+| 4 | V2 physical binding + policy resolution | §4.2 payload store; **plus the two missing resolvers** (§8.3) |
 | 5 | Compile → `PlannedFormulaExecutionIRV2` | the missing `compile_ir_v2` |
 | 6 | Leakage + authorization → authorized IR | calls the built-but-unwired `leakage_v2`, `authorize_compilation_v2` |
 | 7 | Minimum deterministic operator graph | **before** the pilot; adds `FINAL_COMBINE` |
-| 8 | Remove all ten renderer gates atomically; normalize V2 dispatch | §2 |
+| 8 | Remove all ten renderer gates atomically; normalize V2 dispatch | §2 — plus the four join-step `isinstance` sites (§8.8) |
 | 9 | **Narrow pilot** — no policy, identity + sum/count, to sealed code | the first end-to-end proof |
 | 10 | Semantic pilot — status, direction, reversal policies | first real policy payloads |
 | 11 | Common aggregates — avg, min, max | unblocks ordinary features |
-| 12 | Complex V2 ops, FX, remaining aggregates | driven by product demand, not by completing an enum |
+| 12 | Complex V2 ops, FX, remaining aggregates | FX ownership settled in §9 |
 | 13 | On-demand verification worker | lifecycle REQUESTED→CLAIMED→RUNNING→PASSED/FAILED/REFUSED; execution identity must include the sealed artifact id |
-| 14 | Publication requires a current passing verification | plus the reconciler; then the endpoint can expose the active revision, which is what lets the UI say "published" again |
-| 15 | Remove V1 product-language code; rename reusable execution machinery | one deliberate commit |
+| 14 | Publication requires a current passing verification | plus the reconciler; then the endpoint can expose the active revision, which lets the UI say "published" again |
+| 15 | Delete `schema_v1` and the V1 product language; regenerate goldens | one deliberate commit. Cheap **because** step 0 happened. Verify/drain shadow work items first (§8.6). |
 
 **Why 9 is still where it is:** every step before it is a contract or a gate, and the pilot is the
 first thing that can be *wrong in an interesting way*. If the seam analysis is mistaken, it surfaces
@@ -253,13 +257,71 @@ there — on a slice — rather than after the seventeen-aggregate payload.
 
 ---
 
-## 7. Open — and now genuinely open
+## 7. FX ownership — ruled
 
-Only one remains, and it is a spec question rather than a decision:
+**The policy realization owns the rate relation. The graph carries only its resolved execution
+binding.** The last open question is closed, and closed without creating a second source of truth.
 
-**The as-of FX join carries `rate_table_ref` in its own payload, and the policy realization also
-names a rate relation.** Which owns it? Two places naming the same table is how they come to
-disagree. This blocks step 12, not before.
+```
+Currency-conversion policy
+  ↓ identifies the required conversion semantics
+Policy realization        ← AUTHORITATIVE: rate relation, keys, time column, rate column,
+  ↓                          quote convention, missing-rate behaviour
+Physical binding          ← resolves the governed relation to THIS environment's dataset
+  ↓
+AsOfFxJoinV2              ← records exactly what THIS compilation will execute
+  ↓
+Gate 2                    ← authorizes that exact resolved read set
+```
+
+`AsOfFxJoinV2.rate_table_ref` must **never** be independently chosen by the graph builder or accepted
+from an external caller.
+
+### What changes
+
+The payload today is four bare refs with no link to any realization — the two-sources-of-truth shape
+this ruling removes:
+
+```python
+# now (operator_graph_v2.py:210-221)          # ruled
+currency_conversion_ref: str                  currency_conversion_ref: str
+rate_table_ref: str          ← chosen freely  policy_realization_revision_id: str
+as_of_ref: str                                executable_content_hash: str
+rate_column_ref: str                          bound_rate_dataset_ref: str
+                                              binding_snapshot_id: str
+                                              as_of_column_ref: str
+                                              rate_column_ref: str
+                                              rate_key_refs: tuple[str, ...]
+```
+
+The apparent duplication is acceptable **only** as a derived snapshot: the realization is the
+decision, the binding is the environment's answer, and the graph is the frozen record of what this
+compilation will run.
+
+### The builder refuses if
+
+Any of these means the snapshot has stopped agreeing with its source, and a snapshot that disagrees
+with its source is worse than no snapshot:
+
+1. the policy payload's rate relation cannot be bound;
+2. the bound dataset differs from the graph value;
+3. the rate columns lie outside that dataset;
+4. the rate dataset is missing from the authorized read set;
+5. the realization or binding changed after compilation.
+
+Each refuses **by name** — never a silent default, and never a re-derivation that quietly picks a
+different table.
+
+### Two notes for whoever implements it
+
+* **Graph identity moves.** `AsOfFxJoinV2.identity_payload()` (`:229-232`) feeds the content-addressed
+  graph hash, so this changes it. That is safe here and only here: the graph is deliberately **not
+  persisted** — `seal_v2` stores the verdict, not the graph — so no stored hash is invalidated. Under
+  Decision 1 the graph is a derived view, and a derived view's identity is allowed to move with its
+  derivation.
+* **`rate_key_refs` is new** and `as_of_ref` is renamed `as_of_column_ref`. Neither exists today, so
+  the producer must supply them from the realization rather than infer them — which is the entire
+  point of the ruling.
 
 ---
 
@@ -294,12 +356,21 @@ Genuinely deletable: four explicit V1 byte/source-freeze assertions — two of w
 **source text** of V1 functions — plus roughly **187 test functions across ten files and an
 11-fixture gold corpus, about 3,435 lines.**
 
-### 8.3 ▲ `resolve_v2.py` does not exist — a missing link steps 4–5 assume
+### 8.3 ▲ The V2 restorer does not exist — a missing link steps 4–5 assume
 
 `materialize/resolve.py` is privately bound to the V1 restorer, and there is no V2 equivalent. This
 is the concrete gap between an admitted V2 formula and a compilable one. Estimated ~200 lines and
 described as the smallest high-leverage item in the whole map — it belongs in step 4, named, rather
 than being discovered inside step 5.
+
+**▲ Name it `restore_formula_v3.py`, not `resolve_v2.py`.** `resolve_output_v2` already exists
+(`formula/output_authority_v2.py:77`), and a `resolve_v2` beside it invites the reading that one is
+the general case of the other. They are different verbs:
+
+* **resolve_\*** — *decide* a value that was undetermined (an output policy, a physical type).
+* **restore_\*** — *rehydrate* a stored artifact into the object a compiler can use.
+
+Keeping the two verbs distinct is worth more than matching the existing suffix.
 
 Related and equally unnamed: `physical_types_v2.py` is **not** the V2 replacement for
 `physical_types.py`; the V2 feature→type resolver does not exist. `PlannedFeature` hard-requires a
