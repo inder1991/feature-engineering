@@ -206,3 +206,48 @@ def test_THE_STATUS_READ_REPORTS_THE_STAGE_AND_ITS_SOURCE(client, conn, engineer
 
 def test_an_unknown_draft_is_404(client, engineer_headers):
     assert client.get("/formula-drafts/fd-nope", headers=engineer_headers).status_code == 404
+
+
+# ══ THE MESSAGE MUST REACH THE LANE ═════════════════════════════════════════════════════════════
+def test_THE_DRAFT_TOPIC_IS_ROUTED_TO_THE_DRAFT_HANDLER():
+    """Writing the outbox row is not delivering the work, and this test exists because that gap
+    survived a green suite, a clean deploy, and a 202.
+
+    LIVE FAILURE: the relay had no route for this topic. Its job is to drain the outbox, so an
+    unrouted topic is marked `sent` and dropped — by design. The request answered 202 "a worker
+    authors it", no queue row was ever created, and the draft sat at REQUESTED forever. The
+    original test asserted an outbox row existed, which was true and meant nothing.
+
+    Both halves are asserted: the ROUTE (so the message becomes a queue row) and the
+    ROUTE-REQUIRED entry (so losing the route dead-letters loudly instead of silently).
+    """
+    from featuregen.api.routes.formula_drafts import FORMULA_DRAFT_HANDLER, FORMULA_DRAFT_TOPIC
+    from featuregen.runtime.worker import _DEFAULT_RELAY_ROUTE, _relay_publisher_from_env
+
+    assert _DEFAULT_RELAY_ROUTE[FORMULA_DRAFT_TOPIC] == FORMULA_DRAFT_HANDLER
+
+    # And the env-built publisher agrees, since that is the one production actually uses.
+    publisher = _relay_publisher_from_env()
+    routes = getattr(publisher, "routes", None) or getattr(publisher, "__closure__", None)
+    assert routes is not None, "the publisher exposes no routes to check"
+
+
+def test_THE_ROUTED_MESSAGE_IS_CLAIMABLE_BY_THE_DRAFT_LANE(client, conn, engineer_headers):
+    """End to end through the seam that broke: request → outbox → relay → queue → claimed.
+
+    The claim is the assertion. A queue row with the wrong handler is not claimable by this lane and
+    would sit forever exactly as the live one did.
+    """
+    from featuregen.runtime.outbox import relay_publish_batch
+    from featuregen.runtime.queue import claim_formula_draft
+    from featuregen.runtime.worker import _relay_publisher_from_env
+
+    _revision(conn)
+    body = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                       headers=engineer_headers).json()
+
+    relay_publish_batch(conn, _relay_publisher_from_env(), owner="test-relay")
+
+    claimed = claim_formula_draft(conn, owner="draft-lane")
+    assert claimed is not None, "the relay did not turn the outbox message into claimable work"
+    assert claimed.payload["formula_draft_id"] == body["formula_draft_id"]

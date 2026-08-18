@@ -26,6 +26,10 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 from psycopg.rows import dict_row
 
+from featuregen.api.routes.formula_drafts import (
+    FORMULA_DRAFT_HANDLER,
+    FORMULA_DRAFT_TOPIC,
+)
 from featuregen.contracts import Command, Projection
 from featuregen.materialize.queue_lane import (
     materialization_enabled,
@@ -71,6 +75,13 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 # deployment adds real routes (or swaps in an external-bus publisher) by passing `publish=`.
 _DEFAULT_RELAY_ROUTE: dict[str, str] = {
     RECIPE_FORMULA_SHADOW_TOPIC: RECIPE_FORMULA_SHADOW_HANDLER,
+    # A draft's outbox message must become a queue row, or the work is never claimed. Found LIVE:
+    # without this entry the relay had no route for the topic, marked the outbox row `sent`, and
+    # enqueued nothing — the request returned a cheerful 202 and the draft sat at REQUESTED forever.
+    # An unrouted topic is silently dropped by design (the relay's job is to drain the outbox, not
+    # to know every topic), which is exactly why this route and the route-REQUIRED entry below have
+    # to be declared together.
+    FORMULA_DRAFT_TOPIC: FORMULA_DRAFT_HANDLER,
 }
 
 
@@ -103,10 +114,18 @@ def _relay_publisher_from_env(
     if configured_formula_handler not in (None, RECIPE_FORMULA_SHADOW_HANDLER):
         raise ValueError("the reserved recipe-formula shadow route cannot be overridden")
     routes[RECIPE_FORMULA_SHADOW_TOPIC] = RECIPE_FORMULA_SHADOW_HANDLER
+    configured_draft_handler = routes.get(FORMULA_DRAFT_TOPIC)
+    if configured_draft_handler not in (None, FORMULA_DRAFT_HANDLER):
+        raise ValueError("the reserved formula-draft route cannot be overridden")
+    routes[FORMULA_DRAFT_TOPIC] = FORMULA_DRAFT_HANDLER
     required = os.environ.get("FEATUREGEN_RELAY_REQUIRED", "").strip()
     route_required = frozenset({
         *(t.strip() for t in required.split(",") if t.strip()),
         RECIPE_FORMULA_SHADOW_TOPIC,
+        # ROUTE-REQUIRED, so a deployment that loses this route DEAD-LETTERS loudly instead of
+        # marking the message sent and dropping paid work on the floor. The silent-drop is what
+        # made this defect survive a green suite and a clean deploy.
+        FORMULA_DRAFT_TOPIC,
     })
     return make_queue_publisher(routes, route_required=route_required)
 
