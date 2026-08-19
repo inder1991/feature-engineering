@@ -65,6 +65,18 @@ class CompilationRefusalCode(StrEnum):
     JOIN_PATH_NOT_VERIFIED = "JOIN_PATH_NOT_VERIFIED"
     JOIN_PATH_DENIED_BY_READ_SCOPE = "JOIN_PATH_DENIED_BY_READ_SCOPE"
     GRAIN_PATH_NOT_GOVERNED = "GRAIN_PATH_NOT_GOVERNED"
+    #: The candidate does not say what grain it is computed PER. Distinct from
+    #: GRAIN_PATH_NOT_GOVERNED, which is about a grain that IS declared and whose path is not
+    #: approved: this one is the absence itself. It exists because the alternative was a fallback
+    #: that treated every operand ref as a grain key — a guess that produced a plausible, wrong
+    #: answer rather than a refusal anybody could act on.
+    GRAIN_NOT_RESOLVED = "GRAIN_NOT_RESOLVED"
+    #: The candidate was frozen under a canonicalization that did not carry its typed computation
+    #: (operation, measures, grain, time, window, grouping). Those candidates are readable and
+    #: auditable, and they cannot be EXECUTED: the identity they were sealed under does not describe
+    #: what they compute, so a build from one would be a build of something nobody can name. The
+    #: remedy is regeneration, which the message says.
+    CANDIDATE_REGENERATION_REQUIRED = "CANDIDATE_REGENERATION_REQUIRED"
     JOIN_FANOUT_UNSUPPORTED = "JOIN_FANOUT_UNSUPPORTED"
     JOIN_CARDINALITY_UNKNOWN = "JOIN_CARDINALITY_UNKNOWN"
 

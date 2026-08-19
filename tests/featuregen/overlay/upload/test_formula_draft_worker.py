@@ -176,7 +176,7 @@ def test_AN_UNRESOLVED_REQUESTER_IS_A_BLOCKER_NOT_AN_OUTAGE(db, monkeypatch):
         "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
         "generation_run_id, metadata_snapshot_id, considered_json, considered_content_hash, "
         "canonicalization_version) VALUES ('crev-1','int-1','run-1','snap-1', %s::jsonb, 'h', "
-        "'contract-considered-v2')", (_one_option_revision(),))
+        "'contract-considered-v3')", (_one_option_revision(),))
     _request(db)
     enqueue(db, message_id="m-1", partition_key="p-1", handler=HANDLER,
             payload={"formula_draft_id": "fd-1"})
@@ -203,10 +203,15 @@ def _one_option_revision():
 
     idea = FeatureIdea(name="f", description="d", derives_from=["public.t.c"],
                        derives_pairs=(("src", "public.t.c"),),
-                       aggregation="sum", grain_table="t")
+                       aggregation="sum", grain_table="t",
+                       # A DECLARED GRAIN, so this candidate reaches the check the test is about.
+                       # Without one the worker blocks on GRAIN_NOT_RESOLVED first — correctly, and
+                       # that ordering has its own test.
+                       operation_kind="sum", measure_refs=(("src", "public.t.c"),),
+                       grain_refs=(("src", "public.t.k"),))
     identity = _candidate_identity(path="anchor", source="anchor", lens="anchor", feature=idea)
     return json.dumps({
-        "version": "contract-considered-v2",
+        "version": "contract-considered-v3",
         "public": {"anchor": {**_idea_json(idea), "option_id": "opt-a"}, "rejections": []},
         "options_by_id": {"opt-a": {
             "source": "anchor", "lens": "anchor",

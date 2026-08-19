@@ -109,14 +109,26 @@ def test_role_binding_is_frozen_hashable_and_round_trips():
 
 
 def test_idea_json_byte_identical_for_plain_idea():
-    # A plain llm_freeform idea (all H1a fields default) serializes to exactly the v2 base key set.
+    # A plain llm_freeform idea (all H1a fields default) serializes to exactly the v3 base key set.
     # No H1a-only key leaks; description is load-bearing candidate identity, not an H1a field.
+    #
+    # THE BASE SET GREW BY SIX, DELIBERATELY, and the byte-identity guarantee with v2 is gone on
+    # purpose. The H1a strategy — emit only when non-default — exists so ADDING a field leaves
+    # existing persisted bytes untouched. The typed computation is the opposite case: it was being
+    # dropped entirely, so candidates were sealed under an identity that did not say what they
+    # compute. Preserving those bytes would have preserved the defect. The canonicalization version
+    # moved to v3 for exactly this reason, and pre-v3 revisions are refused from execution rather
+    # than reinterpreted.
+    #
+    # These six are emitted UNCONDITIONALLY, unlike the carry-through fields: an absent execution
+    # field is not a default, it is a candidate that cannot be executed.
     idea = FeatureIdea(name="avg_balance_90d", description="d",
                        derives_from=["public.accounts.balance"], aggregation="avg_90d",
                        grain_table="accounts",
                        derives_pairs=(("bank", "public.accounts.balance"),))
     d = _idea_json(idea)
-    assert set(d.keys()) == _PRE_H1A_IDEA_JSON_KEYS
+    assert set(d.keys()) == _PRE_H1A_IDEA_JSON_KEYS | {
+        "operation_kind", "measure_refs", "grain_refs", "time_ref", "window", "grouping_refs"}
     for leaked in ("generation_source", "recipe_id", "candidate_status", "input_role_bindings",
                    "external_requirement_previews", "metadata_snapshot_id", "planner_applicability",
                    "physical_plan_id", "planner_declaration_id", "binding_fact_keys"):

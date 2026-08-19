@@ -115,6 +115,11 @@ _NO_SNAPSHOT = {
     "reason": "this candidate set was generated without a pinned catalog snapshot, so there is no "
               "frozen catalog to author against; regenerate the candidates to draft a formula",
 }
+_NO_DECLARED_GRAIN = {
+    "code": "GRAIN_NOT_RESOLVED",
+    "reason": "this candidate does not say what grain it is computed per, so a formula authored "
+              "for it would be computed per something nobody chose; regenerate the candidate set",
+}
 _NO_GROUNDED_REFS = {
     "code": "CANDIDATE_UNGROUNDED",
     "reason": "this candidate names no columns that exist in the catalog, so there is nothing to "
@@ -333,6 +338,12 @@ def _frozen_facts(
     # plausible, matched nothing in the snapshot, and the loader refused the whole draft.
     from featuregen.overlay.upload.column_authority import logical_ref_of
 
+    if not idea.grain_refs:
+        # WHAT THIS FEATURE IS COMPUTED PER is not optional. A candidate frozen before the typed
+        # computation was carried through declares no grain at all, and authoring one against a
+        # guessed grain produces a formula for a feature nobody asked for.
+        return {"blocker": _NO_DECLARED_GRAIN}
+
     pairs = tuple(idea.derives_pairs or ())
     if not pairs:
         # No catalog source recorded, so no ref can be resolved. Not a failure — a candidate the
@@ -375,12 +386,17 @@ def _frozen_facts(
             name=idea.name,
             hypothesis=row[2],
             target_entity=idea.grain_table or "",
-            # The grain goes through the SAME resolution as everything else: `grain_ref` is a
-            # (catalog_source, object_ref) pair like the others, and handing the raw object_ref
-            # through would name a column in a spelling nothing downstream is keyed by.
-            target_grain_keys=(
-                tuple(sorted(column_refs)) if idea.grain_ref is None
-                else (logical_ref_of(conn, str(idea.grain_ref[0]), str(idea.grain_ref[1])),)),
+            # THE DECLARED GRAIN, ORDERED, AND NO FALLBACK. This previously used every operand ref
+            # when no grain was declared — a guess that always fired, because the serializer dropped
+            # the typed computation and so a declared grain never survived to be read. Every formula
+            # was authored against a grain listing each column it derives from.
+            #
+            # It must also agree EXACTLY with `restore_formula_v3._intent_of`: the restorer derives
+            # this intent and the checkpoint compares the two hashes, so a worker that guessed and a
+            # restorer that refused would make every draft unrestorable. One rule, stated twice, is
+            # a rule that drifts — so both read `grain_refs` and both refuse without one.
+            target_grain_keys=tuple(
+                logical_ref_of(conn, str(source), str(ref)) for source, ref in idea.grain_refs),
         ),
     }
 

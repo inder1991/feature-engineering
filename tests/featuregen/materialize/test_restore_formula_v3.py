@@ -127,7 +127,14 @@ def _considered_revision(conn) -> None:
         derives_from=["public.txns.txn_amt"],
         derives_pairs=(("authored", "public.txns.txn_amt"),),
         aggregation="sum", grain_table=_INTENT.target_entity,
-        grain_ref=("authored", "public.txns.cif_id"))
+        # The TYPED COMPUTATION, which a v3 candidate carries and a v2 one did not. The grain is
+        # what the restorer reads; the rest is here because a candidate that declares one and not
+        # the others is not a shape production produces.
+        operation_kind="sum",
+        measure_refs=(("authored", "public.txns.txn_amt"),),
+        grain_refs=(("authored", "public.txns.cif_id"),),
+        time_ref=("authored", "public.txns.txn_dt"),
+        window="90d")
     identity = _candidate_identity(path="anchor", source="anchor", lens="anchor", feature=idea)
     # A SECOND candidate, because `feature_selection_revision` enforces one selection per option:
     # two selections need two options, which is the truthful shape anyway — a person picking two
@@ -135,7 +142,7 @@ def _considered_revision(conn) -> None:
     other = _candidate_identity(path=["alternative", "lens", 0], source="alternative",
                                 lens="lens", feature=idea)
     considered = {
-        "version": "contract-considered-v2",
+        "version": "contract-considered-v3",
         "public": {
             "anchor": {**_idea_json(idea), "option_id": "opt-a"},
             "alternatives": [{"lens": "lens",
@@ -162,7 +169,7 @@ def _considered_revision(conn) -> None:
         "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
         "generation_run_id, metadata_snapshot_id, considered_json, considered_content_hash, "
         "canonicalization_version) VALUES ('crev-1','int-1','run-1','snap-1',%s::jsonb,'h',"
-        "'contract-considered-v2') ON CONFLICT DO NOTHING", (json.dumps(considered),))
+        "'contract-considered-v3') ON CONFLICT DO NOTHING", (json.dumps(considered),))
 
 
 def _selection(conn, revision_id: str, *, option_id: str = "opt-a") -> str:

@@ -46,7 +46,7 @@ def _revision(conn, *, revision_id="crev-1", snapshot_id="snap-1"):
     identity = _candidate_identity(
         path="anchor", source="anchor", lens="anchor", feature=idea)
     considered = {
-        "version": "contract-considered-v2",
+        "version": "contract-considered-v3",
         "public": {"anchor": {**public_feature, "option_id": "opt-a"}, "rejections": []},
         "options_by_id": {
             "opt-a": {
@@ -67,7 +67,7 @@ def _revision(conn, *, revision_id="crev-1", snapshot_id="snap-1"):
         "generation_run_id, metadata_snapshot_id, metadata_snapshot_content_hash, considered_json, "
         "considered_content_hash, canonicalization_version) "
         "VALUES (%s,'int-1','run-1',%s,'sha256:snap',%s::jsonb,'sha256:considered',"
-        "'contract-considered-v2')",
+        "'contract-considered-v3')",
         (revision_id, snapshot_id, json.dumps(considered)))
     return revision_id
 

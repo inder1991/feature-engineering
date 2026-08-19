@@ -94,10 +94,10 @@ def _seed_candidate(db):
         derives_pairs=tuple((src, ref) for src, ref in columns),
         aggregation="sum",
         grain_table="account",
-        grain_ref=("authored", REF_CIF))
+        grain_refs=(("authored", REF_CIF),))
     identity = _candidate_identity(path="anchor", source="anchor", lens="anchor", feature=idea)
     considered = {
-        "version": "contract-considered-v2",
+        "version": "contract-considered-v3",
         "public": {"anchor": {**_idea_json(idea), "option_id": "opt-a"}, "rejections": []},
         "options_by_id": {"opt-a": {
             "source": "anchor", "lens": "anchor",
@@ -114,7 +114,7 @@ def _seed_candidate(db):
         "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
         "generation_run_id, metadata_snapshot_id, considered_json, considered_content_hash, "
         "canonicalization_version) VALUES ('crev-1','int-1','run-1',%s,%s::jsonb,'h',"
-        "'contract-considered-v2')", (SNAPSHOT, json.dumps(considered)))
+        "'contract-considered-v3')", (SNAPSHOT, json.dumps(considered)))
 
 
 def _seed_user(db):

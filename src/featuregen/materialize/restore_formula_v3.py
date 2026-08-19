@@ -164,6 +164,7 @@ def _intent_of(
     immutable so reading it late reads the same bytes the draft was requested against.
     """
     from featuregen.overlay.upload.contract.gate1 import (
+        CONSIDERED_CANONICALIZATION_VERSION,
         Gate1Error,
         UnknownConsideredOption,
         _chosen_option_from_revision,
@@ -180,6 +181,23 @@ def _intent_of(
             f"{considered_revision_id}, which does not exist")
 
     considered = row[0] if isinstance(row[0], dict) else {}
+
+    # PRE-REGENERATION REVISIONS ARE READABLE, NOT EXECUTABLE. A v2 revision's options were sealed
+    # under an identity that did not include their typed computation, so the hash it carries does
+    # not describe what the candidate computes. Building from one would be a build of something
+    # nobody can name — and the old revisions are kept precisely so the record of what was offered
+    # survives. The refusal names the remedy rather than the version.
+    version = considered.get("version")
+    if version and version != CONSIDERED_CANONICALIZATION_VERSION:
+        raise MaterializationRefused(
+            CompilationRefusalCode.CANDIDATE_REGENERATION_REQUIRED,
+            f"selection {selection_revision_id} names considered revision "
+            f"{considered_revision_id}, frozen under {version}. Candidates from that "
+            f"canonicalization do not carry their typed computation — operation, measures, grain, "
+            f"time column, window and grouping — so their identity does not say what they compute. "
+            f"They remain readable for audit and cannot be executed: regenerate the candidate set "
+            f"and select again")
+
     try:
         idea, _source, _identity = _chosen_option_from_revision(considered, option_id)
     except (Gate1Error, UnknownConsideredOption) as exc:
@@ -190,16 +208,36 @@ def _intent_of(
 
     from featuregen.overlay.upload.column_authority import logical_ref_of
 
-    pairs = tuple(idea.derives_pairs or ())
-    grain = idea.grain_ref
+    # ── THE GRAIN, AND NO FALLBACK ──────────────────────────────────────────────────────────────
+    # This previously read: use the declared grain if there is one, OTHERWISE every operand ref,
+    # sorted. That fallback was not a safety net — it was a guess that always fired, because the
+    # serializer dropped `grain_ref` and so the declared grain was ALWAYS absent. Every formula was
+    # authored against a grain listing each column it derives from: a feature meant to be per
+    # customer described to the model as grained on its amount, its date and its customer together.
+    #
+    # It was invisible because it was CONSISTENT: the intent hash covers the grain keys, the
+    # restorer re-derived the same wrong value, and every check agreed with every other. A guess
+    # that produces a plausible answer and is confirmed by its own re-derivation is worse than an
+    # exception, because nothing ever contradicts it.
+    #
+    # Missing grain is now a named refusal. A candidate that does not say what it is computed PER
+    # cannot be executed, and saying so is the only honest answer.
+    if not idea.grain_refs:
+        raise MaterializationRefused(
+            CompilationRefusalCode.GRAIN_NOT_RESOLVED,
+            f"selection {selection_revision_id} names a candidate with no declared grain, so what "
+            f"this feature is computed PER is unknown. Candidates frozen before the typed "
+            f"computation was carried through carry no grain at all — regenerate the candidate set "
+            f"and select again")
+
     return AuthoringIntent(
         name=idea.name,
         hypothesis=row[1],
         target_entity=idea.grain_table or "",
-        target_grain_keys=(
-            (logical_ref_of(conn, str(grain[0]), str(grain[1])),) if grain is not None
-            else tuple(sorted(
-                logical_ref_of(conn, str(source), str(ref)) for source, ref in pairs))),
+        # ORDERED, and not sorted: the order of grain keys decides the published column order, so
+        # re-sorting here would silently reorder the output of a multi-key feature.
+        target_grain_keys=tuple(
+            logical_ref_of(conn, str(source), str(ref)) for source, ref in idea.grain_refs),
     )
 
 
