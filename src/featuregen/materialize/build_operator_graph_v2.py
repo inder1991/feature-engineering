@@ -184,9 +184,6 @@ def _expression_chain(
         # emitted above, and the ref is what resolves that selection to this ledger's encoding.
 
     aggregation = _aggregate_function(expression)
-    if isinstance(aggregation, MaterializationRefused):
-        return aggregation
-
     operand = _operand_ref(expression)
     if aggregation is AggregateFunctionV2.COUNT_ROWS:
         operand = None                     # AggregateV2 refuses an operand it would not use
@@ -231,24 +228,14 @@ def _scan_payload(
     return GovernedScanV2(table_ref=relations[0], column_refs=columns)
 
 
-def _aggregate_function(
-    expression: ExpressionExecutionIR,
-) -> AggregateFunctionV2 | MaterializationRefused:
-    """The V2 aggregate for a V1-compiled expression, mapped BY VALUE and refused when absent.
+def _aggregate_function(expression: ExpressionExecutionIR) -> AggregateFunctionV2:
+    """The expression's aggregate, which is ALREADY V2's — guaranteed by the IR, not re-crossed.
 
-    The expression compiler is V1's, so ``expression.aggregation`` is a ``AggregateFunction`` — and
-    ``AggregateFunctionV2.SUM is AggregateFunction.SUM`` is **False**. Two enums that compare equal
-    as strings and not as members is precisely how a branch silently takes the wrong arm, so the
-    crossing is made once, here, explicitly.
+    This used to convert, defensively. It no longer does, because step 8 made
+    ``ExpressionExecutionIR`` enforce the vocabulary at construction: a second crossing here would
+    be a second place that could answer differently, which is the whole failure being removed.
     """
-    try:
-        return AggregateFunctionV2(str(expression.aggregation))
-    except ValueError:
-        return MaterializationRefused(
-            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
-            f"{expression.expr_path} aggregates with {expression.aggregation!r}, which V2's "
-            f"vocabulary does not contain: the graph would name an operation no engine has been "
-            f"asked whether it can emit")
+    return expression.aggregation
 
 
 def _operand_ref(expression: ExpressionExecutionIR) -> str | None:

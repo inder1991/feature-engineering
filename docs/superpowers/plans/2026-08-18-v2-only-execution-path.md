@@ -17,6 +17,35 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 
 ---
 
+## 0. Execution status — updated 2026-08-19
+
+| Steps | State | Notes |
+|---|---|---|
+| **0–8** | **done** | migrations 1091, 1092, 1093 APPLIED to live (189 total) |
+| 9–15 | not started | 9 is the narrow pilot — the first end-to-end proof |
+
+**Found during execution, and not in the plan when it was written:**
+
+* **Step 4** — the six typed computation fields were dropped by the candidate serializer, so
+  identity described how a candidate *read* rather than what it *computes*. Fixed forward; the
+  frozen v2 candidates refuse with `CANDIDATE_REGENERATION_REQUIRED`, and regeneration is an
+  operator runbook (`docs/architecture/candidate-regeneration-runbook.md`), never an automatic
+  retry.
+* **Step 5** — three defects its own tests could not reach, all found by step 6 consuming its
+  output: the IR carried resolved payloads where `DeclaredPoliciesV2` belongs, `row_selections` were
+  read off the proposal (a field that does not exist there) and silently dropped, and compiling
+  returned a bare IR where the plan says planned.
+* **Step 5** — policy payloads did not record **when** their columns are read, which is the one
+  fact that decides whether a policy leaks. Added as a required field with no default: a default of
+  `event_time` would have made every policy pass the leakage gate by construction.
+* **Step 8** — the ten sites were confirmed exactly ten, and the mechanism was worse than recorded.
+  The two enums do not merely fail `is`: they compare EQUAL and **hash equal**, so a V2 member finds
+  the right entry in a V1-keyed dispatch table. Dispatch working while identity fails is what let a
+  V2 feature render down the wrong arm. Both halves are now one vocabulary, crossed once, in
+  `compile_expression`, and enforced by `ExpressionExecutionIR.__post_init__`.
+
+---
+
 ## 1. Rulings adopted
 
 ### Decision 1 — `FormulaExecutionIRV2` is the compile target

@@ -43,14 +43,14 @@ from featuregen.materialize.expression_ir import RefRole
 from featuregen.materialize.render import nodes_compute
 
 
-def _with_aggregation(ir, aggregation: AggregateFunction):
+def _with_aggregation(ir, aggregation: AggregateFunctionV2):
     """The compiled SUM IR, re-aggregated — everything else stays exactly what was compiled.
 
     ``COUNT_ROWS`` additionally sheds the OPERAND role from its read set, because Child-1's
     grammar gives it no operand at all and the renderer refuses a read set that names one.
     """
     expression = ir.expressions[0]
-    if aggregation is AggregateFunction.COUNT_ROWS:
+    if aggregation is AggregateFunctionV2.COUNT_ROWS:
         stripped = tuple(
             dataclasses.replace(
                 ref, roles=tuple(role for role in ref.roles if role is not RefRole.OPERAND))
@@ -83,11 +83,14 @@ def _staged_values(compiled, feature, lock_tree, aggregation):  # noqa: F811
 #: NULL for C1 (``null_input=IGNORE``), one 7 for C2. Four different numbers out of one input is
 #: what tells the four rendering paths apart; a dispatch that wired two members to the same Spark
 #: call would collide on at least one row here.
+# Keyed on V2's members, like the renderer's own dispatch. A V1-keyed map answered a V2 lookup
+# anyway — the two enums hash equal — so keying it either way "worked", which is exactly why the
+# one that matches the code under test is the one to use.
 _EXPECTED = {
-    AggregateFunction.SUM: {"C1": 20, "C2": 7},
-    AggregateFunction.COUNT_NON_NULL: {"C1": 2, "C2": 1},
-    AggregateFunction.COUNT_DISTINCT: {"C1": 1, "C2": 1},
-    AggregateFunction.COUNT_ROWS: {"C1": 3, "C2": 1},
+    AggregateFunctionV2.SUM: {"C1": 20, "C2": 7},
+    AggregateFunctionV2.COUNT_NON_NULL: {"C1": 2, "C2": 1},
+    AggregateFunctionV2.COUNT_DISTINCT: {"C1": 1, "C2": 1},
+    AggregateFunctionV2.COUNT_ROWS: {"C1": 3, "C2": 1},
 }
 
 
@@ -95,7 +98,7 @@ _EXPECTED = {
 def test_every_advertised_aggregation_has_a_rendering_path(
         compiled, feature, lock_tree, aggregation):  # noqa: F811
     """Render each advertised member and RUN it — the advertisement is executable, not prose."""
-    member = AggregateFunction(aggregation)
+    member = AggregateFunctionV2(aggregation)
     values = _staged_values(compiled, feature, lock_tree, member)
     expected = _EXPECTED[member]
     assert {cif: (value if value is None else int(value))

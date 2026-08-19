@@ -70,12 +70,12 @@ from featuregen.contracts.db import DbConn
 from featuregen.formula.canonical import filter_plain
 from featuregen.formula.schema import (
     AggregateExpression,
-    AggregateFunction,
     FilterNode,
     FilterPredicate,
     ParameterRef,
     TypedLiteral,
 )
+from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requirement
@@ -335,10 +335,33 @@ class ExpressionExecutionIR:
     join_plan: JoinPlan
     pit: PitSpec
     input_requirements: tuple[PhysicalInputRequirement, ...]
-    aggregation: AggregateFunction
+    #: NORMALIZED to V2's vocabulary at construction — see :func:`_as_v2_aggregate`. This field was
+    #: annotated ``AggregateFunction`` and carried whatever the formula happened to hold, so a V2
+    #: formula put an ``AggregateFunctionV2`` behind a V1 annotation and every ``is
+    #: AggregateFunction.X`` downstream silently took the else-branch.
+    aggregation: AggregateFunctionV2
     filter_tree: Mapping[str, Any] | None
     non_physical_refs: tuple[NonPhysicalRef, ...]
     operand_type: OperandTypeEvidence
+
+    def __post_init__(self) -> None:
+        """The aggregate must BE a V2 member, not merely equal to one.
+
+        Enforced rather than annotated, because the annotation alone was what let this drift: a V1
+        member behind it compares EQUAL to its V2 twin and HASHES EQUAL, so it finds the right entry
+        in the renderer's dispatch table and fails every ``is`` comparison against the same member.
+        The result is a renderer that emits code down the wrong arm — no exception, no wrong type,
+        just a different feature.
+
+        A ``TypeError`` rather than a governed refusal: a compiled IR carrying the wrong vocabulary
+        is a caller assembling the object wrongly, not a verdict about somebody's formula.
+        """
+        if type(self.aggregation) is not AggregateFunctionV2:
+            raise TypeError(
+                f"{self.expr_path} carries a {type(self.aggregation).__name__} aggregate "
+                f"({self.aggregation!r}): the compiled IR speaks V2's vocabulary, and a member of "
+                f"another enum with the same value compares equal, hashes equal, and is NOT "
+                f"identical — which passes every dispatch and fails every branch")
 
     def identity_payload(self) -> dict[str, Any]:
         """What this expression IS — no provenance, no run-time value.
@@ -959,6 +982,10 @@ def compile_expression(
     if unaccounted is not None:
         return unaccounted
 
+    aggregation = _as_v2_aggregate(expr.aggregation, expr_path)
+    if isinstance(aggregation, MaterializationRefused):
+        return aggregation
+
     # Read LAST, after every refusal: the evidence describes an expression that compiled, and a
     # catalog read performed for a plan that was then refused is a read nothing needed.
     operand_type = _operand_type_evidence(conn, expr)
@@ -979,11 +1006,41 @@ def compile_expression(
             window_end_inclusive=expr.window.end_inclusive.value,
             window_timezone=expr.window.timezone),
         input_requirements=tables.requirements((source_table_ref, *joined_tables)),
-        aggregation=expr.aggregation,
+        aggregation=aggregation,
         filter_tree=(None if expr.filter is None
                      else filter_plain(expr.filter, f"{expr_path}.filter")),
         non_physical_refs=tuple(_classify_non_physical(expr, expr_path)),
         operand_type=operand_type)
+
+
+def _as_v2_aggregate(
+    aggregation: object, expr_path: str,
+) -> AggregateFunctionV2 | MaterializationRefused:
+    """Cross a formula's aggregate into V2's vocabulary — ONCE, here, and by name.
+
+    **The crossing has to be explicit because the accidental version of it half-works.**
+    ``AggregateFunctionV2.SUM is AggregateFunction.SUM`` is ``False`` while
+    ``AggregateFunctionV2.SUM == AggregateFunction.SUM`` is ``True`` and the two HASH EQUAL — so a
+    V2 member looked up in a V1-keyed dispatch table finds the right entry, and the same member
+    compared with ``is`` takes the else-branch. Dispatch that works and identity that does not is
+    the worst of both: the renderer emits code, and emits the wrong one.
+
+    Compiling both languages into one vocabulary removes the question rather than answering it
+    everywhere it is asked.
+
+    Returns:
+        The V2 member, or a refusal naming the aggregate. An aggregate outside V2's vocabulary is a
+        statement about the formula's language rather than about this expression, so it refuses
+        rather than passing an unrecognised member downstream to be compared against nothing.
+    """
+    try:
+        return AggregateFunctionV2(str(aggregation))
+    except ValueError:
+        return MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"{expr_path} aggregates with {aggregation!r}, which is not in V2's vocabulary: the "
+            f"compiled IR speaks one aggregate language, and a member outside it would be compared "
+            f"against every arm of the renderer's dispatch and match none")
 
 
 def _column_of(column_ref: str) -> str | None:
