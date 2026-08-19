@@ -218,25 +218,24 @@ def test_the_capture_population_is_every_recipe_with_a_bindable_blueprint():
     assert "not_a_registry_recipe" not in population
 
 
-def test_the_two_readings_of_formula_v1_still_agree_ON_WHAT_REMAINS():
+def test_NOTHING_DECLARES_FORMULA_V1_ANY_MORE():
     """A4-c, superseded by the v1 retirement — and the two readings have now DELIBERATELY diverged.
 
-    `obligor_facility_count` was converted to ``formula-v2`` during the v1 routing retirement — its
-    derived v2 blueprint carries the same grain as its reviewed entry, so the lane moved and nothing
-    else did. `merchant_mcc_diversity` was NOT: its reviewed entry declares merchant grain while the
-    definition computes per customer, so converting it would substitute a different grain for a
-    reviewed decision. See `test_the_merchant_v1_entry_is_untouched`.
+    Both recipes moved to ``formula-v2`` during the v1 routing retirement — `obligor_facility_count`
+    trivially, `merchant_mcc_diversity` on an explicit per-customer decision (see
+    `test_the_merchant_v1_entry_is_RETIRED_by_an_explicit_decision`).
 
-    So the two readings have deliberately diverged by one: the declaration side holds only
-    `merchant_mcc_diversity`, while the v1 expectation registry still holds both entries. The
-    obligor entry is now dead weight that nothing selects — pinned rather than removed, because
-    `recipe_audit`, `recipe_formula_eval` and `recipe_formula_gate` still reference the registry and
-    removing an entry would change those three for a reason unrelated to lane selection.
+    So the two readings have now DELIBERATELY diverged: nothing declares v1, while the v1
+    expectation registry still holds both entries. That is the point rather than a regression —
+    the registry is dead weight that nothing selects, which is what makes deleting it safe. The
+    entries stay until `recipe_audit`, `recipe_formula_eval` and `recipe_formula_gate` stop
+    referencing them; removing one earlier would change those three for a reason unrelated to lane
+    selection.
     """
     declared_v1 = {definition.recipe_id for definition in V2_RECIPES
                    if definition.formula is not None
                    and definition.formula.formula_schema_version == FORMULA_SCHEMA_V1}
-    assert declared_v1 == {"merchant_mcc_diversity"}, (
+    assert declared_v1 == set(), (
         f"{sorted(declared_v1)} declare formula-v1: while any does, the v1 worker arm cannot be "
         f"removed and a missing declaration cannot become terminal")
     assert set(RECIPE_FORMULA_EXPECTATIONS) == {
@@ -244,7 +243,7 @@ def test_the_two_readings_of_formula_v1_still_agree_ON_WHAT_REMAINS():
 
 
 @pytest.mark.parametrize(("recipe_id", "declared"), [
-    ("merchant_mcc_diversity", FORMULA_SCHEMA_V1),
+    ("merchant_mcc_diversity", FORMULA_SCHEMA_V2),
     ("obligor_facility_count", FORMULA_SCHEMA_V2),
     ("posted_debit_amount", FORMULA_SCHEMA_V2),
 ])

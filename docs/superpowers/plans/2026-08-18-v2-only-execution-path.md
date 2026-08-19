@@ -60,50 +60,43 @@ The real position was: **298 of 317 recipes declared `formula-v2`, 19 have no fo
 TWO still declared `formula-v1`** — `merchant_mcc_diversity` and `obligor_facility_count`, both of
 which already derived valid v2 blueprints and needed no reason to stay.
 
-### 0.2 The V1 routing retirement — ▲ BLOCKED BY ONE RECIPE, on a GRAIN question
+### 0.2 The V1 routing retirement — DONE 2026-08-19
 
-Executed, then partly reverted when the conversion turned out not to be lane-only.
+1. **Both remaining v1 recipes converted to `formula-v2`.** Capturable v1 recipes: **0**.
+   * `obligor_facility_count` was trivial — its derived v2 blueprint carries the same grain
+     (`obligor`/`obligor`) as its reviewed v1 entry, so the lane moved and nothing else did.
+   * `merchant_mcc_diversity` was **not** trivial and was escalated rather than absorbed: its
+     reviewed v1 entry declared `merchant` grain while its definition and derived blueprint say
+     `customer`, so converting the lane changes what the feature is computed PER.
+     `test_the_merchant_v1_entry_is_untouched` existed to say that belongs to a human. It was
+     decided explicitly: **per customer**.
+   * The stale entry is **retired in place, not re-keyed** — and that is forced rather than chosen.
+     Its v1 template declares needs `merchant`/`mcc`/`event_ts` and no `customer`, so
+     `validate_expectation_registry` refuses the re-key by name. Editing the template to add a need
+     would rewrite a reviewed artifact to say something it was never reviewed for. Capture now
+     derives the customer-grain blueprint; the entry survives unselected until the v1 registry goes
+     with the rest of the stack.
+2. **A registry-wide producer invariant** (`test_expectation_lane_invariant`) over all 317 recipes:
+   nothing capturable declares v1, every capturable blueprint is the V2 type — the thing
+   `CaptureBlueprintV1.bind` dispatches on, so "binds to a V2 expectation" is a type fact rather
+   than 317 grounding contexts — and the single serialization owner always writes the declaration.
+3. **Absence is terminal and the v1 worker arm is gone**, in one change because either alone is
+   worse than neither. `DEFAULT_EXPECTATION_SCHEMA = "formula-v1"` deleted;
+   `AUTHORABLE_EXPECTATION_SCHEMAS` has one member; both `authors_v2` branches removed.
+   `EXPECTATION_SCHEMA_UNDECLARED` is DISTINCT from `EXPECTATION_SCHEMA_UNKNOWN`: unknown is a work
+   item from a newer build, undeclared is our own producer, and one word for both sends an operator
+   to investigate the wrong thing.
 
-**Done and kept:**
-
-1. **`obligor_facility_count` converted to `formula-v2`.** Its derived v2 blueprint carries the same
-   grain as its reviewed v1 entry (`obligor`/`obligor`), so the lane moved and nothing about what it
-   computes did.
-2. **A registry-wide producer invariant** (`test_expectation_lane_invariant`), over all 317 recipes
-   rather than a fixture: which recipes still declare v1, that every other capturable blueprint is
-   the V2 type — the thing `CaptureBlueprintV1.bind` dispatches on, so "binds to a V2 expectation"
-   is a type fact rather than 317 grounding contexts — and that the single serialization owner
-   (`build_recipe_authoring_egress`) always writes the declaration.
-
-**Reverted, and this is the finding:**
-
-3. **`merchant_mcc_diversity` must NOT be converted without a human decision**, so the v1 worker arm
-   stays and absence cannot become terminal yet.
-
-```
-reviewed v1 expectation :  grain = merchant  (keys: merchant)
-derived  v2 blueprint   :  grain = customer  (keys: customer)
-definition output_grain :  customer
-```
-
-The reviewed v1 entry disagrees with its own definition, and that disagreement is **recorded and
-deliberate** — `test_the_merchant_v1_entry_is_untouched` exists to say no task may re-key it,
-substitute the derived customer-grain blueprint for it, or make the disagreement invisible, because
-*"that decision belongs to a human"*. Converting the lane does exactly that substitution: the
-capture path stops resolving the reviewed merchant-grain object and starts deriving a customer-grain
-one. That is not a routing change; it changes what the feature is computed PER.
-
-**The decision owed:** is `merchant_mcc_diversity` a per-merchant or a per-customer feature? Answer
-it, re-key or retire the reviewed v1 entry accordingly, and the arm can go the same day.
-
-**Status:**
+**Status to report until a real provider run succeeds:**
 
 ```
-V1 routing retired:                     NO  — 1 of 317 recipes still needs it
-V2 routing verified deterministically:  yes (registry-wide invariant, FakeLLM paths)
-Capturable v1 recipes:                  1   (was 2)
-Real-provider authoring verified:       NO  — separate acceptance gate
+V1 routing retired:                     yes
+V2 routing verified deterministically:  yes  (registry-wide invariant + FakeLLM producer→worker)
+Capturable v1 recipes:                  0
+Real-provider authoring verified:       NO   — a separate acceptance gate
 ```
+
+The authoring lane is NOT to be reported as fully operational on the strength of the above.
 
 **▲ NAMING, before the final deletion.** `formula_schema_version` names two different things: a
 string LANE selector (`"formula-v2"`) and an integer product WIRE FORMAT (`3`). Split them on the

@@ -57,7 +57,14 @@ _V2_EXPECTATION = {
 }
 
 
-def _seed_work(db, suffix: str = "1", *, declared_schema: str | None = None):
+#: What a REAL work item declares. Defaulted here because the producer defaults it too:
+#: `build_recipe_authoring_egress` writes `formula-v2` into every v2 payload and every capturable
+#: recipe is v2. A test seeding an UNDECLARED item is testing the producer-bug path, and says so.
+_DECLARED_BY_REAL_PRODUCERS = "formula-v2"
+
+
+def _seed_work(db, suffix: str = "1", *,
+               declared_schema: str | None = _DECLARED_BY_REAL_PRODUCERS):
     intent_id = f"intent-worker-{suffix}"
     run_id = f"run-worker-{suffix}"
     scope_id = f"scope-worker-{suffix}"
@@ -238,7 +245,7 @@ def _prepare_dispatch_ready(monkeypatch, suffix: str, _dsn: str):
         lambda value: object(),
     )
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
@@ -292,8 +299,6 @@ def test_an_unknown_expectation_declaration_never_reaches_any_orchestrator(
         return _run
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _never("v1"))
-    monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay",
         _never("v2"))
     # Everything downstream of the gate is left REAL: if the gate were absent the run would
@@ -345,8 +350,9 @@ def test_a_declared_v2_work_item_is_authored_by_the_REPLAY_SHAPED_v2_orchestrato
         kwargs["progress_callback"]()
         return _AuthoringResult("RESOLVED", "ok", _authoring_run_id(work_item_id))
 
-    monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _v1)
+    # The v1 arm is GONE, so "routed to v2 and not to v1" is no longer two stubs — there is one
+    # orchestrator, and that it is reached with the V2 SEAMS is what
+    # `test_the_v2_route_uses_the_v2_validator_and_the_v2_tools` proves.
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _v2)
     monkeypatch.setattr(
@@ -435,7 +441,7 @@ def test_a_v2_work_item_verifies_the_V2_frozen_configuration(db, monkeypatch, _d
     _prepare_dispatch_ready(monkeypatch, "v2-config", _dsn)
     asked: list[str] = []
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
         lambda *a, **k: asked.append("v1"))
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
@@ -487,20 +493,28 @@ def test_a_second_operand_reaches_the_frozen_read_context(db, monkeypatch, _dsn)
         "ftr::public.tx.tran_date"})
 
 
-def test_a_v1_work_item_declaring_nothing_is_still_authored(db, monkeypatch, _dsn) -> None:
-    """The other half of the gate: absence of a declaration is the v1 shape, and every work item
-    written before A4 is exactly that. It must still reach the orchestrator."""
-    _work_item_id, _run_id = _seed_work(db, "undeclared")
+def test_a_work_item_DECLARING_NOTHING_IS_TERMINAL(db, monkeypatch, _dsn) -> None:
+    """The inversion this retirement is FOR, and the reason it is safe now.
+
+    Absence used to mean `formula-v1` — correct while the v1 payload shape genuinely carried no
+    version key. Every capturable recipe now declares `formula-v2`, so absence can only mean a
+    PRODUCER that failed to declare, and routing that down a lane which no longer exists would
+    author a bug instead of reporting one.
+
+    UNDECLARED, not UNKNOWN: unknown is a work item from a newer build — somebody else's deploy —
+    and undeclared is ours.
+    """
+    _work_item_id, _run_id = _seed_work(db, "undeclared", declared_schema=None)
     _prepare_dispatch_ready(monkeypatch, "undeclared", _dsn)
     reached = False
 
-    def _run(*args, **kwargs):
+    def _never_run(*args, **kwargs):
         nonlocal reached
         reached = True
-        return _AuthoringResult("RESOLVED", "ok", _authoring_run_id("work-worker-undeclared"))
+        raise AssertionError("an undeclared work item must never reach the orchestrator")
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _never_run)
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
         lambda *args: True)
@@ -511,10 +525,14 @@ def test_a_v1_work_item_declaring_nothing_is_still_authored(db, monkeypatch, _ds
         critic_client=object(),
         identity_resolver=_IdentityResolver(PrincipalResolutionStatus.CURRENT),
     )
-    assert outcome.status == "completed", db.execute(
-        "SELECT last_error FROM queue WHERE message_id='formula-test-undeclared'"
-    ).fetchone()
-    assert reached
+    # "completed" is the QUEUE's word — handled, not to be retried. The verdict is the axis; a
+    # retry here would re-run a producer bug forever.
+    assert outcome.status == "completed"
+    assert reached is False
+    observed = db.execute(
+        "SELECT technical_axis FROM recipe_formula_shadow_observation "
+        "WHERE generation_run_id = %s", (_run_id,)).fetchone()
+    assert observed is not None and observed[0] == "EXPECTATION_SCHEMA_UNDECLARED"
 
 
 def test_revoked_principal_terminalizes_without_dispatch(db, monkeypatch) -> None:
@@ -526,7 +544,7 @@ def test_revoked_principal_terminalizes_without_dispatch(db, monkeypatch) -> Non
         called = True
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-1",
@@ -571,7 +589,7 @@ def test_configuration_drift_is_terminal_not_retryable(db, monkeypatch) -> None:
         raise ConfigurationDrifted("changed")
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
         _drift,
     )
     outcome = process_recipe_formula_shadow_once(
@@ -612,7 +630,7 @@ def test_authority_drift_terminalizes_before_provider_dispatch(db, monkeypatch) 
         called = True
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-1",
@@ -657,7 +675,7 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
         lambda value: object(),
     )
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
@@ -666,6 +684,7 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
     )
     frozen = SimpleNamespace(
         formula_facts=lambda proposal: ({}, {}),
+        formula_facts_v2=lambda proposal: ({}, ()),
         get_column_metadata=lambda ref: {"found": True, "logical_ref": ref},
     )
     monkeypatch.setattr(
@@ -680,7 +699,7 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
         return _AuthoringResult("RESOLVED", "ok", "authoring-success")
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     monkeypatch.setattr(
         "featuregen.overlay.upload.recipe_formula_worker.formula_dispatches_reconciled",
         lambda *args: True,
@@ -699,7 +718,10 @@ def test_success_uses_frozen_readers_and_completes_fenced_work(
     assert outcome.status == "completed", db.execute(
         "SELECT last_error FROM queue WHERE message_id='formula-test-success'"
     ).fetchone()
-    assert received["facts_reader"] is frozen.formula_facts
+    # The V2 reader: `formula_facts` is body-path-keyed and `formula_facts_v2` is not, so handing
+    # the v2 orchestrator the v1 bundle would resolve a v2 proposal over evidence keyed for another
+    # shape and still look confident.
+    assert received["facts_reader"] is frozen.formula_facts_v2
     assert received["critic_metadata_loader"] is frozen.get_column_metadata
     assert db.execute(
         "SELECT status FROM queue WHERE message_id='formula-test-success'"
@@ -738,7 +760,7 @@ def test_missing_durable_audit_store_terminalizes_without_dispatch(
         lambda value: object(),
     )
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration",
+        "featuregen.overlay.upload.recipe_formula_worker.verify_frozen_configuration_v2",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
@@ -756,7 +778,7 @@ def test_missing_durable_audit_store_terminalizes_without_dispatch(
         called = True
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-1",
@@ -817,7 +839,7 @@ def test_completed_durable_authoring_is_delegated_to_verified_replay(
         return _AuthoringResult("RESOLVED", "ok", authoring_run_id)
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-recovery",
@@ -856,7 +878,7 @@ def test_incomplete_prior_dispatch_is_not_automatically_reissued(
         raise RecoveryRequiresReconciliation("ambiguous pre-dispatch record")
 
     monkeypatch.setattr(
-        "featuregen.overlay.upload.recipe_formula_worker.run_authoring", _run)
+        "featuregen.overlay.upload.recipe_formula_worker.run_authoring_v2_replay", _run)
     outcome = process_recipe_formula_shadow_once(
         db,
         owner="worker-recovery",

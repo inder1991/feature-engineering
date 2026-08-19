@@ -43,27 +43,21 @@ def _capturable():
 
 
 # ══ THE REGISTRY, WHOLE ════════════════════════════════════════════════════════════════════════
-def test_EXACTLY_ONE_CAPTURABLE_RECIPE_STILL_DECLARES_V1():
-    """The gate on retiring the v1 arm, and it is NOT yet open — for one recipe, for a real reason.
+def test_NO_CAPTURABLE_RECIPE_STILL_DECLARES_V1():
+    """The condition that makes retiring the v1 arm safe, over the whole registry.
 
-    Two recipes declared `formula-v1`. `obligor_facility_count` was converted: its derived v2
-    blueprint carries the SAME grain as its reviewed v1 expectation (obligor/obligor), so moving
-    the lane changed nothing about what it computes.
-
-    `merchant_mcc_diversity` was NOT converted, and must not be without a human deciding first. Its
-    reviewed v1 expectation declares MERCHANT grain while its definition computes per CUSTOMER —
-    a known, recorded disagreement — so the derived v2 blueprint computes at a DIFFERENT GRAIN from
-    the reviewed one. Converting the lane would silently substitute customer-grain for the reviewed
-    merchant-grain expectation: not a routing change, a change to what the feature IS.
-    `test_the_merchant_v1_entry_is_untouched` says that decision belongs to a human, and it does.
-
-    While this is non-empty the v1 worker arm stays and "absence is v1" cannot become terminal.
+    Two recipes declared `formula-v1`. `obligor_facility_count` converted trivially — its derived v2
+    blueprint carries the same grain as its reviewed entry. `merchant_mcc_diversity` did not: its
+    reviewed entry declared MERCHANT grain while the definition computed per CUSTOMER, so converting
+    the lane changed what the feature is computed PER. That needed a human, got one — **per
+    customer** — and the stale entry is retired in place rather than re-keyed, because its v1
+    template has no `customer` need and could not express the answer.
     """
     still_v1 = sorted(rid for rid, bp in _capturable()
                       if bp.declared_schema_version == FORMULA_SCHEMA_V1)
-    assert still_v1 == ["merchant_mcc_diversity"], (
-        f"the set of capturable v1 recipes moved to {still_v1}: it gates the v1 arm's removal, so "
-        f"a change here is a decision rather than a detail")
+    assert still_v1 == [], (
+        f"{len(still_v1)} capturable recipe(s) still declare formula-v1: while any exists, the v1 "
+        f"arm cannot be removed and 'absence is v1' cannot become terminal — {still_v1}")
 
 
 def test_EVERY_CAPTURABLE_BLUEPRINT_IS_A_V2_BLUEPRINT():
@@ -71,9 +65,7 @@ def test_EVERY_CAPTURABLE_BLUEPRINT_IS_A_V2_BLUEPRINT():
     what makes the next link a type fact rather than a test over 317 grounding contexts."""
     wrong = sorted(rid for rid, bp in _capturable()
                    if not isinstance(bp.blueprint, RecipeFormulaExpectationBlueprintV2))
-    assert wrong == ["merchant_mcc_diversity"], (
-        f"every capturable recipe except the one still on v1 must carry a V2 blueprint, got "
-        f"{wrong}")
+    assert wrong == [], f"{len(wrong)} capturable recipe(s) carry a non-V2 blueprint: {wrong}"
 
 
 def test_THE_REGISTRY_IS_STILL_THE_SIZE_WE_THINK_IT_IS():

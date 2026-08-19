@@ -55,11 +55,16 @@ def test_merchant_anomaly_is_customer_relative():
     assert "customer-relative" in r.business_definition
 
 
-def test_merchant_mcc_diversity_keeps_its_reviewed_v1_expectation():
-    """The one honestly-authorable recipe: the Formula-v1 count-distinct expectation is
-    retained verbatim as the expectation ref, and the readiness says so."""
+def test_merchant_mcc_diversity_AUTHORS_ON_THE_V2_LANE():
+    """Moved off `formula-v1` on an explicit product decision: this feature is PER CUSTOMER.
+
+    Its reviewed v1 expectation declared merchant grain while the definition computed per customer.
+    Resolving that disagreement was a human's call, not a refactor's; it was made, and the recipe
+    now authors from the derived customer-grain v2 blueprint. The expectation ref and readiness are
+    unchanged — what moved is the lane and, deliberately, the grain the reviewed entry had wrong.
+    """
     r = BY_ID["merchant_mcc_diversity"]
-    assert r.formula.formula_schema_version == "formula-v1"
+    assert r.formula.formula_schema_version == "formula-v2"
     assert r.formula.expectation_ref == "merchant_mcc_diversity"
     assert r.readiness == "FORMULA_AUTHORABLE"
     from featuregen.overlay.upload.recipe_formula_expectations import (
