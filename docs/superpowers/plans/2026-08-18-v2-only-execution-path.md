@@ -48,29 +48,68 @@ green.
   and authorize functions, `expression_ir.compile_expression`, `physical_types`' helpers. Those get
   repointed, never deleted — the plan's own rule is that V1's *execution* machinery is reused.
 
-**And the blocking fact.** §8.6 says the v1 arm "cannot be retired by flipping a default — existing
-rows select it by saying nothing". The ROWS are gone (0 on live, verified). **The PRODUCER is not:**
+**▲ CORRECTED — a review found the blocking claim wrong.** An earlier version of this section said
+the producer never declares. That was researched badly: `recipe_formula_eval` and
+`recipe_formula_blueprint_derivation` were checked, found silent, and the conclusion drawn from
+their silence. They are not the serialization owner. `build_recipe_authoring_egress`
+(`recipe_egress.py:657`) is, and it has always written the declaration for a
+`BoundRecipeFormulaExpectationV2`. Adding the field in the evaluation modules would have created a
+second source of truth for one fact.
+
+The real position was: **298 of 317 recipes declared `formula-v2`, 19 have no formula, and exactly
+TWO still declared `formula-v1`** — `merchant_mcc_diversity` and `obligor_facility_count`, both of
+which already derived valid v2 blueprints and needed no reason to stay.
+
+### 0.2 The V1 routing retirement — ▲ BLOCKED BY ONE RECIPE, on a GRAIN question
+
+Executed, then partly reverted when the conversion turned out not to be lane-only.
+
+**Done and kept:**
+
+1. **`obligor_facility_count` converted to `formula-v2`.** Its derived v2 blueprint carries the same
+   grain as its reviewed v1 entry (`obligor`/`obligor`), so the lane moved and nothing about what it
+   computes did.
+2. **A registry-wide producer invariant** (`test_expectation_lane_invariant`), over all 317 recipes
+   rather than a fixture: which recipes still declare v1, that every other capturable blueprint is
+   the V2 type — the thing `CaptureBlueprintV1.bind` dispatches on, so "binds to a V2 expectation"
+   is a type fact rather than 317 grounding contexts — and that the single serialization owner
+   (`build_recipe_authoring_egress`) always writes the declaration.
+
+**Reverted, and this is the finding:**
+
+3. **`merchant_mcc_diversity` must NOT be converted without a human decision**, so the v1 worker arm
+   stays and absence cannot become terminal yet.
 
 ```
-recipe_formula_worker.declared_expectation_schema()  ->  DEFAULT_EXPECTATION_SCHEMA ("formula-v1")
-                                                          when formula_schema_version is absent
-recipe_formula_eval / recipe_formula_blueprint_derivation  ->  never set formula_schema_version
+reviewed v1 expectation :  grain = merchant  (keys: merchant)
+derived  v2 blueprint   :  grain = customer  (keys: customer)
+definition output_grain :  customer
 ```
 
-So every NEW work item still selects the v1 arm by saying nothing. Retiring it means changing what
-the live authoring lane emits, which is a behaviour change that wants a real generation run to
-exercise — and that needs the Anthropic key, which is currently rejected.
+The reviewed v1 entry disagrees with its own definition, and that disagreement is **recorded and
+deliberate** — `test_the_merchant_v1_entry_is_untouched` exists to say no task may re-key it,
+substitute the derived customer-grain blueprint for it, or make the disagreement invisible, because
+*"that decision belongs to a human"*. Converting the lane does exactly that substitution: the
+capture path stops resolving the reviewed merchant-grain object and starts deriving a customer-grain
+one. That is not a routing change; it changes what the feature is computed PER.
 
-**The sequence step 15 actually requires:**
+**The decision owed:** is `merchant_mcc_diversity` a per-merchant or a per-customer feature? Answer
+it, re-key or retire the reviewed v1 entry accordingly, and the arm can go the same day.
 
-1. ~~repoint the shared leaves; delete the re-export shim~~ **DONE**
-2. make the expectation producer DECLARE `formula-v2`, and exercise it on a real run
-3. retire the v1 arm of `recipe_formula_worker`; make absence terminal rather than v1
-4. migrate the live authoring stack (`result`, `critic`, `parse`, `output_authority`, …) to V3
-5. repoint the REUSED machinery off V1's vocabulary — never delete it
-6. delete `formula/schema.py` and the V1 authoring modules; regenerate the goldens (§8.2)
+**Status:**
 
-Steps 2 and 3 are the gate. Everything after them is mechanical.
+```
+V1 routing retired:                     NO  — 1 of 317 recipes still needs it
+V2 routing verified deterministically:  yes (registry-wide invariant, FakeLLM paths)
+Capturable v1 recipes:                  1   (was 2)
+Real-provider authoring verified:       NO  — separate acceptance gate
+```
+
+**▲ NAMING, before the final deletion.** `formula_schema_version` names two different things: a
+string LANE selector (`"formula-v2"`) and an integer product WIRE FORMAT (`3`). Split them on the
+work item — `expectation_schema` and `output_formula_schema_version` — so later code cannot confuse
+*which lane authors this* with *which format it produced*. Not done here: it changes the persisted
+payload bytes, which the v1 golden freeze pins.
 
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact

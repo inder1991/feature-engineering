@@ -218,22 +218,34 @@ def test_the_capture_population_is_every_recipe_with_a_bindable_blueprint():
     assert "not_a_registry_recipe" not in population
 
 
-def test_the_two_readings_of_formula_v1_still_agree():
-    """A4-c. "Declares ``formula-v1``" and "has a reviewed v1 registry entry" pick out the SAME
-    two recipes today, so keying the capture on the declared version (the plan's words) changes
-    nothing. This pins the agreement: a registry edit that separates the two readings — a third
-    v1-declaring recipe, or a v1 entry for a v2-declaring one — fails CI here instead of silently
-    changing which BINDER runs on a customer's request."""
+def test_the_two_readings_of_formula_v1_still_agree_ON_WHAT_REMAINS():
+    """A4-c, superseded by the v1 retirement — and the two readings have now DELIBERATELY diverged.
+
+    `obligor_facility_count` was converted to ``formula-v2`` during the v1 routing retirement — its
+    derived v2 blueprint carries the same grain as its reviewed entry, so the lane moved and nothing
+    else did. `merchant_mcc_diversity` was NOT: its reviewed entry declares merchant grain while the
+    definition computes per customer, so converting it would substitute a different grain for a
+    reviewed decision. See `test_the_merchant_v1_entry_is_untouched`.
+
+    So the two readings have deliberately diverged by one: the declaration side holds only
+    `merchant_mcc_diversity`, while the v1 expectation registry still holds both entries. The
+    obligor entry is now dead weight that nothing selects — pinned rather than removed, because
+    `recipe_audit`, `recipe_formula_eval` and `recipe_formula_gate` still reference the registry and
+    removing an entry would change those three for a reason unrelated to lane selection.
+    """
     declared_v1 = {definition.recipe_id for definition in V2_RECIPES
                    if definition.formula is not None
                    and definition.formula.formula_schema_version == FORMULA_SCHEMA_V1}
-    assert declared_v1 == set(RECIPE_FORMULA_EXPECTATIONS)
-    assert declared_v1 == {"merchant_mcc_diversity", "obligor_facility_count"}
+    assert declared_v1 == {"merchant_mcc_diversity"}, (
+        f"{sorted(declared_v1)} declare formula-v1: while any does, the v1 worker arm cannot be "
+        f"removed and a missing declaration cannot become terminal")
+    assert set(RECIPE_FORMULA_EXPECTATIONS) == {
+        "merchant_mcc_diversity", "obligor_facility_count"}
 
 
 @pytest.mark.parametrize(("recipe_id", "declared"), [
     ("merchant_mcc_diversity", FORMULA_SCHEMA_V1),
-    ("obligor_facility_count", FORMULA_SCHEMA_V1),
+    ("obligor_facility_count", FORMULA_SCHEMA_V2),
     ("posted_debit_amount", FORMULA_SCHEMA_V2),
 ])
 def test_a_recipe_resolves_the_blueprint_its_own_declaration_names(recipe_id, declared):
@@ -610,8 +622,13 @@ def test_formula_redactor_failure_persists_no_raw_prose_or_work(
             redacted_prediction_goal=raw_goal,
         ),
     )
+    # Patched at the DISPATCH POINT rather than on one binder. This used to replace
+    # `bind_formula_expectation` (v1) and stopped intercepting anything the moment the recipe
+    # started routing v2 — `CaptureBlueprintV1.bind` chooses the binder by blueprint type, so it is
+    # the one place that is true for both lanes. Binding is scaffolding here: what is under test is
+    # that a redactor failure persists no raw prose.
     monkeypatch.setattr(
-        shadow_module, "bind_formula_expectation", lambda _context, _blueprint: object())
+        shadow_module.CaptureBlueprintV1, "bind", lambda _self, _context: object())
     monkeypatch.setattr(
         shadow_module,
         "build_recipe_authoring_egress",

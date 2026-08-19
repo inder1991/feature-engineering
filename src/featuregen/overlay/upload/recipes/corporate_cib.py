@@ -329,7 +329,7 @@ CORPORATE_CIB_RECIPES: tuple[RecipeDefinitionV2, ...] = (
         source_grain="facility_event", output_grain="obligor",
         temporal=event_window(),
         readiness="FORMULA_AUTHORABLE", parameters=(_WINDOW,),
-        formula=FormulaReferenceV2(formula_schema_version="formula-v1",
+        formula=FormulaReferenceV2(formula_schema_version="formula-v2",
                                    expectation_ref="obligor_facility_count",
                                    result_class="distinct_count"),
         replaces_legacy_ids=("obligor_facility_count",)),
