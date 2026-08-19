@@ -6,24 +6,40 @@ hard-requires a resolved type — could never be filled for a V2 feature.
 
 What these tests hold:
 
-1. **A sum WIDENS.** Publishing at the operand's own precision overflows on exactly the data the
-   feature exists to measure.
+1. **The DECLARED decimal policy governs**, including for a sum. `sum_type_v2`'s widening is not
+   applied: it needs the operand's real precision, and the compiled IR establishes a governed
+   *word* (`"numeric"`), never a width. A wider type derived from a precision nobody read is a
+   worse answer than the one the author declared.
 2. **Nullability comes from the POLICIES**, never from the SQL type. A BIGINT count can be nullable.
-3. **An operand with no resolved type is REFUSED**, not guessed. A column published on a guess is
-   worse than one refused.
-4. **Aggregates the renderer cannot emit refuse BY NAME**, rather than typing cleanly and failing
+3. **Every arithmetic operand must be a GOVERNED EXACT NUMERIC**, and the three ways that fails are
+   three refusals, because they route to different people.
+4. **The evidence must line up with the body**, both directions — an omitted body path would
+   silently exempt one half of a ratio from the rule above.
+5. **Aggregates the renderer cannot emit refuse BY NAME**, rather than typing cleanly and failing
    later.
 """
 from __future__ import annotations
 
+import pytest
 from tests.featuregen.materialize.test_admission_v2_s13 import REF_AMT, _expr, _raw, _window
 
 from featuregen.formula.parse_v2 import parse_proposal_v2
 from featuregen.materialize.codes import MaterializationRefused
-from featuregen.materialize.physical_types_v2 import DecimalTypeV2
+from featuregen.materialize.expression_ir import OperandTypeEvidence, OperandTypeStatus
 from featuregen.materialize.resolve_physical_type_v3 import resolve_physical_type_v3
 
-AMOUNT = {REF_AMT: DecimalTypeV2(precision=18, scale=2)}
+
+def _evidence(operand_ref=REF_AMT, *, status=OperandTypeStatus.GOVERNED,
+              logical_type="decimal", read_status="resolved"):
+    """What the compiled IR actually holds for one body path — a governed WORD, never a width."""
+    return OperandTypeEvidence(operand_ref=operand_ref, status=status,
+                               logical_type=logical_type, read_status=read_status)
+
+
+#: Keyed by BODY PATH, exactly as `{e.expr_path: e.operand_type for e in ir.expressions}` is.
+AMOUNT = {"body.expr": _evidence()}
+NO_OPERAND = {"body.expr": _evidence(None, status=OperandTypeStatus.NO_OPERAND,
+                                     logical_type=None, read_status=None)}
 
 
 def _typed(raw=None, operands=None):
@@ -32,35 +48,68 @@ def _typed(raw=None, operands=None):
         operand_types=AMOUNT if operands is None else operands)
 
 
-# ══ A SUM WIDENS ════════════════════════════════════════════════════════════════════════════════
-def test_A_SUM_IS_WIDER_THAN_ITS_OPERAND():
-    """Summing N rows of DECIMAL(18,2) needs headroom.
+# ══ THE DECLARED POLICY GOVERNS ════════════════════════════════════════════════════════════════
+def test_A_SUM_PUBLISHES_THE_DECLARED_POLICY():
+    """`sum_type_v2` widens DECIMAL(18,2) to (28,2) and is deliberately NOT applied here.
 
-    Publishing at the operand's own precision would overflow on exactly the data the feature exists
-    to measure — a bank with more transactions is a bank whose feature breaks first.
+    Widening needs the operand's real precision and scale. What the compiled IR establishes is a
+    governed WORD — `"decimal"`, `"numeric"` — not a width, so a widened type would be derived from
+    a precision nobody read and published as though the author had asked for it. An earlier draft
+    of this module took `DecimalTypeV2` values, which no caller in this codebase can produce: the
+    signature was satisfiable only by a test that invented them, which is what this test used to do.
     """
+    assert _typed().sql_type == "DECIMAL(38,6)"        # the fixture's own declared policy
+
+
+def test_the_ROUNDING_AND_OVERFLOW_ARE_CARRIED_not_defaulted():
+    """Generated code must round explicitly and must fail on overflow rather than take a NULL."""
     resolved = _typed()
-    assert resolved.sql_type == "DECIMAL(28,2)"
-    assert resolved.sql_type != "DECIMAL(18,2)", "the sum was published at the operand's precision"
+    assert resolved.rounding is not None and resolved.overflow is not None
 
 
-def test_the_scale_is_PRESERVED_while_the_precision_grows():
-    """Widening is about magnitude, not about inventing decimal places the money never had."""
-    assert _typed().sql_type.endswith(",2)")
-
-
-def test_an_operand_with_NO_RESOLVED_TYPE_is_refused(catalog=None):
-    """A column published on a guess is worse than one refused: nobody downstream can tell it was
-    guessed, and the guess is in the schema for good."""
-    refusal = _typed(operands={})
+# ══ THE OPERAND MUST BE A GOVERNED EXACT NUMERIC ═══════════════════════════════════════════════
+def test_an_UNREADABLE_operand_type_refuses_toward_THE_TYPE_AUTHORITY():
+    """Unknown is not the same as known-and-unsupported, and the remedy differs: repair the read."""
+    refusal = _typed(operands={"body.expr": _evidence(
+        status=OperandTypeStatus.UNAVAILABLE, logical_type=None, read_status="fork")})
     assert isinstance(refusal, MaterializationRefused)
-    assert "cannot be typed by guessing" in refusal.detail
+    assert "repair the type authority" in refusal.detail
+
+
+def test_an_UNATTESTED_operand_type_refuses_toward_GOVERNANCE():
+    refusal = _typed(operands={"body.expr": _evidence(
+        status=OperandTypeStatus.UNGOVERNED, logical_type=None, read_status="file_declared")})
+    assert isinstance(refusal, MaterializationRefused)
+    assert "nobody attested" in refusal.detail
+
+
+def test_a_GOVERNED_BUT_INEXACT_operand_refuses_toward_THE_FORMULA():
+    """A float aggregate is order-dependent under parallel execution, so no fixed-point conversion
+    of it is reproducible — the number would differ run to run and look stable."""
+    refusal = _typed(operands={"body.expr": _evidence(logical_type="double")})
+    assert isinstance(refusal, MaterializationRefused)
+    assert "not an exact numeric" in refusal.detail
+
+
+# ══ THE EVIDENCE MUST LINE UP WITH THE BODY ════════════════════════════════════════════════════
+def test_OMITTED_EVIDENCE_IS_A_CALLER_ERROR_not_a_verdict():
+    """An omitted body path would silently exempt that operand from the rule above — the fail-open
+    the argument exists to close. A call assembled wrongly is not a governed verdict."""
+    with pytest.raises(ValueError, match="exactly the formula's expressions"):
+        _typed(operands={})
+
+
+def test_EVIDENCE_FOR_ANOTHER_FORMULA_IS_REFUSED():
+    """Same body path, different operand: the column actually summed would be typed by a statement
+    about a column it does not read."""
+    with pytest.raises(ValueError, match="different operand"):
+        _typed(operands={"body.expr": _evidence("hdfc::public.transactions.other_col")})
 
 
 # ══ COUNTS ══════════════════════════════════════════════════════════════════════════════════════
 def test_a_count_is_BIGINT():
     counting = _raw(body={"final_operation": "identity", "expr": _expr("count_rows", None)})
-    assert _typed(counting, operands={}).sql_type == "BIGINT"
+    assert _typed(counting, operands=NO_OPERAND).sql_type == "BIGINT"
 
 
 def test_A_COUNT_CAN_STILL_BE_NULLABLE():
@@ -71,7 +120,7 @@ def test_A_COUNT_CAN_STILL_BE_NULLABLE():
     writes.
     """
     counting = _raw(body={"final_operation": "identity", "expr": _expr("count_rows", None)})
-    resolved = _typed(counting, operands={})
+    resolved = _typed(counting, operands=NO_OPERAND)
     assert resolved.sql_type == "BIGINT"
     assert resolved.nullable is True
 
@@ -81,10 +130,26 @@ def test_nullability_comes_from_the_POLICY_not_the_type():
     never_empty = _raw(body={"final_operation": "identity",
                              "expr": _expr("count_rows", None,
                                            window=_window(empty_window="zero"))})
-    assert _typed(never_empty, operands={}).nullable is False
+    assert _typed(never_empty, operands=NO_OPERAND).nullable is False
 
 
 # ══ ARITHMETIC USES THE DECLARED POLICY ═════════════════════════════════════════════════════════
+def _ratio(rounding: str = "half_up") -> dict:
+    return _raw(body={"final_operation": "ratio",
+                      "numerator": _expr("sum", REF_AMT),
+                      "denominator": _expr("count_rows", None),
+                      "zero_denominator": "null"},
+                decimal={"precision": 38, "scale": 6, "rounding": rounding,
+                         "overflow": "error"})
+
+
+RATIO_EVIDENCE = {
+    "body.numerator": _evidence(),
+    "body.denominator": _evidence(None, status=OperandTypeStatus.NO_OPERAND,
+                                  logical_type=None, read_status=None),
+}
+
+
 def test_a_RATIO_publishes_the_formulas_own_decimal_policy():
     """How the answer is REPRESENTED is a governed decision.
 
@@ -92,13 +157,25 @@ def test_a_RATIO_publishes_the_formulas_own_decimal_policy():
     the formula says what precision this number is reported at, not the columns it was computed
     from.
     """
-    ratio = _raw(body={"final_operation": "ratio",
-                       "numerator": _expr("sum", REF_AMT),
-                       "denominator": _expr("count_rows", None),
-                       "zero_denominator": "null"})
-    resolved = _typed(ratio)
+    resolved = _typed(_ratio(), operands=RATIO_EVIDENCE)
     assert resolved.sql_type == "DECIMAL(38,6)"        # the fixture's declared policy
     assert resolved.rounding is not None and resolved.overflow is not None
+
+
+def test_HALF_EVEN_ON_A_RATIO_REFUSES_here_too():
+    """V1's finding, and it is about the ENGINE rather than about a language, so V2 inherits it.
+
+    Spark's decimal divide wraps its result in `CheckOverflow`, which rounds HALF_UP at the division
+    result scale BEFORE any explicit rounding the generated code performs — the ties are gone before
+    the emitted `bround` runs. A declaration the engine silently ignores is refused rather than
+    recorded as applied.
+
+    Found by running it: the V2 fixture declares `half_even`, so the first version of the test above
+    was refused rather than typed, which is exactly the right answer to the wrong question.
+    """
+    refusal = _typed(_ratio("half_even"), operands=RATIO_EVIDENCE)
+    assert isinstance(refusal, MaterializationRefused)
+    assert "rounds HALF_UP at the result scale" in refusal.detail
 
 
 # ══ WHAT THIS BUILD CANNOT TYPE, IT REFUSES BY NAME ════════════════════════════════════════════

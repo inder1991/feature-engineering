@@ -22,7 +22,8 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 | Steps | State | Notes |
 |---|---|---|
 | **0–8** | **done** | migrations 1091, 1092, 1093 APPLIED to live (189 total) |
-| 9–15 | not started | 9 is the narrow pilot — the first end-to-end proof |
+| **9** | **compile half done** | `compile_generation_v2` closes admitted → operator graph; rendering and sealing are the caller's, and are not yet wired |
+| 10–15 | not started | 10 needs real policy payloads, which is governance input, not engineering |
 
 **Found during execution, and not in the plan when it was written:**
 
@@ -38,6 +39,15 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 * **Step 5** — policy payloads did not record **when** their columns are read, which is the one
   fact that decides whether a policy leaks. Added as a required field with no default: a default of
   `event_time` would have made every policy pass the leakage gate by construction.
+* **Step 9** — `resolve_physical_type_v3` took `DecimalTypeV2` operand types that **no caller in
+  this codebase can produce**: the compiled IR establishes a governed *word* (`"numeric"`), never a
+  width. Its signature was satisfiable only by a test that invented them. Rewritten to V1's
+  contract, which the compiled IR satisfies directly — and `sum_type_v2`'s widening is consequently
+  NOT applied, because widening on a precision nobody read publishes a type the author did not
+  declare.
+* **Step 9** — `compile_ir_v2` read the output policy off `proposal.expected_output`, which is what
+  the author EXPECTED rather than what output authority permits. Now a required argument, resolved
+  by `resolve_output_v2` in the orchestrator.
 * **Step 8** — the ten sites were confirmed exactly ten, and the mechanism was worse than recorded.
   The two enums do not merely fail `is`: they compare EQUAL and **hash equal**, so a V2 member finds
   the right entry in a V1-keyed dispatch table. Dispatch working while identity fails is what let a

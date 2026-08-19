@@ -56,6 +56,11 @@ from enum import StrEnum
 from typing import Any
 
 from featuregen.materialize.binding import physical_target_for
+from featuregen.materialize.boundary_v2 import (
+    AuthorizedCompilationV2,
+    FeatureGroupPlanV2,
+    build_compilation_identity_v2,
+)
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
 from featuregen.materialize.identity import (
@@ -292,9 +297,17 @@ def slug(value: str) -> str:
     return "".join(char if char.isalnum() or char == "_" else "_" for char in _fold(value))
 
 
+#: The authorized groups and packing lists this renderer produces a project from. ONE renderer, so
+#: both languages arrive here; the two plans differ in a single field name and the two tokens answer
+#: the same questions (`irs`, `spine`). The only genuine difference is which identity they carry,
+#: and that is the one place below that asks which it holds.
+RenderableCompilation = AuthorizedCompilation | AuthorizedCompilationV2
+RenderablePlan = FeatureGroupPlanV1 | FeatureGroupPlanV2
+
+
 def project_datasets(
-    authorized: AuthorizedCompilation,
-    plan: FeatureGroupPlanV1,
+    authorized: RenderableCompilation,
+    plan: RenderablePlan,
     *,
     spine_input: PhysicalInputRequirement,
 ) -> ProjectDatasets:
@@ -308,14 +321,14 @@ def project_datasets(
         ValueError: two datasets normalize to one name, or ``spine_input`` describes a table other
             than the declared population's.
     """
-    if not isinstance(authorized, AuthorizedCompilation):
+    if not isinstance(authorized, AuthorizedCompilation | AuthorizedCompilationV2):
         raise TypeError(
-            f"rendering requires Gate 2's AuthorizedCompilation, got {type(authorized).__name__}: "
+            f"rendering requires Gate 2's authorization token, got {type(authorized).__name__}: "
             f"§1.3 says no contract, group plan or PROJECT is produced from an unauthorized group, "
             f"and a token is the only thing that shows the group's whole read set was authorized")
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
-            f"rendering requires a FeatureGroupPlanV1, got {type(plan).__name__}: the plan is what "
+            f"rendering requires a group plan, got {type(plan).__name__}: the plan is what "
             f"states which columns the published table carries")
     if not isinstance(spine_input, PhysicalInputRequirement):
         raise TypeError(
@@ -384,7 +397,7 @@ def project_datasets(
 
 
 def _expression_requirements(
-    authorized: AuthorizedCompilation,
+    authorized: RenderableCompilation,
 ) -> tuple[PhysicalInputRequirement, ...]:
     """Every physical table the group's expressions read, in a plan-determined order.
 
@@ -407,7 +420,18 @@ def _expression_requirements(
     return tuple(ordered)
 
 
-def _column_of(plan: FeatureGroupPlanV1, feature_name: str) -> str:
+def _physical_type_policy(plan: RenderablePlan) -> str:
+    """What decided this plan's physical types, for the README.
+
+    V1 records an ordinal and V2 a named policy id — the same fact, and V2's docstring says why it
+    is a name: a persisted plan should state the rule set its types were decided under rather than
+    a number a reader has to look up.
+    """
+    version = getattr(plan, "physical_type_policy_version", None)
+    return str(version) if version is not None else plan.physical_type_policy
+
+
+def _column_of(plan: RenderablePlan, feature_name: str) -> str:
     """The planned COLUMN a compiled feature occupies — read off the plan, never re-normalized.
 
     ``build_compilation_identity`` has already proved the two sides describe the same features, so a
@@ -496,7 +520,7 @@ def feature_staging_path(column: str) -> str:
 def _catalog_entries(
     datasets: ProjectDatasets,
     *,
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     published_target: str,
     selection: PublisherSelection | None,
 ) -> tuple[_CatalogEntry, ...]:
@@ -1081,7 +1105,7 @@ def _render_crosswalk_pins(compilation: CompilationIdentity) -> str:
 
 
 def _render_readme(
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     compilation: CompilationIdentity,
     datasets: ProjectDatasets,
     *,
@@ -1108,7 +1132,7 @@ def _render_readme(
         "  (§10.1). It is not a parameter and not a template variable: there is no way to make a run\n"
         "  write anywhere else.\n"
         f"- **Renderer version** `{RENDERER_VERSION}` · **physical type policy** "
-        f"`{plan.physical_type_policy_version}`\n"
+        f"`{_physical_type_policy(plan)}`\n"
         f"- **Materialization contract** `{compilation.materialization_contract_hash}`\n"
         f"- **Group plan** `{compilation.group_plan_hash}`\n"
         "\n"
@@ -1182,8 +1206,8 @@ def _render_readme(
 
 
 def render_project(
-    authorized: AuthorizedCompilation,
-    plan: FeatureGroupPlanV1,
+    authorized: RenderableCompilation,
+    plan: RenderablePlan,
     *,
     environment_id: str,
     engine_versions: EngineVersions,
@@ -1225,8 +1249,7 @@ def render_project(
         ``GENERATED.lock``, and the two-phase identity they were sealed under.
 
     Raises:
-        TypeError: ``authorized`` is not an ``AuthorizedCompilation``, ``plan`` is not a
-            ``FeatureGroupPlanV1``, ``spine_input`` is not a ``PhysicalInputRequirement``, or
+        TypeError: ``authorized`` is not one of Gate 2's tokens, ``plan`` is not a group plan, ``spine_input`` is not a ``PhysicalInputRequirement``, or
             ``engine_versions`` is not an ``EngineVersions``.
         ValueError: the wiring does not close, a node's source does not define the function it
             wires, two datasets normalize to one name, the spine requirement names another table,
@@ -1235,9 +1258,9 @@ def render_project(
     # Checked FIRST, before anything is derived from it: §1.3 says no project is produced from an
     # unauthorized group, and a check that ran after `build_compilation_identity` would report a
     # missing attribute rather than the refusal it is.
-    if not isinstance(authorized, AuthorizedCompilation):
+    if not isinstance(authorized, AuthorizedCompilation | AuthorizedCompilationV2):
         raise TypeError(
-            f"render_project requires Gate 2's AuthorizedCompilation, got "
+            f"render_project requires Gate 2's authorization token, got "
             f"{type(authorized).__name__}: §1.3 says no contract, group plan or PROJECT is produced "
             f"from an unauthorized group, and a bare list of IRs never showed that the group's "
             f"complete physical read set was authorized")
@@ -1298,7 +1321,14 @@ def render_project(
         *node_parameters,
     }))
 
-    compilation = build_compilation_identity(authorized.irs, plan)
+    # The ONE place that asks which language it holds, and it asks because the answer is genuinely
+    # different: the two identities cover different content, and deriving one from the other would
+    # be a compilation claiming an identity it does not have. Everything else above reads both
+    # tokens through the same attributes.
+    compilation = (
+        build_compilation_identity_v2(authorized, plan.materialization_contract_hash, plan)
+        if isinstance(authorized, AuthorizedCompilationV2)
+        else build_compilation_identity(authorized.irs, plan))
     datasets = project_datasets(authorized, plan, spine_input=spine_input)
     _check_wiring(datasets, supplied)
 

@@ -78,6 +78,7 @@ def compile_ir_v2(
     *,
     spine,
     inventory: ClusterInventoryV1,
+    output_policy,
     roles: Iterable[str] = (),
     policy_realization_ids: Mapping[str, str] = (),
 ) -> PlannedFormulaExecutionIRV2 | MaterializationRefused:
@@ -89,6 +90,11 @@ def compile_ir_v2(
     would leave the next stage to re-derive the reads from content it does not have.
 
     Args:
+        output_policy: the RESOLVED output policy, from `resolve_output_v2`. Required, and
+            deliberately not read off ``proposal.expected_output``: that field is what the author
+            EXPECTED, and output authority is what the operands' governed units and declared
+            conversions actually permit. Substituting the expectation for the authority is how a
+            feature comes to claim a unit nobody established.
         policy_realization_ids: declared policy ref → the realization revision that decides it.
             Every policy the formula declares must appear here and resolve to stored executable
             content. A missing entry is a refusal, not a policy that does not apply: the formula
@@ -167,14 +173,13 @@ def compile_ir_v2(
             return result                      # the FIRST failure decides the code
         compiled.append(result)
 
-    # ── 5. THE OUTPUT POLICY, THROUGH V2's OWN AUTHORITY ────────────────────────────────────────
-    output = getattr(proposal, "expected_output", None) or getattr(proposal, "output", None)
-    if output is None:
+    # ── 5. THE OUTPUT POLICY, RESOLVED BY V2's OWN AUTHORITY AND PASSED IN ──────────────────────
+    if output_policy is None:
         return MaterializationRefused(
-            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
-            f"feature {admitted.feature_name!r} resolved no output policy: without one the "
-            f"published column has no declared unit, currency or additivity, and a consumer would "
-            f"have to guess what the number means")
+            CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED,
+            f"feature {admitted.feature_name!r} has no resolved output policy: without one the "
+            f"published column has no established unit, currency or additivity, and a consumer "
+            f"would have to guess what the number means")
 
     ir = FormulaExecutionIRV2(
         feature_name=admitted.feature_name,
@@ -191,7 +196,7 @@ def compile_ir_v2(
         row_selections=_row_selections(paths, expressions_in),
         policies=declared,
         spine=spine,
-        output_policy=output,
+        output_policy=output_policy,
         authoring_run_id=admitted.authoring_run_id)
 
     # Derives the read set from the IR and pairs the two — never a caller's assertion about what an

@@ -22,12 +22,14 @@ import pytest
 from tests.featuregen.formula.authoring_fixtures import seed_authoring_catalog
 from tests.featuregen.materialize.test_admission_v2_s13 import _INTENT, _expr, _raw
 
+from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
 from featuregen.formula.policy_payloads import (
     DirectionPayloadV1,
     EligibleStatusPayloadV1,
     PolicyReadBasisV1,
     record_payload,
 )
+from featuregen.formula.schema import AdditivityClass
 from featuregen.formula.schema_v2 import FinalOperationV2
 from featuregen.materialize.boundary_v2 import KnowledgeTimeBasisV2
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
@@ -70,7 +72,17 @@ def _compile(db, admitted=None, **kwargs):
     """
     return compile_ir_v2(
         db, admitted if admitted is not None else _v2_admitted(),
-        spine=kwargs.pop("spine", object()), inventory=kwargs.pop("inventory", None), **kwargs)
+        spine=kwargs.pop("spine", object()), inventory=kwargs.pop("inventory", None),
+        output_policy=kwargs.pop("output_policy", _OUTPUT), **kwargs)
+
+
+#: A resolved output policy, supplied because the compiler REQUIRES one: `expected_output` is what
+#: the author expected and output authority is what the operands permit, and the compiler takes the
+#: second. Every test here asserts a decision made before the output step, so its content is not
+#: what is under test — its presence is.
+_OUTPUT = FormulaOutputPolicyV2(
+    output_type="decimal", unit="monetary", currency="fixed:AED",
+    output_additivity=AdditivityClass.NON_ADDITIVE, external_type_required=False)
 
 
 # ══ A DECLARED POLICY MUST RESOLVE TO CONTENT ══════════════════════════════════════════════════

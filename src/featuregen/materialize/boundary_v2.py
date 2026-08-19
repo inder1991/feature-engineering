@@ -491,6 +491,16 @@ class AuthorizedCompilationV2:
         return tuple(sorted(self.planned, key=lambda planned: planned.ir.feature_name))
 
     @property
+    def irs(self) -> tuple[FormulaExecutionIRV2, ...]:
+        """The compiled IRs this token covers, ordered by feature name.
+
+        Named to match V1's attribute deliberately: the project renderer asks a token for the IRs it
+        authorized, and that question has one answer in both languages. A differently-spelled
+        accessor would force the renderer to know which token it holds in order to ask.
+        """
+        return tuple(planned.ir for planned in self.ordered_planned())
+
+    @property
     def ir_hashes(self) -> tuple[str, ...]:
         """The V2 IR hashes this token covers, ordered by feature name."""
         return tuple(ir_hash_v2(planned.ir) for planned in self.ordered_planned())
