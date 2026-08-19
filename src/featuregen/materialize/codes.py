@@ -71,6 +71,10 @@ class CompilationRefusalCode(StrEnum):
     #: that treated every operand ref as a grain key — a guess that produced a plausible, wrong
     #: answer rather than a refusal anybody could act on.
     GRAIN_NOT_RESOLVED = "GRAIN_NOT_RESOLVED"
+    #: The formula declares a policy and nothing says which realization decides it. Distinct from a
+    #: realization whose CONTENT is missing: this one is unbound, that one is unstored, and the
+    #: remedies differ — bind it, or supply its content.
+    POLICY_REFERENCE_UNRESOLVABLE = "POLICY_REFERENCE_UNRESOLVABLE"
     #: The candidate was frozen under a canonicalization that did not carry its typed computation
     #: (operation, measures, grain, time, window, grouping). Those candidates are readable and
     #: auditable, and they cannot be EXECUTED: the identity they were sealed under does not describe
