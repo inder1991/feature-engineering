@@ -22,8 +22,14 @@ import pytest
 from tests.featuregen.formula.authoring_fixtures import seed_authoring_catalog
 from tests.featuregen.materialize.test_admission_v2_s13 import _INTENT, _expr, _raw
 
-from featuregen.formula.policy_payloads import EligibleStatusPayloadV1, record_payload
+from featuregen.formula.policy_payloads import (
+    DirectionPayloadV1,
+    EligibleStatusPayloadV1,
+    PolicyReadBasisV1,
+    record_payload,
+)
 from featuregen.formula.schema_v2 import FinalOperationV2
+from featuregen.materialize.boundary_v2 import KnowledgeTimeBasisV2
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.compile_ir_v2 import compile_ir_v2
 
@@ -100,34 +106,115 @@ def test_a_policy_whose_CONTENT_IS_MISSING_refuses_differently(catalog):
     assert "sha256:nothing-here" in result.detail
 
 
-def test_a_policy_with_STORED_CONTENT_RESOLVES_TO_EMITTABLE_CONTENT(catalog):
-    """The round trip the renderer needs: a governed decision becomes content it can emit.
+def test_a_policy_with_STORED_CONTENT_BECOMES_A_PHYSICAL_READ(catalog):
+    """The round trip Gate 2 needs: a governed decision becomes the COLUMN it causes to be read.
 
-    Asserted on the resolution step rather than on a full compile. Reaching the IR also requires
-    physical resolution against a seeded cluster inventory, which is step 9's pilot — and a test
-    that had to seed one to prove "the policy resolved" would mostly be testing the seeding, and
-    would fail for reasons that have nothing to do with policies.
+    This is why resolution belongs at compile time. A policy is applied by reading its columns, and
+    which columns those are lives only in the payload — so until it is resolved the read set is
+    incomplete, and Gate 2 would authorize a compilation narrower than the run performs.
+
+    Asserted on the derivation rather than on a full compile: reaching the IR also requires physical
+    resolution against a seeded cluster inventory, which is step 9's pilot, and a test that had to
+    seed one to prove "the policy became a read" would mostly be testing the seeding.
     """
-    from featuregen.materialize.compile_ir_v2 import _resolve_policies
+    _store_status_policy(catalog, "pr-1", "status:posted-only")
+    reads = _reads_for(catalog, "status:posted-only", {"status:posted-only": "pr-1"})
 
+    assert not isinstance(reads, MaterializationRefused), reads
+    assert [(r.policy_ref, r.role, r.logical_ref) for r in reads] == [
+        ("status:posted-only", "status", "authored::public.txns.status_cd")]
+
+
+def test_the_READ_BASIS_TRAVELS_from_the_payload_to_the_read(catalog):
+    """The one fact that decides whether a policy leaks, carried unchanged to the gate that reads it.
+
+    A status column updated in place reads as it is NOW, so a feature filtering on "was POSTED"
+    learns an answer its cutoff could not have known. The payload is the only thing that knows, and
+    the leakage gate is the only thing that acts on it — anything lost between the two makes the
+    gate decide on an assumption.
+    """
+    _store_status_policy(catalog, "pr-1", "status:posted-only",
+                         basis=PolicyReadBasisV1.LATEST_AVAILABLE)
+    reads = _reads_for(catalog, "status:posted-only", {"status:posted-only": "pr-1"})
+
+    assert not isinstance(reads, MaterializationRefused), reads
+    assert reads[0].temporal.basis is KnowledgeTimeBasisV2.LATEST_AVAILABLE
+
+
+def test_the_TWO_BASIS_ENUMS_ARE_ONE_VOCABULARY():
+    """`formula` must not import `materialize`, so the basis is spelled twice. Two spellings of one
+    vocabulary drift the first time either side gains a member, and a basis the compiler cannot map
+    would raise where a governed refusal belongs."""
+    assert ({b.value for b in PolicyReadBasisV1}
+            == {b.value for b in KnowledgeTimeBasisV2})
+
+
+def test_a_realization_holding_THE_WRONG_SHAPE_refuses(catalog):
+    """A status ref that resolves to a direction payload is not a near-miss: it would read the
+    direction column and filter on values that mean something else entirely, producing a plausible
+    number from a policy the formula never declared."""
     content = record_payload(
         catalog,
-        EligibleStatusPayloadV1(status_column_ref="authored::public.txns.status_cd",
-                                eligible_values=("POSTED", "SETTLED")),
+        DirectionPayloadV1(direction_column_ref="authored::public.txns.dr_cr",
+                           debit_values=("D",), credit_values=("C",),
+                           read_basis=PolicyReadBasisV1.EVENT_TIME),
         recorded_by="user:ops")
-    catalog.execute(
-        "INSERT INTO policy_realization_revision (revision_id, family_key_hash, policy_kind, "
-        "policy_ref, bound_dataset, environment_id, semantic_role, executable_content_hash, "
-        "cas_pointer, provenance) VALUES ('pr-1','fam','status','status:posted-only','ds','env',"
-        "'status',%s,'cas','source_derived')", (content,))
+    _realization(catalog, "pr-1", "status:posted-only", content)
+    reads = _reads_for(catalog, "status:posted-only", {"status:posted-only": "pr-1"})
 
-    declared = _with_status_policy(_v2_admitted(), "status:posted-only")
-    resolved = _resolve_policies(
-        catalog, declared.proposal, {"status:posted-only": "pr-1"})
+    assert isinstance(reads, MaterializationRefused)
+    assert reads.code is CompilationRefusalCode.POLICY_REFERENCE_UNRESOLVABLE
+    assert "different question" in reads.detail
 
-    assert not isinstance(resolved, MaterializationRefused), resolved
-    assert resolved[0].eligible_values == ("POSTED", "SETTLED")
-    assert resolved[0].status_column_ref == "authored::public.txns.status_cd"
+
+# ══ WHAT THE IR CARRIES ════════════════════════════════════════════════════════════════════════
+def test_ROW_SELECTIONS_ARE_CARRIED_FROM_THE_EXPRESSION(catalog):
+    """V3 puts row selections on the EXPRESSION. An earlier draft of the compiler read them off the
+    proposal — a field that does not exist there — so it produced an empty tuple for every formula,
+    and a semantically filtered feature compiled to an unfiltered one whose only symptom was its
+    numbers."""
+    from featuregen.formula.parse_v3 import parse_proposal_v3
+    from featuregen.formula.schema_v3 import FORMULA_SCHEMA_VERSION_V3
+    from featuregen.materialize.compile_ir_v2 import _row_selections
+
+    # The policy ref is not decoration here: V3 refuses a selection that declares intent with no
+    # reference to resolve it, because "wants debit rows" without a direction policy is a filter
+    # nothing can apply.
+    raw = _raw(body={"final_operation": "identity", "expr": _expr(
+        authority_refs={"direction_policy_ref": "direction:dr-cr"},
+        row_selections=[{"kind": "transaction_direction", "role": "direction",
+                         "semantic_value": "debit"}])})
+    raw["formula_schema_version"] = FORMULA_SCHEMA_VERSION_V3
+    proposal = parse_proposal_v3(raw)
+    carried = _row_selections(("body.expr",), tuple(_body_expressions(proposal)))
+
+    assert [s.expr_path for s in carried] == ["body.expr"]
+    assert carried[0].selections[0].semantic_value == "debit"
+
+
+def test_an_expression_with_NO_SELECTIONS_gets_NO_ENTRY(catalog):
+    """`SelectedRowsV2` refuses an empty tuple precisely so "selects nothing" and "the selection was
+    dropped on the way here" cannot look alike — so the compiler must omit, never emit empty."""
+    from featuregen.materialize.compile_ir_v2 import _row_selections
+
+    assert _row_selections(("body.expr",), tuple(_body_expressions(_v2_admitted().proposal))) == ()
+
+
+def test_THE_DECLARATION_IS_WHAT_THE_IR_CARRIES_not_the_resolved_content(catalog):
+    """Identity-bearing: a formula with a reversal policy is a different formula from one without.
+
+    The resolved CONTENT never enters the IR. Baking one environment's realization into a feature's
+    identity would make the same governed formula two different features in two environments, and
+    re-pointing a realization would silently re-identify every feature that used it.
+    """
+    from featuregen.materialize.compile_ir_v2 import _declared_policies
+
+    declared = _declared_policies(
+        ("body.expr",),
+        tuple(_body_expressions(_with_status_policy(_v2_admitted(), "status:x").proposal)))
+
+    assert [(d.expr_path, d.declared_refs()) for d in declared] == [
+        ("body.expr", (("status", "status:x"),))]
 
 
 # ══ THE GRAIN IS NOT OPTIONAL ══════════════════════════════════════════════════════════════════
@@ -198,3 +285,37 @@ def _with_status_policy(admitted, ref: str):
         "status_policy_ref": ref, "direction_policy_ref": "",
         "reversal_policy_ref": "", "currency_conversion_ref": ""})})
     return _v2_admitted(proposal=parse_proposal_v2(raw))
+
+
+def _body_expressions(proposal):
+    from featuregen.formula.schema_v2 import body_expressions_v2
+
+    return body_expressions_v2(proposal.body)
+
+
+def _realization(conn, revision_id: str, policy_ref: str, content_hash: str) -> None:
+    conn.execute(
+        "INSERT INTO policy_realization_revision (revision_id, family_key_hash, policy_kind, "
+        "policy_ref, bound_dataset, environment_id, semantic_role, executable_content_hash, "
+        "cas_pointer, provenance) VALUES (%s,'fam','status',%s,'ds','env','status',%s,'cas',"
+        "'source_derived')", (revision_id, policy_ref, content_hash))
+
+
+def _store_status_policy(conn, revision_id: str, policy_ref: str,
+                         basis: PolicyReadBasisV1 = PolicyReadBasisV1.EVENT_TIME) -> None:
+    content = record_payload(
+        conn,
+        EligibleStatusPayloadV1(status_column_ref="authored::public.txns.status_cd",
+                                eligible_values=("POSTED", "SETTLED"), read_basis=basis),
+        recorded_by="user:ops")
+    _realization(conn, revision_id, policy_ref, content)
+
+
+def _reads_for(conn, ref: str, realization_ids):
+    """The physical reads one declared status policy causes, through the compiler's own derivation."""
+    from featuregen.materialize.compile_ir_v2 import _declared_policies, _policy_reads
+
+    declared = _declared_policies(
+        ("body.expr",),
+        tuple(_body_expressions(_with_status_policy(_v2_admitted(), ref).proposal)))
+    return _policy_reads(conn, declared, realization_ids)

@@ -32,6 +32,7 @@ __all__ = [
     "EligibleStatusPayloadV1",
     "MissingRateBehaviourV1",
     "PolicyKindV1",
+    "PolicyReadBasisV1",
     "PolicyPayloadUnavailable",
     "QuoteConventionV1",
     "ReversalPayloadV1",
@@ -53,6 +54,37 @@ class PolicyKindV1(StrEnum):
     DIRECTION = "direction"
     REVERSAL = "reversal"
     CURRENCY_CONVERSION = "currency_conversion"
+
+
+class PolicyReadBasisV1(StrEnum):
+    """WHEN this policy's columns are read — the fact that decides whether the policy leaks.
+
+    **Required, with no default, because it cannot be inferred from anything else stored.** A status
+    column that is UPDATED IN PLACE reads as it is now: a transaction posted last March and reversed
+    yesterday reads REVERSED today, so a model trained on "was this eligible in March" is trained on
+    an answer March could not have known. An append-only ledger where the status travels with the
+    row has the opposite property. The two look identical in the catalog — same column, same type,
+    same name — and only whoever governs the source knows which it is.
+
+    Defaulting this would be worse than leaving it out. The leakage gate refuses
+    ``LATEST_AVAILABLE`` policy reads, so a default of ``EVENT_TIME`` would make every policy pass
+    the gate by construction, and a leakage gate that cannot refuse is a gate that reports safety
+    it never checked.
+
+    **One basis per policy, not per column.** A policy whose columns are read on two different bases
+    is two decisions wearing one name, and it should be two policies — otherwise which basis a given
+    column got would be a fact nobody recorded.
+
+    Deliberately a SECOND enum, mirroring ``materialize.boundary_v2.KnowledgeTimeBasisV2`` member
+    for member. ``formula`` must not import ``materialize`` — that is the layer direction of the
+    whole package — and a string here that the compiler mapped by hand would drift the first time
+    either side gained a member. A test asserts the two sets are equal, so drift is a failing test
+    rather than a silent divergence.
+    """
+
+    AS_OF_CUTOFF = "as_of_cutoff"
+    EVENT_TIME = "event_time"
+    LATEST_AVAILABLE = "latest_available"
 
 
 class QuoteConventionV1(StrEnum):
@@ -108,6 +140,7 @@ class EligibleStatusPayloadV1:
 
     status_column_ref: str
     eligible_values: tuple[str, ...]
+    read_basis: PolicyReadBasisV1
 
     kind = PolicyKindV1.ELIGIBLE_STATUS
 
@@ -125,7 +158,8 @@ class EligibleStatusPayloadV1:
         # SORTED, because a set of eligible values has no order and two orderings of the same set
         # must not be two different policies.
         return {"status_column_ref": self.status_column_ref,
-                "eligible_values": sorted(self.eligible_values)}
+                "eligible_values": sorted(self.eligible_values),
+                "read_basis": self.read_basis.value}
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +174,7 @@ class DirectionPayloadV1:
     direction_column_ref: str
     debit_values: tuple[str, ...]
     credit_values: tuple[str, ...]
+    read_basis: PolicyReadBasisV1
 
     kind = PolicyKindV1.DIRECTION
 
@@ -159,7 +194,8 @@ class DirectionPayloadV1:
     def to_json(self) -> dict:
         return {"direction_column_ref": self.direction_column_ref,
                 "debit_values": sorted(self.debit_values),
-                "credit_values": sorted(self.credit_values)}
+                "credit_values": sorted(self.credit_values),
+                "read_basis": self.read_basis.value}
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +208,7 @@ class ReversalPayloadV1:
 
     link_column_ref: str
     survivor_rule: SurvivorRuleV1
+    read_basis: PolicyReadBasisV1
 
     kind = PolicyKindV1.REVERSAL
 
@@ -180,7 +217,8 @@ class ReversalPayloadV1:
 
     def to_json(self) -> dict:
         return {"link_column_ref": self.link_column_ref,
-                "survivor_rule": self.survivor_rule.value}
+                "survivor_rule": self.survivor_rule.value,
+                "read_basis": self.read_basis.value}
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,7 +235,8 @@ class CurrencyConversionPayloadV1:
     * wrong ``rate_key_refs`` join the wrong currency pair;
     * a wrong ``as_of_column_ref`` applies today's rate to a year-old row;
     * a wrong ``quote_convention`` returns the reciprocal;
-    * an unstated ``missing_rate_behaviour`` silently drops or zeroes rows.
+    * an unstated ``missing_rate_behaviour`` silently drops or zeroes rows;
+    * a wrong ``read_basis`` joins today's rate to a year-old row and calls it as-of.
     """
 
     rate_table_ref: str
@@ -206,6 +245,7 @@ class CurrencyConversionPayloadV1:
     rate_key_refs: tuple[str, ...]
     quote_convention: QuoteConventionV1
     missing_rate_behaviour: MissingRateBehaviourV1
+    read_basis: PolicyReadBasisV1
 
     kind = PolicyKindV1.CURRENCY_CONVERSION
 
@@ -227,7 +267,8 @@ class CurrencyConversionPayloadV1:
                 # ORDERED: the key order is the join order, and reordering it changes the plan.
                 "rate_key_refs": list(self.rate_key_refs),
                 "quote_convention": self.quote_convention.value,
-                "missing_rate_behaviour": self.missing_rate_behaviour.value}
+                "missing_rate_behaviour": self.missing_rate_behaviour.value,
+                "read_basis": self.read_basis.value}
 
 
 PolicyPayloadV1 = (EligibleStatusPayloadV1 | DirectionPayloadV1 | ReversalPayloadV1
@@ -331,23 +372,50 @@ def _from_json(kind: str, data: Mapping[str, object]) -> PolicyPayloadV1:
     if shape is EligibleStatusPayloadV1:
         return EligibleStatusPayloadV1(
             status_column_ref=str(data["status_column_ref"]),
-            eligible_values=tuple(data.get("eligible_values") or ()))
+            eligible_values=tuple(data.get("eligible_values") or ()),
+            read_basis=_basis(data))
     if shape is DirectionPayloadV1:
         return DirectionPayloadV1(
             direction_column_ref=str(data["direction_column_ref"]),
             debit_values=tuple(data.get("debit_values") or ()),
-            credit_values=tuple(data.get("credit_values") or ()))
+            credit_values=tuple(data.get("credit_values") or ()),
+            read_basis=_basis(data))
     if shape is ReversalPayloadV1:
         return ReversalPayloadV1(
             link_column_ref=str(data["link_column_ref"]),
-            survivor_rule=SurvivorRuleV1(str(data["survivor_rule"])))
+            survivor_rule=SurvivorRuleV1(str(data["survivor_rule"])),
+            read_basis=_basis(data))
     return CurrencyConversionPayloadV1(
         rate_table_ref=str(data["rate_table_ref"]),
         rate_column_ref=str(data["rate_column_ref"]),
         as_of_column_ref=str(data["as_of_column_ref"]),
         rate_key_refs=tuple(data.get("rate_key_refs") or ()),
         quote_convention=QuoteConventionV1(str(data["quote_convention"])),
-        missing_rate_behaviour=MissingRateBehaviourV1(str(data["missing_rate_behaviour"])))
+        missing_rate_behaviour=MissingRateBehaviourV1(str(data["missing_rate_behaviour"])),
+        read_basis=_basis(data))
+
+
+def _basis(data: Mapping[str, object]) -> PolicyReadBasisV1:
+    """The stored read basis, REFUSED rather than defaulted when absent.
+
+    A payload written before this field existed cannot be read as though it had one: whichever
+    basis were assumed, the leakage gate would then decide on an assumption rather than on a
+    recorded fact. Refusing sends an operator to re-record the decision, which is the only thing
+    that actually establishes it.
+    """
+    raw = data.get("read_basis")
+    if raw is None or not str(raw).strip():
+        raise PolicyPayloadUnavailable(
+            "this payload records no read_basis, so WHEN its columns are read is unknown. It "
+            "cannot be defaulted: the leakage gate refuses post-cutoff policy reads, so assuming "
+            "a basis would make this policy pass a check nobody performed. Re-record the decision "
+            "with its basis stated")
+    try:
+        return PolicyReadBasisV1(str(raw))
+    except ValueError:
+        raise PolicyPayloadUnavailable(
+            f"read_basis {raw!r} is not one this build knows "
+            f"({[b.value for b in PolicyReadBasisV1]})") from None
 
 
 def _require(value: str, name: str) -> None:

@@ -25,6 +25,7 @@ from featuregen.formula.policy_payloads import (
     EligibleStatusPayloadV1,
     MissingRateBehaviourV1,
     PolicyPayloadUnavailable,
+    PolicyReadBasisV1,
     QuoteConventionV1,
     load_payload,
     payload_content_hash,
@@ -33,14 +34,16 @@ from featuregen.formula.policy_payloads import (
 )
 
 STATUS = EligibleStatusPayloadV1(
-    status_column_ref="cib::bo_dpl_cib.txns.status", eligible_values=("POSTED", "SETTLED"))
+    status_column_ref="cib::bo_dpl_cib.txns.status", eligible_values=("POSTED", "SETTLED"),
+    read_basis=PolicyReadBasisV1.EVENT_TIME)
 FX = CurrencyConversionPayloadV1(
     rate_table_ref="cib::bo_dpl_cib.fx_rates",
     rate_column_ref="cib::bo_dpl_cib.fx_rates.rate",
     as_of_column_ref="cib::bo_dpl_cib.fx_rates.effective_dt",
     rate_key_refs=("cib::bo_dpl_cib.fx_rates.base_ccy", "cib::bo_dpl_cib.fx_rates.quote_ccy"),
     quote_convention=QuoteConventionV1.BASE_TO_QUOTE,
-    missing_rate_behaviour=MissingRateBehaviourV1.REFUSE)
+    missing_rate_behaviour=MissingRateBehaviourV1.REFUSE,
+    read_basis=PolicyReadBasisV1.AS_OF_CUTOFF)
 
 
 def _realization(conn, revision_id: str, content_hash: str, kind: str = "status") -> str:
@@ -104,7 +107,8 @@ def test_recording_the_same_decision_twice_is_ONE_payload(db):
 def test_MEANINGLESS_ORDER_IS_NOT_PART_OF_THE_ADDRESS():
     """A set of eligible values has no order; two spellings of the same set are one policy."""
     assert payload_content_hash(STATUS) == payload_content_hash(EligibleStatusPayloadV1(
-        status_column_ref=STATUS.status_column_ref, eligible_values=("SETTLED", "POSTED")))
+        status_column_ref=STATUS.status_column_ref, eligible_values=("SETTLED", "POSTED"),
+        read_basis=STATUS.read_basis))
 
 
 def test_MEANINGFUL_ORDER_IS_PART_OF_THE_ADDRESS():
@@ -114,7 +118,8 @@ def test_MEANINGFUL_ORDER_IS_PART_OF_THE_ADDRESS():
         as_of_column_ref=FX.as_of_column_ref,
         rate_key_refs=tuple(reversed(FX.rate_key_refs)),
         quote_convention=FX.quote_convention,
-        missing_rate_behaviour=FX.missing_rate_behaviour)
+        missing_rate_behaviour=FX.missing_rate_behaviour,
+        read_basis=FX.read_basis)
     assert payload_content_hash(FX) != payload_content_hash(swapped)
 
 
@@ -123,7 +128,8 @@ def test_the_KIND_is_inside_the_address():
     a = payload_content_hash(STATUS)
     b = payload_content_hash(DirectionPayloadV1(
         direction_column_ref=STATUS.status_column_ref,
-        debit_values=("POSTED",), credit_values=("SETTLED",)))
+        debit_values=("POSTED",), credit_values=("SETTLED",),
+        read_basis=STATUS.read_basis))
     assert a != b
 
 
@@ -132,20 +138,23 @@ def test_a_status_policy_with_NO_VALUES_is_refused():
     """A filter admitting every row is not a policy, and recording it as one lets a feature claim a
     governed filter it does not have."""
     with pytest.raises(ValueError, match="admits every row"):
-        EligibleStatusPayloadV1(status_column_ref="c", eligible_values=())
+        EligibleStatusPayloadV1(status_column_ref="c", eligible_values=(),
+                                read_basis=PolicyReadBasisV1.EVENT_TIME)
 
 
 def test_a_direction_policy_needs_BOTH_SIDES():
     """Treating 'not debit' as credit silently classifies every unrecognised value."""
     with pytest.raises(ValueError, match="BOTH directions"):
-        DirectionPayloadV1(direction_column_ref="c", debit_values=("DR",), credit_values=())
+        DirectionPayloadV1(direction_column_ref="c", debit_values=("DR",), credit_values=(),
+                           read_basis=PolicyReadBasisV1.EVENT_TIME)
 
 
 def test_a_value_cannot_be_BOTH_debit_and_credit():
     """A policy saying it can makes the classification depend on evaluation order."""
     with pytest.raises(ValueError, match="both debit and credit"):
         DirectionPayloadV1(direction_column_ref="c", debit_values=("X", "DR"),
-                           credit_values=("CR", "X"))
+                           credit_values=("CR", "X"),
+                           read_basis=PolicyReadBasisV1.EVENT_TIME)
 
 
 def test_an_FX_policy_needs_KEY_REFS():
@@ -155,7 +164,8 @@ def test_an_FX_policy_needs_KEY_REFS():
         CurrencyConversionPayloadV1(
             rate_table_ref="t", rate_column_ref="r", as_of_column_ref="d", rate_key_refs=(),
             quote_convention=QuoteConventionV1.BASE_TO_QUOTE,
-            missing_rate_behaviour=MissingRateBehaviourV1.REFUSE)
+            missing_rate_behaviour=MissingRateBehaviourV1.REFUSE,
+            read_basis=PolicyReadBasisV1.AS_OF_CUTOFF)
 
 
 def test_the_QUOTE_CONVENTION_IS_DECLARED_not_inferred():
@@ -168,7 +178,8 @@ def test_the_QUOTE_CONVENTION_IS_DECLARED_not_inferred():
     with pytest.raises(TypeError):
         CurrencyConversionPayloadV1(                                    # type: ignore[call-arg]
             rate_table_ref="t", rate_column_ref="r", as_of_column_ref="d",
-            rate_key_refs=("k",), missing_rate_behaviour=MissingRateBehaviourV1.REFUSE)
+            rate_key_refs=("k",), missing_rate_behaviour=MissingRateBehaviourV1.REFUSE,
+            read_basis=PolicyReadBasisV1.AS_OF_CUTOFF)
 
 
 def test_MISSING_RATE_BEHAVIOUR_has_no_default():
@@ -178,7 +189,8 @@ def test_MISSING_RATE_BEHAVIOUR_has_no_default():
     with pytest.raises(TypeError):
         CurrencyConversionPayloadV1(                                    # type: ignore[call-arg]
             rate_table_ref="t", rate_column_ref="r", as_of_column_ref="d",
-            rate_key_refs=("k",), quote_convention=QuoteConventionV1.BASE_TO_QUOTE)
+            rate_key_refs=("k",), quote_convention=QuoteConventionV1.BASE_TO_QUOTE,
+            read_basis=PolicyReadBasisV1.AS_OF_CUTOFF)
 
 
 # ══ IMMUTABLE ══════════════════════════════════════════════════════════════════════════════════
@@ -199,3 +211,41 @@ def test_an_unknown_KIND_is_refused_rather_than_guessed(db):
     db.execute("UPDATE pg_class SET relname = relname WHERE false")   # no-op; keeps the tx shape
     with pytest.raises((PolicyPayloadUnavailable, KeyError)):
         load_payload(db, "sha256:future")
+
+
+# ══ WHEN THE POLICY IS READ — THE FACT THAT DECIDES WHETHER IT LEAKS ═══════════════════════════
+def test_the_READ_BASIS_has_no_default():
+    """A status column updated in place reads as it is NOW: a transaction posted in March and
+    reversed yesterday reads REVERSED today, so a model trained on "was this eligible in March" is
+    trained on an answer March could not have known. An append-only ledger has the opposite
+    property, the catalog cannot tell them apart, and only the source's governor knows which.
+
+    Defaulting would be worse than omitting: the leakage gate refuses `latest_available` policy
+    reads, so a default of `event_time` would make every policy pass by construction.
+    """
+    assert {b.value for b in PolicyReadBasisV1} == {
+        "as_of_cutoff", "event_time", "latest_available"}
+    with pytest.raises(TypeError):
+        EligibleStatusPayloadV1(                                        # type: ignore[call-arg]
+            status_column_ref="c", eligible_values=("POSTED",))
+
+
+def test_the_BASIS_IS_PART_OF_THE_ADDRESS():
+    """The same column and values read as-of and read at current state are two different decisions,
+    and one address for both would let the leaking one be served for the safe one."""
+    latest = EligibleStatusPayloadV1(
+        status_column_ref=STATUS.status_column_ref, eligible_values=STATUS.eligible_values,
+        read_basis=PolicyReadBasisV1.LATEST_AVAILABLE)
+    assert payload_content_hash(STATUS) != payload_content_hash(latest)
+
+
+def test_a_payload_stored_WITHOUT_A_BASIS_refuses_on_read(db):
+    """The pre-field shape, read back by this build. It must not be interpreted as though a basis
+    had been recorded — whichever were assumed, the leakage gate would then decide on an assumption
+    rather than on a fact."""
+    db.execute(
+        "INSERT INTO executable_policy_payload (content_hash, policy_kind, payload_version, "
+        "payload_json, recorded_by) VALUES ('legacy','eligible_status',1,"
+        """'{"status_column_ref":"c","eligible_values":["POSTED"]}'::jsonb,'user:ops')""")
+    with pytest.raises(PolicyPayloadUnavailable, match="records no read_basis"):
+        load_payload(db, "legacy")
