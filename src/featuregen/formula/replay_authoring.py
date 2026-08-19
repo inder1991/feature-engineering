@@ -52,15 +52,14 @@ from featuregen.formula.result import (
 )
 from featuregen.formula.schema import (
     OUTPUT_POLICY_VERSION,
-    AdditivityClass,
     DiffBody,
     FormulaOutputPolicyV1,
     RatioBody,
-    SchemaError,
     TypedFormulaProposalV1,
     TypedFormulaV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import AdditivityClass, SchemaError
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.operational_facts import read_operational_value
 

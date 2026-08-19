@@ -18,7 +18,7 @@ from tests.featuregen.materialize.test_ir import (
 )
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v2 import AuthorityRefsV2, FinalOperationV2
 from featuregen.materialize.boundary_v2 import (
     AuthorizedCompilationV2,

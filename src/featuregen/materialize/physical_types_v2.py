@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from featuregen.formula.schema import DecimalPolicy, OverflowBehavior
+from featuregen.formula.schema_leaves import DecimalPolicy, OverflowBehavior
 
 __all__ = [
     "FLOAT_OPERAND_REFUSED",

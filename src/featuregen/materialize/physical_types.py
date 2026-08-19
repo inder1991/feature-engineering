@@ -92,17 +92,19 @@ from typing import Any
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
-    DecimalPolicy,
-    EmptyWindowResult,
     FormulaBody,
-    NullInput,
-    OverflowBehavior,
     RatioBody,
-    RoundingMode,
     TypedFormulaV1,
     UnaryBody,
-    ZeroDenominator,
     body_expressions,
+)
+from featuregen.formula.schema_leaves import (
+    DecimalPolicy,
+    EmptyWindowResult,
+    NullInput,
+    OverflowBehavior,
+    RoundingMode,
+    ZeroDenominator,
 )
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.expression_ir import OperandTypeEvidence, OperandTypeStatus

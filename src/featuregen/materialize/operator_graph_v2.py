@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from featuregen.formula.schema import DecimalPolicy
+from featuregen.formula.schema_leaves import DecimalPolicy
 from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.materialize.canonical import materialize_hash

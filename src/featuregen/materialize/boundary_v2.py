@@ -43,7 +43,7 @@ from enum import StrEnum
 from typing import Any
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.schema import ZeroDenominator
+from featuregen.formula.schema_leaves import ZeroDenominator
 from featuregen.formula.schema_v2 import AuthorityRefsV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.materialize.canonical import materialize_hash

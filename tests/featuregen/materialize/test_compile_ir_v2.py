@@ -29,7 +29,7 @@ from featuregen.formula.policy_payloads import (
     PolicyReadBasisV1,
     record_payload,
 )
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v2 import FinalOperationV2
 from featuregen.materialize.boundary_v2 import KnowledgeTimeBasisV2
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused

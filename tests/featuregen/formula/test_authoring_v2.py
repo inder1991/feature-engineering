@@ -68,7 +68,7 @@ from featuregen.formula.result import (
 )
 from featuregen.formula.result import _fold as _fold_v1
 from featuregen.formula.result_v2 import derive_disposition_v2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.trace import run_status
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.formula.turns_v2 import AUTHOR_TURN_SCHEMA_ID_V2, AUTHOR_TURN_V2_SCHEMA

@@ -12,15 +12,13 @@ from featuregen.formula.recipe_egress import (
     RecipeEgressViolation,
     build_recipe_authoring_egress,
 )
-from featuregen.formula.schema import (
-    AggregateFunction,
+from featuregen.formula.schema import AggregateFunction, FinalOperation, WindowBasis
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
-    FinalOperation,
     Inclusivity,
     NullInput,
     OverflowBehavior,
     RoundingMode,
-    WindowBasis,
     WindowUnit,
 )
 from featuregen.overlay.upload import recipe_formula_shadow as shadow_module

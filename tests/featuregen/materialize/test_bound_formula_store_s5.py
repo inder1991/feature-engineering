@@ -23,7 +23,7 @@ from featuregen.formula.output_intent_v2 import (
     derive_output_intent_v2,
 )
 from featuregen.formula.parse_v3 import parse_proposal_v3
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v3 import FORMULA_SCHEMA_VERSION_V3
 from featuregen.materialize.bound_formula_store import (
     BoundFormulaStoreCorrupt,

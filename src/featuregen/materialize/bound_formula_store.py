@@ -24,7 +24,7 @@ import json
 
 from featuregen.contracts import DbConn
 from featuregen.formula.output_intent_v2 import AuthoredOutputIntentV2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.materialize.bound_formula_v2 import (
     BoundFormulaRevisionV2,
     ExecutableOutputPolicyV2,

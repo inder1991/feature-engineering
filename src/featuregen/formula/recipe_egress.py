@@ -36,7 +36,7 @@ from enum import Enum
 from typing import Any
 
 from featuregen.formula.operations_v2 import operation_rule
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     Inclusivity,
     NullInput,

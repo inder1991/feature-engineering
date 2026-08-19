@@ -153,11 +153,12 @@ def test_a_fully_grounded_narrative_passes():
 def test_the_citable_universe_comes_from_the_rows_that_were_returned(db):
     """Built from an actual run, so a narrative can only cite what the query produced — not what the
     plan said it would produce."""
+    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
+    from tests.featuregen.data_agent.pilot_fixture import create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
-    from tests.featuregen.data_agent.pilot_fixture import create_pilot_tables
 
     create_pilot_tables(db)
     rows = run_analysis(db, plan_to_execution_ir(_grounded(), _inputs()),

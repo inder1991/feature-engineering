@@ -32,7 +32,7 @@ from tests.featuregen.materialize.test_ir import (  # the V1 machinery, reused n
 )
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v2 import AuthorityRefsV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SelectionKind, SemanticRowSelectionV1
 from featuregen.materialize.boundary_v2 import (

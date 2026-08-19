@@ -94,8 +94,9 @@ from featuregen.contracts.db import DbConn
 # re-exported here and quietly become a public entry point.
 from featuregen.formula.canonical import formula_content_hash as _formula_content_hash
 from featuregen.formula.result import AuthoringResult
-from featuregen.formula.schema import SchemaError, TypedFormulaV1
+from featuregen.formula.schema import TypedFormulaV1
 from featuregen.formula.schema import body_expressions as _body_expressions
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.materialize import authoring_trace as _trace
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash

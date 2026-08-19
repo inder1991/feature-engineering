@@ -67,11 +67,8 @@ from featuregen.formula.result import (
     IncoherentResultError,
     derive_disposition,
 )
-from featuregen.formula.schema import (
-    AdditivityClass,
-    FormulaOutputPolicyV1,
-    TypedFormulaV1,
-)
+from featuregen.formula.schema import FormulaOutputPolicyV1, TypedFormulaV1
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.trace import TraceEventKind, run_status
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import FakeLLM, FakeResponse

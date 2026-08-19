@@ -11,7 +11,7 @@ from dataclasses import replace
 
 import pytest
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     Inclusivity,
     NullInput,

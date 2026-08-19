@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import replace
 from inspect import signature
 
-from featuregen.formula.schema import EmptyWindowResult, NullInput, WindowUnit
+from featuregen.formula.schema_leaves import EmptyWindowResult, NullInput, WindowUnit
 from featuregen.formula.schema_v2 import (
     AggregateFunctionV2,
     FinalOperationV2,

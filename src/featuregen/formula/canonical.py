@@ -40,27 +40,29 @@ from featuregen.formula._jcs import dumps as _jcs_dumps
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
-    DecimalPolicy,
     DiffBody,
+    FormulaBody,
+    FormulaOutputPolicyV1,
+    RatioBody,
+    TypedFormulaV1,
+    UnaryBody,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    DecimalPolicy,
     FilterBool,
     FilterBoolOp,
     FilterNode,
     FilterPredicate,
     FilterPredicateOp,
-    FormulaBody,
-    FormulaOutputPolicyV1,
     Grain,
     LiteralType,
     ParamClass,
     ParameterDecl,
     ParameterRef,
-    RatioBody,
     SchemaError,
     SourceRelation,
-    TypedFormulaV1,
     TypedLiteral,
-    UnaryBody,
-    WindowPolicy,
 )
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 

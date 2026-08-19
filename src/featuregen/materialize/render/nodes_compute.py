@@ -84,7 +84,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, TypeVar
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     FilterBoolOp,
     FilterKind,

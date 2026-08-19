@@ -400,7 +400,7 @@ def recipe_tool_runner_v2(
     """
     from featuregen.formula.capability_v2 import classify_formula_capability_v2
     from featuregen.formula.parse_v2 import parse_proposal_v2
-    from featuregen.formula.schema import SchemaError
+    from featuregen.formula.schema_leaves import SchemaError
 
     def _list_supported_operations_v2() -> dict:
         return {

@@ -22,6 +22,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen.data_agent.pilot_fixture import create_pilot_tables
+from tests.featuregen.data_agent.test_analysis_ir import _attribution, _ir, _policy
 
 from featuregen.data_agent.analysis import (
     AnalysisExecutionIRV1,
@@ -38,8 +40,6 @@ from featuregen.data_agent.learning import (
     record_refusal,
 )
 from featuregen.data_agent.sql_postgres import PostgresDialect
-from tests.featuregen.data_agent.pilot_fixture import create_pilot_tables
-from tests.featuregen.data_agent.test_analysis_ir import _attribution, _ir, _policy
 
 _NOW = datetime(2026, 7, 29, tzinfo=UTC)
 _SNAPSHOT = "snap-release3"

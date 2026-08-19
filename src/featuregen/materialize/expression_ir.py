@@ -68,8 +68,8 @@ from typing import Any
 
 from featuregen.contracts.db import DbConn
 from featuregen.formula.canonical import filter_plain
-from featuregen.formula.schema import (
-    AggregateExpression,
+from featuregen.formula.schema import AggregateExpression
+from featuregen.formula.schema_leaves import (
     FilterNode,
     FilterPredicate,
     ParameterRef,

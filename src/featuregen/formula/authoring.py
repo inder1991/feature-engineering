@@ -96,11 +96,11 @@ from featuregen.formula.schema import (
     FinalOperation,
     FormulaOutputPolicyV1,
     RatioBody,
-    SchemaError,
     TypedFormulaProposalV1,
     TypedFormulaV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.trace import TraceEventKind, append_event, open_authoring_run
 from featuregen.formula.turns import AuthoringIntent, AuthorTurnRecord, TurnKind
 from featuregen.intake.llm import LLMClient

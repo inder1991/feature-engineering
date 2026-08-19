@@ -23,7 +23,7 @@ from featuregen.formula.parse import (
     _plain,
 )
 from featuregen.formula.parse_v2 import _build_authority_refs, _build_window_v2
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     DecimalPolicy,
     Grain,
     OverflowBehavior,

@@ -8,8 +8,6 @@ So the tests here are mostly about what must NOT appear on the screen.
 """
 from __future__ import annotations
 
-import pytest
-
 from featuregen.analysis.charts import ChartKind, choose_chart
 from featuregen.analysis.plan import AnalysisPlanV1, Dimension, Measure
 from featuregen.data_agent.analysis import AnalysisRow
@@ -146,11 +144,12 @@ def test_a_missing_dimension_value_is_a_named_bucket_not_a_dropped_row():
 def test_the_chart_totals_reconcile_with_the_hand_counted_fixture(db):
     """Built from a real run: the bars must add up to the customers the answer says declined, or the
     picture and the number disagree."""
+    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     grounded = _grounded()

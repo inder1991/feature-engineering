@@ -317,7 +317,7 @@ def test_a_blank_authority_block_never_reaches_the_validator_at_all() -> None:
     validator's ``None``-vs-``{}`` distinction can never be tested through a parsed proposal. The
     projection keeps the distinction anyway, because a work item's stored expectation is a DICT
     and nothing re-parses it."""
-    from featuregen.formula.schema import SchemaError
+    from featuregen.formula.schema_leaves import SchemaError
 
     blank = {"status_policy_ref": "", "direction_policy_ref": "",
              "reversal_policy_ref": "", "currency_conversion_ref": ""}

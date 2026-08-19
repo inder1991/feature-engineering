@@ -42,16 +42,8 @@ from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.formula._jcs import dumps as _jcs_dumps
 from featuregen.formula.audited import audited_formula_call
 from featuregen.formula.control import LeaseFence
-from featuregen.formula.schema import (
-    DiffBody,
-    FilterBool,
-    FilterNode,
-    FilterPredicate,
-    RatioBody,
-    SchemaError,
-    TypedFormulaProposalV1,
-    UnaryBody,
-)
+from featuregen.formula.schema import DiffBody, RatioBody, TypedFormulaProposalV1, UnaryBody
+from featuregen.formula.schema_leaves import FilterBool, FilterNode, FilterPredicate, SchemaError
 from featuregen.formula.schema_v2 import (
     CompositeBodyV2,
     DiffBodyV2,

@@ -123,7 +123,7 @@ from featuregen.formula.result_v2 import (
     ReviewedBlueprintBypassV2,
     derive_disposition_v2,
 )
-from featuregen.formula.schema import AdditivityClass, SchemaError
+from featuregen.formula.schema_leaves import AdditivityClass, SchemaError
 from featuregen.formula.schema_v2 import (
     OPERATION_GRAMMAR_VERSION_V2,
     TypedFormulaProposalV2,

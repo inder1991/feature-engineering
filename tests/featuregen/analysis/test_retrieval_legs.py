@@ -32,15 +32,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.analysis.intent import (
     AnalysisIntentInputV2,
-    IntentCandidates,
     validate_intent,
 )
 from featuregen.analysis.retrieval import (
     LEG_GRAIN_TIME,
-    LEG_LEXICAL,
     LEG_LINK_NEIGHBOURHOOD,
     LEG_SEMANTIC_EXPANSION,
     LEGS,
@@ -48,8 +47,6 @@ from featuregen.analysis.retrieval import (
     record_retrieval_gap,
     retrieve_candidates,
 )
-from tests.featuregen._helpers import mint_test_identity
-
 from featuregen.contracts import SchemaValidationError
 from featuregen.overlay.upload.graph import rebuild_search_doc
 
@@ -268,9 +265,9 @@ def test_no_embeddings_are_used_anywhere_in_retrieval():
     """Task 9 is explicit: exact controlled expansion first; embeddings can be measured later. A
     vector dependency creeping in here would change the failure mode from "did not match" to
     "matched something nothing sanctioned"."""
-    import featuregen.analysis.retrieval as module
-
     import ast
+
+    import featuregen.analysis.retrieval as module
 
     tree = ast.parse(open(module.__file__, encoding="utf-8").read())
     # CODE, not prose: the module's own docstring says the word "embeddings" on purpose (it is the
@@ -409,9 +406,8 @@ def test_the_v2_input_keeps_the_offered_refs_exactly_where_they_were(catalog):
     """Placement is the recorded hazard: moving metadata out of the user turn once separated the
     refs from the instruction telling the model to choose only from them, and the extraction failed
     validation until the repair budget ran out."""
-    from featuregen.intake.redaction import INPUT_KEY_CATALOG
-
     from featuregen.analysis import intent as intent_module
+    from featuregen.intake.redaction import INPUT_KEY_CATALOG
 
     got = retrieve_candidates(catalog, "transaction value by customer", now=_NOW)
     captured: dict = {}

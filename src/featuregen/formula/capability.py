@@ -25,11 +25,11 @@ from featuregen.formula.schema import (
     AggregateExpression,
     DiffBody,
     FormulaBody,
-    LogicalRef,
     RatioBody,
     TypedFormulaProposalV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import LogicalRef
 
 # Version pin for THIS classifier's policy. Deliberately NOT part of the
 # TypedFormulaV1 identity object [c7] — capability is a policy verdict about

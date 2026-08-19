@@ -168,12 +168,14 @@ def test_anchoring_windows_that_do_not_exist_says_so():
 def test_an_answered_plan_reaches_execution(db):
     """End to end from an abstention: the model could not tell which column identified the customer,
     a human said, and the resulting plan produces the fixture's hand-counted answer."""
+    from tests.featuregen.analysis.test_plan_to_execution import _inputs
+    from tests.featuregen.analysis.test_plan_to_execution import _plan as pilot_plan
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.analysis.plan import GroundedPlan
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _inputs, _plan as pilot_plan
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     blank = pilot_plan(entity_ref="")                    # the model abstained on the entity

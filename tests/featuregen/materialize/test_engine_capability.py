@@ -32,7 +32,8 @@ from tests.featuregen.materialize.test_render_nodes_compute import (
     lock_tree,  # noqa: F401 — fixture re-export
 )
 
-from featuregen.formula.schema import AggregateFunction, EmptyWindowResult, NullInput
+from featuregen.formula.schema import AggregateFunction
+from featuregen.formula.schema_leaves import EmptyWindowResult, NullInput
 from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize import engine_capability
 from featuregen.materialize.engine_capability import (

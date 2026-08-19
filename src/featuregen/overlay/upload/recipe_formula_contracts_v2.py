@@ -23,12 +23,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 
-from featuregen.formula.schema import (
-    EmptyWindowResult,
-    Inclusivity,
-    NullInput,
-    WindowUnit,
-)
+from featuregen.formula.schema_leaves import EmptyWindowResult, Inclusivity, NullInput, WindowUnit
 from featuregen.formula.schema_v2 import (
     MAX_WINDOW_OFFSET_PERIODS,
     AggregateFunctionV2,

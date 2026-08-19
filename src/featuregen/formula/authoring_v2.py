@@ -88,7 +88,7 @@ from featuregen.formula.result import (
     StructuralStatus,
 )
 from featuregen.formula.result_v2 import DISPOSITION_POLICY_VERSION_V2, derive_disposition_v2
-from featuregen.formula.schema import SchemaError
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.schema_v2 import (
     CANONICALIZATION_VERSION_V2,
     FORMULA_SCHEMA_VERSION_V2,

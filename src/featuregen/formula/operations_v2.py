@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v2 import AggregateFunctionV2
 
 # What kind of value an operation emits — the output-authority (BR-6's later increment) and the

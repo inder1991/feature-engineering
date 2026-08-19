@@ -29,6 +29,10 @@ from tests.featuregen.materialize import fixtures
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
+    WindowBasis,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     FilterBool,
     FilterBoolOp,
@@ -40,8 +44,6 @@ from featuregen.formula.schema import (
     ParameterRef,
     SourceRelation,
     TypedLiteral,
-    WindowBasis,
-    WindowPolicy,
     WindowUnit,
 )
 from featuregen.formula.schema_v2 import AggregateFunctionV2
@@ -1026,14 +1028,16 @@ def _one_expression_formula(expr, *, output_type="numeric"):
         FORMULA_SCHEMA_VERSION,
         OPERATION_GRAMMAR_VERSION,
         OUTPUT_POLICY_VERSION,
+        FormulaOutputPolicyV1,
+        TypedFormulaV1,
+        UnaryBody,
+    )
+    from featuregen.formula.schema_leaves import (
         AdditivityClass,
         DecimalPolicy,
-        FormulaOutputPolicyV1,
         Grain,
         OverflowBehavior,
         RoundingMode,
-        TypedFormulaV1,
-        UnaryBody,
     )
 
     return TypedFormulaV1(

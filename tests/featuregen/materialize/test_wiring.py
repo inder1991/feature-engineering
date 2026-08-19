@@ -54,7 +54,7 @@ from tests.featuregen.materialize.test_ir import (
 )
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
-from featuregen.formula.schema import Grain
+from featuregen.formula.schema_leaves import Grain
 from featuregen.materialize.compile.chain import NodeAssemblyInputs
 from featuregen.materialize.compile.wiring import assemble_nodes
 from featuregen.materialize.contract import (

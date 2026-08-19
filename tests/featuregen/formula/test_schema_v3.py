@@ -18,7 +18,7 @@ from featuregen.formula.canonical_v2 import proposal_content_hash_v2
 from featuregen.formula.canonical_v3 import canonical_json_v3, proposal_content_hash_v3
 from featuregen.formula.parse_v2 import parse_proposal_v2, parse_versioned
 from featuregen.formula.parse_v3 import parse_proposal_v3
-from featuregen.formula.schema import SchemaError
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.schema_v2 import AggregateExpressionV2, TypedFormulaProposalV2
 from featuregen.formula.schema_v3 import (
     FORMULA_SCHEMA_VERSION_V3,

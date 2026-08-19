@@ -49,9 +49,9 @@ from tests.featuregen.materialize.test_ir import (
 )
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema import FinalOperation
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
-    FinalOperation,
     Grain,
     NullInput,
     OverflowBehavior,

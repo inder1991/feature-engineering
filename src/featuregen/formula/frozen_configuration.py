@@ -27,13 +27,12 @@ from featuregen.formula.schema import (
     FORMULA_SCHEMA_VERSION,
     OPERATION_GRAMMAR_VERSION,
     OUTPUT_POLICY_VERSION,
-    AdditivityClass,
     AggregateFunction,
     FinalOperation,
     WindowBasis,
-    WindowUnit,
     validate_semantics,
 )
+from featuregen.formula.schema_leaves import AdditivityClass, WindowUnit
 from featuregen.formula.tools import TOOLS
 from featuregen.formula.turns import (
     AUTHOR_TURN_SCHEMA_ID,

@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.formula.schema import AdditivityClass, DecimalPolicy
+from featuregen.formula.schema_leaves import AdditivityClass, DecimalPolicy
 from featuregen.formula.schema_v3 import TypedFormulaProposalV3, body_expressions_v3
 
 __all__ = [

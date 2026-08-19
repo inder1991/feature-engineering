@@ -28,9 +28,51 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 | 12 | not started | FX needs the physical-binding layer §7 names (`bound_rate_dataset_ref`, `binding_snapshot_id`), which does not exist |
 | **13** | **done** | migration 1094 + `verification_request_store` — the lifecycle `verification_attempt` had no room for |
 | **14** | **gate done** | `authorize_publication_v2` + `VERIFICATION_ABSENT`; the reconciler and the endpoint change are not done |
-| 15 | prerequisite VERIFIED, not started | §8.6's blocker does not apply here — see below |
+| **15** | **stage 1 done; ▲ THE STEP IS NOT ONE COMMIT** | leaf repoint done and green; the deletion is BLOCKED by a live producer — see §0.1 |
 
-**§8.6 verified against live on 2026-08-19 (read-only), and it clears:** the plan says the v1 egress
+### 0.1 ▲ Step 15 is not "one deliberate commit" — corrected 2026-08-19
+
+The plan says step 15 is cheap **because** step 0 happened. That is true of the half step 0 was
+about, and it is now DONE: every shared-leaf import across 68 files was repointed from
+`formula.schema` to `formula.schema_leaves`, the re-export shim is gone (45 re-exported names → 20
+genuinely used), and `formula/schema.py` is now exactly the V1 language and nothing else. Suite
+green.
+
+**What the estimate missed is that the V1 LANGUAGE is still the live authoring vocabulary.**
+
+* 20 source modules use V1-language names, and **9 of them are the live authoring stack** —
+  `result.py` (10 importers), `critic.py` (6), `parse.py` (5), `output_authority.py` (5),
+  `capability.py`, `canonical.py`, `replay_authoring.py`, `recipe_authoring.py`, `authoring.py`.
+  They are reachable from `recipe_formula_worker`, `enrich_llm` and `planner/requests`.
+* Several V1 modules are **machinery V2 REUSES** rather than language: `ir.py`'s read-scope, union
+  and authorize functions, `expression_ir.compile_expression`, `physical_types`' helpers. Those get
+  repointed, never deleted — the plan's own rule is that V1's *execution* machinery is reused.
+
+**And the blocking fact.** §8.6 says the v1 arm "cannot be retired by flipping a default — existing
+rows select it by saying nothing". The ROWS are gone (0 on live, verified). **The PRODUCER is not:**
+
+```
+recipe_formula_worker.declared_expectation_schema()  ->  DEFAULT_EXPECTATION_SCHEMA ("formula-v1")
+                                                          when formula_schema_version is absent
+recipe_formula_eval / recipe_formula_blueprint_derivation  ->  never set formula_schema_version
+```
+
+So every NEW work item still selects the v1 arm by saying nothing. Retiring it means changing what
+the live authoring lane emits, which is a behaviour change that wants a real generation run to
+exercise — and that needs the Anthropic key, which is currently rejected.
+
+**The sequence step 15 actually requires:**
+
+1. ~~repoint the shared leaves; delete the re-export shim~~ **DONE**
+2. make the expectation producer DECLARE `formula-v2`, and exercise it on a real run
+3. retire the v1 arm of `recipe_formula_worker`; make absence terminal rather than v1
+4. migrate the live authoring stack (`result`, `critic`, `parse`, `output_authority`, …) to V3
+5. repoint the REUSED machinery off V1's vocabulary — never delete it
+6. delete `formula/schema.py` and the V1 authoring modules; regenerate the goldens (§8.2)
+
+Steps 2 and 3 are the gate. Everything after them is mechanical.
+
+**§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
 bytes"*. `recipe_formula_shadow_work_item` holds **0 rows** on this environment, so there is nothing
 sealed against them. `sealed_artifact_v2`, `generation_request`, `build_set_revision`,
