@@ -59,6 +59,12 @@ class CompilationRefusalCode(StrEnum):
     #: a physical read names a column the governed catalog does not describe — §11's L1 would
     #: call it COLUMN_ABSENT, but compile must not emit a read nobody governs.
     COLUMN_NOT_GOVERNED = "COLUMN_NOT_GOVERNED"
+    #: The compilation reads its own prediction target, or takes knowledge from after the cutoff.
+    #: Distinct from READ_SCOPE_INSUFFICIENT, and the distinction is the remedy: read scope is a
+    #: fact about the CALLER (someone else may be permitted), leakage is a fact about the FEATURE
+    #: (it is wrong for everyone). A model trained on a leaking feature scores beautifully in
+    #: backtest and fails in production, so this refuses the build rather than annotating it.
+    TARGET_LEAKAGE_DETECTED = "TARGET_LEAKAGE_DETECTED"
 
     # Physical resolution and join planning (§3).
     AMBIGUOUS_TABLE_NAME = "AMBIGUOUS_TABLE_NAME"

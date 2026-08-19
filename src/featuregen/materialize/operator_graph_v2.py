@@ -467,9 +467,9 @@ class OperatorNodeV2:
         expected = _PAYLOAD_TYPE.get(self.kind)
         if expected is None:
             raise ValueError(
-                f"{self.kind!r} is not one of C-C10a's thirteen operators: the vocabulary is CLOSED, "
-                f"and a fourteenth operator is an amendment to this module rather than something a "
-                f"caller introduces")
+                f"{self.kind!r} is not one of this vocabulary's {len(_PAYLOAD_TYPE)} operators: "
+                f"the set is CLOSED, and adding one is an amendment to this module rather than "
+                f"something a caller introduces")
         if not isinstance(self.payload, expected):
             raise TypeError(
                 f"{self.kind} takes a {expected.__name__} payload, got "

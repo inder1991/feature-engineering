@@ -19,6 +19,10 @@ def test_compilation_codes_are_exactly_the_spec_set():
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
         "FORMULA_HASH_MISMATCH", "FORMULA_SCHEMA_UNSUPPORTED", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
+        # Step 6. Deliberately NOT folded into READ_SCOPE_INSUFFICIENT: read scope is a fact about
+        # the CALLER and someone else may be permitted, leakage is a fact about the FEATURE and is
+        # wrong for everyone. One code would send half the operators who hit it to the wrong remedy.
+        "TARGET_LEAKAGE_DETECTED",
         "AMBIGUOUS_TABLE_NAME",
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
         "GRAIN_PATH_NOT_GOVERNED",
