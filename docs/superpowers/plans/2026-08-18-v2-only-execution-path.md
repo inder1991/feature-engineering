@@ -414,3 +414,38 @@ enum/type gates and was not counted there.
 Corroborating the other direction: `OperatorGraphV2`'s `PitAvailabilityFilterV2` carries `PitSpec`
 **verbatim** — the V2 vocabulary already reuses the exact V1 execution type. The PIT renderer needs
 no change for the two supported window bases.
+
+---
+
+## 9. Found during step 4: the declared grain never reaches the model
+
+**`FeatureIdea.grain_ref` is computed and then discarded**, and nothing downstream can tell.
+
+The generator sets it (`feature_assist.py:2614`, from the resolved grain operand). The considered
+revision does not serialise it — `_idea_json` emits fifteen keys and `grain_ref` is not among them —
+so `_chosen_option_from_revision` always returns an idea whose `grain_ref` is `None`. Verified on the
+live cluster: **zero** stored options carry it.
+
+**What that costs.** The draft worker builds its authoring intent as:
+
+```python
+target_grain_keys = (tuple(sorted(column_refs)) if idea.grain_ref is None
+                     else (logical_ref_of(...grain_ref...),))
+```
+
+The `else` branch is dead in production. Every formula is therefore authored with grain keys listing
+**every column the feature derives from**, rather than the one column it is computed per. A feature
+meant to be "per customer" is described to the model as grained on its amount column, its date
+column and its customer column together.
+
+The intent hash covers `target_grain_keys`, so this is consistent — the restorer re-derives the same
+wrong value and the checkpoint agrees. Consistency is why nothing has noticed.
+
+**Why it is not fixed here.** `_idea_json` feeds `_candidate_identity`, which is the canonical
+candidate identity hash. Adding a field changes that hash, which changes every stored option
+identity and every draft's `planning_request_hash`. That is a migration-shaped change with identity
+consequences, and doing it inside a step about restoring formulas would bury it.
+
+**Where it belongs:** step 4's physical-binding work, as an explicit item — the grain is exactly what
+binding needs to be correct about. Until then, formulas are authored against a grain nobody
+declared, which is a correctness question rather than a cosmetic one.
