@@ -40,7 +40,10 @@ def test_publication_codes_are_exactly_the_spec_set():
     """CAPABILITY_UNPROVEN / GROUP_BINDING_CONFLICT are PUBLICATION decisions —
     they are not compilation refusals and not runtime gates."""
     assert {c.value for c in PublicationRefusalCode} == {
-        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED"}
+        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED",
+        # Step 14. Capability is about the ENVIRONMENT, this is about the ARTIFACT — an environment
+        # can be perfectly capable of publishing a feature nobody has checked.
+        "VERIFICATION_ABSENT"}
 
 
 def test_gate_codes_are_exactly_the_spec_set():

@@ -23,7 +23,32 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 |---|---|---|
 | **0–8** | **done** | migrations 1091, 1092, 1093 APPLIED to live (189 total) |
 | **9** | **compile half done** | `compile_generation_v2` closes admitted → operator graph; rendering and sealing are the caller's, and are not yet wired |
-| 10–15 | not started | 10 needs real policy payloads, which is governance input, not engineering |
+| 10 | **blocked on GOVERNANCE, not code** | needs real policy payloads *and* each policy's `read_basis` — see below |
+| **11** | **done** | `avg`, `min`, `max` render, type, and reach an operator graph |
+| 12 | not started | FX needs the physical-binding layer §7 names (`bound_rate_dataset_ref`, `binding_snapshot_id`), which does not exist |
+| **13** | **done** | migration 1094 + `verification_request_store` — the lifecycle `verification_attempt` had no room for |
+| **14** | **gate done** | `authorize_publication_v2` + `VERIFICATION_ABSENT`; the reconciler and the endpoint change are not done |
+| 15 | prerequisite VERIFIED, not started | §8.6's blocker does not apply here — see below |
+
+**§8.6 verified against live on 2026-08-19 (read-only), and it clears:** the plan says the v1 egress
+byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
+bytes"*. `recipe_formula_shadow_work_item` holds **0 rows** on this environment, so there is nothing
+sealed against them. `sealed_artifact_v2`, `generation_request`, `build_set_revision`,
+`verification_attempt` and `executable_policy_payload` are also empty; `formula_draft` holds the 7
+known non-carrying rows and `contract_considered_revision` the 5 v2 candidates awaiting regeneration.
+
+**▲ OPERATOR CONSEQUENCE OF STEP 11.** `renderer_build_hash` is derived from the emittable set, so
+giving `avg`/`min`/`max` a rendering MOVED it:
+
+```
+live engine_operator_capability:  rbh-67dd87be54f5e80e25e8053d19e2656e   x39 rows
+this build:                       rbh-e57a6c191559eaa34bd61171737a3dd7
+```
+
+That is the designed fail-safe — *"a moved renderer simply has no rows yet, and an operator with no
+row for the current build is unsupported, which is exactly true"* — but it means **after deploying
+this code every operator reads as unsupported until the dispatch surface is re-recorded**. Not a
+defect; a step the deploy runbook has to include.
 
 **Found during execution, and not in the plan when it was written:**
 
@@ -39,6 +64,14 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 * **Step 5** — policy payloads did not record **when** their columns are read, which is the one
   fact that decides whether a policy leaks. Added as a required field with no default: a default of
   `event_time` would have made every policy pass the leakage gate by construction.
+* **Step 11** — the V2 resolver was missing V1's **fourth** nullability source: `null_input =
+  ignore` on a NON-COUNT aggregate. A non-empty window whose every operand is NULL aggregates to
+  NULL and the renderer deliberately does not coalesce it, so the column was being published NOT
+  NULL for values the pipeline legitimately writes. It bites hardest on exactly the three
+  aggregates step 11 adds, since all three are non-counts.
+* **Step 11** — the advertisement test *runs* each aggregate through the fake engine, so adding
+  three to the advertised set failed until the fake could execute them. That is the test working:
+  advertising an aggregate nothing can run is the gap the whole capability model exists to close.
 * **Step 9** — `resolve_physical_type_v3` took `DecimalTypeV2` operand types that **no caller in
   this codebase can produce**: the compiled IR establishes a governed *word* (`"numeric"`), never a
   width. Its signature was satisfiable only by a test that invented them. Rewritten to V1's

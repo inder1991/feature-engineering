@@ -91,6 +91,12 @@ _EXPECTED = {
     AggregateFunctionV2.COUNT_NON_NULL: {"C1": 2, "C2": 1},
     AggregateFunctionV2.COUNT_DISTINCT: {"C1": 1, "C2": 1},
     AggregateFunctionV2.COUNT_ROWS: {"C1": 3, "C2": 1},
+    # Step 11, over the same projection: C1 holds 10, 10 and NULL; C2 holds 7. Every one of these
+    # SKIPS the null — which is why C1 averages 10 rather than 6.67, and the divisor is the reason
+    # to state the expectation as a number rather than as "the average".
+    AggregateFunctionV2.AVG: {"C1": 10, "C2": 7},
+    AggregateFunctionV2.MIN: {"C1": 10, "C2": 7},
+    AggregateFunctionV2.MAX: {"C1": 10, "C2": 7},
 }
 
 
@@ -109,12 +115,12 @@ def test_every_renderable_aggregation_is_advertised():
     """The converse — the pair is exhaustive in both directions, member for member."""
     renderable = {member.value for member in nodes_compute.renderable_aggregations()}
     assert renderable == KEDRO_PYSPARK_ENGINE.supported_aggregations
-    # And the renderer's own self-description covers Child-1's v1 vocabulary exactly: every v1
-    # member renders. The v2-only vocabulary is NOT advertised — that gap is the whole point of
-    # the engine arm (`unsupported_engine`), so pin a representative slice of it.
-    assert renderable == {member.value for member in AggregateFunction}
-    for v2_only in ("avg", "min", "max", "percentile", "last_known", "slope"):
-        assert AggregateFunctionV2(v2_only).value not in renderable
+    # The renderer covers Child-1's v1 vocabulary and, since step 11, the three ordinary aggregates
+    # V2 added. It is deliberately NOT the whole V2 vocabulary — that remaining gap is the point of
+    # the engine arm (`unsupported_engine`), so pin a representative slice of what is still absent.
+    assert renderable == {member.value for member in AggregateFunction} | {"avg", "min", "max"}
+    for still_absent in ("percentile", "median", "last_known", "slope", "stddev", "zscore"):
+        assert AggregateFunctionV2(still_absent).value not in renderable
 
 
 def test_window_offset_and_future_horizon_advertisements_match_the_renderer():

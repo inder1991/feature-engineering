@@ -135,6 +135,13 @@ class PublicationRefusalCode(StrEnum):
     GROUP_BINDING_CONFLICT = "GROUP_BINDING_CONFLICT"
     #: The probe proved the environment offers no supported publish mechanism.
     PUBLISH_MECHANISM_UNSUPPORTED = "PUBLISH_MECHANISM_UNSUPPORTED"
+    #: No PASSING verification exists for this exact sealed artifact in this environment. Distinct
+    #: from CAPABILITY_UNPROVEN, and the distinction is what each one is about: capability is about
+    #: the ENVIRONMENT (can anything be published here atomically), this is about the ARTIFACT (does
+    #: this one produce the right numbers). An environment can be perfectly capable of publishing a
+    #: feature nobody has checked. Covers "never asked", "still running" and "refused" alike —
+    #: every one of them is equally not-evidence at this door.
+    VERIFICATION_ABSENT = "VERIFICATION_ABSENT"
 
 
 class ValidationGateCode(StrEnum):

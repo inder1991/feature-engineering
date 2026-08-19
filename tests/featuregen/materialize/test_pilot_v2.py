@@ -20,7 +20,6 @@ What these tests hold:
 from __future__ import annotations
 
 import pytest
-from featuregen.overlay.upload.field_resolution import resolve_and_project
 from tests.featuregen.materialize import fixtures
 from tests.featuregen.materialize.test_ir import (
     _ROLES,
@@ -48,6 +47,7 @@ from featuregen.materialize.contract import (
 from featuregen.materialize.generation_authorization import GenerationAuthorizationV1
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.materialize.pilot_v2 import CompiledGenerationV2, compile_generation_v2
+from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.selection_revisions import TargetModeV1
 
 ENV = "hdfc-local"
@@ -268,3 +268,27 @@ def test_AN_EMPTY_GENERATION_IS_A_CALLER_ERROR(catalog, spine):
     nothing."""
     with pytest.raises(ValueError, match="no admitted features"):
         _run(catalog, spine, [], empty_values={})
+
+
+# ══ STEP 11 — THE ORDINARY AGGREGATES REACH A GRAPH ════════════════════════════════════════════
+@pytest.mark.parametrize("aggregation", ["avg", "min", "max"])
+def test_AN_ORDINARY_AGGREGATE_REACHES_AN_OPERATOR_GRAPH(catalog, spine, aggregation):
+    """"Average balance over 90 days" was unrenderable when this program started. The whole chain
+    is exercised rather than the renderer alone, because an aggregate is only really added once it
+    types, compiles, authorizes and shapes — advertising it on any one of those is the gap."""
+    result = _run(catalog, spine, [_admitted_v2(aggregation=aggregation)])
+
+    assert isinstance(result, CompiledGenerationV2), result
+    aggregate = next(n for n in result.graphs[FEATURE].nodes
+                     if n.kind is OperatorKindV2.AGGREGATE)
+    assert aggregate.payload.function.value == aggregation
+    assert result.plan.features[0].physical_type.sql_type == "DECIMAL(38,6)"
+
+
+def test_an_aggregate_THIS_BUILD_STILL_CANNOT_EMIT_refuses_by_name(catalog, spine):
+    """The discriminator for the three above, and the reason they are worth adding one at a time:
+    `median` types cleanly nowhere and rendering it is the same piece of work as typing it."""
+    result = _run(catalog, spine, [_admitted_v2(aggregation="median")])
+
+    assert isinstance(result, MaterializationRefused)
+    assert "median" in result.detail

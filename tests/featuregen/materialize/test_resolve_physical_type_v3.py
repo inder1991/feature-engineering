@@ -194,3 +194,49 @@ def test_the_refusal_is_RETURNED_not_raised():
     would let the first bad feature hide every other verdict in the group."""
     median = _raw(body={"final_operation": "identity", "expr": _expr("median", REF_AMT)})
     assert isinstance(_typed(median), MaterializationRefused)     # returned, no pytest.raises
+
+
+# ══ STEP 11 — THE ORDINARY AGGREGATES ══════════════════════════════════════════════════════════
+@pytest.mark.parametrize("aggregation", ["avg", "min", "max"])
+def test_the_ORDINARY_AGGREGATES_publish_the_declared_policy(aggregation):
+    """They need no new typing RULE: each publishes the formula's declared decimal policy exactly as
+    a sum does. Adding them is a renderer question, and this is the answer to the typing half."""
+    raw = _raw(body={"final_operation": "identity", "expr": _expr(aggregation, REF_AMT)})
+    assert _typed(raw).sql_type == "DECIMAL(38,6)"
+
+
+@pytest.mark.parametrize("aggregation", ["avg", "min", "max"])
+def test_an_ORDINARY_AGGREGATE_over_an_INEXACT_operand_refuses(aggregation):
+    """A `min` over a DATE is meaningful and is still refused, because the published type is a
+    DECIMAL: typing it would describe a column the value does not fit."""
+    raw = _raw(body={"final_operation": "identity", "expr": _expr(aggregation, REF_AMT)})
+    refusal = _typed(raw, operands={"body.expr": _evidence(logical_type="double")})
+    assert isinstance(refusal, MaterializationRefused)
+    assert "not an exact numeric" in refusal.detail
+
+
+# ══ THE FOURTH NULLABILITY SOURCE — MISSING UNTIL STEP 11 ══════════════════════════════════════
+@pytest.mark.parametrize("aggregation", ["sum", "avg", "min", "max"])
+def test_IGNORE_ON_A_NON_COUNT_IS_NULLABLE(aggregation):
+    """A NON-EMPTY window in which every operand is NULL aggregates to NULL, and the renderer
+    deliberately does not coalesce it.
+
+    This source was absent from the V2 resolver until step 11 — it would have published NOT NULL for
+    a column the pipeline legitimately writes NULLs into. It bites hardest on exactly the aggregates
+    step 11 adds, since all three are non-counts.
+    """
+    raw = _raw(body={"final_operation": "identity", "expr": _expr(
+        aggregation, REF_AMT, window=_window(empty_window="zero", null_input="ignore"))})
+    assert _typed(raw).nullable is True
+
+
+def test_A_COUNT_IS_EXEMPT_FROM_THAT_SOURCE_AND_NO_OTHER():
+    """Every COUNT answers an all-null group with 0, so `ignore` does not make it nullable — while
+    a window declared NULL-when-empty still does. The exemption is one source wide, not general."""
+    counting = _raw(body={"final_operation": "identity", "expr": _expr(
+        "count_rows", None, window=_window(empty_window="zero", null_input="ignore"))})
+    assert _typed(counting, operands=NO_OPERAND).nullable is False
+
+    empty_is_null = _raw(body={"final_operation": "identity", "expr": _expr(
+        "count_rows", None, window=_window(empty_window="null", null_input="ignore"))})
+    assert _typed(empty_is_null, operands=NO_OPERAND).nullable is True

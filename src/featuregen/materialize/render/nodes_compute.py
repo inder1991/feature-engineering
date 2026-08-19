@@ -301,6 +301,14 @@ _AGGREGATE_CALLS: dict[AggregateFunctionV2, str] = {
     AggregateFunctionV2.SUM: "F.sum",
     AggregateFunctionV2.COUNT_NON_NULL: "F.count",
     AggregateFunctionV2.COUNT_DISTINCT: "F.countDistinct",
+    # Step 11 — the ordinary aggregates, and they are ordinary: `_aggregate_expression` substitutes
+    # into this table, so each renders through the SAME null-input, zero-coalesce and propagation
+    # branches a sum does. None of them needs an overflow gate — `_needs_overflow_gate` asks for
+    # SUM specifically, and min/max are bounded by their operand while an average is bounded by the
+    # largest one.
+    AggregateFunctionV2.AVG: "F.avg",
+    AggregateFunctionV2.MIN: "F.min",
+    AggregateFunctionV2.MAX: "F.max",
 }
 
 def renderable_aggregations() -> frozenset[AggregateFunctionV2]:

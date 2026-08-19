@@ -59,6 +59,7 @@ Nothing here may be imported from ``src`` — it is test support, and the packag
 """
 from __future__ import annotations
 
+import builtins
 import datetime as _dt
 import decimal as _decimal
 import hashlib as _hashlib
@@ -719,6 +720,24 @@ class DataFrame:
             "BLOCKING gate, never a de-duplication step")
 
 
+def _as_decimal(value: Any) -> _decimal.Decimal:
+    """A Decimal for arithmetic that must stay exact, whatever the fixture happened to supply."""
+    return (value if isinstance(value, _decimal.Decimal)
+            else _decimal.Decimal(str(value)))
+
+
+def _extremum(column: Column, pick):
+    """MIN/MAX share one body: skip nulls, and answer an all-null group with NULL.
+
+    Returning a sentinel — 0, or the type's floor — would be a value the data never contained, and
+    a published column carrying it is indistinguishable from one where that value was real.
+    """
+    def aggregate(rows: Sequence[dict[str, Any]]) -> Any:
+        present = [value for value in (column._eval(row) for row in rows) if value is not None]
+        return pick(present) if present else None
+    return aggregate
+
+
 class _Functions:
     """``pyspark.sql.functions``, only the members the spine renders."""
 
@@ -848,6 +867,38 @@ class _Functions:
                       lambda rows: len({value for value in (column._eval(row) for row in rows)
                                         if value is not None}),
                       aggregate=True)
+
+    @staticmethod
+    def avg(column: Column) -> Column:
+        """Spark's AVG: nulls are SKIPPED, and the DIVISOR is the non-null count.
+
+        The divisor is the part worth stating. Averaging over the row count instead would answer a
+        different question — "average per row including the ones with no value" — and the two agree
+        on every group that has no nulls, which is exactly the data a test fixture tends to hold.
+
+        Decimal, never float: `Decimal(sum)/Decimal(n)` keeps the exactness the published DECIMAL
+        column promises, and a float here would make the fake agree with Spark on small fixtures and
+        disagree on the values this platform exists to compute.
+        """
+        def aggregate(rows: Sequence[dict[str, Any]]) -> Any:
+            present = [value for value in (column._eval(row) for row in rows) if value is not None]
+            if not present:
+                return None
+            total = present[0]
+            for value in present[1:]:
+                total = total + value
+            return _as_decimal(total) / _as_decimal(len(present))
+        return Column(f"avg({column.name})", aggregate, aggregate=True)
+
+    @staticmethod
+    def min(column: Column) -> Column:  # noqa: A003 — Spark's name shadows the builtin
+        """Spark's MIN: nulls SKIPPED, and an all-null group is NULL rather than a sentinel."""
+        return Column(f"min({column.name})", _extremum(column, builtins.min), aggregate=True)
+
+    @staticmethod
+    def max(column: Column) -> Column:  # noqa: A003 — Spark's name shadows the builtin
+        """Spark's MAX: nulls SKIPPED, and an all-null group is NULL rather than a sentinel."""
+        return Column(f"max({column.name})", _extremum(column, builtins.max), aggregate=True)
 
     @staticmethod
     def coalesce(*columns: Column) -> Column:

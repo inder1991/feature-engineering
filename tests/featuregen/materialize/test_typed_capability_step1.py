@@ -98,17 +98,26 @@ def test_the_build_hash_is_DERIVED_from_what_the_renderer_can_emit(db):
 
 
 # ══ THE PROMISE: THE RECIPE CATALOGUE DOES NOT MOVE ════════════════════════════════════════════
-def test_STEP_1_DOES_NOT_CHANGE_THE_RECIPE_READINESS_ANSWER():
-    """The cross-effect flagged before this step landed, pinned so it stays true.
+def test_NO_CAPABILITY_CHANGE_SILENTLY_RELABELS_THE_RECIPES():
+    """The cross-effect flagged before step 1 landed, pinned so it stays true — and re-checked when
+    step 11 moved the advertised set for real.
 
-    Recipe readiness is computed from the IN-CODE advertised set (`engine_capability_for`), not from
-    the capability table this step reshapes. So the reshape must leave it untouched — a capability
-    refactor that silently re-labels 317 recipes would be a product change wearing an infrastructure
-    commit message.
+    A capability change that silently re-labelled 317 recipes would be a product change wearing an
+    infrastructure commit message. The DISTRIBUTION is what protects against that, so it is what is
+    asserted: `readiness` is a recipe's own recorded field rather than something derived from the
+    advertised set, and measuring it after step 11 is how that was established rather than assumed.
+
+    The advertised list is pinned separately, and it DID move: step 11 gave `avg`, `min` and `max` a
+    rendering. That is a deliberate product change, which is why it is spelled out here instead of
+    the assertion being loosened.
     """
+    from collections import Counter
+
     from featuregen.materialize.engine_capability import engine_capability_for
     from featuregen.overlay.upload.recipe_registry_v2 import V2_RECIPES
 
     assert len(V2_RECIPES) == 317
+    assert Counter(str(recipe.readiness) for recipe in V2_RECIPES) == {
+        "FORMULA_BLOCKED": 295, "CONCEPTUAL_ONLY": 19, "FORMULA_AUTHORABLE": 3}
     assert sorted(engine_capability_for("kedro-pyspark").supported_aggregations) == [
-        "count_distinct", "count_non_null", "count_rows", "sum"]
+        "avg", "count_distinct", "count_non_null", "count_rows", "max", "min", "sum"]

@@ -69,7 +69,16 @@ COUNTING_AGGREGATES = frozenset({
 #: Deliberately not "every aggregate in the vocabulary": typing an operation the renderer cannot emit
 #: produces a column definition for code that will never exist. The set widens in step 11 alongside
 #: the renderer, and the two moving together is the point.
-_TYPEABLE = COUNTING_AGGREGATES | {AggregateFunctionV2.SUM}
+_TYPEABLE = COUNTING_AGGREGATES | {
+    AggregateFunctionV2.SUM,
+    # Step 11 — the ordinary aggregates. They need no new typing RULE: each publishes the formula's
+    # declared decimal policy, exactly as a sum does, and each is refused unless its operand is a
+    # governed exact numeric. A `min` over a DATE is therefore refused rather than published as a
+    # DECIMAL, which is the honest answer while the published type is a decimal.
+    AggregateFunctionV2.AVG,
+    AggregateFunctionV2.MIN,
+    AggregateFunctionV2.MAX,
+}
 
 
 def resolve_physical_type_v3(
@@ -287,15 +296,20 @@ def _operand_of(expression) -> str | None:
 def _is_nullable(proposal, final, expressions) -> bool:
     """Whether the published column can hold NULL, from the POLICIES rather than the SQL type.
 
-    Three independent sources, any one of which makes the column nullable:
+    FOUR independent sources, any one of which makes the column nullable:
 
     * an empty window declared ``null`` — a grain key with no rows in range produces NULL;
     * a null input declared ``propagate`` — one NULL row makes the aggregate NULL;
+    * a null input declared ``ignore`` on a NON-COUNT aggregate — a non-empty window in which every
+      row's operand is NULL aggregates to NULL, and the renderer deliberately does not coalesce it;
     * a ratio whose zero denominator is declared ``null``.
 
-    A count is not exempt. ``BIGINT`` says nothing about nullability, and a count over a window
-    declared NULL-when-empty is a nullable column — publishing it NOT NULL would reject rows the
-    pipeline legitimately writes.
+    **The third was missing here and is V1's.** It matters most for the aggregates step 11 adds:
+    ``avg``/``min``/``max`` over an all-NULL group are NULL in Spark exactly as ``sum`` is, and
+    publishing the column NOT NULL would reject rows the pipeline legitimately writes. Counts are
+    exempt from this source ALONE — every COUNT answers an all-null group with 0 — and from no
+    other: ``BIGINT`` says nothing about nullability, so a count over a window declared
+    NULL-when-empty is still a nullable column.
     """
     for expression in expressions:
         window = getattr(expression, "window", None)
@@ -307,6 +321,9 @@ def _is_nullable(proposal, final, expressions) -> bool:
             # named a member that does not exist, which would have raised on the first formula it
             # saw — caught by the test that asserts a non-nullable case.
             if str(getattr(window, "null_input", "")) == NullInput.PROPAGATE.value:
+                return True
+            if (str(getattr(window, "null_input", "")) == NullInput.IGNORE.value
+                    and _aggregation_of(expression) not in COUNTING_AGGREGATES):
                 return True
     if final is FinalOperationV2.RATIO:
         zero = getattr(proposal.body, "zero_denominator", None)
