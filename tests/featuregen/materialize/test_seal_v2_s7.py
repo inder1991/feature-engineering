@@ -43,6 +43,34 @@ LINKS = (
 )
 
 
+def _authorization(db) -> str:
+    """A real approval for this environment and group — the artifact's FK target.
+
+    Seeded through `record_generation_authorization` rather than a raw INSERT: the composite keys
+    below only mean something if the row they point at was made the way production makes it.
+    """
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-seal','h','hypothesis','h') "
+               "ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+               "VALUES ('trr-seal','int-seal','exploration','h') ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO build_set_revision (revision_id, target_reading_revision_id, "
+               "declaration_hash, declaration_json, content_hash, declared_by, declared_at) "
+               "VALUES ('bs-seal','trr-seal','dh','{}'::jsonb,'ch','user:ops','2026-08-20') "
+               "ON CONFLICT DO NOTHING")
+    return record_generation_authorization(
+        db, GenerationAuthorizationV1(
+            environment_id=ENV, logical_group_name=GROUP, build_set_revision_id="bs-seal",
+            target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+        authorized_by="user:ops", authorized_at="2026-08-20T00:00:00Z")
+
+
 def _manifest(artifact_id: str = "art-1", files=None):
     return manifest_for(artifact_id, files or FILES,
                         content_reference=lambda path: content_reference_for(
@@ -55,7 +83,8 @@ def _seal(db, *, graph=None, artifact_id: str = "art-1", files=None, links=LINKS
         db, graph if graph is not None else _fx_chain(), _manifest(artifact_id, payload), payload,
         environment_id=ENV, logical_group_name=GROUP,
         compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
-        project_digest="sha256:project", realizations=links, sealed_at="2026-08-17T00:00:00Z")
+        project_digest="sha256:project", realizations=links, sealed_at="2026-08-17T00:00:00Z",
+        generation_authorization_revision_id=_authorization(db))
 
 
 # ══ ACCEPTANCE 1 — deleting the FX duplicate-rate gate refuses, links INTACT ════════════════════
@@ -224,7 +253,8 @@ def test_the_manifest_is_verified_BEFORE_anything_is_written(db):
                 {**FILES, "src/pipeline.py": "different bytes entirely"},
                 environment_id=ENV, logical_group_name=GROUP,
                 compilation_identity_hash="sha256:c", group_plan_hash="sha256:p",
-                project_digest="sha256:d", realizations=LINKS, sealed_at="t")
+                project_digest="sha256:d", realizations=LINKS, sealed_at="t",
+                generation_authorization_revision_id=_authorization(db))
     assert db.execute(
         "SELECT count(*) FROM sealed_artifact_v2").fetchone()[0] == 0
 
@@ -302,7 +332,7 @@ def test_a_sealed_artifact_must_name_its_ENVIRONMENT(db):
         seal_v2(db, _fx_chain(), _manifest(), FILES, environment_id="  ",
                 logical_group_name=GROUP, compilation_identity_hash="sha256:c",
                 group_plan_hash="sha256:p", project_digest="sha256:d", realizations=LINKS,
-                sealed_at="t")
+                sealed_at="t", generation_authorization_revision_id=_authorization(db))
 
 
 def test_a_realization_link_with_a_BLANK_HALF_is_refused(db):
@@ -334,12 +364,13 @@ def test_the_migration_forbids_a_PASS_that_carries_findings(db):
     reader happened to trust."""
     with pytest.raises(psycopg.errors.CheckViolation):
         db.execute(
-            "INSERT INTO sealed_artifact_v2 (artifact_id, environment_id, logical_group_name, "
+            "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+            "environment_id, logical_group_name, "
             "compilation_identity_hash, group_plan_hash, project_digest, subgraph_satisfied, "
             "triggered_requirements, subgraph_findings, sealed_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, true, '[]'::jsonb, "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, true, '[]'::jsonb, "
             "'[{\"code\": \"X\"}]'::jsonb, %s)",
-            ("art-bad", ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+            ("art-bad", _authorization(db), ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
 
 
 def test_the_migration_forbids_a_REFUSAL_with_no_findings(db):
@@ -347,11 +378,12 @@ def test_the_migration_forbids_a_REFUSAL_with_no_findings(db):
     check that failed for its own reasons."""
     with pytest.raises(psycopg.errors.CheckViolation):
         db.execute(
-            "INSERT INTO sealed_artifact_v2 (artifact_id, environment_id, logical_group_name, "
+            "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+            "environment_id, logical_group_name, "
             "compilation_identity_hash, group_plan_hash, project_digest, subgraph_satisfied, "
             "triggered_requirements, subgraph_findings, sealed_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, false, '[]'::jsonb, '[]'::jsonb, %s)",
-            ("art-bad", ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, false, '[]'::jsonb, '[]'::jsonb, %s)",
+            ("art-bad", _authorization(db), ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
 
 
 # ══ A GROUP IS ONE ARTIFACT AND MANY GRAPHS ════════════════════════════════════════════════════
@@ -429,4 +461,5 @@ def _seal_many(db, graphs, *, artifact_id: str = "art-many"):
         db, graphs, _manifest(artifact_id, payload), payload,
         environment_id=ENV, logical_group_name=GROUP,
         compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
-        project_digest="sha256:project", realizations=LINKS, sealed_at="2026-08-20T00:00:00Z")
+        project_digest="sha256:project", realizations=LINKS, sealed_at="2026-08-20T00:00:00Z",
+        generation_authorization_revision_id=_authorization(db))

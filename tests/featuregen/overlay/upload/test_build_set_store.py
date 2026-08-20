@@ -24,6 +24,45 @@ from featuregen.overlay.upload.build_set_store import (
     request_generation,
 )
 
+
+def _sealed(db, approval: str, *, artifact_id: str = "art-1", environment: str) -> str:
+    """A real sealed artifact under this approval — the request's FK target.
+
+    `sealed_artifact_id` was plain text, so a SUCCEEDED request could name an artifact that does not
+    exist and nothing objected. It now travels inside a composite key with the approval and the
+    environment, which is why this fixture has to exist at all.
+    """
+    db.execute(
+        "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+        "environment_id, logical_group_name, compilation_identity_hash, group_plan_hash, "
+        "project_digest, subgraph_satisfied, triggered_requirements, subgraph_findings, sealed_at) "
+        "VALUES (%s,%s,%s,'customer_txn_features','sha256:c','sha256:p','sha256:d',"
+        "true,'[]'::jsonb,'[]'::jsonb,'t') ON CONFLICT DO NOTHING",
+        (artifact_id, approval, environment))
+    return artifact_id
+
+
+def _approval(db, build_set: str, environment: str) -> str:
+    """A real approval covering this build set here — the request's FK target.
+
+    Requests carry a MANDATORY authorization now. An earlier version allowed NULL and called it
+    "predates the chain", but both writers defaulted the argument to None, so NULL equally meant
+    "a caller forgot" — a column whose absence has two meanings cannot tell them apart.
+    """
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    return record_generation_authorization(
+        db, GenerationAuthorizationV1(
+            environment_id=environment, logical_group_name="customer_txn_features",
+            build_set_revision_id=build_set,
+            target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+        authorized_by="user:ops", authorized_at="t")
+
+
 ENV = "hdfc-local"
 
 
@@ -130,10 +169,12 @@ def test_A_DOUBLE_CLICK_DOES_NOT_START_A_SECOND_COMPILE(db):
     _set(db)
     first, created_first = request_generation(
         db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-        requested_by="user:ops", requested_at="t")
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     second, created_second = request_generation(
         db, request_id="gr-2", build_set_revision_id="bs-1", environment_id=ENV,
-        requested_by="user:ops", requested_at="t")
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=_approval(db, "bs-1", ENV))
 
     assert created_first is True
     assert created_second is False
@@ -149,12 +190,14 @@ def test_A_RETRY_AFTER_A_FAILURE_IS_ALLOWED(db):
     """
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     advance_request(db, "gr-1", GenerationStatusV1.FAILED, failure_reason="provider unreachable")
 
     retry, created = request_generation(
         db, request_id="gr-2", build_set_revision_id="bs-1", environment_id=ENV,
-        requested_by="user:ops", requested_at="t")
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     assert created is True and retry == "gr-2"
 
 
@@ -162,10 +205,12 @@ def test_the_same_set_in_a_DIFFERENT_environment_is_a_different_attempt(db):
     """Building for local and for prod are two builds, not one — the artifact differs."""
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     other, created = request_generation(
         db, request_id="gr-2", build_set_revision_id="bs-1", environment_id="hdfc-prod",
-        requested_by="user:ops", requested_at="t")
+        requested_by="user:ops", requested_at="t",
+        generation_authorization_revision_id=_approval(db, "bs-1", "hdfc-prod"))
     assert created is True and other == "gr-2"
 
 
@@ -174,8 +219,13 @@ def test_THE_HAPPY_PATH_VISITS_EVERY_STAGE(db):
     """So "still running" is distinguishable from "the worker died" and from "nothing consumes this
     table" — the gap S11's verification attempts have and this deliberately does not."""
     _set(db)
+    approval = _approval(db, "bs-1", ENV)
+    # The artifact must EXIST and be one this approval produced — `sealed_artifact_id` is no longer
+    # free text, so succeeding into a name nobody sealed is now unwritable rather than unnoticed.
+    _sealed(db, approval, environment=ENV)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=approval)
     for stage in (GenerationStatusV1.CLAIMED, GenerationStatusV1.RUNNING):
         advance_request(db, "gr-1", stage)
     advance_request(db, "gr-1", GenerationStatusV1.SUCCEEDED, sealed_artifact_id="art-1")
@@ -191,7 +241,8 @@ def test_a_SKIPPED_STAGE_IS_REFUSED(db):
     behind it."""
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     with pytest.raises(InvalidStatusMove, match="cannot move"):
         advance_request(db, "gr-1", GenerationStatusV1.SUCCEEDED, sealed_artifact_id="art-1")
 
@@ -201,7 +252,8 @@ def test_SUCCEEDING_WITHOUT_AN_ARTIFACT_IS_REFUSED_BY_THE_SCHEMA(db):
     nothing behind it."""
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     advance_request(db, "gr-1", GenerationStatusV1.CLAIMED)
     advance_request(db, "gr-1", GenerationStatusV1.RUNNING)
     with pytest.raises(psycopg.errors.CheckViolation):
@@ -217,14 +269,16 @@ def test_A_REFUSAL_MUST_NAME_WHAT_REFUSED_IT(db):
     """
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     with pytest.raises(psycopg.errors.CheckViolation):
         advance_request(db, "gr-1", GenerationStatusV1.REFUSED)      # no refusals named
 
     db.rollback()
     _set(db)
     request_generation(db, request_id="gr-2", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     advance_request(db, "gr-2", GenerationStatusV1.REFUSED, refusals=[
         {"selection_revision_id": "sel-b", "code": "FORMULA_SCHEMA_UNSUPPORTED",
          "reason": "the renderer cannot emit aggregate:median in this build"}])
@@ -237,7 +291,8 @@ def test_a_refusal_is_reachable_from_ANY_live_stage(db):
     would write a history that is not true."""
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     advance_request(db, "gr-1", GenerationStatusV1.REFUSED,
                     refusals=[{"selection_revision_id": "sel-a", "code": "NO_READY_FORMULA",
                                "reason": "this feature has no drafted formula yet"}])
@@ -248,7 +303,8 @@ def test_the_request_identity_is_FROZEN(db):
     """Status and results move; which set, which environment and who asked do not."""
     _set(db)
     request_generation(db, request_id="gr-1", build_set_revision_id="bs-1", environment_id=ENV,
-                       requested_by="user:ops", requested_at="t")
+                       requested_by="user:ops", requested_at="t",
+                       generation_authorization_revision_id=_approval(db, "bs-1", ENV))
     with pytest.raises(psycopg.errors.RaiseException, match="frozen"):
         db.execute("UPDATE generation_request SET environment_id = 'somewhere-else' "
                    "WHERE request_id = 'gr-1'")

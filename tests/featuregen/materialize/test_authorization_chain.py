@@ -49,6 +49,16 @@ def _authorization(db, *, environment=ENV, group=GROUP, build_set=BUILD_SET) -> 
         authorized_by="user:ops", authorized_at="2026-08-20T00:00:00Z")
 
 
+def _artifact(db, revision_id, *, artifact_id="art-1", environment=ENV, group=GROUP):
+    db.execute(
+        "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+        "environment_id, logical_group_name, compilation_identity_hash, group_plan_hash, "
+        "project_digest, subgraph_satisfied, triggered_requirements, subgraph_findings, sealed_at) "
+        "VALUES (%s,%s,%s,%s,'sha256:c','sha256:p','sha256:d',true,'[]'::jsonb,'[]'::jsonb,'t')",
+        (artifact_id, revision_id, environment, group))
+    return artifact_id
+
+
 def _request(db, revision_id, *, request_id="gr-1", build_set=BUILD_SET, environment=ENV):
     return request_generation(
         db, request_id=request_id, build_set_revision_id=build_set,
@@ -90,29 +100,76 @@ def test_AN_AUTHORIZATION_THAT_DOES_NOT_EXIST_IS_UNWRITABLE(db):
         _request(db, "gar-never-issued")
 
 
-# ══ NULL IS "PREDATES THE CHAIN", AND IS NOT AN AUTHORIZATION ══════════════════════════════════
-def test_NULL_IS_ACCEPTED_AND_IS_NOT_AN_APPROVAL(db):
-    """The V1 chain writes no authorization, and backfilling one for rows that never had it would
-    invent the very evidence this chain exists to make trustworthy.
+# ══ THE EDGE THAT MAKES IT A CHAIN: request -> artifact ════════════════════════════════════════
+def test_A_REQUEST_MAY_POINT_AT_AN_ARTIFACT_ITS_OWN_APPROVAL_PRODUCED(db):
+    revision_id = _authorization(db)
+    _artifact(db, revision_id)
+    _request(db, revision_id)
+    db.execute("UPDATE generation_request SET sealed_artifact_id='art-1' "
+               "WHERE request_id='gr-1'")
 
-    NULL is therefore legitimate and distinguishable from every authorization — it can never be
-    confused for one, because no query matching a revision id will return it.
-    """
+    assert db.execute("SELECT sealed_artifact_id FROM generation_request "
+                      "WHERE request_id='gr-1'").fetchone()[0] == "art-1"
+
+
+def test_AN_ARTIFACT_FROM_ANOTHER_APPROVAL_IS_UNWRITABLE(db):
+    """`sealed_artifact_id` was plain text, so a SUCCEEDED request could claim an artifact somebody
+    else's approval produced and nothing in the schema would object. The approval travels inside the
+    key, so that row cannot exist."""
+    mine = _authorization(db)
+    theirs = _authorization(db, build_set="bs-theirs")
+    _artifact(db, theirs, artifact_id="art-theirs")
+    _request(db, mine)
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        db.execute("UPDATE generation_request SET sealed_artifact_id='art-theirs' "
+                   "WHERE request_id='gr-1'")
+
+
+def test_AN_ARTIFACT_THAT_DOES_NOT_EXIST_IS_UNWRITABLE(db):
+    revision_id = _authorization(db)
+    _request(db, revision_id)
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        db.execute("UPDATE generation_request SET sealed_artifact_id='art-imaginary' "
+                   "WHERE request_id='gr-1'")
+
+
+# ══ AUTHORIZATION IS MANDATORY, NOT NULLABLE ═══════════════════════════════════════════════════
+def test_A_REQUEST_WITHOUT_AN_APPROVAL_IS_UNWRITABLE(db):
+    """An earlier version allowed NULL, reasoning it meant "predates the chain". Both writers
+    defaulted the argument to None, so NULL equally meant "a caller forgot" — and a column whose
+    absence has two meanings cannot distinguish them. The product is pre-live and both tables were
+    empty, so the honest form is NOT NULL."""
     _authorization(db)
-    _request(db, None, request_id="gr-legacy")
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        db.execute(
+            "INSERT INTO generation_request (request_id, build_set_revision_id, environment_id, "
+            "status, requested_by, requested_at) VALUES "
+            "('gr-null',%s,%s,'REQUESTED','user:ops','2026-08-20T00:00:00Z')",
+            (BUILD_SET, ENV))
 
-    stored = db.execute(
-        "SELECT generation_authorization_revision_id FROM generation_request "
-        "WHERE request_id='gr-legacy'").fetchone()[0]
-    assert stored is None
+
+def test_AN_APPROVAL_FOR_A_NONEXISTENT_BUILD_SET_IS_UNWRITABLE(db):
+    """An approval for a build set nobody declared is permission to generate something that does not
+    exist. A downstream request rejecting it later is a worse place to learn that than the moment it
+    is granted."""
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        record_generation_authorization(
+            db,
+            GenerationAuthorizationV1(
+                environment_id=ENV, logical_group_name=GROUP,
+                build_set_revision_id="bs-never-declared",
+                target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+            authorized_by="user:ops", authorized_at="2026-08-20T00:00:00Z")
 
 
 def test_THE_AUDITORS_QUESTION_IS_ANSWERABLE(db):
     """Every request one approval produced — the query the chain exists to make possible, and which
     matching loose fields could only approximate."""
     revision_id = _authorization(db)
+    other = _authorization(db, build_set="bs-other")
     _request(db, revision_id, request_id="gr-a")
-    _request(db, None, request_id="gr-legacy")
+    _request(db, other, request_id="gr-b", build_set="bs-other")
 
     produced = [r[0] for r in db.execute(
         "SELECT request_id FROM generation_request "

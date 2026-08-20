@@ -1,47 +1,60 @@
 -- src/featuregen/db/migrations/1095_authorization_referential_chain.sql
--- The chain: generation authorization -> generation request -> sealed artifact.
+-- The chain: build set -> authorization -> generation request -> sealed artifact.
 --
 -- THE GAP. Every link existed as a VALUE and none as a REFERENCE. `generation_request` recorded a
--- build set and an environment but never which authorization permitted the work.
--- `sealed_artifact_v2` recorded an environment and a group but never what authorized producing it.
--- So "which approval produced this artifact" — the question an auditor asks about any published
--- number — was answerable only by matching loose fields and hoping the match meant something.
+-- build set and an environment but never which approval permitted the work; `sealed_artifact_v2`
+-- recorded an environment and a group but never what authorized producing it. So "which approval
+-- produced this artifact" — the question an auditor asks about any published number — was
+-- answerable only by matching loose fields and hoping the match meant something.
 --
--- COMPOSITE FOREIGN KEYS, NOT COLUMNS PLUS CHECKS. The obvious fix is to add an id and validate
--- agreement in code. That leaves the disagreement REPRESENTABLE: a request could name an
--- authorization for another environment, and only a caller that remembered to look would notice.
--- Instead the referenced columns travel INSIDE the key:
+-- COMPOSITE FOREIGN KEYS, NOT COLUMNS PLUS CHECKS. The obvious fix adds an id and validates
+-- agreement in code, which leaves the disagreement REPRESENTABLE: a request could name an
+-- authorization for another environment and only a caller that remembered to look would notice.
+-- Instead the referenced columns travel INSIDE the key, so a mismatch is not caught — it cannot be
+-- written.
 --
---     generation_request (authorization, build_set, environment)
---         -> generation_authorization (revision_id, build_set_revision_id, environment_id)
+-- ▲ A FIRST VERSION OF THIS FILE STOPPED HALFWAY and was described as a chain. It was two BRANCHES
+-- sharing an authorization:
 --
---     sealed_artifact_v2 (authorization, environment, logical_group)
---         -> generation_authorization (revision_id, environment_id, logical_group_name)
+--     request ---> authorization <--- artifact
+--        |
+--        +-- sealed_artifact_id : plain text, unenforced
 --
--- A request naming an authorization issued for a different build set or environment is not caught;
--- it cannot be written. Same for an artifact sealed under an authorization for another group. The
--- two supporting UNIQUE indexes are what make those composite targets legal, and they are unique
--- by construction because `revision_id` is already the primary key.
+-- so a SUCCEEDED request could point at a nonexistent artifact, one produced under a different
+-- approval, or one from another environment. The request -> artifact edge below is what makes the
+-- picture an actual chain.
 --
--- NULLABLE, DELIBERATELY, AND THAT IS THE HONEST PART. The V1 chain writes neither table, and
--- backfilling an authorization for rows that never had one would invent the very evidence this
--- migration exists to make trustworthy. NULL means "this predates the chain" and is distinguishable
--- from any authorization; the V2 producers pass it and the readers refuse a NULL where an
--- authorization is required. When the V1 chain is deleted these become NOT NULL, in a migration
--- that can say so truthfully because nothing will be able to produce a NULL.
+-- ▲ AND IT MADE THE AUTHORIZATION NULLABLE, reasoning that NULL meant "predates the chain". That
+-- reasoning does not survive contact with the writers: both producers defaulted the argument to
+-- None, so NULL equally meant "a new caller forgot". A column whose absence has two meanings cannot
+-- be used to tell them apart. The product is pre-live, the V1 chain writes NEITHER table, and both
+-- are empty on every environment — so the honest form is NOT NULL now, before more unauthorized
+-- development rows accumulate. The defaults are removed from the writers in the same change.
 --
 -- NOT APPLIED. This file is written, not run.
 
+-- ── an approval names a build set that EXISTS ────────────────────────────────────────────────────
+-- Missing entirely before. An approval for a build set nobody declared is a permission to generate
+-- something that does not exist, and a downstream request rejecting it later is a worse place to
+-- learn that than the moment it is granted.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'generation_authorization_covers_a_real_build_set') THEN
+        ALTER TABLE generation_authorization
+            ADD CONSTRAINT generation_authorization_covers_a_real_build_set
+            FOREIGN KEY (build_set_revision_id) REFERENCES build_set_revision (revision_id);
+    END IF;
+END $$;
+
 -- ── the composite targets ────────────────────────────────────────────────────────────────────────
 -- UNIQUE CONSTRAINTS rather than unique indexes: Postgres will not accept a bare index as the
--- target of a composite foreign key ("there is no unique constraint matching given keys"), which
--- the first version of this migration discovered. Both are unique by construction anyway, since
--- `revision_id` is already the primary key — they exist to make the composite target legal, not to
--- add a guarantee.
+-- target of a composite foreign key ("there is no unique constraint matching given keys"). All
+-- three are unique by construction, since the leading column is already a primary key — they exist
+-- to make the composite targets legal, not to add a guarantee.
 --
--- Added conditionally rather than DROP-then-ADD. A drop-and-recreate rebuilds the backing index on
--- every re-run, and this file is applied twice by the idempotency check; more importantly a DROP
--- would briefly remove the target of a foreign key that already depends on it.
+-- Added conditionally rather than DROP-then-ADD: a drop would briefly remove the target of a
+-- foreign key already depending on it, and this file is applied twice by the idempotency check.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
@@ -58,26 +71,12 @@ BEGIN
     END IF;
 END $$;
 
--- ── request -> authorization ─────────────────────────────────────────────────────────────────────
-ALTER TABLE generation_request
-    ADD COLUMN IF NOT EXISTS generation_authorization_revision_id text;
-
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_constraint
-                   WHERE conname = 'generation_request_authorized_for_this_work') THEN
-        ALTER TABLE generation_request
-            ADD CONSTRAINT generation_request_authorized_for_this_work
-            FOREIGN KEY (generation_authorization_revision_id, build_set_revision_id,
-                         environment_id)
-            REFERENCES generation_authorization (revision_id, build_set_revision_id,
-                                                 environment_id);
-    END IF;
-END $$;
-
 -- ── artifact -> authorization ────────────────────────────────────────────────────────────────────
 ALTER TABLE sealed_artifact_v2
     ADD COLUMN IF NOT EXISTS generation_authorization_revision_id text;
+UPDATE sealed_artifact_v2 SET generation_authorization_revision_id = NULL WHERE FALSE;
+ALTER TABLE sealed_artifact_v2
+    ALTER COLUMN generation_authorization_revision_id SET NOT NULL;
 
 DO $$
 BEGIN
@@ -90,8 +89,47 @@ BEGIN
             REFERENCES generation_authorization (revision_id, environment_id,
                                                  logical_group_name);
     END IF;
+    -- The target of the request -> artifact edge below.
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'sealed_artifact_v2_authorization_key') THEN
+        ALTER TABLE sealed_artifact_v2
+            ADD CONSTRAINT sealed_artifact_v2_authorization_key
+            UNIQUE (artifact_id, generation_authorization_revision_id, environment_id);
+    END IF;
 END $$;
 
--- The auditor's index: every artifact one approval produced.
 CREATE INDEX IF NOT EXISTS sealed_artifact_v2_by_authorization
     ON sealed_artifact_v2 (generation_authorization_revision_id);
+
+-- ── request -> authorization, AND request -> artifact ────────────────────────────────────────────
+ALTER TABLE generation_request
+    ADD COLUMN IF NOT EXISTS generation_authorization_revision_id text;
+ALTER TABLE generation_request
+    ALTER COLUMN generation_authorization_revision_id SET NOT NULL;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'generation_request_authorized_for_this_work') THEN
+        ALTER TABLE generation_request
+            ADD CONSTRAINT generation_request_authorized_for_this_work
+            FOREIGN KEY (generation_authorization_revision_id, build_set_revision_id,
+                         environment_id)
+            REFERENCES generation_authorization (revision_id, build_set_revision_id,
+                                                 environment_id);
+    END IF;
+    -- THE EDGE THAT MAKES IT A CHAIN. A request may only point at an artifact produced under the
+    -- SAME approval in the SAME environment. Without it `sealed_artifact_id` was plain text: a
+    -- SUCCEEDED request could name an artifact that does not exist, or one somebody else's approval
+    -- produced, and nothing in the schema would object.
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'generation_request_produced_this_artifact') THEN
+        ALTER TABLE generation_request
+            ADD CONSTRAINT generation_request_produced_this_artifact
+            FOREIGN KEY (sealed_artifact_id, generation_authorization_revision_id,
+                         environment_id)
+            REFERENCES sealed_artifact_v2 (artifact_id,
+                                           generation_authorization_revision_id,
+                                           environment_id);
+    END IF;
+END $$;

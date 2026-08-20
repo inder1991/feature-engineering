@@ -116,6 +116,10 @@ class GenerationRequestV1:
     request_id: str
     build_set_revision_id: str
     environment_id: str
+    #: WHICH approval permitted this work. Carried on the object, not left to a second query: a
+    #: reader that has to fetch it separately is a reader that can forget to, and every downstream
+    #: check about "was this authorized" would then be optional.
+    generation_authorization_revision_id: str
     status: GenerationStatusV1
     sealed_artifact_id: str | None
     refusals: tuple[Mapping[str, str], ...]
@@ -231,7 +235,7 @@ def request_generation(
     environment_id: str,
     requested_by: str,
     requested_at: str,
-    generation_authorization_revision_id: str | None = None,
+    generation_authorization_revision_id: str,
 ) -> tuple[str, bool]:
     """Start an attempt, or return the LIVE one for this set and environment.
 
@@ -240,9 +244,10 @@ def request_generation(
 
     ``generation_authorization_revision_id`` names WHICH approval permits this work. It travels
     inside a COMPOSITE foreign key with the build set and the environment, so a request naming an
-    authorization issued for a different set or cluster is not caught — it cannot be written. ``None``
-    means "predates the chain" and is distinguishable from any authorization; it is accepted because
-    the V1 chain writes no authorization and backfilling one would invent the evidence.
+    authorization issued for a different set or cluster is not caught — it cannot be written. REQUIRED,
+    with no default. A default of ``None`` would mean absence had two meanings — "predates the
+    chain" and "a caller forgot" — and a column whose absence means two things cannot distinguish
+    them.
 
     Idempotent on the WORK — the build set and environment — rather than on a caller-supplied key,
     because a client minting a fresh key per click would defeat a key-based guard and generation
@@ -317,10 +322,12 @@ def read_request(conn: DbConn, request_id: str) -> GenerationRequestV1 | None:
     """One attempt as stored, or ``None``."""
     row = conn.execute(
         "SELECT build_set_revision_id, environment_id, status, sealed_artifact_id, refusals, "
-        "failure_reason FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
+        "failure_reason, generation_authorization_revision_id "
+        "FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
     if row is None:
         return None
     return GenerationRequestV1(
         request_id=request_id, build_set_revision_id=row[0], environment_id=row[1],
+        generation_authorization_revision_id=row[6],
         status=GenerationStatusV1(row[2]), sealed_artifact_id=row[3],
         refusals=tuple(row[4] or ()), failure_reason=row[5])

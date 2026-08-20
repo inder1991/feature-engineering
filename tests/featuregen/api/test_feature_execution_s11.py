@@ -322,7 +322,37 @@ def _seal(db, *, servable: bool = True):
         compilation_identity_hash="sha256:c", group_plan_hash="sha256:p",
         project_digest="sha256:d",
         realizations=(RealizationLinkV1(revision_id="rev-1", occurrence_hash="occ-1"),),
-        sealed_at="2026-08-17T00:00:00Z")
+        sealed_at="2026-08-17T00:00:00Z",
+        generation_authorization_revision_id=_seal_approval(db))
+
+
+def _seal_approval(db) -> str:
+    """The approval this artifact was produced under — mandatory since the referential chain.
+
+    An artifact that cannot name the approval that produced it leaves "which approval produced this"
+    answerable only by matching loose fields, which is the gap the chain closes.
+    """
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-s11','h','hypothesis','h') "
+               "ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+               "VALUES ('trr-s11','int-s11','exploration','h') ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO build_set_revision (revision_id, target_reading_revision_id, "
+               "declaration_hash, declaration_json, content_hash, declared_by, declared_at) "
+               "VALUES ('bs-s11','trr-s11','dh','{}'::jsonb,'ch','user:ops','t') "
+               "ON CONFLICT DO NOTHING")
+    return record_generation_authorization(
+        db, GenerationAuthorizationV1(
+            environment_id="hdfc-local", logical_group_name="customer_txn_features",
+            build_set_revision_id="bs-s11",
+            target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+        authorized_by="user:ops", authorized_at="t")
 
 
 def _verify(db) -> str:

@@ -53,6 +53,7 @@ from featuregen.materialize.subgraph_requirements_v2 import (
 )
 
 __all__ = [
+    "SealedArtifactConflict",
     "ArtifactNotServable",
     "RealizationLinkV1",
     "SealedArtifactV2",
@@ -87,6 +88,9 @@ class SealedArtifactV2:
     artifact_id: str
     environment_id: str
     logical_group_name: str
+    #: WHICH approval produced this. On the object rather than a second query away, so a caller
+    #: asking "was this authorized" cannot get an answer by forgetting to ask.
+    generation_authorization_revision_id: str
     compilation_identity_hash: str
     group_plan_hash: str
     project_digest: str
@@ -116,7 +120,7 @@ def seal_v2(
     project_digest: str,
     realizations: Sequence[RealizationLinkV1],
     sealed_at: str,
-    generation_authorization_revision_id: str | None = None,
+    generation_authorization_revision_id: str,
     requirements: tuple[SubgraphRequirementV2, ...] = PILOT_REQUIREMENTS,
 ) -> SealedArtifactV2:
     """Check EVERY member's operator graph, persist the artifact and its evidence, and return it.
@@ -188,9 +192,14 @@ def seal_v2(
          sealed_at,
          # WHICH APPROVAL PRODUCED THIS. Inside a composite FK with the environment and the group,
          # so an artifact sealed under an authorization issued for another group is unwritable
-         # rather than merely wrong. NULL is "predates the chain" — the V1 path writes no
-         # authorization, and inventing one would forge the evidence an auditor comes here for.
+         # rather than merely wrong.
          generation_authorization_revision_id))
+    _require_identity_unchanged(
+        conn, manifest.artifact_id,
+        environment_id=environment_id, logical_group_name=logical_group_name,
+        compilation_identity_hash=compilation_identity_hash, group_plan_hash=group_plan_hash,
+        project_digest=project_digest,
+        generation_authorization_revision_id=generation_authorization_revision_id)
 
     # RECORDED ON BOTH PATHS. See the module docstring: the acceptance clause is that a refusal
     # keeps these, and a refused compilation depended on exactly the policies it depended on.
@@ -204,8 +213,54 @@ def seal_v2(
     return SealedArtifactV2(
         artifact_id=manifest.artifact_id, environment_id=environment_id,
         logical_group_name=logical_group_name,
+        generation_authorization_revision_id=generation_authorization_revision_id,
         compilation_identity_hash=compilation_identity_hash, group_plan_hash=group_plan_hash,
         project_digest=project_digest, verdict=verdict, realizations=links)
+
+
+class SealedArtifactConflict(RuntimeError):
+    """An artifact id was re-sealed with DIFFERENT identity-bearing content.
+
+    Distinct from a manifest integrity error: the bytes are fine, and it is the artifact's own
+    identity that two callers disagree about.
+    """
+
+
+#: The fields that make a sealed artifact THAT artifact. A retry may differ in none of them.
+#: `sealed_at` is deliberately absent — the same artifact re-sealed a minute later is the same
+#: artifact, and refusing on the clock would turn every legitimate retry into an error.
+_IDENTITY_FIELDS = (
+    "environment_id", "logical_group_name", "compilation_identity_hash",
+    "group_plan_hash", "project_digest", "generation_authorization_revision_id",
+)
+
+
+def _require_identity_unchanged(conn: DbConn, artifact_id: str, **supplied: str) -> None:
+    """After an idempotent insert, prove the STORED row is the one the caller described.
+
+    ``ON CONFLICT (artifact_id) DO NOTHING`` makes re-sealing safe, and silently makes MIS-sealing
+    safe too: an id retried with a different authorization, environment, group or project digest is
+    ignored, and the function then returns an object built from the CALLER's values — describing a
+    row that does not exist. Every later reader trusts the database; the caller trusted its own
+    arguments; nothing reconciles them.
+
+    So the insert is followed by a read-back. Identity-bearing fields must match exactly, and the
+    first that does not is named on both sides.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(_IDENTITY_FIELDS)} FROM sealed_artifact_v2 WHERE artifact_id = %s",
+        (artifact_id,)).fetchone()
+    if row is None:                       # pragma: no cover — the insert above guarantees it
+        raise SealedArtifactConflict(
+            f"artifact {artifact_id!r} vanished between its insert and its read-back")
+    for field, stored, given in zip(_IDENTITY_FIELDS, row, 
+                                    (supplied[f] for f in _IDENTITY_FIELDS), strict=True):
+        if stored != given:
+            raise SealedArtifactConflict(
+                f"artifact {artifact_id!r} is already sealed with a different {field}: stored "
+                f"{stored!r}, this call supplied {given!r}. The id names ONE artifact, so the two "
+                f"callers disagree about what it is — and returning either answer would describe a "
+                f"row the other one is reading")
 
 
 def _members_of(
@@ -304,7 +359,8 @@ def load_sealed_artifact(conn: DbConn, artifact_id: str) -> SealedArtifactV2 | N
     """
     row = conn.execute(
         "SELECT environment_id, logical_group_name, compilation_identity_hash, group_plan_hash, "
-        "project_digest, subgraph_satisfied, triggered_requirements, subgraph_findings "
+        "project_digest, subgraph_satisfied, triggered_requirements, subgraph_findings, "
+        "generation_authorization_revision_id "
         "FROM sealed_artifact_v2 WHERE artifact_id = %s", (artifact_id,)).fetchone()
     if row is None:
         return None
@@ -315,6 +371,9 @@ def load_sealed_artifact(conn: DbConn, artifact_id: str) -> SealedArtifactV2 | N
                        for item in row[7]))
     return SealedArtifactV2(
         artifact_id=artifact_id, environment_id=row[0], logical_group_name=row[1],
+        # The authorization comes back with the artifact. A loader that dropped it would make
+        # "which approval produced this" a second query — and therefore optional.
+        generation_authorization_revision_id=row[8],
         compilation_identity_hash=row[2], group_plan_hash=row[3], project_digest=row[4],
         verdict=verdict, realizations=realization_links_of(conn, artifact_id))
 
