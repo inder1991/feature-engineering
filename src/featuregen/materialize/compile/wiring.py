@@ -264,7 +264,7 @@ def _calculation_node(ir: FormulaExecutionIRV1, inputs: NodeAssemblyInputs) -> R
             f"would be this code answering a question the formula exists to answer — and `ignore` "
             f"and `propagate` produce different numbers from the same rows")
     column = _planned_column(inputs.plan, ir.feature_name)
-    declared = body_expressions(admitted.formula.body)
+    declared = _declared_windows(admitted)
     paths = [expression.expr_path for expression in ir.expressions]
     return render_calculation_node(
         ir, _planned_feature(inputs.plan, column), inputs.plan,
@@ -274,6 +274,44 @@ def _calculation_node(ir: FormulaExecutionIRV1, inputs: NodeAssemblyInputs) -> R
         spine_dataset=inputs.datasets.spine,
         staging_dataset=_named(inputs.datasets.staging, column, "staging output"),
         manifest_dataset=_named(inputs.datasets.manifests, column, "staging manifest"))
+
+
+def _declared_windows(admitted) -> tuple[tuple[str, object], ...]:
+    """``(body path, expression)`` for one admitted feature, in EITHER language.
+
+    ▲ **THE ONE PLACE THE TWO LANGUAGES ARE CROSSED IN THIS MODULE**, and everything above it is
+    genuinely version-neutral rather than merely untyped: `_join_gate_nodes` and `_joined_datasets`
+    read `join_plan.steps` off :class:`ExpressionExecutionIR`, which BOTH IRs carry, and every name
+    lookup below reads the plan and the dataset map. This function is the exception because the two
+    window policies are the formula's own declarations, and the two languages spell the formula
+    differently: V1 carries a :class:`TypedFormulaV1` at ``.formula``, V2 a proposal at
+    ``.proposal``.
+
+    Each side goes through ITS OWN vocabulary's walker — `body_expressions` for V1,
+    `body_paths_v2` for V2/V3 — never through a traversal written here. That is
+    `body_expressions`' own rule: the path names the staging output every later stage reads, so a
+    second enumeration free to disagree about how many expressions a body has would wire a
+    calculation to a projection that does not exist.
+
+    Dispatch is on WHICH FIELD IS PRESENT rather than on an isinstance of the admitted class,
+    because the question is which formula the artifact carries and that is what the attribute
+    answers. An artifact carrying NEITHER is refused loudly: silently returning no policies would
+    publish `ignore` and `propagate` features with whatever the renderer defaults to, and those are
+    different numbers from the same rows.
+    """
+    from featuregen.materialize.compile_ir_v2 import body_paths_v2
+
+    formula = getattr(admitted, "formula", None)
+    if formula is not None:
+        return body_expressions(formula.body)
+    proposal = getattr(admitted, "proposal", None)
+    if proposal is not None:
+        return body_paths_v2(proposal.body)
+    raise ValueError(
+        f"the admitted artifact for this member carries neither a `formula` (V1) nor a `proposal` "
+        f"(V2/V3): got {type(admitted).__name__}. The empty-window and null-input policies live on "
+        f"the formula, so an artifact with no formula at all cannot answer them and a default here "
+        f"would publish a number the author never declared")
 
 
 # ── looking names up, and refusing when the map does not cover the compilation ───────────────────

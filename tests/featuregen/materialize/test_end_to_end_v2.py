@@ -40,7 +40,6 @@ from tests.featuregen.materialize.test_ir import (
     seed_catalog,
 )
 from tests.featuregen.materialize.test_pilot_v2 import ENV, GROUP, _admitted_v2, _run
-from tests.featuregen.materialize.test_render_project import _nodes
 
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1
 from featuregen.materialize.generate_v2 import generate_v2
@@ -90,6 +89,29 @@ def _advertise_this_build(db) -> None:
         db, engine_id="kedro-pyspark", dispatchable=renderer_dispatch_surface())
 
 
+def _production_nodes(compiled, spine_input):
+    """The nodes the PRODUCTION assembler produces for a V2 compilation.
+
+    ▲ This used to be `test_render_project._nodes(datasets)` — a test fixture — and that is what
+    hid the gap. `assemble_nodes` is the only node assembly in `src/`, and it was reachable only
+    from the V1 chain: its inputs declared a V1 token and V1 admitted artifacts, so nothing V2 could
+    call it and the e2e run rendered a hand-wired stub instead. A chain that assembles its own
+    nodes in the test is a chain with no production wiring, however green the test is.
+    """
+    from featuregen.materialize.compile.chain import NodeAssemblyInputs
+    from featuregen.materialize.compile.wiring import assemble_nodes
+
+    datasets = project_datasets(compiled.authorized.token, compiled.plan,
+                                spine_input=spine_input)
+    return assemble_nodes(NodeAssemblyInputs(
+        authorized=compiled.authorized.token,
+        plan=compiled.plan,
+        contract=compiled.contract,
+        admitted={_admitted_v2().feature_name: _admitted_v2()},
+        spine_input=spine_input,
+        datasets=datasets))
+
+
 def _approval(db) -> str:
     from featuregen.materialize.generation_authorization import (
         GenerationAuthorizationV1,
@@ -120,8 +142,6 @@ def generated(catalog, spine):
     assert isinstance(compiled, CompiledGenerationV2), compiled
 
     spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
-    datasets = project_datasets(compiled.authorized.token, compiled.plan,
-                                spine_input=spine_input)
     return generate_v2(
         catalog, compiled,
         environment_id=ENV,
@@ -129,7 +149,7 @@ def generated(catalog, spine):
         engine_id="kedro-pyspark",
         engine_versions=fixtures.ENGINE_VERSIONS,
         spine_input=spine_input,
-        nodes=_nodes(datasets),
+        nodes=_production_nodes(compiled, spine_input),
         artifact_id="art-e2e",
         occurrences_by_member={name: PolicyOccurrenceSetV1(()) for name in compiled.graphs},
         realizations=(), compiled_at="t", sealed_at="2026-08-20T00:00:00Z")
@@ -209,15 +229,33 @@ def test_REAL_SPARK_SOURCE_WAS_EMITTED_not_an_empty_project(catalog, spine):
 
     compiled = _run(catalog, spine, [_admitted_v2()])
     spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
-    datasets = project_datasets(compiled.authorized.token, compiled.plan,
-                               spine_input=spine_input)
+    nodes = _production_nodes(compiled, spine_input)
     project = render_project(
         compiled.authorized.token, compiled.plan, environment_id=ENV,
-        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=spine_input,
-        nodes=_nodes(datasets))
+        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=spine_input, nodes=nodes)
 
     assert GENERATED_LOCK_FILENAME in project.files
     assert any(path.endswith(".py") for path in project.files), sorted(project.files)
     assert project.identity.generated_project_hash
     # The project describes THIS group, not a template.
     assert any(GROUP in text for text in project.files.values())
+
+
+def test_THE_NODES_COME_FROM_THE_PRODUCTION_ASSEMBLER_not_a_fixture(catalog, spine):
+    """`assemble_nodes` is the only node assembly in `src/`, and until now nothing V2 could call it:
+    its inputs declared a V1 token and V1 admitted artifacts. So the V2 path had no production
+    wiring at all, and the e2e run was rendering a hand-written test stub — which is exactly the
+    shape of a chain that looks closed and is not.
+
+    Every node here is one the assembler emitted, over a V2 token, against real dataset names.
+    """
+    compiled = _run(catalog, spine, [_admitted_v2()])
+    spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
+
+    nodes = _production_nodes(compiled, spine_input)
+
+    kinds = [node.name for node in nodes]
+    assert any("spine" in name for name in kinds), kinds
+    assert any(name.startswith("project_") for name in kinds), kinds
+    assert any(name.startswith("calculate_") for name in kinds), kinds
+    assert kinds[-1].startswith("publish") or "gate" in kinds[-1], kinds

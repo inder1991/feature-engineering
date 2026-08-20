@@ -65,7 +65,11 @@ from featuregen.materialize.build_operator_graph_v2 import build_operator_graph_
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.compile_ir_v2 import compile_ir_v2
 from featuregen.materialize.contract import AvailabilityPromiseV1, CadenceDecl
-from featuregen.materialize.contract_v2 import contracts_for, group_by_contract_v2
+from featuregen.materialize.contract_v2 import (
+    MaterializationContractV2,
+    contracts_for,
+    group_by_contract_v2,
+)
 from featuregen.materialize.generation_authorization import GenerationAuthorizationV1
 from featuregen.materialize.group_plan import PlannedFeature
 from featuregen.materialize.group_plan_v2 import build_group_plan_v2
@@ -96,6 +100,12 @@ class CompiledGenerationV2:
     plan: FeatureGroupPlanV2
     graphs: Mapping[str, OperatorGraphV2]
     contract_hash: str
+    #: The contract ITSELF, not only its hash. Carried because the node assembly reads it — the
+    #: spine and projection renderers take the contract to decide what a run of this group means —
+    #: and this object is what a caller renders from. Only the hash was carried, so the one thing
+    #: that could be done with it was compare it; a caller that needed the contract had to re-derive
+    #: it, which is a second answer to a question §5.1 exists to have exactly one answer to.
+    contract: MaterializationContractV2
 
     def __post_init__(self) -> None:
         planned = {feature.column_name for feature in self.plan.features}
@@ -233,7 +243,8 @@ def compile_generation_v2(
         graphs[name] = graph
 
     return CompiledGenerationV2(
-        authorized=authorized, plan=plan, graphs=graphs, contract_hash=group.contract_hash)
+        authorized=authorized, plan=plan, graphs=graphs,
+        contract_hash=group.contract_hash, contract=group.contract)
 
 
 def _reconcile_output(feature: AdmittedFeatureV2, resolved) -> None | MaterializationRefused:

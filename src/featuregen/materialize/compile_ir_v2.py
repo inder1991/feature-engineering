@@ -60,7 +60,7 @@ from featuregen.materialize.expression_ir import BODY_PATHS, compile_expression
 from featuregen.materialize.inventory import ClusterInventoryV1
 from featuregen.materialize.ir import _fold
 
-__all__ = ["compile_ir_v2"]
+__all__ = ["body_paths_v2", "compile_ir_v2"]
 
 #: Which body path each final operation's expressions occupy, in ORDER. The renderer's own
 #: `_BODY_SLOTS` is the authority for what it can emit; this is the compiler's side of the same
@@ -70,6 +70,39 @@ _BODY_PATHS_BY_OPERATION: Mapping[FinalOperationV2, tuple[str, ...]] = {
     FinalOperationV2.RATIO: ("body.numerator", "body.denominator"),
     FinalOperationV2.DIFFERENCE: ("body.minuend", "body.subtrahend"),
 }
+
+
+def body_paths_v2(body) -> tuple[tuple[str, object], ...]:
+    """The body's expressions paired with the BODY PATH each one occupies, in order.
+
+    THE ONE ENUMERATION, for `body_expressions`' stated reason: the path names the staging output
+    every later stage reads, so a second traversal that disagreed about how many expressions a body
+    has — or what each is called — would wire a calculation to a projection that does not exist.
+    V1 keeps the pairing inside `body_expressions`; the V2 language splits it, because the path
+    order belongs to the FINAL OPERATION (`body.numerator` before `body.denominator` is the
+    difference between a/b and b/a) rather than to the body's shape. This function is the join, and
+    both `compile_ir_v2` below and the node assembly read it rather than re-deriving it.
+
+    Order is the body's own and is NEVER sorted.
+
+    Raises:
+        ValueError: the body's shape and its final operation disagree about how many expressions
+            there are. Not a governed refusal — a body that cannot be walked is malformed, and
+            `compile_ir_v2` converts it to one where a caller needs a code.
+    """
+    operation = _final_operation(body)
+    paths = _BODY_PATHS_BY_OPERATION.get(operation)
+    if paths is None:
+        raise ValueError(
+            f"the compiler has no body paths for final operation {operation.value!r}: the paths "
+            f"name the staging outputs, so an operation with none cannot be wired to anything")
+    expressions = _expressions(body)
+    if len(paths) != len(expressions):
+        raise ValueError(
+            f"a {operation.value} body carries {len(expressions)} expressions and occupies "
+            f"{len(paths)} paths {list(paths)}: the two disagree, so at least one expression would "
+            f"be staged under a path nothing reads or dropped entirely")
+    return tuple(zip(paths, expressions, strict=True))
 
 
 def compile_ir_v2(
@@ -128,6 +161,14 @@ def compile_ir_v2(
             f"{final} combines {len(paths)} term(s) and this formula carries "
             f"{len(expressions_in)}: an arity the operation does not have would compile to a "
             f"different calculation from the one the formula declares")
+
+    # The pairing itself comes from `body_paths_v2`, not from a `zip` written here, so the node
+    # assembly and this compiler cannot disagree about which expression occupies which path. The
+    # two checks above are exactly its preconditions, so it cannot raise at this point — they exist
+    # separately because a caller needs a governed CODE here and `body_paths_v2` has none to give.
+    paired = body_paths_v2(body)
+    paths = tuple(path for path, _ in paired)
+    expressions_in = tuple(expression for _, expression in paired)
 
     # ── 2. THE GRAIN, WHICH IS NOT OPTIONAL ─────────────────────────────────────────────────────
     grain = getattr(proposal, "grain", None)

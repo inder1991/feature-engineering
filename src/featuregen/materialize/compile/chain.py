@@ -106,7 +106,9 @@ from typing import Protocol, TypeVar
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.admission import AdmittedFeature, admit_artifacts
+from featuregen.materialize.admission_v2 import AdmittedFeatureV2
 from featuregen.materialize.binding import GroupContractBinding, bind_group, plan_revision
+from featuregen.materialize.boundary_v2 import AuthorizedCompilationV2
 from featuregen.materialize.codes import MaterializationRefused, ValidationFindingCode
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
@@ -390,10 +392,18 @@ class NodeAssemblyInputs:
     from the formula's ``WindowPolicy``, which ``PitSpec`` deliberately excludes.
     """
 
-    authorized: AuthorizedCompilation
+    #: EITHER language's token and admitted artifacts. Widened rather than duplicated because the
+    #: node sequence for a group is ONE concept — a spine, a projection per expression, a
+    #: calculation per feature, an assembly and a gate — and two copies of it would drift. What
+    #: makes the widening honest rather than a `| V2` nobody checked is that `assemble_nodes` reads
+    #: only what both carry: `.irs` (both tokens expose it under that name, deliberately),
+    #: `.spine`, and `ExpressionExecutionIR`, which is one shared type. The single genuine
+    #: difference — where the FORMULA lives — is crossed in exactly one function,
+    #: `wiring._declared_windows`.
+    authorized: AuthorizedCompilation | AuthorizedCompilationV2
     plan: FeatureGroupPlanV1
     contract: MaterializationContractV1
-    admitted: Mapping[str, AdmittedFeature]
+    admitted: Mapping[str, AdmittedFeature | AdmittedFeatureV2]
     spine_input: PhysicalInputRequirement
     datasets: ProjectDatasets
 
