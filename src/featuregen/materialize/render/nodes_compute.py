@@ -100,7 +100,6 @@ from featuregen.formula.schema_leaves import (
 # `FilterKind` and the rest above are the SAME objects in `schema` and `schema_v2` — re-exported,
 # genuinely version-neutral — so comparing them with `is` is correct and stays.
 from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
-from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.boundary_v2 import FormulaExecutionIRV2
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import MaterializationContractV1
@@ -116,6 +115,7 @@ from featuregen.materialize.group_plan import (
     PlannedFeature,
     StagingStatus,
 )
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
 from featuregen.materialize.inputs import PhysicalInputRequirement
 from featuregen.materialize.inventory import (

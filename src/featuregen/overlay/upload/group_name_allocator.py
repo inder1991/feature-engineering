@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from featuregen.materialize.admission import FeatureNamePlanError, hive_identifier
+from featuregen.materialize.identifiers import FeatureNamePlanError, hive_identifier
 
 __all__ = [
     "MAX_HIVE_IDENTIFIER_LENGTH",

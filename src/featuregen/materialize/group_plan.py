@@ -42,10 +42,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from featuregen.materialize.admission import FeatureNamePlanError, hive_identifier
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import ContractGroup
+from featuregen.materialize.identifiers import FeatureNamePlanError, hive_identifier
 from featuregen.materialize.physical_types import PHYSICAL_TYPE_POLICY_VERSION, PhysicalType
 from featuregen.overlay.upload.object_ref import parse_ref
 

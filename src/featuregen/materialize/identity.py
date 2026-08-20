@@ -50,9 +50,9 @@ from types import MappingProxyType
 from typing import Any
 
 from featuregen.materialize import binding, compile, render
-from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_hash
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.ir import (
     FormulaExecutionIRV1,
     bridge_realization_dependencies,

@@ -50,11 +50,11 @@ from featuregen.materialize.admission import (
     _require_resolved,
     _terminal_event,
     _verify_payload_hash,
-    hive_identifier,
 )
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.execution_proof_store import renderer_supported_operators
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 
 __all__ = [
