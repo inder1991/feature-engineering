@@ -104,12 +104,13 @@ class AdmittedFeatureV2:
     """
 
     __slots__ = ("feature_name", "proposal", "proposal_content_hash", "intent",
-                 "authoring_run_id", "operator_kinds")
+                 "authoring_run_id", "operator_kinds", "candidate_output", "output_intent")
 
     def __init__(self, *, feature_name: str,
                  proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
                  proposal_content_hash: str, intent: AuthoringIntent, authoring_run_id: str,
-                 operator_kinds: tuple[str, ...]) -> None:
+                 operator_kinds: tuple[str, ...],
+                 candidate_output=None, output_intent=None) -> None:
         self.feature_name = feature_name
         self.proposal = proposal
         self.proposal_content_hash = proposal_content_hash
@@ -118,6 +119,17 @@ class AdmittedFeatureV2:
         #: What the renderer would be asked to emit. Carried because it is what the ADVERTISED-set
         #: check was made against, so a later stage does not re-derive it from a different reading.
         self.operator_kinds = operator_kinds
+        #: The GOVERNED output policy the authoring run resolved, and the intent the author
+        #: DECLARED. Both were being dropped here, and dropping them is not a tidy: the two exist to
+        #: be reconciled against each other by `resolve_executable_output_v2`, and a stage that has
+        #: neither cannot do that. It can only re-resolve a policy from whatever facts its caller
+        #: happens to hand it — which answers a different question and answers it confidently.
+        #:
+        #: `None` is legitimate and means the run resolved no output (an `output_status` other than
+        #: `resolved`). It is NOT a default standing in for "we did not carry it": admission refuses
+        #: a RESOLVED run whose axes disagree, so a resolved run reaches here with its output.
+        self.candidate_output = candidate_output
+        self.output_intent = output_intent
 
 
 def implied_operator_signatures(
@@ -220,6 +232,11 @@ def _admit_one_v2(
         intent=item.intent,
         authoring_run_id=run_id,
         operator_kinds=kinds,
+        # Carried from the VERIFIED result rather than re-derived. `result` has already survived
+        # checks 2, 4, 4b and 5 — the payload hash, the proposal hash, the language version and the
+        # axes — so these two fields are as proven as the proposal beside them.
+        candidate_output=result.candidate_output,
+        output_intent=result.output_intent,
     )
 
 

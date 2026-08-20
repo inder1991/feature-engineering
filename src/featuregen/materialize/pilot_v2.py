@@ -71,6 +71,11 @@ from featuregen.materialize.group_plan import PlannedFeature
 from featuregen.materialize.group_plan_v2 import build_group_plan_v2
 from featuregen.materialize.inventory import ClusterInventoryV1
 from featuregen.materialize.operator_graph_v2 import OperatorGraphV2
+from featuregen.materialize.output_resolution_v2 import (
+    IntentMismatchV1,
+    resolve_executable_output_v2,
+)
+from featuregen.materialize.physical_types_v2 import DecimalTypeV2
 from featuregen.materialize.resolve_physical_type_v3 import resolve_physical_type_v3
 from featuregen.materialize.spine import SpineSpec
 
@@ -168,6 +173,18 @@ def compile_generation_v2(
             return MaterializationRefused(
                 CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED,
                 f"{feature.feature_name}: {output.code} at {output.path} — {output.detail}")
+
+        # AND THEN RECONCILED against what the author declared. Resolving alone answers "what do the
+        # governed facts permit"; it does not answer "does that agree with what the author said this
+        # number would be", and an earlier version of this function stopped at the first question
+        # while reading like it had answered both.
+        #
+        # Skipped only when the run carried no intent — a run whose output_status is not `resolved`
+        # has nothing to reconcile, and inventing an intent to compare against would manufacture
+        # agreement.
+        reconciled = _reconcile_output(feature, output)
+        if isinstance(reconciled, MaterializationRefused):
+            return reconciled
         compiled = compile_ir_v2(
             conn, feature, spine=spine, inventory=inventory, roles=roles,
             output_policy=output, policy_realization_ids=policy_realization_ids)
@@ -217,6 +234,55 @@ def compile_generation_v2(
 
     return CompiledGenerationV2(
         authorized=authorized, plan=plan, graphs=graphs, contract_hash=group.contract_hash)
+
+
+def _reconcile_output(feature: AdmittedFeatureV2, resolved) -> None | MaterializationRefused:
+    """The authored intent against the governed policy — `resolve_executable_output_v2`'s job.
+
+    This is the check `AdmittedFeatureV2` was dropping the inputs for. The author declares a unit
+    and a currency; the governed operand facts imply one; the two can disagree, and a feature
+    published under a unit its author did not mean is wrong in a way no type check catches.
+
+    Returns ``None`` when there is nothing to reconcile — no carried intent — rather than a pass.
+    The distinction matters: "the two agreed" and "there was only one of them" are different
+    states, and reporting the second as the first is how an unreconciled output comes to look
+    checked.
+    """
+    intent = feature.output_intent
+    if intent is None:
+        return None
+
+    mismatch = resolve_executable_output_v2(
+        intent,
+        resolved,
+        formula_content_hash=feature.proposal_content_hash,
+        # The arithmetic's own type and nullability. Taken from the DECLARED decimal policy, which
+        # is what `resolve_physical_type_v3` publishes — the two must agree or the reconciliation
+        # would be against a width nothing emits.
+        physical_type=DecimalTypeV2(precision=feature.proposal.decimal.precision,
+                                    scale=feature.proposal.decimal.scale),
+        currency_code=_currency_code(resolved),
+        nullable=True,
+    )
+    if isinstance(mismatch, IntentMismatchV1):
+        return MaterializationRefused(
+            CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED,
+            f"{feature.feature_name}: the author's output intent and the governed facts disagree "
+            f"about {mismatch.field} — intended {mismatch.intended!r}, resolved "
+            f"{mismatch.resolved!r} ({mismatch.code}). Publishing either one silently would put a "
+            f"number under a meaning somebody did not choose")
+    return None
+
+
+def _currency_code(resolved) -> str:
+    """The three-letter code out of a resolved policy's currency field.
+
+    `"fixed:AED"` -> `"AED"`; `"converted:<ref>"` has no code recoverable here — S4 says it comes
+    from the realization that performed the conversion — so it is passed through empty rather than
+    guessed, and the reconciliation refuses on the field rather than on a code this function made up.
+    """
+    currency = getattr(resolved, "currency", "") or ""
+    return currency.split(":", 1)[1] if currency.startswith("fixed:") else ""
 
 
 def _physical_type(member, features: Sequence[AdmittedFeatureV2]):

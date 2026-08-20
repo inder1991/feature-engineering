@@ -19,6 +19,8 @@ What these tests hold:
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from tests.featuregen.materialize import fixtures
 from tests.featuregen.materialize.test_ir import (
@@ -292,3 +294,74 @@ def test_an_aggregate_THIS_BUILD_STILL_CANNOT_EMIT_refuses_by_name(catalog, spin
 
     assert isinstance(result, MaterializationRefused)
     assert "median" in result.detail
+
+
+# ══ THE AUTHORED INTENT IS RECONCILED, NOT RE-RESOLVED ═════════════════════════════════════════
+def _intent_for(proposal, proposal_hash, *, unit="monetary", currency="AED"):
+    """What the AUTHOR said the number would be, in the shape the authoring run records."""
+    from featuregen.formula.output_intent_v2 import derive_output_intent_v2
+
+    base = derive_output_intent_v2(proposal, proposal_hash=proposal_hash)
+    return dataclasses.replace(base, unit=unit, target_currency=currency,
+                               authored_expectation_present=True)
+
+
+def _admitted_with_intent(**kwargs):
+    """An admitted feature carrying its authored intent — what `admit_artifacts_v2` now forwards.
+
+    Built here rather than through admission because what is under test is the RECONCILIATION, and
+    driving a full trace-verified admission would mostly be testing the trace.
+    """
+    admitted = _admitted_v2(**kwargs)
+    admitted.output_intent = _intent_for(admitted.proposal, admitted.proposal_content_hash)
+    return admitted
+
+
+def test_AN_AGREEING_INTENT_PASSES_RECONCILIATION(catalog, spine):
+    """The author said monetary/AED and the governed facts say monetary/AED — they agree, and the
+    build proceeds. Without this the refusal test below would pass for the wrong reason."""
+    result = _run(catalog, spine, [_admitted_with_intent()])
+    assert isinstance(result, CompiledGenerationV2), result
+
+
+def test_A_DISAGREEING_UNIT_REFUSES_AND_NAMES_BOTH_SIDES(catalog, spine):
+    """The check `AdmittedFeatureV2` was dropping its inputs for.
+
+    The governed operand facts say this amount is `monetary`; the author declared it a `count`. A
+    feature published under a unit its author did not mean is wrong in a way no type check catches —
+    the column is the right width, holds the right digits, and means something else.
+    """
+    admitted = _admitted_v2()
+    admitted.output_intent = _intent_for(
+        admitted.proposal, admitted.proposal_content_hash, unit="count")
+    result = _run(catalog, spine, [admitted])
+
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
+    assert "'count'" in result.detail and "'monetary'" in result.detail
+
+
+def test_AN_INTENT_FOR_ANOTHER_FORMULA_REFUSES(catalog, spine):
+    """`resolve_executable_output_v2` checks the intent's own `derived_from_proposal_hash` FIRST,
+    because an intent describing a different formula would make every later disagreement
+    attributable to the wrong author."""
+    admitted = _admitted_v2()
+    admitted.output_intent = _intent_for(admitted.proposal, "sha256:some-other-formula")
+    result = _run(catalog, spine, [admitted])
+
+    assert isinstance(result, MaterializationRefused)
+    assert result.code is CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED
+
+
+def test_NO_CARRIED_INTENT_IS_NOT_REPORTED_AS_AGREEMENT(catalog, spine):
+    """"The two agreed" and "there was only one of them" are different states.
+
+    A run whose output_status is not `resolved` carries no intent, and there is nothing to
+    reconcile. The build proceeds — but a reader must not take that as the reconciliation having
+    passed, which is why `_reconcile_output` returns None rather than a verdict object.
+    """
+    from featuregen.materialize.pilot_v2 import _reconcile_output
+
+    admitted = _admitted_v2()
+    assert admitted.output_intent is None
+    assert _reconcile_output(admitted, object()) is None
