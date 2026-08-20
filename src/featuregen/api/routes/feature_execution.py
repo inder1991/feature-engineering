@@ -190,7 +190,7 @@ def authorize_generation(
 @router.get("/feature-execution/{artifact_id}/verify-eligibility",
             dependencies=[Depends(require_feature_read)])
 def verify_eligibility(
-    artifact_id: str, inventory_observation_id: str, environment_id: str,
+    artifact_id: str, inventory_observation_id: str,
     conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
     """May this artifact be verified? A QUESTION — it records nothing.
@@ -200,7 +200,7 @@ def verify_eligibility(
     """
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=artifact_id,
-        inventory_observation_id=inventory_observation_id, environment_id=environment_id,
+        inventory_observation_id=inventory_observation_id,
         execution_permitted=_may_execute(identity))
     return {"action": verdict.action.value, "allowed": verdict.allowed,
             "blockers": _explained(verdict.blockers)}
@@ -292,10 +292,13 @@ class VerificationRequestIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sealed_artifact_id: str = Field(min_length=1)
-    generation_authorization_revision_id: str = Field(min_length=1)
     check_set_hash: str = Field(min_length=1)
     inventory_observation_id: str = Field(min_length=1)
-    environment_id: str = Field(min_length=1)
+    #: `generation_authorization_revision_id` and `environment_id` are NOT fields here, and their
+    #: absence is the point. Both are properties OF THE ARTIFACT, recorded when it was sealed, and
+    #: both end up inside the verification identity — so accepting them from the request body let
+    #: the caller choose two security-relevant values that the server already knows. `extra="forbid"`
+    #: means an old client still sending them gets a 422 rather than being quietly ignored.
     #: Counted from 1 by the caller, because the caller is the one who knows this is a RETRY. A
     #: server-chosen next-attempt would make two concurrent clicks two attempts nobody asked for.
     attempt: int = Field(ge=1)
@@ -315,15 +318,27 @@ def request_verification(
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=body.sealed_artifact_id,
         inventory_observation_id=body.inventory_observation_id,
-        environment_id=body.environment_id, execution_permitted=_may_execute(identity))
+        execution_permitted=_may_execute(identity))
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,
             detail={"detail": "verification is not allowed for this artifact",
                     "blockers": _explained(verdict.blockers)})
 
+    # DERIVED FROM THE ARTIFACT, not from the body. The verification identity says which approval
+    # the run is being verified under; taking that from the request would let a caller verify one
+    # artifact while citing somebody else's approval, and the resulting attempt would look
+    # perfectly well-formed. `evaluate_verify` has already established the artifact is servable, so
+    # this load succeeds — but it is re-read rather than assumed, because "the gate passed" is not
+    # a value.
+    sealed = load_sealed_artifact(conn, body.sealed_artifact_id)
+    if sealed is None:                                            # pragma: no cover — gate-covered
+        raise HTTPException(status_code=409,
+                            detail={"detail": "the artifact disappeared between the gate and the "
+                                              "record; nothing was written"})
+
     identity_v1 = VerificationExecutionIdentityV1(
-        generation_authorization_revision_id=body.generation_authorization_revision_id,
+        generation_authorization_revision_id=sealed.generation_authorization_revision_id,
         check_set_hash=body.check_set_hash,
         inventory_observation_id=body.inventory_observation_id,
         attempt=body.attempt)

@@ -198,8 +198,9 @@ def test_evaluate_verify_TAKES_NO_CAPABILITY_ARGUMENT():
 # ══ the evaluators' own decisions ══════════════════════════════════════════════════════════════
 def test_VERIFY_REFUSES_AN_ARTIFACT_THAT_DOES_NOT_EXIST(db):
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-never-sealed", inventory_observation_id="obs-1",
-        environment_id="hdfc-local", execution_permitted=True)
+        db, sealed_artifact_hash="art-never-sealed",
+        inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
+        execution_permitted=True)
     assert verdict.allowed is False
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
     assert verdict.action is EvaluatorAction.VERIFY
@@ -211,8 +212,9 @@ def test_VERIFY_REFUSES_A_REFUSED_ARTIFACT(db):
     willing to seal."""
     _seal(db, servable=False)
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-1",
-        environment_id="hdfc-local", execution_permitted=True)
+        db, sealed_artifact_hash="art-1",
+        inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
+        execution_permitted=True)
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
 
 
@@ -221,8 +223,22 @@ def test_VERIFY_REFUSES_THE_WRONG_ENVIRONMENT(db):
     under-configured run."""
     _seal(db)
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-1",
-        environment_id="hdfc-prod", execution_permitted=True)
+        db, sealed_artifact_hash="art-1",
+        # An observation that genuinely belongs to another cluster — not a string the caller chose.
+        inventory_observation_id=_observation(db, "obs-prod", "hdfc-prod"),
+        execution_permitted=True)
+    assert verdict.blockers == (R.ENVIRONMENT_INCOMPATIBLE,)
+
+
+def test_VERIFY_REFUSES_AN_OBSERVATION_THAT_DOES_NOT_EXIST(db):
+    """It used to be checked for emptiness and then ignored, so "environment compatibility" was a
+    comparison with nothing on one side: an id naming no row reached the same verdict as a correct
+    one. From this gate's side "never observed" and "a different cluster" are the same answer —
+    nothing establishes that this artifact can run where you are pointing it."""
+    _seal(db)
+    verdict = evaluate_execution.evaluate_verify(
+        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-imaginary",
+        execution_permitted=True)
     assert verdict.blockers == (R.ENVIRONMENT_INCOMPATIBLE,)
 
 
@@ -231,24 +247,30 @@ def test_a_REFUSED_ARTIFACT_does_not_ALSO_report_an_environment_mismatch(db):
     could not run in either."""
     _seal(db, servable=False)
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-1",
-        environment_id="hdfc-prod", execution_permitted=True)
+        db, sealed_artifact_hash="art-1",
+        inventory_observation_id=_observation(db, "obs-prod", "hdfc-prod"),
+        execution_permitted=True)
     assert verdict.blockers == (R.ARTIFACT_NOT_SERVABLE,)
 
 
 def test_VERIFY_REFUSES_WITHOUT_EXECUTION_PERMISSION(db):
     _seal(db)
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-1",
-        environment_id="hdfc-local", execution_permitted=False)
+        db, sealed_artifact_hash="art-1",
+        inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
+        execution_permitted=False)
     assert verdict.blockers == (R.EXECUTION_AUTHORITY_UNMET,)
 
 
 def test_VERIFY_ALLOWS_A_SERVABLE_ARTIFACT_IN_ITS_OWN_ENVIRONMENT(db):
     _seal(db)
     verdict = evaluate_execution.evaluate_verify(
-        db, sealed_artifact_hash="art-1", inventory_observation_id="obs-1",
-        environment_id="hdfc-local", execution_permitted=True)
+        db, sealed_artifact_hash="art-1",
+        # The observation belongs to the SAME cluster the artifact was sealed for. Both sides of the
+        # comparison are now loaded, so this passes for the right reason rather than because the
+        # caller supplied the artifact's own environment back to it.
+        inventory_observation_id=_observation(db, "obs-1", "hdfc-local"),
+        execution_permitted=True)
     assert verdict.allowed is True
 
 
@@ -324,6 +346,22 @@ def _seal(db, *, servable: bool = True):
         realizations=(RealizationLinkV1(revision_id="rev-1", occurrence_hash="occ-1"),),
         sealed_at="2026-08-17T00:00:00Z",
         generation_authorization_revision_id=_seal_approval(db))
+
+
+def _observation(db, observation_id: str, environment: str) -> str:
+    """A real inventory observation belonging to `environment`.
+
+    The verify gate LOADS this now instead of taking an `environment_id` argument. A test that
+    wanted "the wrong environment" used to pass a different string; it now has to seed an
+    observation that genuinely belongs to another cluster — which is the whole point, because a
+    caller could previously assert the environment the comparison was about.
+    """
+    db.execute(
+        "INSERT INTO generation_inventory_observation (observation_id, environment_id, "
+        "inventory_json, used_schema_refs, read_set, content_hash, captured_at) "
+        "VALUES (%s,%s,'{}'::jsonb,'[]'::jsonb,'[]'::jsonb,%s,'t') ON CONFLICT DO NOTHING",
+        (observation_id, environment, observation_id))
+    return observation_id
 
 
 def _seal_approval(db) -> str:
