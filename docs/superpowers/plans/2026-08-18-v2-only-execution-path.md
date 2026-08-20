@@ -21,7 +21,7 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 
 | Steps | State | Notes |
 |---|---|---|
-| **0–8** | **done** | migrations 1091, 1092, 1093 APPLIED to live (189 total) |
+| **0–8** | **done** | migrations 1091–1095 APPLIED to live (**191 total**, 2026-08-20) |
 | **9** | **compile half only — and narrower than its own header claims (§0.9)** | `compile_generation_v2` closes admitted → operator graph; rendering and sealing are the caller's, and are not yet wired |
 | 10 | **blocked on GOVERNANCE, not code** | needs real policy payloads *and* each policy's `read_basis` — see below |
 | **11** | **done** | `avg`, `min`, `max` render, type, and reach an operator graph |
@@ -351,8 +351,7 @@ unit-tested in isolation, and the middle is unwelded.
 
 Three further gaps the review surfaced, none of them yet addressed:
 
-* ~~**Authorization is not bound to the artifact.**~~ **CHAIN BUILT 2026-08-20** (migration 1095,
-  written not applied). `generation_request` and `sealed_artifact_v2` now carry
+* ~~**Authorization is not bound to the artifact.**~~ **CHAIN BUILT 2026-08-20** (migration 1095, APPLIED). `generation_request` and `sealed_artifact_v2` now carry
   `generation_authorization_revision_id` inside COMPOSITE foreign keys — the request's key carries
   the build set and environment, the artifact's carries the environment and logical group. A request
   citing an approval issued for another cluster is not CAUGHT, it is UNWRITABLE. NULL means

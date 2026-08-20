@@ -31,19 +31,41 @@
 -- are empty on every environment — so the honest form is NOT NULL now, before more unauthorized
 -- development rows accumulate. The defaults are removed from the writers in the same change.
 --
--- NOT APPLIED. This file is written, not run.
+-- APPLIED to live 2026-08-20 (189 -> 191), after a scratch-restore dry run caught the orphan
+-- authorization documented above. Backup: ~/featuregen-backups/featuregen-pre-1094-1095-*.dump
 
 -- ── an approval names a build set that EXISTS ────────────────────────────────────────────────────
 -- Missing entirely before. An approval for a build set nobody declared is a permission to generate
 -- something that does not exist, and a downstream request rejecting it later is a worse place to
 -- learn that than the moment it is granted.
+--
+-- ▲ NOT VALID, AND THE REASON IS STRUCTURAL RATHER THAN CONVENIENT. A validating FK aborts this
+-- migration on the live database: one `generation_authorization` row exists (user:ops, 2026-08-17)
+-- naming build set `bs-1`, and `build_set_revision` is EMPTY — an approval for a set that has never
+-- existed, which is exactly the hole this constraint closes. Found by the scratch-restore dry run,
+-- not on live.
+--
+-- It cannot be cleaned up first: `generation_authorization` is APPEND-ONLY by trigger (1082), so
+-- the row cannot be deleted, and dropping that trigger to tidy one dev row would trade a durable
+-- write-once guarantee for a cosmetic fix.
+--
+-- NOT VALID enforces every INSERT and UPDATE from here on and does not re-examine what is already
+-- stored. That is the honest statement: the existing row predates the rule, cannot be removed, and
+-- no new approval may repeat it. When the pre-live data is reset, run
+--
+--     ALTER TABLE generation_authorization
+--         VALIDATE CONSTRAINT generation_authorization_covers_a_real_build_set;
+--
+-- which scans the table and promotes it to fully enforced. That command is deliberately NOT here:
+-- it would fail today, and a migration that fails is worse than one that says what it is waiting on.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
                    WHERE conname = 'generation_authorization_covers_a_real_build_set') THEN
         ALTER TABLE generation_authorization
             ADD CONSTRAINT generation_authorization_covers_a_real_build_set
-            FOREIGN KEY (build_set_revision_id) REFERENCES build_set_revision (revision_id);
+            FOREIGN KEY (build_set_revision_id) REFERENCES build_set_revision (revision_id)
+            NOT VALID;
     END IF;
 END $$;
 

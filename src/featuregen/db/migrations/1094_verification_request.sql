@@ -21,7 +21,8 @@
 -- run without it. Step 14 asks THIS table whether a passing verification exists; it does not ask
 -- this table whether to publish.
 --
--- NOT APPLIED. This file is written, not run.
+-- APPLIED to live 2026-08-20 (189 -> 191), after a scratch-restore dry run caught the orphan
+-- authorization documented above. Backup: ~/featuregen-backups/featuregen-pre-1094-1095-*.dump
 
 CREATE TABLE IF NOT EXISTS verification_request (
     request_id           text PRIMARY KEY CHECK (btrim(request_id) <> ''),
