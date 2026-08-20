@@ -100,9 +100,13 @@ from featuregen.formula.schema_leaves import (
 # `FilterKind` and the rest above are the SAME objects in `schema` and `schema_v2` — re-exported,
 # genuinely version-neutral — so comparing them with `is` is correct and stays.
 from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
-from featuregen.materialize.boundary_v2 import FormulaExecutionIRV2
+from featuregen.materialize.boundary_v2 import (
+    FeatureGroupPlanV2,
+    FormulaExecutionIRV2,
+)
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import MaterializationContractV1
+from featuregen.materialize.contract_v2 import MaterializationContractV2
 from featuregen.materialize.expression_ir import (
     AvailabilityBasis,
     ExpressionExecutionIR,
@@ -207,10 +211,11 @@ _DAYS_PER_UNIT: dict[str, int] = {"day": 1, "week": 7}
 _PERIOD_START: dict[str, str] = {"week": "week", "month": "month", "quarter": "quarter",
                                  "year": "year"}
 
-#: The compiled IRs this renderer accepts. V1 and V2 carry the same ten fields under the same
-#: names (V2 adds two), so every function below reads them structurally — there is no branch on
-#: which one arrived, and adding one would be the second renderer this plan exists to avoid.
-RenderableIR = FormulaExecutionIRV1 | FormulaExecutionIRV2
+from featuregen.materialize.render.renderable import (  # noqa: E402
+    RenderableContract,
+    RenderableIR,
+    RenderablePlan,
+)
 
 #: The two window bases (``formula.schema.WindowBasis``). Closed, and rendered as two different
 #: anchors rather than one anchor with a flag.
@@ -380,8 +385,8 @@ _LOCK_DEPTH = 4
 
 def render_spine_node(
     spine: SpineSpec,
-    plan: FeatureGroupPlanV1,
-    contract: MaterializationContractV1,
+    plan: RenderablePlan,
+    contract: RenderableContract,
     *,
     spine_input: PhysicalInputRequirement,
     source_dataset: str,
@@ -417,12 +422,12 @@ def render_spine_node(
             f"rendering the spine needs the SpineSpec §4 validated, got {type(spine).__name__}: it "
             f"is the record that the governed facts did not refute the declaration, and a bare "
             f"declaration would render a population nothing checked")
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering the spine needs the FeatureGroupPlanV1, got {type(plan).__name__}: the plan "
             f"is what states the COLUMN names the published table carries, and a spine that named "
             f"its own would land its keys under names the group never planned")
-    if not isinstance(contract, MaterializationContractV1):
+    if not isinstance(contract, MaterializationContractV1 | MaterializationContractV2):
         raise TypeError(
             f"rendering the spine needs the MaterializationContractV1, got "
             f"{type(contract).__name__}: the §8 cutoff is derived from ITS cadence, and a cutoff "
@@ -501,7 +506,7 @@ def _column(ref: str, what: str) -> str:
 
 
 def _key_columns(
-    spine: SpineSpec, plan: FeatureGroupPlanV1, contract: MaterializationContractV1,
+    spine: SpineSpec, plan: RenderablePlan, contract: RenderableContract,
 ) -> tuple[tuple[str, str], ...]:
     """``(source column, published column)`` per key, positionally — never re-derived.
 
@@ -911,7 +916,7 @@ def projection_func_name(feature_column: str, expr_path: str) -> str:
 
 def render_projection_node(
     expression: ExpressionExecutionIR,
-    contract: MaterializationContractV1,
+    contract: RenderableContract,
     *,
     feature_column: str,
     source_dataset: str,
@@ -961,7 +966,7 @@ def render_projection_node(
             f"rendering a projection needs the compiled ExpressionExecutionIR, got "
             f"{type(expression).__name__}: the PIT spec, the read set and the join plan are what "
             f"decide which rows the feature may see, and none of them can be inferred from a name")
-    if not isinstance(contract, MaterializationContractV1):
+    if not isinstance(contract, MaterializationContractV1 | MaterializationContractV2):
         raise TypeError(
             f"rendering a projection needs the MaterializationContractV1, got "
             f"{type(contract).__name__}: §8's cutoff is derived from ITS cadence, and a cutoff "
@@ -2181,7 +2186,7 @@ def calculation_func_name(feature_column: str) -> str:
 def render_calculation_node(
     ir: RenderableIR,
     feature: PlannedFeature,
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     *,
     empty_window: Mapping[str, EmptyWindowResult],
     null_input: Mapping[str, NullInput],
@@ -2256,7 +2261,7 @@ def render_calculation_node(
             f"rendering a calculation needs the PlannedFeature, got {type(feature).__name__}: §6's "
             f"resolved PhysicalType carries the rounding and overflow obligations the rendered code "
             f"must discharge, and a bare type string carries neither")
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering a calculation needs the FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"landing key columns and the business-date column are the plan's, and a staged row "
@@ -2348,7 +2353,7 @@ def _signature_lines(func_name: str, slots: tuple[_Slot, ...]) -> list[str]:
 
 
 def _staged_column(ir: RenderableIR, feature: PlannedFeature,
-                   plan: FeatureGroupPlanV1) -> str:
+                   plan: RenderablePlan) -> str:
     """The ONE published column this node stages, proved to be the same one in all three objects."""
     column = hive_identifier(ir.feature_name)
     if feature.column_name != column:
@@ -2541,7 +2546,7 @@ def _per_path(declared: Mapping[str, _Declared], paths: tuple[str, ...], what: s
     return declared
 
 
-def _grain_key_columns(ir: RenderableIR, plan: FeatureGroupPlanV1,
+def _grain_key_columns(ir: RenderableIR, plan: RenderablePlan,
                        slots: tuple[_Slot, ...]) -> tuple[str, ...]:
     """The columns the aggregate groups by — the LANDING keys, in the plan's order.
 

@@ -44,10 +44,12 @@ where a governed group lands.
 from __future__ import annotations
 
 from featuregen.materialize.binding import physical_target_for
+from featuregen.materialize.boundary_v2 import FeatureGroupPlanV2
 from featuregen.materialize.codes import MaterializationRefused, PublicationRefusalCode
 from featuregen.materialize.group_plan import FeatureGroupPlanV1
 from featuregen.materialize.publish import PublisherSelection, PublishMechanism
 from featuregen.materialize.render._yaml import yaml_scalar
+from featuregen.materialize.render.renderable import RenderablePlan
 
 __all__ = [
     "RENDERABLE_MECHANISMS",
@@ -66,7 +68,7 @@ RENDERABLE_MECHANISMS: frozenset[PublishMechanism] = frozenset({PublishMechanism
 _PUBLISHED_PREFIX = "published"
 
 
-def published_dataset_name(plan: FeatureGroupPlanV1) -> str:
+def published_dataset_name(plan: RenderablePlan) -> str:
     """The catalog name of the publication target — the ONE definition of it.
 
     ``render.project.project_datasets`` reads it from here rather than spelling
@@ -74,7 +76,7 @@ def published_dataset_name(plan: FeatureGroupPlanV1) -> str:
     name the same dataset, and two spellings is a project whose publisher writes somewhere its
     catalog does not declare.
     """
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"published_dataset_name needs a FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"dataset name is derived from the logical group name and there is nowhere else to "
@@ -99,8 +101,8 @@ def published_output_location(published_object: str, staging_root: str) -> str:
     return f"{staging_root}/{_PUBLISHED_PREFIX}/{table}"
 
 
-def _check(plan: FeatureGroupPlanV1, selection: PublisherSelection) -> None:
-    if not isinstance(plan, FeatureGroupPlanV1):
+def _check(plan: RenderablePlan, selection: PublisherSelection) -> None:
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"render_publish needs a FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"publication target is DERIVED from the plan's logical group name (§10.1), never "
@@ -123,7 +125,7 @@ def _check(plan: FeatureGroupPlanV1, selection: PublisherSelection) -> None:
 
 
 def publish_entry_body(
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     *,
     selection: PublisherSelection,
 ) -> tuple[str, ...]:
@@ -165,7 +167,7 @@ def publish_entry_body(
     )
 
 
-def render_publish(plan: FeatureGroupPlanV1, *, selection: PublisherSelection) -> str:
+def render_publish(plan: RenderablePlan, *, selection: PublisherSelection) -> str:
     """The complete catalog entry for the publication target, as YAML text.
 
     Note the signature: there is a ``selection`` and there is no ``mechanism``. That is §10.3's

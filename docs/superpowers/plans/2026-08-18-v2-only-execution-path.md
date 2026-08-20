@@ -293,7 +293,7 @@ Switching the restorer would hand V1's forgery check an object with no formula t
 not a shared consumer with a V1 restorer; it is **one stage of the V1 execution chain**, and the
 chain is what has to move.
 
-### 0.8 ▲ THE RENDERER DOES NOT ACCEPT V2 END TO END — corrected 2026-08-20
+### 0.8 ▲ THE RENDERER DID NOT ACCEPT V2 — corrected 2026-08-20, then FIXED 2026-08-20
 
 An earlier commit widened `render_project`/`project_datasets` to accept either token and plan, and
 reported that as the renderer accepting V2. **The outer type gate was widened; the internals were
@@ -309,6 +309,24 @@ raises `TypeError`:
 
 **Consequently §5's "the project and wiring layers are reusable as they stand" is FALSE** and is
 struck. They are reusable in SHAPE; every entry point is typed on V1's plan and contract.
+
+**FIXED.** `render/renderable.py` now declares `RenderablePlan`, `RenderableContract` and
+`RenderableIR` once, with no imports back into `render/` — `nodes_compute` already imports from
+`project`, which imports `publish`, so a union defined in `nodes_compute` closed that loop. Every
+annotation and every `isinstance` gate in `render/` takes the union.
+
+**It is a union and not a second renderer because the overlap was MEASURED:** across `render/` and
+`compile/wiring.py` the only contract attributes read are `ordered_keys` and `pit_semantics`, and
+the V1/V2 contracts differ in exactly one field (`physical_type_policy_version` vs
+`physical_type_policy`) — as do the plans. Nothing the renderer touches is versioned.
+
+**And the acceptance is proved by RENDERING, which is what the first attempt lacked.**
+`test_render_v2_boundary` no longer reads a single annotation: it drives a real V1 object and a real
+V2 object through the same functions and diffs the output. `render_assembly_node` — the node that
+reads the most off the plan — emits BYTE-IDENTICAL source from both. A structural test also fails on
+any `isinstance(..., FeatureGroupPlanV1)` left anywhere under `render/`, since one of those refuses
+a V2 plan at a single call site while every signature says otherwise. The 12901-test suite includes
+the renderer goldens, so V1's emitted code is unchanged.
 
 ### 0.9 ▲ WHAT `compile_generation_v2` IS AND IS NOT — corrected 2026-08-20
 
