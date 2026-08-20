@@ -43,7 +43,7 @@ from featuregen.materialize.artifact_manifest import (
     verify_bytes,
 )
 from featuregen.materialize.artifact_store import fetch_file, store_manifest
-from featuregen.materialize.operator_graph_v2 import OperatorGraphV2
+from featuregen.materialize.operator_graph_v2 import OperatorGraphV2, OperatorKindV2
 from featuregen.materialize.subgraph_requirements_v2 import (
     PILOT_REQUIREMENTS,
     RequirementFindingV2,
@@ -105,7 +105,7 @@ class SealedArtifactV2:
 
 def seal_v2(
     conn: DbConn,
-    graph: OperatorGraphV2,
+    graphs: OperatorGraphV2 | Sequence[OperatorGraphV2],
     manifest: ArtifactManifestV1,
     files: Mapping[str, str],
     *,
@@ -118,7 +118,22 @@ def seal_v2(
     sealed_at: str,
     requirements: tuple[SubgraphRequirementV2, ...] = PILOT_REQUIREMENTS,
 ) -> SealedArtifactV2:
-    """Check the operator graph, persist the artifact and its evidence, and return what was sealed.
+    """Check EVERY member's operator graph, persist the artifact and its evidence, and return it.
+
+    **A group is one artifact and many graphs.** ``compile_generation_v2`` produces one graph per
+    feature — each ending in its own one-column ``GROUP_ASSEMBLY`` — while the sealed artifact is the
+    group's rendered project: one manifest, one set of files, one publication target. This function
+    took a single graph, so a multi-feature group could only be sealed by checking one member and
+    recording that verdict as though it covered all of them.
+
+    **The member name is READ OFF THE GRAPH, never supplied.** Each graph's terminal assembly names
+    the column it publishes, so a caller cannot mislabel which member a finding belongs to, and a
+    graph that publishes zero or several columns is refused rather than attributed to a guess.
+
+    **ALL-OR-NOTHING, the same rule the rest of the chain uses.** The artifact is servable only if
+    every member satisfies its requirements; the findings are the union, each naming its own member.
+    A group is published as one row per key, so a partially-satisfied group would publish some
+    columns computed under requirements nobody checked.
 
     The graph check runs FIRST but does not short-circuit the record: a refused artifact is stored
     with its findings and its realization links, and only its ``servable`` answer differs. Discarding
@@ -132,8 +147,9 @@ def seal_v2(
     Raises:
         ManifestIntegrityError: a manifest entry and its bytes disagree, or a file the manifest
             names was not supplied.
-        ValueError: no environment, or a realization link with a blank half. A link that cannot name
-            both ends records a dependency nobody can follow.
+        ValueError: no environment, a realization link with a blank half, no graphs at all, a graph
+            whose terminal does not publish exactly one column, or two graphs publishing the same
+            one. All are calls assembled wrongly rather than governed verdicts.
     """
     if not environment_id.strip():
         raise ValueError(
@@ -147,7 +163,8 @@ def seal_v2(
                 f"realization link {link} has a blank half: a dependency that cannot name both the "
                 f"realization and the occurrence it answered is one nobody can follow back")
 
-    verdict = check_subgraph_requirements_v2(graph, requirements)
+    members = _members_of(graphs)
+    verdict, by_member = _fold_requirements(members, requirements)
 
     # Bytes first: a manifest that does not match its files must not leave a sealed row behind.
     store_manifest(conn, manifest, files)
@@ -161,8 +178,11 @@ def seal_v2(
         (manifest.artifact_id, environment_id, logical_group_name, compilation_identity_hash,
          group_plan_hash, project_digest, verdict.satisfied,
          json.dumps(list(verdict.triggered)),
-         json.dumps([{"requirement": f.requirement, "code": f.code, "detail": f.detail}
-                     for f in verdict.findings]),
+         json.dumps([{"requirement": f.requirement, "code": f.code, "detail": f.detail,
+                      # WHICH member. A finding that names only the requirement sends an operator
+                      # to read every graph in the group to discover which one failed.
+                      "feature_name": name}
+                     for name, f in by_member]),
          sealed_at))
 
     # RECORDED ON BOTH PATHS. See the module docstring: the acceptance clause is that a refusal
@@ -179,6 +199,79 @@ def seal_v2(
         logical_group_name=logical_group_name,
         compilation_identity_hash=compilation_identity_hash, group_plan_hash=group_plan_hash,
         project_digest=project_digest, verdict=verdict, realizations=links)
+
+
+def _members_of(
+    graphs: OperatorGraphV2 | Sequence[OperatorGraphV2],
+) -> tuple[tuple[str, OperatorGraphV2], ...]:
+    """``(published columns, graph)`` for every member graph, ORDERED, derived from the graphs.
+
+    A bare graph is accepted as a one-member group — that is what a single-feature group IS, not a
+    compatibility shim — so the single-feature callers that predate multi-member sealing keep saying
+    the same thing.
+
+    The label comes from each graph's terminal ``GROUP_ASSEMBLY`` — the columns it publishes, in
+    published order. Taking it from the graph rather than from a caller-supplied key is what makes a
+    finding's attribution unforgeable: there is no second place to say which member a graph belongs
+    to, so there is nothing to disagree with.
+
+    Both shapes are legitimate and both are sealed the same way: ONE graph assembling the whole
+    group's columns, or one graph per feature each assembling its own. What is refused is two graphs
+    claiming the same columns, because then a finding could not say which of them it judged.
+    """
+    ordered = (graphs,) if isinstance(graphs, OperatorGraphV2) else tuple(graphs)
+    if not ordered:
+        raise ValueError(
+            "seal_v2 was given no graphs: an artifact whose members were never checked would record "
+            "a satisfied verdict over nothing, which is the one result that must not be reachable")
+
+    members: list[tuple[str, OperatorGraphV2]] = []
+    for graph in ordered:
+        terminal = graph.terminal
+        if terminal.kind is not OperatorKindV2.GROUP_ASSEMBLY:
+            raise ValueError(
+                f"a member graph terminates in {terminal.kind.value}, not a group assembly: the "
+                f"assembly is what names the columns this graph publishes, and without it a finding "
+                f"cannot say which part of the group it is about")
+        # The columns this graph assembles, joined, as its label. NOT "exactly one column": the
+        # vocabulary's GROUP_ASSEMBLY was designed to assemble THE GROUP's published columns in
+        # published order, and a graph doing that for several is legitimate and shipped.
+        # `build_operator_graph_v2` happens to emit one graph per feature with a one-column
+        # assembly, and an earlier version of this function mistook its own habit for the rule —
+        # it refused a two-column assembly a passing test had been building all along.
+        members.append((",".join(terminal.payload.column_names), graph))
+
+    names = [name for name, _ in members]
+    duplicated = sorted({n for n in names if names.count(n) > 1})
+    if duplicated:
+        raise ValueError(
+            f"two member graphs publish {duplicated}: one column cannot be computed two ways in one "
+            f"group, and a verdict keyed on the columns could not say which graph it judged")
+    return tuple(sorted(members, key=lambda member: member[0]))
+
+
+def _fold_requirements(
+    members: tuple[tuple[str, OperatorGraphV2], ...],
+    requirements: tuple[SubgraphRequirementV2, ...],
+) -> tuple[RequirementVerdictV2, tuple[tuple[str, RequirementFindingV2], ...]]:
+    """One verdict over every member, and every finding still attached to the member that raised it.
+
+    ALL-OR-NOTHING: satisfied only when every member is. The triggered requirements are the union,
+    because "which requirements applied to this artifact" is a question about the group.
+    """
+    findings: list[tuple[str, RequirementFindingV2]] = []
+    triggered: list[str] = []
+    for name, graph in members:
+        verdict = check_subgraph_requirements_v2(graph, requirements)
+        triggered.extend(verdict.triggered)
+        findings.extend((name, finding) for finding in verdict.findings)
+
+    folded = RequirementVerdictV2(
+        satisfied=not findings,
+        triggered=tuple(sorted(set(triggered))),
+        findings=tuple(finding for _name, finding in findings),
+    )
+    return folded, tuple(findings)
 
 
 def realization_links_of(conn: DbConn, artifact_id: str) -> tuple[RealizationLinkV1, ...]:

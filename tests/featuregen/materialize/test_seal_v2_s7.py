@@ -352,3 +352,81 @@ def test_the_migration_forbids_a_REFUSAL_with_no_findings(db):
             "triggered_requirements, subgraph_findings, sealed_at) "
             "VALUES (%s, %s, %s, %s, %s, %s, false, '[]'::jsonb, '[]'::jsonb, %s)",
             ("art-bad", ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+
+
+# ══ A GROUP IS ONE ARTIFACT AND MANY GRAPHS ════════════════════════════════════════════════════
+def _named(column: str, *, duplicate_gate: bool = True):
+    """An FX chain assembling ONE named column — one member of a multi-feature group."""
+    from featuregen.materialize.operator_graph_v2 import (
+        GroupAssemblyV2,
+        OperatorGraphV2,
+        OperatorKindV2,
+        OperatorNodeV2,
+    )
+
+    base = _fx_chain(duplicate_gate=duplicate_gate)
+    assembled = OperatorNodeV2(
+        OperatorKindV2.GROUP_ASSEMBLY, GroupAssemblyV2((column,)),
+        inputs=(base.terminal.node_id,))
+    return OperatorGraphV2(nodes=(*base.nodes, assembled))
+
+
+def test_EVERY_MEMBER_OF_A_GROUP_IS_CHECKED(db):
+    """`compile_generation_v2` produces one graph per feature and the artifact is the GROUP's
+    project — one manifest, one publication target. Sealing checked ONE graph and recorded that
+    verdict as though it covered all of them."""
+    sealed = _seal_many(db, [_named("alpha"), _named("beta")])
+    assert sealed.servable is True
+
+
+def test_ONE_BAD_MEMBER_REFUSES_THE_WHOLE_ARTIFACT(db):
+    """All-or-nothing, the rule the rest of the chain uses. A group is published as one row per
+    key, so a partially-satisfied group would publish some columns computed under requirements
+    nobody checked."""
+    sealed = _seal_many(db, [_named("alpha"), _named("beta", duplicate_gate=False)])
+
+    assert sealed.servable is False
+    assert {f.code for f in sealed.verdict.findings} == {MISSING_OPERATOR}
+
+
+def test_A_FINDING_NAMES_THE_MEMBER_THAT_RAISED_IT(db):
+    """A finding that names only the requirement sends an operator to read every graph in the group
+    to discover which one failed. The member is read off the graph's own assembly, so there is no
+    second place to say which member a graph is and nothing to disagree with."""
+    _seal_many(db, [_named("alpha"), _named("beta", duplicate_gate=False)],
+               artifact_id="art-named")
+    stored = db.execute(
+        "SELECT subgraph_findings FROM sealed_artifact_v2 WHERE artifact_id='art-named'"
+    ).fetchone()[0]
+
+    assert [f["feature_name"] for f in stored] == ["beta"]
+    assert stored[0]["code"] == MISSING_OPERATOR
+
+
+def test_TWO_GRAPHS_CLAIMING_THE_SAME_COLUMN_IS_A_CALLER_ERROR(db):
+    """One column cannot be computed two ways in one group, and a verdict keyed on the columns
+    could not say which graph it judged."""
+    with pytest.raises(ValueError, match="two member graphs publish"):
+        _seal_many(db, [_named("alpha"), _named("alpha")])
+
+
+def test_SEALING_NO_GRAPHS_AT_ALL_IS_REFUSED(db):
+    """The one result that must not be reachable: a satisfied verdict over nothing."""
+    with pytest.raises(ValueError, match="was given no graphs"):
+        _seal_many(db, [])
+
+
+def test_a_SINGLE_GRAPH_IS_STILL_A_ONE_MEMBER_GROUP(db):
+    """Not a compatibility shim — that is what a single-feature group IS. The callers that predate
+    multi-member sealing keep saying exactly the same thing."""
+    sealed = _seal(db)
+    assert sealed.servable is True
+
+
+def _seal_many(db, graphs, *, artifact_id: str = "art-many"):
+    payload = FILES
+    return seal_v2(
+        db, graphs, _manifest(artifact_id, payload), payload,
+        environment_id=ENV, logical_group_name=GROUP,
+        compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
+        project_digest="sha256:project", realizations=LINKS, sealed_at="2026-08-20T00:00:00Z")

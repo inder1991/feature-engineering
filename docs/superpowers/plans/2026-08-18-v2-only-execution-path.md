@@ -356,9 +356,14 @@ Three further gaps the review surfaced, none of them yet addressed:
   logical group and environment separately without proving they agree; `evaluate_verify` accepts a
   client-supplied authorization id without checking it produced the artifact under verification.
   There is no referential chain authorization → request → sealed artifact.
-* **Sealing has an unresolved group-level design problem.** `compile_generation_v2` returns one
-  graph per feature, each ending in a one-column `GROUP_ASSEMBLY`; `seal_v2.py:106` accepts exactly
-  ONE graph. Nothing proves a multi-feature group satisfies the subgraph requirements atomically.
+* ~~**Sealing has an unresolved group-level design problem.**~~ **RESOLVED 2026-08-20.** `seal_v2`
+  takes a graph OR a sequence, checks EVERY member and folds one verdict: satisfied only if all are,
+  findings the union, each naming its own member. The member label is read off each graph's terminal
+  `GROUP_ASSEMBLY` rather than supplied, so attribution is unforgeable — there is no second place to
+  say which member a graph is. **Both shapes are legitimate:** one graph assembling the whole
+  group's columns (what the vocabulary was designed for) or one per feature (what
+  `build_operator_graph_v2` emits). A first cut required exactly one column per graph and broke a
+  passing test that had been assembling two — mistaking this program's own habit for the rule.
 * **Activation is deliberately closed.** `semantic_option_decision.py:426` always returns False and
   the seam walkthrough monkeypatches it, so no stored evaluation can promote a recipe to
   FORMULA_VALIDATED or MATERIALIZATION_READY today.
