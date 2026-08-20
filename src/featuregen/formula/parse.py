@@ -22,6 +22,11 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
+from featuregen.formula.parse_leaves import (
+    _build_filter,
+    _build_parameter,
+    _plain,
+)
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
@@ -39,24 +44,13 @@ from featuregen.formula.schema import (
 from featuregen.formula.schema_leaves import (
     DecimalPolicy,
     EmptyWindowResult,
-    FilterBool,
-    FilterBoolOp,
-    FilterKind,
-    FilterNode,
-    FilterPredicate,
-    FilterPredicateOp,
     Grain,
     Inclusivity,
-    LiteralType,
     NullInput,
     OverflowBehavior,
-    ParamClass,
-    ParameterDecl,
-    ParameterRef,
     RoundingMode,
     SchemaError,
     SourceRelation,
-    TypedLiteral,
     WindowUnit,
     ZeroDenominator,
 )
@@ -71,13 +65,6 @@ def _validator() -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
-def _plain(value: Any) -> Any:
-    """Recursively convert Mappings/sequences to plain dict/list for jsonschema."""
-    if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return value
 
 
 def parse_proposal_v1(raw: Mapping[str, Any]) -> TypedFormulaProposalV1:
@@ -106,35 +93,8 @@ def parse_proposal_v1(raw: Mapping[str, Any]) -> TypedFormulaProposalV1:
 # ---- construction (shape-validated dict -> frozen dataclasses) ----
 
 
-def _build_literal(data: dict[str, Any]) -> TypedLiteral:
-    return TypedLiteral(type=LiteralType(data["type"]), value=data["value"])
 
 
-def _build_filter(data: dict[str, Any]) -> FilterNode:
-    if data["kind"] == FilterKind.BOOL:
-        return FilterBool(
-            op=FilterBoolOp(data["op"]),
-            children=tuple(_build_filter(child) for child in data["children"]),
-        )
-    right_param = data.get("right_param")
-    right_set = data.get("right_set")
-    return FilterPredicate(
-        op=FilterPredicateOp(data["op"]),
-        left=data["left"],
-        right_literal=(
-            _build_literal(data["right_literal"])
-            if data.get("right_literal") is not None
-            else None
-        ),
-        right_param=(
-            ParameterRef(name=right_param["name"]) if right_param is not None else None
-        ),
-        right_set=(
-            tuple(_build_literal(entry) for entry in right_set)
-            if right_set is not None
-            else None
-        ),
-    )
 
 
 def _build_window(data: dict[str, Any]) -> WindowPolicy:
@@ -178,18 +138,6 @@ def _build_body(data: dict[str, Any]) -> FormulaBody:
     )
 
 
-def _build_parameter(data: dict[str, Any]) -> ParameterDecl:
-    allowed_set = data.get("allowed_set")
-    return ParameterDecl(
-        name=data["name"],
-        type=LiteralType(data["type"]),
-        param_class=ParamClass(data["param_class"]),
-        classification=data["classification"],
-        nullable=data["nullable"],
-        allowed_set=tuple(allowed_set) if allowed_set is not None else None,
-        allowed_min=data.get("allowed_min"),
-        allowed_max=data.get("allowed_max"),
-    )
 
 
 def _build_expected_output(data: dict[str, Any] | None) -> ExpectedOutput | None:
