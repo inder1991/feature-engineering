@@ -275,6 +275,36 @@ v3 content hash with expected_output:  f344e944…  UNCHANGED
 The 26 gold_v2 fixtures all carry a NULL expected_output, so their passing is NOT coverage of this
 field — the test says so out loud rather than letting a future reader mistake it for one.
 
+### 0.7 ▲ THE KNOT, and the live evidence that unties it — measured 2026-08-20
+
+The whole remaining V1 authoring stack hangs off **one import**:
+
+```
+materialize.resolve  ->  replay_authoring._restore_terminal_result   (V1)
+                             |
+                             +-> critic's v1 arm, parse_proposal_v1, authoring, tools, result
+```
+
+`replay_authoring` is alive ONLY because of that import. Cut it and the rest becomes unreachable.
+
+**Live says the cut is safe.** All three `formula_authoring_run` rows carry
+`{"authoring_v2": 2, "formula_schema": 3}` — every authoring run on this environment is V2, and
+there has never been a v1 run to replay. `authoring_trace_event` (the 1020 lane) holds 0 rows;
+`formula_authoring_trace_event` (the 1022 lane, the admissible one) holds 6.
+
+**And the consumer barely uses it.** `materialize.resolve` reads exactly ONE field off the restored
+result — `authoring_disposition` — which `AuthoringResultV2` carries identically. It never touches
+`candidate_formula` or `candidate_proposal`, the two V1-typed fields.
+
+**What it actually costs, measured by trying it.** Switching the import is one line and it turns 10
+of `test_resolve.py`'s 15 tests red with `AUTHORING_RUN_INCOMPLETE`: the V2 restorer reads a
+V2-shaped checkpoint and those fixtures seed V1-shaped traces. So the work is a FIXTURE migration —
+teaching `test_resolve` to seed the trace shape the live rows already have — and not a consumer
+change. Attempted and reverted rather than half-landed; the tree stays green.
+
+**This is the highest-value next task in stage 4:** it is one import plus one test module's
+fixtures, and it frees six V1 modules at once.
+
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
 bytes"*. `recipe_formula_shadow_work_item` holds **0 rows** on this environment, so there is nothing

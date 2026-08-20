@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from featuregen.formula.schema_leaves import (
+    ExpectedOutput,
     FilterBool,
     FilterBoolOp,
     FilterKind,
@@ -39,7 +40,7 @@ from featuregen.formula.schema_leaves import (
     TypedLiteral,
 )
 
-__all__ = ["_build_filter", "_build_parameter", "_plain"]
+__all__ = ["_build_expected_output", "_build_filter", "_build_parameter", "_plain"]
 
 
 def _plain(value: Any) -> Any:
@@ -93,4 +94,18 @@ def _build_parameter(data: dict[str, Any]) -> ParameterDecl:
         allowed_set=tuple(allowed_set) if allowed_set is not None else None,
         allowed_min=data.get("allowed_min"),
         allowed_max=data.get("allowed_max"),
+    )
+
+
+# NEUTRAL as of the ExpectedOutput ruling, and only then. It returned a type that lived in a V1
+# module, which is the ONLY thing that made it V1 — v2 and v3 both call it, unchanged, to build the
+# same object. With `ExpectedOutput` a shared leaf this follows it, and `parse.py` loses two of its
+# three remaining live edges.
+def _build_expected_output(data: dict[str, Any] | None) -> ExpectedOutput | None:
+    if data is None:
+        return None
+    return ExpectedOutput(
+        output_type=data.get("output_type"),
+        unit=data.get("unit"),
+        currency=data.get("currency"),
     )

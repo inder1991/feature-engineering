@@ -21,8 +21,13 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from featuregen.formula.parse import _build_expected_output, parse_proposal_v1
-from featuregen.formula.parse_leaves import _build_filter, _build_parameter, _plain
+from featuregen.formula.parse import parse_proposal_v1
+from featuregen.formula.parse_leaves import (
+    _build_expected_output,
+    _build_filter,
+    _build_parameter,
+    _plain,
+)
 from featuregen.formula.schema_leaves import (
     DecimalPolicy,
     OverflowBehavior,

@@ -23,6 +23,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
 from featuregen.formula.parse_leaves import (
+    _build_expected_output,
     _build_filter,
     _build_parameter,
     _plain,
@@ -31,7 +32,6 @@ from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
     DiffBody,
-    ExpectedOutput,
     FinalOperation,
     FormulaBody,
     RatioBody,
@@ -140,14 +140,6 @@ def _build_body(data: dict[str, Any]) -> FormulaBody:
 
 
 
-def _build_expected_output(data: dict[str, Any] | None) -> ExpectedOutput | None:
-    if data is None:
-        return None
-    return ExpectedOutput(
-        output_type=data.get("output_type"),
-        unit=data.get("unit"),
-        currency=data.get("currency"),
-    )
 
 
 def _build_proposal(data: dict[str, Any]) -> TypedFormulaProposalV1:
