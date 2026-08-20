@@ -116,6 +116,7 @@ def seal_v2(
     project_digest: str,
     realizations: Sequence[RealizationLinkV1],
     sealed_at: str,
+    generation_authorization_revision_id: str | None = None,
     requirements: tuple[SubgraphRequirementV2, ...] = PILOT_REQUIREMENTS,
 ) -> SealedArtifactV2:
     """Check EVERY member's operator graph, persist the artifact and its evidence, and return it.
@@ -172,8 +173,9 @@ def seal_v2(
     conn.execute(
         "INSERT INTO sealed_artifact_v2 (artifact_id, environment_id, logical_group_name, "
         "compilation_identity_hash, group_plan_hash, project_digest, subgraph_satisfied, "
-        "triggered_requirements, subgraph_findings, sealed_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s) "
+        "triggered_requirements, subgraph_findings, sealed_at, "
+        "generation_authorization_revision_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s) "
         "ON CONFLICT (artifact_id) DO NOTHING",
         (manifest.artifact_id, environment_id, logical_group_name, compilation_identity_hash,
          group_plan_hash, project_digest, verdict.satisfied,
@@ -183,7 +185,12 @@ def seal_v2(
                       # to read every graph in the group to discover which one failed.
                       "feature_name": name}
                      for name, f in by_member]),
-         sealed_at))
+         sealed_at,
+         # WHICH APPROVAL PRODUCED THIS. Inside a composite FK with the environment and the group,
+         # so an artifact sealed under an authorization issued for another group is unwritable
+         # rather than merely wrong. NULL is "predates the chain" — the V1 path writes no
+         # authorization, and inventing one would forge the evidence an auditor comes here for.
+         generation_authorization_revision_id))
 
     # RECORDED ON BOTH PATHS. See the module docstring: the acceptance clause is that a refusal
     # keeps these, and a refused compilation depended on exactly the policies it depended on.

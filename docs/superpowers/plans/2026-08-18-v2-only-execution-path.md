@@ -351,11 +351,15 @@ unit-tested in isolation, and the middle is unwelded.
 
 Three further gaps the review surfaced, none of them yet addressed:
 
-* **Authorization is not bound to the artifact.** `generation_request` references no generation
-  authorization; `sealed_artifact_v2` references none; `compile_generation_v2` takes authorization,
-  logical group and environment separately without proving they agree; `evaluate_verify` accepts a
-  client-supplied authorization id without checking it produced the artifact under verification.
-  There is no referential chain authorization → request → sealed artifact.
+* ~~**Authorization is not bound to the artifact.**~~ **CHAIN BUILT 2026-08-20** (migration 1095,
+  written not applied). `generation_request` and `sealed_artifact_v2` now carry
+  `generation_authorization_revision_id` inside COMPOSITE foreign keys — the request's key carries
+  the build set and environment, the artifact's carries the environment and logical group. A request
+  citing an approval issued for another cluster is not CAUGHT, it is UNWRITABLE. NULL means
+  "predates the chain" and stays until the V1 path is deleted, because backfilling an authorization
+  for rows that never had one would invent the evidence the chain exists to make trustworthy.
+  **Still open:** `evaluate_verify` accepting a client-supplied authorization id without checking it
+  produced the artifact under verification.
 * ~~**Sealing has an unresolved group-level design problem.**~~ **RESOLVED 2026-08-20.** `seal_v2`
   takes a graph OR a sequence, checks EVERY member and folds one verdict: satisfied only if all are,
   findings the union, each naming its own member. The member label is read off each graph's terminal

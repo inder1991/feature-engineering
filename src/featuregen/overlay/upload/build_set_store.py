@@ -231,11 +231,18 @@ def request_generation(
     environment_id: str,
     requested_by: str,
     requested_at: str,
+    generation_authorization_revision_id: str | None = None,
 ) -> tuple[str, bool]:
     """Start an attempt, or return the LIVE one for this set and environment.
 
     Returns ``(request_id, created)``. ``created=False`` is the double-click answer: an attempt is
     already in flight and asking again must not start a second compile of the same thing.
+
+    ``generation_authorization_revision_id`` names WHICH approval permits this work. It travels
+    inside a COMPOSITE foreign key with the build set and the environment, so a request naming an
+    authorization issued for a different set or cluster is not caught — it cannot be written. ``None``
+    means "predates the chain" and is distinguishable from any authorization; it is accepted because
+    the V1 chain writes no authorization and backfilling one would invent the evidence.
 
     Idempotent on the WORK — the build set and environment — rather than on a caller-supplied key,
     because a client minting a fresh key per click would defeat a key-based guard and generation
@@ -244,10 +251,12 @@ def request_generation(
     """
     inserted = conn.execute(
         "INSERT INTO generation_request (request_id, build_set_revision_id, environment_id, "
-        "status, requested_by, requested_at) VALUES (%s, %s, %s, %s, %s, %s) "
+        "status, requested_by, requested_at, generation_authorization_revision_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT DO NOTHING RETURNING request_id",
         (request_id, build_set_revision_id, environment_id,
-         GenerationStatusV1.REQUESTED.value, requested_by, requested_at)).fetchone()
+         GenerationStatusV1.REQUESTED.value, requested_by, requested_at,
+         generation_authorization_revision_id)).fetchone()
     if inserted is not None:
         return inserted[0], True
 
