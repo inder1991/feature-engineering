@@ -28,9 +28,10 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 | 12 | not started | FX needs the physical-binding layer §7 names (`bound_rate_dataset_ref`, `binding_snapshot_id`), which does not exist |
 | **13** | **done** | migration 1094 + `verification_request_store` — the lifecycle `verification_attempt` had no room for |
 | **14** | **gate done** | `authorize_publication_v2` + `VERIFICATION_ABSENT`; the reconciler and the endpoint change are not done |
-| **15** | **stage 1 done; ▲ THE STEP IS NOT ONE COMMIT** | leaf repoint done and green; the deletion is BLOCKED by a live producer — see §0.1 |
+| **15** | **stages 1–4 done; V1 ROUTING RETIRED** | leaf repoint, the v1 authoring lane's retirement (§0.2) and six shared-machinery extractions (§0.4) are all green. The DELETION is gated on 8 remaining V1-BY-TYPE edges, not on a producer — §0.1's producer blocker was wrong and is corrected in place |
 
-### 0.1 ▲ Step 15 is not "one deliberate commit" — corrected 2026-08-19
+### 0.1 ▲ Step 15 is not "one deliberate commit" — corrected 2026-08-19, and its
+blocker was itself WRONG (see §0.2). Kept for the reasoning, not for the verdict.
 
 The plan says step 15 is cheap **because** step 0 happened. That is true of the half step 0 was
 about, and it is now DONE: every shared-leaf import across 68 files was repointed from
@@ -213,11 +214,66 @@ sealed `formula_content_hashes` — so reshaping it re-identifies sealed artifac
 `output_intent_v2` reads its fields with `getattr(..., None)`, meaning a rename would silently yield
 `unit=None` while still reporting the expectation as present rather than raising.
 
-**One question deliberately NOT answered here.** `overlay.upload.recipe_formula_eval` stamps V1's
-`OPERATION_GRAMMAR_VERSION`/`OUTPUT_POLICY_VERSION` into eval runs, and V2 equivalents exist. Both
-are currently `1`, so switching is behaviour-identical TODAY and semantically different — and line
-300 compares a stored `run["operation_grammar_version"]` against the constant. Changing which
-grammar an eval run claims to have been judged under is a governance call, not a refactor.
+### 0.5 ▲ RULED 2026-08-20 — the evaluator stays truthfully V1 until its replacement exists
+
+`recipe_formula_eval` stamps V1's `OPERATION_GRAMMAR_VERSION`/`OUTPUT_POLICY_VERSION`. **Do not
+switch those to the V2 constants.** Both currently equal `1`, and that is ACCIDENTAL NUMERIC
+EQUALITY, not semantic compatibility — swapping the import would relabel V1 evidence as V2 without
+changing anything about what was actually evaluated.
+
+The surviving evaluator is genuinely V1: it uses `recipe-formula-evaluator-v1`, the V1 expectation
+registry, the V1 gold corpus and V1 formula expectations. It should keep saying so.
+
+**The correct end state is a REPLACEMENT lane with an explicit identity** — V2 formula language, V3
+wire format, V2 output policy — persisting on every run:
+
+* evaluator contract version
+* `expectation_schema = "formula-v2"`
+* formula wire schema version `3`
+* `OPERATION_GRAMMAR_VERSION_V3` (intentionally aliasing V2)
+* `OUTPUT_POLICY_VERSION_V2`
+* `CANONICALIZATION_VERSION_V3`
+* a NEW corpus version and hash
+* the V2 expectation/blueprint registry hash
+* the existing provider-contract hashes
+
+**The V1 gold corpus is not reusable.** It covers two legacy V1 recipes and cannot certify the new
+execution path.
+
+The product is not live and the evaluation tables are empty, so the evaluator is replaced rather
+than run in parallel — but the transition is ATOMIC:
+
+1. create the V2/V3 evaluation contract and corpus;
+2. run it successfully;
+3. make it the only accepted lane;
+4. delete the V1 evaluator, corpus and expectation registry;
+5. make a missing evaluation/version identity TERMINAL.
+
+Never turn V1 evidence into "V2" by swapping an integer-valued import.
+
+### 0.6 `ExpectedOutput` is now ONE shared contract — DONE 2026-08-20
+
+Ruled: extract it EXACTLY, neither renamed nor loosely copied. `output_type`/`unit`/`currency` moved
+to `schema_leaves` unchanged; V1's import is the SAME object; v2 and v3 declare
+`ExpectedOutput | None` instead of `object | None`; `output_intent_v2` uses attribute access and
+raises on a shape it cannot read.
+
+That looseness was the bug: `getattr(expectation, "unit", None)` turned a renamed or missing field
+into `unit=None` while `authored_expectation_present` stayed True — an expectation that exists and
+carries nothing, which `AuthoredOutputIntentV2` does not refuse because it validates only the
+converse. Silent data loss from one rename.
+
+Regression tests pin all four required properties, with the pre-change hashes captured from the
+SHIPPED code and written as literals — a test that derives both sides of its own equality proves
+only that the code agrees with itself:
+
+```
+v2 content hash with expected_output:  d0ee93e6…  UNCHANGED
+v3 content hash with expected_output:  f344e944…  UNCHANGED
+```
+
+The 26 gold_v2 fixtures all carry a NULL expected_output, so their passing is NOT coverage of this
+field — the test says so out loud rather than letting a future reader mistake it for one.
 
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact

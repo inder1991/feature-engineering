@@ -19,6 +19,7 @@ from featuregen.formula.schema_leaves import (
     AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
+    ExpectedOutput,
     FilterNode,
     Grain,
     Inclusivity,
@@ -120,15 +121,6 @@ FormulaBody = UnaryBody | RatioBody | DiffBody  # serialized with "final_operati
 
 
 # ---- top level ----
-
-@dataclass(frozen=True, slots=True)
-class ExpectedOutput:
-    """Advisory only — never identity-bearing."""
-
-    output_type: str | None
-    unit: str | None
-    currency: str | None
-
 
 @dataclass(frozen=True, slots=True)
 class TypedFormulaProposalV1:

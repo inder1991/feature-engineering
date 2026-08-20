@@ -27,6 +27,7 @@ from featuregen.formula.schema_leaves import (
     AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
+    ExpectedOutput,
     FilterNode,
     Grain,
     Inclusivity,
@@ -234,7 +235,11 @@ class TypedFormulaProposalV2:
     body: FormulaBodyV2
     parameters: tuple[ParameterDecl, ...]
     decimal: DecimalPolicy
-    expected_output: object | None
+    #: TYPED, since the v1 retirement made `ExpectedOutput` a shared leaf. It was ``object | None``
+    #: only because the type lived in a V1-named module — and that looseness is what let
+    #: `output_intent_v2` read it with `getattr(..., None)`, turning a renamed field into a silent
+    #: ``unit=None`` rather than a refusal.
+    expected_output: ExpectedOutput | None
     # increment 8: the allocation policy governing the SOURCE-grain → OUTPUT-grain rollup
     # (joint accounts, facility→obligor). "" = grains coincide or the rollup is a plain
     # per-entity aggregation needing no allocation. Identity-bearing.

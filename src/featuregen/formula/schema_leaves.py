@@ -449,3 +449,26 @@ def _check_predicate(
             f"{path}: '{node.op.value}' requires an integer/decimal/date "
             f"right-hand side, got {right_type.value!r}"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedOutput:
+    """What the author SAID the published value would be — output type, unit, currency.
+
+    **Shared, not V1's, and the sharing was already true before it moved.** `parse_v2` and `parse_v3`
+    both build this exact object; they simply declared the field as ``object | None`` because the
+    type lived in a module named for V1. Declaring it as ``object`` is what allowed
+    ``output_intent_v2`` to read it with ``getattr(..., None)``, so a renamed or missing field would
+    not raise — it would silently yield ``unit=None`` while still reporting the expectation as
+    PRESENT. That is the failure this move closes.
+
+    **"Advisory only — never identity-bearing" was V1's claim and is FALSE for v2/v3.** The v2/v3
+    canonicalizers are ``dataclasses.fields``-driven and recurse into any dataclass, so a non-null
+    expected_output IS walked into ``proposal_content_hash_v2``/``_v3`` and folded into the sealed
+    ``formula_content_hashes``. The field names and their canonical order are therefore frozen: they
+    are moved here byte-identically, and a regression test pins the hashes on both wire versions.
+    """
+
+    output_type: str | None
+    unit: str | None
+    currency: str | None

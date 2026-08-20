@@ -53,7 +53,12 @@ def test_the_leaves_module_carries_NO_VERSIONED_VOCABULARY():
     }
     versioned = {
         "AggregateFunction", "FinalOperation", "AggregateExpression", "UnaryBody", "RatioBody",
-        "DiffBody", "ExpectedOutput", "TypedFormulaProposalV1", "FormulaOutputPolicyV1",
+        # `ExpectedOutput` was here and MOVED to the leaves on an explicit ruling: v2 and v3 both
+        # build that exact object, and declaring the field `object | None` — which is what living
+        # in a V1 module forced — let `output_intent_v2` read it with `getattr(..., None)`, turning
+        # a renamed field into a silent `unit=None` rather than a refusal. Its field names and
+        # canonical order are frozen; the hashes are pinned byte-for-byte on both wire versions.
+        "DiffBody", "TypedFormulaProposalV1", "FormulaOutputPolicyV1",
         "TypedFormulaV1", "validate_semantics",
     }
     assert not (defined & versioned), sorted(defined & versioned)
