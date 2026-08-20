@@ -139,7 +139,14 @@ functions**: `frozen_configuration` ships `freeze_current_configuration_v2` and
    `replay_authoring_v2` and `result_v2` no longer import from a V1 module to describe a V2 result.
    Live→V1 names: **64 → 46**. What is left of `result.py` is V1 by type, not by name.
    Then the two unreachable v1 arms above went: **46 → 45**, and the first V1 code was DELETED
-   rather than merely bypassed.
+   rather than merely bypassed. `_intent_material` took it to **44**.
+
+**A note on which V1 functions are still dead-but-undeletable.** `freeze_current_configuration`
+(v1), `freeze_provider_contract` and `verify_provider_contract` all have ZERO production callers,
+and none can be deleted yet: live V1 TESTS exercise them, and `verify_frozen_configuration` (v1) is
+still called by `replay_authoring`, which stays alive because `materialize.resolve` needs
+`_restore_terminal_result`. That chain is the shape of the remaining work — one V1-typed function
+in `materialize` holds a whole V1 module alive.
 2. `formula.frozen_configuration` and `formula.recipe_authoring` — **the first real STAGE-6
    DELETES, 2026-08-20.** Both had a v1 arm that the routing retirement made unreachable:
    * `recipe_formula_shadow` froze a v1 configuration in an `else` branch reachable only for a v1
@@ -153,10 +160,16 @@ functions**: `frozen_configuration` ships `freeze_current_configuration_v2` and
      claim was converted into a guard that asserts their ABSENCE — which fails if either is ever
      reintroduced. A demonstration deleted is a claim lost; a guard is the same claim that outlives
      its subject.
-3. `formula.canonical`, `formula.parse`, `formula.critic`, `formula.tools`,
-   `formula.authoring`, `formula.replay_authoring` — extract the shared helpers, leave the V1
-   language behind.
-4. THEN stage 6 deletes what is finally unreachable, and regenerates the goldens (§8.2).
+3. `formula.replay_authoring` — **half done 2026-08-20.** `_intent_material` extracted to
+   `formula/intent_material.py`: five fields off an authoring intent, hashed identically by BOTH
+   generations, which is why `materialize.authoring_trace` was reaching into a v1-named module to
+   re-derive a trace for a v2 run. Moved VERBATIM — durable rows were sealed under
+   `canonical_hash(_intent_material(intent))`, so a move that also tidied would be a
+   re-identification wearing a refactor's commit message. `_restore_terminal_result` stays: it
+   returns a V1-typed `AuthoringResult`, so `materialize.resolve`'s edge is stage-4 migration work.
+4. `formula.canonical`, `formula.parse`, `formula.critic`, `formula.tools`, `formula.authoring` —
+   extract the shared helpers, leave the V1 language behind.
+5. THEN stage 6 deletes what is finally unreachable, and regenerates the goldens (§8.2).
 
 Each extraction is independently committable and independently green, exactly as step 0 was. What
 must NOT happen is deleting a V1 module while a V2 one still imports from it — the reachability

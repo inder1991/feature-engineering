@@ -35,6 +35,7 @@ from featuregen.formula.frozen_configuration import (
     FrozenAuthorCriticConfigurationV1,
     verify_frozen_configuration,
 )
+from featuregen.formula.intent_material import _intent_material
 from featuregen.formula.output_authority import (
     ExprFacts,
     ExternalRequirement,
@@ -74,16 +75,6 @@ def _actor_json(actor: IdentityEnvelope | None) -> dict | None:
         "authenticated": actor.authenticated,
         "auth_method": actor.auth_method,
         "role_claims": list(actor.role_claims),
-    }
-
-
-def _intent_material(intent) -> dict:
-    return {
-        "name": intent.name,
-        "hypothesis": intent.hypothesis,
-        "target_entity": intent.target_entity,
-        "target_grain_keys": list(intent.target_grain_keys),
-        "recipe_authoring_context": getattr(intent, "recipe_authoring_context", None),
     }
 
 
