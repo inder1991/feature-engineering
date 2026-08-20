@@ -43,16 +43,12 @@ from tests.featuregen.materialize.test_pilot_v2 import ENV, GROUP, _admitted_v2,
 from tests.featuregen.materialize.test_render_project import _nodes
 
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1
-from featuregen.materialize.artifact_manifest import manifest_for
-from featuregen.materialize.artifact_store import content_reference_for
 from featuregen.materialize.generate_v2 import generate_v2
 from featuregen.materialize.inputs import derive_requirement
 from featuregen.materialize.pilot_v2 import CompiledGenerationV2
 from featuregen.materialize.render.project import project_datasets
 from featuregen.materialize.seal_v2 import load_sealed_artifact
 from featuregen.overlay.upload.field_resolution import resolve_and_project
-
-FILES = {"conf/base/catalog.yml": "txn_features:\n  type: MemoryDataset\n"}
 
 
 @pytest.fixture
@@ -126,8 +122,6 @@ def generated(catalog, spine):
     spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
     datasets = project_datasets(compiled.authorized.token, compiled.plan,
                                 spine_input=spine_input)
-    manifest = manifest_for("art-e2e", FILES,
-                            content_reference=lambda path: content_reference_for(FILES[path]))
     return generate_v2(
         catalog, compiled,
         environment_id=ENV,
@@ -136,7 +130,7 @@ def generated(catalog, spine):
         engine_versions=fixtures.ENGINE_VERSIONS,
         spine_input=spine_input,
         nodes=_nodes(datasets),
-        manifest=manifest, files=FILES,
+        artifact_id="art-e2e",
         occurrences_by_member={name: PolicyOccurrenceSetV1(()) for name in compiled.graphs},
         realizations=(), compiled_at="t", sealed_at="2026-08-20T00:00:00Z")
 
@@ -186,6 +180,24 @@ def test_THE_GROUP_PLAN_WAS_PERSISTED_BEFORE_THE_ARTIFACT(catalog, generated):
     assert catalog.execute(
         "SELECT count(*) FROM materialization_group_member WHERE group_plan_hash = %s",
         (generated.group_plan_hash,)).fetchone()[0] == 1
+
+
+def test_THE_STORED_BYTES_ARE_THE_RENDERED_PROJECT_not_a_stub(catalog, generated):
+    """The defect writing the worker exposed. `generate_v2` used to take `manifest` and `files` as
+    arguments while rendering its own project internally, and `store_manifest` verifies a manifest
+    against ITS OWN files — which a caller-supplied pair satisfies trivially. So the artifact could
+    store one set of bytes while `project_digest` stated a hash over a different set, with every
+    integrity check green. This test reads the stored bytes back and finds generated Spark.
+    """
+    stored = catalog.execute(
+        "SELECT f.path, b.content FROM generated_artifact_file f "
+        "JOIN generated_artifact_blob b ON b.content_reference = f.content_reference "
+        "WHERE f.artifact_id = %s", ("art-e2e",)).fetchall()
+
+    assert stored, "the artifact stored no files at all"
+    texts = [content for _path, content in stored]
+    assert any("def " in text for text in texts), "no generated Python among the stored bytes"
+    assert any(GROUP in text for text in texts), "the stored code does not name this group"
 
 
 # ══ WHAT WAS ACTUALLY RENDERED ═════════════════════════════════════════════════════════════════

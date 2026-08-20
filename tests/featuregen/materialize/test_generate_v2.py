@@ -36,12 +36,8 @@ from tests.featuregen.materialize.test_pilot_v2 import (  # the real compiled ge
 )
 
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1
-from featuregen.materialize.artifact_manifest import manifest_for
-from featuregen.materialize.artifact_store import content_reference_for
 from featuregen.materialize.generate_v2 import GenerationRefused, generate_v2
 from featuregen.materialize.pilot_v2 import CompiledGenerationV2
-
-FILES = {"conf/base/catalog.yml": "txn_features:\n  type: MemoryDataset\n"}
 
 
 # Declared here rather than imported: a fixture imported by name shadows the test parameter that
@@ -98,8 +94,6 @@ def _compiled(catalog, spine) -> CompiledGenerationV2:
 
 
 def _generate(catalog, compiled, *, occurrences=None, engine_id="kedro-pyspark", **kwargs):
-    manifest = manifest_for("art-gen-1", FILES,
-                            content_reference=lambda path: content_reference_for(FILES[path]))
     return generate_v2(
         catalog, compiled,
         environment_id=ENV,
@@ -107,7 +101,7 @@ def _generate(catalog, compiled, *, occurrences=None, engine_id="kedro-pyspark",
         engine_id=engine_id,
         engine_versions=kwargs.pop("engine_versions", None),
         spine_input=kwargs.pop("spine_input", None),
-        nodes=(), manifest=manifest, files=FILES,
+        nodes=(), artifact_id="art-gen-1",
         occurrences_by_member=(occurrences if occurrences is not None
                                else {name: PolicyOccurrenceSetV1(())
                                      for name in compiled.graphs}),

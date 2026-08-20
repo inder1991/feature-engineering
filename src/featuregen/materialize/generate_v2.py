@@ -33,7 +33,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
-from featuregen.materialize.artifact_manifest import ArtifactManifestV1
+from featuregen.materialize.artifact_manifest import manifest_for
+from featuregen.materialize.artifact_store import content_reference_for
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.evaluate_generate import evaluate_generate
 from featuregen.materialize.group_plan_v2 import record_group_plan
@@ -80,8 +81,7 @@ def generate_v2(
     engine_versions: EngineVersions,
     spine_input: PhysicalInputRequirement,
     nodes: Sequence[RenderedNode],
-    manifest: ArtifactManifestV1,
-    files: Mapping[str, str],
+    artifact_id: str,
     occurrences_by_member: Mapping[str, object],
     realizations: Sequence[RealizationLinkV1],
     compiled_at: str,
@@ -91,6 +91,9 @@ def generate_v2(
     """Gate, record, render and seal one compiled generation.
 
     Args:
+        artifact_id: the id the sealed artifact is stored under. The manifest is built HERE, over
+            the bytes `render_project` just produced — see the manifest step below for why it is
+            not an argument.
         occurrences_by_member: each member's resolved policy occurrences, by feature name. Required
             per member and not defaulted: `evaluate_generate` refuses a generation whose policy
             references cannot be resolved, and a member with no entry would be gated against an
@@ -131,6 +134,18 @@ def generate_v2(
         compiled.authorized.token, compiled.plan,
         environment_id=environment_id, engine_versions=engine_versions,
         spine_input=spine_input, nodes=nodes)
+
+    # ▲ THE MANIFEST IS BUILT OVER WHAT WAS JUST RENDERED, and is NOT an argument. It used to be
+    # one, alongside the files it described — and `store_manifest` verifies a manifest against ITS
+    # OWN files, which a caller-supplied pair satisfies trivially. What nothing checked is that
+    # either of them was the project this function rendered. So an artifact could store one set of
+    # bytes while `project_digest` below stated a hash over a completely different set, with every
+    # integrity check green: the manifest agreed with its files, the digest agreed with the
+    # project, and the two halves described different code. Deriving both from `project.files`
+    # here makes the disagreement unrepresentable rather than checked.
+    files = project.files
+    manifest = manifest_for(
+        artifact_id, files, content_reference=lambda path: content_reference_for(files[path]))
 
     # ── 4. THE ARTIFACT — every member's graph, folded into one verdict ─────────────────────────
     sealed = seal_v2(

@@ -32,6 +32,7 @@ __all__ = [
     "GenerationRequestV1",
     "GenerationStatusV1",
     "InvalidStatusMove",
+    "RequestMovedUnderneath",
     "build_set_identity",
     "advance_request",
     "read_build_set",
@@ -88,6 +89,16 @@ _NEXT: Mapping[GenerationStatusV1, frozenset[GenerationStatusV1]] = {
 #: operator the renderer cannot emit), the platform can fail at any point, and a user may cancel.
 _FROM_ANYWHERE = frozenset({GenerationStatusV1.REFUSED, GenerationStatusV1.FAILED,
                             GenerationStatusV1.CANCELLED})
+
+
+class RequestMovedUnderneath(RuntimeError):
+    """Another writer advanced this request between the validation read and the write.
+
+    A distinct type from :class:`InvalidStatusMove` because the remedies are opposite. An invalid
+    move is a BUG in the caller — it asked for a step the lifecycle does not have, and the fix is in
+    the code. This is a RACE the design anticipates: the move was legal, and lost. A worker that
+    catches it should stop working on this request, not retry the move.
+    """
 
 
 class InvalidStatusMove(ValueError):
@@ -289,9 +300,22 @@ def advance_request(
 ) -> GenerationStatusV1:
     """Move ONE step and return the new status. The caller commits.
 
+    **The move is COMPARE-AND-SET, not read-then-write.** The status is read to validate the move
+    against the lifecycle, and the UPDATE then re-states it in its own WHERE clause, so the row is
+    only written if it is still what was validated. Without that, two workers holding the same
+    request both read REQUESTED, both find CLAIMED legal, and both write it — the second silently
+    overwriting the first, with a lifecycle table that permitted every individual step. A lifecycle
+    enforced by a check that reads before it writes is a lifecycle with a window in it.
+
+    This is a SECOND line of defence, not the first: the queue lease is what stops two workers
+    holding one request. It is here because the two mechanisms fail differently — a lease can expire
+    while its holder is still alive, and an expired lease's holder must not be able to finish the
+    job as though nothing happened.
+
     Raises:
         InvalidStatusMove: the move is not on the lifecycle's path. A worker that skipped RUNNING
             would produce a SUCCEEDED request whose history says it was never worked on.
+        RequestMovedUnderneath: the row changed between the read and the write.
     """
     row = conn.execute(
         "SELECT status FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
@@ -306,15 +330,22 @@ def advance_request(
             f"Permitted: {sorted(s.value for s in permitted) or 'nothing — it is terminal'}. "
             f"A retry is a NEW attempt against the same build set, never a step backwards")
 
-    conn.execute(
+    moved = conn.execute(
         "UPDATE generation_request SET status = %s, "
         "sealed_artifact_id = COALESCE(%s, sealed_artifact_id), "
         "refusals = CASE WHEN %s::jsonb IS NULL THEN refusals ELSE %s::jsonb END, "
-        "failure_reason = %s, updated_at = now() WHERE request_id = %s",
+        "failure_reason = %s, updated_at = now() "
+        "WHERE request_id = %s AND status = %s RETURNING status",
         (to.value, sealed_artifact_id,
          None if not refusals else json.dumps([dict(r) for r in refusals]),
          None if not refusals else json.dumps([dict(r) for r in refusals]),
-         failure_reason, request_id))
+         failure_reason, request_id, current.value)).fetchone()
+    if moved is None:
+        raise RequestMovedUnderneath(
+            f"generation request {request_id} was {current.value} when this move was validated and "
+            f"is not any more: another worker advanced it. This move is ABANDONED rather than "
+            f"applied — {current.value} → {to.value} was checked against a status that no longer "
+            f"holds, and writing it anyway would overwrite whatever the other worker decided")
     return to
 
 
