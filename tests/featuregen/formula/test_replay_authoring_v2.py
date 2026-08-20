@@ -29,10 +29,8 @@ from tests.featuregen.formula.authoring_fixtures import (
 from featuregen.formula import replay_authoring
 from featuregen.formula.author import AUTHOR_TASK, run_tool
 from featuregen.formula.critic import CRITIC_TASK
-from featuregen.formula.frozen_configuration import (
-    freeze_current_configuration,
-    freeze_current_configuration_v2,
-)
+from featuregen.formula.frozen_configuration import freeze_current_configuration_v2
+from featuregen.formula.frozen_configuration_v1 import freeze_current_configuration
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2, OperandFactsV2
 from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
 from featuregen.formula.replay_trace import run_status

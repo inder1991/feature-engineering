@@ -31,10 +31,8 @@ from featuregen.formula.critic import (
     CriticReview,
     critique,
 )
-from featuregen.formula.frozen_configuration import (
-    FrozenAuthorCriticConfigurationV1,
-    verify_frozen_configuration,
-)
+from featuregen.formula.frozen_configuration import FrozenAuthorCriticConfigurationV1
+from featuregen.formula.frozen_configuration_v1 import verify_frozen_configuration
 from featuregen.formula.intent_material import _intent_material
 from featuregen.formula.output_authority import (
     ExprFacts,
