@@ -138,8 +138,21 @@ functions**: `frozen_configuration` ships `freeze_current_configuration_v2` and
    disposition vocabulary, the coherence error and the six status literals. `authoring_v2`,
    `replay_authoring_v2` and `result_v2` no longer import from a V1 module to describe a V2 result.
    Live→V1 names: **64 → 46**. What is left of `result.py` is V1 by type, not by name.
-2. `formula.frozen_configuration` and `formula.recipe_authoring` — split the `*_v2` exports out;
-   they were never V1's to hold.
+   Then the two unreachable v1 arms above went: **46 → 45**, and the first V1 code was DELETED
+   rather than merely bypassed.
+2. `formula.frozen_configuration` and `formula.recipe_authoring` — **the first real STAGE-6
+   DELETES, 2026-08-20.** Both had a v1 arm that the routing retirement made unreachable:
+   * `recipe_formula_shadow` froze a v1 configuration in an `else` branch reachable only for a v1
+     BOUND expectation, which `capture_blueprint_for` can no longer produce. Branch removed.
+   * `recipe_authoring.recipe_tool_runner` and `.recipe_expectation_validator` (v1) had **zero
+     production callers** — 122 lines deleted, with `test_recipe_authoring.py`. Verified against
+     §8.6 first: the byte-freeze is on `recipe_egress._validate_formula_expectation_v1`, not here,
+     and there are 0 durable work items.
+   * Three tests existed to prove the v2 siblings were needed by demonstrating the v1 ones
+     misbehave on v2 input. That demonstration cannot run once the v1 functions are gone, so the
+     claim was converted into a guard that asserts their ABSENCE — which fails if either is ever
+     reintroduced. A demonstration deleted is a claim lost; a guard is the same claim that outlives
+     its subject.
 3. `formula.canonical`, `formula.parse`, `formula.critic`, `formula.tools`,
    `formula.authoring`, `formula.replay_authoring` — extract the shared helpers, leave the V1
    language behind.

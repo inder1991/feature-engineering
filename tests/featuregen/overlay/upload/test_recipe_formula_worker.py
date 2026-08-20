@@ -424,14 +424,14 @@ def test_the_v2_route_uses_the_v2_validator_and_the_v2_tools(db, monkeypatch, _d
             "aggregation_argument": None, "second_operand": None, "authority_refs": None}},
         "parameters": [], "expected_output": None, "allocation_policy_ref": "",
         "decimal": {"precision": 18, "scale": 6, "rounding": "half_even", "overflow": "error"}})
-    # The proposal PRESERVES the seeded v2 expectation exactly, so the v2 validator passes it —
-    # something v1's validator structurally cannot do for any v2 body.
+    # The proposal PRESERVES the seeded v2 expectation exactly, so the v2 validator passes it.
+    # This used to also assert v1's validator returned FINAL_OPERATION_NOT_PRESERVED on the same
+    # proposal — "which is why the sibling exists". That validator is deleted along with the v1
+    # arm, so the claim moved to
+    # `test_THERE_IS_NO_V1_VALIDATOR_OR_TOOL_RUNNER_LEFT_TO_MIS_HAND_A_PROPOSAL_TO`, which fails if
+    # it comes back. What is still asserted here is the half that is about THIS route: the worker
+    # wired the V2 validator, and it passes a proposal that preserves the expectation.
     assert received["proposal_validator"](proposal) == ()
-
-    from featuregen.formula.recipe_authoring import recipe_expectation_validator
-
-    assert recipe_expectation_validator(_V2_EXPECTATION)(proposal) == (
-        "FINAL_OPERATION_NOT_PRESERVED",), "which is why the sibling exists"
 
 
 def test_a_v2_work_item_verifies_the_V2_frozen_configuration(db, monkeypatch, _dsn) -> None:

@@ -411,26 +411,31 @@ def test_the_expectation_expression_count_must_match_the_combiner() -> None:
     assert _violations(_raw(), two_for_identity) == ("EXPECTATION_SHAPE_INVALID",)
 
 
-def test_the_v1_validator_still_refuses_a_v2_proposal_which_is_why_v2_needs_its_own() -> None:
-    """The whole reason this sibling exists. Handing a v2 proposal to the v1 validator is not a
-    near miss — the v1 validator is typed and written for ``UnaryBody`` and reports the FIRST
-    thing it can, which would become a durable ``invalid_formula → REJECTED`` about a recipe
-    nobody ever failed to author."""
-    from featuregen.formula.recipe_authoring import recipe_expectation_validator
+def test_THERE_IS_NO_V1_VALIDATOR_OR_TOOL_RUNNER_LEFT_TO_MIS_HAND_A_PROPOSAL_TO() -> None:
+    """What this file's two v1-comparison tests used to prove, in the form that outlives them.
 
-    v1_shaped = {
-        "final_operation": "identity", "grain_entity": "account",
-        "grain_key_refs": [REF_CIF],
-        "expressions": [{"aggregation": "sum", "operand_ref": REF_AMT,
-                         "source_relation_ref": TABLE_REF, "event_time_ref": REF_DT,
-                         "window_length": 90, "window": {}}],
-        "decimal": {"precision": 38, "scale": 6, "rounding": "half_even", "overflow": "error"},
-    }
-    assert recipe_expectation_validator(v1_shaped)(parse_proposal_v2(_raw())) == (
-        "FINAL_OPERATION_NOT_PRESERVED",)
+    They demonstrated that handing a v2 proposal to the v1 validator was not a near miss — the v1
+    validator is typed for ``UnaryBody`` and reports the FIRST thing it can, which would become a
+    durable ``invalid_formula → REJECTED`` about a recipe nobody ever failed to author — and that
+    the v1 tool runner answered differently for the same refs. That was the justification for the
+    v2 siblings existing.
 
+    The justification is discharged: the v1 authoring arm is retired and both v1 functions are
+    deleted, so there is nothing to mis-hand a proposal to. Asserting their ABSENCE keeps the
+    original claim enforceable, where a demonstration of their misbehaviour can no longer run — and
+    it fails if either is ever reintroduced, which is the failure the retirement exists to prevent.
+    """
+    from featuregen.formula import recipe_authoring
 
-# ── the v2 tool runner ───────────────────────────────────────────────────────────────────────────
+    gone = [name for name in ("recipe_expectation_validator", "recipe_tool_runner")
+            if hasattr(recipe_authoring, name)]
+    assert gone == [], (
+        f"the v1 authoring surface is back: {gone}. Every capturable recipe declares formula-v2 "
+        f"and the worker has one arm, so a v1 validator or tool runner has nothing to serve and "
+        f"can only be reached by mistake")
+    # The v2 pair is present and is what the worker wires.
+    assert hasattr(recipe_authoring, "recipe_expectation_validator_v2")
+    assert hasattr(recipe_authoring, "recipe_tool_runner_v2")
 
 
 def test_the_v2_tool_runner_answers_in_the_v2_grammar() -> None:
@@ -448,17 +453,17 @@ def test_the_v2_tool_runner_answers_in_the_v2_grammar() -> None:
 
 
 def test_the_v2_tool_runner_calls_a_valid_v2_draft_valid() -> None:
-    """v1's ``validate_draft_formula`` runs ``parse_proposal_v1``, so it would answer ``invalid``
-    for this exact draft — teaching the model to abandon a correct proposal."""
+    """The claim that matters: a correct v2 draft is called VALID.
+
+    This used to also run the v1 runner and assert it answered ``invalid`` for the same draft —
+    v1's ``validate_draft_formula`` parses with ``parse_proposal_v1``, so it would teach the model
+    to abandon a correct proposal. That comparison is gone with the v1 runner itself; its claim now
+    lives in `test_THERE_IS_NO_V1_VALIDATOR_OR_TOOL_RUNNER_LEFT_TO_MIS_HAND_A_PROPOSAL_TO`, which
+    fails if the runner is ever reintroduced.
+    """
     runner = recipe_tool_runner_v2(frozenset({REF_AMT}))
     assert runner(object(), "validate_draft_formula", {"proposal": _raw()}) == {
         "verdict": "ok", "detail": None, "operation_grammar_version": 1}
-
-    from featuregen.formula.recipe_authoring import recipe_tool_runner
-
-    v1_answer = recipe_tool_runner(frozenset({REF_AMT}))(
-        None, "validate_draft_formula", {"proposal": _raw()})
-    assert v1_answer["verdict"] == "invalid", "which is exactly why the sibling exists"
 
 
 def test_the_v2_tool_runner_keeps_the_frozen_ref_gate_and_the_closed_tool_set() -> None:
