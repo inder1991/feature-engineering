@@ -22,7 +22,7 @@ by eye. Revision 1 broke that standard once and the record is kept in §2.
 | Steps | State | Notes |
 |---|---|---|
 | **0–8** | **done** | migrations 1091, 1092, 1093 APPLIED to live (189 total) |
-| **9** | **compile half done** | `compile_generation_v2` closes admitted → operator graph; rendering and sealing are the caller's, and are not yet wired |
+| **9** | **compile half only — and narrower than its own header claims (§0.9)** | `compile_generation_v2` closes admitted → operator graph; rendering and sealing are the caller's, and are not yet wired |
 | 10 | **blocked on GOVERNANCE, not code** | needs real policy payloads *and* each policy's `read_basis` — see below |
 | **11** | **done** | `avg`, `min`, `max` render, type, and reach an operator graph |
 | 12 | not started | FX needs the physical-binding layer §7 names (`bound_rate_dataset_ref`, `binding_snapshot_id`), which does not exist |
@@ -275,35 +275,101 @@ v3 content hash with expected_output:  f344e944…  UNCHANGED
 The 26 gold_v2 fixtures all carry a NULL expected_output, so their passing is NOT coverage of this
 field — the test says so out loud rather than letting a future reader mistake it for one.
 
-### 0.7 ▲ THE KNOT, and the live evidence that unties it — measured 2026-08-20
+### 0.7 ▲ WITHDRAWN — "one import plus fixtures" was WRONG. Corrected 2026-08-20.
 
-The whole remaining V1 authoring stack hangs off **one import**:
+This section claimed `materialize.resolve`'s import of `replay_authoring._restore_terminal_result`
+was the single edge holding the V1 authoring stack alive, and that cutting it cost one import plus a
+test module's fixtures. **That was researched from inside `resolve.py` alone.** It reads only
+`authoring_disposition` — true — but it does not KEEP the result. It hands it to `admit_artifacts`
+(`compile/chain.py:576`), whose check 4 is the anti-forgery gate and re-derives
+`formula_content_hash` from `result.candidate_formula` (`admission.py:325`).
 
 ```
-materialize.resolve  ->  replay_authoring._restore_terminal_result   (V1)
-                             |
-                             +-> critic's v1 arm, parse_proposal_v1, authoring, tools, result
+AuthoringResult    candidate_formula = TypedFormulaV1 | None
+AuthoringResultV2  candidate_formula = does not exist   (it has candidate_proposal / candidate_output)
 ```
 
-`replay_authoring` is alive ONLY because of that import. Cut it and the rest becomes unreachable.
+Switching the restorer would hand V1's forgery check an object with no formula to hash. `resolve` is
+not a shared consumer with a V1 restorer; it is **one stage of the V1 execution chain**, and the
+chain is what has to move.
 
-**Live says the cut is safe.** All three `formula_authoring_run` rows carry
-`{"authoring_v2": 2, "formula_schema": 3}` — every authoring run on this environment is V2, and
-there has never been a v1 run to replay. `authoring_trace_event` (the 1020 lane) holds 0 rows;
-`formula_authoring_trace_event` (the 1022 lane, the admissible one) holds 6.
+### 0.8 ▲ THE RENDERER DOES NOT ACCEPT V2 END TO END — corrected 2026-08-20
 
-**And the consumer barely uses it.** `materialize.resolve` reads exactly ONE field off the restored
-result — `authoring_disposition` — which `AuthoringResultV2` carries identically. It never touches
-`candidate_formula` or `candidate_proposal`, the two V1-typed fields.
+An earlier commit widened `render_project`/`project_datasets` to accept either token and plan, and
+reported that as the renderer accepting V2. **The outer type gate was widened; the internals were
+not.** Verified by execution — passing a real `FeatureGroupPlanV2` to `published_dataset_name`
+raises `TypeError`:
 
-**What it actually costs, measured by trying it.** Switching the import is one line and it turns 10
-of `test_resolve.py`'s 15 tests red with `AUTHORING_RUN_INCOMPLETE`: the V2 restorer reads a
-V2-shaped checkpoint and those fixtures seed V1-shaped traces. So the work is a FIXTURE migration —
-teaching `test_resolve` to seed the trace shape the live rows already have — and not a consumer
-change. Attempted and reverted rather than half-landed; the tree stays green.
+* `render/publish.py:69` — `published_dataset_name(plan: FeatureGroupPlanV1)`, refuses V2
+* `render/nodes_compute.py:381` — `render_spine_node` requires a V1 plan AND a V1 contract
+* `render/nodes_compute.py:912` — requires a V1 contract
+* `render/nodes_compute.py:2181` — accepts a V2 IR and still requires a V1 plan
+* `render/nodes_gate.py:165` — `render_assembly_node` requires a V1 plan
+* `compile/wiring.py:50` — V1 schema, V1 plan, V1 contract, V1 chain inputs
 
-**This is the highest-value next task in stage 4:** it is one import plus one test module's
-fixtures, and it frees six V1 modules at once.
+**Consequently §5's "the project and wiring layers are reusable as they stand" is FALSE** and is
+struck. They are reusable in SHAPE; every entry point is typed on V1's plan and contract.
+
+### 0.9 ▲ WHAT `compile_generation_v2` IS AND IS NOT — corrected 2026-08-20
+
+`pilot_v2`'s module header claims the chain reaches rendering and sealing. It does not: it returns
+authorization, group plan, one operator graph per feature and the contract hash, and stops
+(`pilot_v2.py:203`). The header is corrected in code.
+
+It does NOT call `resolve_executable_output_v2`, `record_bound_formula`, `record_group_plan`,
+`evaluate_generate`, `render_project` or `seal_v2`. More seriously, `AdmittedFeatureV2` drops the
+restored `candidate_output` and `output_intent`: the pilot re-resolves a basic output policy from
+caller-supplied operand facts and never performs the authored-intent-versus-governed-output
+reconciliation in `output_resolution_v2.py:119`.
+
+**So step 3 is NOT done** and its row is corrected: `BuildSet` and `generation_request` exist as
+stores with NO production callers. The runtime worker (`queue_lane.py:161`) drains the V1
+materialization queue only, and `POST /feature-execution/generations` records an authorization and
+says in as many words that nothing was queued (`feature_execution.py:141`). `build_set_store.py:267`
+is a read followed by an update with no fenced claim — two workers could observe the same state.
+
+**§8.7's "finished work waiting to be connected" overstates it** and is struck: the pieces are
+unit-tested in isolation, and the middle is unwelded.
+
+Three further gaps the review surfaced, none of them yet addressed:
+
+* **Authorization is not bound to the artifact.** `generation_request` references no generation
+  authorization; `sealed_artifact_v2` references none; `compile_generation_v2` takes authorization,
+  logical group and environment separately without proving they agree; `evaluate_verify` accepts a
+  client-supplied authorization id without checking it produced the artifact under verification.
+  There is no referential chain authorization → request → sealed artifact.
+* **Sealing has an unresolved group-level design problem.** `compile_generation_v2` returns one
+  graph per feature, each ending in a one-column `GROUP_ASSEMBLY`; `seal_v2.py:106` accepts exactly
+  ONE graph. Nothing proves a multi-feature group satisfies the subgraph requirements atomically.
+* **Activation is deliberately closed.** `semantic_option_decision.py:426` always returns False and
+  the seam walkthrough monkeypatches it, so no stored evaluation can promote a recipe to
+  FORMULA_VALIDATED or MATERIALIZATION_READY today.
+
+### 0.10 SEQUENCING — ruled 2026-08-20, replacing §0.5's ordering
+
+The evaluator cannot validate materialization code it never invokes: `recipe_formula_eval` evaluates
+author/critic/provider behaviour and does not compile, render, seal or execute. Adding V2/V3 identity
+fields to it leaves it an authoring-quality evaluator. So the deterministic chain comes FIRST.
+
+```
+1. correct the plan                                          <- this section
+2. complete deterministic V2 generation
+     restore -> admit -> bind output -> compile -> authorize
+     -> graph -> generate gate -> render -> seal -> persist
+3. real BuildSet/request API + fenced V2 worker
+4. prove the production chain
+     anti-forgery + multi-feature + mutation + Kedro/Spark
+5. the separate V2/V3 authoring/provider evaluator, and expand the reviewed corpus
+     (only ONE reviewed V2 expectation exists today — `posted_debit_amount`,
+      recipe_formula_expectations_v2.py:44)
+6. the current-evaluation validity reader
+7. cut API/runtime traffic V1 -> V2
+8. delete the V1 chain and the V1 authoring language
+```
+
+**None of steps 2–4 need an Anthropic key.** They are built and tested against stored V3 traces and
+reviewed fixtures. A real provider run earns the authoring-quality activation evidence later; it is
+not what proves that rendering and sealing work.
 
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
@@ -562,8 +628,10 @@ pilot only**. Full V2 execution needs genuinely new calculation semantics: polic
 window offsets, second operands, signed expressions, FX, and seventeen unsupported aggregates.
 
 What remains true: three of the five node renderers never touch the formula IR; `FormulaExecutionIRV2`
-is V1's ten fields under the same names plus two, with zero renames. The *project and wiring* layers
-are reusable as they stand. The *calculation* layer is where the new work is.
+is V1's ten fields under the same names plus two, with zero renames. ~~The *project and wiring*
+layers are reusable as they stand.~~ **STRUCK — see §0.8:** they are reusable in SHAPE, and every
+entry point in `render/` and `compile/wiring.py` is typed on V1's plan and contract. The
+*calculation* layer is not the only place the new work is.
 
 ```
 V2 aggregate functions:  21
@@ -584,7 +652,7 @@ Adopted from the review, with the verified detail attached.
 | **0** | **Extract the shared schema leaves** — split `formula/schema.py` into shared leaves + `schema_v1` | ▲ **new, and first.** 24 names V2/V3 import verbatim currently live in a module named for V1. Mechanical, low-risk, independent — and until it lands, nothing in step 15 can be deleted safely. Doing it first turns the last step from "work out what breaks" into "delete `schema_v1`". |
 | 1 | Typed capability signatures + build fingerprints | migration 1091; supersedes 1079's shape. Changes visible readiness for all 263 recipes — deliberate, not incidental. |
 | 2 | Separate admitted / execution-qualified / artifact-verified | resolves §3's contradiction 2 |
-| 3 | BuildSet + generation request + worker | §4.1; the product operation |
+| 3 | BuildSet + generation request + worker | §4.1. **▲ NOT DONE — see §0.9.** The stores exist with ZERO production callers; the runtime worker drains the V1 queue only, and the lifecycle has no fenced claim |
 | 4 | V2 physical binding + policy resolution | §4.2 payload store; **plus the two missing resolvers** (§8.3) |
 | 5 | Compile → `PlannedFormulaExecutionIRV2` | the missing `compile_ir_v2` |
 | 6 | Leakage + authorization → authorized IR | calls the built-but-unwired `leakage_v2`, `authorize_compilation_v2` |
@@ -747,9 +815,11 @@ recipes is a product change wearing an infrastructure commit message.
 ### 8.7 What is already V2 and already dead
 
 The S11 generate/code/verify/publish surface is V2 throughout — and unreachable, because `seal_v2`
-has no production caller. A whole V2 execution sub-chain is built, unit-tested, and has zero
-production callers. That is not V1 debt to remove; it is finished work waiting to be connected,
-which is the entire point of steps 3–9.
+has no production caller. ~~That is finished work waiting to be connected.~~ **STRUCK — see §0.9:**
+"finished" overstates it. The pieces are unit-tested in isolation and the middle is unwelded — the
+renderer is typed on V1 plans, `compile_generation_v2` stops before rendering and skips six V2
+stages, and the generation lifecycle has no fenced claim. Connecting them is step 2 of §0.10, not a
+wiring exercise.
 
 ### 8.8 One additional gate class, beyond the ten
 

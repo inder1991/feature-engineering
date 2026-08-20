@@ -17,9 +17,24 @@ The chain, and who decides what::
     resolve_physical_type_v3 the published column's type, from the DECLARED policy
     build_group_plan_v2      the packing list
     build_operator_graph_v2  the executable shape
-    render_calculation_node  the code                        (V1's renderer, one vocabulary)
-    render_project           the project, sealed under its derived identity
-    seal_v2                  the artifact, its verdict and its realization links
+                             ---- AND IT STOPS HERE ----
+
+**▲ WHAT THIS DOES NOT DO, corrected 2026-08-20.** An earlier version of this header listed
+`render_calculation_node`, `render_project` and `seal_v2` as part of the chain. They are not. This
+function returns the authorization, the group plan, one operator graph per feature and the contract
+hash, and returns. It also does NOT call `resolve_executable_output_v2`, `record_bound_formula`,
+`record_group_plan` or `evaluate_generate`.
+
+More consequentially: `AdmittedFeatureV2` drops the restored `candidate_output` and
+`output_intent`, so what happens below is a re-resolution of a basic output policy from
+caller-supplied operand facts — NOT the authored-intent-versus-governed-output reconciliation in
+`output_resolution_v2.resolve_executable_output_v2`. A caller must not read a successful return here
+as "the output was reconciled against what the author declared".
+
+And rendering could not be reached even if it were called: `render/publish.py`,
+`render/nodes_compute.py` and `render/nodes_gate.py` are typed on `FeatureGroupPlanV1` and
+`MaterializationContractV1` at every entry point, so a `FeatureGroupPlanV2` raises `TypeError` at
+`published_dataset_name`. Widening `render_project`'s outer signature did not change that.
 
 **Refusals are RETURNED and the FIRST one wins.** Every stage answers about the same group, so the
 first thing wrong with it is the thing to report: continuing would collect verdicts that are all
