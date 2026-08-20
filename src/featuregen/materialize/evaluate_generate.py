@@ -32,8 +32,8 @@ from featuregen.formula.policy_store import (
     PolicyReferenceUnresolvable,
     resolve_policy_occurrence,
 )
-from featuregen.materialize.execution_proof_store import capability_of
-from featuregen.materialize.operator_graph_v2 import OperatorGraphV2
+from featuregen.materialize.execution_proof_store import SOLE_VARIANT, capability_of
+from featuregen.materialize.operator_graph_v2 import OperatorGraphV2, OperatorNodeV2
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.evaluator_contracts import (
     EvaluatorAction,
@@ -68,18 +68,46 @@ def unresolvable_references(
 def undispatchable_kinds(
     conn: DbConn, graph: OperatorGraphV2, *, engine_id: str,
 ) -> tuple[str, ...]:
-    """Operator kinds in ``graph`` this build's renderer cannot emit, sorted.
+    """Operator SIGNATURES in ``graph`` this build's renderer cannot emit, sorted.
 
     An operator this build has never recorded counts as UNDISPATCHABLE, never as a default: a
     missing capability row means nobody established that the renderer can emit it, and treating an
     unrecorded operator as renderable is how a project that cannot run gets generated.
+
+    ▲ **BY SIGNATURE, NOT BY KIND — and asking by kind was refusing every graph.** Capability became
+    signature-typed in step 1 (`(kind, variant, build_hash)`) and this function still asked with the
+    sole-variant default, so it asked *"can you emit ANY final_combine?"*. The answer is correctly
+    NO: `final_combine/*` is recorded undispatchable because the renderer emits three specific
+    operations, not all of them. Every graph ends in a `FINAL_COMBINE`, so every generation refused
+    `RENDERER_CANNOT_DISPATCH` — including ones whose operation the renderer emits perfectly well.
+
+    The question that matters is whether THIS node can be emitted, so the variant comes off the
+    node's own payload. Nothing caught it because nothing ran the gate over a real graph until the
+    end-to-end run did.
     """
     cannot: list[str] = []
-    for kind in sorted({node.kind.value for node in graph.nodes}):
-        capability = capability_of(conn, engine_id=engine_id, operator_kind=kind)
+    for kind, variant in sorted({_signature_of(node) for node in graph.nodes}):
+        capability = capability_of(conn, engine_id=engine_id, operator_kind=kind,
+                                   operator_variant=variant)
         if capability is None or not capability.renderer_dispatchable:
-            cannot.append(kind)
+            cannot.append(kind if variant == SOLE_VARIANT else f"{kind}/{variant}")
     return tuple(cannot)
+
+
+def _signature_of(node: OperatorNodeV2) -> tuple[str, str]:
+    """``(kind, variant)`` for one node — the variant read off its own payload.
+
+    Kinds whose payload carries no calculation choice use the SOLE variant, which is what the
+    dispatch surface records for them. The two kinds that DO carry one — the aggregate function and
+    the final operation — are precisely the two where "can the renderer emit this kind" and "can it
+    emit THIS one" have different answers.
+    """
+    payload = node.payload
+    for attribute in ("function", "final_operation"):
+        value = getattr(payload, attribute, None)
+        if value is not None:
+            return node.kind.value, str(value)
+    return node.kind.value, SOLE_VARIANT
 
 
 def evaluate_generate(
