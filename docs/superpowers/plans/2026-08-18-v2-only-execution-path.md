@@ -104,6 +104,51 @@ work item — `expectation_schema` and `output_formula_schema_version` — so la
 *which lane authors this* with *which format it produced*. Not done here: it changes the persisted
 payload bytes, which the v1 golden freeze pins.
 
+### 0.3 Stages 4–6 — measured 2026-08-20, and §8.1's pattern repeats at FUNCTION level
+
+**Nothing is transitively dead.** All 13 V1 modules are reachable from live code, because V2 and V3
+modules import from them. So stage 6 cannot delete anything until stages 4–5 cut those edges — the
+deletion is gated on the extraction, not on courage.
+
+**64 names across 8 modules are what stands between here and deletion:**
+
+| V1-named module | live importers | names |
+|---|---|---|
+| ~~`formula.result`~~ | ~~6~~ → **3** | **EXTRACTION DONE.** The version-neutral half is now `formula/authoring_result_leaves.py`; the 3 that remain need `AuthoringResult`, which carries a `TypedFormulaV1` and is genuinely V1 |
+| `formula.frozen_configuration` | 4 | 8 — incl. `freeze_current_configuration_v2`, `verify_frozen_configuration_v2` |
+| `formula.critic` | 3 | 6 — `CriticFinding`, `CriticReview`, `critique`, `proposal_column_refs` |
+| `formula.parse` | 2 | 5 — `_plain`, `_build_filter`, `_build_expected_output`, `parse_proposal_v1` |
+| `formula.authoring` | 1 | 5 — `AUTHORING_MAX_TURNS`, `_Trace`, `_trace_turns` |
+| `formula.recipe_authoring` | 2 | 3 — `recipe_expectation_validator_v2`, `recipe_tool_runner_v2` |
+| `formula.canonical` | 2 | 2 — `filter_plain`, `formula_content_hash` |
+| `formula.replay_authoring` | 2 | 2 — `_intent_material`, `_restore_terminal_result` |
+| `formula.tools` | 1 | 2 — `TOOLS`, `run_tool` |
+
+**▲ THE FINDING, and it is §8.1 again one level down.** §8.1 said `formula/schema.py` "is not a V1
+module — it is the shared structural-leaf library, and the module name simply lies about its
+contents". The same is true of these, for FUNCTIONS rather than types. Two of them **export `*_v2`
+functions**: `frozen_configuration` ships `freeze_current_configuration_v2` and
+`verify_frozen_configuration_v2`; `recipe_authoring` ships `recipe_expectation_validator_v2` and
+`recipe_tool_runner_v2`. `formula.result`'s authoring-result vocabulary is imported by
+`formula.result_v2` itself. None of that is V1 language; it is shared machinery wearing a V1 name.
+
+**So stages 4–5 are step 0 repeated per module, and the order follows the edge count:**
+
+1. ~~`formula.result`~~ — **DONE 2026-08-20.** `authoring_result_leaves.py` now holds the axes, the
+   disposition vocabulary, the coherence error and the six status literals. `authoring_v2`,
+   `replay_authoring_v2` and `result_v2` no longer import from a V1 module to describe a V2 result.
+   Live→V1 names: **64 → 46**. What is left of `result.py` is V1 by type, not by name.
+2. `formula.frozen_configuration` and `formula.recipe_authoring` — split the `*_v2` exports out;
+   they were never V1's to hold.
+3. `formula.canonical`, `formula.parse`, `formula.critic`, `formula.tools`,
+   `formula.authoring`, `formula.replay_authoring` — extract the shared helpers, leave the V1
+   language behind.
+4. THEN stage 6 deletes what is finally unreachable, and regenerates the goldens (§8.2).
+
+Each extraction is independently committable and independently green, exactly as step 0 was. What
+must NOT happen is deleting a V1 module while a V2 one still imports from it — the reachability
+measurement above is the check, and it should be re-run before every delete.
+
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
 bytes"*. `recipe_formula_shadow_work_item` holds **0 rows** on this environment, so there is nothing

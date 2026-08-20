@@ -11,6 +11,7 @@ from typing import Any
 
 from featuregen.formula._jcs import dumps as jcs_dumps
 from featuregen.formula.author import AUTHOR_PROMPT_VERSION
+from featuregen.formula.authoring_result_leaves import DISPOSITION_POLICY_VERSION
 from featuregen.formula.capability import CAPABILITY_POLICY_VERSION, classify_formula_capability
 from featuregen.formula.critic import (
     CRITIC_INSTRUCTION,
@@ -21,7 +22,7 @@ from featuregen.formula.critic import (
     CRITIC_SCHEMA_VERSION,
 )
 from featuregen.formula.output_authority import resolve_formula_output_policy
-from featuregen.formula.result import DISPOSITION_POLICY_VERSION, derive_disposition
+from featuregen.formula.result import derive_disposition
 from featuregen.formula.schema import (
     CANONICALIZATION_VERSION,
     FORMULA_SCHEMA_VERSION,

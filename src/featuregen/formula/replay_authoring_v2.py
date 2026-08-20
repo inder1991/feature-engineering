@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING, Any, cast
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_TURN_CONTRACT_V2, author_formula
+from featuregen.formula.authoring_result_leaves import AuthoringAxes, AuthorityFailure
 from featuregen.formula.authoring_v2 import (
     AUTHORING_ORCHESTRATOR_VERSION_V2,
     OutputResolutionV2,
@@ -111,10 +112,6 @@ from featuregen.formula.replay_trace import (
     append_event,
     load_verified_checkpoint,
     open_authoring_run,
-)
-from featuregen.formula.result import (
-    AuthoringAxes,
-    AuthorityFailure,
 )
 from featuregen.formula.result_v2 import (
     DISPOSITION_POLICY_VERSION_V2,

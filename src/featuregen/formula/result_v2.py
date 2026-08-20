@@ -32,10 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import get_args
 
-from featuregen.formula.canonical_v2 import proposal_content_hash_v2
-from featuregen.formula.canonical_v3 import proposal_content_hash_v3
-from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.result import (
+from featuregen.formula.authoring_result_leaves import (
     AuthoringAxes,
     AuthoringDisposition,
     AuthorityFailure,
@@ -47,6 +44,9 @@ from featuregen.formula.result import (
     StructuralStatus,
     TechnicalStatus,
 )
+from featuregen.formula.canonical_v2 import proposal_content_hash_v2
+from featuregen.formula.canonical_v3 import proposal_content_hash_v3
+from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
 from featuregen.formula.schema_v2 import TypedFormulaProposalV2
 from featuregen.formula.schema_v3 import TypedFormulaProposalV3
 

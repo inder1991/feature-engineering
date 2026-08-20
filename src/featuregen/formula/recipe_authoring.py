@@ -24,6 +24,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from featuregen.formula.authoring_result_leaves import AuthorityFailure
+
 # The C1 slot→field mapping, the empty-fact projection and the fail-closed attribution come from
 # the LIVE v2 reader rather than being restated: ``authoring_v2`` is the one place that mapping
 # lives, and a frozen reader that disagreed with the live one about what a fact IS would be a second
@@ -49,7 +51,6 @@ from featuregen.formula.measure_facts import (
 from featuregen.formula.operations_v2 import operation_rule
 from featuregen.formula.output_authority import ExprFacts
 from featuregen.formula.output_authority_v2 import OperandFactsV2
-from featuregen.formula.result import AuthorityFailure
 from featuregen.formula.schema import (
     DiffBody,
     RatioBody,

@@ -10,6 +10,11 @@ from typing import Any, Literal, cast
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID, author_formula
+from featuregen.formula.authoring_result_leaves import (
+    DISPOSITION_POLICY_VERSION,
+    AuthoringAxes,
+    AuthorityFailure,
+)
 from featuregen.formula.capability import (
     CAPABILITY_POLICY_VERSION,
     classify_formula_capability,
@@ -43,13 +48,7 @@ from featuregen.formula.replay_trace import (
     load_verified_checkpoint,
     open_authoring_run,
 )
-from featuregen.formula.result import (
-    DISPOSITION_POLICY_VERSION,
-    AuthoringAxes,
-    AuthoringResult,
-    AuthorityFailure,
-    derive_disposition,
-)
+from featuregen.formula.result import AuthoringResult, derive_disposition
 from featuregen.formula.schema import (
     OUTPUT_POLICY_VERSION,
     DiffBody,
