@@ -182,6 +182,43 @@ Each extraction is independently committable and independently green, exactly as
 must NOT happen is deleting a V1 module while a V2 one still imports from it — the reachability
 measurement above is the check, and it should be re-run before every delete.
 
+### 0.4 Stage 4 progress and the honest remainder — 2026-08-20
+
+Extracted so far, each verbatim and each independently green:
+`authoring_result_leaves` · `intent_material` · `canonical_leaves` · `parse_leaves` ·
+`materialize/identifiers` · and `frozen_configuration_v1` (the V1 half moved OUT, leaving the
+shared module clean). Plus the first real deletes: the shadow's unreachable v1 freeze branch and
+`recipe_authoring`'s v1 tool-runner + validator.
+
+**▲ A mistake worth keeping.** `_tool_registry_material` went out with the v1 freeze functions and
+BOTH freezes hash it — the v2 one broke instantly and took the whole capture path with it
+(`CAPTURE_PERSIST_FAILED` on every shadow run). It is shared: the tool registry is what the model is
+handed, and neither generation may be frozen against a registry it was not shown. The lesson is that
+"lives beside the v1 function" is not evidence of being v1's; only reading who calls it is.
+
+**What is left is no longer cheap.** The remaining V1-language users split three ways:
+
+| | modules | why it is not an extraction |
+|---|---|---|
+| **The V1 compile chain** | `materialize.ir`, `materialize.compile.wiring`, `materialize.physical_types`, `materialize.admission` | they walk a `TypedFormulaV1` body. `compile_ir_v2` is their replacement; they go when V1's `compile_ir` goes |
+| **The V1 authoring stack** | `formula.authoring`, `parse`, `canonical`, `capability`, `critic`, `output_authority`, `result`, `replay_authoring`, `operations`, `tools` | genuinely V1, and held alive by 8 live edges that are V1 BY TYPE |
+| **The V1 expectation registry** | `overlay.upload.recipe_formula_contracts`, `recipe_formula_expectations` | the reviewed v1 blueprints; dead weight since the routing retirement, deletable once `recipe_audit`/`recipe_formula_eval`/`recipe_formula_gate` stop reading them |
+
+**The 8 V1-BY-TYPE edges are the whole remaining gate**, and each needs a decision rather than a
+move: `materialize.resolve` needs `_restore_terminal_result` → `AuthoringResult`;
+`materialize.admission` needs `formula_content_hash(TypedFormulaV1)` and `AuthoringResult`;
+`formula.gold` needs `AuthoringResult` and `proposal_column_refs`; `parse_v2`/`parse_v3` need
+`_build_expected_output`, whose result is walked into `proposal_content_hash_v2` and folded into
+sealed `formula_content_hashes` — so reshaping it re-identifies sealed artifacts, and
+`output_intent_v2` reads its fields with `getattr(..., None)`, meaning a rename would silently yield
+`unit=None` while still reporting the expectation as present rather than raising.
+
+**One question deliberately NOT answered here.** `overlay.upload.recipe_formula_eval` stamps V1's
+`OPERATION_GRAMMAR_VERSION`/`OUTPUT_POLICY_VERSION` into eval runs, and V2 equivalents exist. Both
+are currently `1`, so switching is behaviour-identical TODAY and semantically different — and line
+300 compares a stored `run["operation_grammar_version"]` against the constant. Changing which
+grammar an eval run claims to have been judged under is a governance call, not a refactor.
+
 **§8.6 verified against live on 2026-08-19 (read-only), and its ROW half clears:** the plan says the v1 egress
 byte-freeze cannot be deleted because *"durable work-item rows were sealed against those exact
 bytes"*. `recipe_formula_shadow_work_item` holds **0 rows** on this environment, so there is nothing

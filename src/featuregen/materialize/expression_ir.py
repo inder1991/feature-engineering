@@ -75,7 +75,7 @@ from featuregen.formula.schema_leaves import (
     ParameterRef,
     TypedLiteral,
 )
-from featuregen.formula.schema_v2 import AggregateFunctionV2
+from featuregen.formula.schema_v2 import AggregateExpressionV2, AggregateFunctionV2
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requirement
@@ -104,6 +104,16 @@ from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET, TA
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table_ref
+
+#: What this compiler actually accepts. It was annotated `AggregateExpression` (V1) and has compiled
+#: V2 expressions since `compile_ir_v2` existed — the annotation was simply untrue, and it was the
+#: last thing making the SHARED expression compiler import the V1 language.
+#:
+#: The union rather than a protocol, because the fields read below (`aggregation`, `operand`,
+#: `source_relation`, `filter`, `window`, `second_operand`) are a closed set that both dataclasses
+#: declare. A protocol would accept anything shaped right, including a half-built object from a
+#: caller who forgot a field, and this compiler's whole job is to refuse those by name.
+CompilableExpression = AggregateExpression | AggregateExpressionV2
 
 __all__ = [
     "BODY_PATHS",
@@ -574,7 +584,7 @@ def _governed_availability(
                    if basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG else None))
 
 
-def _operand_type_evidence(conn: DbConn, expr: AggregateExpression) -> OperandTypeEvidence:
+def _operand_type_evidence(conn: DbConn, expr: CompilableExpression) -> OperandTypeEvidence:
     """The governed C1 logical type of THIS expression's operand, or a marker saying why there is
     none (§6, Task 8.1).
 
@@ -769,7 +779,7 @@ def _normalized_filter(node: FilterNode) -> FilterNode:
         node, children=tuple(_normalized_filter(child) for child in node.children))
 
 
-def _normalized_expression(expr: AggregateExpression) -> AggregateExpression:
+def _normalized_expression(expr: CompilableExpression) -> CompilableExpression:
     """``expr`` with every AUTHORING-SIDE logical ref folded to its canonical spelling.
 
     Applied ONCE, at the top of :func:`compile_expression` before the first ``tables.resolve``, so
@@ -856,7 +866,7 @@ def compile_expression(
     conn: DbConn,
     *,
     expr_path: str,
-    expr: AggregateExpression,
+    expr: CompilableExpression,
     grain_keys: Iterable[str],
     roles: Iterable[str] = (),
     inventory: ClusterInventoryV1,
@@ -1367,7 +1377,7 @@ def join_key_ref(catalog_source: str, step_ref: str) -> str:
 
 
 def _refuse_unaccounted(
-    expr: AggregateExpression, grain: tuple[str, ...], expr_path: str, read: frozenset[str]
+    expr: CompilableExpression, grain: tuple[str, ...], expr_path: str, read: frozenset[str]
 ) -> MaterializationRefused | None:
     """§2.1 — every ref reachable from the expression was READ or explicitly classified.
 
