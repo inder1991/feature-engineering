@@ -452,3 +452,68 @@ def test_an_operator_the_RENDERER_CANNOT_EMIT_still_blocks(db, lane):
     draft = read_draft(db, "fd-unsupported")
     assert draft.state is DraftStateV1.BLOCKED
     assert "cannot emit in this build" in draft.blockers[0]["reason"]
+
+
+# ══ RETIREMENT AT THE WORKER BOUNDARY ══════════════════════════════════════════════════════════
+def test_a_DRAFT_RETIRED_BEFORE_THE_WORKER_RUNS_SPENDS_NOTHING(db, lane):
+    """▲ THE SPEND FENCE, end to end. The worker must not pay for a draft somebody withdrew.
+
+    The `lane` fixture counts client construction, so zero is the assertion that matters: not "it
+    finished quickly" but that no provider was reached at all.
+    """
+    from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+    _request_and_enqueue(db, "fd-retired-early", "m-retired-early")
+    retire_formula_draft(db, "fd-retired-early", reason="WITHDRAWN", retired_by="ops@bank")
+
+    outcome = process_formula_draft_once(db, owner="w")
+
+    assert outcome.status == "retired", outcome
+    assert lane["n"] == 0, "a withdrawn draft must not reach a provider"
+
+
+def test_a_RETIRED_DRAFTS_QUEUE_ITEM_IS_DONE_not_left_leased(db, lane):
+    """▲ IT USED TO STAY LEASED. `DraftRetired` fell through to the generic handler, which called
+    `_terminalize` -> `advance` -> `DraftRetired` again, raised OUT of the handler — so the queue
+    item was never completed and was redelivered after its lease expired, to do the same thing."""
+    from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+    _request_and_enqueue(db, "fd-retired-queue", "m-retired-queue")
+    retire_formula_draft(db, "fd-retired-queue", reason="WITHDRAWN", retired_by="ops@bank")
+
+    process_formula_draft_once(db, owner="w")
+
+    assert db.execute(
+        "SELECT status FROM queue WHERE message_id = %s",
+        ("m-retired-queue",)).fetchone()[0] == "done"
+
+
+def test_a_RETIRED_DRAFT_KEEPS_ITS_OWN_STATE(db, lane):
+    """The draft is NOT written to FAILED. It was retired, which is the answer; a FAILED verdict
+    would replace an operator's decision with a statement about the candidate — and the candidate
+    was never the problem."""
+    from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+    _request_and_enqueue(db, "fd-retired-state", "m-retired-state")
+    before = read_draft(db, "fd-retired-state").state
+    retire_formula_draft(db, "fd-retired-state", reason="WITHDRAWN", retired_by="ops@bank")
+
+    process_formula_draft_once(db, owner="w")
+
+    after = read_draft(db, "fd-retired-state")
+    assert after.state is before, "the worker must not overwrite the state"
+    assert after.is_retired is True
+
+
+# ▲ NOT COVERED HERE, AND SAID SO RATHER THAN FAKED: that `_sync_from_trace` RE-RAISES
+# `DraftRetired` instead of swallowing it. That callback opens its OWN connection and returns early
+# when no DSN is configured, so exercising it needs committed cross-connection state — and making
+# this suite's rolled-back fixtures durable leaks seeded rows into every test after it (it produced
+# "considered revision crev-1 has inconsistent generation lineage" three tests later).
+#
+# What IS covered: the three worker tests above (retired outcome, queue completed, state untouched,
+# zero provider calls) and `test_formula_draft_retirement.py`'s two-connection race, which proves
+# `advance` blocks on an in-flight retirement and refuses a visible one. What is NOT proved
+# automatically is the ORDERING — that the raise reaches the authoring loop BETWEEN turns. Closing
+# it wants the durable-DSN pattern `test_fenced_replay_integration.py` uses, with the same explicit
+# cleanup of append-only evidence.

@@ -251,3 +251,82 @@ def test_THE_ROUTED_MESSAGE_IS_CLAIMABLE_BY_THE_DRAFT_LANE(client, conn, enginee
     claimed = claim_formula_draft(conn, owner="draft-lane")
     assert claimed is not None, "the relay did not turn the outbox message into claimable work"
     assert claimed.payload["formula_draft_id"] == body["formula_draft_id"]
+
+
+# ══ A RETIRED IDENTITY IS A CONSIDERED REFUSAL, NOT A CRASH ════════════════════════════════════
+def test_REQUESTING_A_RETIRED_IDENTITY_IS_409_not_500(client, conn, engineer_headers):
+    """▲ `request_draft` raises `DraftRetired` deliberately, and the route caught nothing — so the
+    global handler turned a considered refusal into "Internal Server Error", telling a caller the
+    platform had broken rather than that they asked for something withdrawn.
+
+    409 rather than 422: the request is well-formed and would have been valid yesterday. What
+    conflicts is the state of the world.
+    """
+    from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+    _revision(conn)
+    first = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                        headers=engineer_headers).json()
+    retire_formula_draft(conn, first["formula_draft_id"], reason="SCHEMA_CONTRACT_MISMATCH",
+                         detail="manifest 3, formula 2", retired_by="ops@bank")
+
+    response = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                           headers=engineer_headers)
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "FORMULA_DRAFT_RETIRED"
+    assert detail["retired_draft_id"] == first["formula_draft_id"]
+    assert detail["reason"] == "SCHEMA_CONTRACT_MISMATCH"
+    # WHICH inputs must change — `formula_identity_hash` is unique, so a new draft id lands on the
+    # same row and "try again" is not actionable without this list.
+    assert "authoring_config_hash" in detail["identity_bearing_inputs"]
+    assert "identity" in detail["remedy"]
+
+
+def test_THE_409_NAMES_THE_REPLACEMENT_when_there_is_one(client, conn, engineer_headers):
+    """"Use that one instead" is usually the answer somebody actually needs."""
+    from featuregen.overlay.upload.formula_draft_store import (
+        record_draft_replacement,
+        retire_formula_draft,
+    )
+
+    _revision(conn)
+    first = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                        headers=engineer_headers).json()["formula_draft_id"]
+    # The replacement is a draft with a DIFFERENT identity — which is exactly what regenerating
+    # after a retirement produces, since a new draft id alone would collide on the same identity.
+    from featuregen.overlay.upload.formula_draft_store import request_draft
+
+    replacement, _created = request_draft(
+        conn, formula_draft_id="fd-replacement", considered_revision_id="crev-1",
+        option_id="opt-a", planning_request_hash="p", catalog_snapshot_hash="c",
+        authoring_config_hash="a-corrected", definition_revision="",
+        requested_by="ops@bank", requested_at="t")
+    retire_formula_draft(conn, first, reason="CANDIDATE_SUPERSEDED", retired_by="ops@bank")
+    record_draft_replacement(conn, first, replacement_draft_id=replacement)
+
+    response = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                           headers=engineer_headers)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["replacement_draft_id"] == replacement
+
+
+def test_THE_POLLING_ROUTE_REPORTS_RETIREMENT(client, conn, engineer_headers):
+    """A card rendered from `state` alone said "Formula ready" about a withdrawn draft."""
+    from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+    _revision(conn)
+    draft_id = client.post(DRAFT_PATH.format(rev="crev-1", opt="opt-a"),
+                           headers=engineer_headers).json()["formula_draft_id"]
+    retire_formula_draft(conn, draft_id, reason="WITHDRAWN", detail="not needed",
+                         retired_by="ops@bank")
+
+    body = client.get(f"/formula-drafts/{draft_id}", headers=engineer_headers).json()
+
+    assert body["retired"] is True
+    assert body["stage"] == "Retired"
+    assert body["terminal"] is True, "a retired draft is not still in flight"
+    assert body["retirement"]["reason"] == "WITHDRAWN"
+    assert body["retirement"]["retired_by"] == "ops@bank"

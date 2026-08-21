@@ -30,10 +30,17 @@ import sys
 #: ▲ An entry here is an ASSERTION that somebody looked. Anything not listed fails the check, which
 #: is the point: a database genuinely ahead of the code looks exactly like this, and the difference
 #: is whether a human has explained the row.
-ACKNOWLEDGED_LEDGER_ROWS: dict[str, str] = {
-    "1010_multisource_assembly_shadow":
-        "renamed to 1019_multisource_assembly_shadow by 86cc8b8f when main advanced to 1018; both "
-        "names are in the ledger, applied 2026-07-22, and 1019 is the one this build carries",
+#: Each entry pins the EXACT checksum that was acknowledged, plus the migration that replaced it.
+#: Accepting the name alone would clear any row that happened to share it — an unrelated database
+#: carrying different SQL under the old name would pass the check that exists to notice exactly
+#: that. The name is what a rename leaves behind; the checksum is what identifies the bytes.
+ACKNOWLEDGED_LEDGER_ROWS: dict[str, tuple[str, str, str]] = {
+    "1010_multisource_assembly_shadow": (
+        "8ff56402d7a433d271e1830b3db743be3e6baa3020aad632c3aada659a55a4bc",
+        "1019_multisource_assembly_shadow",
+        "renamed by 86cc8b8f when main advanced to 1018; both names are in the ledger, applied "
+        "2026-07-22, and 1019 is the one this build carries",
+    ),
 }
 
 
@@ -100,19 +107,25 @@ def main(argv: list[str] | None = None) -> int:
     # divergence, and without it the verifier would report "no checksum drift" against `main` while
     # silently ignoring 1090-1096 — the database ahead of the code, which is the more dangerous
     # direction because nothing downstream would mention it either.
-    unexpected = sorted(
-        name for name in ledger
-        if name not in expected and name not in ACKNOWLEDGED_LEDGER_ROWS)
-    acknowledged = sorted(
-        name for name in ledger
-        if name not in expected and name in ACKNOWLEDGED_LEDGER_ROWS)
+    unexpected, acknowledged = [], []
+    for name, checksum in sorted(ledger.items()):
+        if name in expected:
+            continue
+        known = ACKNOWLEDGED_LEDGER_ROWS.get(name)
+        # The CHECKSUM must match, and the named replacement must actually be present — an
+        # acknowledgement whose replacement this build does not carry is not an explanation.
+        if known and known[0] == checksum and known[1] in expected:
+            acknowledged.append(name)
+        else:
+            unexpected.append(name)
 
     print(f"ledger rows: {len(ledger)} | migrations this build would apply: {len(expected)}")
     print(f"not yet applied here: {len(not_applied)}"
           + (f" ({not_applied[:5]}…)" if not_applied else ""))
 
     for name in acknowledged:
-        print(f"known extra ledger row: {name} — {ACKNOWLEDGED_LEDGER_ROWS[name]}")
+        _checksum, replacement, why = ACKNOWLEDGED_LEDGER_ROWS[name]
+        print(f"known extra ledger row: {name} -> {replacement} — {why}")
 
     if unexpected:
         print(f"\n▲ {len(unexpected)} UNEXPLAINED LEDGER ROWS THIS BUILD DOES NOT HAVE:")

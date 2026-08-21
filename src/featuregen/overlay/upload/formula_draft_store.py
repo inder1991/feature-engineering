@@ -187,6 +187,26 @@ class FormulaDraftV1:
         }[self.state]
 
 
+#: Serializes a draft's TRANSITIONS against its RETIREMENT. `pg_advisory_xact_lock` releases on
+#: commit or rollback, so nothing has to unlock it, and the key is the draft — two different drafts
+#: never contend.
+#:
+#: ▲ WHY A LOCK AND NOT JUST `WHERE NOT EXISTS`. That predicate is evaluated under the statement's
+#: SNAPSHOT, so an UNCOMMITTED concurrent retirement is invisible to it — and the FK lock the
+#: retirement takes on `formula_draft` is compatible with a non-key update of the same row. An
+#: advance overlapping an in-flight retirement could therefore still commit. The predicate remains
+#: (it is what refuses an already-visible retirement); the lock is what makes "overlapping" mean
+#: "one of them goes first".
+_DRAFT_LOCK_NAMESPACE = 0x0FD1
+
+
+def _lock_draft(conn: DbConn, formula_draft_id: str) -> None:
+    """Take the draft's transaction lock. Both a transition and a retirement must hold it, or the
+    one that does not is exactly the race the other is trying to lose."""
+    conn.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                 (_DRAFT_LOCK_NAMESPACE, formula_draft_id))
+
+
 def formula_identity(
     *,
     considered_revision_id: str,
@@ -329,6 +349,7 @@ def advance(
             stage would produce a READY draft whose trace never records a critic, and nothing
             downstream could tell.
     """
+    _lock_draft(conn, formula_draft_id)
     row = conn.execute(
         "SELECT d.state, r.reason FROM formula_draft d "
         "LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
@@ -354,6 +375,12 @@ def advance(
             f"Re-authoring is a NEW request against a new identity, never a step backwards")
 
     # ▲ THE FENCE RIDES THE UPDATE, and the read above is only the cheap check.
+    #
+    # THE CONTRACT, stated exactly: a retirement and a transition for one draft cannot overlap,
+    # because both take `_lock_draft` first — whichever arrives second sees the other's committed
+    # result. What this does NOT do is abort a provider call already in flight: an authorized turn
+    # finishes, and the retirement stops the NEXT one. That is the honest boundary of a fence made
+    # of database state, and it is where the progress callback's own check earns its place.
     #
     # Reading retirement and then writing in a second statement leaves a window: a retirement that
     # commits between them is invisible to the read and unopposed by the write, so the very
@@ -474,6 +501,7 @@ def retire_formula_draft(
 
     Idempotent on the draft: retiring twice is not two facts.
     """
+    _lock_draft(conn, formula_draft_id)
     inserted = conn.execute(
         "INSERT INTO formula_draft_retirement (formula_draft_id, reason, detail, "
         "replacement_draft_id, retired_by) VALUES (%s, %s, %s, %s, %s) "

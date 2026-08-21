@@ -75,11 +75,24 @@ def test_an_ACKNOWLEDGED_ROW_IS_EXPLAINED_not_failed(tmp_path, capsys):
     reported with its reason and passes; anything unexplained still fails."""
     from scripts.verify_migration_ledger import ACKNOWLEDGED_LEDGER_ROWS
 
-    known = next(iter(ACKNOWLEDGED_LEDGER_ROWS))
-    ledger = {**_expected(), known: hashlib.sha256(b"whatever").hexdigest()}
+    known, (checksum, _replacement, _why) = next(iter(ACKNOWLEDGED_LEDGER_ROWS.items()))
+    ledger = {**_expected(), known: checksum}
 
     assert main(["--ledger-file", str(_ledger_file(tmp_path, ledger))]) == 0
     assert f"known extra ledger row: {known}" in capsys.readouterr().out
+
+
+def test_an_ACKNOWLEDGED_NAME_WITH_DIFFERENT_BYTES_STILL_FAILS(tmp_path, capsys):
+    """▲ The acknowledgement pins the CHECKSUM, not just the name. Accepting the name alone would
+    clear any row that happened to share it — an unrelated database carrying different SQL under
+    the old name would pass the very check that exists to notice exactly that."""
+    from scripts.verify_migration_ledger import ACKNOWLEDGED_LEDGER_ROWS
+
+    known = next(iter(ACKNOWLEDGED_LEDGER_ROWS))
+    ledger = {**_expected(), known: hashlib.sha256(b"different bytes entirely").hexdigest()}
+
+    assert main(["--ledger-file", str(_ledger_file(tmp_path, ledger))]) == 1
+    assert "UNEXPLAINED LEDGER ROWS" in capsys.readouterr().out
 
 
 def test_a_MIGRATION_NOT_YET_APPLIED_IS_NOT_A_FAILURE(tmp_path, capsys):

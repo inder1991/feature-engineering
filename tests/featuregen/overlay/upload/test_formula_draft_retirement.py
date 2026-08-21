@@ -11,6 +11,7 @@ import psycopg
 import pytest
 
 from featuregen.overlay.upload.formula_draft_store import (
+    DraftRetired,
     RetirementDisagreement,
     record_draft_replacement,
     retire_formula_draft,
@@ -223,3 +224,60 @@ def test_THE_READ_CARRIES_RETIREMENT_so_no_caller_can_forget_to_ask(db):
     assert draft.retirement.detail == "the candidate moved"
     assert draft.retirement.retired_by == "ops@bank"
     assert draft.retirement.retired_at
+
+
+# ══ THE FENCE UNDER CONCURRENCY ════════════════════════════════════════════════════════════════
+def test_a_TRANSITION_CANNOT_OVERLAP_AN_IN_FLIGHT_RETIREMENT(db, _dsn):
+    """▲ THE RACE `WHERE NOT EXISTS` ALONE DOES NOT CLOSE, proved with two real connections.
+
+    That predicate is evaluated under the statement's SNAPSHOT, so an UNCOMMITTED retirement is
+    invisible to it — and the FK lock a retirement takes on `formula_draft` is compatible with a
+    non-key update of the same row. Without `_lock_draft`, the advance below would simply commit
+    while the retirement was in flight.
+
+    The proof is that it BLOCKS: with the retirement holding the draft's lock and uncommitted, the
+    advance cannot proceed, and a short `statement_timeout` turns "blocked" into an observable
+    fact. Once the retirement commits, the same advance is refused outright.
+    """
+    import psycopg
+
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    _draft(db, "fd-race")
+    db.commit()
+
+    try:
+        with psycopg.connect(_dsn) as retiring, psycopg.connect(_dsn) as advancing:
+            # A: retire, and HOLD the transaction open.
+            retire_formula_draft(retiring, "fd-race", reason="WITHDRAWN", retired_by="ops@bank")
+
+            # B: the advance must not slip past an in-flight retirement.
+            advancing.execute("SET statement_timeout = '750ms'")
+            with pytest.raises(psycopg.errors.QueryCanceled):
+                advance(advancing, "fd-race", DraftStateV1.AUTHORING)
+            advancing.rollback()
+
+            retiring.commit()
+
+            # And once it IS visible, the refusal is the ordinary one.
+            advancing.execute("SET statement_timeout = 0")
+            with pytest.raises(DraftRetired):
+                advance(advancing, "fd-race", DraftStateV1.AUTHORING)
+            advancing.rollback()
+    finally:
+        # Both tables refuse DELETE by trigger — correctly. This is TEST evidence in a durable
+        # database, so it is removed the way `test_fenced_replay_integration` removes its own:
+        # disable, delete, re-enable. Production never does this, which is why it is confined to a
+        # `finally` in a test that needed a real second connection to exist at all.
+        with psycopg.connect(_dsn, autocommit=True) as cleanup:
+            cleanup.execute("ALTER TABLE formula_draft_retirement DISABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("DELETE FROM formula_draft_retirement WHERE formula_draft_id = %s",
+                            ("fd-race",))
+            cleanup.execute("ALTER TABLE formula_draft_retirement ENABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("ALTER TABLE formula_draft DISABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
+            cleanup.execute("DELETE FROM formula_draft WHERE formula_draft_id = %s", ("fd-race",))
+            cleanup.execute("ALTER TABLE formula_draft ENABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
