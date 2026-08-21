@@ -19,7 +19,9 @@
 -- ONE RETIREMENT PER DRAFT. The primary key is the draft id: retiring twice is not two facts, and a
 -- second row would let two reasons and two replacements disagree about one draft.
 --
--- NOT APPLIED. This file is written, not run.
+-- APPLIED to the live kind cluster on 2026-08-21 (192 migrations). Backup taken first:
+-- ~/featuregen-backups/featuregen-pre-1096-20260821-161831.sql (134M), dump -> scratch
+-- restore -> dry run -> probe -> live.
 
 CREATE TABLE IF NOT EXISTS formula_draft_retirement (
     formula_draft_id     text PRIMARY KEY REFERENCES formula_draft (formula_draft_id),
