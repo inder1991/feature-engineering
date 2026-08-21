@@ -454,10 +454,12 @@ never-reached-READY refusal are all on that same production path.
 place: *"a V3 run CAPTURES the author's intent and stops. Resolving the output policy against C1's
 governed facts is S5's."* That is right — `compile_generation_v2` resolves it. But `needs_authority`
 folds to `NEEDS_REVIEW` unconditionally, and `admit_artifacts_v2` called V1's `_require_resolved`,
-which demands `RESOLVED`. **No V3 formula could ever be admitted.** Nothing caught it because
-nothing had ever put a V3 proposal through admission: of the two places in the whole suite that
-spell `formula_schema_version: 3`, one is a parser test and the other builds `AdmittedFeatureV2` BY
-HAND. Every stage downstream had only ever been exercised against artifacts that skipped this gate.
+which demands `RESOLVED`. **No V3 formula could ever be admitted.** ▲ **CORRECTION to what this plan first recorded.** It said "only two places in the suite spell
+`formula_schema_version: 3`". That was wrong — it came from grepping ONE exact JSON spelling and
+generalising it into a claim about V3 coverage. At least twelve test files referenced V3 constructs.
+The accurate and more useful statement is: **no test drove a V3 proposal through restore and real
+admission into the production generation worker.** That is the coverage gap, and it is why every
+stage downstream of admission had only ever been exercised against artifacts built by hand.
 
 The fix asks the FOLD rather than adding a second list of conditions: re-fold the recorded axes with
 the output axis set to what S5 will establish, and admit only if the answer is `RESOLVED`. A run
@@ -466,6 +468,36 @@ mismatched expectation, an invalid structure or a technical failure is still ref
 precedence chain that produced the original verdict. **This is a change to a GOVERNANCE gate and is
 flagged for ratification** — the alternative reading (that V3 authoring should resolve its own
 output) contradicts C-A7 and would record a stage that never ran as having run and agreed.
+
+**STEP 4 AMENDED AFTER REVIEW (2026-08-21).** The review approved keeping output authority in the
+compiler and rejected marking step 4 complete, for three reasons, all correct:
+
+1. **The exception was not V3-gated.** `_require_admissible_disposition` took only the terminal
+   event, so it could not ask what language it held — and `needs_authority` is reachable from a
+   **V2** run whose governed-facts read fails closed (`replay_authoring_v2.py:909`). The first fix
+   therefore admitted exactly the case the rule exists to refuse.
+2. **`NEEDS_REVIEW` was carrying two meanings** — "a human must look" and "the compiler has not run
+   yet" — so a queue or screen would show "Needs review" while a worker legitimately proceeded
+   without any review.
+3. **The negative cases were missing.**
+
+Amended: `deferred_to_compiler` is now a distinct OUTPUT STATUS that only the V3 branch writes, and
+`READY_FOR_OUTPUT_BINDING` a distinct DISPOSITION the fold returns for it — conditioned on nothing
+else being outstanding. Admission authenticates the proposal FIRST and then requires all seven of:
+V3 proposal, that disposition, exactly that axis, an `output_intent` derived from THIS proposal, no
+`candidate_output`, and a re-fold to `RESOLVED`. **V2 `needs_authority` is refused, and that is now
+its own test.**
+
+**Two more production defects surfaced by the required cases:**
+
+* `pilot_v2` read `output.code` off an `InvalidOutputV2`, which carries `reason`/`path`/`detail`.
+  The REFUSAL PATH ITSELF raised `AttributeError`, so a governed output failure became an unknown
+  fault — which the lane reads as TRANSIENT and retries forever. The one line that reports why a
+  feature cannot be published could never run.
+* The gate built `AuthoringAxesV2(critic_status=...)`, but that type has `review` WHERE V1 has
+  `critic_status`, and `_fold_v2` folds the v1-shaped projection. Every deterministic
+  reviewed-blueprint run was therefore inadmissible — a typo in the caller reported as a verdict
+  about the run.
 
 **Found during execution, and not in the plan when it was written:**
 

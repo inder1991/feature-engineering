@@ -104,7 +104,11 @@ GENERATION_FLAG = "FEATUREGEN_GENERATION_V2_ENABLED"
 #: redelivery. Retrying them burns the attempt budget to reach the same answer later, so they
 #: dead-letter immediately with their reason. `MaterializationRefused` is deliberately NOT here: a
 #: governed refusal is a PRODUCT answer that terminalizes the request as REFUSED, not a fault.
-_DETERMINISTIC = (ValueError, TypeError, KeyError)
+#: `AttributeError` is here because it is the shape a mis-wired refusal path takes — reading a
+#: field the object does not have — and it fails identically on every redelivery. Classifying it as
+#: transient would retry a programming error until the attempt budget ran out, which is exactly what
+#: happened when `pilot_v2` read `.code` off an `InvalidOutputV2`.
+_DETERMINISTIC = (ValueError, TypeError, KeyError, AttributeError)
 
 __all__ = [
     "GENERATION_HANDLER",

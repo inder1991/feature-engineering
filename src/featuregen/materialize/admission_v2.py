@@ -67,6 +67,12 @@ __all__ = [
 #: `admission` module because what counts as ADMISSIBLE now differs between the two languages,
 #: and a shared constant beside two different rules reads as a shared rule.
 _RESOLVED = "RESOLVED"
+#: V3's terminal state when the only outstanding step is the compiler's output binding.
+_READY_FOR_OUTPUT_BINDING = "READY_FOR_OUTPUT_BINDING"
+#: The output axis that means "not asked yet", as opposed to `needs_authority`'s
+#: "asked, and the governed read failed". Admission distinguishes them; nothing else may
+#: collapse them back.
+_DEFERRED_OUTPUT = "deferred_to_compiler"
 
 #: The wire versions of the Formula-V2 LANGUAGE. Two members, not a floor: a version 4 nobody has
 #: defined must be refused rather than admitted by an inequality that happened to be open-ended.
@@ -222,12 +228,17 @@ def _admit_one_v2(
 
     event = _terminal_event(conn, run_id)                        # 1 — shared with v1
     _verify_payload_hash(event, run_id)                          # 2 — shared with v1
-    _require_admissible_disposition(event, run_id)               # 3 — V3-aware
-    proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 4
-    _verify_language_version(proposal, run_id)                   # 4b
+    # ▲ AUTHENTICATE THE PROPOSAL BEFORE JUDGING THE DISPOSITION. The disposition check below
+    # grants an exception that is V3's ALONE, so it must be able to ask what language this is — and
+    # the only trustworthy answer comes from a proposal whose hash has been proven against the
+    # immutable trace. Asking earlier would decide a governed question from an unauthenticated
+    # artifact.
+    proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 3
+    _verify_language_version(proposal, run_id)                   # 4
     _verify_axes_v2(event, result, run_id)                       # 5
-    _verify_intent_hash_v2(conn, item.intent, run_id)            # 6
-    kinds = _verify_advertised(conn, proposal, run_id, engine_id=engine_id)  # 7 (S13)
+    _require_admissible_disposition(event, result, proposal, run_id)        # 6
+    _verify_intent_hash_v2(conn, item.intent, run_id)            # 7
+    kinds = _verify_advertised(conn, proposal, run_id, engine_id=engine_id)  # 8 (S13)
 
     return AdmittedFeatureV2(
         feature_name=hive_identifier(item.intent.name),
@@ -244,63 +255,91 @@ def _admit_one_v2(
     )
 
 
-# ── 3. the disposition ADMITS, which for V3 is not the same as RESOLVED ──────────────────────────
-def _require_admissible_disposition(event: _trace.TerminalEvent, run_id: str) -> None:
+# ── 6. the disposition ADMITS, which for V3 is not the same as RESOLVED ──────────────────────────
+def _require_admissible_disposition(
+    event: _trace.TerminalEvent,
+    result: AuthoringResultV2,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+    run_id: str,
+) -> None:
     """``NOT_RESOLVED`` unless the run's verdict permits compilation.
 
-    ▲ **WHY THIS IS NOT V1's `_require_resolved`, AND WHY THE V3 CHAIN WAS BROKEN WITHOUT IT.**
+    ▲ **WHY THIS IS NOT V1's `_require_resolved`.** V1 and V2 resolve OUTPUT AUTHORITY during
+    authoring, so `RESOLVED` there means every question was answered. **V3 deliberately does not.**
+    A V3 run validates the formula, captures the author's intent and records review evidence;
+    resolving governed output type, unit, currency and additivity is the COMPILER's (C-A7), and
+    emitting `OUTPUT_POLICY_RESOLVED` at authoring time would claim governed metadata had been
+    consulted when nothing had consulted it. Such a run terminates `READY_FOR_OUTPUT_BINDING`.
 
-    V1 and V2 resolve OUTPUT AUTHORITY during authoring, so `RESOLVED` there means "every question
-    was answered". **V3 deliberately does not.** `replay_authoring_v2` terminates a V3 run with
-    ``output_status="needs_authority"`` and says why in place: *"a V3 run CAPTURES the author's
-    intent and stops. Resolving the output policy against C1's governed facts is S5's, and emitting
-    OUTPUT_POLICY_RESOLVED here would represent a stage that has not run as having run and
-    agreed."* That is correct — the compiler resolves it, via `resolve_output_v2` in
-    `compile_generation_v2`.
+    **THE EXCEPTION IS V3's ALONE, and that is checked rather than assumed.** A V2 run reaches an
+    unresolved output too — `replay_authoring_v2` folds `needs_authority` when its governed-facts
+    read fails CLOSED — and that is a genuine failure a human must look at, not a deferral. An
+    earlier version of this function took only the terminal event, could not ask what language it
+    was holding, and therefore admitted exactly that: a V2 run whose authority lookup had failed.
+    The two are now different values on the axis AND different dispositions, and this function
+    additionally requires the authenticated proposal to be V3 before granting anything.
 
-    The consequence was that the two rules contradicted each other. ``needs_authority`` folds to
-    ``NEEDS_REVIEW`` unconditionally, and admission demanded ``RESOLVED``, so **no V3 formula could
-    ever be admitted**. Nothing caught it because nothing had ever put a V3 proposal through
-    admission: of the two places in the suite that spell ``formula_schema_version: 3``, one is a
-    parser test and the other builds `AdmittedFeatureV2` BY HAND. Every stage downstream was
-    exercised against artifacts that skipped this gate.
+    Every condition, and none of them redundant:
 
-    **The test is the FOLD's own, not a second list of conditions.** Re-fold the recorded axes with
-    the output axis set to what S5 will establish, and require the answer to be ``RESOLVED``. So a
-    run whose only unmet axis is the one V3 defers by design is admitted, and a run that ALSO has a
-    blocking critic, a mismatched expectation, an invalid structure or a technical failure is still
-    refused — by the same precedence chain that produced the original verdict, which cannot drift
-    from it because it IS it.
-
-    A deferred output is the ONLY deferral. ``invalid_output`` and ``external_requirement`` are not
-    "the compiler will handle it": the first says the declared output is wrong and the second says
-    something outside this run must happen first, and neither becomes true later on its own.
+    1. the proposal is `TypedFormulaProposalV3` — the language whose contract defers;
+    2. the disposition is `READY_FOR_OUTPUT_BINDING`;
+    3. the output axis is exactly `deferred_to_compiler` — never `needs_authority`,
+       `external_requirement` or `invalid_output`, none of which become true later on their own;
+    4. an `output_intent` exists — the thing the compiler reconciles against;
+    5. that intent was derived from THIS proposal, not carried over from another;
+    6. no `candidate_output` — a deferred run carrying an authoritative output has laundered a
+       guess into authority;
+    7. re-folding the RECORDED axes yields `RESOLVED` once the output axis is resolved, so a
+       payload whose disposition disagrees with its own axes is refused rather than believed.
     """
     disposition = _payload_field(event, "authoring_disposition")
     if disposition == _RESOLVED:
         return
-    if disposition == "NEEDS_REVIEW" and _only_the_deferred_output_is_unmet(event):
+    if disposition == _READY_FOR_OUTPUT_BINDING and _is_v3_deferral(event, result, proposal):
         return
     raise MaterializationRefused(
         CompilationRefusalCode.NOT_RESOLVED,
         f"the terminal {event.kind} event of authoring run {run_id} records "
-        f"authoring_disposition={disposition!r}, not {_RESOLVED} — and its unmet axes are not "
-        f"only the output authority a V3 run defers to compilation",
+        f"authoring_disposition={disposition!r}, which is neither {_RESOLVED} nor a V3 run whose "
+        f"only outstanding step is the governed output binding the compiler performs",
     )
 
 
-def _only_the_deferred_output_is_unmet(event: _trace.TerminalEvent) -> bool:
+def _is_v3_deferral(
+    event: _trace.TerminalEvent,
+    result: AuthoringResultV2,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+) -> bool:
+    """Conditions 1-7 above. Any one of them false refuses, and none is inferred from another."""
+    from featuregen.formula.result_v2 import _content_hash
+    from featuregen.formula.schema_v3 import TypedFormulaProposalV3 as _V3
+
+    if not isinstance(proposal, _V3):                                          # 1
+        return False
+    if _payload_field(event, "output_status") != _DEFERRED_OUTPUT:             # 3
+        return False
+    intent = result.output_intent                                              # 4
+    if intent is None:
+        return False
+    derived_from = getattr(intent, "derived_from_proposal_hash", None)         # 5
+    if not derived_from or derived_from != _content_hash(proposal):
+        return False
+    if result.candidate_output is not None:                                    # 6
+        return False
+    return _refolds_to_resolved(event)                                         # 7
+
+
+def _refolds_to_resolved(event: _trace.TerminalEvent) -> bool:
     """Would this run be ``RESOLVED`` if its output authority were established?
 
-    Asked of :func:`_fold_v2` directly, over the axes the terminal event recorded — which step 2
-    has already proven authentic against the payload's own digest, so these are the run's real axes
-    rather than a caller's account of them.
+    Asked of :func:`_fold_v2` DIRECTLY, over the axes the terminal event recorded — which check 2
+    has already proven authentic against the payload's own digest — rather than by restating the
+    fold's precedence as a second list of conditions here. A second list is a second rule, and the
+    two would disagree the first time either moved.
     """
     from featuregen.formula.replay_authoring_v2 import _axes, _restore_review
     from featuregen.formula.result_v2 import AuthoringAxesV2, _fold_v2
 
-    if _payload_field(event, "output_status") != "needs_authority":
-        return False
     shared = dict(
         structural_status=_payload_field(event, "structural_status"),
         capability_status=_payload_field(event, "capability_status"),
@@ -311,13 +350,19 @@ def _only_the_deferred_output_is_unmet(event: _trace.TerminalEvent) -> bool:
     )
     try:
         # WHICH AXES SHAPE, decided the way the RESTORER decides it (`_restore_terminal_result`):
-        # a run with a recorded `review` folded through the V2 axes and a run without it through
+        # a run with a recorded `review` folds through the V2 axes and a run without it through
         # V1's. Choosing wrongly is not a near miss — the v1-shaped builder REJECTS a bypass's
         # `critic_status=None`, so a single shape here would fail closed on exactly one of the two
         # legitimate paths and read as "this run is inadmissible".
         review = _restore_review(_payload_field(event, "review"))
-        axes = (AuthoringAxesV2(review=review,
-                                critic_status=_payload_field(event, "critic_status"), **shared)
+        # ▲ `AuthoringAxesV2` has `review` WHERE V1 HAS `critic_status` — not in addition to it —
+        # and `_fold_v2` folds the V1-SHAPED projection, exactly as `derive_disposition_v2` does
+        # (`axes = axes.shared_axes()` before folding). A bypass projects to "clean" for folding
+        # only, which is what makes the deterministic path foldable at all. Getting either half
+        # wrong here does not misjudge a run — it raises, and this function turns a raise into a
+        # refusal, so every reviewed-blueprint run would read as inadmissible for a reason that is
+        # a typo in the caller rather than anything about the run.
+        axes = (AuthoringAxesV2(review=review, **shared).shared_axes()
                 if review is not None
                 else _axes(critic_status=_payload_field(event, "critic_status"), **shared))
     except (TypeError, ValueError):

@@ -182,7 +182,12 @@ def compile_generation_v2(
         if isinstance(output, InvalidOutputV2):
             return MaterializationRefused(
                 CompilationRefusalCode.OUTPUT_TYPE_NOT_GOVERNED,
-                f"{feature.feature_name}: {output.code} at {output.path} — {output.detail}")
+                # `.reason`, not `.code` — `InvalidOutputV2` carries reason/path/detail. It said
+                # `.code` until a build was driven through a REAL output-authority failure, and the
+                # refusal path itself then raised AttributeError: a governed refusal became an
+                # unknown fault, which the generation lane reads as TRANSIENT and retries forever.
+                # The one line that reports why a feature cannot be published could never run.
+                f"{feature.feature_name}: {output.reason} at {output.path} — {output.detail}")
 
         # AND THEN RECONCILED against what the author declared. Resolving alone answers "what do the
         # governed facts permit"; it does not answer "does that agree with what the author said this

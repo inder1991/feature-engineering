@@ -39,16 +39,44 @@ DISPOSITION_POLICY_VERSION = 1
 
 StructuralStatus = Literal["ok", "invalid_formula", "unsupported_operation"]
 CapabilityStatus = Literal["ok", "unsupported_capability"]
-OutputStatus = Literal["resolved", "needs_authority", "invalid_output", "external_requirement"]
+#: ``deferred_to_compiler`` is V3's, and ONLY V3's. A V3 run validates the formula and captures the
+#: author's intent; resolving governed output type, unit, currency and additivity is the COMPILER's
+#: (C-A7), so the axis records that the question is not yet asked rather than unanswerable.
+#:
+#: ▲ It is a SEPARATE value from ``needs_authority`` because the two mean opposite things. A V1/V2
+#: run reaching ``needs_authority`` FAILED to establish authority — its governed-facts read failed
+#: closed — and must be reviewed by a human. A V3 run reaching ``deferred_to_compiler`` succeeded at
+#: everything it owns. Collapsing them would make "no human has looked at this" and "the next stage
+#: has not run yet" the same recorded fact, and a reader could not tell a working pipeline from a
+#: stalled one.
+OutputStatus = Literal[
+    "resolved", "needs_authority", "invalid_output", "external_requirement",
+    "deferred_to_compiler",
+]
 ExpectationStatus = Literal["match", "mismatch", "not_provided"]
 CriticStatus = Literal["clean", "advisory", "blocking"]
 TechnicalStatus = Literal["ok", "technical_failure"]
+#: ``READY_FOR_OUTPUT_BINDING`` is the terminal state of a V3 run that did everything IT owns:
+#: the formula validated, the intent was captured, review evidence was recorded, and the only thing
+#: outstanding is the governed output binding the compiler performs. It is admissible; it is not
+#: RESOLVED, because nothing has yet consulted governed metadata.
+#:
+#: A distinct member rather than a special NEEDS_REVIEW, because those are operationally different:
+#: a queue, an API or a screen showing "Needs review" while a worker legitimately proceeds without
+#: any human review is a status that lies to whoever reads it.
 AuthoringDisposition = Literal[
-    "RESOLVED", "NEEDS_REVIEW", "UNSUPPORTED", "REJECTED", "TECHNICAL_FAILURE"
+    "RESOLVED", "READY_FOR_OUTPUT_BINDING", "NEEDS_REVIEW", "UNSUPPORTED", "REJECTED",
+    "TECHNICAL_FAILURE",
 ]
 
 #: The output statuses under which NO authoritative formula can exist (§F honesty core).
-_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({"needs_authority", "external_requirement"})
+_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({
+    "needs_authority", "external_requirement",
+    # V3's deferral belongs here too: no authoritative output exists YET, so a result
+    # carrying a `candidate_output` would be laundering a guess into authority exactly as
+    # `needs_authority` would. What differs is the DISPOSITION, not the honesty core.
+    "deferred_to_compiler",
+})
 
 
 class IncoherentResultError(ValueError):

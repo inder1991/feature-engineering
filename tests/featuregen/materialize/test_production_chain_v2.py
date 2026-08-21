@@ -131,7 +131,20 @@ def _considered(conn) -> None:
         "'contract-considered-v3') ON CONFLICT DO NOTHING", (json.dumps(considered),))
 
 
-def _author_run(conn, monkeypatch, *, run_id: str, raw: dict, findings=()) -> str:
+def _raw_v2(**kwargs) -> dict:
+    """The same feature in the V2 WIRE SHAPE, spelled against this catalog.
+
+    V2 is not a lesser V3: it resolves output authority DURING authoring, which is the whole reason
+    the two languages take different admission paths. `row_selections` is v3's addition, so dropping
+    it and declaring version 2 is the honest difference rather than a trimmed copy.
+    """
+    raw = _raw_v3(**kwargs)
+    raw["formula_schema_version"] = 2
+    raw["body"]["expr"].pop("row_selections", None)
+    return raw
+
+
+def _author_run(conn, monkeypatch, *, run_id: str, raw: dict, findings=(), facts=None) -> str:
     """Drive the REAL v2 orchestrator with the two PROVIDER stages scripted. Returns the run id."""
     def _author(*_args, **kwargs):
         kwargs["on_turn"](AuthorTurnRecord(
@@ -149,18 +162,20 @@ def _author_run(conn, monkeypatch, *, run_id: str, raw: dict, findings=()) -> st
     run_authoring_v2_replay(
         conn, _intent_of(conn, "crev-pc", "opt-a", "production-chain"), object(), object(),
         actor=None, authoring_run_id=run_id,
-        facts_reader=lambda _p: ({TXN_AMT: OperandFactsV2(
-            logical_type="decimal", unit="monetary", currency="fixed:AED")}, ()),
+        facts_reader=facts if facts is not None else (lambda _p: ({TXN_AMT: OperandFactsV2(
+            logical_type="decimal", unit="monetary", currency="fixed:AED")}, ())),
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
         tool_runner=recipe_tool_runner_v2(frozenset({TXN, TXN_AMT, TXN_DT, TXN_CIF})))
     return run_id
 
 
-def _ready_draft(conn, monkeypatch, *, raw=None, findings=(), draft_id="fd-pc") -> str:
+def _ready_draft(conn, monkeypatch, *, raw=None, findings=(), facts=None,
+                 draft_id="fd-pc") -> str:
     """A READY draft whose run left a replayable trace, and whose stored hash is the trace's."""
     _considered(conn)
     run_id = _author_run(conn, monkeypatch, run_id=f"far-{draft_id}",
-                         raw=raw if raw is not None else _raw_v3(), findings=findings)
+                         raw=raw if raw is not None else _raw_v3(), findings=findings,
+                         facts=facts)
     proposal_hash = conn.execute(
         "SELECT payload->'result'->>'candidate_proposal_hash' FROM formula_authoring_trace_event "
         "WHERE authoring_run_id=%s AND kind='completed'", (run_id,)).fetchone()[0]
@@ -269,55 +284,284 @@ def test_THE_STORED_CODE_IS_REAL_SPARK_for_this_group(built, catalog):
     assert any(GROUP in text for text in texts)
 
 
-# ══ THE BREAK THIS FILE FOUND ══════════════════════════════════════════════════════════════════
-def test_a_V3_RUN_IS_ADMISSIBLE_although_its_disposition_is_NEEDS_REVIEW(catalog, monkeypatch):
-    """The chain break, pinned. A V3 run ends `NEEDS_REVIEW` BY DESIGN — output authority is the
-    compiler's to resolve, and claiming otherwise at authoring time would record a stage that never
-    ran as having run and agreed. Admission demanded `RESOLVED`, V1's rule, under which no V3
-    formula could ever be admitted."""
+# ══ THE GATE THIS FILE FOUND, AND ITS EDGES ═══════════════════════════════════════════════════
+def _admit(catalog, selection="sel-pc"):
+    from featuregen.materialize.admission_v2 import admit_artifacts_v2
     from featuregen.materialize.restore_formula_v3 import restore_formula
 
+    _advertise_this_build(catalog)
+    restored = restore_formula(catalog, selection_revision_id=selection)
+    return admit_artifacts_v2(catalog, [restored.input], engine_id="kedro-pyspark")
+
+
+def _refused(catalog, selection="sel-pc"):
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
+    with pytest.raises(MaterializationRefused) as refusal:
+        _admit(catalog, selection)
+    assert refusal.value.code is CompilationRefusalCode.NOT_RESOLVED, refusal.value
+    return refusal.value
+
+
+def _disposition(catalog, run_id="far-fd-pc") -> str:
+    return catalog.execute(
+        "SELECT payload->'result'->>'authoring_disposition' FROM formula_authoring_trace_event "
+        "WHERE authoring_run_id=%s AND kind='completed'", (run_id,)).fetchone()[0]
+
+
+def test_a_V3_RUN_TERMINATES_READY_FOR_OUTPUT_BINDING_not_NEEDS_REVIEW(catalog, monkeypatch):
+    """The state model, pinned. A V3 run that did everything IT owns is not "awaiting a human" —
+    it is awaiting the COMPILER, and a queue or a screen showing "Needs review" while a worker
+    legitimately proceeds without review is a status that lies to whoever reads it."""
     _ready_draft(catalog, monkeypatch)
     _requested(catalog)
 
-    disposition = catalog.execute(
-        "SELECT payload->'result'->>'authoring_disposition' FROM formula_authoring_trace_event "
-        "WHERE authoring_run_id='far-fd-pc' AND kind='completed'").fetchone()[0]
-    assert disposition == "NEEDS_REVIEW", "a V3 run that resolved its own output is a changed design"
-
-    restored = restore_formula(catalog, selection_revision_id="sel-pc")
-    from featuregen.materialize.admission_v2 import admit_artifacts_v2
-    _advertise_this_build(catalog)
-
-    admitted = admit_artifacts_v2(catalog, [restored.input], engine_id="kedro-pyspark")
-
-    assert [feature.feature_name for feature in admitted] == [FEATURE]
+    assert _disposition(catalog) == "READY_FOR_OUTPUT_BINDING"
+    assert [f.feature_name for f in _admit(catalog)] == [FEATURE]
 
 
-def test_a_BLOCKING_CRITIC_is_STILL_refused(catalog, monkeypatch):
-    """The other half, and the one that makes the change narrow rather than a loosening. The output
-    axis is the ONLY one a V3 run defers; a run that also has a blocking critic is `NEEDS_REVIEW`
-    for a second reason nothing downstream resolves, and admitting it would generate code from a
-    formula a reviewer stopped."""
+def test_a_V2_RUN_THAT_RESOLVED_ITS_OUTPUT_IS_ADMITTED(catalog, monkeypatch):
+    """The unchanged half. V2 resolves output authority DURING authoring, so RESOLVED there means
+    every question was answered — and it is admitted on exactly the rule it always was."""
+    _ready_draft(catalog, monkeypatch, raw=_raw_v2())
+    _requested(catalog)
+
+    assert _disposition(catalog) == "RESOLVED"
+    assert [f.feature_name for f in _admit(catalog)] == [FEATURE]
+
+
+def test_a_V2_RUN_WHOSE_AUTHORITY_LOOKUP_FAILED_IS_STILL_REFUSED(catalog, monkeypatch):
+    """▲ THE HOLE THE FIRST FIX OPENED, pinned shut.
+
+    A V2 run reaches an unresolved output too: `replay_authoring_v2` folds `needs_authority` when a
+    governed-facts read fails CLOSED. That is a real failure a human must look at — NOT a deferral.
+    The first version of the disposition exception took only the terminal event, could not ask what
+    language it held, and admitted exactly this. The two are now different values on the axis and
+    different dispositions, and the check requires the authenticated proposal to be V3.
+    """
+    from featuregen.formula.authoring_result_leaves import AuthorityFailure
+
+    _ready_draft(catalog, monkeypatch, raw=_raw_v2(),
+                 facts=lambda _p: ({}, (AuthorityFailure(
+                     reason="projection_unavailable", operand=TXN_AMT, field="unit"),)))
+    _requested(catalog)
+
+    assert _disposition(catalog) == "NEEDS_REVIEW"
+    _refused(catalog)
+
+
+def test_a_V3_RUN_WITH_A_BLOCKING_CRITIC_IS_REFUSED(catalog, monkeypatch):
+    """The deferral is NARROW. A run whose critic blocked is outstanding for a second reason that
+    nothing downstream resolves, and admitting it would generate code from a formula a reviewer
+    stopped."""
     from featuregen.formula.critic import CriticFinding, CriticFindingCode
-    from featuregen.materialize.admission_v2 import admit_artifacts_v2
-    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
-    from featuregen.materialize.restore_formula_v3 import restore_formula
 
-    # Severity is a FIXED property of the code, never the caller's to assert — `_SEVERITY` maps
-    # this one to "blocking", which is what makes the run's critic axis blocking.
+    # Severity is a FIXED property of the code, never the caller's to assert.
     blocking = CriticFinding(
         code=CriticFindingCode.WINDOW_INTENT_MISMATCH, severity="blocking",
         operand=TXN_AMT, detail="the window is not the one the candidate asked for")
     _ready_draft(catalog, monkeypatch, findings=(blocking,))
     _requested(catalog)
-    _advertise_this_build(catalog)
 
-    restored = restore_formula(catalog, selection_revision_id="sel-pc")
+    assert _disposition(catalog) == "NEEDS_REVIEW", "a blocking critic must outrank the deferral"
+    _refused(catalog)
+
+
+def test_a_V3_RUN_WITH_AN_ADVISORY_CRITIC_IS_ADMITTED(catalog, monkeypatch):
+    """The other side of the same line: advisory findings are recorded, not blocking, so they do
+    not make a run outstanding. Without this the previous test would pass for a version that
+    refused every critic finding."""
+    from featuregen.formula.critic import CriticFinding, CriticFindingCode
+
+    advisory = CriticFinding(
+        code=CriticFindingCode.WEAK_PROXY, severity="advisory",
+        operand=TXN_AMT, detail="a weaker proxy than the candidate implies")
+    _ready_draft(catalog, monkeypatch, findings=(advisory,))
+    _requested(catalog)
+
+    assert _disposition(catalog) == "READY_FOR_OUTPUT_BINDING"
+    assert [f.feature_name for f in _admit(catalog)] == [FEATURE]
+
+
+# ── the axis edges, asked of the GATE directly ───────────────────────────────────────────────────
+# Not by rewriting a stored trace event: 1022 makes those payloads physically immutable and check 2
+# verifies the digest, so a tampered one refuses as a HASH MISMATCH long before the disposition is
+# read — which would prove the tamper-evidence, not this gate. These build the event the gate
+# receives, with a REAL parsed proposal and a REAL result, and ask it the question directly.
+class _Event:
+    """The two fields `_require_admissible_disposition` reads off a terminal event."""
+
+    kind = "completed"
+
+    def __init__(self, **payload):
+        self.payload = payload
+
+
+def _terminal(**overrides):
+    """A terminal payload for a clean V3 deferral, with any axis overridable."""
+    payload = dict(
+        authoring_disposition="READY_FOR_OUTPUT_BINDING",
+        structural_status="ok", capability_status="ok",
+        output_status="deferred_to_compiler", expectation_status="not_provided",
+        critic_status="clean", review=None, technical_status="ok")
+    payload.update(overrides)
+    return _Event(**payload)
+
+
+#: "not supplied", distinct from an explicit `None` — which is itself a case under test.
+_MISSING = object()
+
+
+def _gate(event, *, proposal=None, output_intent=_MISSING, candidate_output=None):
+    """Call the gate with a real proposal and a result carrying the two fields it inspects."""
+    from featuregen.formula.parse_v3 import parse_proposal_v3
+    from featuregen.formula.result_v2 import _content_hash
+    from featuregen.materialize.admission_v2 import _require_admissible_disposition
+
+    parsed = proposal if proposal is not None else parse_proposal_v3(_raw_v3())
+
+    class _Result:
+        pass
+
+    result = _Result()
+    result.output_intent = (_intent_for(parsed, _content_hash(parsed))
+                            if output_intent is _MISSING else output_intent)
+    result.candidate_output = candidate_output
+    _require_admissible_disposition(event, result, parsed, "far-gate")
+
+
+def _intent_for(proposal, proposal_hash):
+    from featuregen.formula.output_intent_v2 import derive_output_intent_v2
+
+    return derive_output_intent_v2(proposal, proposal_hash=proposal_hash)
+
+
+def _gate_refuses(event, **kwargs):
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
     with pytest.raises(MaterializationRefused) as refusal:
-        admit_artifacts_v2(catalog, [restored.input], engine_id="kedro-pyspark")
-
+        _gate(event, **kwargs)
     assert refusal.value.code is CompilationRefusalCode.NOT_RESOLVED
+    return refusal.value
+
+
+def test_the_CLEAN_V3_DEFERRAL_is_admitted_by_the_gate():
+    """The positive control. Without it every refusal below could be passing for the wrong
+    reason — a gate that refused everything would satisfy all of them."""
+    _gate(_terminal())
+
+
+@pytest.mark.parametrize("status", ["needs_authority", "external_requirement", "invalid_output",
+                                    "resolved"])
+def test_ONLY_deferred_to_compiler_IS_DEFERRED(status):
+    """The output axis must be EXACTLY the deferral. `needs_authority` means the governed read
+    failed, `external_requirement` means something outside this run must happen first, and
+    `invalid_output` means the declared output is wrong — none becomes true later on its own, so
+    none may be waved through as "the compiler will handle it". `resolved` is here because a run
+    that resolved its output has no business claiming the deferral either."""
+    _gate_refuses(_terminal(output_status=status))
+
+
+def test_a_V2_PROPOSAL_CANNOT_CLAIM_THE_DEFERRAL_whatever_its_axes_say():
+    """▲ THE HOLE THE FIRST FIX OPENED, pinned shut at the gate. The deferral is V3's contract, so
+    it is the authenticated PROPOSAL that decides — not the axes, which a V2 run can also write."""
+    from tests.featuregen.materialize.test_admission_v2_s13 import _raw as _raw_v2_authoring
+
+    from featuregen.formula.parse_v2 import parse_proposal_v2
+
+    v2 = parse_proposal_v2(_raw_v2_authoring())
+    _gate_refuses(_terminal(), proposal=v2, output_intent=None)
+
+
+def test_a_DEFERRAL_WITH_NO_OUTPUT_INTENT_IS_REFUSED():
+    """The intent is what the compiler RECONCILES the governed output against. A deferred run
+    without one defers to a stage that would have nothing to check the answer against."""
+    _gate_refuses(_terminal(), output_intent=None)
+
+
+def test_an_OUTPUT_INTENT_FROM_A_DIFFERENT_PROPOSAL_IS_REFUSED():
+    """`derived_from_proposal_hash` is what makes the intent checkable rather than merely asserted.
+    An intent carried over from another proposal would have the compiler reconcile this formula's
+    output against what somebody intended for a different one."""
+    from featuregen.formula.parse_v3 import parse_proposal_v3
+
+    other = parse_proposal_v3(_raw_v3(aggregation="count_rows", operand=None))
+    _gate_refuses(_terminal(), output_intent=_intent_for(other, "sha256:a-different-proposal"))
+
+
+def test_a_DEFERRAL_CARRYING_AN_AUTHORITATIVE_OUTPUT_IS_REFUSED():
+    """§F's honesty core. No authoritative output exists yet, so one that is present was invented —
+    and admitting it would launder a guess into authority."""
+    _gate_refuses(_terminal(), candidate_output={"unit": "monetary"})
+
+
+@pytest.mark.parametrize("axis,value", [
+    ("structural_status", "invalid_formula"),
+    ("structural_status", "unsupported_operation"),
+    ("capability_status", "unsupported_capability"),
+    ("technical_status", "technical_failure"),
+    ("critic_status", "blocking"),
+    ("expectation_status", "mismatch"),
+])
+def test_a_PAYLOAD_DISAGREEING_WITH_ITS_OWN_AXES_IS_REFUSED(axis, value):
+    """The re-fold, per axis. A terminal event whose recorded disposition does not follow from its
+    recorded axes is refused rather than believed — and the test is the FOLD's own precedence, not
+    a second list here, so it cannot drift from the rule that produced the verdict."""
+    _gate_refuses(_terminal(**{axis: value}))
+
+
+def test_a_RESOLVED_run_needs_none_of_this():
+    """RESOLVED is admitted on sight, as it always was. The exception is an addition, not a
+    replacement — a V1/V2 run that answered every question is unaffected by any of it."""
+    _gate(_terminal(authoring_disposition="RESOLVED", output_status="resolved"),
+          output_intent=None)
+
+
+def test_the_REVIEWED_BLUEPRINT_BYPASS_shape_is_admitted_too():
+    """C-A5's OTHER review provenance. A deterministic run over a reviewed blueprint records HOW
+    review was obtained — a bypass, with `critic_status=None` — and the v1-shaped axes builder
+    REJECTS that None. So a gate that folded every payload through one shape would fail closed on
+    exactly this path and report a reviewed, deterministic run as inadmissible.
+    """
+    review = {"blueprint_revision": "candidate-1", "expectation_hash": "sha256:blueprint"}
+
+    _gate(_terminal(review=review, critic_status=None))
+
+
+def test_the_bypass_shape_ALSO_refuses_when_something_else_is_outstanding():
+    """The bypass is a different review provenance, not a weaker gate."""
+    review = {"blueprint_revision": "candidate-1", "expectation_hash": "sha256:blueprint"}
+
+    _gate_refuses(_terminal(review=review, critic_status=None,
+                            expectation_status="mismatch"))
+
+
+# ══ THE COMPILER'S HALF OF THE BARGAIN ═════════════════════════════════════════════════════════
+def test_a_COMPILER_OUTPUT_FAILURE_SEALS_NOTHING(catalog, spine, monkeypatch):
+    """Admission defers output authority TO the compiler; this is the compiler declining it.
+
+    A monetary operand whose currency is decided per row, with no declared conversion, cannot be
+    summed — the result would add dirhams to dollars. `resolve_output_v2` refuses, and the whole
+    point of deferring is that this refusal happens somewhere that can make it: no artifact, no
+    SUCCEEDED request, and a refusal naming what was wrong.
+    """
+    _ready_draft(catalog, monkeypatch)
+    request_id = _requested(catalog)
+    _advertise_this_build(catalog)
+    # The job's operand facts are what output authority reads. Per-row currency, no conversion.
+    catalog.execute(
+        "UPDATE queue SET payload = jsonb_set(payload, '{operand_facts}', %s::jsonb) "
+        "WHERE message_id = %s",
+        (json.dumps({TXN_AMT: {"logical_type": "decimal", "unit": "monetary",
+                               "currency": "per_row"}}),
+         f"generation:{request_id}"))
+
+    outcome = process_generation_once(catalog, owner="w1", inventory=INVENTORY)
+
+    assert outcome.status == "refused", outcome.detail
+    assert "OUTPUT_TYPE_NOT_GOVERNED" in outcome.detail
+    assert read_request(catalog, request_id).status is GenerationStatusV1.REFUSED
+    assert catalog.execute("SELECT count(*) FROM sealed_artifact_v2").fetchone()[0] == 0
 
 
 # ══ ANTI-FORGERY, ON THE PRODUCTION PATH ═══════════════════════════════════════════════════════

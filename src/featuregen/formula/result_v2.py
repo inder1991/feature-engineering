@@ -62,7 +62,13 @@ __all__ = [
 DISPOSITION_POLICY_VERSION_V2 = 2   # C-A6: REVIEW_BYPASSED is a disposition this version knows
 
 #: The output statuses under which NO authoritative output policy can exist (§F honesty core).
-_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({"needs_authority", "external_requirement"})
+_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({
+    "needs_authority", "external_requirement",
+    # V3's deferral belongs here too: no authoritative output exists YET, so a result
+    # carrying a `candidate_output` would be laundering a guess into authority exactly as
+    # `needs_authority` would. What differs is the DISPOSITION, not the honesty core.
+    "deferred_to_compiler",
+})
 
 _AXIS_VOCABULARY: tuple[tuple[str, frozenset[str]], ...] = (
     ("structural_status", frozenset(get_args(StructuralStatus))),
@@ -223,6 +229,17 @@ def _fold_v2(axes: AuthoringAxes) -> AuthoringDisposition:
         or axes.capability_status == "unsupported_capability"
     ):
         return "UNSUPPORTED"
+    # V3's DEFERRAL, and it sits here on purpose: after the three arms that outrank it, before the
+    # general unresolved-output arm, and conditioned on the two axes that arm also folds. So a
+    # deferred run whose critic blocked, or whose expectation mismatched, falls through to
+    # NEEDS_REVIEW — because it genuinely does need one. Only a run with nothing else outstanding
+    # reaches the state that says so.
+    if (
+        axes.output_status == "deferred_to_compiler"
+        and axes.critic_status != "blocking"
+        and axes.expectation_status != "mismatch"
+    ):
+        return "READY_FOR_OUTPUT_BINDING"
     if (
         axes.output_status in _UNRESOLVED_OUTPUT
         or axes.critic_status == "blocking"

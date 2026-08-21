@@ -860,10 +860,16 @@ def run_authoring_v2_replay(
                 structural_status="ok", capability_status="ok",
                 # The output is UNRESOLVED and says so. S5 resolves it; claiming "resolved" here
                 # would assert an authority nobody consulted.
-                output_status="needs_authority", expectation_status="not_provided",
+                #
+                # ▲ `deferred_to_compiler`, not `needs_authority`. Both are unresolved, and they
+                # mean opposite things: `needs_authority` is a V1/V2 run whose governed-facts read
+                # FAILED and which a human must look at, while this is a V3 run that succeeded at
+                # everything it owns. Spelling them the same made admission unable to tell a
+                # working pipeline from a stalled one — and briefly admitted the stalled one.
+                output_status="deferred_to_compiler", expectation_status="not_provided",
                 review=bypass_for(reviewed_blueprint), technical_status="ok")
         else:
-            axes_v3 = _axes(output_status="needs_authority",
+            axes_v3 = _axes(output_status="deferred_to_compiler",
                             critic_status=_critic_status(list(findings)))
         result = derive_disposition_v2(
             axes_v3,
