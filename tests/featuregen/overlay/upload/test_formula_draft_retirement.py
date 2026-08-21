@@ -342,32 +342,81 @@ def test_the_AUTHORIZED_TRANSITION_FINISHES_and_the_retirement_waits(db, _dsn):
                             "formula_draft_no_identity_edit")
 
 
-def test_the_LOCK_HOLDS_ON_AN_AUTOCOMMIT_CONNECTION(db, _dsn):
-    """▲ THE HOLE THE LOCK ITSELF HAD. `pg_advisory_xact_lock` releases on commit, so on an
-    AUTOCOMMIT connection the lock statement was its own transaction and the lock was gone before
-    the next statement ran — reopening the race it was taken to close. The production worker
-    happens to call inside a transaction; the cleanup runbook's operator connection does not.
+def test_the_LOCK_LIVES_ACROSS_THE_MUTATION_ON_AN_AUTOCOMMIT_CONNECTION(db, _dsn):
+    """▲ THE HOLE THE LOCK ITSELF HAD, exercised at the moment it existed.
 
-    `_draft_locked` now opens one itself, so the guarantee no longer depends on how the caller
-    happened to connect.
+    `pg_advisory_xact_lock` releases on commit, so on an AUTOCOMMIT connection the lock statement
+    was its own transaction and the lock was gone BEFORE the insert that depended on it. The
+    production worker calls inside a transaction and was fine; the cleanup runbook's operator
+    connection is autocommit, and so was the fixture I first wrote for it.
+
+    An earlier version of this test retired the draft COMPLETELY and only then tried a transition —
+    which would pass with no advisory lock at all, because the committed retirement is already
+    visible. The lock's LIFETIME is the thing under test, so this pauses the retirement between
+    taking the lock and inserting, and proves another connection blocks during exactly that window.
     """
+    import threading
+
     import psycopg
 
+    from featuregen.overlay.upload import formula_draft_store as store
     from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
 
-    _draft(db, "fd-auto")
+    _draft(db, "fd-auto", state="REQUESTED")
     db.commit()
 
-    try:
-        with psycopg.connect(_dsn, autocommit=True) as operator:
-            retire_formula_draft(operator, "fd-auto", reason="WITHDRAWN", retired_by="ops@bank")
+    holding = threading.Event()      # the lock is taken, the insert has not happened
+    release = threading.Event()      # the observer is done looking
+    failures: list[BaseException] = []
 
-            # It committed despite autocommit, and the fence holds from another connection.
-            with psycopg.connect(_dsn) as other:
-                with pytest.raises(DraftRetired):
-                    advance(other, "fd-auto", DraftStateV1.AUTHORING)
-                other.rollback()
+    original = store._retire_locked
+
+    def _pause_between_lock_and_insert(conn, formula_draft_id, **kwargs):
+        holding.set()
+        release.wait(timeout=10)
+        return original(conn, formula_draft_id, **kwargs)
+
+    def _retire() -> None:
+        try:
+            with psycopg.connect(_dsn, autocommit=True) as operator:
+                store._retire_locked = _pause_between_lock_and_insert
+                retire_formula_draft(operator, "fd-auto", reason="WITHDRAWN",
+                                     retired_by="ops@bank")
+        except BaseException as exc:                       # surfaced on the main thread below
+            failures.append(exc)
+        finally:
+            store._retire_locked = original
+            holding.set()
+
+    worker = threading.Thread(target=_retire, daemon=True)
+    try:
+        worker.start()
+        assert holding.wait(timeout=10), "the retirement never reached the lock"
+
+        # THE WINDOW: lock held, nothing inserted yet. Nothing is visible to a reader, so only the
+        # lock can stop this — which is the whole claim.
+        with psycopg.connect(_dsn) as other:
+            assert other.execute(
+                "SELECT count(*) FROM formula_draft_retirement WHERE formula_draft_id = %s",
+                ("fd-auto",)).fetchone()[0] == 0, "nothing is committed yet, so visibility is out"
+            other.execute("SET statement_timeout = '750ms'")
+            with pytest.raises(psycopg.errors.QueryCanceled):
+                advance(other, "fd-auto", DraftStateV1.AUTHORING)
+            other.rollback()
+
+        release.set()
+        worker.join(timeout=10)
+        assert not failures, failures
+
+        # And once the retirement has finished, the ordinary refusal applies.
+        with psycopg.connect(_dsn) as after:
+            with pytest.raises(DraftRetired):
+                advance(after, "fd-auto", DraftStateV1.AUTHORING)
+            after.rollback()
     finally:
+        release.set()
+        worker.join(timeout=10)
+        store._retire_locked = original
         with psycopg.connect(_dsn, autocommit=True) as cleanup:
             cleanup.execute("ALTER TABLE formula_draft_retirement DISABLE TRIGGER "
                             "formula_draft_retirement_no_change")

@@ -360,7 +360,13 @@ def advance(
     blockers: Sequence[Mapping[str, str]] = (),
     failure_reason: str | None = None,
 ) -> DraftStateV1:
-    """Move ONE step and return the new state. The caller commits.
+    """Move ONE step and return the new state.
+
+    **WHO COMMITS depends on who opened the transaction**, and `_draft_locked` decides that rather
+    than assuming: inside an existing transaction this nests via savepoint and the CALLER still
+    commits, exactly as before; on a connection with none — including an autocommit one — it opens
+    and commits its own, because the advisory lock it takes is released by that commit and a lock
+    the caller never scoped would protect nothing.
 
     Raises:
         InvalidTransition: the move is not on the machine's path. A worker that silently skipped a

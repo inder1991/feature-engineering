@@ -694,9 +694,9 @@ def test_an_UNAUDITED_AUTHOR_TURN_IS_A_PROBLEM_not_an_absence(db):
     assert any("no llm_call_ref" in p and "unauditable" in p for p in problems), problems
 
 
-def test_a_TURN_WHOSE_STAGE_AND_KIND_DISAGREE_IS_NAMED(db):
-    """Replay reads an `AUTHOR_TURN_*` stage as a turn, so imported material whose `kind` says
-    something else was USED as a turn and skipped by a kind-only audit."""
+def test_a_STAGE_THAT_SAYS_TURN_WITH_ANOTHER_KIND_IS_NAMED(db):
+    """Direction ONE. Replay reads an `AUTHOR_TURN_*` stage as a turn, so imported material whose
+    `kind` says something else was USED as a turn and skipped by a kind-only audit."""
     from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
     from featuregen.formula.replay_trace import open_authoring_run
 
@@ -719,3 +719,71 @@ def test_a_TURN_WHOSE_STAGE_AND_KIND_DISAGREE_IS_NAMED(db):
     _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-kindmix")
 
     assert any("AUTHOR_TURN_9" in p and "kind=" in p for p in problems), problems
+
+
+def test_a_KIND_THAT_SAYS_TURN_WITH_ANOTHER_STAGE_IS_NAMED(db):
+    """▲ DIRECTION TWO, which the first check missed entirely.
+
+    An event with `kind='author_turn'` and `stage='CRITIC_COMPLETED'` is SELECTED by this qualifier
+    because its kind matches — while REPLAY reads it as a critic result, because replay goes by
+    stage. If it referenced a valid V3 author call it passed silently, and the two readers disagreed
+    about what the run contains. The invariant is symmetric now, so both spellings are named.
+    """
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+    from featuregen.formula.replay_trace import open_authoring_run
+
+    _run(db, run_id="far-kindrev-src", raw=_raw_v3(), requested=3)
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-kindrev-src",)).fetchone()
+    open_authoring_run(db, intent_hash=manifest[0], versions=manifest[1], actor=None,
+                       authoring_run_id="far-kindrev")
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT 'far-kindrev', seq + 500, 'author_turn', 'CRITIC_COMPLETED', payload, "
+        "       payload_hash, canonical_output_hash, 'kindrev:' || idempotency_key, "
+        "       logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND llm_call_ref IS NOT NULL LIMIT 1",
+        ("far-kindrev-src",))
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-kindrev")
+
+    assert any("CRITIC_COMPLETED" in p and "author_turn" in p for p in problems), problems
+
+
+def test_a_STAGE_THAT_ONLY_LOOKS_LIKE_A_TURN_INDEX_IS_NAMED(db):
+    """`AUTHOR_TURN_THING` is not a turn index. The SQL uses a LIKE prefix to over-SELECT
+    candidates; the invariant uses `fullmatch`, so a prefix that is not `AUTHOR_TURN_<digits>` does
+    not quietly count as one."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+    from featuregen.formula.replay_trace import open_authoring_run
+
+    _run(db, run_id="far-stagefmt-src", raw=_raw_v3(), requested=3)
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-stagefmt-src",)).fetchone()
+    open_authoring_run(db, intent_hash=manifest[0], versions=manifest[1], actor=None,
+                       authoring_run_id="far-stagefmt")
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT 'far-stagefmt', seq + 400, 'author_turn', 'AUTHOR_TURN_THING', payload, "
+        "       payload_hash, canonical_output_hash, 'stagefmt:' || idempotency_key, "
+        "       logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND llm_call_ref IS NOT NULL LIMIT 1",
+        ("far-stagefmt-src",))
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-stagefmt")
+
+    assert any("AUTHOR_TURN_THING" in p for p in problems), problems
+
+
+# ▲ NOT TESTED, AND THE EARLIER COMMIT WAS WRONG TO SAY IT WAS: an author turn whose
+# `llm_call_ref` matches no `llm_call` row. `formula_authoring_trace_event.llm_call_ref` is a
+# FOREIGN KEY to `llm_call`, so the database prevents it — the `task is None` branch in the
+# qualifier is reachable only with corrupted bytes or a disabled constraint. It is kept as a
+# defensive arm and left deliberately untested, because the only way to exercise it is to disable
+# the constraint that makes it unreachable, which would test the disabling rather than the guard.

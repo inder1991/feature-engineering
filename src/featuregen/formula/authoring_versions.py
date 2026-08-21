@@ -32,6 +32,7 @@ an adapter by majority vote would run a trace under software that did not write 
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
@@ -253,10 +254,20 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     for seq, kind, stage, call_ref, task, schema_id, schema_version, prompt_id, prompt_version \
             in turns:
         where = f"author turn seq={seq}"
-        if kind != "author_turn":
+        # ▲ SYMMETRIC, and it was not. The check rejected `stage=AUTHOR_TURN_* / kind=something
+        # else` and said nothing about the reverse — `kind=author_turn` with, say,
+        # `stage=CRITIC_COMPLETED`. That event is SELECTED here because its kind matches, while
+        # REPLAY reads it as a critic result because replay goes by stage; if it happened to
+        # reference a valid V3 author call it passed silently. The two fields must agree in both
+        # directions or the run means different things to the two readers.
+        #
+        # `fullmatch` rather than a prefix: `AUTHOR_TURN_THING` is not a turn index, and a `LIKE`
+        # prefix (which the SQL above uses only to over-select candidates) would call it one.
+        is_author_stage = re.fullmatch(r"AUTHOR_TURN_\d+", stage or "") is not None
+        if (kind == "author_turn") != is_author_stage:
             problems.append(
-                f"{where} has stage={stage!r} but kind={kind!r}: replay reads it as a turn and a "
-                f"kind-only audit would not")
+                f"{where} records kind={kind!r} with stage={stage!r}: replay goes by STAGE and an "
+                f"audit keyed on kind goes by kind, so the two would read this run differently")
         if call_ref is None:
             problems.append(
                 f"{where} carries no llm_call_ref, so what it was requested under is unauditable")
