@@ -368,3 +368,49 @@ def existing_admission(
         "SELECT admitted, blockers FROM formula_draft_admission "
         "WHERE admission_identity_hash = %s", (identity,)).fetchone()
     return None if row is None else (row[0], tuple(row[1] or ()))
+
+
+# ── retirement (1096) ────────────────────────────────────────────────────────────────────────────
+def retire_formula_draft(
+    conn,
+    formula_draft_id: str,
+    *,
+    reason: str,
+    retired_by: str,
+    detail: str = "",
+    replacement_draft_id: str | None = None,
+) -> None:
+    """Mark a draft as no longer the current answer. It is NOT deleted — it cannot be.
+
+    `formula_draft_guard` raises on every DELETE, and rightly: a draft is what a person was shown
+    and what an authoring run was spent on. So retirement is an APPEND beside it, and readers
+    exclude or label retired drafts rather than finding them absent — which keeps "why is this draft
+    gone?" answerable instead of a gap.
+
+    Idempotent on the draft: retiring twice is not two facts.
+    """
+    conn.execute(
+        "INSERT INTO formula_draft_retirement (formula_draft_id, reason, detail, "
+        "replacement_draft_id, retired_by) VALUES (%s, %s, %s, %s, %s) "
+        "ON CONFLICT (formula_draft_id) DO NOTHING",
+        (formula_draft_id, reason, detail, replacement_draft_id, retired_by))
+
+
+def record_draft_replacement(conn, formula_draft_id: str, *, replacement_draft_id: str) -> None:
+    """Name what replaced a retired draft — a SEPARATE, later act.
+
+    Regeneration spends provider money and is somebody's decision, so a retirement is allowed to
+    exist without a replacement. The trigger permits this field to be set once and never changed.
+    """
+    conn.execute(
+        "UPDATE formula_draft_retirement SET replacement_draft_id = %s "
+        "WHERE formula_draft_id = %s AND replacement_draft_id IS NULL",
+        (replacement_draft_id, formula_draft_id))
+
+
+def retired_draft_ids(conn) -> frozenset[str]:
+    """Every retired draft. Readers filter with this rather than assuming a draft they can see is
+    current."""
+    return frozenset(
+        row[0] for row in conn.execute(
+            "SELECT formula_draft_id FROM formula_draft_retirement").fetchall())

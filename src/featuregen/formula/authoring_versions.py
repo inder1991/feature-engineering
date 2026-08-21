@@ -150,10 +150,27 @@ V3_EVIDENCE_IDENTITY: Mapping[str, object] = {
 #: a frozen provider contract, and it is the single axis that no pre-fix run can fake — those runs
 #: were physically requested under `formula_author_turn_v2`.
 V3_AUTHOR_OUTPUT_SCHEMA_ID = "formula_author_turn_v3"
+#: Its registered version. Checked alongside the id: a future v3 turn schema v2 would
+#: be a different contract requested under the same name.
+V3_AUTHOR_OUTPUT_SCHEMA_VERSION = 1
 
 
 def qualifies_as_v3_evidence(stored: Mapping[str, object] | None) -> tuple[bool, tuple[str, ...]]:
-    """Does this run's manifest carry the complete V3 identity? Returns ``(ok, missing_axes)``.
+    """The MANIFEST half of the question. **Not the authority — see
+    :func:`qualifies_as_v3_evidence_for_run`, which is.**
+
+    ▲ THIS FUNCTION CANNOT SEE THE PROVIDER CONTRACT, and there is an interval where that matters.
+    The version constants moved to 3 in `b5249e80`; the author turn contract only became v3 in
+    `027cc923`. A run authored between those two commits carries a manifest that satisfies every
+    axis below while having been physically driven under `formula_author_turn_v2` — asked for a v2
+    proposal, and given one. The output schema id lives in the dispatch evidence, not in `versions`,
+    so no reading of the manifest alone can exclude it.
+
+    Kept as a separate function because it is genuinely useful — it is the cheap filter, and it
+    names the disagreeing axes — but a caller that treats it as an activation authority will admit
+    exactly the runs this whole correction exists to exclude.
+
+    Returns ``(ok, missing_axes)``.
 
     The axes that DISAGREE are returned rather than a bare False, because "this run is not V3
     evidence" and "this run is not V3 evidence BECAUSE its orchestrator is 2" send an operator to
@@ -169,3 +186,64 @@ def qualifies_as_v3_evidence(stored: Mapping[str, object] | None) -> tuple[bool,
         for axis, expected in sorted(V3_EVIDENCE_IDENTITY.items())
         if stored.get(axis) != expected)
     return (not disagreeing), disagreeing
+
+
+def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool, tuple[str, ...]]:
+    """THE authority: does this run carry the complete V3 identity, checked against the DATABASE?
+
+    Returns ``(ok, disagreements)``. The manifest half is necessary and not sufficient — see
+    :func:`qualifies_as_v3_evidence` for the interval it cannot see — so this adds the facts that
+    live outside ``versions``:
+
+    * every AUTHOR provider call was requested under ``formula_author_turn_v3`` at the expected
+      schema version. This is the axis no pre-fix run can fake: those runs were PHYSICALLY
+      requested under `formula_author_turn_v2`, and the id is recorded by the audited seam at the
+      moment of the call rather than declared afterwards;
+    * the run reached a terminal ``completed`` event carrying a proposal;
+    * that proposal declares schema 3, and the manifest agrees with it.
+
+    A run with no author call at all does NOT qualify. That is deliberate rather than lenient: the
+    deterministic producer authors without a provider, and its evidence is a different thing from a
+    provider-authored run — an evaluator that accepted both under one contract would be reporting
+    two populations as one.
+    """
+    row = conn.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (authoring_run_id,)).fetchone()
+    ok, disagreements = qualifies_as_v3_evidence(row[0] if row else None)
+    problems = list(disagreements)
+
+    # ── the author calls, as they were actually REQUESTED ────────────────────────────────────────
+    schemas = conn.execute(
+        "SELECT DISTINCT c.output_schema_id, c.output_schema_version "
+        "  FROM formula_authoring_trace_event e "
+        "  JOIN llm_call c ON c.llm_call_ref = e.llm_call_ref "
+        " WHERE e.authoring_run_id = %s AND e.llm_call_ref IS NOT NULL "
+        "   AND c.task LIKE %s",
+        (authoring_run_id, "%author%")).fetchall()
+    if not schemas:
+        problems.append(
+            "<no author provider call> (expected one requested under "
+            f"{V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
+    for schema_id, schema_version in schemas:
+        if schema_id != V3_AUTHOR_OUTPUT_SCHEMA_ID:
+            problems.append(
+                f"author output_schema_id={schema_id!r} "
+                f"(expected {V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
+        if schema_version != V3_AUTHOR_OUTPUT_SCHEMA_VERSION:
+            problems.append(
+                f"author output_schema_version={schema_version!r} "
+                f"(expected {V3_AUTHOR_OUTPUT_SCHEMA_VERSION!r})")
+
+    # ── and the artifact the run actually produced ───────────────────────────────────────────────
+    produced = conn.execute(
+        "SELECT payload->'result'->'candidate_proposal'->>'formula_schema_version' "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND kind = 'completed'",
+        (authoring_run_id,)).fetchone()
+    if produced is None or produced[0] is None:
+        problems.append("<no terminal proposal> (a run that produced nothing evidences nothing)")
+    elif str(produced[0]) != "3":
+        problems.append(f"produced proposal formula_schema_version={produced[0]!r} (expected 3)")
+
+    return (not problems), tuple(problems)

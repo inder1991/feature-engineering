@@ -49,17 +49,29 @@ The same disagreement, pinned as a test:
 rows, 3 BLOCKED and 4 FAILED, **none carrying a formula**. If that still holds, this runbook has
 nothing to reset and step 3 is a no-op — run the query and find out rather than assuming.
 
-## 2. Reset the DRAFTS, never the traces
+## 2. RETIRE the drafts — they cannot be deleted
 
-For each row the query returns:
+▲ **An earlier revision of this runbook said `DELETE FROM formula_draft`. That statement cannot
+execute.** `formula_draft_guard` (migration 1090) raises `formula_draft is append-only` on every
+DELETE, and `test_formula_draft_store.py` already pins that refusal. Do not disable the trigger: a
+draft is what a person was shown and what an authoring run was spent on, and the failures recorded
+on BLOCKED and FAILED drafts are the only evidence those defects were ever real.
 
-```sql
-DELETE FROM formula_draft WHERE formula_draft_id = :draft_id;
+Retirement is an APPEND beside the draft (migration 1096):
+
+```python
+from featuregen.overlay.upload.formula_draft_store import retire_formula_draft
+
+retire_formula_draft(
+    conn, draft_id,
+    reason="SCHEMA_CONTRACT_MISMATCH",
+    detail="manifest declared 3; stored formula is 2 (pre-027cc923 author contract)",
+    retired_by="ops@bank")
 ```
 
-The draft is derived from the candidate and the authoring run; deleting it removes a claim
-("READY") that is no longer true. The run and its trace are untouched and remain auditable as the
-record of a v2 formula authored under a v2 contract — which is what they honestly are.
+The draft stays exactly as it was. Readers exclude or label retired drafts via
+`retired_draft_ids(conn)` rather than finding them absent — which keeps *"why is this draft gone?"*
+an answerable question instead of a gap.
 
 ## 3. Regenerate under NEW ids
 
@@ -72,6 +84,18 @@ required rather than preferred.
 **Regeneration calls the provider and costs money.** It is a separate operator decision, taken with
 a computed cost in front of you — see `candidate-regeneration-runbook.md`, whose rule applies
 identically here: *a key becoming usable is not an instruction to spend.*
+
+Once the replacement exists, name it — a separate, later act, which is why the retirement row
+allows a null replacement rather than forcing a placeholder that reads as a draft nobody made:
+
+```python
+from featuregen.overlay.upload.formula_draft_store import record_draft_replacement
+
+record_draft_replacement(conn, retired_draft_id, replacement_draft_id=new_draft_id)
+```
+
+It may be set once. Changing it would make *"what replaced this draft"* a question with two
+answers.
 
 ## 4. Confirm nothing mislabelled can be consumed
 
@@ -90,3 +114,15 @@ moved to 3 when the V3 state was added, and the author output schema is `formula
 which no pre-fix run was ever requested under.
 
 Re-run the step-1 query after regeneration. It must return zero rows.
+
+**And qualify by the DATABASE, not the manifest alone.** `qualifies_as_v3_evidence(versions)` reads
+only the version bundle, and there is an interval it cannot see: between `b5249e80` (the version
+constants moved to 3) and `027cc923` (the author contract became v3), a run carried a fully current
+manifest while being physically driven under `formula_author_turn_v2`. The authority is
+`qualifies_as_v3_evidence_for_run(conn, run_id)`, which additionally checks the output schema every
+author call was actually REQUESTED under — the one axis no pre-fix run can fake, because the audited
+seam records it at the moment of the call rather than declaring it afterwards.
+
+**Live status, audited 2026-08-21 (read-only):** the step-1 query returned **0 rows**. All 7 drafts
+are BLOCKED (3) or FAILED (4) and none carries a formula or a hash. Nothing needs retiring or
+regenerating today; this runbook is the procedure for when something does.

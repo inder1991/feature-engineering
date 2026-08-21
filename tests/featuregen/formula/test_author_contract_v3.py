@@ -214,7 +214,8 @@ def test_a_MISMATCHED_RUN_LEAVES_NOTHING_ADMISSIBLE(db):
 
 
 # ══ THE THIRD GUARD, DRIVEN THROUGH REAL ADMISSION ═════════════════════════════════════════════
-def _relabelled(db, *, source_run: str, run_id: str, declared_schema: int | None) -> str:
+def _relabelled(db, *, source_run: str, run_id: str, declared_schema: int | None,
+                drop_provider_calls: bool = False) -> str:
     """A run whose MANIFEST says one language and whose TRACE holds another.
 
     Authoring refuses to produce this now, which is the point: the admission guard exists for
@@ -244,7 +245,11 @@ def _relabelled(db, *, source_run: str, run_id: str, declared_schema: int | None
         "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
         "SELECT %s, seq, kind, stage, payload, payload_hash, canonical_output_hash, "
         "       %s || ':' || idempotency_key, logical_turn_index, llm_call_ref "
-        "  FROM formula_authoring_trace_event WHERE authoring_run_id = %s",
+        "  FROM formula_authoring_trace_event WHERE authoring_run_id = %s"
+        # `llm_call` and the trace are BOTH write-once, so a run with no provider call is BUILT
+        # that way rather than edited into it — which is also how the deterministic producer's own
+        # runs genuinely look.
+        + ("   AND llm_call_ref IS NULL" if drop_provider_calls else ""),
         (run_id, run_id, source_run))
     return run_id
 
@@ -417,3 +422,74 @@ def test_a_MISLABELLED_RUN_IS_FINDABLE_by_the_cleanup_query(db):
     found = {row[0] for row in mismatched}
     assert "far-clean-bad" in found, "the mislabelled run must be findable"
     assert "far-clean-src" not in found, "a consistent run must not be swept up"
+
+
+# ══ THE INTERVAL THE MANIFEST CANNOT SEE ═══════════════════════════════════════════════════════
+def test_the_MANIFEST_ALONE_ADMITS_THE_b5249e80_INTERVAL(db):
+    """▲ THE REGRESSION CASE. Between `b5249e80` (version constants moved to 3) and `027cc923` (the
+    author contract became v3), a run carried a manifest satisfying EVERY version axis while being
+    physically driven under `formula_author_turn_v2` — asked for a v2 proposal, and given one.
+
+    The manifest-only qualifier says yes to it. That is not a bug in that function; it is the limit
+    of what a manifest can answer, and the reason the authority is database-backed.
+    """
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence
+
+    interval = {"formula_schema": 3, "orchestrator": 3, "disposition": 3,
+                "canonicalization": 1, "output_policy": 1}
+
+    assert qualifies_as_v3_evidence(interval) == (True, ()), (
+        "the manifest half cannot see the provider contract — which is exactly the gap")
+
+
+def test_the_DATABASE_BACKED_QUALIFIER_REJECTS_IT_and_names_the_axis(db):
+    """The same interval, asked of the authority. It must fail, and it must say WHY — an operator
+    told only "not V3 evidence" has to guess which of six axes to look at."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    # THE INTERVAL, BUILT BY CONSTRUCTION. A run authored at schema 2 records its author calls
+    # under `formula_author_turn_v2` and carries orchestrator/disposition at today's 3 — because
+    # those constants moved in `b5249e80` while the contract only moved in `027cc923`. Relabelling
+    # its manifest to 3 reproduces exactly what a run from that window looks like: every version
+    # axis current, the physical provider contract v2's.
+    _run(db, run_id="far-interval-src", raw=_raw(), requested=2)
+    _relabelled(db, source_run="far-interval-src", run_id="far-interval", declared_schema=3)
+
+    ok, problems = qualifies_as_v3_evidence_for_run(db, "far-interval")
+
+    assert ok is False
+    assert any("output_schema_id" in p and "formula_author_turn_v2" in p for p in problems), problems
+
+
+def test_a_GENUINE_V3_RUN_QUALIFIES_against_the_database(db):
+    """The positive control for the authority, on a run this build actually authored."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-authority-ok", raw=_raw_v3(), requested=3)
+
+    assert qualifies_as_v3_evidence_for_run(db, "far-authority-ok") == (True, ())
+
+
+def test_a_RUN_WITH_NO_AUTHOR_CALL_DOES_NOT_QUALIFY(db):
+    """Deliberate rather than lenient. The deterministic producer authors with no provider at all,
+    and its evidence is a different thing from a provider-authored run — an evaluator accepting both
+    under one contract would report two populations as one."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-nocall-src", raw=_raw_v3(), requested=3)
+    _relabelled(db, source_run="far-nocall-src", run_id="far-nocall", declared_schema=3,
+                drop_provider_calls=True)
+
+    ok, problems = qualifies_as_v3_evidence_for_run(db, "far-nocall")
+
+    assert ok is False
+    assert any("no author provider call" in p for p in problems), problems
+
+
+def test_a_RUN_THAT_DOES_NOT_EXIST_QUALIFIES_FOR_NOTHING(db):
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    ok, problems = qualifies_as_v3_evidence_for_run(db, "far-nobody-authored-this")
+
+    assert ok is False
+    assert "<no manifest>" in problems
