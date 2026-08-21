@@ -47,7 +47,6 @@ from featuregen.formula.turns import AuthoringIntent
 from featuregen.materialize import authoring_trace as _trace
 from featuregen.materialize.admission import (
     _payload_field,
-    _require_resolved,
     _terminal_event,
     _verify_payload_hash,
 )
@@ -63,6 +62,11 @@ __all__ = [
     "admit_artifacts_v2",
     "implied_operator_signatures",
 ]
+
+#: The one disposition that needs no explanation. Spelled here rather than imported from V1's
+#: `admission` module because what counts as ADMISSIBLE now differs between the two languages,
+#: and a shared constant beside two different rules reads as a shared rule.
+_RESOLVED = "RESOLVED"
 
 #: The wire versions of the Formula-V2 LANGUAGE. Two members, not a floor: a version 4 nobody has
 #: defined must be refused rather than admitted by an inequality that happened to be open-ended.
@@ -218,7 +222,7 @@ def _admit_one_v2(
 
     event = _terminal_event(conn, run_id)                        # 1 — shared with v1
     _verify_payload_hash(event, run_id)                          # 2 — shared with v1
-    _require_resolved(event, run_id)                             # 3 — shared with v1
+    _require_admissible_disposition(event, run_id)               # 3 — V3-aware
     proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 4
     _verify_language_version(proposal, run_id)                   # 4b
     _verify_axes_v2(event, result, run_id)                       # 5
@@ -238,6 +242,89 @@ def _admit_one_v2(
         candidate_output=result.candidate_output,
         output_intent=result.output_intent,
     )
+
+
+# ── 3. the disposition ADMITS, which for V3 is not the same as RESOLVED ──────────────────────────
+def _require_admissible_disposition(event: _trace.TerminalEvent, run_id: str) -> None:
+    """``NOT_RESOLVED`` unless the run's verdict permits compilation.
+
+    ▲ **WHY THIS IS NOT V1's `_require_resolved`, AND WHY THE V3 CHAIN WAS BROKEN WITHOUT IT.**
+
+    V1 and V2 resolve OUTPUT AUTHORITY during authoring, so `RESOLVED` there means "every question
+    was answered". **V3 deliberately does not.** `replay_authoring_v2` terminates a V3 run with
+    ``output_status="needs_authority"`` and says why in place: *"a V3 run CAPTURES the author's
+    intent and stops. Resolving the output policy against C1's governed facts is S5's, and emitting
+    OUTPUT_POLICY_RESOLVED here would represent a stage that has not run as having run and
+    agreed."* That is correct — the compiler resolves it, via `resolve_output_v2` in
+    `compile_generation_v2`.
+
+    The consequence was that the two rules contradicted each other. ``needs_authority`` folds to
+    ``NEEDS_REVIEW`` unconditionally, and admission demanded ``RESOLVED``, so **no V3 formula could
+    ever be admitted**. Nothing caught it because nothing had ever put a V3 proposal through
+    admission: of the two places in the suite that spell ``formula_schema_version: 3``, one is a
+    parser test and the other builds `AdmittedFeatureV2` BY HAND. Every stage downstream was
+    exercised against artifacts that skipped this gate.
+
+    **The test is the FOLD's own, not a second list of conditions.** Re-fold the recorded axes with
+    the output axis set to what S5 will establish, and require the answer to be ``RESOLVED``. So a
+    run whose only unmet axis is the one V3 defers by design is admitted, and a run that ALSO has a
+    blocking critic, a mismatched expectation, an invalid structure or a technical failure is still
+    refused — by the same precedence chain that produced the original verdict, which cannot drift
+    from it because it IS it.
+
+    A deferred output is the ONLY deferral. ``invalid_output`` and ``external_requirement`` are not
+    "the compiler will handle it": the first says the declared output is wrong and the second says
+    something outside this run must happen first, and neither becomes true later on its own.
+    """
+    disposition = _payload_field(event, "authoring_disposition")
+    if disposition == _RESOLVED:
+        return
+    if disposition == "NEEDS_REVIEW" and _only_the_deferred_output_is_unmet(event):
+        return
+    raise MaterializationRefused(
+        CompilationRefusalCode.NOT_RESOLVED,
+        f"the terminal {event.kind} event of authoring run {run_id} records "
+        f"authoring_disposition={disposition!r}, not {_RESOLVED} — and its unmet axes are not "
+        f"only the output authority a V3 run defers to compilation",
+    )
+
+
+def _only_the_deferred_output_is_unmet(event: _trace.TerminalEvent) -> bool:
+    """Would this run be ``RESOLVED`` if its output authority were established?
+
+    Asked of :func:`_fold_v2` directly, over the axes the terminal event recorded — which step 2
+    has already proven authentic against the payload's own digest, so these are the run's real axes
+    rather than a caller's account of them.
+    """
+    from featuregen.formula.replay_authoring_v2 import _axes, _restore_review
+    from featuregen.formula.result_v2 import AuthoringAxesV2, _fold_v2
+
+    if _payload_field(event, "output_status") != "needs_authority":
+        return False
+    shared = dict(
+        structural_status=_payload_field(event, "structural_status"),
+        capability_status=_payload_field(event, "capability_status"),
+        # THE SWAP, and the only one. Everything else is exactly as recorded.
+        output_status="resolved",
+        expectation_status=_payload_field(event, "expectation_status"),
+        technical_status=_payload_field(event, "technical_status"),
+    )
+    try:
+        # WHICH AXES SHAPE, decided the way the RESTORER decides it (`_restore_terminal_result`):
+        # a run with a recorded `review` folded through the V2 axes and a run without it through
+        # V1's. Choosing wrongly is not a near miss — the v1-shaped builder REJECTS a bypass's
+        # `critic_status=None`, so a single shape here would fail closed on exactly one of the two
+        # legitimate paths and read as "this run is inadmissible".
+        review = _restore_review(_payload_field(event, "review"))
+        axes = (AuthoringAxesV2(review=review,
+                                critic_status=_payload_field(event, "critic_status"), **shared)
+                if review is not None
+                else _axes(critic_status=_payload_field(event, "critic_status"), **shared))
+    except (TypeError, ValueError):
+        # An axis the vocabulary does not know is not a permissive one. `_validate_axes` fails
+        # closed for the same reason and this mirrors it rather than swallowing it.
+        return False
+    return _fold_v2(axes) == _RESOLVED
 
 
 # ── 4. the recorded candidate hash equals the supplied proposal's ────────────────────────────────

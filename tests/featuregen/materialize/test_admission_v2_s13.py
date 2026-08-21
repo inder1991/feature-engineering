@@ -462,13 +462,30 @@ def test_admission_is_ALL_OR_NOTHING(catalog):
 
 
 def test_the_shared_checks_are_IMPORTED_not_reimplemented():
-    """Checks 1, 2 and 3 read one trace row and carry no grammar. Two readings of one record
+    """Checks 1 and 2 read one trace row and carry no grammar. Two readings of one record
     eventually disagree about what a tampered payload looks like."""
     import inspect
 
     from featuregen.materialize import admission, admission_v2
 
     source = inspect.getsource(admission_v2)
-    for shared in ("_terminal_event", "_verify_payload_hash", "_require_resolved"):
+    for shared in ("_terminal_event", "_verify_payload_hash"):
         assert "from featuregen.materialize.admission import" in source or shared in source
         assert getattr(admission_v2, shared) is getattr(admission, shared)
+
+
+def test_the_DISPOSITION_CHECK_IS_NOT_SHARED_and_that_is_the_point():
+    """Check 3 USED to be `admission._require_resolved`, and sharing it broke the V3 chain.
+
+    V1 and V2 resolve output authority DURING authoring, so `RESOLVED` there means every question
+    was answered. V3 defers it to the compiler by design and therefore always terminates
+    `NEEDS_REVIEW` — so the shared rule refused every V3 formula that had ever been authored, and
+    nothing noticed because nothing had put one through admission.
+
+    Pinned as a NON-identity so a later tidy that "restores consistency" by re-sharing the check
+    fails here, with the reason, instead of silently closing the chain again.
+    """
+    from featuregen.materialize import admission, admission_v2
+
+    assert not hasattr(admission_v2, "_require_resolved")
+    assert admission_v2._require_admissible_disposition is not admission._require_resolved

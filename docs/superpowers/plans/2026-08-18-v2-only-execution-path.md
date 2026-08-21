@@ -441,6 +441,32 @@ the features are computed for, defaulted operand facts let a monetary sum cross 
 task on this surface is to give `build_set_revision.declaration_json` a type, since a population is
 declared once per SET rather than per attempt.
 
+**STEP 4 IS COMPLETE (2026-08-21).** `tests/featuregen/materialize/test_production_chain_v2.py`
+drives the chain from a PERSON'S SELECTION: a build set naming a selection whose candidate has a
+READY formula draft, whose authoring run left a replayable trace, requested through
+`request_generation` and driven by the real fenced worker to a sealed artifact and a SUCCEEDED
+request. Anti-forgery (the draft disagreeing with its trace), mutation (a different formula seals a
+different artifact under a different compilation identity and project digest) and the
+never-reached-READY refusal are all on that same production path.
+
+▲ **AND IT FOUND THAT THE V3 CHAIN WAS BROKEN AT ADMISSION — the whole way, for every V3 formula.**
+`replay_authoring_v2` terminates a V3 run with `output_status="needs_authority"` and says why in
+place: *"a V3 run CAPTURES the author's intent and stops. Resolving the output policy against C1's
+governed facts is S5's."* That is right — `compile_generation_v2` resolves it. But `needs_authority`
+folds to `NEEDS_REVIEW` unconditionally, and `admit_artifacts_v2` called V1's `_require_resolved`,
+which demands `RESOLVED`. **No V3 formula could ever be admitted.** Nothing caught it because
+nothing had ever put a V3 proposal through admission: of the two places in the whole suite that
+spell `formula_schema_version: 3`, one is a parser test and the other builds `AdmittedFeatureV2` BY
+HAND. Every stage downstream had only ever been exercised against artifacts that skipped this gate.
+
+The fix asks the FOLD rather than adding a second list of conditions: re-fold the recorded axes with
+the output axis set to what S5 will establish, and admit only if the answer is `RESOLVED`. A run
+whose only unmet axis is the deferred one is admitted; one that also has a blocking critic, a
+mismatched expectation, an invalid structure or a technical failure is still refused, by the same
+precedence chain that produced the original verdict. **This is a change to a GOVERNANCE gate and is
+flagged for ratification** — the alternative reading (that V3 authoring should resolve its own
+output) contradicts C-A7 and would record a stage that never ran as having run and agreed.
+
 **Found during execution, and not in the plan when it was written:**
 
 * **Step 4** — the six typed computation fields were dropped by the candidate serializer, so

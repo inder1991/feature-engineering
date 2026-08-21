@@ -118,6 +118,11 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Test idioms we use deliberately.
 "tests/**" = ["B011", "B017", "B007", "E402"]
+# Importing a fixture from a sibling test module is how pytest shares one, and ruff reads the
+# test's own parameter of the same name as redefining the import. Scoped to this ONE file rather
+# than to `tests/**`, because F811 also catches two test functions with one name — a real defect
+# that silently drops a test — and that check is worth keeping everywhere else.
+"tests/featuregen/materialize/test_production_chain_v2.py" = ["F811"]
 # Vendored VERBATIM from trailofbits/rfc8785.py (see its header); style-only
 # findings are not worth diverging from the audited upstream bytes.
 "src/featuregen/formula/_jcs.py" = ["UP006", "UP007", "PIE790", "B904"]
