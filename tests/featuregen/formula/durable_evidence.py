@@ -104,12 +104,27 @@ _APPEND_ONLY = (
 
 
 def _erase(dsn: str, run_id: str, queue_id: int) -> None:
-    """Remove exactly what this run wrote. Deterministic: keyed on the run id, never on a time
-    window or a `LIKE`, so a concurrent test's evidence cannot be caught in it."""
-    with psycopg.connect(dsn, autocommit=True) as cleanup:
-        for table, trigger in _APPEND_ONLY:
-            cleanup.execute(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}")
-        try:
+    """Remove exactly what this run wrote — ALL OF IT IN ONE TRANSACTION, or none of it.
+
+    ▲ **THE GUARDS MUST NEVER BE LEFT OFF.** An earlier version disabled the append-only triggers on
+    an AUTOCOMMIT connection, before entering its `try`. Every `ALTER TABLE ... DISABLE TRIGGER`
+    committed on the spot and became visible to every other session, so a failure part-way through
+    disabling — or part-way through re-enabling — left a durable table's append-only guard OFF, with
+    nothing to turn it back on. A test fixture that can silently disarm production's tamper-evidence
+    is worse than the leftover rows it exists to avoid.
+
+    PostgreSQL's DDL is transactional, so the whole sequence belongs in one transaction: disable,
+    delete, re-enable, commit. Any failure rolls the entire thing back and the guards were, from
+    every other session's point of view, never disabled at all. Other connections block on the table
+    locks for the duration rather than observing an unguarded window — which is the stronger
+    property, not merely a tidier one.
+    """
+    # NOT autocommit: the transaction IS the guarantee here.
+    with psycopg.connect(dsn) as cleanup:
+        with cleanup.transaction():
+            for table, trigger in _APPEND_ONLY:
+                cleanup.execute(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}")
+
             refs = [row[0] for row in cleanup.execute(
                 "SELECT dispatch_ref FROM llm_dispatch WHERE authoring_run_id = %s",
                 (run_id,)).fetchall()]
@@ -126,8 +141,21 @@ def _erase(dsn: str, run_id: str, queue_id: int) -> None:
             cleanup.execute(
                 "DELETE FROM formula_authoring_run WHERE authoring_run_id = %s", (run_id,))
             cleanup.execute("DELETE FROM queue WHERE id = %s", (queue_id,))
-        finally:
-            # Re-enabled even if a delete fails: leaving a durable table's append-only guard OFF
-            # would be a far worse legacy than a leftover row.
+            _erase_hook()
+
+            # FLUSH DEFERRED CONSTRAINT TRIGGERS FIRST. The deletes above leave pending FK trigger
+            # events on these tables, and PostgreSQL refuses `ALTER TABLE ... ENABLE TRIGGER` while
+            # any are outstanding ("cannot ALTER TABLE ... because it has pending trigger events").
+            # Forcing them immediate resolves them inside this transaction, so the re-enable still
+            # happens here rather than in a second one — which is the whole point.
+            cleanup.execute("SET CONSTRAINTS ALL IMMEDIATE")
             for table, trigger in _APPEND_ONLY:
                 cleanup.execute(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}")
+
+
+def _erase_hook() -> None:
+    """A seam for the failure-injection test, and nothing else.
+
+    Present so a test can prove the rollback property without corrupting a real cleanup path or
+    depending on which statement happens to be fragile this month.
+    """
