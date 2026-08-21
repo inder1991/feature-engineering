@@ -13,13 +13,14 @@ import pytest
 from featuregen.overlay.upload.formula_draft_store import (
     DraftRetired,
     RetirementDisagreement,
+    read_draft,
     record_draft_replacement,
     retire_formula_draft,
     retired_draft_ids,
 )
 
 
-def _draft(db, draft_id: str) -> str:
+def _draft(db, draft_id: str, *, state: str = "BLOCKED") -> str:
     # BLOCKED, because a READY draft must carry a formula (`formula_draft_ready_carries_a_formula`)
     # and this file is about retirement, which is state-agnostic — a draft is retired for what it
     # SAYS, not for how far it got.
@@ -27,8 +28,9 @@ def _draft(db, draft_id: str) -> str:
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
         "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
         "formula_identity_hash, state, blockers, requested_by, requested_at) "
-        "VALUES (%s,'crev-r',%s,'h1','h2','h3','',%s,'BLOCKED','[\"X\"]'::jsonb,'user:ops','t')",
-        (draft_id, f"opt-{draft_id}", f"ident-{draft_id}"))
+        "VALUES (%s,'crev-r',%s,'h1','h2','h3','',%s,%s,%s::jsonb,'user:ops','t')",
+        (draft_id, f"opt-{draft_id}", f"ident-{draft_id}", state,
+         '["X"]' if state == "BLOCKED" else "[]"))
     return draft_id
 
 
@@ -248,14 +250,19 @@ def test_a_TRANSITION_CANNOT_OVERLAP_AN_IN_FLIGHT_RETIREMENT(db, _dsn):
 
     try:
         with psycopg.connect(_dsn) as retiring, psycopg.connect(_dsn) as advancing:
-            # A: retire, and HOLD the transaction open.
-            retire_formula_draft(retiring, "fd-race", reason="WITHDRAWN", retired_by="ops@bank")
+            # A: retire inside an OUTER transaction, so the lock is still held when the block
+            # returns. `_draft_locked` nests via savepoint when a transaction is already open and
+            # commits only when it opened one itself — which is what makes it safe on the
+            # runbook's autocommit connection and still caller-controlled here.
+            with retiring.transaction():
+                retire_formula_draft(retiring, "fd-race", reason="WITHDRAWN",
+                                     retired_by="ops@bank")
 
-            # B: the advance must not slip past an in-flight retirement.
-            advancing.execute("SET statement_timeout = '750ms'")
-            with pytest.raises(psycopg.errors.QueryCanceled):
-                advance(advancing, "fd-race", DraftStateV1.AUTHORING)
-            advancing.rollback()
+                # B: the advance must not slip past an in-flight retirement.
+                advancing.execute("SET statement_timeout = '750ms'")
+                with pytest.raises(psycopg.errors.QueryCanceled):
+                    advance(advancing, "fd-race", DraftStateV1.AUTHORING)
+                advancing.rollback()
 
             retiring.commit()
 
@@ -279,5 +286,97 @@ def test_a_TRANSITION_CANNOT_OVERLAP_AN_IN_FLIGHT_RETIREMENT(db, _dsn):
             cleanup.execute("ALTER TABLE formula_draft DISABLE TRIGGER "
                             "formula_draft_no_identity_edit")
             cleanup.execute("DELETE FROM formula_draft WHERE formula_draft_id = %s", ("fd-race",))
+            cleanup.execute("ALTER TABLE formula_draft ENABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
+
+
+def test_the_AUTHORIZED_TRANSITION_FINISHES_and_the_retirement_waits(db, _dsn):
+    """▲ THE OTHER HALF OF THE CONTRACT: "an already-authorized action finishes".
+
+    The first race test proves retirement-then-transition. This proves the reverse ordering, which
+    is the half the documented contract actually promises operators — a turn already under way is
+    not torn up; the retirement lands after it and stops the NEXT one.
+    """
+    import psycopg
+
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    _draft(db, "fd-race2", state="REQUESTED")
+    db.commit()
+
+    try:
+        with psycopg.connect(_dsn) as advancing, psycopg.connect(_dsn) as retiring:
+            with advancing.transaction():
+                advance(advancing, "fd-race2", DraftStateV1.AUTHORING)
+
+                # The retirement must WAIT for the in-flight transition rather than interleave.
+                retiring.execute("SET statement_timeout = '750ms'")
+                with pytest.raises(psycopg.errors.QueryCanceled):
+                    retire_formula_draft(retiring, "fd-race2", reason="WITHDRAWN",
+                                         retired_by="ops@bank")
+                retiring.rollback()
+
+            advancing.commit()
+
+            # The authorized transition stood, and the retirement now succeeds.
+            retiring.execute("SET statement_timeout = 0")
+            retire_formula_draft(retiring, "fd-race2", reason="WITHDRAWN", retired_by="ops@bank")
+            retiring.commit()
+
+            assert read_draft(retiring, "fd-race2").state is DraftStateV1.AUTHORING
+            with pytest.raises(DraftRetired):
+                advance(advancing, "fd-race2", DraftStateV1.CRITIC_REVIEW)
+            advancing.rollback()
+    finally:
+        with psycopg.connect(_dsn, autocommit=True) as cleanup:
+            cleanup.execute("ALTER TABLE formula_draft_retirement DISABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("DELETE FROM formula_draft_retirement WHERE formula_draft_id = %s",
+                            ("fd-race2",))
+            cleanup.execute("ALTER TABLE formula_draft_retirement ENABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("ALTER TABLE formula_draft DISABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
+            cleanup.execute("DELETE FROM formula_draft WHERE formula_draft_id = %s", ("fd-race2",))
+            cleanup.execute("ALTER TABLE formula_draft ENABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
+
+
+def test_the_LOCK_HOLDS_ON_AN_AUTOCOMMIT_CONNECTION(db, _dsn):
+    """▲ THE HOLE THE LOCK ITSELF HAD. `pg_advisory_xact_lock` releases on commit, so on an
+    AUTOCOMMIT connection the lock statement was its own transaction and the lock was gone before
+    the next statement ran — reopening the race it was taken to close. The production worker
+    happens to call inside a transaction; the cleanup runbook's operator connection does not.
+
+    `_draft_locked` now opens one itself, so the guarantee no longer depends on how the caller
+    happened to connect.
+    """
+    import psycopg
+
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    _draft(db, "fd-auto")
+    db.commit()
+
+    try:
+        with psycopg.connect(_dsn, autocommit=True) as operator:
+            retire_formula_draft(operator, "fd-auto", reason="WITHDRAWN", retired_by="ops@bank")
+
+            # It committed despite autocommit, and the fence holds from another connection.
+            with psycopg.connect(_dsn) as other:
+                with pytest.raises(DraftRetired):
+                    advance(other, "fd-auto", DraftStateV1.AUTHORING)
+                other.rollback()
+    finally:
+        with psycopg.connect(_dsn, autocommit=True) as cleanup:
+            cleanup.execute("ALTER TABLE formula_draft_retirement DISABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("DELETE FROM formula_draft_retirement WHERE formula_draft_id = %s",
+                            ("fd-auto",))
+            cleanup.execute("ALTER TABLE formula_draft_retirement ENABLE TRIGGER "
+                            "formula_draft_retirement_no_change")
+            cleanup.execute("ALTER TABLE formula_draft DISABLE TRIGGER "
+                            "formula_draft_no_identity_edit")
+            cleanup.execute("DELETE FROM formula_draft WHERE formula_draft_id = %s", ("fd-auto",))
             cleanup.execute("ALTER TABLE formula_draft ENABLE TRIGGER "
                             "formula_draft_no_identity_edit")

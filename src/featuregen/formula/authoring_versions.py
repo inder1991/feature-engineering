@@ -229,38 +229,64 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     # one means an unexpected task is a PROBLEM rather than an absence.
     from featuregen.formula.author import AUTHOR_TASK
 
-    calls = conn.execute(
-        "SELECT DISTINCT c.task, c.output_schema_id, c.output_schema_version, c.prompt_id, "
-        "       c.prompt_version "
+    # ▲ LEFT JOIN, AND NO `IS NOT NULL` FILTER. An inner join with that filter silently DROPPED an
+    # author turn carrying no `llm_call_ref` — so a run with one good turn and one unaudited turn
+    # qualified on the strength of the good one. The comment said every turn was judged; the query
+    # did not. An event this qualifier cannot audit is a PROBLEM, never an absence.
+    #
+    # Candidates are matched on the STAGE too: replay treats `AUTHOR_TURN_*` as a turn, so imported
+    # material whose stage says author-turn while its `kind` says something else was used as a turn
+    # and skipped by a kind-only query. Both spellings are collected and any disagreement is named.
+    turns = conn.execute(
+        "SELECT e.seq, e.kind, e.stage, e.llm_call_ref, c.task, c.output_schema_id, "
+        "       c.output_schema_version, c.prompt_id, c.prompt_version "
         "  FROM formula_authoring_trace_event e "
-        "  JOIN llm_call c ON c.llm_call_ref = e.llm_call_ref "
-        " WHERE e.authoring_run_id = %s AND e.kind = 'author_turn' "
-        "   AND e.llm_call_ref IS NOT NULL",
+        "  LEFT JOIN llm_call c ON c.llm_call_ref = e.llm_call_ref "
+        " WHERE e.authoring_run_id = %s "
+        "   AND (e.kind = 'author_turn' OR e.stage LIKE 'AUTHOR_TURN%%')",
         (authoring_run_id,)).fetchall()
-    if not calls:
+    if not turns:
         problems.append(
             f"<no author_turn provider call> (expected one requested under "
             f"{V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
-    for task, schema_id, schema_version, prompt_id, prompt_version in calls:
+    seen_audited = False
+    for seq, kind, stage, call_ref, task, schema_id, schema_version, prompt_id, prompt_version \
+            in turns:
+        where = f"author turn seq={seq}"
+        if kind != "author_turn":
+            problems.append(
+                f"{where} has stage={stage!r} but kind={kind!r}: replay reads it as a turn and a "
+                f"kind-only audit would not")
+        if call_ref is None:
+            problems.append(
+                f"{where} carries no llm_call_ref, so what it was requested under is unauditable")
+            continue
+        if task is None:
+            problems.append(f"{where} references {call_ref!r}, which no llm_call row matches")
+            continue
+        seen_audited = True
         if task != AUTHOR_TASK:
-            problems.append(f"author_turn call task={task!r} (expected {AUTHOR_TASK!r})")
+            problems.append(f"{where} call task={task!r} (expected {AUTHOR_TASK!r})")
         # The SCHEMA is what the answer was validated against; the PROMPT is what the model was
         # told to produce. A run held to the v3 shape under v2's instruction, or the reverse, is
         # not a v3 run — and only checking one of them would miss exactly that.
         if schema_id != V3_AUTHOR_OUTPUT_SCHEMA_ID:
             problems.append(
-                f"author output_schema_id={schema_id!r} "
+                f"{where} output_schema_id={schema_id!r} "
                 f"(expected {V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
         if schema_version != V3_AUTHOR_OUTPUT_SCHEMA_VERSION:
             problems.append(
-                f"author output_schema_version={schema_version!r} "
+                f"{where} output_schema_version={schema_version!r} "
                 f"(expected {V3_AUTHOR_OUTPUT_SCHEMA_VERSION!r})")
         if prompt_id != V3_AUTHOR_PROMPT_ID:
-            problems.append(f"author prompt_id={prompt_id!r} (expected {V3_AUTHOR_PROMPT_ID!r})")
+            problems.append(f"{where} prompt_id={prompt_id!r} (expected {V3_AUTHOR_PROMPT_ID!r})")
         if prompt_version != V3_AUTHOR_PROMPT_VERSION:
             problems.append(
-                f"author prompt_version={prompt_version!r} "
+                f"{where} prompt_version={prompt_version!r} "
                 f"(expected {V3_AUTHOR_PROMPT_VERSION!r})")
+    if turns and not seen_audited:
+        problems.append(
+            "no author turn could be audited at all: every one lacked a resolvable provider call")
 
     # ── and the artifact the run actually produced ───────────────────────────────────────────────
     # PARSED, not string-compared. `"formula_schema_version": 3` in the stored JSON is a claim; a

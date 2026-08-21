@@ -112,9 +112,12 @@ def main(argv: list[str] | None = None) -> int:
         if name in expected:
             continue
         known = ACKNOWLEDGED_LEDGER_ROWS.get(name)
-        # The CHECKSUM must match, and the named replacement must actually be present — an
-        # acknowledgement whose replacement this build does not carry is not an explanation.
-        if known and known[0] == checksum and known[1] in expected:
+        # The CHECKSUM must match, the replacement must exist in THIS BUILD, and it must also be
+        # in the LEDGER — the acknowledgement's safety argument is "both names are applied, and the
+        # new one is what this build carries". Checking only the build let a database holding just
+        # the retired row pass while reporting the replacement as "not yet applied", which is the
+        # one shape the argument does not cover.
+        if known and known[0] == checksum and known[1] in expected and known[1] in ledger:
             acknowledged.append(name)
         else:
             unexpected.append(name)

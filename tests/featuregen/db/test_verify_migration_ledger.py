@@ -99,3 +99,17 @@ def test_a_MIGRATION_NOT_YET_APPLIED_IS_NOT_A_FAILURE(tmp_path, capsys):
     """A fresh database has applied nothing. That is the normal case, not drift."""
     assert main(["--ledger-file", str(_ledger_file(tmp_path, {}))]) == 0
     assert "not yet applied here" in capsys.readouterr().out
+
+
+def test_an_ACKNOWLEDGED_ROW_WHOSE_REPLACEMENT_IS_ABSENT_STILL_FAILS(tmp_path, capsys):
+    """▲ The acknowledgement's safety argument is "both names are applied, and the new one is what
+    this build carries". A database holding ONLY the retired row does not satisfy it — and
+    previously passed, reporting the replacement as merely "not yet applied"."""
+    from scripts.verify_migration_ledger import ACKNOWLEDGED_LEDGER_ROWS
+
+    known, (checksum, replacement, _why) = next(iter(ACKNOWLEDGED_LEDGER_ROWS.items()))
+    ledger = {name: digest for name, digest in _expected().items() if name != replacement}
+    ledger[known] = checksum
+
+    assert main(["--ledger-file", str(_ledger_file(tmp_path, ledger))]) == 1
+    assert "UNEXPLAINED LEDGER ROWS" in capsys.readouterr().out

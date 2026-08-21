@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -188,8 +189,12 @@ class FormulaDraftV1:
 
 
 #: Serializes a draft's TRANSITIONS against its RETIREMENT. `pg_advisory_xact_lock` releases on
-#: commit or rollback, so nothing has to unlock it, and the key is the draft — two different drafts
-#: never contend.
+#: commit or rollback, so nothing has to unlock it, and the key is the draft.
+#:
+#: `hashtext` is 32-bit, so two unrelated draft ids CAN collide and block each other. That is
+#: conservative contention, never incorrect state — the pair simply serializes when it did not have
+#: to — and at this cardinality it is not worth a wider key to avoid. Saying "two different drafts
+#: never contend" would have been wrong.
 #:
 #: ▲ WHY A LOCK AND NOT JUST `WHERE NOT EXISTS`. That predicate is evaluated under the statement's
 #: SNAPSHOT, so an UNCOMMITTED concurrent retirement is invisible to it — and the FK lock the
@@ -200,11 +205,24 @@ class FormulaDraftV1:
 _DRAFT_LOCK_NAMESPACE = 0x0FD1
 
 
-def _lock_draft(conn: DbConn, formula_draft_id: str) -> None:
-    """Take the draft's transaction lock. Both a transition and a retirement must hold it, or the
-    one that does not is exactly the race the other is trying to lose."""
-    conn.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
-                 (_DRAFT_LOCK_NAMESPACE, formula_draft_id))
+@contextmanager
+def _draft_locked(conn: DbConn, formula_draft_id: str):
+    """Hold the draft's lock across the statements that depend on it.
+
+    ▲ A TRANSACTION IS PART OF THE LOCK, not an assumption about the caller.
+    `pg_advisory_xact_lock` releases on commit — so on an AUTOCOMMIT connection the lock statement
+    is its own transaction and the lock is gone before the next statement runs, which reopens
+    exactly the race it was taken to close. The production worker happens to call inside a
+    transaction; the cleanup runbook's operator connection does not, and neither did the fixture I
+    wrote for it.
+
+    `conn.transaction()` starts an explicit one when there is none and nests harmlessly when there
+    is, so the guarantee stops depending on how the caller happened to open the connection.
+    """
+    with conn.transaction():
+        conn.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                     (_DRAFT_LOCK_NAMESPACE, formula_draft_id))
+        yield
 
 
 def formula_identity(
@@ -349,7 +367,25 @@ def advance(
             stage would produce a READY draft whose trace never records a critic, and nothing
             downstream could tell.
     """
-    _lock_draft(conn, formula_draft_id)
+    with _draft_locked(conn, formula_draft_id):
+        return _advance_locked(
+            conn, formula_draft_id, to, authoring_run_id=authoring_run_id,
+            formula_content_hash=formula_content_hash, formula_json=formula_json,
+            blockers=blockers, failure_reason=failure_reason)
+
+
+def _advance_locked(
+    conn: DbConn,
+    formula_draft_id: str,
+    to: DraftStateV1,
+    *,
+    authoring_run_id: str | None,
+    formula_content_hash: str | None,
+    formula_json: Mapping[str, object] | None,
+    blockers: Sequence[Mapping[str, str]],
+    failure_reason: str | None,
+) -> DraftStateV1:
+    """The transition itself, with the draft's lock already held."""
     row = conn.execute(
         "SELECT d.state, r.reason FROM formula_draft d "
         "LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
@@ -501,7 +537,21 @@ def retire_formula_draft(
 
     Idempotent on the draft: retiring twice is not two facts.
     """
-    _lock_draft(conn, formula_draft_id)
+    with _draft_locked(conn, formula_draft_id):
+        _retire_locked(conn, formula_draft_id, reason=reason, retired_by=retired_by,
+                       detail=detail, replacement_draft_id=replacement_draft_id)
+
+
+def _retire_locked(
+    conn: DbConn,
+    formula_draft_id: str,
+    *,
+    reason: str,
+    retired_by: str,
+    detail: str,
+    replacement_draft_id: str | None,
+) -> None:
+    """The retirement itself, with the draft's lock already held."""
     inserted = conn.execute(
         "INSERT INTO formula_draft_retirement (formula_draft_id, reason, detail, "
         "replacement_draft_id, retired_by) VALUES (%s, %s, %s, %s, %s) "

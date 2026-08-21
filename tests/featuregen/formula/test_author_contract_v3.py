@@ -656,3 +656,66 @@ def test_the_PARSE_CHECK_CATCHES_MALFORMED_PAYLOADS_but_NOT_relabelling():
     problems = _v3_parse_problems(malformed)
     assert problems and "does not parse as v3" in problems[0], problems
 
+
+def test_an_UNAUDITED_AUTHOR_TURN_IS_A_PROBLEM_not_an_absence(db):
+    """▲ THE INNER JOIN DROPPED IT. `JOIN llm_call ... WHERE llm_call_ref IS NOT NULL` silently
+    removed an author turn carrying no call reference, so a run with one good turn and one
+    unauditable turn qualified on the strength of the good one. An event this qualifier cannot
+    audit is a problem, never an absence."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+    from featuregen.formula.replay_trace import open_authoring_run
+
+    _run(db, run_id="far-unaudited-src", raw=_raw_v3(), requested=3)
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-unaudited-src",)).fetchone()
+    open_authoring_run(db, intent_hash=manifest[0], versions=manifest[1], actor=None,
+                       authoring_run_id="far-unaudited")
+    # every event copied, but the extra turn carries NO call reference
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT 'far-unaudited', seq, kind, stage, payload, payload_hash, canonical_output_hash, "
+        "       'u:' || idempotency_key, logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND kind <> 'completed' AND kind <> 'failed'",
+        ("far-unaudited-src",))
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT 'far-unaudited', seq + 700, 'author_turn', stage, payload, payload_hash, "
+        "       canonical_output_hash, 'unaudited:' || idempotency_key, logical_turn_index, NULL "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND llm_call_ref IS NOT NULL LIMIT 1",
+        ("far-unaudited-src",))
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-unaudited")
+
+    assert any("no llm_call_ref" in p and "unauditable" in p for p in problems), problems
+
+
+def test_a_TURN_WHOSE_STAGE_AND_KIND_DISAGREE_IS_NAMED(db):
+    """Replay reads an `AUTHOR_TURN_*` stage as a turn, so imported material whose `kind` says
+    something else was USED as a turn and skipped by a kind-only audit."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+    from featuregen.formula.replay_trace import open_authoring_run
+
+    _run(db, run_id="far-kindmix-src", raw=_raw_v3(), requested=3)
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-kindmix-src",)).fetchone()
+    open_authoring_run(db, intent_hash=manifest[0], versions=manifest[1], actor=None,
+                       authoring_run_id="far-kindmix")
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT 'far-kindmix', seq + 600, 'validation_result', 'AUTHOR_TURN_9', payload, "
+        "       payload_hash, canonical_output_hash, 'kindmix:' || idempotency_key, "
+        "       logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND llm_call_ref IS NOT NULL LIMIT 1",
+        ("far-kindmix-src",))
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-kindmix")
+
+    assert any("AUTHOR_TURN_9" in p and "kind=" in p for p in problems), problems
