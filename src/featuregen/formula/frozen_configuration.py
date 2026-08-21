@@ -323,6 +323,7 @@ def _operation_grammar_material_v2() -> dict:
 def freeze_current_configuration_v2(
     *,
     generation_settings: Mapping[str, Any],
+    formula_schema_version: int,
 ) -> FrozenAuthorCriticConfigurationV1:
     """Freeze a **Formula-v2** run's configuration — the same ENVELOPE, entirely v2 material.
 
@@ -359,7 +360,6 @@ def freeze_current_configuration_v2(
     )
     from featuregen.formula.schema_v2 import (
         CANONICALIZATION_VERSION_V2,
-        FORMULA_SCHEMA_VERSION_V2,
         OPERATION_GRAMMAR_VERSION_V2,
     )
     from featuregen.formula.turns_v2 import (
@@ -414,11 +414,31 @@ def freeze_current_configuration_v2(
         "review_projection_sha256": _hash_bytes(
             inspect.getsource(AuthoringAxesV2.shared_axes).encode("utf-8")),
     }))
+    # ▲ VERSION-DISPATCHED, not hardcoded. This vector is folded into `configuration_hash`, so
+    # sealing `formula_schema: 2` for a V3 run would mint a configuration identity stating that a
+    # v2 formula was authored — and every later reader keyed on the hash would agree with it. The
+    # canonicalization axis travels with the schema because the two are one lineage: v3 canonical
+    # bytes include `row_selections`, which v2's projection never saw.
+    # The wire schemas this freezer can seal a configuration FOR — CLOSED, and checked. Built here
+    # rather than at module scope because the version constants are imported inside this function,
+    # which is where the rest of the v2 material is resolved too.
+    from featuregen.formula.schema_v3 import CANONICALIZATION_VERSION_V3
+
+    freezable: Mapping[int, int] = {
+        2: CANONICALIZATION_VERSION_V2,
+        3: CANONICALIZATION_VERSION_V3,
+    }
+    canonicalization = freezable.get(formula_schema_version)
+    if canonicalization is None:
+        raise ValueError(
+            f"cannot freeze a configuration for formula schema {formula_schema_version!r}: this "
+            f"freezer knows the canonicalization lineage of {sorted(freezable)} only, and "
+            f"sealing an unknown one would state a provenance it cannot support")
     version_vector = {
-        "formula_schema": FORMULA_SCHEMA_VERSION_V2,
+        "formula_schema": formula_schema_version,
         "operation_grammar": OPERATION_GRAMMAR_VERSION_V2,
         "output_policy": OUTPUT_POLICY_VERSION_V2,
-        "canonicalization": CANONICALIZATION_VERSION_V2,
+        "canonicalization": canonicalization,
         "critic_policy": CRITIC_POLICY_VERSION,
         "disposition_policy": DISPOSITION_POLICY_VERSION_V2,
     }
@@ -450,7 +470,25 @@ def verify_frozen_configuration_v2(
     *,
     generation_settings: Mapping[str, Any],
 ) -> None:
-    current = freeze_current_configuration_v2(generation_settings=generation_settings)
+    """Re-freeze and compare, UNDER THE SCHEMA THE SEAL ITSELF DECLARES.
+
+    ▲ The schema is read back out of `frozen.version_vector_json` rather than defaulted. When this
+    function re-froze under a fixed schema, a configuration sealed for V3 could never verify: the
+    re-freeze produced a v2 vector, the hashes differed, and the caller was told the configuration
+    had DRIFTED — a false report of the one condition it exists to detect, and one that names
+    nothing about what actually differed.
+
+    A seal that does not declare its schema is refused rather than assumed: comparing it against a
+    guess would answer "has this drifted?" with "it depends what I assumed it was".
+    """
+    declared = json.loads(frozen.version_vector_json).get("formula_schema")
+    if declared is None:
+        raise ConfigurationDrifted(
+            "the frozen v2 configuration declares no formula_schema in its version vector, so "
+            "there is no schema to re-freeze under — and re-freezing under a guess would compare "
+            "this seal against a configuration nobody sealed")
+    current = freeze_current_configuration_v2(
+        generation_settings=generation_settings, formula_schema_version=declared)
     if current.configuration_hash != frozen.configuration_hash:
         raise ConfigurationDrifted(
             "author/critic v2 configuration changed after observation")

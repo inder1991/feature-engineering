@@ -342,7 +342,7 @@ _SETTINGS = {"provider": "fake", "model": "test"}
 
 def test_a_v2_frozen_configuration_verifies_and_never_reaches_the_provider_on_drift(
         db, monkeypatch) -> None:
-    frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS)
+    frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS, formula_schema_version=2)
     monkeypatch.setattr(
         "featuregen.formula.replay_authoring_v2.current_formula_generation_settings",
         lambda: _SETTINGS)
@@ -376,7 +376,7 @@ def test_a_v1_frozen_configuration_is_DRIFT_for_a_v2_run(db, monkeypatch) -> Non
     v1_frozen = freeze_current_configuration(
         generation_settings=_SETTINGS, author_instruction=AUTHOR_INSTRUCTION,
         author_prompt_id=AUTHOR_PROMPT_ID)
-    v2_frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS)
+    v2_frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS, formula_schema_version=2)
     assert v1_frozen.configuration_hash != v2_frozen.configuration_hash
     assert v1_frozen.author.prompt_id != v2_frozen.author.prompt_id
     assert v1_frozen.author.output_schema_id != v2_frozen.author.output_schema_id

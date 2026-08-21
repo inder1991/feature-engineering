@@ -97,6 +97,7 @@ from featuregen.formula.frozen_configuration import (
     verify_frozen_configuration_v2,
 )
 from featuregen.formula.output_authority_v2 import (
+    OUTPUT_POLICY_VERSION_V2,
     FormulaOutputPolicyV2,
     OperandFactsV2,
     resolve_output_v2,
@@ -122,10 +123,14 @@ from featuregen.formula.result_v2 import (
 )
 from featuregen.formula.schema_leaves import AdditivityClass, SchemaError
 from featuregen.formula.schema_v2 import (
+    CANONICALIZATION_VERSION_V2,
     OPERATION_GRAMMAR_VERSION_V2,
     TypedFormulaProposalV2,
 )
-from featuregen.formula.schema_v3 import TypedFormulaProposalV3
+from featuregen.formula.schema_v3 import (
+    CANONICALIZATION_VERSION_V3,
+    TypedFormulaProposalV3,
+)
 from featuregen.overlay.field_evidence import canonical_hash
 
 if TYPE_CHECKING:
@@ -141,7 +146,14 @@ __all__ = [
 #: The wiring version of THIS orchestrator (stage order, resume points, axis mapping). Its own
 #: number beside ``authoring_v2``'s: the two modules can be re-wired independently, and a frozen
 #: run's manifest must name the one that decided it.
-AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 2   # C-A6: see `authoring_versions` for the policy
+AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 3   # the V3 branch now records
+#   `output_status="deferred_to_compiler"` where it recorded `needs_authority`. That is a
+#   change in what this orchestrator WRITES, so it is a change in which orchestrator wrote a
+#   run — see `authoring_versions` for the policy. The non-replay `AUTHORING_ORCHESTRATOR_
+#   VERSION_V2` is deliberately NOT bumped alongside it: `authoring_v2._parse_v2` refuses
+#   anything that is not a `TypedFormulaProposalV2` as `invalid_formula`, and V3 is not a
+#   subclass of V2, so that orchestrator cannot author a V3 run and its behaviour is
+#   genuinely unchanged. Bumping it would claim a change nobody made.
 
 #: The facts reader's contract: one v2 proposal in, the ref-keyed bundle plus the governed reads
 #: that failed CLOSED out. The worker injects ``FrozenRecipeReadContext.formula_facts_v2``.
@@ -491,6 +503,18 @@ def run_authoring_v2_replay(
         # The non-replay v2 orchestrator's own wiring version rides along: a run must name which
         # v2 stage-mapping decided it, and the two modules move independently.
         "authoring_v2": AUTHORING_ORCHESTRATOR_VERSION_V2,
+        # ▲ THE TWO AXES THE MANIFEST WAS MISSING, and their absence was load-bearing. An evaluator
+        # asking "under exactly what did this run decide?" could not answer from the manifest: the
+        # canonicalization version decides the BYTES a proposal hashes to, and the output-policy
+        # version decides what a governed output MEANS. Both were reachable only through a frozen
+        # configuration, which the production draft worker does not supply — so for every run this
+        # platform actually authors, neither was recorded anywhere.
+        #
+        # Version-DISPATCHED, never hardcoded, for `formula_schema`'s stated reason: a v3 run must
+        # not inherit v2's canonicalization identity, and the two lineages are separate by design.
+        "canonicalization": (CANONICALIZATION_VERSION_V3 if formula_schema_version == 3
+                             else CANONICALIZATION_VERSION_V2),
+        "output_policy": OUTPUT_POLICY_VERSION_V2,
     }
     if frozen_configuration is not None:
         versions["frozen_configuration_policy"] = (

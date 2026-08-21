@@ -62,6 +62,12 @@ VERSION_KEYS: tuple[str, ...] = (
     "disposition",
     "authoring_v2",
     "frozen_configuration_policy",
+    # The two axes the manifest gained: what BYTES a proposal hashes to, and what a governed output
+    # MEANS. They belong in the classified set — a key the classifier does not compare is a key a
+    # run may differ on while still classifying CURRENT, which is the whole failure this tuple
+    # exists to prevent.
+    "canonicalization",
+    "output_policy",
 )
 
 #: What the three C-A6 constants were before the bump, plus the schema version that was hardcoded

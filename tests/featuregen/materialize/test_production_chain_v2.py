@@ -165,7 +165,12 @@ def _author_run(conn, monkeypatch, *, run_id: str, raw: dict, findings=(), facts
         facts_reader=facts if facts is not None else (lambda _p: ({TXN_AMT: OperandFactsV2(
             logical_type="decimal", unit="monetary", currency="fixed:AED")}, ())),
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
-        tool_runner=recipe_tool_runner_v2(frozenset({TXN, TXN_AMT, TXN_DT, TXN_CIF})))
+        tool_runner=recipe_tool_runner_v2(frozenset({TXN, TXN_AMT, TXN_DT, TXN_CIF})),
+        # WHAT PRODUCTION PASSES (`formula_draft_worker._DRAFT_FORMULA_SCHEMA_VERSION = 3`). It is
+        # not a detail: this is the version the run's MANIFEST declares, and a fixture that left it
+        # at the parameter's default would author V3 proposals under a manifest saying V2 — the
+        # exact disagreement `_verify_manifest_declares_the_language` now refuses.
+        formula_schema_version=3 if raw.get("formula_schema_version") == 3 else 2)
     return run_id
 
 

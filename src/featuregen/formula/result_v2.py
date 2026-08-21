@@ -59,7 +59,24 @@ __all__ = [
 #: Version of the v2 fold precedence + coherence rules stamped on every v2 result. Its own pin:
 #: v1's :data:`~featuregen.formula.result.DISPOSITION_POLICY_VERSION` must be free to move without
 #: restamping v2 runs, and vice versa.
-DISPOSITION_POLICY_VERSION_V2 = 2   # C-A6: REVIEW_BYPASSED is a disposition this version knows
+DISPOSITION_POLICY_VERSION_V2 = 3   # READY_FOR_OUTPUT_BINDING is a disposition this version
+                                    # knows — the same reason 1 -> 2 was C-A6's REVIEW_BYPASSED.
+#
+# ▲ WHY A BUMP, WHEN NO EXISTING TRACE FOLDS DIFFERENTLY. Nothing already recorded changes
+# meaning: `deferred_to_compiler` did not exist before, so no axis set that was expressible
+# under version 2 folds to a different disposition under version 3, and every stored result
+# re-folds to exactly what it folded then. The bump is not about rescuing old bytes — it is
+# about what the NUMBER identifies. Two runs both stamped `disposition: 2` would otherwise mean
+# different policies: one written by software that could never produce READY_FOR_OUTPUT_BINDING,
+# one written by software that can.
+#
+# AND THE FINE-GRAINED PIN DOES NOT COVER PRODUCTION. `frozen_configuration` hashes
+# `inspect.getsource(_fold_v2)` into `disposition_policy_hash`, so a FROZEN run's seal moves
+# automatically when this fold changes — which is why the integer looks redundant. It is not:
+# the production formula-draft worker supplies no frozen configuration at all, so for every run
+# this platform actually authors, that source hash is recorded nowhere and this integer is the
+# ONLY pin on which policy decided the run. The coarse one is load-bearing exactly where the
+# fine one is absent.
 
 #: The output statuses under which NO authoritative output policy can exist (§F honesty core).
 _UNRESOLVED_OUTPUT: frozenset[str] = frozenset({
