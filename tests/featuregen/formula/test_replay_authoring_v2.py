@@ -105,6 +105,10 @@ def _run(db, *, raw: dict | None = None, client: FakeLLM | None = None, run_id: 
     # kwarg entirely; the seam now refuses omission, so the tool set a test runs against is written
     # down. Behaviour is unchanged — what changed is that it is visible.
     kwargs.setdefault("tool_runner", run_tool)
+    # STATED, not inherited, for the reason above and now for a second one: the orchestrator no
+    # longer defaults the schema, and the schema SELECTS the provider contract a run is driven
+    # under. A helper that fixed it would drive every caller's run under one grammar.
+    kwargs.setdefault("formula_schema_version", 2)
     return run_authoring_v2_replay(
         db, _INTENT, llm, llm, actor=None, authoring_run_id=run_id,
         facts_reader=facts_reader,
@@ -319,7 +323,7 @@ def test_a_broken_critic_is_technical_never_clean(db) -> None:
         CRITIC_TASK: FakeResponse(output=None)})
     result = run_authoring_v2_replay(
         db, _INTENT, llm, llm, actor=None, authoring_run_id="far_v2_critic",
-        facts_reader=_monetary_facts, tool_runner=run_tool)
+        facts_reader=_monetary_facts, tool_runner=run_tool, formula_schema_version=2)
     assert result.authoring_disposition == "TECHNICAL_FAILURE"
     assert result.candidate_output is None
 

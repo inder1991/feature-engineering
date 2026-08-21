@@ -269,7 +269,7 @@ def test_A_CHANGED_INTENT_STILL_REFUSES_ON_THE_LEGACY_PATH(db, monkeypatch):
         run_authoring_v2_replay(
             db, other, None, None, actor=None, authoring_run_id=run_id,
             facts_reader=_monetary_facts, tool_runner=run_tool,
-            critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref})
+            critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref}, formula_schema_version=2)
 
 
 # ══ acceptance #8 — a V3 run records schema 3 ════════════════════════════════════════════════════

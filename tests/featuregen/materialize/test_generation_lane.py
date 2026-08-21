@@ -59,8 +59,9 @@ GROUP = "customer_txn_features"
 def _job(request_id: str = "req-1", **overrides) -> GenerationJobV2:
     """A decodable job. The declarations are minimal on purpose — these tests are about the lane,
     and a job that compiles is `test_end_to_end_v2`'s subject, not this file's."""
-    from featuregen.materialize.contract import AvailabilityPromiseV1
     from tests.featuregen.materialize.test_pilot_v2 import CADENCE
+
+    from featuregen.materialize.contract import AvailabilityPromiseV1
 
     fields = dict(
         request_id=request_id,

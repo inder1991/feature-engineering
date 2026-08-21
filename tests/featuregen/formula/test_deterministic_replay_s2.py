@@ -194,7 +194,7 @@ def test_OMITTING_the_blueprint_still_takes_the_AUTHORED_path(db, monkeypatch):
         db, _INTENT, None, None, actor=None, authoring_run_id="far_s2_authored",
         facts_reader=_monetary_facts,
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
-        tool_runner=lambda **kw: {})
+        tool_runner=lambda **kw: {}, formula_schema_version=3)
 
     assert reached == ["author"], "the authored path was taken"
     assert result.authoring_disposition == "TECHNICAL_FAILURE"

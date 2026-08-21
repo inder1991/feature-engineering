@@ -235,6 +235,7 @@ def _admit_one_v2(
     # artifact.
     proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 3
     _verify_language_version(proposal, run_id)                   # 4
+    _verify_manifest_declares_the_language(conn, proposal, run_id)          # 4b
     _verify_axes_v2(event, result, run_id)                       # 5
     _require_admissible_disposition(event, result, proposal, run_id)        # 6
     _verify_intent_hash_v2(conn, item.intent, run_id)            # 7
@@ -424,6 +425,57 @@ def _verify_language_version(
             f"be read under operations v1 never defined, and a version nobody has defined would "
             f"be read under a grammar that does not exist",
         )
+
+
+# ── 4b. the MANIFEST, the PROPOSAL and the RUNTIME TYPE all name one language ────────────────────
+def _verify_manifest_declares_the_language(
+    conn: DbConn,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+    run_id: str,
+) -> None:
+    """Three records of one fact must agree: what the run DECLARED, what the proposal SAYS, and
+    what the proposal IS.
+
+    ▲ DEFENCE IN DEPTH, and the depth is the point. Authoring now refuses a schema mismatch at the
+    moment it happens (`FORMULA_SCHEMA_CONTRACT_MISMATCH`), which is where it belongs — the run
+    fails, names the mismatch, and nothing downstream ever sees it. This check exists for the runs
+    that did not come through today's authoring path: traces written before it, imported material,
+    and whatever a future orchestration mistake produces. Those are exactly the cases the authoring
+    check cannot cover, because it did not run.
+
+    The RUNTIME TYPE is compared as well as the declared integer, because they are separately
+    forgeable: `parse_versioned` dispatches on the declared field, so an object whose field says 3
+    while its class is `TypedFormulaProposalV2` would satisfy an integer comparison and then be
+    read by every downstream stage as v2 — which is the shape of the bug this whole family of
+    checks exists to catch.
+
+    A run with NO manifest is refused rather than waved through: a run that states nothing about
+    what decided it cannot be shown to agree with anything.
+    """
+    row = conn.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (run_id,)).fetchone()
+    declared = (row[0] or {}).get("formula_schema") if row else None
+    if declared is None:
+        raise MaterializationRefused(
+            CompilationRefusalCode.AUTHORING_RUN_INCOMPLETE,
+            f"authoring run {run_id} records no formula_schema in its manifest, so what language "
+            f"it was opened under is unanswerable — and an unanswerable provenance is not a "
+            f"permissive one")
+    if declared != proposal.formula_schema_version:
+        raise MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"authoring run {run_id} declares formula_schema={declared!r} in its manifest but "
+            f"carries a version {proposal.formula_schema_version} proposal. The manifest is what "
+            f"every later reader is keyed on, so admitting this would file the artifact under a "
+            f"language it is not written in")
+    expected = TypedFormulaProposalV3 if declared == 3 else TypedFormulaProposalV2
+    if not isinstance(proposal, expected):
+        raise MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"authoring run {run_id} declares formula_schema={declared!r} and its proposal says so, "
+            f"but the object is a {type(proposal).__name__}: the declared field and the type are "
+            f"separately forgeable, and every stage below this one reads the TYPE")
 
 
 # ── 5. the SEVEN axes match the trace ────────────────────────────────────────────────────────────

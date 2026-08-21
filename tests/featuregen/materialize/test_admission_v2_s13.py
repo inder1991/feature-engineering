@@ -100,6 +100,18 @@ def _raw(body: dict | None = None, **overrides) -> dict:
             **overrides}
 
 
+def _raw_v3(body: dict | None = None, **overrides) -> dict:
+    """The SAME feature in the v3 wire shape — version 3, and the `row_selections` slot v3 exists
+    for. Derived from `_raw()` rather than written out again so the two fixtures cannot drift into
+    describing different features while claiming to differ only in version."""
+    raw = _raw(body=body, **overrides)
+    raw["formula_schema_version"] = 3
+    expr = raw["body"].get("expr")
+    if isinstance(expr, dict):
+        expr.setdefault("row_selections", [])
+    return raw
+
+
 def _client(raw: dict | None = None, findings=None) -> FakeLLM:
     return FakeLLM(script={
         AUTHOR_TASK: FakeResponse(
@@ -141,7 +153,11 @@ def _free_form_run(db, raw: dict | None = None, *, intent: AuthoringIntent = _IN
         facts_reader=_monetary_facts,
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
         tool_runner=recipe_tool_runner_v2(
-            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})))
+            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})),
+        # DERIVED from the proposal this run is scripted to return, so a fixture cannot ask for one
+        # grammar and script another — the mismatch authoring now refuses outright.
+        formula_schema_version=(raw if raw is not None else _raw()).get(
+            "formula_schema_version", 2))
 
 
 def _dispatch_only(db):
@@ -243,7 +259,7 @@ def test_THE_TOOL_SEAM_IS_THE_V2_ONE(catalog):
     with pytest.raises(ToolRunnerRequired, match="wrong catalog surface"):
         run_authoring_v2_replay(
             catalog, _INTENT, client, client, actor=None, authoring_run_id="far_s13_notools",
-            facts_reader=_monetary_facts, tool_runner=None)
+            facts_reader=_monetary_facts, tool_runner=None, formula_schema_version=2)
 
 
 # ══ the ADVERTISED-set gate (S13's two clauses meeting) ════════════════════════════════════════

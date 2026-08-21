@@ -347,11 +347,7 @@ def freeze_current_configuration_v2(
     caller that could pass a different one could freeze a v2 work item under a prompt no v2 run
     would ever use.
     """
-    from featuregen.formula.author import (
-        AUTHOR_INSTRUCTION_V2,
-        AUTHOR_PROMPT_ID_V2,
-        AUTHOR_PROMPT_VERSION_V2,
-    )
+    from featuregen.formula.author import author_contract_for
     from featuregen.formula.result_v2 import (
         DISPOSITION_POLICY_VERSION_V2,
         AuthoringAxesV2,
@@ -362,25 +358,26 @@ def freeze_current_configuration_v2(
         CANONICALIZATION_VERSION_V2,
         OPERATION_GRAMMAR_VERSION_V2,
     )
-    from featuregen.formula.turns_v2 import (
-        AUTHOR_TURN_SCHEMA_ID_V2,
-        AUTHOR_TURN_SCHEMA_VERSION_V2,
-        AUTHOR_TURN_V2_SCHEMA,
-    )
 
     from featuregen.formula.output_authority_v2 import (  # isort: skip
         OUTPUT_POLICY_VERSION_V2,
     )
 
+    # ▲ THE WHOLE AUTHOR IDENTITY COMES FROM THE REQUESTED SCHEMA — prompt, instruction and turn
+    # schema, not just the canonicalization axis. It was fixed at v2's, so a configuration could
+    # seal `formula_schema: 3` while freezing the v2 prompt that instructs a model to produce v2.
+    # Selecting through the same closed mapping the orchestrator uses makes that combination
+    # unconstructible rather than merely discouraged.
+    turn_contract = author_contract_for(formula_schema_version)
     author = freeze_provider_contract(
         role="author",
         generation_settings=generation_settings,
-        prompt_id=AUTHOR_PROMPT_ID_V2,
-        prompt_version=AUTHOR_PROMPT_VERSION_V2,
-        instruction=AUTHOR_INSTRUCTION_V2,
-        output_schema_id=AUTHOR_TURN_SCHEMA_ID_V2,
-        output_schema_version=AUTHOR_TURN_SCHEMA_VERSION_V2,
-        output_schema=AUTHOR_TURN_V2_SCHEMA,
+        prompt_id=turn_contract.prompt_id,
+        prompt_version=turn_contract.prompt_version,
+        instruction=turn_contract.instruction,
+        output_schema_id=turn_contract.schema_id,
+        output_schema_version=turn_contract.schema_version,
+        output_schema=turn_contract.schema,
     )
     critic = freeze_provider_contract(
         role="critic",

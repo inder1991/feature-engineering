@@ -25,7 +25,12 @@ from tests.featuregen.formula.authoring_fixtures import (
     TABLE_REF,
     seed_authoring_catalog,
 )
-from tests.featuregen.materialize.test_admission_v2_s13 import ENGINE, _advertise, _client, _raw
+from tests.featuregen.materialize.test_admission_v2_s13 import (
+    ENGINE,
+    _advertise,
+    _client,
+    _raw_v3,
+)
 
 from featuregen.overlay.upload.formula_draft_store import DraftStateV1, read_draft, request_draft
 from featuregen.overlay.upload.formula_draft_worker import (
@@ -160,7 +165,14 @@ def lane(db, monkeypatch):
 
     def _counted_client():
         calls["n"] += 1
-        return _client(_raw())
+        # ▲ A GENUINE V3 PROPOSAL, because that is what this worker ASKS FOR
+        # (`_DRAFT_FORMULA_SCHEMA_VERSION = 3`). It returned `_raw()` — a v2 proposal — and the
+        # draft still reached READY, because the worker declared v3 in its manifest while driving
+        # the provider under the v2 turn contract whose instruction says "MUST declare
+        # formula_schema_version 2". These tests were faithfully reproducing that contradiction.
+        # Now the v3 turn schema rejects a v2 answer on the wire, and authoring refuses a run that
+        # produced a different grammar from the one it requested.
+        return _client(_raw_v3())
 
     monkeypatch.setattr(
         "featuregen.overlay.upload.formula_draft_worker.current_llm_client", _counted_client)

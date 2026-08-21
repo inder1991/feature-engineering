@@ -14,7 +14,11 @@ from pathlib import Path
 
 import featuregen
 from featuregen.documents.registry import DocumentSchemaRegistry
-from featuregen.formula.author import AUTHOR_TURN_CONTRACT_V2, _register_turn_schema
+from featuregen.formula.author import (
+    AUTHOR_TURN_CONTRACT_V2,
+    AUTHOR_TURN_CONTRACT_V3,
+    _register_turn_schema,
+)
 from featuregen.formula.critic import _register_critic_schema
 from featuregen.overlay.upload import feature_assist
 from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
@@ -202,6 +206,10 @@ def test_every_requested_schema_pair_resolves(db):
     register_enrichment_schemas(db)
     _register_turn_schema(db)                       # the v1 author turn contract (the default)
     _register_turn_schema(db, AUTHOR_TURN_CONTRACT_V2)   # Task A3 — the v2 author turn contract
+    # The v3 contract. A distinct registered pair, not a version bump of v2's: the audited
+    # seam records the id a call was made under, and a v3 run requested under the v2
+    # identity is indistinguishable in the audit from a v2 run.
+    _register_turn_schema(db, AUTHOR_TURN_CONTRACT_V3)
     _register_critic_schema(db)
     _register_selection_schema(db)
     reg = DocumentSchemaRegistry(db)

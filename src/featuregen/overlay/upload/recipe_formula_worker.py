@@ -59,6 +59,7 @@ from featuregen.formula.recipe_egress import (
     validate_recipe_provider_payload,
 )
 from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
+from featuregen.formula.schema_v2 import FORMULA_SCHEMA_VERSION_V2
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.identity.current_principal import (
     PrincipalResolutionStatus,
@@ -489,6 +490,11 @@ def process_recipe_formula_shadow_once(
             intent,
             client,
             critic,
+            # EXPLICIT, because the orchestrator no longer defaults. This is the v2 shadow lane:
+            # every capturable recipe declares formula-v2 (asserted registry-wide in
+            # `test_expectation_lane_invariant`), and the contract the provider is driven under is
+            # now selected from this number rather than fixed.
+            formula_schema_version=FORMULA_SCHEMA_VERSION_V2,
             roles=principal.principal.role_claims,
             actor=principal.principal,
             frozen_configuration=configuration,

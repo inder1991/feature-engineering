@@ -82,7 +82,10 @@ def _author_the_run(db, monkeypatch, run_id: str, intent=None) -> None:
             logical_type="decimal", unit="monetary", currency="fixed:AED")}, ()),
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
         tool_runner=recipe_tool_runner_v2(
-            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})))
+            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})),
+        # DERIVED from the scripted proposal: authoring now refuses a run that asks for one grammar
+        # and produces another, so a fixture may not disagree with itself either.
+        formula_schema_version=raw.get("formula_schema_version", 2))
 
 
 def _ready_draft(db, monkeypatch, *, draft_id: str = "fd-restore",

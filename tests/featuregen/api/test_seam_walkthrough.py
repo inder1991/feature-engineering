@@ -589,6 +589,7 @@ def _author_the_captured_v2_work_item(conn, work_item_id: str, provider_input: d
     )
     from featuregen.formula.recipe_egress import validate_recipe_provider_payload
     from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
+    from featuregen.formula.schema_v2 import FORMULA_SCHEMA_VERSION_V2
     from featuregen.formula.turns import AuthoringIntent
     from featuregen.intake.llm import FakeLLM, FakeResponse
     from featuregen.overlay.upload.recipe_formula_authority import (
@@ -652,6 +653,9 @@ def _author_the_captured_v2_work_item(conn, work_item_id: str, provider_input: d
         authoring_run_id="far_" + hashlib.sha256(work_item_id.encode()).hexdigest()[:24],
         facts_reader=frozen_reads.formula_facts_v2,
         critic_metadata_loader=frozen_reads.get_column_metadata,
+        # STATED: this walkthrough is the v2 recipe lane, and the schema now SELECTS the provider
+        # contract a run is driven under rather than being a label beside a fixed one.
+        formula_schema_version=FORMULA_SCHEMA_VERSION_V2,
     )
     return {
         "result": result,

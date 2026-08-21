@@ -56,7 +56,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.audited import current_formula_generation_settings
-from featuregen.formula.author import AUTHOR_TURN_CONTRACT_V2, author_formula
+from featuregen.formula.author import author_contract_for, author_formula
 from featuregen.formula.authoring_result_leaves import AuthoringAxes, AuthorityFailure
 from featuregen.formula.authoring_v2 import (
     AUTHORING_ORCHESTRATOR_VERSION_V2,
@@ -482,7 +482,7 @@ def run_authoring_v2_replay(
     critic_metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
-    formula_schema_version: int = 2,
+    formula_schema_version: int,
     reviewed_blueprint: Any | None = None,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
@@ -492,6 +492,9 @@ def run_authoring_v2_replay(
     the same call site; the types they carry are v2's.
     """
     _require_tool_runner(tool_runner)
+    # BEFORE the run is opened and before any provider call: a schema with no contract has no
+    # instruction to hold a model to and no schema to validate its answer against.
+    turn_contract = author_contract_for(formula_schema_version)
     versions: dict[str, Any] = {
         "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
         # C-A6 — RECORDED, not hardcoded. A v3 run must not inherit `2`: the manifest would then
@@ -643,7 +646,11 @@ def run_authoring_v2_replay(
                 progress_callback=progress_callback,
                 lease_fence=lease_fence,
                 resume_turns=checkpoint.author_turns,
-                turn_contract=AUTHOR_TURN_CONTRACT_V2,
+                # SELECTED from the schema this run declares, never fixed. It was
+                # `AUTHOR_TURN_CONTRACT_V2` unconditionally, whose instruction says
+                # "MUST declare formula_schema_version 2" — so every run this
+                # platform opened as v3 asked its provider for v2 and got it.
+                turn_contract=turn_contract,
                 # C-A8 — ALWAYS passed, never omitted. `author_formula`'s own default is `run_tool`,
                 # the V1 tool set, so omitting this kwarg silently authored a v2 formula against v1
                 # tools. `_require_tool_runner` refuses above rather than letting that happen.
@@ -690,6 +697,22 @@ def run_authoring_v2_replay(
         _terminal(conn, run_id, seq, "failed", result,
                   lease_fence=lease_fence, extra={"reason": str(exc)})
         return result
+    # ▲ THE RUN MUST HAVE PRODUCED WHAT IT ASKED FOR. A TECHNICAL failure, deliberately, and not
+    # `invalid_formula`: an invalid formula says the requested FEATURE is structurally or
+    # semantically wrong and a person can respond by changing the hypothesis. This says the
+    # provider or the platform returned an artifact under a different PROTOCOL — nothing about the
+    # feature is known to be wrong, and nobody can fix it from the product side. The draft becomes
+    # FAILED naming the mismatch rather than BLOCKED as though the candidate were at fault.
+    #
+    # A live provider response should normally be rejected by the turn schema long before this,
+    # since the two contracts hold a model to different shapes. This protects the paths where no
+    # response schema runs: replayed material, the deterministic producer, and imports.
+    if proposal.formula_schema_version != formula_schema_version:
+        return _technical_failure(
+            conn, run_id, seq,
+            f"FORMULA_SCHEMA_CONTRACT_MISMATCH requested_schema={formula_schema_version} "
+            f"produced_schema={proposal.formula_schema_version}",
+            lease_fence=lease_fence)
     if checkpoint.raw_proposal is None:
         append_event(
             conn,
