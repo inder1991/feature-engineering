@@ -417,6 +417,30 @@ row for the current build is unsupported, which is exactly true"* — but it mea
 this code every operator reads as unsupported until the dispatch surface is re-recorded**. Not a
 defect; a step the deploy runbook has to include.
 
+**STEP 2 IS COMPLETE (2026-08-20, `05bccc88`).** `tests/featuregen/materialize/test_end_to_end_v2.py`
+drives one V3 formula through every stage with nothing stubbed between them and asserts on what was
+PRODUCED — real Spark source, a durable artifact row readable from the database alone, a servable
+verdict, and an approval the artifact agrees with by construction. **No Anthropic key is involved.**
+Rendering and sealing are proved; provider authoring quality is not, and is step 5's job.
+
+**STEP 3 IS COMPLETE (2026-08-21).** `materialize/generation_lane.py` is the fenced consumer and
+`api/routes/build_sets.py` the producer: declare a set, ask to build it, watch the attempt. Three
+guards, and they fail differently — the queue's per-partition unique partial index, the monotonic
+`lease_fence` on every terminal write, and `advance_request`'s compare-and-set, which is the one
+that catches a worker whose lease expired while it was still alive. Wired into the worker tick
+behind its OWN switch (`FEATUREGEN_GENERATION_V2_ENABLED`, default off), separate from
+materialization's because a cutover needs to run the two lanes in either combination.
+
+▲ **WHAT STEP 3 DOES NOT YET DELIVER, and it is on the API side only.** `GenerationJobV2` freezes
+five declarations a generation cannot derive — population, cadence, availability promise, operand
+facts, policy realization ids — and the request body carries none of them. A build requested through
+the API therefore queues and is REFUSED at the population stage: by name, with the reason, having
+recorded nothing. That is correct behaviour and not finished behaviour. It was not closed by
+defaulting, because each of the five decides a published number — a defaulted spine picks whose rows
+the features are computed for, defaulted operand facts let a monetary sum cross currencies. The next
+task on this surface is to give `build_set_revision.declaration_json` a type, since a population is
+declared once per SET rather than per attempt.
+
 **Found during execution, and not in the plan when it was written:**
 
 * **Step 4** — the six typed computation fields were dropped by the candidate serializer, so
@@ -431,6 +455,28 @@ defect; a step the deploy runbook has to include.
 * **Step 5** — policy payloads did not record **when** their columns are read, which is the one
   fact that decides whether a policy leaks. Added as a required field with no default: a default of
   `event_time` would have made every policy pass the leakage gate by construction.
+* **Step 3** — `assemble_nodes` is the only Kedro node assembly in `src/`, and nothing V2 could
+  call it: `NodeAssemblyInputs` declared a V1 token and V1 admitted artifacts. So the V2 path had no
+  production wiring at all and the step-2 run was rendering a hand-wired TEST fixture. Widened, not
+  duplicated — every read was audited, and exactly one genuine difference exists (where the FORMULA
+  lives), crossed in `_declared_windows`.
+* **Step 3** — `generate_v2` took `manifest` and `files` as ARGUMENTS while rendering its own
+  project internally. `store_manifest` verifies a manifest against its own files, which a
+  caller-supplied pair satisfies trivially, so an artifact could store one set of bytes while
+  `project_digest` stated a hash over a different set with every check green. The e2e test was doing
+  exactly that.
+* **Step 3** — `advance_request` was read-then-write: two workers both read REQUESTED, both found
+  CLAIMED legal, both wrote it. Now compare-and-set. And the first version of the lane classified
+  "another worker already claimed this" as `InvalidStatusMove` — a caller bug — and DEAD-LETTERED
+  the job; its own test caught it.
+* **Step 2's end-to-end run** — two defects nothing else could reach, because nothing ran the
+  chain over a real graph. `seal_project` still required a V1 `CompilationIdentity`, so `render/`
+  produced a V2 identity that sealing refused — the same class of bug as §0.8, one level deeper,
+  since `identity.py` sits outside `render/`. And `undispatchable_kinds` asked capability BY KIND,
+  i.e. *"can you emit ANY final_combine?"* — correctly answered NO, because the renderer emits three
+  specific operations. Every feature ends in a FINAL_COMBINE, so **every generation refused**
+  `RENDERER_CANNOT_DISPATCH`, with a capability row that said False and was read correctly. The
+  wrong thing was the question.
 * **Step 11** — the V2 resolver was missing V1's **fourth** nullability source: `null_input =
   ignore` on a NON-COUNT aggregate. A non-empty window whose every operand is NULL aggregates to
   NULL and the renderer deliberately does not coalesce it, so the column was being published NOT

@@ -95,6 +95,18 @@ their feature when in fact the caller is broken.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # ANNOTATION-ONLY, and deliberately not runtime imports. This module sits at the centre
+    # of the compile graph and both of these reach back into it transitively; importing them
+    # at runtime closes a cycle, and a cycle first triggered from a REQUEST thread deadlocks
+    # on the import lock rather than raising — the main thread waits on a lock forever and
+    # the suite simply stops. `from __future__ import annotations` keeps the field types as
+    # strings, so `NodeAssemblyInputs` needs neither class at runtime.
+    from featuregen.materialize.admission_v2 import AdmittedFeatureV2
+    from featuregen.materialize.boundary_v2 import AuthorizedCompilationV2
+
 import hashlib
 import os
 import pathlib
@@ -106,9 +118,7 @@ from typing import Protocol, TypeVar
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.admission import AdmittedFeature, admit_artifacts
-from featuregen.materialize.admission_v2 import AdmittedFeatureV2
 from featuregen.materialize.binding import GroupContractBinding, bind_group, plan_revision
-from featuregen.materialize.boundary_v2 import AuthorizedCompilationV2
 from featuregen.materialize.codes import MaterializationRefused, ValidationFindingCode
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,

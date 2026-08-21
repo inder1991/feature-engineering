@@ -31,6 +31,11 @@ from featuregen.api.routes.formula_drafts import (
     FORMULA_DRAFT_TOPIC,
 )
 from featuregen.contracts import Command, Projection
+from featuregen.materialize.generation_lane import (
+    generation_enabled,
+    generation_inventory_from_env,
+    process_generation_once,
+)
 from featuregen.materialize.queue_lane import (
     materialization_enabled,
     process_materialization_once,
@@ -151,6 +156,8 @@ class WorkerTick:
     #: How many per-candidate "Draft formula" jobs this tick drove to a terminal state.
     formula_drafts_processed: int = 0
     materialization_processed: int = 0
+    #: §0.10 step 3 — how many V2 generation jobs this tick drove to a terminal request.
+    generation_processed: int = 0
     #: Phase G §3.3 — how many stranded materialization requests this tick gave a terminal verdict.
     #: Candidates LEFT ALONE (a deliverable message, a live claim, a class with no legal terminal)
     #: are not counted here: this is the number of durable state changes, not the sweep's size.
@@ -528,6 +535,29 @@ def run_worker_once(
 
     materialization_processed = _stage("materialization")(_drain_materialization, 0)
 
+    def _drain_generation() -> int:
+        # §0.10 step 3's fenced V2 lane, beside the V1 one and switched independently. THE SAME
+        # DISCIPLINE, for the same reasons stated at length above: the switch is read from the
+        # environment every tick and BEFORE the claim, off is silent and byte-identical to the tick
+        # that existed before this lane did, and it stops the NEXT claim rather than interrupting
+        # one in flight.
+        #
+        # A SEPARATE SWITCH from materialization, deliberately. The two lanes drive different
+        # chains over different tables, and a deployment cutting traffic from V1 to V2 needs to run
+        # them in either combination — including both, during the cutover §0.10 step 7 describes.
+        # One switch would make "V2 only" and "V1 only" the same setting.
+        if not generation_enabled():
+            return 0
+        # ONE job per tick, for the V1 lane's reason: a tick is one bounded non-blocking pass, and
+        # a generation restores, admits, compiles, renders and seals. It is far shorter than a V1
+        # compile — no subprocess, no provider — but draining a backlog inside one tick would still
+        # hold the timers, the relay and every poller for the sum of them.
+        outcome = process_generation_once(
+            conn, owner=f"{owner}:generate", inventory=generation_inventory_from_env())
+        return 0 if outcome.status == "idle" else 1
+
+    generation_processed = _stage("generation")(_drain_generation, 0)
+
     def _reconcile_materialization() -> int:
         # Phase G §3.3. It runs HERE — beside the lane, on the tick — because the alternative was a
         # function with no scheduler, and a reconciler nothing runs is a deferral wearing a costume.
@@ -647,6 +677,7 @@ def run_worker_once(
         formula_processed=formula_processed,
         formula_drafts_processed=formula_drafts_processed,
         materialization_processed=materialization_processed,
+        generation_processed=generation_processed,
         materialization_reconciled=materialization_reconciled,
     )
 

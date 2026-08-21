@@ -1,0 +1,259 @@
+"""§0.10 step 3 — declare a build set, ask to build it, watch the attempt.
+
+The rules under test are the ones that cost compute or mislead a person:
+
+1. **The route never runs the chain.** It records, enqueues and returns — an AST check, because a
+   route holds one transaction for its whole request and a generation is not a request-shaped
+   amount of work.
+2. **A double-click does not start a second compile**, and the second answer says so.
+3. **The environment comes from the AUTHORIZATION**, never from the body.
+4. **The request and its queue row commit together** — neither exists without the other.
+5. **Flag off is a 404**, not a 503: this deployment does not run V2 generation at all.
+"""
+from __future__ import annotations
+
+import ast
+import pathlib
+
+import pytest
+
+SETS = "/build-sets"
+GENERATIONS = "/build-sets/generations"
+
+
+@pytest.fixture
+def enabled(monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_GENERATION_V2_ENABLED", "1")
+
+
+@pytest.fixture
+def engineer_headers():
+    """The role that MAY generate. Administering the platform is a different permission from
+    running a build, and the route gates on the latter."""
+    return {"X-User": "sam", "X-Roles": "feature_engineer"}
+
+
+def _seed(conn, *, environment="hdfc-local", group="customer_txn_features"):
+    """A target reading, two selections, a recorded build set and an approval for it."""
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.build_set_store import record_build_set
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    conn.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, redacted_hypothesis) "
+        "VALUES ('int-bs','h','hypothesis','h') ON CONFLICT DO NOTHING")
+    conn.execute(
+        "INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+        "VALUES ('trr-bs','int-bs','exploration','sha256:t') ON CONFLICT DO NOTHING")
+    for name in ("sel-1", "sel-2"):
+        conn.execute(
+            "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+            "considered_revision_id, option_id, decision_id, planning_request_hash, "
+            "binding_plan_hash, content_hash) "
+            "VALUES (%s,'trr-bs','crev-bs',%s,%s,'sha256:a','sha256:b',%s) "
+            "ON CONFLICT DO NOTHING",
+            (name, f"opt-{name}", f"dec-{name}", f"sha256:{name}"))
+    build_set, _ = record_build_set(
+        conn, revision_id="bs-api", target_reading_revision_id="trr-bs",
+        selection_revision_ids=["sel-1", "sel-2"], declaration={"grain": "customer"},
+        declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
+    approval = record_generation_authorization(
+        conn, GenerationAuthorizationV1(
+            environment_id=environment, logical_group_name=group,
+            build_set_revision_id=build_set,
+            target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+        authorized_by="user:ops", authorized_at="2026-08-21T00:00:00Z")
+    # NO COMMIT. `make_client` overrides `get_conn` with this very connection, so the routes see
+    # these rows uncommitted — and the root `conn` fixture rolls the whole thing back on teardown.
+    # Committing here would make the seed permanent and leak `sel-1`, `bs-api` and an approval into
+    # every suite that runs after this one.
+    return build_set, approval
+
+
+def _body(build_set, approval, **overrides):
+    body = {
+        "build_set_revision_id": build_set,
+        "generation_authorization_revision_id": approval,
+        "physical_type_policy": "formula-v2/physical-types@1",
+        "empty_values": {"posted_amount_30d": "0"},
+        "engine_id": "kedro-pyspark",
+    }
+    body.update(overrides)
+    return body
+
+
+# ══ THE ROUTE NEVER RUNS THE CHAIN ═════════════════════════════════════════════════════════════
+def test_the_route_module_NEVER_NAMES_THE_CHAIN() -> None:
+    """Read as source, not asserted by behaviour, because the failure this prevents is a future
+    edit rather than a current bug: `get_conn` holds ONE transaction for the whole request, and a
+    generation restores, admits, compiles, renders and seals. A route that called any of it would
+    hold that transaction for the duration and time out under a real build set.
+    """
+    source = pathlib.Path("src/featuregen/api/routes/build_sets.py").read_text()
+    names = {node.id for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Name)}
+    names |= {node.attr for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Attribute)}
+
+    forbidden = {"compile_generation_v2", "generate_v2", "seal_v2", "render_project",
+                 "assemble_nodes", "process_generation_once", "admit_artifacts_v2"}
+    assert not (names & forbidden), sorted(names & forbidden)
+
+
+# ══ DECLARING ══════════════════════════════════════════════════════════════════════════════════
+def test_A_BUILD_SET_IS_DECLARED_and_returned(client, conn, enabled, engineer_headers) -> None:
+    _seed(conn)
+
+    response = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs",
+        "selection_revision_ids": ["sel-1", "sel-2"],
+        "declaration": {"grain": "customer"}}, headers=engineer_headers)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["selection_revision_ids"] == ["sel-1", "sel-2"]
+
+
+def test_DECLARING_THE_SAME_BUILD_TWICE_IS_ONE_SET(client, conn, enabled,
+                                                   engineer_headers) -> None:
+    """Idempotent on CONTENT. A second identical set would split its attempts across two roots and
+    make "how did this build go" a question with two answers."""
+    _seed(conn)
+    payload = {"target_reading_revision_id": "trr-bs",
+               "selection_revision_ids": ["sel-1", "sel-2"],
+               "declaration": {"grain": "customer"}}
+
+    first = client.post(SETS, json=payload, headers=engineer_headers).json()
+    second = client.post(SETS, json=payload, headers=engineer_headers).json()
+
+    assert second["build_set_revision_id"] == first["build_set_revision_id"]
+    assert second["created"] is False
+
+
+def test_an_EMPTY_BUILD_SET_is_422_and_says_why(client, conn, enabled, engineer_headers) -> None:
+    _seed(conn)
+
+    response = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs", "selection_revision_ids": []},
+        headers=engineer_headers)
+
+    assert response.status_code == 422, response.text
+
+
+# ══ ASKING TO BUILD ════════════════════════════════════════════════════════════════════════════
+def test_REQUESTING_A_BUILD_QUEUES_IT(client, conn, enabled, engineer_headers) -> None:
+    """202 and not 201: the artifact does not exist when this returns."""
+    build_set, approval = _seed(conn)
+
+    response = client.post(GENERATIONS, json=_body(build_set, approval),
+                           headers=engineer_headers)
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["environment_id"] == "hdfc-local"
+
+    queued = conn.execute(
+        "SELECT count(*) FROM queue WHERE message_id = %s",
+        (f"generation:{body['request_id']}",)).fetchone()[0]
+    assert queued == 1, "the request and its work item must commit together"
+
+
+def test_A_DOUBLE_CLICK_DOES_NOT_START_A_SECOND_COMPILE(client, conn, enabled,
+                                                        engineer_headers) -> None:
+    """Idempotency is on the WORK, so a client minting a fresh key per click cannot defeat it."""
+    build_set, approval = _seed(conn)
+
+    first = client.post(GENERATIONS, json=_body(build_set, approval),
+                        headers=engineer_headers).json()
+    second = client.post(GENERATIONS, json=_body(build_set, approval),
+                         headers=engineer_headers).json()
+
+    assert second["request_id"] == first["request_id"]
+    assert second["created"] is False
+    assert conn.execute("SELECT count(*) FROM generation_request").fetchone()[0] == 1
+
+
+def test_the_ENVIRONMENT_COMES_FROM_THE_APPROVAL_not_the_body(client, conn, enabled,
+                                                              engineer_headers) -> None:
+    """A caller-supplied environment would let a build authorized for one cluster be requested
+    against another — and the composite key would then refuse it with a message about keys rather
+    than about permission."""
+    build_set, approval = _seed(conn, environment="hdfc-prod")
+
+    response = client.post(
+        GENERATIONS,
+        json={**_body(build_set, approval), "environment_id": "somewhere-else"},
+        headers=engineer_headers)
+
+    # `extra="forbid"`: the field does not exist, so supplying it is a 422 rather than being
+    # silently ignored — an ignored field reads as accepted.
+    assert response.status_code == 422, response.text
+
+    accepted = client.post(GENERATIONS, json=_body(build_set, approval),
+                           headers=engineer_headers)
+    assert accepted.json()["environment_id"] == "hdfc-prod"
+
+
+def test_an_APPROVAL_FOR_A_DIFFERENT_SET_IS_REFUSED(client, conn, enabled,
+                                                    engineer_headers) -> None:
+    """409 rather than 422: both halves exist and are individually valid, and what is wrong is the
+    relation between them."""
+    build_set, approval = _seed(conn)
+    from featuregen.overlay.upload.build_set_store import record_build_set
+    other, _ = record_build_set(
+        conn, revision_id="bs-other", target_reading_revision_id="trr-bs",
+        selection_revision_ids=["sel-2", "sel-1"], declaration={"grain": "customer"},
+        declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
+
+    response = client.post(GENERATIONS, json=_body(other, approval), headers=engineer_headers)
+
+    assert response.status_code == 409, response.text
+    assert "approves build set" in response.json()["detail"]
+
+
+def test_an_APPROVAL_THAT_DOES_NOT_EXIST_is_404(client, conn, enabled, engineer_headers) -> None:
+    build_set, _ = _seed(conn)
+
+    response = client.post(GENERATIONS, json=_body(build_set, "gar-nope"),
+                           headers=engineer_headers)
+
+    assert response.status_code == 404, response.text
+
+
+# ══ WATCHING ═══════════════════════════════════════════════════════════════════════════════════
+def test_AN_ATTEMPT_CAN_BE_READ_BACK_with_server_owned_words(client, conn, enabled,
+                                                             engineer_headers) -> None:
+    """`stage_label` is server-owned: a screen that mapped statuses to words itself would be a
+    second vocabulary, and the two would disagree the first time either changed."""
+    build_set, approval = _seed(conn)
+    request_id = client.post(GENERATIONS, json=_body(build_set, approval),
+                             headers=engineer_headers).json()["request_id"]
+
+    response = client.get(f"{GENERATIONS}/{request_id}", headers=engineer_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "REQUESTED"
+    assert body["stage_label"] == "Queued"
+    assert body["sealed_artifact_id"] is None
+    assert body["refusals"] == []
+
+
+def test_an_attempt_that_does_not_exist_is_404(client, enabled, engineer_headers) -> None:
+    assert client.get(f"{GENERATIONS}/nope", headers=engineer_headers).status_code == 404
+
+
+# ══ THE SWITCH ═════════════════════════════════════════════════════════════════════════════════
+def test_a_FLAG_OFF_DEPLOYMENT_ANSWERS_404_on_every_path(client, monkeypatch,
+                                                         engineer_headers) -> None:
+    """Not 503. A 503 says "this exists and is unwell"; the flag says this deployment does not run
+    V2 generation at all."""
+    monkeypatch.delenv("FEATUREGEN_GENERATION_V2_ENABLED", raising=False)
+
+    assert client.post(SETS, json={"target_reading_revision_id": "t",
+                                   "selection_revision_ids": ["s"]},
+                       headers=engineer_headers).status_code == 404
+    assert client.post(GENERATIONS, json=_body("bs", "gar"),
+                       headers=engineer_headers).status_code == 404
+    assert client.get(f"{GENERATIONS}/req-1", headers=engineer_headers).status_code == 404
