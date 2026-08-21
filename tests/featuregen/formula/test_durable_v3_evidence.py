@@ -7,6 +7,7 @@ existed the evaluator had no basis to treat the qualifier as an activation autho
 """
 from __future__ import annotations
 
+import pytest
 from tests.featuregen.formula.authoring_fixtures import (
     REF_AMT,
     REF_CIF,
@@ -67,49 +68,119 @@ def test_the_QUALIFIER_READS_THE_REPLAYED_PROPOSAL_not_the_raw_row(db, monkeypat
             assert proposal["formula_schema_version"] == 3
 
 
-# ══ GATE 1 IS STILL OPEN — and the two-arm design is right; my SCRIPT is not ══════════════════
+# ══ GATE 1 IS STILL OPEN — and here is the ACTUAL obstacle ════════════════════════════════════
 #
-# The reviewed design is sound: two arms driven by the IDENTICAL multi-turn script, so the tool
+# The reviewed design is right: two arms driven by the IDENTICAL multi-turn script, so the tool
 # result is the same in both and RETIREMENT is the only variable, measured in AUDITED AUTHOR CALLS
-# rather than in the final disposition. That removes the coupling that sank the previous attempt.
+# rather than in the final disposition. That removes the coupling that sank the first attempt.
 #
-# ▲ WHAT THE CONTROL REVEALED, and why this is not committed as a passing test: scripting
-# `{"tool_name": "get_column_metadata", "arguments": {"logical_ref": REF_AMT}}` before the proposal
-# does NOT produce two author turns. It produces EIGHT — `max_turns`. The scripted tool turn is not
-# being accepted and retired from the sequence the way the design assumes, so the loop keeps
-# re-prompting until the turn budget runs out, and "two calls vs one" is not a measurement of
-# anything yet.
+# ▲ CORRECTION TO A WRONG DIAGNOSIS I LEFT HERE. I recorded that the eight author calls came from a
+# malformed tool-argument shape and that the next implementer should fix it. **That was wrong** —
+# `{"tool_name": "get_column_metadata", "arguments": {"logical_ref": ...}}` already matches what
+# `recipe_authoring.py:316` expects. Do not spend time on it.
 #
-# The next attempt needs a tool turn the runner actually ACCEPTS — verify the arguments shape
-# `recipe_tool_runner_v2` expects for the chosen tool, and assert the control makes exactly two
-# audited calls BEFORE writing the retirement arm. Committing the arm first would be measuring
-# against a control that does not hold.
+# The real cause is `FakeLLM.call` (`intake/llm.py:175`): the response POSITION is tracked in
+# `self._calls` keyed on `(task, prompt_id, input_hash)`. A tool result changes the next turn's
+# inputs, so the hash changes, `idx` resets to 0, and the task-key fallback sequence hands back
+# response ZERO — the tool call — again. The loop therefore repeats the tool turn until `max_turns`,
+# which is where eight comes from. Nothing about the run or the tool is malformed.
+#
+# So the script must be keyed by INPUT HASH rather than by task, the way the existing multi-turn
+# author tests do it:
+#   * first input hash                              -> the tool response
+#   * the input hash INCLUDING the canonical tool trail -> the final proposal
+# Assert the control makes exactly TWO audited author calls before writing the retirement arm, then
+# run the identical script with the retirement committed after call one and assert `DraftRetired`
+# plus exactly ONE audited call.
 #
 # Everything else about retirement is proved: `advance` refuses a retired draft under BOTH
 # concurrency orderings, the worker returns `retired` with ZERO provider calls and completes its
 # queue item, and `_sync_from_trace` re-raises rather than swallowing. The unproved claim is
 # narrowly the ORDERING — that the raise reaches the loop between turns.
 #
-# Separately confirmed by review: the V3 early return before the post-authoring callback
+# Confirmed by review: the V3 early return before the post-authoring callback
 # (`replay_authoring_v2.py:932` vs `935`) is a progress-REPORTING gap only. After the critic, V3
 # performs local derivation and persistence, so no additional provider spend rides on it.
 
 
-# ══ THE CLEANUP IS ATOMIC — the FIX is in; its regression test is not ═════════════════════════
-#
-# `_erase` now does everything in ONE transaction: disable the append-only guards, delete, flush
-# deferred FK trigger events, re-enable, commit. PostgreSQL's DDL is transactional, so any failure
-# rolls the whole thing back and the guards were — from every other session's view — never disabled.
-# Other connections block on the table locks rather than observing an unguarded window.
-#
-# ▲ THE FAILURE-INJECTION TESTS FOR IT ARE NOT COMMITTED, and the reason is the exact hazard they
-# were testing. To prove a failed cleanup leaves the guards enabled, the test must MAKE a cleanup
-# fail — which by construction leaves that run's evidence behind. Mine did, and because
-# `durable_v3_run` does not expose the queue id, the compensating `_erase(dsn, run_id, -1)` could
-# not remove the queue row either. The leak surfaced as ELEVEN unrelated failures across the suite
-# (queue backlog counts, provider-call counters) — durable rows in a shared database, exactly what
-# this fixture's cleanup exists to prevent.
-#
-# The next attempt needs `durable_v3_run` to hand back the queue id (or a teardown handle) so the
-# compensating cleanup can be complete. Injecting the failure is easy; leaving nothing behind
-# afterwards is the part that has to be designed first.
+# ══ THE CLEANUP IS ATOMIC, AND PROVED WITHOUT CREATING ANY EVIDENCE ═══════════════════════════
+def test_a_FAILED_CLEANUP_ROLLS_BACK_ENTIRELY(db, monkeypatch, _dsn):
+    """▲ THE PROPERTY THAT MATTERS MORE THAN THE ROWS: a cleanup that fails must leave production's
+    append-only guards ENABLED.
+
+    An earlier `_erase` disabled them on an AUTOCOMMIT connection before entering its `try`, so each
+    `ALTER TABLE ... DISABLE TRIGGER` committed on the spot and became visible everywhere — and a
+    failure part-way through either loop left a durable table's tamper-evidence off with nothing to
+    restore it. A test fixture able to silently disarm production's guards is worse than the
+    leftover rows it exists to avoid.
+
+    ▲ AND IT PROVES THAT WITHOUT CREATING ANY AUTHORING EVIDENCE. My first attempt at this test
+    authored real runs and deliberately failed their cleanup — which by construction left that
+    evidence behind, and leaked into ELEVEN unrelated tests via queue backlog counts and provider
+    counters. `_erase` deletes by run id and queue id, so a NONEXISTENT run id matches nothing while
+    a disposable queue row gives the transaction something real to roll back. Same code path, same
+    guarantee, nothing appended.
+    """
+    import psycopg
+    from tests.featuregen.formula import durable_evidence
+    from tests.featuregen.formula.durable_evidence import unique
+
+    triggers = [trigger for _table, trigger in durable_evidence._APPEND_ONLY]
+
+    def _states(conn) -> dict[str, str]:
+        return {name: enabled for name, enabled in conn.execute(
+            "SELECT t.tgname, t.tgenabled FROM pg_trigger t WHERE t.tgname = ANY(%s)",
+            (triggers,)).fetchall()}
+
+    message_id = unique("erase-rollback")
+    with psycopg.connect(_dsn, autocommit=True) as setup:
+        queue_id = setup.execute(
+            "INSERT INTO queue (message_id, partition_key, handler, payload) "
+            "VALUES (%s, %s, 'formula_draft.author.v1', '{}'::jsonb) RETURNING id",
+            (message_id, message_id)).fetchone()[0]
+        before = _states(setup)
+
+    assert before and all(state != "D" for state in before.values()), before
+
+    monkeypatch.setattr(durable_evidence, "_erase_hook",
+                        lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed mid-flight")))
+    try:
+        with pytest.raises(RuntimeError, match="mid-flight"):
+            durable_evidence._erase(_dsn, unique("far-does-not-exist"), queue_id)
+
+        with psycopg.connect(_dsn) as check:
+            assert _states(check) == before, "append-only guards changed after a FAILED cleanup"
+            assert check.execute(
+                "SELECT count(*) FROM queue WHERE id = %s", (queue_id,)).fetchone()[0] == 1, (
+                "the delete inside the failed transaction was not rolled back")
+    finally:
+        with psycopg.connect(_dsn, autocommit=True) as cleanup:
+            cleanup.execute("DELETE FROM queue WHERE id = %s", (queue_id,))
+
+
+def test_a_SUCCEEDING_CLEANUP_LEAVES_THE_GUARDS_ENABLED_TOO(db, monkeypatch, _dsn):
+    """The control. Without it the test above would pass for an `_erase` that never disabled
+    anything — which would silently stop cleaning up the append-only tables it exists for."""
+    import psycopg
+    from tests.featuregen.formula import durable_evidence
+    from tests.featuregen.formula.durable_evidence import unique
+
+    triggers = [trigger for _table, trigger in durable_evidence._APPEND_ONLY]
+    message_id = unique("erase-ok")
+
+    with psycopg.connect(_dsn, autocommit=True) as setup:
+        queue_id = setup.execute(
+            "INSERT INTO queue (message_id, partition_key, handler, payload) "
+            "VALUES (%s, %s, 'formula_draft.author.v1', '{}'::jsonb) RETURNING id",
+            (message_id, message_id)).fetchone()[0]
+
+    durable_evidence._erase(_dsn, unique("far-does-not-exist"), queue_id)
+
+    with psycopg.connect(_dsn) as check:
+        disabled = check.execute(
+            "SELECT tgname FROM pg_trigger WHERE tgname = ANY(%s) AND tgenabled = 'D'",
+            (triggers,)).fetchall()
+        assert disabled == [], disabled
+        assert check.execute(
+            "SELECT count(*) FROM queue WHERE id = %s", (queue_id,)).fetchone()[0] == 0, (
+            "a succeeding cleanup must actually delete")
