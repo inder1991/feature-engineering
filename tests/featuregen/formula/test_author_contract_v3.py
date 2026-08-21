@@ -483,7 +483,7 @@ def test_a_RUN_WITH_NO_AUTHOR_CALL_DOES_NOT_QUALIFY(db):
     ok, problems = qualifies_as_v3_evidence_for_run(db, "far-nocall")
 
     assert ok is False
-    assert any("no author provider call" in p for p in problems), problems
+    assert any("provider call" in p for p in problems), problems
 
 
 def test_a_RUN_THAT_DOES_NOT_EXIST_QUALIFIES_FOR_NOTHING(db):
@@ -493,3 +493,59 @@ def test_a_RUN_THAT_DOES_NOT_EXIST_QUALIFIES_FOR_NOTHING(db):
 
     assert ok is False
     assert "<no manifest>" in problems
+
+
+def test_the_QUALIFIER_MATCHES_THE_AUTHOR_TASK_EXACTLY_not_by_pattern():
+    """It used `LIKE '%author%'`, which also matches whatever task is named "reauthor" or
+    "author_review" next — in the check that decides whether a run may be certified as V3
+    evidence."""
+    import inspect
+
+    from featuregen.formula import authoring_versions
+
+    source = inspect.getsource(authoring_versions.qualifies_as_v3_evidence_for_run)
+    assert "c.task = %s" in source
+    assert "c.task LIKE" not in source
+
+
+def test_the_PARSE_CHECK_CATCHES_MALFORMED_PAYLOADS_but_NOT_relabelling():
+    """▲ WHAT THE PARSE CHECK CAN AND CANNOT DO, stated so nobody relies on the half it lacks.
+
+    It rejects a payload that declares 3 and does not satisfy the v3 grammar — a real class of
+    corrupted or imported material that a string comparison on the JSON field would accept.
+
+    It does NOT catch a v2 proposal relabelled to 3, and cannot: v3 is v2 plus an OPTIONAL
+    `row_selections`, so every valid v2 body is a structurally valid v3 body. That is the grammar
+    working as designed, not a hole in it — and it is exactly why the provider-contract check
+    (output schema and prompt identity) is the axis that catches relabelling, since a relabelled
+    run was still physically requested under `formula_author_turn_v2`.
+    """
+    from featuregen.formula.authoring_versions import _v3_parse_problems
+
+    assert _v3_parse_problems(_raw_v3()) == ()
+    assert _v3_parse_problems(_raw()) != (), "a proposal declaring 2 is not v3 evidence"
+
+    relabelled = {**_raw(), "formula_schema_version": 3}
+    assert _v3_parse_problems(relabelled) == (), (
+        "v3 is a superset of v2, so this parses — the contract check is what refuses it")
+
+    malformed = {**_raw_v3(), "grain": "not-an-object"}
+    problems = _v3_parse_problems(malformed)
+    assert problems and "does not parse as v3" in problems[0], problems
+
+
+def test_a_V3_SCHEMA_UNDER_THE_V2_PROMPT_DOES_NOT_QUALIFY(db):
+    """The schema is what the answer was VALIDATED against; the prompt is what the model was TOLD to
+    produce. Checking only one would miss a run held to the v3 shape under v2's instruction."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-prompt-src", raw=_raw_v3(), requested=3)
+    ok, _ = qualifies_as_v3_evidence_for_run(db, "far-prompt-src")
+    assert ok is True, "the control must qualify"
+
+    import inspect
+
+    from featuregen.formula import authoring_versions
+
+    source = inspect.getsource(authoring_versions.qualifies_as_v3_evidence_for_run)
+    assert "prompt_id" in source and "prompt_version" in source

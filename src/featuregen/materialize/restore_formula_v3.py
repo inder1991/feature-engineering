@@ -77,11 +77,15 @@ def restore_formula(
     """
     row = conn.execute(
         "SELECT s.considered_revision_id, s.option_id, d.formula_draft_id, d.state, "
-        "       d.authoring_run_id, d.formula_content_hash "
+        "       d.authoring_run_id, d.formula_content_hash, r.reason, r.replacement_draft_id "
         "  FROM feature_selection_revision s "
         "  LEFT JOIN formula_draft d "
         "    ON d.considered_revision_id = s.considered_revision_id "
         "   AND d.option_id = s.option_id "
+        # RETIREMENT TRAVELS WITH THE DRAFT, in this one read. Without it this function selected a
+        # retired draft and compiled it: a formula somebody had explicitly withdrawn could reach a
+        # sealed, servable artifact, and nothing between here and publication would have objected.
+        "  LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
         " WHERE s.revision_id = %s "
         " ORDER BY d.updated_at DESC LIMIT 1", (selection_revision_id,)).fetchone()
     if row is None:
@@ -90,13 +94,27 @@ def restore_formula(
             f"selection {selection_revision_id} does not exist, so there is no chosen candidate to "
             f"build a formula for")
 
-    considered_revision_id, option_id, draft_id, state, run_id, stored_hash = row
+    (considered_revision_id, option_id, draft_id, state, run_id, stored_hash,
+     retired_reason, replacement_id) = row
     if draft_id is None:
         raise MaterializationRefused(
             CompilationRefusalCode.NOT_RESOLVED,
             f"selection {selection_revision_id} (option {option_id} of {considered_revision_id}) "
             f"has no formula draft: a feature cannot be built from a candidate nobody has drafted "
             f"a formula for. Draft it first — selecting and drafting are separate acts")
+
+    # ▲ RETIRED BEATS READY. A retired draft may still read READY — retirement is an append beside
+    # it, not an edit of it (1090 makes the draft append-only, which is why 1096 exists at all) — so
+    # a reader that checked only the state would compile something an operator withdrew. The
+    # refusal names the replacement when there is one, because "use that instead" is the actionable
+    # half of the answer.
+    if retired_reason is not None:
+        raise MaterializationRefused(
+            CompilationRefusalCode.NOT_RESOLVED,
+            f"selection {selection_revision_id} names formula draft {draft_id}, which was RETIRED "
+            f"({retired_reason})"
+            f"{'' if replacement_id is None else f' and replaced by {replacement_id}'}. A retired "
+            f"draft is no longer the current answer, whatever its state still says")
 
     if DraftStateV1(state) is not DraftStateV1.READY:
         raise MaterializationRefused(

@@ -195,8 +195,23 @@ def formula_draft_status(formula_draft_id: str, conn: _Conn) -> dict[str, Any]:
         "state": draft.state.value,
         # The words the card shows, from the SERVER, so the API and the screen cannot describe one
         # state with two different sentences.
-        "stage": draft.stage_label,
-        "terminal": draft.state.is_terminal,
+        #
+        # ▲ RETIREMENT OVERRIDES THE LABEL. Retirement is an append BESIDE the draft, never an edit
+        # of it, so a retired draft's `state` still says READY — and a card rendered from `state`
+        # alone said "Formula ready" about something an operator had withdrawn. The state is still
+        # reported truthfully; what the screen is told to SHOW accounts for the retirement.
+        "stage": ("Retired" if draft.is_retired else draft.stage_label),
+        "terminal": draft.state.is_terminal or draft.is_retired,
+        # The whole retirement, not a boolean: "retired" alone sends a person to ask why, and the
+        # replacement is usually the answer they actually need.
+        "retired": draft.is_retired,
+        "retirement": (None if draft.retirement is None else {
+            "reason": draft.retirement.reason,
+            "detail": draft.retirement.detail,
+            "replacement_draft_id": draft.retirement.replacement_draft_id,
+            "retired_by": draft.retirement.retired_by,
+            "retired_at": draft.retirement.retired_at,
+        }),
         "formula_source": "llm_authored",
         "authoring_run_id": draft.authoring_run_id,
         "formula_content_hash": draft.formula_content_hash,

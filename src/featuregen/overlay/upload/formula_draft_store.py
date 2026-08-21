@@ -120,6 +120,31 @@ class InvalidTransition(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class RetirementV1:
+    """A draft's retirement, as stored (migration 1096)."""
+
+    reason: str
+    detail: str
+    replacement_draft_id: str | None
+    retired_by: str
+    retired_at: str
+
+
+class RetirementDisagreement(RuntimeError):
+    """A second retirement or replacement that does not AGREE with the recorded one.
+
+    Distinct from idempotency, which is the same act repeated and is silently fine. This is two
+    operators deciding differently about one draft, and `ON CONFLICT DO NOTHING` reported it as
+    success — so the second decision vanished and whoever made it believed it had taken effect.
+    """
+
+
+class DraftRetired(RuntimeError):
+    """This draft is retired: it is no longer the current answer and must not be advanced, restored
+    or compiled."""
+
+
+@dataclass(frozen=True, slots=True)
 class FormulaDraftV1:
     """One draft as stored — what was asked, how far it got, and what it produced."""
 
@@ -133,6 +158,14 @@ class FormulaDraftV1:
     formula_json: Mapping[str, object] | None
     blockers: tuple[Mapping[str, str], ...]
     failure_reason: str | None
+    #: WHY this draft is no longer the current answer, or `None`. On the object rather than a second
+    #: query away: a reader that has to ask separately is a reader that can forget to, and a retired
+    #: draft rendered from `state` alone still reads "Formula ready".
+    retirement: RetirementV1 | None = None
+
+    @property
+    def is_retired(self) -> bool:
+        return self.retirement is not None
 
     @property
     def stage_label(self) -> str:
@@ -256,8 +289,25 @@ def request_draft(
         return inserted[0], True
 
     existing = conn.execute(
-        "SELECT formula_draft_id FROM formula_draft WHERE formula_identity_hash = %s",
-        (identity,)).fetchone()
+        "SELECT d.formula_draft_id, r.reason, r.replacement_draft_id "
+        "  FROM formula_draft d "
+        "  LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
+        " WHERE d.formula_identity_hash = %s", (identity,)).fetchone()
+    # ▲ A RETIRED IDENTITY IS NOT A USABLE DRAFT. The identity is UNIQUE, so a new draft id alone
+    # does not defeat this conflict — the request lands on the retired row and, before this check,
+    # was reported as "an identical draft already exists" with `created=False`. Whoever asked would
+    # reasonably conclude they already had what they wanted.
+    #
+    # Raised rather than silently re-minted, because re-minting is not this function's decision:
+    # something IDENTITY-BEARING must change (the corrected authoring configuration, the catalog
+    # snapshot, the definition revision), and only the caller knows which. The refusal names the
+    # replacement when one exists, so the answer is usually "use that one".
+    if existing is not None and existing[1] is not None:
+        raise DraftRetired(
+            f"formula identity {identity} belongs to retired draft {existing[0]} "
+            f"({existing[1]}){'' if existing[2] is None else f', replaced by {existing[2]}'}. "
+            f"A new draft id does not change the identity — something identity-bearing must "
+            f"differ, or this request is asking for the very thing that was retired")
     return existing[0], False
 
 
@@ -280,10 +330,20 @@ def advance(
             downstream could tell.
     """
     row = conn.execute(
-        "SELECT state FROM formula_draft WHERE formula_draft_id = %s",
-        (formula_draft_id,)).fetchone()
+        "SELECT d.state, r.reason FROM formula_draft d "
+        "LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
+        "WHERE d.formula_draft_id = %s", (formula_draft_id,)).fetchone()
     if row is None:
         raise InvalidTransition(f"formula draft {formula_draft_id} does not exist")
+    # ▲ THE FENCE. A draft retired WHILE IN FLIGHT kept authoring: more provider calls, more spend,
+    # and eventually a READY draft that an operator had already withdrawn. Checked on every step
+    # rather than once at claim time, because retirement can happen at any point during a run and
+    # the whole reason to withdraw one is usually that it should stop NOW.
+    if row[1] is not None:
+        raise DraftRetired(
+            f"formula draft {formula_draft_id} was retired ({row[1]}) and must not advance to "
+            f"{to.value}: continuing would spend against a draft somebody already withdrew, and "
+            f"could end in a READY formula nobody wants")
 
     current = DraftStateV1(row[0])
     permitted = _NEXT[current] | (frozenset() if current.is_terminal else _FROM_ANYWHERE)
@@ -341,16 +401,25 @@ def record_admission(
 def read_draft(conn: DbConn, formula_draft_id: str) -> FormulaDraftV1 | None:
     """One draft, or ``None``. The polling endpoint's whole implementation."""
     row = conn.execute(
-        "SELECT considered_revision_id, option_id, formula_identity_hash, state, "
-        "authoring_run_id, formula_content_hash, formula_json, blockers, failure_reason "
-        "FROM formula_draft WHERE formula_draft_id = %s", (formula_draft_id,)).fetchone()
+        "SELECT d.considered_revision_id, d.option_id, d.formula_identity_hash, d.state, "
+        "d.authoring_run_id, d.formula_content_hash, d.formula_json, d.blockers, "
+        "d.failure_reason, r.reason, r.detail, r.replacement_draft_id, r.retired_by, r.retired_at "
+        "FROM formula_draft d "
+        # LEFT JOIN, in the ONE read every caller uses: retirement travels with the draft rather
+        # than being a second query a caller can forget. Without it a retired draft still renders
+        # as "Formula ready", which is the state lying to whoever reads it.
+        "LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
+        "WHERE d.formula_draft_id = %s", (formula_draft_id,)).fetchone()
     if row is None:
         return None
     return FormulaDraftV1(
         formula_draft_id=formula_draft_id, considered_revision_id=row[0], option_id=row[1],
         formula_identity_hash=row[2], state=DraftStateV1(row[3]), authoring_run_id=row[4],
         formula_content_hash=row[5], formula_json=row[6],
-        blockers=tuple(row[7] or ()), failure_reason=row[8])
+        blockers=tuple(row[7] or ()), failure_reason=row[8],
+        retirement=(None if row[9] is None else RetirementV1(
+            reason=row[9], detail=row[10], replacement_draft_id=row[11],
+            retired_by=row[12], retired_at=str(row[13]))))
 
 
 def existing_admission(
@@ -389,11 +458,27 @@ def retire_formula_draft(
 
     Idempotent on the draft: retiring twice is not two facts.
     """
-    conn.execute(
+    inserted = conn.execute(
         "INSERT INTO formula_draft_retirement (formula_draft_id, reason, detail, "
         "replacement_draft_id, retired_by) VALUES (%s, %s, %s, %s, %s) "
-        "ON CONFLICT (formula_draft_id) DO NOTHING",
-        (formula_draft_id, reason, detail, replacement_draft_id, retired_by))
+        "ON CONFLICT (formula_draft_id) DO NOTHING RETURNING formula_draft_id",
+        (formula_draft_id, reason, detail, replacement_draft_id, retired_by)).fetchone()
+    if inserted is not None:
+        return
+
+    # ▲ ALREADY RETIRED — but is this the SAME act repeated, or a SECOND operator deciding
+    # differently? `ON CONFLICT DO NOTHING` alone reported both as success, so a colleague retiring
+    # the same draft for a different reason had their decision silently discarded while being told
+    # it took effect. Repeating an identical retirement stays free; disagreeing is loud.
+    recorded = conn.execute(
+        "SELECT reason, retired_by FROM formula_draft_retirement WHERE formula_draft_id = %s",
+        (formula_draft_id,)).fetchone()
+    if recorded is not None and (recorded[0], recorded[1]) != (reason, retired_by):
+        raise RetirementDisagreement(
+            f"formula draft {formula_draft_id} is already retired as {recorded[0]!r} by "
+            f"{recorded[1]!r}; this call says {reason!r} by {retired_by!r}. Retiring twice is not "
+            f"two facts — one of these decisions would be lost, and the person who made it would "
+            f"be told it had taken effect")
 
 
 def record_draft_replacement(conn, formula_draft_id: str, *, replacement_draft_id: str) -> None:
@@ -402,10 +487,29 @@ def record_draft_replacement(conn, formula_draft_id: str, *, replacement_draft_i
     Regeneration spends provider money and is somebody's decision, so a retirement is allowed to
     exist without a replacement. The trigger permits this field to be set once and never changed.
     """
-    conn.execute(
+    updated = conn.execute(
         "UPDATE formula_draft_retirement SET replacement_draft_id = %s "
-        "WHERE formula_draft_id = %s AND replacement_draft_id IS NULL",
-        (replacement_draft_id, formula_draft_id))
+        "WHERE formula_draft_id = %s AND replacement_draft_id IS NULL "
+        "RETURNING formula_draft_id",
+        (replacement_draft_id, formula_draft_id)).fetchone()
+    if updated is not None:
+        return
+
+    # ▲ The UPDATE matched nothing, and the two reasons need different answers. Previously both
+    # reported success: naming a replacement for a draft that was never retired did nothing at all,
+    # and naming a SECOND replacement silently kept the first.
+    recorded = conn.execute(
+        "SELECT replacement_draft_id FROM formula_draft_retirement WHERE formula_draft_id = %s",
+        (formula_draft_id,)).fetchone()
+    if recorded is None:
+        raise RetirementDisagreement(
+            f"formula draft {formula_draft_id} has no retirement, so there is nothing for "
+            f"{replacement_draft_id} to replace — a replacement recorded against a live draft "
+            f"would claim a supersession nobody decided")
+    if recorded[0] != replacement_draft_id:
+        raise RetirementDisagreement(
+            f"formula draft {formula_draft_id} was already replaced by {recorded[0]!r}; this call "
+            f"names {replacement_draft_id!r}. 'What replaced this draft' must not have two answers")
 
 
 def retired_draft_ids(conn) -> frozenset[str]:

@@ -154,6 +154,12 @@ V3_AUTHOR_OUTPUT_SCHEMA_ID = "formula_author_turn_v3"
 #: be a different contract requested under the same name.
 V3_AUTHOR_OUTPUT_SCHEMA_VERSION = 1
 
+#: The PROMPT identity a genuine V3 run was authored under. Checked beside the schema:
+#: the schema is what the answer was validated against, the prompt is what the model was
+#: TOLD to produce, and a run can be wrong about either one independently.
+V3_AUTHOR_PROMPT_ID = "formula_author_turn_v3"
+V3_AUTHOR_PROMPT_VERSION = 1
+
 
 def qualifies_as_v3_evidence(stored: Mapping[str, object] | None) -> tuple[bool, tuple[str, ...]]:
     """The MANIFEST half of the question. **Not the authority — see
@@ -214,18 +220,26 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     problems = list(disagreements)
 
     # ── the author calls, as they were actually REQUESTED ────────────────────────────────────────
-    schemas = conn.execute(
-        "SELECT DISTINCT c.output_schema_id, c.output_schema_version "
+    # The task is matched EXACTLY, never by `LIKE '%author%'`: a pattern also matches whatever task
+    # named "reauthor" or "author_review" exists next, and this is the check deciding whether a run
+    # may be certified as V3 evidence.
+    from featuregen.formula.author import AUTHOR_TASK
+
+    calls = conn.execute(
+        "SELECT DISTINCT c.output_schema_id, c.output_schema_version, c.prompt_id, "
+        "       c.prompt_version "
         "  FROM formula_authoring_trace_event e "
         "  JOIN llm_call c ON c.llm_call_ref = e.llm_call_ref "
-        " WHERE e.authoring_run_id = %s AND e.llm_call_ref IS NOT NULL "
-        "   AND c.task LIKE %s",
-        (authoring_run_id, "%author%")).fetchall()
-    if not schemas:
+        " WHERE e.authoring_run_id = %s AND e.llm_call_ref IS NOT NULL AND c.task = %s",
+        (authoring_run_id, AUTHOR_TASK)).fetchall()
+    if not calls:
         problems.append(
-            "<no author provider call> (expected one requested under "
+            f"<no {AUTHOR_TASK} provider call> (expected one requested under "
             f"{V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
-    for schema_id, schema_version in schemas:
+    for schema_id, schema_version, prompt_id, prompt_version in calls:
+        # The SCHEMA is what the answer was validated against; the PROMPT is what the model was
+        # told to produce. A run held to the v3 shape under v2's instruction, or the reverse, is
+        # not a v3 run — and only checking one of them would miss exactly that.
         if schema_id != V3_AUTHOR_OUTPUT_SCHEMA_ID:
             problems.append(
                 f"author output_schema_id={schema_id!r} "
@@ -234,16 +248,43 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
             problems.append(
                 f"author output_schema_version={schema_version!r} "
                 f"(expected {V3_AUTHOR_OUTPUT_SCHEMA_VERSION!r})")
+        if prompt_id != V3_AUTHOR_PROMPT_ID:
+            problems.append(f"author prompt_id={prompt_id!r} (expected {V3_AUTHOR_PROMPT_ID!r})")
+        if prompt_version != V3_AUTHOR_PROMPT_VERSION:
+            problems.append(
+                f"author prompt_version={prompt_version!r} "
+                f"(expected {V3_AUTHOR_PROMPT_VERSION!r})")
 
     # ── and the artifact the run actually produced ───────────────────────────────────────────────
+    # PARSED, not string-compared. `"formula_schema_version": 3` in the stored JSON is a claim; a
+    # payload that says 3 and does not satisfy the v3 grammar is not v3 evidence, and the whole
+    # reason this qualifier exists is that a declared version and the thing itself can disagree.
     produced = conn.execute(
-        "SELECT payload->'result'->'candidate_proposal'->>'formula_schema_version' "
+        "SELECT payload->'result'->'candidate_proposal' "
         "  FROM formula_authoring_trace_event "
         " WHERE authoring_run_id = %s AND kind = 'completed'",
         (authoring_run_id,)).fetchone()
     if produced is None or produced[0] is None:
         problems.append("<no terminal proposal> (a run that produced nothing evidences nothing)")
-    elif str(produced[0]) != "3":
-        problems.append(f"produced proposal formula_schema_version={produced[0]!r} (expected 3)")
+    else:
+        problems.extend(_v3_parse_problems(produced[0]))
 
     return (not problems), tuple(problems)
+
+
+def _v3_parse_problems(raw: Mapping[str, object]) -> tuple[str, ...]:
+    """``()`` if ``raw`` genuinely parses as a V3 proposal, else what is wrong with it."""
+    from featuregen.formula.parse_v2 import parse_versioned
+    from featuregen.formula.schema_leaves import SchemaError
+    from featuregen.formula.schema_v3 import TypedFormulaProposalV3
+
+    declared = raw.get("formula_schema_version")
+    if declared != 3:
+        return (f"produced proposal formula_schema_version={declared!r} (expected 3)",)
+    try:
+        parsed = parse_versioned(raw)
+    except SchemaError as exc:
+        return (f"produced proposal declares 3 but does not parse as v3: {exc}",)
+    if not isinstance(parsed, TypedFormulaProposalV3):
+        return (f"produced proposal declares 3 but parses as {type(parsed).__name__}",)
+    return ()

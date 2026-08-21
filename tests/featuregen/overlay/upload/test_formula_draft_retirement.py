@@ -11,6 +11,7 @@ import psycopg
 import pytest
 
 from featuregen.overlay.upload.formula_draft_store import (
+    RetirementDisagreement,
     record_draft_replacement,
     retire_formula_draft,
     retired_draft_ids,
@@ -53,16 +54,34 @@ def test_RETIREMENT_MARKS_A_DRAFT_WITHOUT_REMOVING_IT(db):
         ("fd-retire",)).fetchone()[0] == "BLOCKED", "the draft itself is untouched"
 
 
-def test_RETIRING_TWICE_IS_ONE_FACT(db):
-    """A second row would let two reasons and two replacements disagree about one draft."""
+def test_REPEATING_THE_SAME_RETIREMENT_IS_FREE(db):
+    """True idempotency: the same act repeated is one fact, and costs nothing to say twice."""
     _draft(db, "fd-twice")
     retire_formula_draft(db, "fd-twice", reason="WITHDRAWN", retired_by="a@bank")
-    retire_formula_draft(db, "fd-twice", reason="CANDIDATE_SUPERSEDED", retired_by="b@bank")
+    retire_formula_draft(db, "fd-twice", reason="WITHDRAWN", retired_by="a@bank")
 
     rows = db.execute(
         "SELECT reason, retired_by FROM formula_draft_retirement WHERE formula_draft_id = %s",
         ("fd-twice",)).fetchall()
-    assert rows == [("WITHDRAWN", "a@bank")], "the first retirement stands"
+    assert rows == [("WITHDRAWN", "a@bank")]
+
+
+def test_a_SECOND_OPERATOR_DISAGREEING_IS_LOUD(db):
+    """▲ NOT idempotency — two people deciding differently about one draft.
+
+    `ON CONFLICT DO NOTHING` reported this as success, so the second decision vanished while its
+    author was told it had taken effect. One of the two would have been acting on a belief the
+    system had quietly discarded.
+    """
+    _draft(db, "fd-disagree")
+    retire_formula_draft(db, "fd-disagree", reason="WITHDRAWN", retired_by="a@bank")
+
+    with pytest.raises(RetirementDisagreement, match="already retired"):
+        retire_formula_draft(db, "fd-disagree", reason="CANDIDATE_SUPERSEDED", retired_by="b@bank")
+
+    assert db.execute(
+        "SELECT reason FROM formula_draft_retirement WHERE formula_draft_id = %s",
+        ("fd-disagree",)).fetchone()[0] == "WITHDRAWN", "the recorded decision is unchanged"
 
 
 def test_THE_REPLACEMENT_IS_NAMED_LATER_and_only_once(db):
@@ -78,11 +97,24 @@ def test_THE_REPLACEMENT_IS_NAMED_LATER_and_only_once(db):
         ("fd-old",)).fetchone()[0] is None
 
     record_draft_replacement(db, "fd-old", replacement_draft_id="fd-new")
-    record_draft_replacement(db, "fd-old", replacement_draft_id="fd-newer")
+    record_draft_replacement(db, "fd-old", replacement_draft_id="fd-new")   # the same act, repeated
+
+    with pytest.raises(RetirementDisagreement, match="already replaced"):
+        record_draft_replacement(db, "fd-old", replacement_draft_id="fd-newer")
 
     assert db.execute(
         "SELECT replacement_draft_id FROM formula_draft_retirement WHERE formula_draft_id = %s",
         ("fd-old",)).fetchone()[0] == "fd-new", "'what replaced this' has one answer"
+
+
+def test_a_REPLACEMENT_FOR_A_LIVE_DRAFT_IS_REFUSED(db):
+    """It silently did nothing. A replacement recorded against a draft nobody retired would claim a
+    supersession nobody decided."""
+    _draft(db, "fd-live")
+    _draft(db, "fd-other")
+
+    with pytest.raises(RetirementDisagreement, match="no retirement"):
+        record_draft_replacement(db, "fd-live", replacement_draft_id="fd-other")
 
 
 def test_a_RETIREMENT_CANNOT_BE_DELETED(db):
@@ -120,3 +152,74 @@ def test_an_UNKNOWN_REASON_IS_REFUSED(db):
 
     with pytest.raises(psycopg.errors.IntegrityError):
         retire_formula_draft(db, "fd-badreason", reason="because", retired_by="ops@bank")
+
+
+# ══ RETIREMENT IS AUTHORITATIVE, NOT DECORATIVE ════════════════════════════════════════════════
+def test_a_RETIRED_DRAFT_CANNOT_ADVANCE(db):
+    """▲ THE SPEND FENCE. A draft retired WHILE IN FLIGHT kept authoring — more provider calls,
+    more money, and eventually a READY formula an operator had already withdrawn. Checked on every
+    step rather than once at claim time, because the whole point of withdrawing one is that it
+    should stop NOW."""
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired, DraftStateV1, advance
+
+    _draft(db, "fd-inflight")
+    retire_formula_draft(db, "fd-inflight", reason="WITHDRAWN", retired_by="ops@bank")
+
+    with pytest.raises(DraftRetired, match="must not advance"):
+        advance(db, "fd-inflight", DraftStateV1.FAILED, failure_reason="x")
+
+
+def test_a_RETIRED_IDENTITY_IS_NOT_HANDED_BACK_AS_A_USABLE_DRAFT(db):
+    """▲ The runbook's "use a new draft id" was incomplete, and this is why. `formula_identity_hash`
+    is UNIQUE, so a fresh id lands on the SAME retired row — and the request reported
+    `created=False`, which reads as "you already have an identical, usable draft"."""
+    from featuregen.overlay.upload.formula_draft_store import DraftRetired, request_draft
+
+    first, created = request_draft(
+        db, formula_draft_id="fd-id-1", considered_revision_id="crev-r", option_id="opt-id",
+        planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a",
+        definition_revision="", requested_by="ops@bank", requested_at="t")
+    assert created
+    retire_formula_draft(db, first, reason="SCHEMA_CONTRACT_MISMATCH", retired_by="ops@bank")
+
+    with pytest.raises(DraftRetired, match="identity-bearing"):
+        request_draft(
+            db, formula_draft_id="fd-id-2", considered_revision_id="crev-r", option_id="opt-id",
+            planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a",
+            definition_revision="", requested_by="ops@bank", requested_at="t")
+
+
+def test_CHANGING_AN_IDENTITY_BEARING_INPUT_MINTS_A_NEW_DRAFT(db):
+    """The other half — otherwise the refusal above would be a dead end. Correcting the authoring
+    configuration changes the identity, so the request is genuinely new work."""
+    from featuregen.overlay.upload.formula_draft_store import request_draft
+
+    first, _ = request_draft(
+        db, formula_draft_id="fd-cfg-1", considered_revision_id="crev-r", option_id="opt-cfg",
+        planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a-broken",
+        definition_revision="", requested_by="ops@bank", requested_at="t")
+    retire_formula_draft(db, first, reason="SCHEMA_CONTRACT_MISMATCH", retired_by="ops@bank")
+
+    second, created = request_draft(
+        db, formula_draft_id="fd-cfg-2", considered_revision_id="crev-r", option_id="opt-cfg",
+        planning_request_hash="p", catalog_snapshot_hash="c", authoring_config_hash="a-fixed",
+        definition_revision="", requested_by="ops@bank", requested_at="t")
+
+    assert created is True and second == "fd-cfg-2"
+
+
+def test_THE_READ_CARRIES_RETIREMENT_so_no_caller_can_forget_to_ask(db):
+    """A retired draft rendered from `state` alone still reads "Formula ready"."""
+    from featuregen.overlay.upload.formula_draft_store import read_draft
+
+    _draft(db, "fd-read")
+    retire_formula_draft(db, "fd-read", reason="CANDIDATE_SUPERSEDED",
+                         detail="the candidate moved", retired_by="ops@bank")
+
+    draft = read_draft(db, "fd-read")
+
+    assert draft.is_retired is True
+    assert draft.retirement.reason == "CANDIDATE_SUPERSEDED"
+    assert draft.retirement.detail == "the candidate moved"
+    assert draft.retirement.retired_by == "ops@bank"
+    assert draft.retirement.retired_at
