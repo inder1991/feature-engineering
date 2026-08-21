@@ -59,6 +59,7 @@ from featuregen.materialize.execution_proof_store import (
 )
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.formula_draft_store import (
+    DraftRetired,
     DraftStateV1,
     InvalidTransition,
     advance,
@@ -181,6 +182,20 @@ def process_formula_draft_once(
             code=exc.blocker.get("code"))
         return FormulaDraftWorkerOutcome(
             status="ok", formula_draft_id=draft_id, state=state.value)
+    except DraftRetired as exc:
+        # ▲ ITS OWN ARM, and it must come before the generic one. Falling through to that handler
+        # called `_terminalize`, which calls `advance`, which raises `DraftRetired` AGAIN — out of
+        # the exception handler, so the queue item was never completed and stayed leased until its
+        # lease expired, then redelivered to do the same thing again.
+        #
+        # The draft's state is NOT changed. It was retired, which is the answer; writing FAILED
+        # over it would replace an operator's decision with a verdict about the candidate, and the
+        # candidate was never the problem. The queue item COMPLETES: a retirement is a terminal
+        # answer, and a redelivery would only reach the same one after paying for it.
+        complete_formula_draft(conn, claim)
+        counters.incr("featuregen.formula_draft.retired")
+        log("featuregen.formula_draft.retired", formula_draft_id=draft_id, reason=str(exc))
+        return FormulaDraftWorkerOutcome(status="retired", formula_draft_id=draft_id)
     except (LeaseFenceLost, RecoveryRequiresReconciliation) as exc:
         # TRANSIENT by nature: the lease moved under us, or a run needs reconciling before it can be
         # resumed. Neither is a statement about the candidate, so neither is written to the draft.
@@ -631,12 +646,29 @@ def _sync_from_trace(draft_id: str) -> None:
     try:
         with psycopg.connect(dsn, autocommit=True) as sync_conn:
             draft = read_draft(sync_conn, draft_id)
-            if draft is None or draft.state.is_terminal or draft.authoring_run_id is None:
+            if draft is None:
+                return
+            # CHECKED EXPLICITLY, before anything else. A retired draft may have no state to walk
+            # to — the trace may show nothing new since the last turn — so relying on `_walk_to`
+            # raising would let the loop continue whenever there was no transition to attempt. The
+            # question here is not "has it progressed" but "should this run still be spending".
+            if draft.is_retired:
+                raise DraftRetired(
+                    f"formula draft {draft_id} was retired "
+                    f"({draft.retirement.reason}) while it was being authored")
+            if draft.state.is_terminal or draft.authoring_run_id is None:
                 return
             observed = _observed_state(sync_conn, draft.authoring_run_id)
             if observed is None:
                 return
             _walk_to(sync_conn, draft_id, observed)
+    except DraftRetired:
+        # ▲ NOT a progress-reporting failure, and this is the one exception to "best-effort".
+        # `_sync_from_trace` runs as the authoring loop's progress callback, i.e. BETWEEN provider
+        # calls — so swallowing this here meant the loop carried on and paid for the next turn of a
+        # draft somebody had already withdrawn. Re-raised so the run stops at the nearest turn
+        # boundary, which is the whole purpose of withdrawing one.
+        raise
     except Exception as exc:  # noqa: BLE001 — progress reporting never fails a paid run
         log("featuregen.formula_draft.progress_unavailable", level="warning",
             formula_draft_id=draft_id, error=f"{type(exc).__name__}: {exc}")

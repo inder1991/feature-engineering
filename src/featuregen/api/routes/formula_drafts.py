@@ -38,6 +38,7 @@ from featuregen.aggregates.ids import mint_id
 from featuregen.api.deps import get_conn, get_identity, require_permission
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.formula_draft_store import (
+    DraftRetired,
     read_draft,
     request_draft,
 )
@@ -133,17 +134,40 @@ def request_formula_draft(
     candidate = _frozen_candidate(conn, revision_id, option_id)
     minted = mint_id(_DRAFT_PREFIX)
 
-    draft_id, created = request_draft(
-        conn,
-        formula_draft_id=minted,
-        considered_revision_id=candidate["considered_revision_id"],
-        option_id=option_id,
-        planning_request_hash=candidate["planning_request_hash"],
-        catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
-        authoring_config_hash=_authoring_config_hash(),
-        definition_revision=candidate["definition_revision"],
-        requested_by=identity.subject,
-        requested_at=_now(conn))
+    try:
+        draft_id, created = request_draft(
+            conn,
+            formula_draft_id=minted,
+            considered_revision_id=candidate["considered_revision_id"],
+            option_id=option_id,
+            planning_request_hash=candidate["planning_request_hash"],
+            catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
+            authoring_config_hash=_authoring_config_hash(),
+            definition_revision=candidate["definition_revision"],
+            requested_by=identity.subject,
+            requested_at=_now(conn))
+    except DraftRetired as exc:
+        # ▲ 409, NOT a 500. `request_draft` raises this deliberately — the identity belongs to a
+        # RETIRED draft — and with nothing catching it the global handler turned a considered
+        # refusal into "Internal Server Error", which tells a caller that the platform broke rather
+        # than that their request asked for something withdrawn.
+        #
+        # 409 rather than 422: the request is well-formed and would have been valid yesterday. What
+        # conflicts is the state of the world. The body carries what somebody actually needs to act
+        # — which draft, why, what replaced it, and WHICH input has to change — because
+        # `formula_identity_hash` is unique, so retrying with a new draft id lands on the same row.
+        retired = _retired_detail(conn, candidate, option_id)
+        raise HTTPException(status_code=409, detail={
+            "code": "FORMULA_DRAFT_RETIRED",
+            "message": str(exc),
+            **retired,
+            "identity_bearing_inputs": [
+                "authoring_config_hash", "catalog_snapshot_hash",
+                "planning_request_hash", "definition_revision"],
+            "remedy": ("this identity was retired, and a new draft id does not change it — either "
+                       "use the replacement, or re-request once an identity-bearing input has "
+                       "genuinely changed"),
+        }) from exc
 
     if created:
         # Enqueued ONLY for a genuinely new draft. Re-enqueuing an existing one would put a second
@@ -172,6 +196,36 @@ def request_formula_draft(
         "detail": ("the formula draft was requested; a worker authors it" if created else
                    "an identical draft already exists for this candidate, catalog snapshot and "
                    "configuration — nothing was queued and nothing was spent"),
+    }
+
+
+def _retired_detail(conn, candidate, option_id: str) -> dict[str, object]:
+    """Which draft was retired, why, and what replaced it — read for the 409 body.
+
+    A refusal that named only "retired" would send the caller to ask three more questions, and the
+    replacement is usually the answer they need.
+    """
+    from featuregen.overlay.upload.formula_draft_store import formula_identity
+
+    identity = formula_identity(
+        considered_revision_id=candidate["considered_revision_id"], option_id=option_id,
+        planning_request_hash=candidate["planning_request_hash"],
+        catalog_snapshot_hash=candidate["catalog_snapshot_hash"],
+        authoring_config_hash=_authoring_config_hash(),
+        definition_revision=candidate["definition_revision"])
+    row = conn.execute(
+        "SELECT d.formula_draft_id, r.reason, r.detail, r.replacement_draft_id "
+        "  FROM formula_draft d "
+        "  JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
+        " WHERE d.formula_identity_hash = %s", (identity,)).fetchone()
+    if row is None:
+        return {"formula_identity_hash": identity}
+    return {
+        "formula_identity_hash": identity,
+        "retired_draft_id": row[0],
+        "reason": row[1],
+        "detail": row[2],
+        "replacement_draft_id": row[3],
     }
 
 

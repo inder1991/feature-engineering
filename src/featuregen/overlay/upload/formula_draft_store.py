@@ -353,18 +353,34 @@ def advance(
             f"Permitted: {sorted(s.value for s in permitted) or 'nothing — it is terminal'}. "
             f"Re-authoring is a NEW request against a new identity, never a step backwards")
 
-    conn.execute(
+    # ▲ THE FENCE RIDES THE UPDATE, and the read above is only the cheap check.
+    #
+    # Reading retirement and then writing in a second statement leaves a window: a retirement that
+    # commits between them is invisible to the read and unopposed by the write, so the very
+    # transition this exists to stop goes through. `NOT EXISTS` inside the UPDATE's own WHERE makes
+    # the guard and the write ONE statement — the row is written only if it is still unretired at
+    # the instant of writing. Matching no row is the refusal.
+    moved = conn.execute(
         "UPDATE formula_draft SET state = %s, "
         "authoring_run_id = COALESCE(%s, authoring_run_id), "
         "formula_content_hash = COALESCE(%s, formula_content_hash), "
         "formula_json = COALESCE(%s::jsonb, formula_json), "
         "blockers = CASE WHEN %s::jsonb IS NULL THEN blockers ELSE %s::jsonb END, "
-        "failure_reason = %s, updated_at = now() WHERE formula_draft_id = %s",
+        "failure_reason = %s, updated_at = now() "
+        "WHERE formula_draft_id = %s "
+        "  AND NOT EXISTS (SELECT 1 FROM formula_draft_retirement r "
+        "                   WHERE r.formula_draft_id = formula_draft.formula_draft_id) "
+        "RETURNING formula_draft_id",
         (to.value, authoring_run_id, formula_content_hash,
          None if formula_json is None else json.dumps(dict(formula_json)),
          None if not blockers else json.dumps([dict(b) for b in blockers]),
          None if not blockers else json.dumps([dict(b) for b in blockers]),
-         failure_reason, formula_draft_id))
+         failure_reason, formula_draft_id)).fetchone()
+    if moved is None:
+        raise DraftRetired(
+            f"formula draft {formula_draft_id} was retired while this transition was being "
+            f"validated and must not advance to {to.value}: the retirement landed between the "
+            f"check and the write, which is exactly the window this guard closes")
     return to
 
 
@@ -470,15 +486,20 @@ def retire_formula_draft(
     # differently? `ON CONFLICT DO NOTHING` alone reported both as success, so a colleague retiring
     # the same draft for a different reason had their decision silently discarded while being told
     # it took effect. Repeating an identical retirement stays free; disagreeing is loud.
+    # The COMPLETE caller-controlled tuple, not just reason and actor. Comparing two of the four
+    # let the other two disagree silently: the same person retiring for the same reason with a
+    # DIFFERENT detail, or naming a different replacement, was reported as the identical act — and
+    # the second detail or replacement was discarded while its author was told it had landed.
     recorded = conn.execute(
-        "SELECT reason, retired_by FROM formula_draft_retirement WHERE formula_draft_id = %s",
-        (formula_draft_id,)).fetchone()
-    if recorded is not None and (recorded[0], recorded[1]) != (reason, retired_by):
+        "SELECT reason, detail, replacement_draft_id, retired_by FROM formula_draft_retirement "
+        "WHERE formula_draft_id = %s", (formula_draft_id,)).fetchone()
+    supplied = (reason, detail, replacement_draft_id, retired_by)
+    if recorded is not None and tuple(recorded) != supplied:
         raise RetirementDisagreement(
-            f"formula draft {formula_draft_id} is already retired as {recorded[0]!r} by "
-            f"{recorded[1]!r}; this call says {reason!r} by {retired_by!r}. Retiring twice is not "
-            f"two facts — one of these decisions would be lost, and the person who made it would "
-            f"be told it had taken effect")
+            f"formula draft {formula_draft_id} is already retired as "
+            f"(reason, detail, replacement, by) = {tuple(recorded)!r}; this call says "
+            f"{supplied!r}. Retiring twice is not two facts — one of these decisions would be "
+            f"lost, and the person who made it would be told it had taken effect")
 
 
 def record_draft_replacement(conn, formula_draft_id: str, *, replacement_draft_id: str) -> None:

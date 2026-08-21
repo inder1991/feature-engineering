@@ -79,7 +79,9 @@ where = ["src"]
 "featuregen.overlay.upload.taxonomy" = ["*.schema.json"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." so `scripts/` is importable: the migration-ledger verifier guards every deploy,
+# and a check that cannot be imported cannot be tested.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 # importlib mode lets test modules with the same basename coexist across packages
 # (e.g. tests/projections/test_migration.py and tests/featuregen/documents/test_migration.py)

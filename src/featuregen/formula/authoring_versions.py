@@ -220,23 +220,30 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     problems = list(disagreements)
 
     # ── the author calls, as they were actually REQUESTED ────────────────────────────────────────
-    # The task is matched EXACTLY, never by `LIKE '%author%'`: a pattern also matches whatever task
-    # named "reauthor" or "author_review" exists next, and this is the check deciding whether a run
-    # may be certified as V3 evidence.
+    # ▲ EVERY author_turn's call is validated — the task is CHECKED, never used as a filter.
+    #
+    # Filtering `WHERE c.task = 'formula.author'` first looked stricter than the `LIKE` it replaced,
+    # and hid the same class of run: a trace with one correct author call and one author_turn made
+    # under a DIFFERENT task simply dropped the second row, so the qualifier certified a run on the
+    # strength of the calls that happened to match. Selecting every author_turn and judging each
+    # one means an unexpected task is a PROBLEM rather than an absence.
     from featuregen.formula.author import AUTHOR_TASK
 
     calls = conn.execute(
-        "SELECT DISTINCT c.output_schema_id, c.output_schema_version, c.prompt_id, "
+        "SELECT DISTINCT c.task, c.output_schema_id, c.output_schema_version, c.prompt_id, "
         "       c.prompt_version "
         "  FROM formula_authoring_trace_event e "
         "  JOIN llm_call c ON c.llm_call_ref = e.llm_call_ref "
-        " WHERE e.authoring_run_id = %s AND e.llm_call_ref IS NOT NULL AND c.task = %s",
-        (authoring_run_id, AUTHOR_TASK)).fetchall()
+        " WHERE e.authoring_run_id = %s AND e.kind = 'author_turn' "
+        "   AND e.llm_call_ref IS NOT NULL",
+        (authoring_run_id,)).fetchall()
     if not calls:
         problems.append(
-            f"<no {AUTHOR_TASK} provider call> (expected one requested under "
+            f"<no author_turn provider call> (expected one requested under "
             f"{V3_AUTHOR_OUTPUT_SCHEMA_ID!r})")
-    for schema_id, schema_version, prompt_id, prompt_version in calls:
+    for task, schema_id, schema_version, prompt_id, prompt_version in calls:
+        if task != AUTHOR_TASK:
+            problems.append(f"author_turn call task={task!r} (expected {AUTHOR_TASK!r})")
         # The SCHEMA is what the answer was validated against; the PROMPT is what the model was
         # told to produce. A run held to the v3 shape under v2's instruction, or the reverse, is
         # not a v3 run — and only checking one of them would miss exactly that.
@@ -259,17 +266,48 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     # PARSED, not string-compared. `"formula_schema_version": 3` in the stored JSON is a claim; a
     # payload that says 3 and does not satisfy the v3 grammar is not v3 evidence, and the whole
     # reason this qualifier exists is that a declared version and the thing itself can disagree.
-    produced = conn.execute(
-        "SELECT payload->'result'->'candidate_proposal' "
-        "  FROM formula_authoring_trace_event "
-        " WHERE authoring_run_id = %s AND kind = 'completed'",
-        (authoring_run_id,)).fetchone()
-    if produced is None or produced[0] is None:
+    # ▲ THROUGH THE VERIFIED CHECKPOINT, not raw terminal JSON. `load_verified_checkpoint` walks
+    # the events, re-derives every payload hash, enforces the stage ordering and reconciles each
+    # provider dispatch before handing anything back — so reading the terminal row directly would
+    # certify bytes that no replay had ever validated, which is the opposite of what an evidence
+    # qualifier is for. Falling back to the raw row when the manifest is unreadable is deliberate
+    # too: it lets the parse problems below name what is wrong instead of the whole run reading as
+    # "no proposal".
+    produced = _verified_proposal(conn, authoring_run_id, problems)
+    if produced is None:
         problems.append("<no terminal proposal> (a run that produced nothing evidences nothing)")
     else:
-        problems.extend(_v3_parse_problems(produced[0]))
+        problems.extend(_v3_parse_problems(produced))
 
     return (not problems), tuple(problems)
+
+
+def _verified_proposal(conn, authoring_run_id: str, problems: list[str]):
+    """The terminal proposal AS THE REPLAY VERIFIES IT, or ``None``.
+
+    Every payload hash, the stage ordering and each provider dispatch are re-checked on the way —
+    a trace that cannot be replayed cannot say what the run decided, and a qualifier that read the
+    terminal row directly would certify bytes nothing had validated.
+    """
+    from featuregen.formula.control import FormulaControlFlow
+    from featuregen.formula.replay_trace import load_verified_checkpoint
+
+    manifest = conn.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (authoring_run_id,)).fetchone()
+    if manifest is None:
+        return None
+    try:
+        checkpoint = load_verified_checkpoint(
+            conn, authoring_run_id, intent_hash=manifest[0], versions=manifest[1])
+    except FormulaControlFlow as exc:
+        problems.append(f"the trace does not replay, so it cannot say what the run decided: {exc}")
+        return None
+    terminal = checkpoint.terminal_result
+    if not isinstance(terminal, dict):
+        return None
+    result = terminal.get("result")
+    return result.get("candidate_proposal") if isinstance(result, dict) else None
 
 
 def _v3_parse_problems(raw: Mapping[str, object]) -> tuple[str, ...]:

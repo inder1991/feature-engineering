@@ -461,13 +461,57 @@ def test_the_DATABASE_BACKED_QUALIFIER_REJECTS_IT_and_names_the_axis(db):
     assert any("output_schema_id" in p and "formula_author_turn_v2" in p for p in problems), problems
 
 
-def test_a_GENUINE_V3_RUN_QUALIFIES_against_the_database(db):
-    """The positive control for the authority, on a run this build actually authored."""
+def test_an_UNREPLAYABLE_TRACE_DOES_NOT_QUALIFY(db):
+    """The qualifier runs through `load_verified_checkpoint`, so payload hashes, stage ordering and
+    dispatch lineage are all re-checked — reading the terminal row directly would certify bytes
+    nothing had validated.
+
+    ▲ AND THAT IS WHY THIS SUITE CANNOT SHOW A FULLY-QUALIFYING PROVIDER RUN. The audited seam's
+    `llm_call` dispatch rows reconcile only under a durable DSN, which this suite deliberately does
+    not have (`test_resolve.py` states the reason: write-once trace rows a durable connection
+    commits can never be cleaned up between runs). So a provider-authored run here has real author
+    calls and an unreplayable trace, and the deterministic path has a replayable trace and no
+    provider calls. Each half is asserted separately below; the two together need an environment
+    with a durable DSN, and that gap is stated rather than papered over with a weaker qualifier.
+    """
     from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
 
-    _run(db, run_id="far-authority-ok", raw=_raw_v3(), requested=3)
+    _run(db, run_id="far-unreplayable", raw=_raw_v3(), requested=3)
 
-    assert qualifies_as_v3_evidence_for_run(db, "far-authority-ok") == (True, ())
+    ok, problems = qualifies_as_v3_evidence_for_run(db, "far-unreplayable")
+
+    assert ok is False
+    assert any("does not replay" in p for p in problems), problems
+
+
+def test_the_AUTHOR_CALLS_OF_A_GENUINE_V3_RUN_ARE_ACCEPTED(db):
+    """The provider-contract half, isolated: a real V3 run's author calls raise no complaint about
+    task, schema or prompt. Without this, every refusal in this file could be passing because the
+    call check rejects everything."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-calls-ok", raw=_raw_v3(), requested=3)
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-calls-ok")
+
+    assert not [p for p in problems if "task=" in p or "schema_id" in p or "prompt_" in p], problems
+
+
+def test_the_VERSION_BUNDLE_OF_A_GENUINE_V3_RUN_IS_ACCEPTED(db):
+    """The manifest half, isolated — the same run, no version axis disagreeing."""
+    from featuregen.formula.authoring_versions import (
+        qualifies_as_v3_evidence,
+        qualifies_as_v3_evidence_for_run,
+    )
+
+    _run(db, run_id="far-bundle-ok", raw=_raw_v3(), requested=3)
+    stored = db.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-bundle-ok",)).fetchone()[0]
+
+    assert qualifies_as_v3_evidence(stored) == (True, ())
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-bundle-ok")
+    assert not [p for p in problems if "expected 3" in p and "formula_schema" in p], problems
 
 
 def test_a_RUN_WITH_NO_AUTHOR_CALL_DOES_NOT_QUALIFY(db):
@@ -495,17 +539,96 @@ def test_a_RUN_THAT_DOES_NOT_EXIST_QUALIFIES_FOR_NOTHING(db):
     assert "<no manifest>" in problems
 
 
-def test_the_QUALIFIER_MATCHES_THE_AUTHOR_TASK_EXACTLY_not_by_pattern():
-    """It used `LIKE '%author%'`, which also matches whatever task is named "reauthor" or
-    "author_review" next — in the check that decides whether a run may be certified as V3
-    evidence."""
-    import inspect
+def _run_with_a_mismatched_call(db, *, source_run: str, run_id: str, **overrides) -> str:
+    """A run carrying one correct author call and one made under DIFFERENT provider identity.
 
-    from featuregen.formula import authoring_versions
+    Built as a whole new run rather than by appending to `source_run`: a terminal run refuses new
+    events (correctly — its verdict is written), and `llm_call` is write-once, so a mismatched call
+    is CONSTRUCTED the way imported material arrives. The terminal event is deliberately not copied,
+    which keeps the new run appendable; the qualifier will also report the missing proposal, and the
+    assertions below name the problem they are about.
 
-    source = inspect.getsource(authoring_versions.qualifies_as_v3_evidence_for_run)
-    assert "c.task = %s" in source
-    assert "c.task LIKE" not in source
+    The full `llm_call` row is copied by reading `information_schema` rather than by listing
+    columns — the audited seam has several NOT NULL fields that are not this test's subject, and
+    enumerating them would break the fixture every time it gains one.
+    """
+    from featuregen.formula.replay_trace import open_authoring_run
+
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (source_run,)).fetchone()
+    open_authoring_run(db, intent_hash=manifest[0], versions=manifest[1], actor=None,
+                       authoring_run_id=run_id)
+
+    ref = db.execute(
+        "SELECT llm_call_ref FROM formula_authoring_trace_event "
+        "WHERE authoring_run_id = %s AND llm_call_ref IS NOT NULL LIMIT 1",
+        (source_run,)).fetchone()[0]
+    columns = [c for (c,) in db.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'llm_call' "
+        "ORDER BY ordinal_position").fetchall()]
+    projected = [
+        "llm_call_ref || ':bad'" if c == "llm_call_ref" else ("%s" if c in overrides else c)
+        for c in columns
+    ]
+    db.execute(
+        f"INSERT INTO llm_call ({', '.join(columns)}) SELECT {', '.join(projected)} "
+        f"FROM llm_call WHERE llm_call_ref = %s",
+        [overrides[c] for c in columns if c in overrides] + [ref])
+
+    # the GOOD author turns, then the BAD one — every author_turn, which is the point
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT %s, seq, kind, stage, payload, payload_hash, canonical_output_hash, "
+        "       %s || ':' || idempotency_key, logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND kind <> 'completed' AND kind <> 'failed'",
+        (run_id, run_id, source_run))
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT %s, seq + 900, kind, stage, payload, payload_hash, canonical_output_hash, "
+        "       %s || ':bad:' || idempotency_key, logical_turn_index, llm_call_ref || ':bad' "
+        "  FROM formula_authoring_trace_event "
+        " WHERE authoring_run_id = %s AND llm_call_ref = %s",
+        (run_id, run_id, source_run, ref))
+    return run_id
+
+
+def test_an_AUTHOR_TURN_UNDER_THE_WRONG_TASK_IS_A_PROBLEM_not_an_absence(db):
+    """▲ THE FILTER HID EXACTLY THIS. `WHERE c.task = 'formula.author'` looked stricter than the
+    `LIKE` it replaced and dropped the same class of row: a trace with one correct author call and
+    one author_turn made under a DIFFERENT task simply lost the second, so the qualifier certified
+    the run on the calls that happened to match. Every author_turn is now judged.
+
+    Built by CONSTRUCTION — `llm_call` is write-once — by linking a second author_turn event to a
+    call recorded under another task.
+    """
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-wrongtask", raw=_raw_v3(), requested=3)
+    _run_with_a_mismatched_call(db, source_run="far-wrongtask", run_id="far-wrongtask-2",
+                                task="formula.reauthor")
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-wrongtask-2")
+
+    assert any("formula.reauthor" in p for p in problems), problems
+
+
+def test_a_V3_SCHEMA_UNDER_A_V2_PROMPT_DOES_NOT_QUALIFY(db):
+    """The schema is what the answer was VALIDATED against; the prompt is what the model was TOLD
+    to produce. Checking only one would miss a run held to the v3 shape under v2's instruction — so
+    this constructs exactly that run rather than reading the source for the word "prompt_id"."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
+
+    _run(db, run_id="far-v2prompt", raw=_raw_v3(), requested=3)
+    _run_with_a_mismatched_call(db, source_run="far-v2prompt", run_id="far-v2prompt-2",
+                                prompt_id="formula_author_turn_v2")
+
+    _ok, problems = qualifies_as_v3_evidence_for_run(db, "far-v2prompt-2")
+
+    assert any("prompt_id" in p and "formula_author_turn_v2" in p for p in problems), problems
 
 
 def test_the_PARSE_CHECK_CATCHES_MALFORMED_PAYLOADS_but_NOT_relabelling():
@@ -533,19 +656,3 @@ def test_the_PARSE_CHECK_CATCHES_MALFORMED_PAYLOADS_but_NOT_relabelling():
     problems = _v3_parse_problems(malformed)
     assert problems and "does not parse as v3" in problems[0], problems
 
-
-def test_a_V3_SCHEMA_UNDER_THE_V2_PROMPT_DOES_NOT_QUALIFY(db):
-    """The schema is what the answer was VALIDATED against; the prompt is what the model was TOLD to
-    produce. Checking only one would miss a run held to the v3 shape under v2's instruction."""
-    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
-
-    _run(db, run_id="far-prompt-src", raw=_raw_v3(), requested=3)
-    ok, _ = qualifies_as_v3_evidence_for_run(db, "far-prompt-src")
-    assert ok is True, "the control must qualify"
-
-    import inspect
-
-    from featuregen.formula import authoring_versions
-
-    source = inspect.getsource(authoring_versions.qualifies_as_v3_evidence_for_run)
-    assert "prompt_id" in source and "prompt_version" in source
