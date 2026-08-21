@@ -126,3 +126,46 @@ def classify_version_bundle(
     if stored_versions == legacy_bundle_v1(current):
         return BundleClassV2.LEGACY
     return BundleClassV2.UNKNOWN
+
+
+#: The COMPLETE identity a run must carry to count as V3 evidence. Every axis, not a date.
+#:
+#: ▲ WHY IDENTITY AND NOT A COMMIT DATE. Before the contract fix, this platform declared
+#: `formula_schema: 3` on runs it drove under the v2 author contract — an instruction that says
+#: "MUST declare formula_schema_version 2". Those runs are indistinguishable from real V3 evidence
+#: by their schema field alone, and a date cutoff would be a guess about which build wrote them
+#: that nothing in the row supports. The tuple below cannot be satisfied by any of them: the
+#: orchestrator and disposition versions moved when the V3 state was added, and the author output
+#: schema is `formula_author_turn_v3`, which no pre-fix run was ever requested under.
+V3_EVIDENCE_IDENTITY: Mapping[str, object] = {
+    "formula_schema": 3,
+    "orchestrator": 3,
+    "disposition": 3,
+    "canonicalization": 1,      # CANONICALIZATION_VERSION_V3
+    "output_policy": 1,         # OUTPUT_POLICY_VERSION_V2 — v3 reuses v2's output authority
+}
+
+#: The author output schema a genuine V3 run was requested under. Checked SEPARATELY from the
+#: version bundle because it does not live there: it is recorded by the audited seam and hashed into
+#: a frozen provider contract, and it is the single axis that no pre-fix run can fake — those runs
+#: were physically requested under `formula_author_turn_v2`.
+V3_AUTHOR_OUTPUT_SCHEMA_ID = "formula_author_turn_v3"
+
+
+def qualifies_as_v3_evidence(stored: Mapping[str, object] | None) -> tuple[bool, tuple[str, ...]]:
+    """Does this run's manifest carry the complete V3 identity? Returns ``(ok, missing_axes)``.
+
+    The axes that DISAGREE are returned rather than a bare False, because "this run is not V3
+    evidence" and "this run is not V3 evidence BECAUSE its orchestrator is 2" send an operator to
+    different places — the first to guess, the second to the regeneration list.
+
+    A run with no manifest qualifies for nothing: a run that states nothing about what decided it
+    cannot be shown to be anything.
+    """
+    if not stored:
+        return False, ("<no manifest>",)
+    disagreeing = tuple(
+        f"{axis}={stored.get(axis)!r} (expected {expected!r})"
+        for axis, expected in sorted(V3_EVIDENCE_IDENTITY.items())
+        if stored.get(axis) != expected)
+    return (not disagreeing), disagreeing

@@ -20,6 +20,8 @@ The agreement is now enforced at three independent places, and each covers what 
 """
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from tests.featuregen.materialize.test_admission_v2_s13 import _raw, _raw_v3
 
@@ -211,21 +213,207 @@ def test_a_MISMATCHED_RUN_LEAVES_NOTHING_ADMISSIBLE(db):
     assert disposition == "TECHNICAL_FAILURE"
 
 
-def test_ADMISSION_INDEPENDENTLY_COMPARES_manifest_declared_and_TYPE():
-    """The THIRD guard itself. It protects traces written before any of this existed, corrupted
-    imports and future orchestration mistakes — none of which the first two guards ran on.
+# ══ THE THIRD GUARD, DRIVEN THROUGH REAL ADMISSION ═════════════════════════════════════════════
+def _relabelled(db, *, source_run: str, run_id: str, declared_schema: int | None) -> str:
+    """A run whose MANIFEST says one language and whose TRACE holds another.
 
-    The runtime TYPE is compared as well as the declared integer because they are separately
-    forgeable: `parse_versioned` dispatches on the declared field, so an object whose field says 3
-    while its class is `TypedFormulaProposalV2` would satisfy an integer comparison and then be read
-    by every downstream stage as v2.
+    Authoring refuses to produce this now, which is the point: the admission guard exists for
+    material that did NOT come through today's authoring path — traces written before the contract
+    fix, and imports. So it is built the way an import would arrive: a run row opened with the
+    declared manifest, and the terminal bytes of a genuine run of the OTHER language copied under
+    it. The payload digest covers the payload alone, so the copied event verifies exactly as the
+    original did — which is what makes this a test of the version guard rather than of tampering.
     """
-    import inspect
+    from featuregen.formula.replay_trace import open_authoring_run
 
-    from featuregen.materialize import admission_v2
+    manifest = db.execute(
+        "SELECT intent_hash, versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (source_run,)).fetchone()
+    versions = dict(manifest[1])
+    # `None` opens the run with NO declared schema — an import whose manifest is incomplete. It is
+    # constructed this way rather than stripped afterwards because `formula_authoring_run` is
+    # write-once by trigger, which is itself the reason this guard cannot rely on repair.
+    if declared_schema is None:
+        versions.pop("formula_schema", None)
+    else:
+        versions["formula_schema"] = declared_schema
+    open_authoring_run(db, intent_hash=manifest[0], versions=versions, actor=None,
+                       authoring_run_id=run_id)
+    db.execute(
+        "INSERT INTO formula_authoring_trace_event (authoring_run_id, seq, kind, stage, payload, "
+        "payload_hash, canonical_output_hash, idempotency_key, logical_turn_index, llm_call_ref) "
+        "SELECT %s, seq, kind, stage, payload, payload_hash, canonical_output_hash, "
+        "       %s || ':' || idempotency_key, logical_turn_index, llm_call_ref "
+        "  FROM formula_authoring_trace_event WHERE authoring_run_id = %s",
+        (run_id, run_id, source_run))
+    return run_id
 
-    source = inspect.getsource(admission_v2._verify_manifest_declares_the_language)
-    assert "formula_schema" in source
-    assert "isinstance(proposal, expected)" in source
-    assert "_verify_manifest_declares_the_language" in inspect.getsource(
-        admission_v2._admit_one_v2)
+
+def _admit(db, run_id: str, result):
+    from tests.featuregen.materialize.test_admission_v2_s13 import _INTENT, _advertise
+
+    from featuregen.materialize.admission_v2 import ResolvedFeatureInputV2, admit_artifacts_v2
+
+    _advertise(db)
+    swapped = dataclasses.replace(result, authoring_run_id=run_id)
+    return admit_artifacts_v2(
+        db, [ResolvedFeatureInputV2(_INTENT, swapped)], engine_id="kedro-pyspark")
+
+
+def test_a_MANIFEST_3_RUN_CARRYING_A_V2_PROPOSAL_IS_REFUSED(db):
+    """The pre-fix shape, through REAL `admit_artifacts_v2`: manifest says 3, the trace holds a
+    genuine v2 proposal. Exactly what every "v3" draft authored before the contract fix looks
+    like."""
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
+    real = _run(db, run_id="far-real-v2", raw=_raw(), requested=2)
+    assert real.authoring_disposition == "RESOLVED", "the control must be admissible as v2"
+    _relabelled(db, source_run="far-real-v2", run_id="far-mislabelled-3", declared_schema=3)
+
+    with pytest.raises(MaterializationRefused) as refusal:
+        _admit(db, "far-mislabelled-3", real)
+
+    assert refusal.value.code is CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED
+    assert "formula_schema=3" in str(refusal.value)
+
+
+def test_a_MANIFEST_2_RUN_CARRYING_A_V3_PROPOSAL_IS_REFUSED(db):
+    """The other direction, also through real admission. The guard is an AGREEMENT, not a floor
+    that only stops downgrades."""
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
+    real = _run(db, run_id="far-real-v3", raw=_raw_v3(), requested=3)
+    assert real.authoring_disposition == "READY_FOR_OUTPUT_BINDING"
+    _relabelled(db, source_run="far-real-v3", run_id="far-mislabelled-2", declared_schema=2)
+
+    with pytest.raises(MaterializationRefused) as refusal:
+        _admit(db, "far-mislabelled-2", real)
+
+    assert refusal.value.code is CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED
+
+
+def test_a_RUN_WHOSE_MANIFEST_DECLARES_NO_SCHEMA_is_INCOMPLETE(db):
+    """A run that states nothing about what decided it cannot be shown to agree with anything — so
+    it is refused as INCOMPLETE rather than waved through."""
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
+    real = _run(db, run_id="far-real-noschema", raw=_raw_v3(), requested=3)
+    _relabelled(db, source_run="far-real-noschema", run_id="far-noschema", declared_schema=None)
+
+    with pytest.raises(MaterializationRefused) as refusal:
+        _admit(db, "far-noschema", real)
+
+    assert refusal.value.code is CompilationRefusalCode.AUTHORING_RUN_INCOMPLETE
+
+
+def test_a_MATCHING_V3_RUN_IS_STILL_ADMITTED(db):
+    """The positive control. Without it every refusal above could be passing because admission
+    refuses everything."""
+    real = _run(db, run_id="far-good-v3", raw=_raw_v3(), requested=3)
+
+    admitted = _admit(db, "far-good-v3", real)
+
+    assert len(admitted) == 1
+    assert admitted[0].proposal.formula_schema_version == 3
+
+
+def test_a_FORGED_V2_OBJECT_CLAIMING_VERSION_3_IS_CAUGHT_BY_ITS_TYPE():
+    """The declared field and the runtime type are SEPARATELY forgeable. `parse_versioned`
+    dispatches on the field, so an object whose field says 3 while its class is
+    `TypedFormulaProposalV2` satisfies an integer comparison and is then read as v2 by every stage
+    below — which is why the guard compares the type as well.
+
+    Asked of the check directly: constructing this pair is the whole point, and no writer in the
+    platform can produce it.
+    """
+    from featuregen.formula.parse_v2 import parse_proposal_v2
+    from featuregen.materialize.admission_v2 import _verify_manifest_declares_the_language
+    from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+
+    forged = dataclasses.replace(parse_proposal_v2(_raw()), formula_schema_version=3)
+    assert forged.formula_schema_version == 3, "the integer comparison alone would pass"
+
+    class _Conn:
+        def execute(self, *_a, **_k):
+            return type("R", (), {"fetchone": lambda self: ({"formula_schema": 3},)})()
+
+    with pytest.raises(MaterializationRefused) as refusal:
+        _verify_manifest_declares_the_language(_Conn(), forged, "far-forged")
+
+    assert refusal.value.code is CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED
+    assert "separately forgeable" in str(refusal.value)
+
+
+# ══ NO PRE-FIX "V3" EVIDENCE CAN QUALIFY ═══════════════════════════════════════════════════════
+def test_a_PRE_FIX_V3_LABELLED_RUN_DOES_NOT_QUALIFY_as_v3_evidence():
+    """The evaluator must exclude the old runs by IDENTITY, never by commit date.
+
+    A pre-fix run declares `formula_schema: 3` — it is indistinguishable from real V3 evidence on
+    that axis alone, which is exactly how it came to be mislabelled. What it cannot fake is the
+    rest of the tuple: the orchestrator and disposition versions moved when the V3 state was added.
+    """
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence
+
+    pre_fix = {"formula_schema": 3, "orchestrator": 2, "disposition": 2,
+               "canonicalization": 1, "output_policy": 1}
+
+    ok, disagreeing = qualifies_as_v3_evidence(pre_fix)
+    assert ok is False
+    # It NAMES the axes, because "not V3 evidence" and "not V3 evidence because its orchestrator is
+    # 2" send an operator to different places.
+    assert any("orchestrator" in axis for axis in disagreeing)
+    assert any("disposition" in axis for axis in disagreeing)
+
+
+def test_a_GENUINE_V3_RUN_QUALIFIES(db):
+    """Asserted against a REAL manifest this build wrote, not a hand-written dict — otherwise the
+    predicate could agree with a tuple nothing produces."""
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence
+
+    _run(db, run_id="far-qualifies", raw=_raw_v3(), requested=3)
+    stored = db.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-qualifies",)).fetchone()[0]
+
+    assert qualifies_as_v3_evidence(stored) == (True, ())
+
+
+def test_a_V2_RUN_DOES_NOT_QUALIFY(db):
+    from featuregen.formula.authoring_versions import qualifies_as_v3_evidence
+
+    _run(db, run_id="far-v2-nonqual", raw=_raw(), requested=2)
+    stored = db.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-v2-nonqual",)).fetchone()[0]
+
+    ok, disagreeing = qualifies_as_v3_evidence(stored)
+    assert ok is False
+    assert any("formula_schema" in axis for axis in disagreeing)
+
+
+def test_a_MISLABELLED_RUN_IS_FINDABLE_by_the_cleanup_query(db):
+    """The development-data cleanup needs to IDENTIFY the mislabelled drafts before anything is
+    reset. This is that query, run against a mislabelled row built the way an import arrives.
+
+    It reads the manifest and the stored proposal SEPARATELY and compares them, because that is the
+    disagreement — a query keyed on the manifest alone would return every V3 draft, and one keyed on
+    the proposal alone would return every V2 draft.
+    """
+    real = _run(db, run_id="far-clean-src", raw=_raw(), requested=2)
+    assert real.authoring_disposition == "RESOLVED"
+    _relabelled(db, source_run="far-clean-src", run_id="far-clean-bad", declared_schema=3)
+
+    mismatched = db.execute(
+        "SELECT r.authoring_run_id, r.versions->>'formula_schema' AS declared, "
+        "       e.payload->'result'->'candidate_proposal'->>'formula_schema_version' AS produced "
+        "  FROM formula_authoring_run r "
+        "  JOIN formula_authoring_trace_event e ON e.authoring_run_id = r.authoring_run_id "
+        " WHERE e.kind = 'completed' "
+        "   AND e.payload->'result'->'candidate_proposal' IS NOT NULL "
+        "   AND r.versions->>'formula_schema' IS DISTINCT FROM "
+        "       (e.payload->'result'->'candidate_proposal'->>'formula_schema_version')"
+    ).fetchall()
+
+    found = {row[0] for row in mismatched}
+    assert "far-clean-bad" in found, "the mislabelled run must be findable"
+    assert "far-clean-src" not in found, "a consistent run must not be swept up"
