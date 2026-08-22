@@ -112,6 +112,10 @@ _NEXT: Mapping[DraftStateV1, frozenset[DraftStateV1]] = {
 #: reachable from ADMISSION alone, so a READY draft whose trace records no critic stays impossible.
 _FROM_ANYWHERE = frozenset({DraftStateV1.BLOCKED, DraftStateV1.FAILED, DraftStateV1.CANCELLED})
 
+#: ▲ States that are NOT an answer to "has this already been bought?". `BLOCKED` is deliberately
+#: absent: a business refusal IS an answer about the candidate, and re-buying cannot change it.
+_NOT_AN_ANSWER = frozenset({DraftStateV1.FAILED, DraftStateV1.CANCELLED})
+
 
 class InvalidTransition(ValueError):
     """A state move the machine does not permit.
@@ -138,6 +142,16 @@ class RetirementDisagreement(RuntimeError):
     Distinct from idempotency, which is the same act repeated and is silently fine. This is two
     operators deciding differently about one draft, and `ON CONFLICT DO NOTHING` reported it as
     success — so the second decision vanished and whoever made it believed it had taken effect.
+    """
+
+
+class DraftNotAnAnswer(FormulaControlFlow):
+    """The existing draft for this identity records a FAILURE, not a formula.
+
+    ▲ A `FormulaControlFlow`, for the same reason `DraftRetired` is one: the worker's bounded poison
+    guard catches bare `Exception` and would fold this into `TECHNICAL_FAILURE`, filing a considered
+    refusal as a platform fault. Distinct from `DraftRetired` because the remedies differ — a
+    retirement is somebody's decision to withdraw, a failure is the platform's to explain.
     """
 
 
@@ -315,6 +329,9 @@ def request_draft(
     definition_revision: str,
     requested_by: str,
     requested_at: str,
+    provider_contract_hash: str | None = None,
+    strategy_identity_hash: str | None = None,
+    now=None,
 ) -> tuple[str, bool]:
     """Create the draft request, or return the EXISTING one for this identity.
 
@@ -324,13 +341,89 @@ def request_draft(
     for this candidate?") has the same answer.
 
     A short transaction by construction: one INSERT, no provider call anywhere near it.
+
+    ▲ **RETIREMENT IS CHECKED BEFORE THE INSERT, UNDER THE SCOPE LOCK — and that is the whole fix.**
+    It used to be consulted only when the INSERT *lost* the unique-index race, so a won INSERT was
+    silent permission to spend and every correction to the identity hash moved retirement with it.
+    Now the tombstone is loaded first, on a key the authoring configuration cannot move, and the
+    caller enqueues nothing when it refuses.
+
+    ▲ **AND THE EXCEPTION IS LOADED BEFORE THE DECISION, not after it.** An earlier ordering refused
+    on the tombstone before any exception was read, so an override could never be evaluated — the
+    column existed with no reachable code path. `provider_contract_hash` and
+    `strategy_identity_hash` are what an exception BINDS, so without them no exception can be
+    honoured and a tombstone always refuses. **That is fail-closed by construction**, and it is
+    temporary: the facts arrive with the strategy contract.
+
+    Raises:
+        DraftRetired: a tombstone covers this request and no valid exception authorises it.
+        DraftNotAnAnswer: the existing draft for this identity is FAILED or CANCELLED, so returning
+            it would report a bought answer that was never bought.
     """
+    from featuregen.overlay.upload.retirement_scope import (
+        consume_exception,
+        retirement_scope_key,
+        scope_locked,
+        tombstone_covering,
+        valid_exception_for,
+    )
+
     identity = formula_identity(
         considered_revision_id=considered_revision_id, option_id=option_id,
         planning_request_hash=planning_request_hash,
         catalog_snapshot_hash=catalog_snapshot_hash,
         authoring_config_hash=authoring_config_hash,
         definition_revision=definition_revision)
+    scope_key = retirement_scope_key(
+        considered_revision_id=considered_revision_id, option_id=option_id,
+        planning_request_hash=planning_request_hash,
+        catalog_snapshot_hash=catalog_snapshot_hash,
+        definition_revision=definition_revision)
+
+    with scope_locked(conn, scope_key):
+        return _request_draft_locked(
+            conn, identity=identity, scope_key=scope_key,
+            formula_draft_id=formula_draft_id,
+            considered_revision_id=considered_revision_id, option_id=option_id,
+            planning_request_hash=planning_request_hash,
+            catalog_snapshot_hash=catalog_snapshot_hash,
+            authoring_config_hash=authoring_config_hash,
+            definition_revision=definition_revision,
+            requested_by=requested_by, requested_at=requested_at,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash, now=now,
+            consume_exception=consume_exception,
+            tombstone_covering=tombstone_covering,
+            valid_exception_for=valid_exception_for)
+
+
+def _request_draft_locked(
+    conn, *, identity: str, scope_key: str, formula_draft_id: str, considered_revision_id: str,
+    option_id: str, planning_request_hash: str, catalog_snapshot_hash: str,
+    authoring_config_hash: str, definition_revision: str, requested_by: str, requested_at: str,
+    provider_contract_hash, strategy_identity_hash, now,
+    consume_exception, tombstone_covering, valid_exception_for,
+) -> tuple[str, bool]:
+    """The request itself, with the retirement scope's lock already held."""
+    tombstone = tombstone_covering(
+        conn, scope_key=scope_key, formula_identity_hash=identity)
+    if tombstone is not None:
+        exception_id = None
+        if provider_contract_hash and strategy_identity_hash:
+            exception_id = valid_exception_for(
+                conn, target_formula_identity_hash=identity,
+                provider_contract_hash=provider_contract_hash,
+                strategy_identity_hash=strategy_identity_hash,
+                now=now or _now(conn))
+        # ▲ CONSUMED IN THIS TRANSACTION, alongside the INSERT it authorises. An exception checked
+        # and not consumed is a coupon that regenerates itself every time somebody clicks.
+        if exception_id is None or not consume_exception(conn, exception_id):
+            raise DraftRetired(
+                f"formula identity {identity} is withdrawn by tombstone "
+                f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason})"
+                f"{'' if tombstone.replacement_draft_id is None else f', replaced by {tombstone.replacement_draft_id}'}"
+                f". A new draft id does not change the identity — either use the replacement, or "
+                f"obtain an approved regeneration exception for this exact identity")
 
     inserted = conn.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
@@ -345,26 +438,51 @@ def request_draft(
         return inserted[0], True
 
     existing = conn.execute(
-        "SELECT d.formula_draft_id, r.reason, r.replacement_draft_id "
+        "SELECT d.formula_draft_id, d.state, r.reason, r.replacement_draft_id "
         "  FROM formula_draft d "
+        # 1096's rows are still read: they are the historical record, and until every one has a
+        # tombstone (a step-2 backfill, EMPTY on today's measurement) a request must keep seeing
+        # them. The tombstone check above is the new guard, not a replacement for this one.
         "  LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
         " WHERE d.formula_identity_hash = %s", (identity,)).fetchone()
-    # ▲ A RETIRED IDENTITY IS NOT A USABLE DRAFT. The identity is UNIQUE, so a new draft id alone
-    # does not defeat this conflict — the request lands on the retired row and, before this check,
-    # was reported as "an identical draft already exists" with `created=False`. Whoever asked would
-    # reasonably conclude they already had what they wanted.
-    #
-    # Raised rather than silently re-minted, because re-minting is not this function's decision:
-    # something IDENTITY-BEARING must change (the corrected authoring configuration, the catalog
-    # snapshot, the definition revision), and only the caller knows which. The refusal names the
-    # replacement when one exists, so the answer is usually "use that one".
-    if existing is not None and existing[1] is not None:
+    if existing is None:                                   # pragma: no cover — see below
+        # ▲ NOT REACHABLE, AND NOT ASSUMED. `ON CONFLICT DO NOTHING` returning nothing means the row
+        # exists, and `formula_draft` forbids DELETE — but `None` here would raise `TypeError` where
+        # a refusal belongs, and that difference shows up on a restored dump or a disabled trigger.
         raise DraftRetired(
-            f"formula identity {identity} belongs to retired draft {existing[0]} "
-            f"({existing[1]}){'' if existing[2] is None else f', replaced by {existing[2]}'}. "
+            f"formula identity {identity} conflicted with a draft that is not there: the identity "
+            f"index refused the insert and no row answers to it. Authoring against a store in that "
+            f"state would build from something nobody can read")
+
+    draft_id, state, retired_reason, replacement_id = existing
+    if retired_reason is not None:
+        raise DraftRetired(
+            f"formula identity {identity} belongs to retired draft {draft_id} "
+            f"({retired_reason})"
+            f"{'' if replacement_id is None else f', replaced by {replacement_id}'}. "
             f"A new draft id does not change the identity — something identity-bearing must "
             f"differ, or this request is asking for the very thing that was retired")
-    return existing[0], False
+
+    # ▲ A FAILED DRAFT IS NOT A BOUGHT ANSWER, and returning it as one is the wedge this raises on.
+    #
+    # `FAILED` and `CANCELLED` are TERMINAL — their transition sets are literally empty — so a
+    # candidate reaching one could never be authored again: this returned the dead draft with
+    # `created=False`, the route enqueued nothing because it enqueues only `if created`, and the
+    # only escape was moving an identity-bearing input, which `_authoring_config_hash` cannot do
+    # because it is a constant. All seven drafts on the live cluster are terminal, and two say in
+    # their own failure text that the fault was the platform's and "not a problem with the
+    # candidate".
+    #
+    # The money guard asks *"have we already BOUGHT this answer?"* — and a technical failure bought
+    # nothing. `READY` and `BLOCKED` ARE answers (one succeeded; one is a verdict about the
+    # candidate) and are returned unchanged, as is a live draft, which is the double-click answer.
+    if DraftStateV1(state) in _NOT_AN_ANSWER:
+        raise DraftNotAnAnswer(
+            f"formula identity {identity} belongs to draft {draft_id}, which is {state}. That is "
+            f"not an answer this platform bought — it is a failure it recorded — so returning it "
+            f"as an existing draft would report a purchase that never happened. Re-attempting "
+            f"needs an approved regeneration exception for this exact identity")
+    return draft_id, False
 
 
 def advance(

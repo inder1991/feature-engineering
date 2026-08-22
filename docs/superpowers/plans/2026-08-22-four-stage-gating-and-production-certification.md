@@ -2320,10 +2320,25 @@ request inserts the draft and queues provider work
 insufficient under snapshot isolation — the lock is well argued and keyed to the wrong noun.)*
 
 **Both the request path and the retirement path take the SAME transaction-scoped lock on the
-retirement scope key**, in a namespace distinct from the draft lock, **before either reads**. The
-transaction is part of the lock (`conn.transaction()`), for the reason `_draft_locked` already
-documents: on an autocommit connection the lock statement is its own transaction, and the lock is
-gone before the next statement runs.
+retirement scope key**, in a namespace distinct from the draft lock, **before either reads**.
+
+▲ **IMPLEMENTED — and the lock must NOT COMMIT ON THE CALLER'S BEHALF, which is subtler than
+`_draft_locked`'s version admits and cost a suite-wide leak to find.** `conn.transaction()` **nests
+as a savepoint when a transaction is already open, and opens a real one — committing on exit — when
+none is.** So wrapping unconditionally makes *"does this function commit your work?"* depend on
+whether the caller happened to execute a statement first. Wrapping `request_draft`'s INSERT that way
+committed drafts past the test teardown's rollback — and **the failure did not look like a leak**: it
+surfaced as impossible state transitions in later tests (`ADMISSION → AUTHORING`), which reads like a
+lifecycle bug rather than a transaction one.
+
+**So the block is opened only for an AUTOCOMMIT connection** — the one case with no scope to borrow.
+A transactional caller takes the lock inside its own transaction, where `pg_advisory_xact_lock`
+already releases exactly when that caller commits or rolls back, which is the behaviour wanted.
+
+▲ **The same hazard is latent in `_draft_locked`** (`formula_draft_store.py:227`), whose docstring
+says it *"opens and commits its own"* for a connection with none. For `advance` that was deliberate —
+the runbook's operator connection wants durability — so it is left alone, and recorded here because
+the next person to copy that pattern into a path that INSERTS will reproduce the leak.
 
 ###### ▲ Retirement SCOPE is a governance decision, not a migration — P0-4, second half
 
@@ -2484,6 +2499,14 @@ add a mutable counter to an append-only table: **bind the re-attempt to the spen
 `max_uses` / `uses_consumed`** (§11.2), which already enforces one-time consumption in the same
 transaction as the work it authorizes. The bound then comes from the thing that also bounds the
 money, which is the same question asked once.
+
+▲ **IMPLEMENTED 2026-08-23, in part.** `request_draft` now raises `DraftNotAnAnswer` — a
+`FormulaControlFlow`, so the worker's bounded poison guard cannot fold a considered refusal into
+`TECHNICAL_FAILURE` — for `FAILED` and `CANCELLED`, instead of returning a dead draft as an existing
+one. `BLOCKED` and `READY` are returned unchanged, because both ARE answers. **The bounded
+re-attempt itself waits on 1105**: it binds to the spend authorization's `max_uses`, since
+`formula_draft` has no attempts column and adding a mutable counter to an append-only table would be
+the wrong fix (C7).
 
 ▲ **And `formula_draft_worker`'s retryable set is too narrow.** Only `LeaseFenceLost` and
 `RecoveryRequiresReconciliation` are treated as transient (`:199`); the bare `except Exception` at
@@ -2967,7 +2990,7 @@ still follow step order.**
 | 1100b | **parent §0.1.2 / §0.3** | ▲ **the CONTRACT half, deferred**: typed per-action child tables · 1095's chain re-pointed · the one legacy row copied to `legacy_generation_authorization` **marked orphaned** · `generation_authorization` dropped **in a proven constraint order**. Runs once all six acts have callers on 1100 | 2 |
 | 1101 | **parent §11.0 / §11.0.1** | ▲ **DONE** — `selection_formula_binding` with composite FKs into BOTH parents (including `formula_content_hash`, and the selection's `planning_request_hash` + `binding_plan_hash`), the parent unique indexes, the append-only guard, and `build_set_member.selection_formula_binding_id` **NOT NULL** under `build_set_member_formula_pinned_v1` — keyed on `(binding_id, selection_revision_id)` so the member's own selection cannot disagree with its pin | 2 |
 | 1102 | **parent §10** | `sealed_artifact_member_method_identity` (append-only, same guard as 1099) | 2 |
-| 1103 | **parent §11.1.1** | `formula_draft_authoring_identity` + `formula_draft_retirement_tombstone` (**with `scope`**) + `formula_draft_regeneration_exception` | 2 |
+| 1103 | **parent §11.1.1** | ▲ **DONE** — `formula_draft_authoring_identity` (composite FK to `formula_draft (formula_draft_id, authoring_config_hash)`, so a V2 companion cannot attach to a draft it does not describe) + `formula_draft_retirement_tombstone` keyed on `tombstone_id`, with `scope` and a `(scope, coverage_identity_hash)` unique key + `formula_draft_regeneration_exception` binding the exact target identity, provider contract, strategy, actor, expiry and one-time consumption. Plus `overlay/upload/retirement_scope.py` and the corrected order in `request_draft` | 2 |
 | 1104 | **child §3.3 / parent §0.1.4** | ▲ `formula_draft_authoring_plan` — **MOVED from step 4 to step 2** (P0-2) + ▲ **`authoring_subject_revision`**, the subject `AUTHOR_FORMULA` actually authorizes (R8) | **2** |
 | 1105 | **parent §11.2** | ▲ `llm_spend_authorization_revision` (immutable) + ▲ **`llm_spend_reservation` and `llm_spend_settlement`** (R11) | 2 |
 | 1106 | **parent §7.1 / §0.1.2** | ▲ `action_decision_revision` + ▲ **the NOT NULL `action_decision_revision_id` columns and composite FKs on every request/attempt table** (R6) | 3 |
