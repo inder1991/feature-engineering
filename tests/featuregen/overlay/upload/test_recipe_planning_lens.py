@@ -287,6 +287,16 @@ def test_the_dataset_story_names_an_explicit_population_from_the_declared_grain(
     assert story.cross_dataset is False
     assert R.POPULATION_DATASET_UNDECLARED not in story.codes
 
+    # ▲ AND THE GRAIN COLUMN, WHICH THIS FOLD USED TO DISCARD. `population_ref` answers "whose
+    # rows?"; authoring needs "keyed by WHICH column?" — `formula_draft_worker._frozen_facts`
+    # refuses a draft at REQUESTED, before any provider call, when `grain_refs` is empty. The ref
+    # here is the one the governed binder actually selected, not a second lookup.
+    assert story.population_key_ref == "public.transactions.acct_ref"
+
+    # It must survive into the BINDING PLAN, which is what the serving projection reads (the
+    # projection holds no connection and can only carry what the plan established).
+    assert bound.binding_plan["grain_refs"] == [[SOURCE, "public.transactions.acct_ref"]]
+
 
 def test_an_undeclared_grain_makes_the_population_named_setup_work(db):
     """Same catalog, grain flag withheld: the entity key still BINDS (meaning matched), but the
@@ -560,47 +570,33 @@ def test_a_capitalized_uoa_matches_the_lowercase_grain():
     assert plan is None and refusals == (R.UOA_MISMATCH,)
 
 
-def test_the_STORY_KEEPS_THE_GRAIN_COLUMN_not_only_its_table():
-    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
+def test_the_GRAIN_REACHES_THE_PROJECTED_FEATURE_IDEA(db):
+    """▲ THE END OF THE CHAIN, on the real candidate rather than a hand-built one.
 
-    """▲ THE FACT THAT WAS BEING DROPPED ON THE FLOOR.
+    Two earlier tests here constructed a `DatasetStoryV1` themselves and asserted against their own
+    fixtures — they would have passed unchanged if production stopped assigning or projecting the
+    grain entirely, which is precisely the regression they were meant to catch. This drives the real
+    fold and the real projection and asserts on what authoring would actually receive.
 
-    The fold binds the population from the entity-key operand whose `is_grain` flag was DECLARED in
-    the upload — so at that exact moment it holds the grain COLUMN's ref. It kept `column.table` and
-    discarded the ref, and `population_ref` (a table) is not what authoring needs:
-    `formula_draft_worker._frozen_facts` refuses a draft at REQUESTED, before any provider call,
-    when `idea.grain_refs` is empty. Every governed-path candidate therefore carried no grain and
-    could never be authored.
-
-    Keeping both halves costs nothing and queries nothing — which matters, because this lens forbids
-    reloading `graph_node` and holds a fixed query budget. An earlier attempt at this resolved the
-    column with a fresh per-recipe query and the lens's own tests refused it immediately.
+    `FeatureIdea.grain_refs` is the field `_frozen_facts` reads. Empty here means no formula is ever
+    authored for this candidate, whatever its origin.
     """
-    story = DatasetStoryV1(
-        population_ref="public.customers", population_basis="declared_grain",
-        dataset_tables=("public.customers",), cross_dataset=False, codes=(),
-        population_key_ref="bank::public.customers.cust_id")
+    from featuregen.overlay.upload.semantic_projection import _served_idea
+    from featuregen.overlay.upload.typed_gauntlet import validate_candidate
 
-    assert story.population_ref == "public.customers", "whose rows"
-    assert story.population_key_ref == "bank::public.customers.cust_id", "keyed by which column"
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE,
+        scope=ConfirmedScope(primary=EXEMPLAR.primary_objective))
+    bound = next(c for c in candidates
+                 if c.recipe_id == EXEMPLAR.recipe_id and c.binding_state == "bound")
 
+    idea = _served_idea(
+        type("A", (), {"candidate": bound})(), validate_candidate(bound),
+        catalog_source=SOURCE)
 
-def test_the_PLAN_CARRIES_THE_GRAIN_REF_so_the_projection_can_hand_it_to_authoring():
-    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
-
-    """The serving projection takes no connection, so it cannot resolve a grain itself — it can only
-    carry what the plan already established. This is the join between the two."""
-    story = DatasetStoryV1(
-        population_ref="public.customers", population_basis="declared_grain",
-        dataset_tables=("public.customers",), cross_dataset=False, codes=(),
-        population_key_ref="bank::public.customers.cust_id")
-
-    assert ([["bank", story.population_key_ref]] if story.population_key_ref else []) == [
-        ["bank", "bank::public.customers.cust_id"]]
-
-    # And an undeclared population yields NO grain rather than a guessed one — authoring against a
-    # guessed grain produces a formula for a feature nobody asked for.
-    undeclared = DatasetStoryV1(
-        population_ref=None, population_basis="undeclared", dataset_tables=(),
-        cross_dataset=False, codes=())
-    assert undeclared.population_key_ref is None
+    assert idea.grain_refs == ((SOURCE, "public.transactions.acct_ref"),), (
+        "the projected idea carries no grain, so the draft worker would refuse this candidate at "
+        "REQUESTED with GRAIN_NOT_RESOLVED before any provider call")
+    # The table half must still be there too — they answer different questions.
+    assert idea.grain_table == "transactions"
