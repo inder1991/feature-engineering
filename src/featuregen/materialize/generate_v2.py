@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.artifact_manifest import manifest_for
 from featuregen.materialize.artifact_store import content_reference_for
+from featuregen.materialize.authoring_provenance import MemberAuthoringInputV1
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.evaluate_generate import evaluate_generate
 from featuregen.materialize.group_plan_v2 import record_group_plan
@@ -84,6 +85,7 @@ def generate_v2(
     artifact_id: str,
     occurrences_by_member: Mapping[str, object],
     realizations: Sequence[RealizationLinkV1],
+    member_provenance: Sequence[MemberAuthoringInputV1],
     compiled_at: str,
     sealed_at: str,
     activation_blockers: Sequence[str] = (),
@@ -98,14 +100,23 @@ def generate_v2(
             per member and not defaulted: `evaluate_generate` refuses a generation whose policy
             references cannot be resolved, and a member with no entry would be gated against an
             empty set — which passes.
+        member_provenance: what the caller knows about how each published column was authored —
+            the selection, the draft, the authoring run and the formula hash. Passed straight to
+            `seal_v2`, which DERIVES the method from the run's evidence and refuses a member it
+            cannot establish. Required for the same reason `occurrences_by_member` is: a member
+            omitted here would be sealed with no provenance row, which a production gate reads as
+            "nothing to check".
 
     Returns:
         :class:`GeneratedArtifactV2`.
 
     Raises:
         GenerationRefused: the gate refused for at least one member. Nothing was written.
-        ValueError: a member has no occurrences entry, or the arguments disagree with the
-            compilation.
+        MemberProvenanceRefused: a member's authoring method could not be established. No artifact,
+            no bytes and no provenance row were written — the group plan recorded at step 2 stays,
+            as it does for every other failure past that point, and is content-addressed.
+        ValueError: a member has no occurrences entry, `member_provenance` does not describe exactly
+            the published columns, or the arguments disagree with the compilation.
     """
     members = sorted(compiled.graphs)
     missing = [name for name in members if name not in occurrences_by_member]
@@ -165,6 +176,11 @@ def generate_v2(
         # two spellings of one digest is how a lock and a row come to disagree.
         project_digest=f"sha256:{project.identity.generated_project_hash}",
         realizations=realizations,
+        # PASSED THROUGH, never assembled here. This function knows the graphs and the bytes; it
+        # does not know which selection a person made or which run authored which member, and a
+        # function that derived those from what it has would be reconstructing provenance from the
+        # artifact instead of recording it from the act.
+        member_provenance=member_provenance,
         sealed_at=sealed_at,
         generation_authorization_revision_id=generation_authorization_revision_id)
 

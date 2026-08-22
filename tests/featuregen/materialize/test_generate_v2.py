@@ -94,6 +94,8 @@ def _compiled(catalog, spine) -> CompiledGenerationV2:
 
 
 def _generate(catalog, compiled, *, occurrences=None, engine_id="kedro-pyspark", **kwargs):
+    from tests.featuregen.materialize.provenance_fixtures import evidenced_members
+
     return generate_v2(
         catalog, compiled,
         environment_id=ENV,
@@ -105,7 +107,13 @@ def _generate(catalog, compiled, *, occurrences=None, engine_id="kedro-pyspark",
         occurrences_by_member=(occurrences if occurrences is not None
                                else {name: PolicyOccurrenceSetV1(())
                                      for name in compiled.graphs}),
-        realizations=(), compiled_at="t", sealed_at="t", **kwargs)
+        realizations=(),
+        # ONE PROVENANCE INPUT PER PUBLISHED COLUMN, each naming a run that really left evidence.
+        # `seal_v2` derives the method from that evidence, so a hand-built record is refused.
+        member_provenance=kwargs.pop(
+            "member_provenance",
+            evidenced_members(catalog, *sorted(compiled.graphs), run_prefix="far-gen")),
+        compiled_at="t", sealed_at="t", **kwargs)
 
 
 # ══ THE GATE RUNS FIRST, AND NOTHING IS RECORDED BEHIND IT ═════════════════════════════════════

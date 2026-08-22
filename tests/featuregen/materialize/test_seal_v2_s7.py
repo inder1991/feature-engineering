@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen.materialize.provenance_fixtures import evidenced_members
 from tests.featuregen.materialize.test_subgraph_requirements_v2 import RATES, _fx_chain, _scan
 
 from featuregen.materialize.artifact_manifest import ManifestIntegrityError, manifest_for
@@ -77,13 +78,22 @@ def _manifest(artifact_id: str = "art-1", files=None):
                             (files or FILES)[path]))
 
 
-def _seal(db, *, graph=None, artifact_id: str = "art-1", files=None, links=LINKS):
+def _seal(db, *, graph=None, artifact_id: str = "art-1", files=None, links=LINKS,
+          columns=("f",)):
+    """Seal, with REAL authoring provenance for every column the graph publishes.
+
+    `evidenced_members` drives a genuine deterministic reviewed-blueprint run per column, because
+    `seal_v2` derives the method from a run's own evidence and refuses a run that establishes none.
+    A hand-built record would be refused here, which is the design working.
+    """
     payload = files or FILES
     return seal_v2(
         db, graph if graph is not None else _fx_chain(), _manifest(artifact_id, payload), payload,
         environment_id=ENV, logical_group_name=GROUP,
         compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
-        project_digest="sha256:project", realizations=links, sealed_at="2026-08-17T00:00:00Z",
+        project_digest="sha256:project", realizations=links,
+        member_provenance=evidenced_members(db, *columns, run_prefix=f"far-{artifact_id}"),
+        sealed_at="2026-08-17T00:00:00Z",
         generation_authorization_revision_id=_authorization(db))
 
 
@@ -168,7 +178,8 @@ def test_a_gate_ON_A_BRANCH_THAT_NEVER_SEES_THE_JOIN_refuses_too(db):
     graph = OperatorGraphV2(nodes=(*rest, stray, assembled))
 
     assert OperatorKindV2.DUPLICATE_RATE_GATE in graph.kinds, "the gate really is present"
-    sealed = _seal(db, graph=graph)
+    # TWO published columns, so TWO provenance rows: the assembly above publishes `f` and `g`.
+    sealed = _seal(db, graph=graph, columns=("f", "g"))
     assert sealed.servable is False
     # The links are kept here too — the refusal is about position, not about the policies.
     assert realization_links_of(db, "art-1")
@@ -253,7 +264,8 @@ def test_the_manifest_is_verified_BEFORE_anything_is_written(db):
                 {**FILES, "src/pipeline.py": "different bytes entirely"},
                 environment_id=ENV, logical_group_name=GROUP,
                 compilation_identity_hash="sha256:c", group_plan_hash="sha256:p",
-                project_digest="sha256:d", realizations=LINKS, sealed_at="t",
+                project_digest="sha256:d", realizations=LINKS,
+                member_provenance=evidenced_members(db, "f"), sealed_at="t",
                 generation_authorization_revision_id=_authorization(db))
     assert db.execute(
         "SELECT count(*) FROM sealed_artifact_v2").fetchone()[0] == 0
@@ -332,7 +344,8 @@ def test_a_sealed_artifact_must_name_its_ENVIRONMENT(db):
         seal_v2(db, _fx_chain(), _manifest(), FILES, environment_id="  ",
                 logical_group_name=GROUP, compilation_identity_hash="sha256:c",
                 group_plan_hash="sha256:p", project_digest="sha256:d", realizations=LINKS,
-                sealed_at="t", generation_authorization_revision_id=_authorization(db))
+                member_provenance=(), sealed_at="t",
+                generation_authorization_revision_id=_authorization(db))
 
 
 def test_a_realization_link_with_a_BLANK_HALF_is_refused(db):
@@ -455,11 +468,18 @@ def test_a_SINGLE_GRAPH_IS_STILL_A_ONE_MEMBER_GROUP(db):
     assert sealed.servable is True
 
 
-def _seal_many(db, graphs, *, artifact_id: str = "art-many"):
+def _seal_many(db, graphs, *, artifact_id: str = "art-many", columns=None):
     payload = FILES
+    if columns is None:
+        # Derived from the graphs rather than restated, so a test that changes what a member
+        # publishes does not silently seal provenance for a column nobody publishes.
+        columns = sorted({name for graph in graphs
+                          for name in graph.terminal.payload.column_names})
     return seal_v2(
         db, graphs, _manifest(artifact_id, payload), payload,
         environment_id=ENV, logical_group_name=GROUP,
         compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
-        project_digest="sha256:project", realizations=LINKS, sealed_at="2026-08-20T00:00:00Z",
+        project_digest="sha256:project", realizations=LINKS,
+        member_provenance=evidenced_members(db, *columns, run_prefix=f"far-{artifact_id}"),
+        sealed_at="2026-08-20T00:00:00Z",
         generation_authorization_revision_id=_authorization(db))

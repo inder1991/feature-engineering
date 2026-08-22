@@ -141,6 +141,8 @@ def generated(catalog, spine):
     compiled = _run(catalog, spine, [_admitted_v2()])
     assert isinstance(compiled, CompiledGenerationV2), compiled
 
+    from tests.featuregen.materialize.provenance_fixtures import evidenced_members
+
     spine_input = derive_requirement(catalog, INVENTORY, table_ref=CUSTOMERS)
     return generate_v2(
         catalog, compiled,
@@ -152,7 +154,14 @@ def generated(catalog, spine):
         nodes=_production_nodes(compiled, spine_input),
         artifact_id="art-e2e",
         occurrences_by_member={name: PolicyOccurrenceSetV1(()) for name in compiled.graphs},
-        realizations=(), compiled_at="t", sealed_at="2026-08-20T00:00:00Z")
+        realizations=(),
+        # HOW THE MEMBER WAS AUTHORED, from a run that really left evidence. This chain starts from
+        # a HAND-BUILT admitted proposal (that is the gap `test_production_chain_v2` closes), so the
+        # run named here is a real deterministic reviewed-blueprint run rather than the one that
+        # produced this proposal — there is no such run in this file to name.
+        member_provenance=evidenced_members(
+            catalog, *sorted(compiled.graphs), run_prefix="far-e2e"),
+        compiled_at="t", sealed_at="2026-08-20T00:00:00Z")
 
 
 # ══ THE CHAIN CLOSES, AND THE ARTIFACT IS DURABLE ══════════════════════════════════════════════

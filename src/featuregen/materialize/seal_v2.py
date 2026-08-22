@@ -20,6 +20,15 @@ store returned something else, at execution the bytes changed after they were fe
 through :func:`serve_artifact`, which re-derives every digest, so a mismatched digest is neither
 served nor executed rather than being caught by whoever remembered to check.
 
+**HOW EACH MEMBER WAS AUTHORED IS DECIDED HERE, because it disappears everywhere else.** The sealed
+row records formula and IR hashes, the plan, the environment and the authorization — and nothing
+about the authoring RUN or METHOD, so a production gate choosing between a platform gold evaluation
+and a deterministic compiler certification would have no basis to choose from. :func:`seal_v2`
+therefore takes one :class:`~featuregen.materialize.authoring_provenance.MemberAuthoringInputV1` per
+published column and DERIVES each method from that run's own evidence (1099). It is not
+reconstructible afterwards: "the latest draft for this selection" is a different question, and by
+then another draft may describe a formula this artifact does not contain.
+
 **Surviving a worker restart is a property of the store, not of a process.** A restarted worker holds
 an artifact id and a database and nothing else, so :func:`load_sealed_artifact` and
 :func:`load_manifest` exist: the sealed record, its verdict, its realization links and the manifest
@@ -43,6 +52,12 @@ from featuregen.materialize.artifact_manifest import (
     verify_bytes,
 )
 from featuregen.materialize.artifact_store import fetch_file, store_manifest
+from featuregen.materialize.authoring_provenance import (
+    MemberAuthoringInputV1,
+    MemberProvenanceRefused,
+    derive_member_provenance,
+    record_member_provenance,
+)
 from featuregen.materialize.operator_graph_v2 import OperatorGraphV2, OperatorKindV2
 from featuregen.materialize.subgraph_requirements_v2 import (
     PILOT_REQUIREMENTS,
@@ -55,6 +70,8 @@ from featuregen.materialize.subgraph_requirements_v2 import (
 __all__ = [
     "SealedArtifactConflict",
     "ArtifactNotServable",
+    "MemberAuthoringInputV1",
+    "MemberProvenanceRefused",
     "RealizationLinkV1",
     "SealedArtifactV2",
     "load_manifest",
@@ -119,6 +136,7 @@ def seal_v2(
     group_plan_hash: str,
     project_digest: str,
     realizations: Sequence[RealizationLinkV1],
+    member_provenance: Sequence[MemberAuthoringInputV1],
     sealed_at: str,
     generation_authorization_revision_id: str,
     requirements: tuple[SubgraphRequirementV2, ...] = PILOT_REQUIREMENTS,
@@ -149,12 +167,29 @@ def seal_v2(
     verifies every entry against its bytes BEFORE writing — the one point where a renderer
     disagreeing with itself is still recoverable.
 
+    **▲ ONE AUTHORING-PROVENANCE ROW PER PUBLISHED COLUMN, AND THE METHOD IS DERIVED HERE.**
+    ``member_provenance`` is REQUIRED and must name exactly the columns the graphs publish. It is
+    not defaulted and there is no empty case: an artifact sealed without it publishes numbers whose
+    authoring method nobody can name, and the production gate reads a missing row as "nothing to
+    check" — a pass by omission. What the caller supplies are FACTS it holds (which selection, which
+    draft, which run, which formula bytes); the METHOD is derived from the run's own evidence by
+    :func:`~featuregen.materialize.authoring_provenance.derive_member_provenance`, so a caller has
+    no way to assert one. The derivation runs BEFORE the manifest is stored, so a member whose
+    method cannot be established leaves no bytes, no artifact row and no provenance row behind.
+
+    Args:
+        member_provenance: one record per published column — the selection a person made, the draft
+            and run that answered it, and the formula hash this artifact carries. See above.
+
     Raises:
         ManifestIntegrityError: a manifest entry and its bytes disagree, or a file the manifest
             names was not supplied.
+        MemberProvenanceRefused: a member's authoring method cannot be established from its run's
+            evidence, or a supplied record is blank where it must not be. Nothing is written.
         ValueError: no environment, a realization link with a blank half, no graphs at all, a graph
-            whose terminal does not publish exactly one column, or two graphs publishing the same
-            one. All are calls assembled wrongly rather than governed verdicts.
+            whose terminal does not publish exactly one column, two graphs publishing the same one,
+            or a ``member_provenance`` that does not describe exactly the published columns. All are
+            calls assembled wrongly rather than governed verdicts.
     """
     if not environment_id.strip():
         raise ValueError(
@@ -169,6 +204,13 @@ def seal_v2(
                 f"realization and the occurrence it answered is one nobody can follow back")
 
     members = _members_of(graphs)
+
+    # ▲ PROVENANCE IS DECIDED BEFORE ANYTHING IS WRITTEN, for the reason the manifest check is:
+    # this is the last point at which a member whose authoring method cannot be established can be
+    # refused without leaving an artifact behind. `derive_member_provenance` only reads.
+    _require_provenance_covers(members, member_provenance)
+    derived = derive_member_provenance(conn, member_provenance)
+
     verdict, by_member = _fold_requirements(members, requirements)
 
     # Bytes first: a manifest that does not match its files must not leave a sealed row behind.
@@ -200,6 +242,11 @@ def seal_v2(
         compilation_identity_hash=compilation_identity_hash, group_plan_hash=group_plan_hash,
         project_digest=project_digest,
         generation_authorization_revision_id=generation_authorization_revision_id)
+
+    # HOW EACH MEMBER WAS AUTHORED — written on BOTH paths, for the realization links' reason. A
+    # refused artifact was still authored somehow, and an operator asking "where did this formula
+    # come from" about a build that failed is asking the same question as about one that passed.
+    record_member_provenance(conn, manifest.artifact_id, derived)
 
     # RECORDED ON BOTH PATHS. See the module docstring: the acceptance clause is that a refusal
     # keeps these, and a refused compilation depended on exactly the policies it depended on.
@@ -310,6 +357,37 @@ def _members_of(
             f"two member graphs publish {duplicated}: one column cannot be computed two ways in one "
             f"group, and a verdict keyed on the columns could not say which graph it judged")
     return tuple(sorted(members, key=lambda member: member[0]))
+
+
+def _require_provenance_covers(
+    members: tuple[tuple[str, OperatorGraphV2], ...],
+    member_provenance: Sequence[MemberAuthoringInputV1],
+) -> None:
+    """EXACTLY the published columns — no gap, no stranger.
+
+    The set is the columns the terminal assemblies PUBLISH, not the member labels. A group may be
+    sealed as one graph assembling several columns or as one graph per column (``_members_of``
+    accepts both), and provenance is per PUBLISHED FEATURE either way — the migration's key is the
+    feature name, because that is what a production gate is asked about.
+
+    A GAP is refused because a published column with no provenance row is indistinguishable, later,
+    from an artifact whose provenance was never written: both read as "nothing to check". A
+    STRANGER is refused because a row filed under a name this artifact does not publish describes
+    nothing, and would answer a gate asking about a column that is not here.
+    """
+    published: set[str] = set()
+    for _label, graph in members:
+        published.update(graph.terminal.payload.column_names)
+
+    supplied = [member.member_name for member in member_provenance]
+    missing = sorted(published - set(supplied))
+    unexpected = sorted(set(supplied) - published)
+    if missing or unexpected:
+        raise ValueError(
+            f"member_provenance must describe exactly the columns this artifact publishes: missing "
+            f"{missing}, unexpected {unexpected}. A published column with no provenance row reads "
+            f"later as 'nothing to check', and a row for a column nobody publishes answers a "
+            f"question about a feature this artifact does not contain")
 
 
 def _fold_requirements(

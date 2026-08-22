@@ -329,6 +329,7 @@ def test_a_SWEPT_output_cannot_be_published(db):
 
 # ══ fixtures ═══════════════════════════════════════════════════════════════════════════════════
 def _seal(db, *, servable: bool = True):
+    from tests.featuregen.materialize.provenance_fixtures import evidenced_members
     from tests.featuregen.materialize.test_subgraph_requirements_v2 import _fx_chain
 
     from featuregen.materialize.artifact_manifest import manifest_for
@@ -344,6 +345,9 @@ def _seal(db, *, servable: bool = True):
         compilation_identity_hash="sha256:c", group_plan_hash="sha256:p",
         project_digest="sha256:d",
         realizations=(RealizationLinkV1(revision_id="rev-1", occurrence_hash="occ-1"),),
+        # Sealing now records HOW each published column was authored, derived from a real run's
+        # evidence. `_fx_chain` publishes one column, `f`.
+        member_provenance=evidenced_members(db, "f", run_prefix="far-s11"),
         sealed_at="2026-08-17T00:00:00Z",
         generation_authorization_revision_id=_seal_approval(db))
 

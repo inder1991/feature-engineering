@@ -195,6 +195,42 @@ def _ready_draft(conn, monkeypatch, *, raw=None, findings=(), facts=None,
     return draft_id
 
 
+def _bypass_draft(conn, *, draft_id="fd-pc", window: int = 30) -> str:
+    """A READY draft authored by a REVIEWED BLUEPRINT — deterministically, with real evidence.
+
+    ▲ **WHY THE SEAL-REACHING TESTS USE THIS AND NOT `_ready_draft`.** Sealing now derives HOW each
+    member was authored from the run's own durable evidence, and refuses a run that establishes
+    none. `_ready_draft` SCRIPTS the two provider stages (see `_author_run`), so its runs leave no
+    dispatch audit at all — the audit seam writes on its own connection under a durable DSN this
+    suite deliberately lacks. Those runs are therefore not sealable, which is the rule working and
+    is pinned by `test_a_run_WHOSE_AUTHORING_METHOD_CANNOT_BE_ESTABLISHED_seals_nothing`.
+
+    A reviewed blueprint is the one authoring method this suite CAN evidence honestly: no provider
+    is involved by construction, and the `REVIEW_BYPASSED` stage the real orchestrator writes is
+    exactly what the derivation reads. Nothing here inserts a trace row by hand.
+
+    The candidate, the selection and the intent are unchanged — only the formula's ORIGIN differs —
+    so everything below admission is the same chain `_ready_draft` drives.
+    """
+    from tests.featuregen.materialize.provenance_fixtures import (
+        proposal_hash_of,
+        reviewed_blueprint_run,
+    )
+
+    _considered(conn)
+    run_id = reviewed_blueprint_run(
+        conn, f"far-{draft_id}",
+        intent=_intent_of(conn, "crev-pc", "opt-a", "production-chain"), window=window)
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
+        "formula_identity_hash, state, authoring_run_id, formula_content_hash, formula_json, "
+        "requested_by, requested_at) VALUES (%s,'crev-pc','opt-a','h1','h2','h3','',%s,'READY',%s,"
+        "%s,'{\"body\":{}}'::jsonb,'user:ops','t')",
+        (draft_id, f"ident-{draft_id}", run_id, proposal_hash_of(conn, run_id)))
+    return draft_id
+
+
 def _requested(conn, *, request_id="req-pc") -> str:
     """A selection, a build set, an approval and a REQUESTED generation — what a person's click
     leaves behind."""
@@ -233,8 +269,13 @@ def _requested(conn, *, request_id="req-pc") -> str:
 
 @pytest.fixture
 def built(catalog, spine, monkeypatch):
-    """THE RUN: a drafted V3 formula driven to a sealed artifact by the real worker."""
-    _ready_draft(catalog, monkeypatch)
+    """THE RUN: a drafted V3 formula driven to a sealed artifact by the real worker.
+
+    The draft is BLUEPRINT-authored rather than provider-authored — see `_bypass_draft` for why
+    that is the only authoring method this suite can evidence honestly. Everything from the
+    selection down is identical: restore, admit, compile, gate, render, seal.
+    """
+    _bypass_draft(catalog)
     request_id = _requested(catalog)
     _advertise_this_build(catalog)
     return request_id, process_generation_once(catalog, owner="w1", inventory=INVENTORY)
@@ -288,6 +329,90 @@ def test_THE_STORED_CODE_IS_REAL_SPARK_for_this_group(built, catalog):
     texts = [row[0] for row in stored]
     assert any("def " in text for text in texts)
     assert any(GROUP in text for text in texts)
+
+
+# ══ HOW EACH SEALED MEMBER WAS AUTHORED ════════════════════════════════════════════════════════
+def test_THE_SEALED_ARTIFACT_RECORDS_HOW_ITS_MEMBER_WAS_AUTHORED(built, catalog):
+    """▲ The row a production gate chooses a certificate from, written by the act that sealed.
+
+    It carries the whole trail from the PERSON's side: the selection they made, the draft that
+    answered it, the run that authored it and the formula bytes this artifact contains. Reading it
+    back from the store rather than from the sealing call, because an answer that only exists in the
+    return value of the call that made it is not a record.
+    """
+    from featuregen.materialize.authoring_provenance import (
+        REVIEWED_RECIPE_BLUEPRINT,
+        member_provenance_of,
+    )
+
+    _request_id, outcome = built
+    assert outcome.status == "generated", outcome.detail
+
+    rows = member_provenance_of(catalog, outcome.artifact_id)
+    assert [row.member_name for row in rows] == [FEATURE]
+    row = rows[0]
+    assert row.selection_revision_id == "sel-pc"
+    assert row.formula_draft_id == "fd-pc"
+    assert row.authoring_run_id == "far-fd-pc"
+    assert row.authoring_method == REVIEWED_RECIPE_BLUEPRINT
+    assert len(row.authoring_evidence_hash) == 64
+    # The bytes THIS artifact carries — the draft's stored hash, which the restorer cross-checked
+    # against the trace. A provenance row naming some other formula would describe a feature the
+    # artifact does not contain.
+    assert row.formula_content_hash == catalog.execute(
+        "SELECT formula_content_hash FROM formula_draft WHERE formula_draft_id = 'fd-pc'"
+    ).fetchone()[0]
+
+
+def test_the_METHOD_IS_DERIVED_FROM_EVIDENCE_not_from_where_the_idea_came_from(built, catalog):
+    """▲ The distinction the production certificate turns on, pinned on the production path.
+
+    This member's candidate came from an `anchor` option a person picked — nothing about it says
+    "recipe". The method recorded is `REVIEWED_RECIPE_BLUEPRINT` because the RUN took the reviewed
+    bypass, and re-deriving from the run alone gives the same answer and the same evidence hash. A
+    method read off `generation_source` would answer a different question entirely.
+    """
+    from featuregen.materialize.authoring_provenance import (
+        derive_authoring_method,
+        member_provenance_of,
+    )
+
+    _request_id, outcome = built
+    stored = member_provenance_of(catalog, outcome.artifact_id)[0]
+    rederived = derive_authoring_method(catalog, stored.authoring_run_id)
+
+    assert rederived.authoring_method == stored.authoring_method
+    assert rederived.evidence_hash == stored.authoring_evidence_hash
+
+
+def test_a_run_WHOSE_AUTHORING_METHOD_CANNOT_BE_ESTABLISHED_seals_nothing(
+        catalog, spine, monkeypatch):
+    """▲ REFUSE RATHER THAN GUESS, on the production path.
+
+    `_ready_draft` scripts the two provider stages, so its run records no dispatch audit and no
+    reviewed bypass: nothing about it establishes how the formula was written. That is a build no
+    production certificate could be chosen for, so the request is REFUSED by name and NOTHING is
+    sealed — not a servable artifact, not a refused one, and no provenance row that a later reader
+    could mistake for a check that passed.
+
+    This is also what makes the sealing tests above meaningful: they pass because their runs left
+    real evidence, not because the requirement is toothless.
+    """
+    _ready_draft(catalog, monkeypatch)
+    request_id = _requested(catalog)
+    _advertise_this_build(catalog)
+
+    outcome = process_generation_once(catalog, owner="w1", inventory=INVENTORY)
+
+    assert outcome.status == "refused", outcome.detail
+    assert "AUTHORING_RUN_INCOMPLETE" in outcome.detail
+    assert "posted_amount_30d" in outcome.detail, "the refusal names the MEMBER, not only the run"
+    assert read_request(catalog, request_id).status is GenerationStatusV1.REFUSED
+    assert catalog.execute("SELECT count(*) FROM sealed_artifact_v2").fetchone()[0] == 0
+    assert catalog.execute(
+        "SELECT count(*) FROM sealed_artifact_member_provenance").fetchone()[0] == 0
+    assert catalog.execute(
+        "SELECT count(*) FROM generated_artifact_file").fetchone()[0] == 0
 
 
 # ══ THE GATE THIS FILE FOUND, AND ITS EDGES ═══════════════════════════════════════════════════
@@ -608,22 +733,21 @@ def test_a_DRAFT_THAT_NEVER_REACHED_READY_stops_the_build(catalog, monkeypatch):
 # ══ MUTATION ═══════════════════════════════════════════════════════════════════════════════════
 def test_A_DIFFERENT_FORMULA_SEALS_A_DIFFERENT_ARTIFACT(catalog, spine, monkeypatch):
     """Change what the feature COMPUTES and the sealed bytes change with it. An identity that
-    survived a changed aggregation would let a verified artifact stand in for one nobody verified.
+    survived a changed window would let a verified artifact stand in for one nobody verified.
     """
-    _ready_draft(catalog, monkeypatch)
+    _bypass_draft(catalog)
     _requested(catalog)
     _advertise_this_build(catalog)
     first = process_generation_once(catalog, owner="w1", inventory=INVENTORY)
     assert first.status == "generated", first.detail
     original = load_sealed_artifact(catalog, first.artifact_id)
 
-    # A SECOND build of the same group, from a formula that aggregates differently. Nothing is
+    # A SECOND build of the same group, from a formula computed over a DIFFERENT WINDOW. Nothing is
     # deleted — `formula_draft` is append-only and `generation_request` records every attempt — so
     # the second draft simply supersedes the first, which is how the restorer already reads them
     # (`ORDER BY d.updated_at DESC`), and the second request is a NEW attempt at the same set,
     # permitted because the first is terminal.
-    _ready_draft(catalog, monkeypatch, draft_id="fd-pc2",
-                 raw=_raw_v3(aggregation="count_rows", operand=None))
+    _bypass_draft(catalog, draft_id="fd-pc2", window=90)
     catalog.execute("UPDATE formula_draft SET updated_at = now() + interval '1 second' "
                     "WHERE formula_draft_id = 'fd-pc2'")
     second_id = _requested(catalog, request_id="req-pc2")

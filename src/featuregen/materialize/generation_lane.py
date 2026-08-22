@@ -55,8 +55,12 @@ import psycopg
 
 from featuregen.formula.output_authority_v2 import OperandFactsV2
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1
-from featuregen.materialize.admission_v2 import admit_artifacts_v2
-from featuregen.materialize.codes import MaterializationRefused
+from featuregen.materialize.admission_v2 import AdmittedFeatureV2, admit_artifacts_v2
+from featuregen.materialize.authoring_provenance import (
+    MemberAuthoringInputV1,
+    MemberProvenanceRefused,
+)
+from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.compile.chain import NodeAssemblyInputs
 from featuregen.materialize.compile.wiring import assemble_nodes
 from featuregen.materialize.generate_v2 import GenerationRefused, generate_v2
@@ -536,10 +540,19 @@ def _drive(
             occurrences_by_member=_occurrences(
                 compiled, admitted, environment_id=request.environment_id),
             realizations=(),
+            member_provenance=_member_provenance(restored, admitted),
             compiled_at=job.compiled_at,
             sealed_at=job.sealed_at)
     except GenerationRefused as refusal:
         return _refuse_gate(conn, claim, job, refusal)
+    except MemberProvenanceRefused as refusal:
+        # ▲ A GOVERNED REFUSAL, not a fault. A member whose authoring method cannot be established
+        # from its run's evidence is a build that cannot be certified, and a redelivery would reach
+        # the same answer from the same immutable trace — so the request terminalizes REFUSED with
+        # the reason rather than being retried until the attempt budget runs out. Nothing was
+        # sealed: `seal_v2` derives before it stores anything.
+        return _refuse(conn, claim, job, MaterializationRefused(
+            CompilationRefusalCode.AUTHORING_RUN_INCOMPLETE, str(refusal)))
 
     if complete_generation(conn, claim):
         _terminalize(conn, job.request_id, GenerationStatusV1.SUCCEEDED,
@@ -556,6 +569,51 @@ def _artifact_id(request_id: str) -> str:
     make "which attempt produced what is running" unanswerable.
     """
     return f"{_NAMESPACE}:{request_id}"
+
+
+def _member_provenance(
+    restored: Sequence[Any],
+    admitted: Sequence[AdmittedFeatureV2],
+) -> tuple[MemberAuthoringInputV1, ...]:
+    """What each member's provenance row is made of — from the two stages that own the halves.
+
+    ▲ **THIS IS THE ONLY PLACE BOTH HALVES EXIST.** `RestoredFormulaV3` knows which SELECTION a
+    person made and which DRAFT answered it; `AdmittedFeatureV2` knows the published feature name
+    and the formula hash its provenance PROOF verified against the immutable trace. Neither carries
+    the other's half, and admission deliberately drops the selection — so a stage below this one
+    could only recover it by asking "which draft is current for this selection now", which is a
+    different question with a possibly different answer.
+
+    ▲ **AND NOTHING HERE READS `generation_source`.** Where the IDEA came from — recipe, llm_intent,
+    user_defined — is not how the FORMULA was written: `formula_draft_worker` always drives the LLM
+    author and critic, so a recipe-origin feature is still LLM-authored. The method is not decided
+    here at all; `seal_v2` derives it from the run's own evidence.
+
+    Paired POSITIONALLY, because that is what the two stages guarantee: `restore_build_set_formulas`
+    preserves the build set's declared order and `admit_artifacts_v2` maps its inputs one for one,
+    in order. The run ids are compared anyway — a silent re-pairing would attach one member's
+    selection to another member's formula, and every row would still look well-formed.
+    """
+    provenance: list[MemberAuthoringInputV1] = []
+    for item, feature in zip(restored, admitted, strict=True):
+        restored_run = item.input.result.authoring_run_id
+        if restored_run != feature.authoring_run_id:
+            raise ValueError(
+                f"selection {item.selection_revision_id} restored authoring run {restored_run!r} "
+                f"and the admitted feature {feature.feature_name!r} names {feature.authoring_run_id!r}: "
+                f"the two stages have come out of step, and pairing them anyway would file one "
+                f"member's selection against another member's formula")
+        provenance.append(MemberAuthoringInputV1(
+            member_name=feature.feature_name,
+            selection_revision_id=item.selection_revision_id,
+            formula_draft_id=item.formula_draft_id,
+            authoring_run_id=feature.authoring_run_id,
+            # THE VERIFIED HASH, not the draft's stored one. Admission recomputed it from the
+            # proposal and proved it against the trace's immutable payload; the draft's copy is what
+            # a person was shown. `restore_formula` refuses when they disagree, so here they agree —
+            # and taking the proven one keeps that true if the restorer's check ever moves.
+            formula_content_hash=feature.proposal_content_hash))
+    return tuple(provenance)
 
 
 def _occurrences(

@@ -365,3 +365,40 @@ def test_a_REAL_PROVIDER_AUTHORED_RUN_DERIVES_AS_LLM_AUTHORED(db, monkeypatch, _
     assert got.evidence["author_dispatch_count"] > 0
     assert got.evidence["critic_dispatch_count"] > 0
     assert len(got.evidence_hash) == 64
+
+
+def test_a_MEMBERS_PROVENANCE_DERIVES_AS_LLM_AUTHORED_FROM_A_REAL_RUN(db, monkeypatch, _dsn):
+    """▲ THE OTHER AUTHORING METHOD A SEAL CAN RECORD, on real evidence.
+
+    `seal_v2` builds one provenance row per published column through `derive_member_provenance`,
+    and every sealing test in the ordinary suite evidences the REVIEWED_RECIPE_BLUEPRINT half —
+    that is the only half a rolled-back transaction can hold, because the dispatch audit writes on
+    its own connection. This is the LLM half: a genuinely provider-authored run, carried through
+    the member-provenance derivation the seal uses, landing on LLM_AUTHORED and naming its run.
+
+    Naming the run is not decoration. Migration 1099 REQUIRES it for an LLM_AUTHORED row — without
+    it the method cannot be re-derived — so a derivation that returned the method without the run
+    would produce a record the database refuses.
+    """
+    import psycopg
+
+    from featuregen.materialize.authoring_provenance import (
+        LLM_AUTHORED,
+        MemberAuthoringInputV1,
+        derive_member_provenance,
+    )
+
+    with durable_v3_run(_dsn, monkeypatch, raw=_raw_v3(), intent=_INTENT, allowed_refs=_REFS,
+                        facts_ref=REF_AMT) as (run_id, result):
+        member = MemberAuthoringInputV1(
+            member_name="posted_debit_amount_30d",
+            selection_revision_id="sel-durable",
+            authoring_run_id=run_id,
+            formula_content_hash=result.candidate_proposal_hash)
+        with psycopg.connect(_dsn) as check:
+            derived = derive_member_provenance(check, [member])
+
+    assert len(derived) == 1
+    assert derived[0].member.member_name == "posted_debit_amount_30d"
+    assert derived[0].provenance.authoring_method == LLM_AUTHORED
+    assert derived[0].provenance.authoring_run_id == run_id
