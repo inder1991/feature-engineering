@@ -157,14 +157,30 @@ def test_THE_WIDER_WITHDRAWAL_IS_REPORTED_when_both_cover_a_request(db):
 
 
 # ══ THE EXCEPTION MUST BIND ════════════════════════════════════════════════════════════════════
+def _spend(db, *, authorization_id="sa-1", contract="pc-1"):
+    """▲ An exception BINDS its money (1105), so one cannot be written without an authorization.
+    Regeneration is an approved, COST-CONFIRMED act — the constraint is what makes that true rather
+    than intended."""
+    db.execute(
+        "INSERT INTO llm_spend_authorization_revision (spend_authorization_id, action, "
+        "actor_subject, job_identity, member_identities, provider_contract_hash, max_calls, "
+        "max_tokens, currency, max_cost, pricing_version, idempotency_identity, expires_at) "
+        "VALUES (%s, 'AUTHOR_FORMULA', 'user:ops', 'job-1', '[]'::jsonb, %s, 4, 100000, 'USD', "
+        "5.00, 'price-v1', %s, '2099-01-01T00:00:00Z') ON CONFLICT DO NOTHING",
+        (authorization_id, contract, f"idem-{authorization_id}"))
+    return authorization_id
+
+
 def _exception(db, tombstone_id, *, target, contract="pc-1", strategy="st-1", uses=1,
                expires="2099-01-01T00:00:00Z"):
+    spend = _spend(db, contract=contract)
     db.execute(
         "INSERT INTO formula_draft_regeneration_exception (exception_id, tombstone_id, "
         "target_formula_identity_hash, provider_contract_hash, strategy_identity_hash, "
-        "actor_subject, overrides_tombstone, max_uses, expires_at) "
-        "VALUES ('ex-1', %s, %s, %s, %s, 'user:ops', %s, %s, %s)",
-        (tombstone_id, target, contract, strategy, tombstone_id is not None, uses, expires))
+        "actor_subject, overrides_tombstone, max_uses, expires_at, llm_spend_authorization_id) "
+        "VALUES ('ex-1', %s, %s, %s, %s, 'user:ops', %s, %s, %s, %s)",
+        (tombstone_id, target, contract, strategy, tombstone_id is not None, uses, expires,
+         spend))
     return "ex-1"
 
 
