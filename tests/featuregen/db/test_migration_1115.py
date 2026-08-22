@@ -53,6 +53,24 @@ def test_root_parent_check(db):
             (c["intent_id"], c["scope_id"], c["considered_revision_id"], c["snapshot_id"]))
 
 
+def test_a_root_row_may_reference_itself(db):
+    """root_generation_run_id is FK'd to this very table (spec §6.1), and a root names ITSELF.
+
+    Postgres validates the FK at end of statement, by which time the row exists — so the
+    self-reference inserts cleanly. Pinned because adding that FK could plausibly have made every
+    root row (i.e. every non-forked run) uninsertable."""
+    c = seed_run_chain(db, run_id="m1115-f")
+    _insert_identity(db, c)
+    row = db.execute("SELECT root_generation_run_id, parent_generation_run_id "
+                     "FROM feature_run_identity WHERE generation_run_id='m1115-f'").fetchone()
+    assert row == ("m1115-f", None)
+
+
+def test_state_refuses_a_run_that_does_not_exist(db):
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        db.execute("INSERT INTO feature_run_state (generation_run_id) VALUES ('no-such-run')")
+
+
 def test_profile_and_state_tables_exist_and_state_ships_empty(db):
     db.execute("INSERT INTO feature_run_profile (generation_run_id, display_name) "
                "VALUES ('m1115-e', 'My run')")

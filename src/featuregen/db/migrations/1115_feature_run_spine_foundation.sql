@@ -33,7 +33,11 @@ CREATE TABLE IF NOT EXISTS feature_run_identity (
     metadata_snapshot_content_hash text NOT NULL CHECK (btrim(metadata_snapshot_content_hash) <> ''),
     owner_subject               text NOT NULL CHECK (btrim(owner_subject) <> ''),
     owner_tenant                text NULL,
-    root_generation_run_id      text NOT NULL,
+    -- BOTH ancestry columns are FK'd to this table (spec §6.1: "parent and root are workflow-V1
+    -- runs"). A root row naming ITSELF passes: FK triggers fire at end of statement, by which time
+    -- the row exists. Without the root FK a forked row could name a root that is not a run at all.
+    root_generation_run_id      text NOT NULL
+        REFERENCES feature_run_identity (generation_run_id),
     parent_generation_run_id    text NULL REFERENCES feature_run_identity (generation_run_id),
     run_identity_hash           text NOT NULL CHECK (btrim(run_identity_hash) <> ''),
     created_by                  text NOT NULL,
@@ -69,8 +73,11 @@ CREATE TABLE IF NOT EXISTS feature_run_profile (
     updated_at        timestamptz NOT NULL DEFAULT now()
 );
 
--- the only mutable COORDINATION row per run; rows minted lazily, NONE in the foundation
+-- the only mutable COORDINATION row per run; rows minted lazily, NONE in the foundation.
+-- PK/FK per spec §5 — free to declare while the table ships empty, and it keeps a coordination row
+-- from ever naming a run that does not exist.
 CREATE TABLE IF NOT EXISTS feature_run_state (
-    generation_run_id text PRIMARY KEY,
+    generation_run_id text PRIMARY KEY
+        REFERENCES feature_generation_run (generation_run_id),
     state_version     bigint NOT NULL DEFAULT 0
 );
