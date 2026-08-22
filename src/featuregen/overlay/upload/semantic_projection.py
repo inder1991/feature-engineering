@@ -145,6 +145,11 @@ def _served_idea(assembled, validation, *, catalog_source: str,
         derives_from=list(bound_refs),
         aggregation=None,
         grain_table=plan.get("population_ref"),
+        # WHAT THIS FEATURE IS COMPUTED PER, resolved by the planning lens (which holds the
+        # connection this projection does not). Without it the draft worker refuses at REQUESTED
+        # with GRAIN_NOT_RESOLVED, before any provider call — which is what silently stopped every
+        # governed-path candidate, LLM-proposed ones included, from ever getting a formula.
+        grain_refs=tuple(tuple(pair) for pair in (plan.get("grain_refs") or ())),
         window=(f"{plan['window']}d" if plan.get("window") else None),
         derives_pairs=tuple((catalog_source, ref) for ref in bound_refs),
         rationale=request.conceptual_reason,

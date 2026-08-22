@@ -558,3 +558,49 @@ def test_a_capitalized_uoa_matches_the_lowercase_grain():
     plan, refusals = fold_frozen_binding_plan(
         request, verdicts, story, "pit", "", "bank", uoa_entity="Account")
     assert plan is None and refusals == (R.UOA_MISMATCH,)
+
+
+def test_the_STORY_KEEPS_THE_GRAIN_COLUMN_not_only_its_table():
+    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
+
+    """▲ THE FACT THAT WAS BEING DROPPED ON THE FLOOR.
+
+    The fold binds the population from the entity-key operand whose `is_grain` flag was DECLARED in
+    the upload — so at that exact moment it holds the grain COLUMN's ref. It kept `column.table` and
+    discarded the ref, and `population_ref` (a table) is not what authoring needs:
+    `formula_draft_worker._frozen_facts` refuses a draft at REQUESTED, before any provider call,
+    when `idea.grain_refs` is empty. Every governed-path candidate therefore carried no grain and
+    could never be authored.
+
+    Keeping both halves costs nothing and queries nothing — which matters, because this lens forbids
+    reloading `graph_node` and holds a fixed query budget. An earlier attempt at this resolved the
+    column with a fresh per-recipe query and the lens's own tests refused it immediately.
+    """
+    story = DatasetStoryV1(
+        population_ref="public.customers", population_basis="declared_grain",
+        dataset_tables=("public.customers",), cross_dataset=False, codes=(),
+        population_key_ref="bank::public.customers.cust_id")
+
+    assert story.population_ref == "public.customers", "whose rows"
+    assert story.population_key_ref == "bank::public.customers.cust_id", "keyed by which column"
+
+
+def test_the_PLAN_CARRIES_THE_GRAIN_REF_so_the_projection_can_hand_it_to_authoring():
+    from featuregen.overlay.upload.recipe_planning_lens import DatasetStoryV1
+
+    """The serving projection takes no connection, so it cannot resolve a grain itself — it can only
+    carry what the plan already established. This is the join between the two."""
+    story = DatasetStoryV1(
+        population_ref="public.customers", population_basis="declared_grain",
+        dataset_tables=("public.customers",), cross_dataset=False, codes=(),
+        population_key_ref="bank::public.customers.cust_id")
+
+    assert ([["bank", story.population_key_ref]] if story.population_key_ref else []) == [
+        ["bank", "bank::public.customers.cust_id"]]
+
+    # And an undeclared population yields NO grain rather than a guessed one — authoring against a
+    # guessed grain produces a formula for a feature nobody asked for.
+    undeclared = DatasetStoryV1(
+        population_ref=None, population_basis="undeclared", dataset_tables=(),
+        cross_dataset=False, codes=())
+    assert undeclared.population_key_ref is None
