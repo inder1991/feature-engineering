@@ -21,14 +21,84 @@ from featuregen.overlay.upload.formula_draft_store import (
 )
 
 CREV = "crev-r"
+CHAIN_RUN = "fdr"
+
+# The write-once guards standing between this file's teardown and the rows it seeded. Same
+# disable/delete/re-enable shape the race tests below already use for `formula_draft`.
+_CHAIN_GUARDS = (
+    ("contract_generation_input", "contract_generation_input_no_mutation"),
+    ("contract_considered_revision", "contract_considered_revision_no_mutation"),
+    ("catalog_metadata_snapshot", "catalog_metadata_snapshot_no_mutation"),
+    ("intent_recognition_attempt", "intent_recognition_attempt_no_mutation"),
+)
 
 
 @pytest.fixture(autouse=True)
-def _considered_revision_exists(db):
+def _considered_revision_exists(db, _dsn):
     """Migration 1116 makes `formula_draft.considered_revision_id` a real foreign key, so the one
     revision every draft in this file names has to exist. Seeding only — nothing here asserts on
-    the chain."""
-    seed_run_chain(db, run_id="fdr", considered_revision_id=CREV)
+    the chain.
+
+    ▲ **AND IT MUST CLEAN UP AFTER ITSELF, because three tests below call `db.commit()`.** That
+    commit does not only make their draft durable — it makes EVERYTHING in the fixture's
+    transaction durable, this chain included, in a database the whole session shares. The three
+    already remove their own draft in a `finally`; nothing removed the chain, so a leaked
+    `contract_intent` row broke the next suite that asserts the table is empty
+    (`contract/test_no_permissive_path_when_live.py`, `api/test_contract_scoped.py`) — and only
+    when collection order put this file first, which is the worst way to find out.
+
+    The teardown probes before it erases: for the fourteen tests that never commit, the rows are
+    still invisible to another connection and the probe answers "nothing here", so they pay one
+    SELECT and no DDL. Only a test that actually committed reaches the guard dance — and a fourth
+    such test, added later, is covered without anyone remembering this."""
+    chain = seed_run_chain(db, run_id=CHAIN_RUN, considered_revision_id=CREV)
+    yield chain
+    _erase_chain_if_committed(_dsn, chain)
+
+
+def _erase_chain_if_committed(dsn: str, chain: dict) -> None:
+    """Remove the seeded chain iff it was committed — all of it in ONE transaction, or none of it.
+
+    ▲ NOT autocommit, and the guards go back on inside the same transaction. `durable_evidence.py`
+    records why in full: an `ALTER TABLE ... DISABLE TRIGGER` that commits on the spot is visible
+    to every other session, so a failure between the disable and the re-enable leaves a durable
+    table's tamper-evidence off with nothing to restore it.
+    """
+    with psycopg.connect(dsn) as probe:
+        committed = probe.execute(
+            "SELECT 1 FROM contract_intent WHERE intent_id = %s",
+            (chain["intent_id"],)).fetchone()
+    if committed is None:
+        return
+
+    with psycopg.connect(dsn) as cleanup:
+        with cleanup.transaction():
+            for table, trigger in _CHAIN_GUARDS:
+                cleanup.execute(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}")
+            # Children first: the input names the run, the revision names the snapshot, and both
+            # the run and the recognition name the intent.
+            cleanup.execute("DELETE FROM contract_generation_input WHERE generation_run_id = %s",
+                            (chain["run_id"],))
+            cleanup.execute(
+                "DELETE FROM contract_considered_revision WHERE considered_revision_id = %s",
+                (chain["considered_revision_id"],))
+            cleanup.execute("DELETE FROM catalog_metadata_snapshot WHERE snapshot_id = %s",
+                            (chain["snapshot_id"],))
+            cleanup.execute("DELETE FROM confirmed_generation_scope WHERE scope_id = %s",
+                            (chain["scope_id"],))
+            cleanup.execute("DELETE FROM intent_recognition_attempt WHERE recognition_id = %s",
+                            (chain["recognition_id"],))
+            cleanup.execute("DELETE FROM feature_generation_run WHERE generation_run_id = %s",
+                            (chain["run_id"],))
+            cleanup.execute("DELETE FROM contract_intent WHERE intent_id = %s",
+                            (chain["intent_id"],))
+            # 1027's lineage FKs are DEFERRABLE INITIALLY DEFERRED, so the deletes above leave
+            # pending trigger events and PostgreSQL refuses ENABLE TRIGGER while any are
+            # outstanding. Forcing them immediate resolves them inside THIS transaction, which is
+            # what keeps the re-enable here rather than in a second one.
+            cleanup.execute("SET CONSTRAINTS ALL IMMEDIATE")
+            for table, trigger in _CHAIN_GUARDS:
+                cleanup.execute(f"ALTER TABLE {table} ENABLE TRIGGER {trigger}")
 
 
 def _draft(db, draft_id: str, *, state: str = "BLOCKED") -> str:
