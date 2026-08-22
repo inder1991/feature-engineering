@@ -85,6 +85,29 @@ restore and confirmed the real database refused both `UPDATE` and `DELETE` with 
 message, and that the `clean` ↔ `expectation_ref` pairing check fires. Guards that exist only in a
 test suite are not guards on the cluster.
 
+### 1099 — applied 2026-08-22, and it was DEPLOY-BLOCKING
+
+| | |
+|---|---|
+| migration | `1099_sealed_artifact_member_provenance` |
+| ledger rows after | 195 |
+| backup taken first | `~/featuregen-backups/featuregen-pre-1099-20260822-162927.sql` (134M, completion marker verified) |
+| drift after | none; 0 pending |
+| rows in the new table | 0 — nothing has sealed since |
+
+▲ **WHY THIS ONE WAS URGENT.** Commit `364cd7fa` made sealing write per-member provenance with an
+unguarded `INSERT INTO sealed_artifact_member_provenance`, while live schema was still 1098. Any
+deploy of that image before this migration would have made **every seal fail**. The hazard existed
+from the moment that commit landed and was not noticed in its review — it was found later, by a
+separate agent reading the plan against the live schema. **A commit that adds a write to a new table
+makes its migration backend-blocking from that instant; the two are one deploy unit even when they
+are two commits.**
+
+Probed on the scratch restore first: the `LLM_AUTHORED`-must-name-its-run CHECK fires, and fires
+BEFORE the foreign key, so it is proven independent of any parent row. The append-only trigger was
+NOT probed here — doing so needs a full valid authorization chain for the parent artifact, and the
+trigger is identical in form to 1097's, which was probed live on 2026-08-21. The test suite covers it.
+
 ▲ **THE DEPLOYED IMAGE COULD NOT HAVE DONE THIS, and that is worth knowing before the next deploy.**
 The backend init container runs `python -m featuregen migrate`, but the running image only carries
 migrations through **1093** — so it applied nothing, silently and successfully, against a database
