@@ -234,10 +234,13 @@ ledger — in an amendment commit, with numbers matching intended apply order. [
 "1115 onward" contradicted the parent's explicit write-order rule: 1113/1114 are *later*
 certification work, and the foundation ships before them. The runner would technically tolerate a
 lower-numbered file added later (`migrations.py:288` applies every missing file, checksum-ledgered)
-— that tolerance is deliberately **not** relied on. Nothing above 1099 is applied live (owner
-re-measured: ledger 195, highest 1099; the in-flight 1100 is a file only), so renumbering is still
-free. The foundation's block and the actionable block are requested as contiguous slots in that
-table, foundation first.
+— that tolerance is never relied on ACCIDENTALLY. **Overtaken by events (2026-08-23, ruled at
+execution):** migrations 1100 and 1101 are now COMMITTED files (`75bdfe26`), so the foundation can
+no longer slot before the parent's block; global number-order-equals-apply-order across two
+parallel workstreams is unachievable without renumbering the parent's cited-everywhere 1101+. The
+foundation therefore takes **1115/1116**, reserved in the §17 table with an explicit ordering note
+— a DOCUMENTED interleaving of two independent blocks (the spine's FKs reach only ≤1024 tables),
+which honours the owner's actual rule: never an *undocumented* out-of-order convention.
 
 ### 6.1 Identity — a composite-FK-enforced chain **[R3 — P0-8]**
 
