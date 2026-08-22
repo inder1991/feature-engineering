@@ -55,7 +55,8 @@ def unique(prefix: str) -> str:
 def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, facts_ref: str,
                    progress_callback=None, tool_first: dict | None = None,
                    run_id: str | None = None, draft_id: str | None = None,
-                   expect: type[BaseException] | None = None):
+                   expect: type[BaseException] | None = None,
+                   eval_run_id: str | None = None):
     """Author ONE real V3 run against a durable DSN, yield its ids, then remove every trace of it.
 
     The provider is a `FakeLLM` — this is about the DISPATCH AUDIT being real, not about reaching
@@ -123,7 +124,7 @@ def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, fa
                 f"expected the run to raise {expect.__name__}; it completed instead: {outcome!r}")
         yield run_id, outcome
     finally:
-        _erase(dsn, run_id, queue_id, draft_id)
+        _erase(dsn, run_id, queue_id, draft_id, eval_run_id)
 
 
 def _script_two_turns(client, dsn, intent, raw, tool_call, allowed_refs) -> None:
@@ -173,6 +174,12 @@ def _script_two_turns(client, dsn, intent, raw, tool_call, allowed_refs) -> None
 
 
 _APPEND_ONLY = (
+    # The evaluation tables come FIRST because their rows are deleted first: an attempt references
+    # the authoring run this fixture also removes, and the FK is what orders that rather than a
+    # convention.
+    ("recipe_formula_eval_attempt_v2", "recipe_formula_eval_attempt_v2_write_once"),
+    ("recipe_formula_eval_case_v2", "recipe_formula_eval_case_v2_write_once"),
+    ("recipe_formula_eval_run", "recipe_formula_eval_run_no_mutation"),
     ("formula_draft_retirement", "formula_draft_retirement_no_change"),
     ("formula_draft", "formula_draft_no_identity_edit"),
     ("formula_authoring_trace_event", "formula_authoring_event_no_mutation"),
@@ -184,7 +191,8 @@ _APPEND_ONLY = (
 )
 
 
-def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None) -> None:
+def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None,
+           eval_run_id: str | None = None) -> None:
     """Remove exactly what this run wrote — ALL OF IT IN ONE TRANSACTION, or none of it.
 
     ▲ **THE GUARDS MUST NEVER BE LEFT OFF.** An earlier version disabled the append-only triggers on
@@ -205,6 +213,11 @@ def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None) ->
         with cleanup.transaction():
             for table, trigger in _APPEND_ONLY:
                 cleanup.execute(f"ALTER TABLE {table} DISABLE TRIGGER {trigger}")
+
+            if eval_run_id is not None:
+                for table in ("recipe_formula_eval_attempt_v2", "recipe_formula_eval_case_v2",
+                              "recipe_formula_eval_run"):
+                    cleanup.execute(f"DELETE FROM {table} WHERE eval_run_id = %s", (eval_run_id,))
 
             refs = [row[0] for row in cleanup.execute(
                 "SELECT dispatch_ref FROM llm_dispatch WHERE authoring_run_id = %s",

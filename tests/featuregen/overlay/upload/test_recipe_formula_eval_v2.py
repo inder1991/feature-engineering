@@ -290,39 +290,37 @@ def test_the_GATE_REFUSES_A_RUN_THAT_CITES_NO_CONTRACT(db):
         evaluate_persisted_run_v2(db, v1_run)
 
 
-def test_an_ATTEMPT_WITH_NO_AUTHORING_RUN_IS_NOT_V3_EVIDENCE(db):
-    """There is nothing to qualify, so it does not qualify — recorded with the reason rather than
-    defaulting to true and being noticed later."""
+def test_an_ATTEMPT_FOR_A_CASE_THE_RUN_NEVER_FROZE_IS_REFUSED(db):
+    """▲ The frozen corpus is what a run measured. An attempt naming a case outside it is evidence
+    about something the run never froze, which is worse than no attempt at all — it would be counted
+    in the totals."""
+    from featuregen.overlay.upload.recipe_formula_gold_v2 import FormulaGoldCaseV2
+
     run_id = create_evaluation_run_v2(db, _config())
-    case = _clean_case()
-    _record(db, run_id, case, 0, _good_v3_result(), authoring_run_id=None)
+    stranger = FormulaGoldCaseV2(
+        case_id="not-in-this-corpus", case_kind="clean", expectation_ref="whatever",
+        fixture_name="x.json", fixture_pin="0" * 64, expected={})
 
-    evidence, problems = db.execute(
-        "SELECT v3_evidence, v3_evidence_problems FROM recipe_formula_eval_attempt_v2 "
-        "WHERE eval_run_id=%s", (run_id,)).fetchone()
-    assert evidence is False
-    assert problems == ["the attempt has no authoring run to qualify",
-                        "the attempt produced no authoring run, so there is no artifact"]
-
-    gate = evaluate_persisted_run_v2(db, run_id)
-    assert gate.attempts_without_v3_evidence == 1
-    assert any(r.startswith("NOT_V3_EVIDENCE") for r in gate.reasons)
+    with pytest.raises(FormulaEvaluationIntegrityErrorV2, match="does not belong to the corpus"):
+        record_evaluation_attempt_v2(
+            db, eval_run_id=run_id, case=stranger, repeat_index=0,
+            authoring_run_id="whatever", result=_good_v3_result(),
+            candidate_proposal_hash=None)
 
 
-def test_ATTEMPTS_ARE_WRITE_ONCE(db):
-    """Migration 1098's guard. An evaluation whose attempts could be edited afterwards is a claim,
-    not evidence."""
+def test_an_ATTEMPT_WHOSE_DISPATCH_DOES_NOT_RECONCILE_IS_REFUSED(db):
+    """If the audit cannot say what was sent to the provider, the attempt cannot say what the
+    provider did. Reachable here because a made-up run id reconciles nothing."""
     run_id = create_evaluation_run_v2(db, _config())
-    _record(db, run_id, _clean_case(), 0, _good_v3_result())
 
-    with db.transaction(force_rollback=True), pytest.raises(Exception, match="write-once"):
-        db.execute("UPDATE recipe_formula_eval_attempt_v2 SET disposition='RESOLVED' "
-                   "WHERE eval_run_id=%s", (run_id,))
-    with db.transaction(force_rollback=True), pytest.raises(Exception, match="write-once"):
-        db.execute("DELETE FROM recipe_formula_eval_attempt_v2 WHERE eval_run_id=%s", (run_id,))
+    with pytest.raises(FormulaEvaluationIntegrityErrorV2, match="not strictly reconciled"):
+        record_evaluation_attempt_v2(
+            db, eval_run_id=run_id, case=_clean_case(), repeat_index=0,
+            authoring_run_id="far-does-not-exist", result=_good_v3_result(),
+            candidate_proposal_hash=_PIN)
 
 
-def _record(db, run_id, case, index, result, *, authoring_run_id=None):
+def _record(db, run_id, case, index, result, *, authoring_run_id):
     return record_evaluation_attempt_v2(
         db, eval_run_id=run_id, case=case, repeat_index=index,
         authoring_run_id=authoring_run_id, result=result,

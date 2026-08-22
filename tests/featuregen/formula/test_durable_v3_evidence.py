@@ -262,3 +262,73 @@ def test_a_SUCCEEDING_CLEANUP_LEAVES_THE_GUARDS_ENABLED_TOO(db, monkeypatch, _ds
         assert check.execute(
             "SELECT count(*) FROM queue WHERE id = %s", (queue_id,)).fetchone()[0] == 0, (
             "a succeeding cleanup must actually delete")
+
+
+# ══ THE EVALUATION LANE, FED BY A REAL RUN ═════════════════════════════════════════════════════
+def test_an_EVALUATION_ATTEMPT_IS_ASSEMBLED_FROM_THE_AUDIT_not_from_its_caller(db, monkeypatch,
+                                                                               _dsn):
+    """▲ THE PROPERTY THAT MAKES AN ATTEMPT EVIDENCE. `record_evaluation_attempt_v2` takes no
+    dispatch refs and no token or cost figures — it reads them from the audited run. An earlier
+    version accepted them as parameters, which would have measured the caller rather than the
+    provider.
+
+    Proving that needs a run whose dispatches genuinely reconcile, which is the same reason Gate 2
+    lives here: the audit writes on its own connection, so nothing it records is reconcilable from
+    inside a rolled-back test transaction.
+
+    ▲ AND IT SHOWS THE REPRODUCTION CHECK DISCRIMINATING ON REAL DATA. This run authors a formula
+    that is not the reviewed `posted_debit_amount` one, so `reproduced_reviewed_formula` must come
+    out FALSE while the run is otherwise perfect V3 evidence. A check that could not tell those
+    apart would pass every clean case that merely ran.
+    """
+    from dataclasses import asdict
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    import psycopg
+    from tests.featuregen.formula.durable_evidence import unique
+
+    from featuregen.overlay.upload.recipe_formula_eval_v2 import (
+        EvaluationRunConfigurationV2,
+        create_evaluation_run_v2,
+        record_evaluation_attempt_v2,
+    )
+    from featuregen.overlay.upload.recipe_formula_gold_v2 import formula_gold_v2_cases
+
+    eval_run_id = unique("rfe2")
+
+    with durable_v3_run(_dsn, monkeypatch, raw=_raw_v3(), intent=_INTENT, allowed_refs=_REFS,
+                        facts_ref=REF_AMT, eval_run_id=eval_run_id) as (run_id, result):
+        with psycopg.connect(_dsn) as work:
+            create_evaluation_run_v2(work, EvaluationRunConfigurationV2(
+                provider="fake", model="fake-1", generation_controls={},
+                author_provider_contract_hash="author-1",
+                critic_provider_contract_hash="critic-1",
+                shadow_window_start=datetime(2026, 8, 1, tzinfo=UTC),
+                shadow_window_end=datetime(2026, 8, 2, tzinfo=UTC),
+                shadow_generation_run_ids=(), token_budget=1000, cost_budget=Decimal("1.00"),
+                created_by={"actor": "durable-evidence"}, runner_kind="FAKE_TEST",
+                code_commit="testcommit"), eval_run_id=eval_run_id)
+
+            case = next(c for c in formula_gold_v2_cases() if c.case_kind == "clean")
+            record_evaluation_attempt_v2(
+                work, eval_run_id=eval_run_id, case=case, repeat_index=0,
+                authoring_run_id=run_id, result=asdict(result),
+                candidate_proposal_hash=result.candidate_proposal_hash)
+            work.commit()
+
+            row = work.execute(
+                "SELECT v3_evidence, author_dispatch_refs, critic_dispatch_refs, llm_call_refs, "
+                "       outcome_json "
+                "  FROM recipe_formula_eval_attempt_v2 WHERE eval_run_id=%s",
+                (eval_run_id,)).fetchone()
+
+    evidence, author_refs, critic_refs, llm_refs, outcome = row
+    assert evidence is True, "a real provider-authored V3 run must qualify"
+    # DERIVED, and non-empty — the caller passed none of these.
+    assert author_refs and critic_refs and llm_refs
+    assert outcome["conducted_under_v3"] is True
+    assert outcome["reproduced_reviewed_formula"] is False, (
+        "this run authored a different formula from the reviewed one; a reproduction check that "
+        "called it a match would pass every clean case that merely ran")
+    assert outcome["exact_match"] is False

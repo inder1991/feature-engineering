@@ -27,7 +27,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from featuregen.formula.authoring_versions import V3RunConformance, v3_run_conformance
+from featuregen.formula.authoring_versions import v3_run_conformance
 from featuregen.idgen import mint_id
 from featuregen.overlay.upload.recipe_formula_evaluation_contract import (
     EvaluationContractV2,
@@ -284,29 +284,57 @@ def record_evaluation_attempt_v2(
     eval_run_id: str,
     case: FormulaGoldCaseV2,
     repeat_index: int,
-    authoring_run_id: str | None,
+    authoring_run_id: str,
     result: dict[str, Any],
     candidate_proposal_hash: str | None,
-    author_dispatch_refs: tuple[str, ...] = (),
-    critic_dispatch_refs: tuple[str, ...] = (),
-    llm_call_refs: tuple[str, ...] = (),
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-    cost_amount: Decimal = Decimal(0),
 ) -> str:
-    """Score and persist one attempt, qualifying its authoring run as V3 evidence AT THIS MOMENT.
+    """Score and persist one attempt, DERIVING every fact about it from the audited run.
 
-    ▲ The qualification is recorded, not derived on read. Whether a run qualifies depends on its
-    trace replaying and on every author call having been requested under the v3 contract — facts
-    about when the attempt ran. Deriving it later would let a since-repaired trace make a historical
-    attempt look better than it was, which is the opposite of what evidence is for.
+    ▲ **NOTHING HERE IS CALLER-SUPPLIED EXCEPT WHAT THE CALLER ALONE KNOWS.** An earlier version of
+    this function accepted the dispatch refs and the token/cost figures as parameters. That is not
+    evidence — a caller could have passed anything, and an evaluation assembled from numbers it was
+    handed measures the caller rather than the provider. They are read from the audit instead, the
+    way `recipe_formula_eval` already reads them.
+
+    Three refusals, before anything is written:
+
+    * the case must belong to THIS run's frozen corpus, or the attempt is evidence about a case the
+      run never froze;
+    * the authoring dispatch must be strictly reconciled, or the audit cannot say what was sent;
+    * there must be audited author AND critic calls, because an attempt with neither did not
+      exercise the lane it claims to have measured.
+
+    `authoring_run_id` is REQUIRED, deliberately. An attempt with no authoring run is not an
+    attempt, and scoring one as merely "unevidenced" would let a run of twelve no-ops record twelve
+    rows that say nothing.
     """
-    if authoring_run_id is None:
-        conformance = V3RunConformance(
-            conduct_problems=("the attempt has no authoring run to qualify",),
-            artifact_problems=("the attempt produced no authoring run, so there is no artifact",))
-    else:
-        conformance = v3_run_conformance(conn, authoring_run_id)
+    from featuregen.overlay.upload.dispatch_audit import formula_dispatches_reconciled
+    from featuregen.overlay.upload.recipe_formula_eval import (
+        _audited_usage,
+        _dispatch_identity,
+    )
+
+    if repeat_index < 0:
+        raise ValueError("evaluation repeat index cannot be negative")
+    frozen = conn.execute(
+        "SELECT 1 FROM recipe_formula_eval_case_v2 WHERE eval_run_id=%s AND case_id=%s",
+        (eval_run_id, case.case_id)).fetchone()
+    if frozen is None:
+        raise FormulaEvaluationIntegrityErrorV2(
+            f"case {case.case_id!r} does not belong to the corpus frozen into run "
+            f"{eval_run_id!r}")
+    if not formula_dispatches_reconciled(conn, authoring_run_id):
+        raise FormulaEvaluationIntegrityErrorV2(
+            "evaluation attempt authoring dispatch is not strictly reconciled, so the audit "
+            "cannot say what was sent to the provider")
+
+    author_refs, critic_refs, llm_refs = _dispatch_identity(conn, authoring_run_id)
+    if not author_refs or not critic_refs or not llm_refs:
+        raise FormulaEvaluationIntegrityErrorV2(
+            "evaluation attempt requires audited author and critic provider calls")
+    input_tokens, output_tokens, cost_amount = _audited_usage(conn, llm_refs)
+
+    conformance = v3_run_conformance(conn, authoring_run_id)
     qualifies, problems = conformance.as_evidence()
 
     outcome = derive_outcome_v2(
@@ -325,10 +353,9 @@ def record_evaluation_attempt_v2(
         "outcome_json,outcome_hash,input_tokens,output_tokens,cost_amount) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (attempt_id, eval_run_id, case.case_id, repeat_index, authoring_run_id,
-         _json(list(author_dispatch_refs)), _json(list(critic_dispatch_refs)),
-         _json(list(llm_call_refs)), str(result.get("authoring_disposition")), qualifies,
-         _json(list(problems)), _json(outcome), content_hash(outcome),
-         input_tokens, output_tokens, cost_amount))
+         _json(list(author_refs)), _json(list(critic_refs)), _json(list(llm_refs)),
+         str(result.get("authoring_disposition")), qualifies, _json(list(problems)),
+         _json(outcome), content_hash(outcome), input_tokens, output_tokens, cost_amount))
     return attempt_id
 
 
