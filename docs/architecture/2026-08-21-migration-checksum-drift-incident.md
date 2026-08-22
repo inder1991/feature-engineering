@@ -63,9 +63,40 @@ applied to that database. Drift is the deploy-stopping condition.
 | latest migration | `1096_formula_draft_retirement` |
 | backup taken first | `~/featuregen-backups/featuregen-pre-1096-20260821-161831.sql` (134M) |
 
+## Deployment log
+
+This section, not the migration files, is where "when was this applied" lives. That is the whole
+corollary above: a note added to a migration header after it was applied is what caused this
+incident twice.
+
+### 1097 + 1098 — applied 2026-08-22
+
+| | |
+|---|---|
+| migrations | `1097_recipe_formula_evaluation_contract`, `1098_recipe_formula_eval_v2_cases` |
+| ledger rows after | 194 |
+| backup taken first | `~/featuregen-backups/featuregen-pre-1097-1098-20260822-115244.sql` (134M, completion marker verified) |
+| drift after | none; 0 migrations pending |
+| existing data | untouched — `formula_draft` 7, `formula_authoring_run` 3, `recipe_formula_eval_run` 0, all unchanged; the three new tables are empty |
+
+Sequence: dump → scratch restore (`featuregen_scratch_1097`) → dry run → **probe** → live → verify →
+scratch dropped. The probe is worth keeping as a step: it inserted a contract row into the scratch
+restore and confirmed the real database refused both `UPDATE` and `DELETE` with the intended
+message, and that the `clean` ↔ `expectation_ref` pairing check fires. Guards that exist only in a
+test suite are not guards on the cluster.
+
+▲ **THE DEPLOYED IMAGE COULD NOT HAVE DONE THIS, and that is worth knowing before the next deploy.**
+The backend init container runs `python -m featuregen migrate`, but the running image only carries
+migrations through **1093** — so it applied nothing, silently and successfully, against a database
+at 1096. Migrations 1094–1098 have all been applied by running the migrator from a local checkout
+through a port-forward. That is fine and it is what happened; what must not happen is anyone reading
+a green init container as evidence that the schema is current. **The image is the floor, not the
+authority — check the ledger.**
+
 ## ▲ Open: the live database is ahead of `origin/main`
 
-`main` ends at **1089**; this branch and the live kind database reach **1096**. Deploying anything
+`main` ends at **1089**; this branch reaches **1098** and the live kind database is now at **1098**
+too. Deploying anything
 from `main` against that cluster would meet a schema it does not know, and its migrate step would
 not reconcile the difference.
 
