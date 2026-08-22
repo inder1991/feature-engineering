@@ -1,8 +1,19 @@
 # Recipe-to-code: reviewed formulas, LLM fallback, and one generation journey
 
-**Date:** 2026-08-22 · amended 2026-08-22 to become a child plan
+**Date:** 2026-08-22 · amended 2026-08-22 to become a child plan · amended again to fold the owner's
+**third review** (five rulings)
 **Status:** implementation plan only; this document changes no runtime behaviour
 **Branch:** `feature/asset-detail-reapply`
+
+▲ **What the third review changed HERE.** Four of the five rulings are the parent's to hold; this
+document carries their consequences and nothing more:
+
+| Ruling | Consequence in this plan |
+|---|---|
+| **1 — legacy pinning** | step 1 records the measurement that already exists (all four build tables **zero**) and adds the two row counts nobody has measured — `formula_draft`, `formula_draft_retirement`. Parent §11.0 owns the rule |
+| **2 — two comparisons** | parent §12 piece #4 is **no longer an open ruling**. It costs this plan a bigger supply obligation: a compiler case needs an approved IR **and reviewed test data** (step 9) |
+| **3 — the money guard** | §3.3's *"two remedies, pick one"* is **gone**. Retirement decouples from identity; this plan still supplies exactly two facts and still touches no composition (parent §11.1.1) |
+| **5 — delete the legacy route** | ▲ **the parent explicitly supersedes this document's earlier "thin adapter" commitment.** Step 10's both-route equivalence test is replaced by route-absence and direct-queue-bypass |
 
 ---
 
@@ -72,7 +83,7 @@ Deterministic instantiation                    Explicit LLM authoring
    |                                          |
    +--------------------+---------------------+
                         v
-        Parse -> deterministic validation -> admission          <- BOTH routes, identically
+        Parse -> deterministic validation -> admission          <- BOTH METHODS, identically
                         v
             Compile -> render -> seal artifact
                         v
@@ -305,6 +316,13 @@ not touch that composition.** Its `{formula_strategy, strategy_identity_hash}` f
 by parent step 2, together with `provider_contract_hash` and the corrected model/prompt read, as
 **one** identity change — see §3.3 below.
 
+▲ **And the owner's third review says something this plan must not paper over: the money promise and
+the RETIREMENT promise are two different promises riding on one mechanism** (parent §11.1.1).
+Retirement is enforced only when the unique-index INSERT *loses*, so "selection never spends" and
+"a withdrawn formula is never rebought" are today the same code path — and fixing either moves both.
+The parent decouples them; **the visible consequence in this plan is that a retired candidate must
+refuse before the coordinator ever counts it as a costed member** (step 5a item 1).
+
 ### D6 — One backend coordinator owns the journey
 
 The React client must not chain five write APIs and hope the browser stays open. A durable
@@ -329,13 +347,20 @@ The product is pre-live. Implement the canonical path, test it, deploy it to the
 cluster, and delete the legacy path. Rollback is the previous image. Do not create dark gates that
 let the two behaviours drift.
 
-▲ **CORRECTED — no thin adapter.** The previous revision's opening promised *"keep the old
-materialization API temporarily as a thin adapter, then delete it."* **Parent D2 rules: DELETE the
-route, do not build an adapter**, and parent §8.3 explains why a thin adapter is a bypass rather
-than a simplification: `POST /materialization-runs` compiles, renders, seals, runs L0 and **can
-publish** — mapping it to one `GENERATE_PREVIEW` decision would let its later execution and
+▲ **CORRECTED — no thin adapter, and the owner's third review says so EXPLICITLY.** The previous
+revision's opening promised *"keep the old materialization API temporarily as a thin adapter, then
+delete it."* **The parent supersedes that commitment**: DELETE the route and its execution entry
+points, build no adapter, not even temporarily. Parent §8.3 explains why an adapter is a bypass
+rather than a simplification — `POST /materialization-runs` compiles, renders, seals, runs L0 and
+**can publish**, so mapping it to one `GENERATE_PREVIEW` decision would let its later execution and
 publication proceed under a decision made for a weaker act. **There is no "old API preview"
-operation to map.** The migration surface is three test modules and one frontend run-sheet read.
+operation to map**, and an adapter that orchestrated the stages properly would simply *be* the
+canonical lane with a legacy entrance attached.
+
+▲ **The deletion surface is bigger than this section used to say, and the extra item is the one that
+matters:** parent §1 D2 enumerates it, and it includes **`enqueue_materialization` and the legacy
+queue handler**. A route deleted while its producer survives is a renamed bypass — which is exactly
+what step 10's direct-queue-bypass test exists to catch.
 
 ---
 
@@ -450,13 +475,25 @@ model/prompt facts. ▲ **`blueprint_bindable` and `semantic_inputs_ready` stay 
 measurements of the world, and a measurement that flaps re-mints the identity and **buys the same
 answer twice**, which is the expense the index exists to prevent.
 
-▲ **ANY composition change re-hashes every existing draft**, so parent §11.1 owns one of two
-remedies before deploy, and states which: a one-time re-spend with **every existing retirement
-re-asserted first**, or a backfill reproducing today's value. ▲ The backfill is unusually cheap here
-because **today's value is a constant** — `_authoring_config_hash` calls `getattr` on a `dict`, so
-all three fields fall to their defaults and every deployment produces the same hash. This plan does
-not fix that and does not depend on it being unfixed; it supplies two of the facts and lets step 2
-land them once.
+▲ **RULED, third review — and NEITHER of the two remedies this section used to offer.** The owner
+refused both the one-time re-spend and the hash-preserving backfill, because they answer the money
+question while the question that bites is retirement. **Parent §11.1.1** is the design; the four
+facts this plan must build against are:
+
+1. **Retirement moves off the identity hash** onto a *retirement scope key* — the five identity
+   fields that are not the authoring configuration — and is checked **before** the INSERT and
+   therefore before any enqueue.
+2. **Legacy drafts keep identity V1 explicitly**, constant and all, recorded as what it was: a
+   record of the defect, never a claim about a historical model configuration.
+3. **Identity V2 is the corrected composition**, into which this plan's two facts fold.
+4. **No automatic re-spend.** A V2 request that finds only a legacy draft returns it as an auditable
+   preview marked `LEGACY_CONFIG_UNPROVEN` and enqueues nothing; regeneration needs explicit
+   approval and cost confirmation.
+
+**This plan supplies `formula_strategy` and `strategy_identity_hash`, and nothing else.** It does not
+compute the composition, does not write the tombstones, and must not "help" by correcting the
+`getattr` in passing — parent §11.1.1's whole point is that this looks like a one-line fix and is
+two governance rules.
 
 ### 3.4 Fix the generalized work-item model
 
@@ -521,13 +558,28 @@ item:
 1. ~~Finish or shelve the 1099 provenance writer~~ — **DONE at `364cd7fa`; 1099 applied, ledger 195**
    (§1.4).
 2. Record `git status`, full backend/frontend baselines, migration-ledger verification, and live row
-   counts for `formula_draft`, `authoring_work_item`, `feature_selection_revision`,
-   `build_set_revision`, `generation_request`, `sealed_artifact_v2`.
+   counts for `formula_draft`, **`formula_draft_retirement`**, `authoring_work_item`,
+   `feature_selection_revision`, `build_set_revision`, `generation_request`, `sealed_artifact_v2`.
+
+   ▲ **Four of these are ALREADY MEASURED, and the answer decides a migration.** Live kind,
+   2026-08-22: `build_set_revision=0`, `build_set_member=0`, `generation_request=0`,
+   `sealed_artifact_v2=0` — which is why parent §11.0 takes the immediate-`NOT NULL` branch.
+   **Re-measure at deploy anyway**: the rule governs, not the reading.
+   ▲ **Two of them have NEVER been measured and size parent step 2's tombstone backfill:**
+   `formula_draft` and `formula_draft_retirement` (parent §11.1.1). Nothing else depends on them,
+   and nothing should proceed on a guess about them.
 3. Characterization tests pinning **317 / 298 / 19 / 295 / 3 / 90 / 1** — running the real
    registry, fold and deriver, not a hand-built fixture. ▲ **The last two are separate numbers on
    purpose** (§1.2): 90 derivable, 1 reviewed. A test that pins only "90" is how they get conflated.
-4. Route-call enumeration tests showing which old and new endpoints consult which policy today —
-   the before-state proof for parent §8.3's decision-equivalence.
+   ▲ **These pins are the funnel's FIRST ROW, not the funnel.** Parent Phase B owns the versioned
+   funnel — `funnel_version · registry_content_hash · code_revision · measured_at`, stage by stage
+   with per-stage refusal histograms — and the owner's third review requires it **recorded before
+   any coverage claim**. This plan may not state a preview-coverage number until that row exists.
+4. Route-call enumeration tests showing which endpoints consult which policy today. ▲ **Its purpose
+   changed with ruling 5:** it is no longer the before-state for a decision-equivalence comparison —
+   there will be no second route to compare with — it is the **deletion inventory**, the proof that
+   every act the legacy route performs already has a canonical home (parent §1 D2's replacement
+   table) before anything is removed.
 5. Freeze applied migrations; corrections get new files; ledger verification runs in CI.
 
 **Acceptance:** no behavioural change; clean ledger; baselines recorded; the 90-vs-1 distinction is
@@ -535,10 +587,17 @@ pinned by a test.
 
 ### Step 2 (PARENT) — identity and authorization foundations
 
-Not this plan's work. This plan **depends on all five** and must not duplicate any:
-server-derived roles (parent §0.1) · formula-draft pinning (§11) · the money-guard composition
-(§11.1, into which §3.3's two facts fold) · immutable action authorization (§0.1) · per-member
-method identity (§10, §10.1).
+Not this plan's work. This plan **depends on all six** and must not duplicate any:
+server-derived roles (parent §0.1) · formula-draft pinning, `NOT NULL` on today's measurement
+(§11, §11.0) · the money-guard composition, identity **V1 preserved / V2 introduced** (§11.1,
+§11.1.1 — into which §3.3's two facts fold) · **retirement tombstones, written and verified BEFORE
+V2 activates** (§11.1.1) · immutable action authorization (§0.1) · per-member method identity
+(§10, §10.1).
+
+▲ **The one ordering this plan can break by starting early:** step 4 persists a strategy that step 2
+folds into the draft identity. Authoring drafts under V2 before the tombstones exist re-buys
+withdrawn formulas — so **no `formula_draft_authoring_plan` row may be written until step 2's
+tombstones are verified in place.**
 
 ### Step 3 (SHARED) — the shared action-decision service
 
@@ -632,6 +691,10 @@ its sealed member says `LLM_AUTHORED`.
    options, per-member strategy, deterministic-vs-LLM counts, estimated provider calls and token
    ceiling, required user decisions, and **the blockers and warnings from the parent's decision
    service** — not from a second implementation.
+   ▲ **A retired candidate and a legacy-only candidate are refused HERE, in the plan**, before
+   either is counted as a costed LLM member: `FORMULA_DRAFT_RETIRED` and
+   `LEGACY_REGENERATION_NOT_APPROVED` (parent §11.1.1). A cost estimate that quotes work the
+   platform will then refuse is a quote for a purchase nobody can make.
 2. `POST /code-generation-jobs` — the one explicit write/spend action. Records the request,
    immutable selection revisions and authoring plans in one transaction, then enqueues.
 3. The coordinator waits on **durable formula states**. It does not poll providers and does not hold
@@ -700,10 +763,25 @@ sandbox split honestly.
 
 ### Step 9 (SHARED) — the two evaluation programmes, and growing the corpus
 
-**Parent** owns both programmes (§12, Phase E) — including the ▲ **unresolved product ruling**, §12
-piece #4: what "the compiler produced the right thing" MEANS (byte-identical IR? equivalent results
-within tolerance?). **This plan owns the supply side**, and it is **not a prerequisite for LLM
-preview generation**:
+**Parent** owns both programmes (§12, Phase E). ▲ **Piece #4 is RULED — it is no longer an open
+question and it changes what this plan must supply.** Parent §12.1: *the normalized semantic IR must
+exactly match the expert-approved IR* **AND** *executing it against reviewed test data must produce
+the expected rows and values*; generated source bytes are never compared; failure of either fails
+the case.
+
+**So a compiler clean case is now TWO reviewed artifacts, not one**, and both are this plan's supply
+problem:
+
+| | |
+|---|---|
+| **The approved IR** | the normalized `FormulaExecutionIRV2.identity_payload()` a reviewer signed off — structure, not bytes |
+| **The reviewed test data** | a frozen dataset pinned by content hash, plus the expected rows and values, plus any per-case tolerance for an explicitly approximate operation (usually none) |
+
+▲ **The dataset is governed data.** It carries read scope and a data-use licence like any other data
+(parent §4, §13), so "assemble a certification corpus from production rows" is an exfiltration path
+wearing a governance name. Synthetic or approved extracts, reviewed as fixtures.
+
+**This plan owns the supply side**, and it is **not a prerequisite for LLM preview generation**:
 
 1. A "Formula review" queue beside recipe review, showing the derived blueprint or its named
    derivation refusal.
@@ -726,7 +804,9 @@ preview generation**:
 approved `recipe_review_event` rows from **every** role `required_reviewer_roles` names — at minimum
 three for a `deterministic_formula`, more with privacy/risk/model-output refs — under the
 multi-person rule (`ReviewValidityV1.single_identity_violation`). Nine more clean cases is **at
-least 27 approval events plus nine reviewed fixtures**, not nine signatures.
+least 27 approval events plus nine reviewed fixtures**, not nine signatures. ▲ **And after ruling 2,
+plus nine reviewed DATASETS with their expected rows** — the fixture alone no longer constitutes a
+compiler case.
 
 **Acceptance:** adding an approved expectation requires no source edit but still requires the full
 review/event/test-vector contract · revocation immediately stops new deterministic selection without
@@ -755,15 +835,29 @@ reintroduction table:
 12. Deterministic producer defect: **no silent LLM fallback**.
 13. Double-click / reload / cancellation / queue redelivery idempotency.
 14. Retirement during multi-turn LLM authoring stops the next provider call.
-15. Old and new route **decision** equivalence over the full six-action matrix (parent §8.3 — compare
-    decisions, not routes).
+15. ▲ **REPLACED — there is no second route to compare with.** The previous revision asked for old-
+    versus-new decision equivalence over the six-action matrix. Parent D2 deletes the old route, so
+    that test would drive a fixture and report it as coverage. Its replacements (parent §8.3):
+    * **route absence** — no OpenAPI path begins `/materialization-runs`, and a live call is 404;
+    * **direct-queue bypass** — a legacy-shaped message dead-letters because the handler is gone,
+      and a canonical `generation_request` with no `action_authorization_revision_id` refuses at the
+      worker instead of building;
+    * **request-time vs worker-time agreement** on the canonical route — the same
+      `evaluate_action`, two moments, identical decision for unmoved state and a refusal on drift.
 16. Direct API permission and stale-snapshot attempts cannot bypass UI policy.
 17. ▲ **Derivable-but-unreviewed**: the sealed member says `LLM_AUTHORED`, never
     `REVIEWED_RECIPE_BLUEPRINT`.
-18. **Mutation tests** must fail under each reintroduced defect: gold on preview · origin-as-method ·
+18. ▲ **Retirement**: a candidate covered by a tombstone refuses **with no outbox message written**
+    — asserted on the queue, not on the HTTP response (parent §11.1.1).
+19. ▲ **Legacy identity**: a V2 request against a candidate that has only a V1 draft **spends
+    nothing**, returns the legacy draft marked `LEGACY_CONFIG_UNPROVEN`, previews it, and is refused
+    at production materialization.
+20. **Mutation tests** must fail under each reintroduced defect: gold on preview · origin-as-method ·
     missing provenance treated as pass · selection-triggered LLM call · silent member dropping ·
     **routing on `blueprint_derivable`** · **recomposing `authoring_config_hash` without
-    `provider_contract_hash`**.
+    `provider_contract_hash`** · **checking retirement only on identity collision** · **activating
+    identity V2 before the tombstones exist** · **restoring `POST /materialization-runs` or leaving
+    `enqueue_materialization` in place**.
 
 ▲ Read pytest's summary line. `grep -c "^FAILED"` silently matches nothing against coloured output
 and reports a false pass.
@@ -784,9 +878,12 @@ and reports a false pass.
 
 5. Verify generated Spark/Kedro files are visible, artifact hashes reproduce, sandbox results have
    one row per declared grain, and production stays blocked without a current certificate.
-6. ▲ **Delete `POST /materialization-runs`** once the run sheet (`frontend/src/api.ts:4257`) and the
-   three test modules (`test_materialization_runs.py`, `test_materialization_e2e.py`,
-   `test_seam_walkthrough.py`) are migrated. **No adapter** (D9, parent D2/§8.3).
+6. ▲ **Delete `POST /materialization-runs`, its status read, its router registration, its producer
+   `enqueue_materialization` and its queue handler** — the full surface is parent §1 D2's table —
+   once the run sheet (`frontend/src/api.ts:4257`, flag `nav.ts:37,41`) and the three test modules
+   (`test_materialization_runs.py`, `test_materialization_e2e.py`, `test_seam_walkthrough.py`) are
+   migrated. **No adapter, not even temporarily** (D9, parent D2/§8.3). Then run test 15's
+   route-absence and direct-queue-bypass pair against the deployed image, not only in CI.
 7. Keep the cluster branch-owned until its migration lineage is merged into main and the image
    carries the same migration set.
 
@@ -809,6 +906,7 @@ returned three and silently merged the sandbox acts:
   "formula_state": "READY",
   "formula_draft_id": "fd_...",
   "formula_content_hash": "...",
+  "authoring_identity_version": 2,
   "method_identity_hash": "...",
   "actions": {
     "author_formula":         {"allowed": true,  "blockers": [], "warnings": []},
@@ -859,8 +957,28 @@ A **derivable but unreviewed** recipe differs again, and this is the distinction
 }
 ```
 
-▲ The API never reports an LLM-authored recipe formula as "reviewed recipe formula", and never
-reports a **derived** blueprint as a **reviewed** one.
+A **legacy** draft — one authored before the identity correction — differs in the version and in what
+it may reach (parent §11.1.1):
+
+```json
+{
+  "authoring_identity_version": 1,
+  "formula_state": "READY",
+  "warnings": [{
+    "code": "LEGACY_CONFIG_UNPROVEN",
+    "reason": "This draft was authored before the platform recorded which model configuration produced it.",
+    "next_step": "Inspect it freely; regenerating it under the corrected identity needs approval and costs money."
+  }],
+  "actions": {
+    "generate_preview":       {"allowed": true},
+    "materialize_production": {"allowed": false, "blockers": [{"code": "LEGACY_CONFIG_UNPROVEN"}]}
+  }
+}
+```
+
+▲ The API never reports an LLM-authored recipe formula as "reviewed recipe formula", never reports a
+**derived** blueprint as a **reviewed** one, and never reports a legacy constant configuration as a
+**known** one.
 
 ---
 
@@ -874,7 +992,14 @@ Record, without logging sensitive values:
 * LLM parse, critic, admission and repair outcomes;
 * blocker counts by **action** and code — six actions, so the counts are comparable across the gate;
 * **percentage of unreviewed recipe candidates reaching preview and sandbox** — ▲ this is the number
-  parent §0.2 fact 2 asks for, measured continuously rather than claimed once;
+  parent §0.2 fact 2 asks for, measured continuously rather than claimed once, and **stamped with
+  the funnel version** so two readings are comparable rather than merely different;
+* **drafts by authoring identity version** (V1 legacy vs V2), and **`LEGACY_CONFIG_UNPROVEN` members
+  reaching preview** — expected non-zero, and expected to fall to zero only through approved
+  regeneration, never through a sweep;
+* **retirement refusals raised BEFORE an enqueue** vs **after an identity collision** (alert: the
+  second must remain **zero** once parent §11.1.1 lands — a non-zero count means the tombstone check
+  was skipped and the old coupling is back);
 * method-certificate production refusals, split by materialization vs publication;
 * **deterministic routes with non-zero provider calls** (alert: must remain **zero**);
 * **`REVIEWED_RECIPE_BLUEPRINT` seals whose expectation ref is not in the reviewed registry**
@@ -930,6 +1055,28 @@ The previous revision proposed exactly this. It would void the money guard **and
 every withdrawn formula**, because retirement is checked only when the INSERT loses the unique index
 (§3.3). Fold, never replace — and the folding belongs to parent step 2.
 
+### ▲ "Just fix the `getattr` — it's a one-line bug"
+
+**The most plausible-sounding attack in this list**, because the line really is wrong and the fix
+really is one line. It is also, today, the code that enforces retirement: correcting the hash
+re-mints every identity, every INSERT then wins, and **no retirement row is ever read again**. Two
+governance rules ride on one mechanism; the fix is a sequence (tombstones, then V1 recorded, then V2
+activated), not an edit. Parent §11.1.1, and it is not this plan's to attempt.
+
+### ▲ "Re-buy the legacy drafts once and be done with it"
+
+Refused by the owner. A one-time re-spend is a bill nobody approved, made on behalf of people who
+are not in the room, for answers the platform already holds. Legacy drafts stay as auditable preview
+artifacts marked `LEGACY_CONFIG_UNPROVEN`; regeneration is an approved, cost-confirmed act, one
+draft at a time.
+
+### ▲ "Certify the compiler by diffing the generated project against a golden file"
+
+Cheap, fast, and it fails on a whitespace change while passing a wrong number. Parent §12.1 rules
+the comparison is the **normalized semantic IR** plus **executed values against reviewed test
+data** — never generated source bytes. A golden-file test of the rendered project must never become
+a certification gate.
+
 ### "Put one authoring method on the artifact"
 
 A mixed artifact carries both. Per-member provenance, per-member method identity and per-member
@@ -983,13 +1130,20 @@ are marked — they are not this plan's to claim, and it cannot finish without t
 * the full journey passes against Kind/Postgres with **a reviewed recipe and an unreviewed
   recipe/LLM fallback in ONE build set** — the mixed-**method** case, which parent §0.2 fact 4
   records is impossible until this plan lands;
+* selection never spends **and a withdrawn candidate refuses before an outbox message exists**;
+* a legacy V1 draft is **previewable, honestly labelled `LEGACY_CONFIG_UNPROVEN`, never re-bought
+  without approval, and never certifiable**;
 * **(PARENT)** production materialization *and* publication are fail-closed on a current,
   method-matched certificate for **every member**;
-* **(PARENT)** old and new APIs return the same decision for the same action, and the old route is
-  deleted rather than adapted.
+* **(PARENT)** ▲ **the legacy route, its producer and its handler are DELETED** — no adapter — and
+  route-absence plus direct-queue-bypass tests pass against the deployed image. *(This replaces the
+  previous "old and new APIs return the same decision", which named a route that no longer exists.)*
 
 ▲ **What "done" does NOT mean.** Production stays closed for every recipe until the reviewed corpus
-grows past its single clean case — at least 27 approval events and nine reviewed fixtures (step 9,
-parent §21) — and until §12's eight compiler-certification pieces exist, of which #4 is an
-undelivered product ruling. That is the intended invariant, not a defect, and it is why preview must
-never be gated on the thing that cannot yet happen.
+grows past its single clean case — at least 27 approval events, nine reviewed fixtures **and, after
+ruling 2, nine reviewed datasets with expected rows** (step 9, parent §21) — and until §12's eight
+compiler-certification pieces exist. ▲ **Piece #4 is no longer an undelivered ruling** (parent
+§12.1); all eight are now engineering, and comparison B additionally needs a deployment whose
+execution seam is configured, or it records `UNMEASURED` and certifies nothing. That is the intended
+invariant, not a defect, and it is why preview must never be gated on the thing that cannot yet
+happen.
