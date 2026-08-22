@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.overlay.upload.authoring_work_item_store import (
@@ -216,6 +217,9 @@ def test_a_definition_needs_an_entity_and_a_grain():
 
 # ══ the selection→definition link ════════════════════════════════════════════════════════════════
 def _seed_selection(db, revision_id: str = "fsr-1") -> str:
+    # Migration 1116 makes `feature_selection_revision.considered_revision_id` a real foreign key,
+    # so the revision this selection names has to exist. Seeding only.
+    seed_run_chain(db, run_id="awis2", considered_revision_id=REVISION)
     db.execute(
         "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) VALUES (%s, %s, %s) "
         "ON CONFLICT DO NOTHING", ("int-1", "h", "hypothesis"))

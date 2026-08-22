@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.overlay.upload.formula_draft_store import (
     DraftRetired,
@@ -18,6 +19,16 @@ from featuregen.overlay.upload.formula_draft_store import (
     retire_formula_draft,
     retired_draft_ids,
 )
+
+CREV = "crev-r"
+
+
+@pytest.fixture(autouse=True)
+def _considered_revision_exists(db):
+    """Migration 1116 makes `formula_draft.considered_revision_id` a real foreign key, so the one
+    revision every draft in this file names has to exist. Seeding only — nothing here asserts on
+    the chain."""
+    seed_run_chain(db, run_id="fdr", considered_revision_id=CREV)
 
 
 def _draft(db, draft_id: str, *, state: str = "BLOCKED") -> str:
