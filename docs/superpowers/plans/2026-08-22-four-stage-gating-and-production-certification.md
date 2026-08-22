@@ -17,6 +17,42 @@ longer inputs to be gathered, they are constraints to be built.
 
 ---
 
+### This is the PARENT plan, and it has a child
+
+`2026-08-22-recipe-to-code-llm-fallback.md` is a **CHILD IMPLEMENTATION PLAN of this document**, not
+a separate programme executed afterward. The owner's ruling of 2026-08-22:
+
+> *"The gating plan defines WHETHER each action is allowed; the recipe-to-code plan defines HOW a
+> selected feature obtains a formula and generated code. … recipe-to-code-llm-fallback.md should
+> become a CHILD IMPLEMENTATION PLAN of the amended gating architecture — not a separate plan
+> executed afterward."*
+
+> *The gating plan defines the traffic rules; the recipe-to-code plan builds the road and the
+> vehicle.*
+
+| | Owns |
+|---|---|
+| **This plan (PARENT) — the traffic rules** | WHETHER an act may proceed: the six actions (§3), the ONE blocker matrix (§4), the exhaustive `(code, action)` disposition table (§5), the shared decision service (§7), the bypasses (§8), the production boundary (§9), method identity and per-member certificate binding (§10), formula pinning and draft identity (§11), the certification programmes (§12), code-retrieval authorization (§13) |
+| **The CHILD — the road and the vehicle** | HOW a selected feature obtains a formula and generated code: strategy resolution from evidence, the deterministic reviewed-blueprint lane, the LLM fallback lane, the durable code-generation coordinator, preview generation, the frontend journey, and the reviewed-expectation growth programme |
+
+▲ **There is exactly ONE action matrix in this repository, and it is §4 of this document.** The
+child's competing *"D4 — four actions, four decisions"* matrix — which named four actions, omitted
+`PUBLISH_SANDBOX` and `MATERIALIZE_PRODUCTION`, and carried its own twelve rows — is **deleted**. The
+child now points here. Rows that existed only in the child have been **folded into §4** and are
+marked `(child)`. A second matrix is not a convenience; it is the mechanism by which two routes give
+two answers, which §8.3 exists to prevent.
+
+▲ **The circularity is real and it decides the order.** This plan's deterministic lane (§1 D1), its
+support for the other 295 recipes (§0.2 fact 2), its mixed-**method** artifacts (§0.2 fact 4, §10)
+and its decisive journey test (§19) all depend on the child. **Finishing this plan first is
+impossible.** §17 is the single ten-step order that supersedes both plans' internal phase lists.
+
+▲ **Neither plan may begin implementation until step 1 of §17 is complete** — the owner:
+*"As currently written, neither should begin implementation until their conflicting action matrices
+and the P0 findings are corrected."* This revision IS step 1.
+
+---
+
 ## 0. Where we actually are
 
 **Done and green** (tree clean at `d4023825`):
@@ -156,8 +192,10 @@ diff small and the invariant large.
   provider calls**. When none exists, **explicitly** ask the LLM, then validate the result
   deterministically, and allow preview/sandbox if it is valid. Deferring D1 would leave the
   recipe-compiler certification programme certifying a path nothing uses, and would make the
-  mixed-method journey test unwritable (fact 4). Task-level design lives in the sibling plan
+  mixed-method journey test unwritable (fact 4). Task-level design lives in the **child plan**
   `2026-08-22-recipe-to-code-llm-fallback.md`; this plan owns the gating contract it must satisfy.
+  ▲ **"Reviewed" means the reviewed EXPECTATION REGISTRY at generation V2 — not a derived
+  blueprint** (§10.1). On today's evidence that is exactly ONE recipe, `posted_debit_amount`.
   ▲ **Its production ceiling is sandbox until §12's eight pieces exist.** Stated up front so nobody
   discovers it at Phase F.
 * **D2 — DELETE the old materialization route. Do not build an adapter.** The product is pre-live and
@@ -261,26 +299,55 @@ PUBLISH_SANDBOX requires a current passing one** — `VERIFICATION_NOT_CURRENT`,
 `evaluate_execution.py:183`. One column per action makes the difference statable; the merged column
 made it evasive.
 
+Rows marked `(child)` were folded in from the child plan's deleted D4 matrix and from the blocker
+codes its §3.2 proposed. They are here, and only here.
+
 | Condition | AUTHOR_FORMULA | GENERATE_PREVIEW | EXECUTE_SANDBOX | PUBLISH_SANDBOX | MATERIALIZE_PRODUCTION | PUBLISH_PRODUCTION |
 |---|---|---|---|---|---|---|
 | **No reviewed expectation, valid LLM-authored formula exists** | **Allow** | **Allow after deterministic validation** | **Allow + warn** | **Allow + warn** | **Require LLM-method certification + feature governance** | **Same certificate, re-derived** |
-| **Reviewed executable blueprint exists** | **Deterministic, zero provider calls** | Allow | Allow | Allow | **Require deterministic-method certification (§12)** | **Same certificate, re-derived** |
+| **Reviewed REGISTRY entry at generation V2, current, and it binds** (§10.1) | **Deterministic, zero provider calls** | Allow | Allow | Allow | **Require deterministic-method certification (§12)** | **Same certificate, re-derived** |
+| ▲ **Blueprint DERIVABLE but NOT reviewed** `(child)` | **LLM route — a derivation is not a review (§10)** | Allow after deterministic validation | Allow + warn | Allow + warn | **BLOCK** | **BLOCK** |
+| Reviewed expectation exists but is **Formula V1** `(child)` | **LLM route + warn** — V1 is not a V3-producible method (§10) | Allow after deterministic validation | Allow + warn | Allow + warn | **BLOCK** | **BLOCK** |
+| Deterministic instantiation of a reviewed blueprint **refused** `(child)` | **Block by name — NO silent LLM fallback**; an explicit new draft identity is a new user act | Block | Block | Block | Block | Block |
 | Method certificate pending / never run | Allow | Allow + warn | Allow + warn | Allow + warn | **BLOCK** | **BLOCK** |
 | Method certificate stale | Allow | Allow + warn | Allow + warn | Allow + warn | **BLOCK** | **BLOCK** |
 | Certificate exists but **method-mismatched** | Allow | Allow | Allow | Allow | **BLOCK** | **BLOCK** |
 | Any member lacks method identity (§10) | Allow | Allow | Allow | Allow | **BLOCK** | **BLOCK** |
 | Mixed-method artifact, one member's certificate stale | Allow | Allow | Allow | Allow | **BLOCK — all-must-pass** | **BLOCK — all-must-pass** |
-| Missing customer relationship / grain | Block | Block | Block | Block | Block | Block |
+| **Recipe business review not current** (`RECIPE_REVIEW_NOT_CURRENT`) `(child)` | Allow + warn | Allow + warn | Allow + warn | Allow + warn | **BLOCK** | **BLOCK** |
+| Missing customer relationship / grain / **unbound operand** | Block | Block | Block | Block | Block | Block |
+| **No frozen catalog snapshot** `(child)` | **Block** — there is nothing to author against | Block | Block | Block | Block | Block |
+| **Formula validation failed** `(child)` | Block — the proposal is the output, the refusal is the answer | Block | Block | Block | Block | Block |
 | Target leakage | business formula visible | Block | Block | Block | Block | Block |
 | Unsupported renderer operation | business formula visible | Block | Block | Block | Block | Block |
 | Missing currency / reversal / status policy | business formula visible | Block | Block | Block | Block | Block |
 | Caller lacks read authorization for the physical columns | **business-level formula only, no physical refs (§13)** | Block | Block | Block | Block | Block |
+| **Caller lacks a data-USE licence** (`PERSONAL_DATA_POLICY_REQUIRED`) `(child)` | Block — a licence is not a read scope, and no formula review makes the use lawful | Block | Block | Block | Block | Block |
+| **LLM authoring required, provider unreachable** `(child)` | **Block THIS member only** — a reviewed-blueprint member in the same set is unaffected | Block (this member) | Block (this member) | Block (this member) | Block | Block |
+| **LLM authoring required, no approved cost ceiling** `(child)` | **Block this member** — spend is an authorized act, not a side effect | Block (this member) | Block (this member) | Block (this member) | Block | Block |
+| **Conceptual pattern** (`CONCEPTUAL_PATTERN_NOT_AUTHORABLE`) `(child)` | **Save idea / specify computation only** — never a deterministic Generate Code affordance | Block | Block | Block | Block | Block |
+| **Governed model output** `(child)` | **Model workflow** — not a formula | Block (deterministic code) | Model workflow, not this action | Model workflow | **Model certification, a separate programme** | Model certification |
 | No sealed artifact yet | n/a | n/a — preview produces it | Block | Block | Block | Block |
 | Artifact sealed, **not yet verified** | Allow | Allow | **Allow — this is what produces verification** | **Block** | Block | Block |
 | Verification stale | Allow | Allow | **Allow — re-execute** | **Block** | Block | Block |
 | Artifact not servable (subgraph check refused) | Allow | Allow | Block | Block | Block | Block |
 | Environment incompatible | Allow | Allow | Block | Block | Block | Block |
 | Formula draft not pinned to the build set (§11) | Allow | **Block** | Block | Block | Block | Block |
+
+▲ **Two child rows were folded as CORRECTIONS rather than copied.**
+
+* The child's *"Artifact not verified → Sandbox: Depends on execution policy"* is the same evasion
+  the merged sandbox column produced (see the ▲ above). It does not depend. It splits into the two
+  sandbox rows already in the table.
+* The child's *"User lacks read/use authority → Formula visible only if already authored"* made
+  visibility depend on whether the platform had already spent money, which is not an authorization
+  rule. It splits into the read-scope row (§13's business-level formula) and the new data-use
+  licence row, which blocks outright.
+
+▲ **`AUTHOR_FORMULA` is an EXPLICIT, COSTED act, never a side effect of selection.** The child's D5
+is a rule this matrix assumes rather than states: selecting a candidate updates client state and
+spends nothing; polling, reload and double-click create no provider work. The money guard (§11.1) is
+the durable half of that promise, and it is currently broken.
 
 **The rule, stated so it can be quoted back at a future change:**
 
@@ -289,9 +356,10 @@ made it evasive.
 
 Which resolves to two routes and no third:
 
-* **Reviewed blueprint exists** → instantiate the formula **deterministically. NO LLM calls.**
-* **No blueprint** → **explicitly** ask the LLM, **validate deterministically**, and allow preview
-  and sandbox if the result is valid.
+* **A reviewed expectation-registry entry exists, at generation V2, and it binds** → instantiate the
+  formula **deterministically. NO LLM calls.**
+* **Anything else — including a merely DERIVED blueprint (§10.1)** → **explicitly** ask the LLM,
+  **validate deterministically**, and allow preview and sandbox if the result is valid.
 
 There is no automatic silent fallback from a failed deterministic instantiation to the LLM: the
 method is chosen from evidence before authoring, and a deterministic failure is a deterministic
@@ -315,7 +383,7 @@ disposition gets shipped.
 | Codes with **no disposition anywhere** | **29** |
 
 The 29 are not an oversight in that table — its exhaustiveness test
-(`tests/featuregen/overlay/upload/test_evaluator_contracts.py:51`) asserts equality against *codes
+(`tests/featuregen/overlay/upload/test_evaluator_contracts.py:50`) asserts equality against *codes
 the activation policy emits* ∪ `EVALUATOR_ONLY_BLOCKERS`, and the 29 are emitted by the option and
 eligibility layers instead. They include `TARGET_LEAKAGE_BLOCKED`, `CURRENCY_POLICY_MISSING`,
 `STATUS_POLICY_UNRESOLVED`, `JOIN_PATH_DENIED`, `SOURCE_GRAIN_MISMATCH`,
@@ -337,7 +405,7 @@ ACTION_DISPOSITIONS: Mapping[tuple[str, Action], Disposition]   # 51 × 6 = 306 
   is not the gate for it"*. Anything that decides whether a computation is LEGAL or POSSIBLE stays
   `BLOCK`.
 * **CI FAILS if any `(code, action)` pair is missing.** Extend the pattern already proved at
-  `test_evaluator_contracts.py:51` — enumerate the reason module's codes by reflection, enumerate
+  `test_evaluator_contracts.py:50` — enumerate the reason module's codes by reflection, enumerate
   `Action`, assert the product is covered. Do not invent a second exhaustiveness mechanism.
 * ▲ **This is the thing that stops a newly added code silently becoming a sandbox blocker.** Today an
   unknown code raises through `_explained` (`feature_execution.py:119`) at DISPLAY time — the wrong
@@ -357,6 +425,52 @@ actions from the day it lands):
 | `FORMULA_DRAFT_NOT_PINNED` | a build-set member names no `formula_draft_id` (§11) |
 | `ACTION_AUTHORIZATION_MISSING` | the request references no `action_authorization_revision` (§0.1) |
 | `FORMULA_REVIEW_UNMEASURED` | see §6 — the honest half of today's `FORMULA_SCHEMA_UNSUPPORTED` |
+| `LLM_AUTHORING_REQUIRED` `(child)` | **a WARNING, never a blocker** — the route selector, surfaced |
+| `REVIEWED_EXPECTATION_LEGACY_VERSION` `(child)` | a reviewed expectation exists and is Formula V1, so it cannot select the V3 producer (§10) |
+| `REVIEWED_BLUEPRINT_NOT_EXECUTABLE` `(child)` | deterministic instantiation of a reviewed blueprint refused — **and does not fall back** |
+| `BLUEPRINT_DERIVED_NOT_REVIEWED` `(child, new)` | a blueprint was *derived* structurally and no human reviewed it (§10) |
+| `FORMULA_VALIDATION_FAILED` `(child)` | the authored proposal did not pass deterministic validation |
+| `CATALOG_SNAPSHOT_NOT_FROZEN` `(child)` | there is no frozen snapshot to author or bind against |
+
+▲ **Three codes the child proposed are NOT added, and the reason matters.**
+`PRODUCTION_METHOD_CERTIFICATE_MISSING` / `_STALE` and `PRODUCTION_RECIPE_REVIEW_NOT_CURRENT`
+duplicate `METHOD_CERTIFICATE_MISSING`, `METHOD_CERTIFICATE_STALE` and the existing
+`R.RECIPE_REVIEW_NOT_CURRENT`. A code whose name embeds the ACTION cannot have a per-action
+disposition — the action is already a column. `LLM_AUTHORING_UNAVAILABLE` becomes
+`PROVIDER_UNAVAILABLE`, above, for the same reason. `FORMULA_NOT_READY` is a STATE, not a blocker.
+
+### ▲ Adding any code is a THREE-PART commit — P0, folded from the child's B3
+
+**Verified**: `tests/featuregen/overlay/upload/test_evaluator_contracts.py:50` regex-scans
+`activation_policy.py`'s **source text** for `R.([A-Z_]+)` and asserts
+
+```python
+assert len(emitted) == 16, sorted(emitted)
+assert emitted | EVALUATOR_ONLY_BLOCKERS == set(ACTIVATION_BLOCKER_DISPOSITIONS)
+```
+
+Both are **EQUALITIES**, deliberately — the test's own docstring says a superset check *"would let a
+genuinely lost code back in"*. So a seventeenth code mentioned anywhere in that module — even in a
+comment the regex happens to match — fails CI until the literal moves.
+
+▲ **And the second failure mode is worse than a red build.** `ACTIVATION_BLOCKER_DISPOSITIONS`
+(`evaluator_contracts.py:61`) is **18 CARRIED / 4 DROPPED** — verified by counting the rows.
+`evaluate_publish_sandbox` (`evaluate_execution.py:165`) folds `carried_blockers(...)` as its **FIRST
+act**, before it reads a single row of evidence. There is no literal default: `carried_blockers`
+indexes the mapping and **raises `KeyError`** on an unknown code, which is a 500 out of the sandbox
+publish path rather than a refusal. So a new production-certificate code has exactly two ways to go
+wrong, and both violate the owner's ruling that gold must not gate sandbox:
+
+| What you do | What happens |
+|---|---|
+| Add the code, no disposition row | `carried_blockers` raises — sandbox publication **crashes** |
+| Add the code with `CARRIED` (the table's norm, 18 of 22) | sandbox publication **is blocked by a production certificate** |
+
+**Therefore every new code lands with all three in the SAME commit:** its
+`semantic_eligibility_reasons` entry · an explicit `CARRIED`/`DROPPED` row **with a written reason**
+(the `len(reason) > 40` test enforces that a decision was made, not copied) · the `== 16` literal
+updated. The §5 `ACTION_DISPOSITIONS` table does not replace this one — until §7's service is the
+only caller, both exist, and both must be exhaustive.
 
 Families the table must cover by name, per the owner: conceptual patterns
 (`CONCEPTUAL_PATTERN_NOT_AUTHORABLE`), governed model outputs, stale recipe review
@@ -389,6 +503,27 @@ policies, the caller's read authorization, and the renderer's capability for eac
 So even a hypothetical `MATERIALIZATION_READY` recipe still collects `FORMULA_NOT_REVIEWED`. All
 three must be re-homed, not just the first.
 
+▲ **TWO VOCABULARIES, and the child was naming the wrong one — P0, folded from the child's B2.**
+The child's §3.2 and D3 proposed to keep `no_reviewed_formula_expectation` in the "legacy fold-owned
+set" as though that were the enforcing blocker. It is not. **Verified — these are two different
+codes in two different modules, and only one of them refuses anything:**
+
+| Code | Where | What it does |
+|---|---|---|
+| `"no_reviewed_formula_expectation"` | `recipe_readiness.py:37` (`BLOCKER_NO_REVIEWED_EXPECTATION`) | a **readiness-fold** string. Displays, sorts, explains. Enforces nothing |
+| `R.FORMULA_NOT_REVIEWED` = `"FORMULA_NOT_REVIEWED"` | `semantic_eligibility_reasons.py:93` | the **activation-policy** code emitted at `activation_policy.py:184`. This is the refusal |
+
+Leaving `no_reviewed_formula_expectation` fold-owned is correct *and changes nothing about the
+gate*. `R.FORMULA_NOT_REVIEWED` is the code the ladder actually raises, and it is what Phase B must
+re-home. ▲ The same distinction applies to the gold code: `BLOCKER_GOLD_UNPROVEN`
+(`"gold_evaluation_unproven"`, `recipe_readiness.py:39`) is a fold string with **no counterpart in
+`semantic_eligibility_reasons`** — which is precisely why §0.2 fact 1 could measure that removing
+gold changes zero served states.
+
+▲ And note where `R.FORMULA_NOT_REVIEWED` already sits in the disposition table:
+**`DROPPED`** — *"this evaluator is not the gate for it"*. The evaluator chain had already decided
+review is not its question. The activation ladder never got the message.
+
 ▲ **And the third is a FALSE STATEMENT to the operator.**
 `semantic_option_decision.py:403::_formula_schema_supported` begins:
 
@@ -416,7 +551,7 @@ operator to the engine team for a governance problem. The same function's blanke
 
 ▲ **Sequencing dependency:** **Phase C only works if Phase B has already removed the ladder from
 preview authorization.** Relocating gold while `MATERIALIZATION_READY` equality still authorizes
-preview would leave the same 295 recipes blocked by a different sentence, and §17's journey test
+preview would leave the same 295 recipes blocked by a different sentence, and §19's journey test
 would pass its production assertion while failing its preview assertion for an unrelated reason.
 
 ---
@@ -621,9 +756,39 @@ certificate against a count is matching on the wrong thing.
 | `LLM_AUTHORED` | provider · model id · author contract ref + hash · critic contract ref + hash · formula schema version · grammar version · governing policy version |
 | `REVIEWED_RECIPE_BLUEPRINT` | blueprint revision id · blueprint content hash · expectation hash · **expectation generation (V1/V2)** · producer version · compiler version · grammar version |
 
-▲ **Expectation generation is load-bearing, not decoration** — `has_reviewed_expectation()` unions
-two registries and **two of the three reviewed recipes are Formula V1**, so "a reviewed expectation
-exists" does not by itself identify a V3-producible method.
+▲ **Expectation generation is load-bearing, not decoration** — `has_reviewed_expectation()`
+(`recipe_formula_expectations_v2.py:53`) unions two registries and **two of the three reviewed
+recipes are Formula V1**, so "a reviewed expectation exists" does not by itself identify a
+V3-producible method.
+
+### ▲ 10.1 A DERIVED blueprint is not a REVIEWED blueprint — P0, folded from the child
+
+**Verified, and this is a governance hole rather than a modelling nicety.** The child's D2 selects
+`REVIEWED_RECIPE_BLUEPRINT` when *"a current executable V2 blueprint exists and binds"*, and its
+§3.1 supplies `blueprint_derivable` and `blueprint_bindable` as the facts that answer it. Those two
+facts do not know whether a human ever looked:
+
+| | |
+|---|---|
+| `derive_blueprint_v2` (`recipe_formula_blueprint_derivation.py:152`) | **pure — definition only.** Its own docstring: *"Pure: definition only."* It derives a blueprint for **90** of the 317 recipes |
+| `RECIPE_FORMULA_V2_EXPECTATIONS` (`recipe_formula_expectations_v2.py`) | **one entry**: `posted_debit_amount`. Its docstring: *"A2 derives a blueprint for 90 of the 317 recipes, but* which *of those 90 a human has actually reviewed is a governance answer no derivation can supply, and no `recipe_review_event` row exists yet"* |
+| `bypass_for` / `proposal_from_bound_expectation` (`deterministic_producer.py:138,173`) | **contain no review check.** `grep` for `has_reviewed`, `recipe_review_event` or `review_validity` across `deterministic_producer.py` and `replay_authoring_v2.py` returns **nothing** |
+
+So a lane that routes on derivability would seal `REVIEWED_RECIPE_BLUEPRINT` — and, under §10, mint
+a `method_identity_hash` naming a *blueprint revision and expectation hash* — for up to **90**
+recipes **no reviewer approved**. That is a sealed method claim the evidence does not support, and
+it is the one failure this whole programme cannot audit its way out of afterwards, because the seal
+is append-only.
+
+**The rule:**
+
+> `REVIEWED_RECIPE_BLUEPRINT` requires **membership in the reviewed expectation registry**, at
+> **expectation generation V2**, **and** a successful binding. Derivability is a fourth,
+> independent fact and **grants nothing**.
+
+A derived-but-unreviewed blueprint is a **proposal**. It may be shown, it may seed the child's
+review queue, and it selects the **LLM** route with `BLUEPRINT_DERIVED_NOT_REVIEWED` (§5) recorded —
+because on today's evidence one recipe qualifies for the deterministic lane, not ninety.
 
 **Storage — 1099 is APPLIED and append-only, so extend, never alter.** The table carries the trigger
 `sealed_artifact_member_provenance_no_change` (BEFORE UPDATE OR DELETE, raises). `ADD COLUMN` would
@@ -712,6 +877,102 @@ freezing whatever happens to be newest at migration time as though someone had c
 invented pinning. If the owner prefers a hard `NOT NULL`, existing rows must be deleted rather than
 backfilled.
 
+### 11.1 The MONEY GUARD, its enforced retirements, and the constant nobody noticed — P0
+
+Folded from the child's B1, **verified — and one step worse than the child reported.**
+
+**The chain, as shipped:**
+
+```
+_authoring_config_hash()              formula_drafts.py:279      hashes {model, max_tokens, prompt_id}
+   → formula_identity()               formula_draft_store.py:246 folds it with 5 other facts
+   → formula_draft.formula_identity_hash
+   → CREATE UNIQUE INDEX formula_draft_identity      1090_formula_draft.sql:101
+```
+
+Migration 1090 names that index **"THE MONEY GUARD"** in its own comment: *"One paid authoring run
+per formula identity — a second request for the same candidate, snapshot and configuration finds
+this row instead of buying the answer again."*
+
+▲ **Retirement is enforced ONLY by identity collision.** `request_draft`
+(`formula_draft_store.py:335-367`) inserts `ON CONFLICT (formula_identity_hash) DO NOTHING`, and
+reads `formula_draft_retirement` **only when the INSERT loses the race**. Its own comment says so:
+*"the identity is UNIQUE, so a new draft id alone does not defeat this conflict."* **If every insert
+succeeds, no retirement is ever consulted.** A composition change is therefore not just a re-spend —
+it is a silent, blanket un-retirement of every formula anyone has ever withdrawn.
+
+**So the child's §3.3 — recompute `authoring_config_hash` as
+`hash({formula_strategy, strategy_identity_hash})` — is refused.** Replacing the composition voids
+the guard and every recorded retirement in one edit.
+
+**Instead: FOLD, do not replace.**
+
+```
+authoring_config_hash = jcs_sha256({
+    provider_contract_hash,     # NEW — the frozen author/critic contract (frozen_configuration.py)
+    formula_strategy,           # from the child
+    strategy_identity_hash,     # from the child
+    ... the model/prompt facts, ACTUALLY READ (see the defect below)
+})
+```
+
+▲ **Measured and mutable facts stay OUT.** The child's `blueprint_bindable` and
+`semantic_inputs_ready` are *measurements of the world*, not descriptions of the build. A
+measurement that flaps re-mints the identity and **buys the same answer twice** — which is the exact
+expense the index exists to prevent. `formula_identity`'s own docstring already states this rule
+about engine capabilities: *"folding them in would buy the same answer again every time an engine
+gained an operator."*
+
+#### ▲ The live defect: `_authoring_config_hash()` is a CONSTANT
+
+Neither plan knew this, and it inverts B1's premise.
+
+```python
+settings = current_formula_generation_settings()   # returns a dict — audited.py:47
+jcs_sha256({
+    "model":      getattr(settings, "model", ""),        # dicts have no .model attribute
+    "max_tokens": getattr(settings, "max_tokens", 0),    # → 0
+    "prompt_id":  getattr(settings, "prompt_id", ""),    # → "" ; not even a key in the dict
+})
+```
+
+`_generation_settings()` (`enrich_llm.py:1019`) returns a **plain dict** —
+`{"provider", "model", "max_tokens", "thinking", "effort"}`. `getattr` on a dict looks up an
+**attribute**, not a key, so all three defaults fire, every time. **Measured on this branch, under
+three different provider/model configurations:**
+
+```
+fake/test            f5c34b84d694062755f4b88605f9fc8d67e2f4ac1699054f99f6ccd09bfdc3c8
+anthropic/opus       f5c34b84d694062755f4b88605f9fc8d67e2f4ac1699054f99f6ccd09bfdc3c8
+anthropic/haiku      f5c34b84d694062755f4b88605f9fc8d67e2f4ac1699054f99f6ccd09bfdc3c8
+                     == jcs_sha256({"model": "", "max_tokens": 0, "prompt_id": ""})
+```
+
+**The money guard has been blind to model, token budget and prompt since it shipped.** Two drafts
+authored under different models collide on identity and are treated as interchangeable — the precise
+thing `_authoring_config_hash`'s docstring says it exists to notice: *"two drafts authored under
+different model contracts are not interchangeable, and the identity has to notice."* It does not
+notice. `prompt_id` is not a key of that dict at all, so even correcting `getattr` to subscription
+does not produce one; the prompt identity has to come from the frozen provider contract instead.
+
+**Consequences for the sequence, all three of which this programme owns:**
+
+1. **This is a §15 violation already on the branch** — a governance value with no enforcement, whose
+   docstring asserts the enforcement. It is not the child's to fix in passing; it is step 2 of §17.
+2. ▲ **ANY composition change re-hashes EVERY existing draft.** Every request then wins its INSERT,
+   consults no retirement row, and **re-authors and re-bills withdrawn formulas.** The plan must own
+   one of exactly two remedies, before deploy, and say which:
+   * **(a) One-time re-spend, with every existing retirement RE-ASSERTED against the new identities
+     first** — re-assertion before the composition lands, not after. Recomputing retirements after
+     the deploy leaves a window in which the withdrawn formula is buyable.
+   * **(b) Backfill a value that reproduces today's hash.** ▲ Cheap here, precisely because the
+     current value is a constant: write `f5c34b84…` into the existing rows' new-shaped payload so
+     their identities do not move, and let only NEW drafts carry the real composition. Re-derive the
+     literal at implementation time rather than trusting this line.
+3. **The corrected composition is itself the change** — fixing `getattr` and folding
+   `provider_contract_hash` are ONE identity change, not two. Doing them in separate commits pays
+   the re-spend twice.
+
 ---
 
 ## 12. The deterministic certification programme is only NAMED
@@ -793,6 +1054,7 @@ and a perfectly governed feature refused because the platform's evaluation job h
 | `sealed_artifact_member_provenance` (1099) had no writer | **fixed at `364cd7fa`**, migration applied at ledger 195 |
 | `evaluate_publish_production` proposed with no endpoint | **still true — the function does not exist, and §9 is what stops it repeating** |
 | `activation_blockers: Sequence[str] = ()` with no caller supplying it | **still true — §8.1** |
+| `_authoring_config_hash` asserts in its docstring that the identity notices a model change, and returns a constant | **still true — §11.1.** The enforcement point exists (migration 1090's unique index); the VALUE feeding it is inert |
 
 The rule: a merged governance function whose enforcement point is "next phase" is indistinguishable,
 from the outside, from a governance function that does nothing.
@@ -825,10 +1087,81 @@ may block on the second before its final two steps.
 
 ---
 
-## 17. The phases
+## 17. The combined TEN-STEP sequence — this supersedes both plans' phase orders
+
+The owner's order, for the parent and the child together. ▲ **Where a phase list in either document
+disagrees with this, this wins.** Neither document's internal phase letters/numbers are an execution
+order any more; they are names for bodies of work that these ten steps sequence.
+
+| # | Step | Owner | Where it is specified |
+|---|---|---|---|
+| **1** | **Amend both plans; establish ONE authoritative action matrix** | **SHARED** | this revision + the child's revision; matrix = §4 |
+| **2** | **Identity and authorization foundations** — server-derived roles · exact formula-draft pinning · immutable action authorization · output-affecting declarations included in identity · exact per-member method identity | **PARENT** | §0.1 · §11 · §11.1 · §10 · §10.1 |
+| **3** | **Shared action-decision service** | **PARENT** | §7 (service) · §5 (dispositions) · §8 (bypasses) · §6 (ladder removed from preview) |
+| **4** | **Recipe formula routing** — reviewed executable blueprint → deterministic authoring; otherwise → **explicit** LLM authoring; **deterministic validation for BOTH** | **CHILD** *(contract from parent §4, §10.1)* | child D1/D2/D3 · child §3.1 · child steps 4a–4c |
+| **5** | **Durable recipe-to-code coordinator and preview generation** | **CHILD** | child §3.5 · child steps 5a–5c (coordinator, API, frontend journey) |
+| **6** | **Sandbox execution and sandbox publication as SEPARATE actions** | **PARENT** | §3 · §4's two sandbox columns · §5 |
+| **7** | **Production materialization/publication gates and method certificates** | **PARENT** | §9 · §10 |
+| **8** | **Atomically move gold OUT of preview readiness INTO the production boundary** | **PARENT** | Phase C — one commit with step 7 |
+| **9** | **Both evaluation programmes** — LLM authoring, and deterministic recipe-compiler | **SHARED** | parent §12 + Phase E (the programmes) · child step 9 (growing the corpus they run on) |
+| **10** | **Both-method / both-route / adversarial journey tests, then remove the legacy path** | **SHARED** | parent §19 + Phases F/G · child step 10 (its own 17 scenarios + Kind cutover) |
+
+▲ **Steps 6, 7 and 8 are the reason the child cannot own the decision service.** The child's original
+Phase 5 proposed to build it — with four actions, no sandbox-publication split, and gold relocation
+inside the same phase. That phase is **dissolved**: its decision-service half becomes parent step 3,
+its gold-relocation half becomes parent step 8, and its certificate-reader half becomes parent
+step 7. The child keeps none of it.
+
+### What each existing phase becomes — nothing is orphaned
+
+| Plan | Phase | → Step | Note |
+|---|---|---|---|
+| Parent | **A** — the sealing writer | — | ✅ **DONE at `364cd7fa`**, migration applied. Discharged before step 2 |
+| Parent | **0** — server-derived authz + formula pinning | **2** | joined by §11.1's money-guard composition, which is the same identity change |
+| Parent | **B** — six actions + one decision service | **3** and **6** | the six-action split IS step 6; the service IS step 3. Its "first output" measurement lands here |
+| Parent | **C** — production boundary + gold relocation | **7** and **8** | **one commit**, as it already says |
+| Parent | **D** — the deterministic reviewed-blueprint lane | **4** | the design moves to the child; the parent keeps the CONTRACT (§4, §10.1) |
+| Parent | **E** — the operator journey | **9** | both programmes; the compiler one still needs §12's eight pieces |
+| Parent | **F** — the journey tests | **10** | |
+| Parent | **G** — cutover | **10** | after decision-equivalence passes |
+| Child | **0** — baseline + characterization measurements | **1** | its "finish or shelve the 1099 writer" item is **stale**: Phase A did it |
+| Child | **1** — split recipe maturity from executable action | **3** | **SHARED**: the parent removes the ladder from authorization (§6); the child owns the capability projection, the wording and the client filters |
+| Child | **2** — persist formula-strategy selection | **4** | |
+| Child | **3** — wire reviewed deterministic authoring | **4** | now gated on §10.1: reviewed registry membership, not derivability |
+| Child | **4** — harden the LLM fallback | **4** | |
+| Child | **5** — "build the one action-decision service" | **3, 7, 8** | ▲ **DISSOLVED into the parent.** See above |
+| Child | **6** — the durable coordinator | **5** | |
+| Child | **7** — the frontend journey | **5** | |
+| Child | **8** — reviewed-expectation growth | **9** | explicitly **not** a prerequisite for LLM preview |
+| Child | **9** — end-to-end and adversarial tests | **10** | its 17 scenarios join §19's reintroduction table |
+| Child | **10** — Kind deployment and cutover | **10** | its "thin adapter" item is superseded by D2 — **delete the route** |
+
+### ▲ Migration numbers — RESERVED across both plans
+
+Live ledger is **195**; the highest file on this branch is **1099**, applied. Both plans independently
+claimed 1100. Reserved:
+
+| # | Owner | Table / change | Step |
+|---|---|---|---|
+| 1100 | **parent §0.1** | `action_authorization_revision` + `generation_request` FK NOT NULL | 2 |
+| 1101 | **parent §11** | `build_set_member.formula_draft_id` + `formula_content_hash` (NULLABLE — §11's judgement call) | 2 |
+| 1102 | **parent §10** | `sealed_artifact_member_method_identity` (append-only, same guard as 1099) | 2 |
+| 1103 | **parent §9/§10** | production attempt records + `production_attempt_member_certificate` | 7 |
+| 1104 | **child** | `formula_draft_authoring_plan` | 4 |
+| 1105 | **child** | `authoring_work_item` origin/strategy split | 4 |
+| 1106 | **child** | `code_generation_job` + `_member` + `_event` | 5 |
+
+▲ A reservation is not a commitment: **re-verify the ledger at the moment of writing each file**, and
+apply §15's rule — *a governance table's writer and its migration are one deployment unit, migration
+first*.
+
+---
+
+## 18. The phases
 
 Ordered by dependency, not size. **Phase 0 is a prerequisite and Phase B is the spine**; the rest
-attach to B, and doing it late means writing each gate twice.
+attach to B, and doing it late means writing each gate twice. ▲ **Read §17 first** — these phase
+letters are names for bodies of work, and §17 is the order they run in.
 
 ### Phase A — the sealing writer ✅ DONE at `364cd7fa`, migration applied
 Per-member provenance is derived and written inside `seal_v2`, from the one place where
@@ -848,10 +1181,16 @@ them (§8.2).
 * **§11** — pin `formula_draft_id` + `formula_content_hash` per build-set member; both enter
   `content_hash`; `restore_formula_v3` selects by draft id and refuses hash mismatch; legacy rows
   refused, not backfilled.
+* **§11.1** — **one** identity change: fix `_authoring_config_hash`'s `getattr`-on-a-dict defect AND
+  fold in `provider_contract_hash` + the child's `{formula_strategy, strategy_identity_hash}`,
+  measured facts excluded. Re-assert every existing retirement, or backfill the constant. Doing this
+  in two commits pays the re-spend twice.
 
 **Proof:** a request that supplies elevated roles in its body gets exactly the read scope its
 identity earns — asserted against a governed-`restricted` column. A build whose selection acquires a
-newer draft between request and worker **refuses**, and its build-set identity is unchanged.
+newer draft between request and worker **refuses**, and its build-set identity is unchanged. Two
+draft requests under different deployed models produce **different** identities — the assertion that
+fails today.
 
 ### Phase B — the six actions and ONE decision service ▲ THE SPINE
 * Split the single `MATERIALIZATION_READY` authorization into the **six** action decisions of §3.
@@ -889,7 +1228,8 @@ Resolve the method **server-side, from evidence, before authoring**: reviewed cu
 blueprint → `deterministic_producer` with **zero provider calls**; otherwise → explicit LLM authoring
 with the cost shown first, then deterministic validation. Stop `formula_drafts.py:269` hard-coding
 `llm_authored` and read the evidence instead. The resolver must return the **expectation generation**
-too (§10). Detailed tasks live in `2026-08-22-recipe-to-code-llm-fallback.md`.
+too (§10), and must read the **reviewed registry**, never the derivation (§10.1).
+**Detailed tasks live in the child plan** `2026-08-22-recipe-to-code-llm-fallback.md`, step 4.
 ▲ Ceiling: sandbox, until §12.
 
 ### Phase E — the operator journey (Governance → Formula quality)
@@ -906,7 +1246,7 @@ evaluation, but nothing walks the cases as a user-triggered job.
 ### Phase F — the journey tests ▲ BEFORE removing the old path
 Both methods, end to end: hypothesis → recommendation → selection → formula → preview project →
 inspect code → sandbox execution → sandbox publication → attempt production materialization → attempt
-production publication. §18 is the decisive one.
+production publication. §19 is the decisive one.
 
 Must also prove: certification pending does **not** block preview · it **does** block production
 **materialization** · target leakage blocks preview · missing currency/reversal blocks preview · a
@@ -924,7 +1264,7 @@ forward is a cutover onto an unauthorized lane.
 
 ---
 
-## 18. The decisive journey test
+## 19. The decisive journey test
 
 Given a valid **"90-day incoming amount minus prior 90-day"** formula with complete grain and
 bindings, resolved policies, a supported renderer, a pinned formula draft, and **NO current method
@@ -957,13 +1297,17 @@ proves nothing here. Reintroduce these one at a time and confirm the failure:
 | **unpin the formula draft** | build-set identity binds one formula |
 | **bind ONE certificate per attempt instead of per member** | mixed-method artifact requires two |
 | merge `EXECUTE_SANDBOX` and `PUBLISH_SANDBOX` decisions | unverified artifact executes but does not publish |
+| **restore `getattr`-on-a-dict in `_authoring_config_hash`** (§11.1) | **two deployed models produce two draft identities** |
+| **recompose `authoring_config_hash` without `provider_contract_hash`** (§11.1) | a retired formula is re-authored and re-billed |
+| **route on `blueprint_derivable` instead of registry membership** (§10.1) | a derived, unreviewed blueprint seals `REVIEWED_RECIPE_BLUEPRINT` |
+| **give a new blocker code a `CARRIED` disposition by default** (§5) | sandbox publication still allowed under a pending certificate |
 
 Verify the injection actually applied, and read pytest's summary line — `grep -c "^FAILED"` silently
 matches nothing against coloured output and reports a false pass.
 
 ---
 
-## 19. Risks
+## 20. Risks
 
 * **Phase 0 is a prerequisite people will want to reorder.** It looks like cleanup and it is the
   authorization model. Every worker-side recheck built before it is decorative.
@@ -976,16 +1320,23 @@ matches nothing against coloured output and reports a false pass.
 * **Placement.** A gate put on the sandbox path blocks sandbox testing. When a change makes many
   tests on ONE path fail, treat that as a placement signal before treating it as a product question.
 * **Weak tests.** Tests that construct their own fixtures and assert them back prove nothing here.
-  Drive the real path; §18's reintroduction table is the check that the tests have teeth.
+  Drive the real path; §19's reintroduction table is the check that the tests have teeth.
 * **The 295 is a ceiling, not a forecast** (fact 2). If Phase B's measurement returns a small number,
   that is information about binding/grain/policy/renderer coverage, not a failure of this plan — but
   it must be reported rather than absorbed.
-* **Migration ordering.** 1099 taught the rule and is now applied; §0.1, §10 and §11 each add a
-  migration (≥1100) whose writer must not ship ahead of it.
+* **Migration ordering.** 1099 taught the rule and is now applied; §0.1, §10, §11 and §9 each add a
+  migration whose writer must not ship ahead of it. ▲ **Both plans independently claimed 1100** —
+  §17 reserves the range; re-verify the ledger at write time.
+* ▲ **The money guard's re-spend is a REAL BILL, not a test concern** (§11.1). It is the only step
+  in this programme that costs money to get right, and the only one whose botched version silently
+  un-retires withdrawn formulas. It belongs to step 2, where it can be done once.
+* ▲ **"Reviewed" is the word most likely to drift back to "derivable"** (§10.1). Ninety derivations
+  exist and one review does; a resolver written from the derivation module reads as correct, passes
+  its own tests, and seals ninety unreviewed method claims into an append-only table.
 
 ---
 
-## 20. Not engineering, and not blocking these phases
+## 21. Not engineering, and not blocking these phases
 
 ▲ **"Nine expert sign-offs" understated it by roughly a factor of three.** What is actually needed to
 grow the reviewed corpus past its single clean case:
@@ -1012,7 +1363,7 @@ happen.
 
 ---
 
-## 21. What this plan already gets right — confirmed by the owner, do not regress
+## 22. What this plan already gets right — confirmed by the owner, do not regress
 
 Recorded because each of these was a live defect once and a future change will be tempted by each:
 
@@ -1026,4 +1377,8 @@ Recorded because each of these was a live defect once and a future change will b
 | **Request AND worker** boundaries both enforce | §8.2 |
 | Production certification is **method-matched** and **all-members-must-pass** | §9, §10 |
 | Gold removal and the production gate **land together** | Phase C |
-| **Defect-injection** journey tests are required, not optional | §18 |
+| **Defect-injection** journey tests are required, not optional | §19 |
+| There is **ONE action matrix** in the repo, and one decision service | preamble, §4, §7 |
+| A **derived** blueprint is not a **reviewed** one | §10.1 |
+| Identity composition **folds**, never **replaces** — and measured facts stay out | §11.1 |
+| A new blocker code lands with its disposition **and** the `== 16` literal, same commit | §5 |
