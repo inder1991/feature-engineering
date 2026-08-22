@@ -537,10 +537,58 @@ opposite candidate rules:
 **This is an owner decision, not an engineering one.** §0.1.1.1 currently asserts the same-actor rule
 and must not be implemented until it is settled.
 
+## The owner's development-policy ruling, and what it removed
+
+Mid-execution the owner ruled that segregation of duties is premature while the tool is under
+development. **Any authenticated development user may trigger any implemented non-production stage,
+and the server records who.** The safeguards that remain are the ones that are not temporary: roles
+never come from a request body, a client cannot present an authorization the server did not issue to
+it, production actions stay unavailable, and Kind is a development environment whatever an action is
+called.
+
+▲ **This settles B2 in a third way — neither of the two the review offered.** The check built for it
+survives, but as the *"permission is server-owned"* safeguard rather than as a duties rule, and every
+comment around it says so, so nobody later builds four-eyes on top of a foundation that was never
+laying it.
+
+**Removed from the near-term path**, deferred to release-readiness (§21.0): approver ≠ executor,
+delegation records, per-environment entitlement, the revocation tri-state, and
+`ACTION_AUTHORIZATION_UNVERIFIABLE`. ▲ **`policy_version = 'development-v1'` is what keeps that
+deferral honest** — otherwise a deferral and an omission are indistinguishable in hindsight.
+
+## A correction the implementation forced: expand before contract
+
+Migration 1100 was specified to create the new table, re-point 1095's chain and drop
+`generation_authorization` in one file. **It ships expand-only, dropping nothing.**
+
+The reason is R13's own argument turned around: the plan says rollback must restore the database
+because these migrations are not backward-compatible — **so make the ones that can be, be.** An
+additive 1100 leaves the running image working, which means an image-only rollback stays safe and
+this migration needs no maintenance window at all. The contract half becomes 1100b, once all six
+acts have callers on the new table.
+
+▲ **Worth applying to 1101–1105 wherever available.** It is the cheapest way to shrink the window
+§20.1 describes, and it was not visible until someone tried to write the migration.
+
 ## Delivered in this pass
 
 * **B4 fixed** — `derive_authoring_method`'s contradiction guard now uses raw dispatch presence, so
   unreconciled provider calls plus a reviewed bypass **refuse** instead of sealing
-  `REVIEWED_RECIPE_BLUEPRINT`. Two tests added, and **verified to bite**: with the defect
-  reintroduced they fail `DID NOT RAISE`, confirming the old code silently returned the strongest
-  method claim. `2766 passed, 1 skipped` across `materialize/` and the build-set routes.
+  `REVIEWED_RECIPE_BLUEPRINT`. Two tests, **verified to bite** (`DID NOT RAISE` with the defect
+  reintroduced).
+* **B2 closed as the server-owned safeguard** — `authorization_grantee` plus a 403
+  `ACTION_AUTHORIZATION_NOT_HELD` at the route. The grantee had to be read separately because
+  `load_generation_authorization` reconstructs only the five identity-bearing columns. **Five
+  existing route tests failed, and that was the finding**: they had been asserting that spending
+  somebody else's authorization succeeds.
+* **C1 ported** — `materialize/reconcile_generation.py`, wired into the worker tick, gated on the
+  GENERATION switch. Judges `REQUESTED` as well as `CLAIMED`/`RUNNING`; writes `FAILED`, never
+  `REFUSED`; separate gauge. ▲ **The trap test is verified to bite**: under the naive
+  "queue-not-leased" predicate it terminalizes a request that was healthily awaiting redelivery.
+* **Migration 1100 + `action_authorization.py`** — the six-action vocabulary, the development
+  policy, append-only storage. Production acts raise `ActionUnavailable` and record nothing. 19
+  tests.
+
+**Still owed on step 2:** the relational selection→formula binding (1101), method identity (1102),
+retirement rework (1103), the strategy contract (1104), spend authorization (1105) — and B1's full
+fix, whose bounded re-attempt binds to 1105.

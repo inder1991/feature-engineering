@@ -189,13 +189,29 @@ def _selection(conn, revision_id: str, *, option_id: str = "opt-a") -> str:
     return revision_id
 
 
+
+def _bind(conn, selection_revision_id: str, draft_id: str = "fd-restore") -> str:
+    """Pin this selection to this draft, the way a coordinator does before declaring a build set.
+
+    ▲ Restoring now resolves THROUGH the pin rather than searching for "the newest draft", so every
+    test that used to name a selection names a binding instead.
+    """
+    from featuregen.overlay.upload.selection_formula_binding import (
+        record_selection_formula_binding,
+    )
+
+    binding, _ = record_selection_formula_binding(
+        conn, selection_revision_id=selection_revision_id, formula_draft_id=draft_id)
+    return binding.binding_id
+
+
 # ══ THE HAPPY PATH ══════════════════════════════════════════════════════════════════════════════
 def test_A_READY_DRAFT_BECOMES_AN_ADMISSION_INPUT(db, catalog, monkeypatch):
     """The conversion the V2 path was missing entirely."""
     _ready_draft(db, monkeypatch)
     _selection(db, "sel-1")
 
-    restored = restore_formula(db, selection_revision_id="sel-1")
+    restored = restore_formula(db, selection_formula_binding_id=_bind(db, "sel-1"))
 
     assert restored.selection_revision_id == "sel-1"
     assert restored.formula_draft_id == "fd-restore"
@@ -211,22 +227,37 @@ def test_the_restored_input_is_ADMISSIBLE(db, catalog, monkeypatch):
     _ready_draft(db, monkeypatch)
     _selection(db, "sel-1")
     _advertise(db)                     # renderer support recorded for this engine
-    restored = restore_formula(db, selection_revision_id="sel-1")
+    restored = restore_formula(db, selection_formula_binding_id=_bind(db, "sel-1"))
 
     admitted = admit_artifacts_v2(db, [restored.input], engine_id=ENGINE)
     assert admitted and admitted[0].proposal_content_hash
 
 
 # ══ EVERY REFUSAL NAMES THE SELECTION ══════════════════════════════════════════════════════════
-def test_a_selection_with_NO_DRAFT_refuses_and_says_what_to_do(db, catalog, monkeypatch):
-    """Selecting and drafting are separate acts, so a selected candidate may genuinely have no
-    formula. The refusal says so and says which act is missing."""
+def test_a_selection_with_NO_DRAFT_CANNOT_EVEN_BE_PINNED(db, catalog, monkeypatch):
+    """▲ THIS REFUSAL MOVED EARLIER, and that is the improvement. Selecting and drafting are still
+    separate acts, so a selected candidate may genuinely have no formula — but the platform now
+    finds out when the build set is DECLARED rather than when the worker tries to build it. A pin
+    cannot be created for a candidate nobody drafted."""
+    from featuregen.overlay.upload.selection_formula_binding import (
+        BindingDisagreement,
+        record_selection_formula_binding,
+    )
+
     _selection(db, "sel-undrafted", option_id="opt-never-drafted")
+
+    with pytest.raises(BindingDisagreement, match="does not exist"):
+        record_selection_formula_binding(
+            db, selection_revision_id="sel-undrafted", formula_draft_id="fd-never-drafted")
+
+
+def test_a_MEMBER_WITH_NO_PIN_refuses_and_says_why(db, catalog, monkeypatch):
+    """The build-time half: a member naming a binding that is not there. Resolving "the newest
+    draft" instead is exactly the drift the pin exists to prevent, so this is a refusal."""
     with pytest.raises(MaterializationRefused) as raised:
-        restore_formula(db, selection_revision_id="sel-undrafted")
+        restore_formula(db, selection_formula_binding_id="bind-nobody-made")
     assert raised.value.code is CompilationRefusalCode.NOT_RESOLVED
-    assert "sel-undrafted" in raised.value.detail
-    assert "Draft it first" in raised.value.detail
+    assert "bind-nobody-made" in raised.value.detail
 
 
 def test_a_draft_that_stopped_short_refuses_WITHOUT_re_explaining_itself(db, catalog, monkeypatch):
@@ -234,34 +265,71 @@ def test_a_draft_that_stopped_short_refuses_WITHOUT_re_explaining_itself(db, cat
 
     _ready_draft(db, monkeypatch)
     _selection(db, "sel-1")
+    binding = _bind(db, "sel-1")       # pinned while READY, as a coordinator would
     db.execute("UPDATE formula_draft SET state='FAILED', failure_reason='x' "
                "WHERE formula_draft_id='fd-restore'")
 
     with pytest.raises(MaterializationRefused) as raised:
-        restore_formula(db, selection_revision_id="sel-1")
+        restore_formula(db, selection_formula_binding_id=binding)
     assert "rather than READY" in raised.value.detail
     assert "already recorded why" in raised.value.detail
 
 
-def test_a_selection_that_does_not_exist_refuses(db, catalog, monkeypatch):
-    with pytest.raises(MaterializationRefused, match="does not exist"):
-        restore_formula(db, selection_revision_id="sel-nonexistent")
+def test_a_selection_that_does_not_exist_CANNOT_BE_PINNED(db, catalog, monkeypatch):
+    """The refusal moved to pinning time along with the one above: there is no choice to pin to."""
+    from featuregen.overlay.upload.selection_formula_binding import (
+        BindingDisagreement,
+        record_selection_formula_binding,
+    )
+
+    _ready_draft(db, monkeypatch)
+
+    with pytest.raises(BindingDisagreement, match="does not exist"):
+        record_selection_formula_binding(
+            db, selection_revision_id="sel-nonexistent", formula_draft_id="fd-restore")
 
 
 # ══ THE TRACE AND THE DRAFT MUST AGREE ═════════════════════════════════════════════════════════
+def test_A_PINNED_FORMULA_CANNOT_BE_CHANGED_UNDERNEATH_THE_BUILD(db, catalog, monkeypatch):
+    """▲ THE DATABASE REFUSES THIS OUTRIGHT, which is stronger than the runtime check beside it.
+
+    `formula_draft` freezes its IDENTITY columns and permits its RESULT columns to move — so before
+    the pin existed, a draft's contents could change after a build set was declared and the build
+    would compile whatever was there. Migration 1101's composite foreign key includes
+    `formula_content_hash`, so once a binding references the draft, that column cannot move at all
+    while the pin exists.
+
+    `restore_formula` still compares the two. That comparison is DEFENCE IN DEPTH rather than the
+    guarantee — the same relationship the queue has between its partition predicate and
+    `queue_one_inflight_per_partition`: the index is what makes it true, the check is what makes it
+    legible.
+    """
+    import psycopg
+
+    _ready_draft(db, monkeypatch)
+    _selection(db, "sel-1")
+    _bind(db, "sel-1")
+
+    with pytest.raises(psycopg.errors.ForeignKeyViolation, match="selection_formula_binding"):
+        db.execute("UPDATE formula_draft SET formula_content_hash='sha256:something-else' "
+                   "WHERE formula_draft_id='fd-restore'")
+
+
 def test_A_DRAFT_DISAGREEING_WITH_ITS_TRACE_IS_REFUSED(db, catalog, monkeypatch):
     """The draft is what a person READ; the trace is what the run DECIDED.
 
-    Building while they disagree would compile a formula nobody reviewed — so this is a refusal
-    rather than a choice between two sources.
+    ▲ Pinned AFTER the tamper on purpose, so the pin agrees with the draft and this test exercises
+    the TRACE comparison rather than the pin. Without that ordering the pin would refuse first and
+    this check would be dead while still appearing to pass.
     """
     _ready_draft(db, monkeypatch)
     _selection(db, "sel-1")
     db.execute("UPDATE formula_draft SET formula_content_hash='sha256:something-else' "
                "WHERE formula_draft_id='fd-restore'")
+    binding = _bind(db, "sel-1")
 
     with pytest.raises(MaterializationRefused) as raised:
-        restore_formula(db, selection_revision_id="sel-1")
+        restore_formula(db, selection_formula_binding_id=binding)
     assert raised.value.code is CompilationRefusalCode.INTENT_HASH_MISMATCH
     assert "nobody reviewed" in raised.value.detail
 
@@ -275,7 +343,8 @@ def test_declared_ORDER_IS_PRESERVED(db, catalog, monkeypatch):
     _selection(db, "sel-a", option_id="opt-a")
     _selection(db, "sel-b", option_id="opt-b")
 
-    restored = restore_build_set_formulas(db, selection_revision_ids=["sel-b", "sel-a"])
+    restored = restore_build_set_formulas(
+        db, selection_formula_binding_ids=[_bind(db, "sel-b", "fd-b"), _bind(db, "sel-a", "fd-a")])
     assert [r.selection_revision_id for r in restored] == ["sel-b", "sel-a"]
 
 
@@ -284,17 +353,18 @@ def test_ONE_BAD_MEMBER_STOPS_THE_WHOLE_SET(db, catalog, monkeypatch):
     nobody decided — admit_artifacts_v2's rule, and it applies with more force to a build set."""
     _ready_draft(db, monkeypatch, draft_id="fd-a", option_id="opt-a")
     _selection(db, "sel-a", option_id="opt-a")
-    _selection(db, "sel-missing", option_id="opt-b")     # a real option nobody drafted
+    _selection(db, "sel-missing", option_id="opt-b")     # a real option nobody drafted or pinned
 
     with pytest.raises(MaterializationRefused) as raised:
-        restore_build_set_formulas(db, selection_revision_ids=["sel-a", "sel-missing"])
-    assert "sel-missing" in raised.value.detail
+        restore_build_set_formulas(
+            db, selection_formula_binding_ids=[_bind(db, "sel-a", "fd-a"), "bind-missing"])
+    assert "bind-missing" in raised.value.detail
 
 
 def test_an_empty_or_duplicated_group_is_a_CALLER_DEFECT_not_a_verdict(db, catalog, monkeypatch):
     """The closed refusal vocabulary has no member for "the caller assembled the batch wrongly",
     and inventing one would type a caller defect as a verdict about an artifact."""
     with pytest.raises(ValueError, match="restores nothing"):
-        restore_build_set_formulas(db, selection_revision_ids=[])
+        restore_build_set_formulas(db, selection_formula_binding_ids=[])
     with pytest.raises(ValueError, match="appears twice"):
-        restore_build_set_formulas(db, selection_revision_ids=["sel-a", "sel-a"])
+        restore_build_set_formulas(db, selection_formula_binding_ids=["b-1", "b-1"])

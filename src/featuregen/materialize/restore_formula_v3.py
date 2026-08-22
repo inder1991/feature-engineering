@@ -65,9 +65,22 @@ class RestoredFormulaV3:
 def restore_formula(
     conn: DbConn,
     *,
-    selection_revision_id: str,
+    selection_formula_binding_id: str,
 ) -> RestoredFormulaV3:
-    """Rehydrate ONE selection's READY formula, or refuse with a code naming the selection.
+    """Rehydrate the formula THIS BUILD PINNED, or refuse with a code naming the selection.
+
+    ▲ **RESOLVED THROUGH THE PIN, never by recency.** This function used to join drafts on
+    ``(considered_revision_id, option_id)`` and take ``ORDER BY d.updated_at DESC LIMIT 1`` — the
+    newest draft for this selection, *whenever the worker happened to look*. Two consequences, and
+    the second is the one nobody would have noticed:
+
+    * a draft landing between the decision and the build changed what the build MEANT while
+      ``build_set_revision.content_hash`` stayed put — same identity, different feature;
+    * and because the newest draft was taken FIRST and its state checked SECOND, a newer FAILED
+      draft **shadowed an older READY one**, so a selection with a perfectly good formula became
+      unbuildable.
+
+    Both disappear when the formula is named rather than searched for.
 
     Raises:
         MaterializationRefused: the selection has no draft (``NOT_RESOLVED``), its draft never
@@ -76,32 +89,42 @@ def restore_formula(
             formula was produced (``INTENT_HASH_MISMATCH``).
     """
     row = conn.execute(
-        "SELECT s.considered_revision_id, s.option_id, d.formula_draft_id, d.state, "
-        "       d.authoring_run_id, d.formula_content_hash, r.reason, r.replacement_draft_id "
-        "  FROM feature_selection_revision s "
-        "  LEFT JOIN formula_draft d "
-        "    ON d.considered_revision_id = s.considered_revision_id "
-        "   AND d.option_id = s.option_id "
+        "SELECT b.selection_revision_id, b.considered_revision_id, b.option_id, "
+        "       b.formula_draft_id, b.formula_content_hash, "
+        "       d.state, d.authoring_run_id, d.formula_content_hash, "
+        "       r.reason, r.replacement_draft_id "
+        "  FROM selection_formula_binding b "
+        "  JOIN formula_draft d ON d.formula_draft_id = b.formula_draft_id "
         # RETIREMENT TRAVELS WITH THE DRAFT, in this one read. Without it this function selected a
         # retired draft and compiled it: a formula somebody had explicitly withdrawn could reach a
         # sealed, servable artifact, and nothing between here and publication would have objected.
         "  LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
-        " WHERE s.revision_id = %s "
-        " ORDER BY d.updated_at DESC LIMIT 1", (selection_revision_id,)).fetchone()
+        " WHERE b.binding_id = %s", (selection_formula_binding_id,)).fetchone()
     if row is None:
         raise MaterializationRefused(
             CompilationRefusalCode.NOT_RESOLVED,
-            f"selection {selection_revision_id} does not exist, so there is no chosen candidate to "
-            f"build a formula for")
+            f"selection-formula binding {selection_formula_binding_id} does not exist, so this "
+            f"member names no formula to build. A build set member IS its pin — without one there "
+            f"is nothing to resolve, and resolving 'the newest draft' instead is the drift this "
+            f"binding exists to prevent")
 
-    (considered_revision_id, option_id, draft_id, state, run_id, stored_hash,
-     retired_reason, replacement_id) = row
-    if draft_id is None:
+    (selection_revision_id, considered_revision_id, option_id, draft_id, pinned_hash,
+     state, run_id, stored_hash, retired_reason, replacement_id) = row
+
+    # ▲ DEFENCE IN DEPTH, NOT THE GUARANTEE — and the distinction is worth stating so nobody
+    # "simplifies" the schema on the strength of this check. 1101's composite foreign key includes
+    # `formula_content_hash`, so while a binding references a draft that column CANNOT MOVE: the
+    # database refuses the update outright. This comparison exists for the cases the constraint
+    # cannot cover — a restored dump, a disabled trigger, a future migration that widens the key —
+    # and for the message, since a foreign-key violation names a constraint rather than a cause.
+    # Same relationship the queue has between its partition predicate and
+    # `queue_one_inflight_per_partition`: the index makes it true, the check makes it legible.
+    if pinned_hash != stored_hash:
         raise MaterializationRefused(
-            CompilationRefusalCode.NOT_RESOLVED,
-            f"selection {selection_revision_id} (option {option_id} of {considered_revision_id}) "
-            f"has no formula draft: a feature cannot be built from a candidate nobody has drafted "
-            f"a formula for. Draft it first — selecting and drafting are separate acts")
+            CompilationRefusalCode.INTENT_HASH_MISMATCH,
+            f"build member pinned formula {pinned_hash} of draft {draft_id}, which now stores "
+            f"{stored_hash}. The pin is what the build was decided against; building the current "
+            f"contents instead would compile something nobody chose")
 
     # ▲ RETIRED BEATS READY. A retired draft may still read READY — retirement is an append beside
     # it, not an edit of it (1090 makes the draft append-only, which is why 1096 exists at all) — so
@@ -144,7 +167,7 @@ def restore_formula(
 
 
 def restore_build_set_formulas(
-    conn: DbConn, *, selection_revision_ids: Sequence[str],
+    conn: DbConn, *, selection_formula_binding_ids: Sequence[str],
 ) -> tuple[RestoredFormulaV3, ...]:
     """Rehydrate a whole build set IN THE ORDER IT WAS DECLARED, or refuse the whole set.
 
@@ -157,19 +180,19 @@ def restore_build_set_formulas(
     refused group would compile a group whose membership nobody decided. The first refusal names its
     selection and stops the set.
     """
-    if not selection_revision_ids:
+    if not selection_formula_binding_ids:
         raise ValueError(
-            "a build set with no selections restores nothing: an empty group is a caller defect "
+            "a build set with no members restores nothing: an empty group is a caller defect "
             "rather than a verdict about any feature, so it is not a governed refusal")
-    duplicates = sorted({s for s in selection_revision_ids
-                         if list(selection_revision_ids).count(s) > 1})
+    duplicates = sorted({s for s in selection_formula_binding_ids
+                         if list(selection_formula_binding_ids).count(s) > 1})
     if duplicates:
         raise ValueError(
-            f"the same selection appears twice: {duplicates!r}. Position is meaningful in a build "
+            f"the same member appears twice: {duplicates!r}. Position is meaningful in a build "
             f"set, so a duplicate makes the group's column order unanswerable")
 
-    return tuple(restore_formula(conn, selection_revision_id=selection)
-                 for selection in selection_revision_ids)
+    return tuple(restore_formula(conn, selection_formula_binding_id=binding)
+                 for binding in selection_formula_binding_ids)
 
 
 def _intent_of(

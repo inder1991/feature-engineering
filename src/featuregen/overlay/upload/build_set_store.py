@@ -121,6 +121,10 @@ class BuildSetV1:
     revision_id: str
     target_reading_revision_id: str
     selection_revision_ids: tuple[str, ...]
+    #: ▲ POSITIONALLY PARALLEL to `selection_revision_ids` — member *i* of one is member *i* of the
+    #: other. The formula a build resolves comes from HERE, not from "the latest draft for this
+    #: selection", which is what let a build change meaning under a stable identity.
+    selection_formula_binding_ids: tuple[str, ...]
     declaration: Mapping[str, object]
     content_hash: str
 
@@ -159,7 +163,7 @@ class GenerationRequestV1:
 def build_set_identity(
     *,
     target_reading_revision_id: str,
-    selection_revision_ids: Sequence[str],
+    selection_formula_binding_ids: Sequence[str],
     declaration_hash: str,
 ) -> str:
     """*Is this the same build somebody already declared?*
@@ -169,10 +173,16 @@ def build_set_identity(
 
     Order is inside the identity because the order a person chose features in is a fact about the
     build — the dataclass says so, and a hash over a set would quietly disagree with it.
+
+    ▲ **THE MEMBERS ARE BINDINGS, NOT SELECTIONS, AND THAT IS THE POINT.** Hashing selection ids
+    made two builds of the same features under DIFFERENT formulas one identity — so a re-request
+    after a re-author returned the earlier set and built something else under an id somebody was
+    watching. A binding names the selection *and* the exact formula content, so a pin that did not
+    change identity is not a pin.
     """
     return jcs_sha256({
         "target_reading_revision_id": target_reading_revision_id,
-        "selection_revision_ids": list(selection_revision_ids),
+        "selection_formula_binding_ids": list(selection_formula_binding_ids),
         "declaration_hash": declaration_hash,
     })
 
@@ -182,7 +192,7 @@ def record_build_set(
     *,
     revision_id: str,
     target_reading_revision_id: str,
-    selection_revision_ids: Sequence[str],
+    selection_formula_binding_ids: Sequence[str],
     declaration: BuildSetDeclarationV1,
     declared_by: str,
     declared_at: str,
@@ -201,19 +211,38 @@ def record_build_set(
     property this protects, and it is the reason `SpineSourceDeclarationV1` grew `identity_payload`
     in the first place.
     """
-    if not selection_revision_ids:
-        raise ValueError("a build set with no selections builds nothing")
-    if len(set(selection_revision_ids)) != len(selection_revision_ids):
+    if not selection_formula_binding_ids:
+        raise ValueError("a build set with no members builds nothing")
+    if len(set(selection_formula_binding_ids)) != len(selection_formula_binding_ids):
         raise ValueError(
-            f"the same selection appears twice: {list(selection_revision_ids)!r}. Order is "
+            f"the same binding appears twice: {list(selection_formula_binding_ids)!r}. Order is "
             f"meaningful here, so a duplicate makes 'which position is this feature in' "
             f"unanswerable")
+
+    # ▲ RESOLVED FROM THE BINDING, never accepted beside it. The member stores the selection too —
+    # every reader uses it — so taking it from the caller would let the member name one selection
+    # while its binding named another, which is the exact disagreement 1101 exists to forbid. The
+    # composite foreign key refuses that row anyway; resolving here means it never gets built.
+    selections: list[str] = []
+    for binding_id in selection_formula_binding_ids:
+        row = conn.execute(
+            "SELECT selection_revision_id FROM selection_formula_binding WHERE binding_id = %s",
+            (binding_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"selection-formula binding {binding_id!r} does not exist: a build set member "
+                f"names the formula it will be built from, and there is no such pin")
+        selections.append(row[0])
+    if len(set(selections)) != len(selections):
+        raise ValueError(
+            f"two members bind the same selection: {selections!r}. One feature cannot occupy two "
+            f"positions in one build")
 
     declaration_hash = jcs_sha256(declaration_identity(declaration))
     stored = encode_declaration(declaration)
     content = build_set_identity(
         target_reading_revision_id=target_reading_revision_id,
-        selection_revision_ids=selection_revision_ids,
+        selection_formula_binding_ids=selection_formula_binding_ids,
         declaration_hash=declaration_hash)
 
     inserted = conn.execute(
@@ -229,10 +258,12 @@ def record_build_set(
             (content,)).fetchone()
         return existing[0], False
 
-    for position, selection in enumerate(selection_revision_ids):
+    for position, (binding_id, selection) in enumerate(
+            zip(selection_formula_binding_ids, selections, strict=True)):
         conn.execute(
-            "INSERT INTO build_set_member (revision_id, position, selection_revision_id) "
-            "VALUES (%s, %s, %s)", (revision_id, position, selection))
+            "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
+            "selection_formula_binding_id) VALUES (%s, %s, %s, %s)",
+            (revision_id, position, selection, binding_id))
     return revision_id, True
 
 
@@ -243,11 +274,15 @@ def read_build_set(conn: DbConn, revision_id: str) -> BuildSetV1 | None:
         "FROM build_set_revision WHERE revision_id = %s", (revision_id,)).fetchone()
     if row is None:
         return None
-    members = tuple(r[0] for r in conn.execute(
-        "SELECT selection_revision_id FROM build_set_member WHERE revision_id = %s "
-        "ORDER BY position", (revision_id,)).fetchall())
+    rows = conn.execute(
+        "SELECT selection_revision_id, selection_formula_binding_id FROM build_set_member "
+        "WHERE revision_id = %s ORDER BY position", (revision_id,)).fetchall()
+    # ▲ BOTH, in one read. The selections are what most readers want; the bindings are what a
+    # BUILD must resolve its formula through, and fetching them separately would reintroduce the
+    # window where the two answers come from different moments.
     return BuildSetV1(revision_id=revision_id, target_reading_revision_id=row[0],
-                      selection_revision_ids=members,
+                      selection_revision_ids=tuple(r[0] for r in rows),
+                      selection_formula_binding_ids=tuple(r[1] for r in rows),
                       declaration=row[1] if isinstance(row[1], dict) else {},
                       content_hash=row[2])
 

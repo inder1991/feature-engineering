@@ -12,7 +12,11 @@ from __future__ import annotations
 
 import psycopg
 import pytest
-from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
+from tests.featuregen.materialize.crosswalk_fixtures import (
+    bind_ready_formula,
+    bind_ready_formulas,
+    build_set_declaration,
+)
 
 from featuregen.overlay.upload.build_set_store import (
     GenerationStatusV1,
@@ -87,12 +91,16 @@ def _selection(conn, revision_id: str, target: str = "trr-1") -> str:
 
 
 def _set(conn, revision_id="bs-1", members=("sel-a", "sel-b"), target="trr-1"):
+    """▲ Every member now arrives with a PINNED FORMULA. A build set whose members named only
+    selections resolved the formula at build time as "the newest draft", so a re-author between the
+    decision and the build changed what the build meant under an unchanged identity (1101)."""
     _target(conn, target)
     for m in members:
         _selection(conn, m, target)
     return record_build_set(
         conn, revision_id=revision_id, target_reading_revision_id=target,
-        selection_revision_ids=members, declaration=build_set_declaration(),
+        selection_formula_binding_ids=bind_ready_formulas(conn, members),
+        declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="2026-08-18T00:00:00Z")
 
 
@@ -135,9 +143,11 @@ def test_the_same_declaration_is_the_SAME_SET(db):
 
 def test_ORDER_IS_PART_OF_THE_IDENTITY(db):
     """A hash over a SET would quietly disagree with the dataclass, which says order is meaningful."""
-    a = build_set_identity(target_reading_revision_id="t", selection_revision_ids=["x", "y"],
+    a = build_set_identity(target_reading_revision_id="t",
+                       selection_formula_binding_ids=["x", "y"],
                            declaration_hash="d")
-    b = build_set_identity(target_reading_revision_id="t", selection_revision_ids=["y", "x"],
+    b = build_set_identity(target_reading_revision_id="t",
+                       selection_formula_binding_ids=["y", "x"],
                            declaration_hash="d")
     assert a != b
 
@@ -149,7 +159,8 @@ def test_a_duplicate_selection_is_refused(db):
     with pytest.raises(ValueError, match="appears twice"):
         record_build_set(
             db, revision_id="bs-dup", target_reading_revision_id="trr-1",
-            selection_revision_ids=("sel-a", "sel-a"), declaration=build_set_declaration(),
+            selection_formula_binding_ids=("b-1", "b-1"),
+            declaration=build_set_declaration(),
             declared_by="user:ops", declared_at="2026-08-18T00:00:00Z")
 
 
@@ -159,7 +170,7 @@ def test_an_empty_build_set_is_refused(db):
     with pytest.raises(ValueError, match="builds nothing"):
         record_build_set(
             db, revision_id="bs-empty", target_reading_revision_id="trr-1",
-            selection_revision_ids=(), declaration=build_set_declaration(),
+            selection_formula_binding_ids=(), declaration=build_set_declaration(),
             declared_by="user:ops", declared_at="2026-08-18T00:00:00Z")
 
 
@@ -339,11 +350,13 @@ def test_the_SAME_DECLARATION_MADE_TWICE_IS_ONE_BUILD_SET(db) -> None:
 
     first, created_first = record_build_set(
         conn, revision_id="bsr-prov-1", target_reading_revision_id="trr-prov",
-        selection_revision_ids=("sel-a",), declaration=build_set_declaration(),
+        selection_formula_binding_ids=(bind_ready_formula(conn, "sel-a"),),
+        declaration=build_set_declaration(),
         declared_by="engineer@bank", declared_at="2026-08-22T09:00:00+00:00")
     second, created_second = record_build_set(
         conn, revision_id="bsr-prov-2", target_reading_revision_id="trr-prov",
-        selection_revision_ids=("sel-a",), declaration=later,
+        selection_formula_binding_ids=(bind_ready_formula(conn, "sel-a"),),
+        declaration=later,
         declared_by="colleague@bank", declared_at="2027-01-01T00:00:00+00:00")
 
     assert created_first is True

@@ -252,9 +252,14 @@ def test_an_UNDECODABLE_PAYLOAD_dead_letters_rather_than_looping(db) -> None:
 
 
 def test_the_LANE_REACHES_THE_CHAIN_and_refuses_what_it_finds(enqueued, db) -> None:
-    """The wiring, running for real: claim → request → build set → RESTORE. The build set's one
-    selection has no formula draft, so the restore stage refuses by name — which is the correct
-    verdict AND the proof that the lane got that far.
+    """The wiring, running for real: claim → request → build set → RESTORE. The restore stage
+    refuses by name, which is the correct verdict AND the proof that the lane got that far.
+
+    ▲ WHAT IT REFUSES ON CHANGED WITH THE PIN, and the change is the point. A member used to be able
+    to have no formula draft at all; migration 1101 makes that unconstructible — a build set is
+    declared against pinned formulas — so the missing thing here is the frozen considered revision
+    the restorer rebuilds its intent from. Same stage, same governed refusal, one fewer way to reach
+    it by accident.
 
     A governed refusal COMPLETES the queue row rather than failing it: a redelivery would reproduce
     it exactly, so retrying spends the budget to reach the same answer and dead-lettering would file
@@ -263,7 +268,8 @@ def test_the_LANE_REACHES_THE_CHAIN_and_refuses_what_it_finds(enqueued, db) -> N
     outcome = process_generation_once(db, owner="w1", inventory=_inventory())
 
     assert outcome.status == "refused", outcome
-    assert "draft" in outcome.detail.lower(), outcome.detail
+    assert "NOT_RESOLVED" in outcome.detail, outcome.detail
+    assert "sel-a" in outcome.detail, "a refusal that does not name its member is not actionable"
 
     request = read_request(db, enqueued)
     assert request.status is GenerationStatusV1.REFUSED

@@ -480,8 +480,11 @@ def _drive(
 
     # ── 1. THE MEMBERS, rehydrated from the write-once authoring trace ──────────────────────────
     try:
+        # ▲ THE PINS, not the selections. Passing selections made the lane resolve "the newest
+        # draft" at build time, so a re-author between the decision and this moment changed what
+        # the build meant under an unchanged build-set identity (migration 1101).
         restored = restore_build_set_formulas(
-            conn, selection_revision_ids=build_set.selection_revision_ids)
+            conn, selection_formula_binding_ids=build_set.selection_formula_binding_ids)
     except MaterializationRefused as refusal:
         return _refuse(conn, claim, job, refusal)
 

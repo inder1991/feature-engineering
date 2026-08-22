@@ -502,6 +502,24 @@ readiness** and must not be built into the development path:
 | revocation tri-state and `ACTION_AUTHORIZATION_UNVERIFIABLE` | §0.1.1 |
 | the legacy-authorization grantee question | §0.3 |
 
+▲ **IMPLEMENTED 2026-08-22** — migration **1100** and `materialize/action_authorization.py`, with
+`ActionV1` (the six-name service vocabulary, deliberately distinct from `EvaluatorAction`'s three),
+`authorize_action`, `load_action_authorization`, and the append-only guard. 19 tests.
+
+▲ **AND IT IS EXPAND-ONLY, which is a correction to this plan rather than a detail of it.** 1100
+**drops nothing**: `generation_authorization` and 1095's chain are untouched, so the running image
+keeps working and **an image-only rollback stays safe**. Earlier revisions had 1100 create, re-point
+and drop in one file — which is precisely what makes §20.1 say rollback must restore the database
+too. **Splitting expand from contract removes that requirement for this migration**, and the contract
+half (re-point 1095, drop the old table) becomes a later migration once all six acts have callers
+here. ▲ **Apply the same split to 1101–1105 wherever it is available** — it is the cheapest way to
+shrink the maintenance window §20.1 describes.
+
+▲ **Production actions raise `ActionUnavailable` and record NOTHING.** An authorization table holds
+authorizations; a refusal is a decision, and decisions belong to `action_decision_revision` (§7.1).
+This also means the two production acts have **no authorized code path at all**, which is strictly
+stronger than a certificate gate — a gated action still has a path a bypass could reach.
+
 ▲ **`policy_version` is what makes the deferral safe rather than a hole.** Every development
 authorization is stamped `development-v1`, so the day production governance lands, *"which
 authorizations were issued under the permissive policy"* is a query rather than an archaeology
@@ -2003,6 +2021,32 @@ build_set_member  +  selection_formula_binding_id  text NOT NULL
 ▲ **Worker validation still runs.** It becomes defence in depth rather than the only defence — which
 is the difference between a check and a constraint.
 
+▲ **IMPLEMENTED 2026-08-23** — migration **1101**, `overlay/upload/selection_formula_binding.py`,
+and `restore_formula_v3` resolving **through the pin**. `build_set_member` carries
+`selection_formula_binding_id NOT NULL`, the build-set identity hashes **bindings rather than
+selections**, and the API takes `selection_formula_binding_ids`.
+
+▲ **THREE THINGS THE IMPLEMENTATION TAUGHT, none visible from the plan:**
+
+1. **The composite FK is STRONGER than the runtime check it was paired with.** Because
+   `formula_content_hash` is inside the key, a draft's contents **cannot move at all** while a
+   binding references it — Postgres refuses the `UPDATE` outright. The pin-vs-draft comparison in
+   `restore_formula` is therefore **defence in depth, not the guarantee** (restored dumps, disabled
+   triggers, a future key change) — exactly the relationship the queue has between its partition
+   predicate and `queue_one_inflight_per_partition`. **Say which half is load-bearing, or somebody
+   simplifies away the wrong one.**
+2. ▲ **`restore_formula` had a SECOND failure mode, and pinning fixes it silently.** It took the
+   newest draft and *then* checked READY — so a newer FAILED draft **shadowed an older READY one**
+   and the selection became unbuildable. §11 described only the "builds different code" failure.
+   One test now pins each.
+3. ▲ **A refusal MOVED EARLIER, which is a product improvement rather than a refactor.** "This
+   candidate has no formula" used to surface when the worker tried to build; a pin cannot exist for
+   an undrafted candidate, so it now surfaces when the build set is **declared**.
+
+▲ **Fixture discipline matters more than usual here:** a READY draft must satisfy
+`formula_draft_ready_carries_a_formula` (content hash **and** non-empty `formula_json`), so one
+shared `bind_ready_formula` helper exists rather than a hand-rolled draft per suite.
+
 ### 11.1 The MONEY GUARD, its enforced retirements, and the constant nobody noticed — P0
 
 Folded from the child's B1, **verified — and one step worse than the child reported.**
@@ -2895,8 +2939,9 @@ still follow step order.**
 
 | # | Owner | Table / change | Step |
 |---|---|---|---|
-| 1100 | **parent §0.1.1 / §0.1.2** | `action_authorization_revision` **with composite (action, resource_identity_hash) keys and typed per-action child tables** · 1095's chain re-pointed · the one legacy row copied to `legacy_generation_authorization` **marked orphaned** · `generation_authorization` dropped **in a proven constraint order** | 2 |
-| 1101 | **parent §11.0 / §11.0.1** | `selection_formula_binding` (composite FKs to both parents) + the two unique indexes it needs + `build_set_member`'s pin columns and `selection_formula_binding_id`, **`NOT NULL` on today's zero measurement**, plus `build_set_member_formula_pinned_v1` | 2 |
+| 1100 | **parent §0.1.0.1** | ▲ **DONE** — `action_authorization_revision`, **EXPAND-ONLY**: the table, its `(action, resource_identity_hash, authorization_id)` unique index for composite FKs, and the append-only guard. **Drops nothing, so an image-only rollback stays safe** | 2 |
+| 1100b | **parent §0.1.2 / §0.3** | ▲ **the CONTRACT half, deferred**: typed per-action child tables · 1095's chain re-pointed · the one legacy row copied to `legacy_generation_authorization` **marked orphaned** · `generation_authorization` dropped **in a proven constraint order**. Runs once all six acts have callers on 1100 | 2 |
+| 1101 | **parent §11.0 / §11.0.1** | ▲ **DONE** — `selection_formula_binding` with composite FKs into BOTH parents (including `formula_content_hash`, and the selection's `planning_request_hash` + `binding_plan_hash`), the parent unique indexes, the append-only guard, and `build_set_member.selection_formula_binding_id` **NOT NULL** under `build_set_member_formula_pinned_v1` — keyed on `(binding_id, selection_revision_id)` so the member's own selection cannot disagree with its pin | 2 |
 | 1102 | **parent §10** | `sealed_artifact_member_method_identity` (append-only, same guard as 1099) | 2 |
 | 1103 | **parent §11.1.1** | `formula_draft_authoring_identity` + `formula_draft_retirement_tombstone` (**with `scope`**) + `formula_draft_regeneration_exception` | 2 |
 | 1104 | **child §3.3 / parent §0.1.4** | ▲ `formula_draft_authoring_plan` — **MOVED from step 4 to step 2** (P0-2) + ▲ **`authoring_subject_revision`**, the subject `AUTHOR_FORMULA` actually authorizes (R8) | **2** |

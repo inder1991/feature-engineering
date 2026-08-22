@@ -16,7 +16,10 @@ import ast
 import pathlib
 
 import pytest
-from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
+from tests.featuregen.materialize.crosswalk_fixtures import (
+    bind_ready_formulas,
+    build_set_declaration,
+)
 
 from featuregen.materialize.build_set_declaration import encode_declaration
 
@@ -68,7 +71,8 @@ def _seed(conn, *, environment="hdfc-local", group="customer_txn_features",
             (name, f"opt-{name}", f"dec-{name}", f"sha256:{name}"))
     build_set, _ = record_build_set(
         conn, revision_id="bs-api", target_reading_revision_id="trr-bs",
-        selection_revision_ids=["sel-1", "sel-2"], declaration=build_set_declaration(),
+        selection_formula_binding_ids=list(bind_ready_formulas(conn, ["sel-1", "sel-2"])),
+        declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
     approval = record_generation_authorization(
         conn, GenerationAuthorizationV1(
@@ -117,7 +121,7 @@ def test_A_BUILD_SET_IS_DECLARED_and_returned(client, conn, enabled, engineer_he
 
     response = client.post(SETS, json={
         "target_reading_revision_id": "trr-bs",
-        "selection_revision_ids": ["sel-1", "sel-2"],
+        "selection_formula_binding_ids": list(bind_ready_formulas(conn, ["sel-1", "sel-2"])),
         "declaration": encode_declaration(build_set_declaration())}, headers=engineer_headers)
 
     assert response.status_code == 201, response.text
@@ -130,7 +134,7 @@ def test_DECLARING_THE_SAME_BUILD_TWICE_IS_ONE_SET(client, conn, enabled,
     make "how did this build go" a question with two answers."""
     _seed(conn)
     payload = {"target_reading_revision_id": "trr-bs",
-               "selection_revision_ids": ["sel-1", "sel-2"],
+               "selection_formula_binding_ids": list(bind_ready_formulas(conn, ["sel-1", "sel-2"])),
                "declaration": encode_declaration(build_set_declaration())}
 
     first = client.post(SETS, json=payload, headers=engineer_headers).json()
@@ -144,7 +148,7 @@ def test_an_EMPTY_BUILD_SET_is_422_and_says_why(client, conn, enabled, engineer_
     _seed(conn)
 
     response = client.post(SETS, json={
-        "target_reading_revision_id": "trr-bs", "selection_revision_ids": []},
+        "target_reading_revision_id": "trr-bs", "selection_formula_binding_ids": []},
         headers=engineer_headers)
 
     assert response.status_code == 422, response.text
@@ -213,7 +217,8 @@ def test_an_APPROVAL_FOR_A_DIFFERENT_SET_IS_REFUSED(client, conn, enabled,
     from featuregen.overlay.upload.build_set_store import record_build_set
     other, _ = record_build_set(
         conn, revision_id="bs-other", target_reading_revision_id="trr-bs",
-        selection_revision_ids=["sel-2", "sel-1"], declaration=build_set_declaration(),
+        selection_formula_binding_ids=list(bind_ready_formulas(conn, ["sel-2", "sel-1"])),
+        declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
 
     response = client.post(GENERATIONS, json=_body(other, approval), headers=engineer_headers)
@@ -262,7 +267,7 @@ def test_a_FLAG_OFF_DEPLOYMENT_ANSWERS_404_on_every_path(client, monkeypatch,
     monkeypatch.delenv("FEATUREGEN_GENERATION_V2_ENABLED", raising=False)
 
     assert client.post(SETS, json={"target_reading_revision_id": "t",
-                                   "selection_revision_ids": ["s"]},
+                                   "selection_formula_binding_ids": ["b"]},
                        headers=engineer_headers).status_code == 404
     assert client.post(GENERATIONS, json=_body("bs", "gar"),
                        headers=engineer_headers).status_code == 404
@@ -307,9 +312,12 @@ def test_a_DECLARATION_THIS_BUILD_CANNOT_READ_IS_REFUSED_not_half_read(client, c
     is how a generation silently computes the wrong population."""
     payload = {**encode_declaration(build_set_declaration()), "version": 99}
 
+    # ▲ Placeholder pins on purpose: the declaration is decoded BEFORE any member is resolved, so
+    # seeding real bindings here would be building a world the assertion never reaches — and it
+    # would hide a regression that moved the decode after the member lookup.
     response = client.post(SETS, json={
         "target_reading_revision_id": "trr-bs",
-        "selection_revision_ids": ["sel-1", "sel-2"],
+        "selection_formula_binding_ids": ["b-unused-1", "b-unused-2"],
         "declaration": payload}, headers=engineer_headers)
 
     assert response.status_code == 422, response.text
@@ -323,9 +331,12 @@ def test_an_INCOMPLETE_DECLARATION_IS_REFUSED_by_name(client, conn, enabled,
     payload = encode_declaration(build_set_declaration())
     payload.pop("cadence")
 
+    # ▲ Placeholder pins on purpose: the declaration is decoded BEFORE any member is resolved, so
+    # seeding real bindings here would be building a world the assertion never reaches — and it
+    # would hide a regression that moved the decode after the member lookup.
     response = client.post(SETS, json={
         "target_reading_revision_id": "trr-bs",
-        "selection_revision_ids": ["sel-1", "sel-2"],
+        "selection_formula_binding_ids": ["b-unused-1", "b-unused-2"],
         "declaration": payload}, headers=engineer_headers)
 
     assert response.status_code == 422, response.text

@@ -104,7 +104,12 @@ class BuildSetIn(BaseModel):
     target_reading_revision_id: str = Field(min_length=1)
     #: ORDERED. The order a person picked features in is a fact about the build — it decides the
     #: published table's column order — so this is a list and never a set.
-    selection_revision_ids: list[str] = Field(min_length=1)
+    #:
+    #: ▲ BINDINGS, NOT SELECTIONS. A member names the selection AND the exact formula it will be
+    #: built from (migration 1101). Naming only the selection left the formula to be resolved at
+    #: build time as "the newest draft", so a re-author between the decision and the build changed
+    #: what the build meant while its identity stayed put.
+    selection_formula_binding_ids: list[str] = Field(min_length=1)
     #: THE FIVE DECLARATIONS a generation cannot derive, in the shape
     #: `build_set_declaration.decode_declaration` reads. Required, and not defaulted: each decides a
     #: published number, and a route that filled them in would be choosing what gets published on
@@ -154,7 +159,7 @@ def declare_build_set(
             conn,
             revision_id=mint_id("bs"),
             target_reading_revision_id=body.target_reading_revision_id,
-            selection_revision_ids=body.selection_revision_ids,
+            selection_formula_binding_ids=body.selection_formula_binding_ids,
             declaration=declaration,
             declared_by=identity.subject,
             declared_at=_now(conn))
@@ -163,13 +168,20 @@ def declare_build_set(
         # names exactly what is wrong, and neither is a governed verdict about any feature.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # ▲ READ BACK OUT OF THE SET, not echoed from the request — BOTH lists. The request names pins
+    # and the selections are RESOLVED from them, so echoing would report what the caller sent rather
+    # than what was recorded. That matters most on the idempotent path, where `revision_id` is an
+    # EXISTING set: the body happens to match it today because both are inside the identity, and a
+    # response that depends on that coincidence is one identity change away from lying.
+    recorded = read_build_set(conn, revision_id)
     counters.incr("featuregen.build_set.declared")
     log("featuregen.build_set.declared", revision_id=revision_id, created=created,
-        members=len(body.selection_revision_ids))
+        members=len(recorded.selection_formula_binding_ids))
     return {
         "build_set_revision_id": revision_id,
         "created": created,
-        "selection_revision_ids": list(body.selection_revision_ids),
+        "selection_revision_ids": list(recorded.selection_revision_ids),
+        "selection_formula_binding_ids": list(recorded.selection_formula_binding_ids),
         "detail": ("the build set was recorded" if created else
                    "this exact build was already declared; its attempts belong to that set"),
     }

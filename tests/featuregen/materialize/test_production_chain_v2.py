@@ -231,7 +231,7 @@ def _bypass_draft(conn, *, draft_id="fd-pc", window: int = 30) -> str:
     return draft_id
 
 
-def _requested(conn, *, request_id="req-pc") -> str:
+def _requested(conn, *, request_id="req-pc", draft_id=None, set_id="bs-pc") -> str:
     """A selection, a build set, an approval and a REQUESTED generation — what a person's click
     leaves behind."""
     conn.execute(
@@ -242,10 +242,31 @@ def _requested(conn, *, request_id="req-pc") -> str:
         "considered_revision_id, option_id, decision_id, planning_request_hash, binding_plan_hash, "
         "content_hash) VALUES ('sel-pc','trr-pc','crev-pc','opt-a','dec-pc','h1','h2','ch-pc') "
         "ON CONFLICT DO NOTHING")
+    # ▲ THE PIN. A build set now names the exact formula it will be built from, so this fixture
+    # binds the draft this suite already created for the same candidate. Callers that need a draft
+    # in some OTHER state bind it here while it is READY and move it afterwards — which is what a
+    # coordinator does too: the set is declared against a finished formula, and what happens to the
+    # draft later is exactly what the build must refuse.
+    from featuregen.overlay.upload.selection_formula_binding import (
+        record_selection_formula_binding,
+    )
+
+    if draft_id is None:
+        drafted = conn.execute(
+            "SELECT formula_draft_id FROM formula_draft WHERE considered_revision_id='crev-pc' "
+            "AND option_id='opt-a' AND state='READY' ORDER BY updated_at DESC LIMIT 1").fetchone()
+        if drafted is None:
+            raise AssertionError(
+                "_requested needs a READY draft for crev-pc/opt-a: a build set is declared against "
+                "a finished formula, so seed the draft before requesting the build")
+        draft_id = drafted[0]
+    binding, _ = record_selection_formula_binding(
+        conn, selection_revision_id="sel-pc", formula_draft_id=draft_id)
+
     build_set, _ = record_build_set(
-        conn, revision_id="bs-pc", target_reading_revision_id="trr-pc",
-        selection_revision_ids=["sel-pc"], declaration=build_set_declaration(),
-        declared_by="user:ops", declared_at="t")
+        conn, revision_id=set_id, target_reading_revision_id="trr-pc",
+        selection_formula_binding_ids=[binding.binding_id],
+        declaration=build_set_declaration(), declared_by="user:ops", declared_at="t")
     approval = record_generation_authorization(
         conn, GenerationAuthorizationV1(
             environment_id=ENV, logical_group_name=GROUP, build_set_revision_id=build_set,
@@ -417,11 +438,23 @@ def test_a_run_WHOSE_AUTHORING_METHOD_CANNOT_BE_ESTABLISHED_seals_nothing(
 
 # ══ THE GATE THIS FILE FOUND, AND ITS EDGES ═══════════════════════════════════════════════════
 def _admit(catalog, selection="sel-pc"):
+    """Restore THROUGH THE PIN and admit — the same path the lane takes.
+
+    ▲ The binding is read back rather than passed in, so this helper keeps working for any test that
+    declared its build set through `_requested` without knowing which draft it landed on.
+    """
     from featuregen.materialize.admission_v2 import admit_artifacts_v2
     from featuregen.materialize.restore_formula_v3 import restore_formula
 
     _advertise_this_build(catalog)
-    restored = restore_formula(catalog, selection_revision_id=selection)
+    binding = catalog.execute(
+        "SELECT binding_id FROM selection_formula_binding WHERE selection_revision_id = %s "
+        "ORDER BY recorded_at DESC LIMIT 1", (selection,)).fetchone()
+    if binding is None:
+        raise AssertionError(
+            f"selection {selection!r} has no pin: a build resolves its formula THROUGH the "
+            f"binding, so declare the build set before admitting")
+    restored = restore_formula(catalog, selection_formula_binding_id=binding[0])
     return admit_artifacts_v2(catalog, [restored.input], engine_id="kedro-pyspark")
 
 
@@ -719,9 +752,9 @@ def test_a_DRAFT_THAT_NEVER_REACHED_READY_stops_the_build(catalog, monkeypatch):
     """Only a finished formula can be compiled, and a draft that stopped short has already recorded
     why — so the refusal does not re-explain it."""
     _ready_draft(catalog, monkeypatch)
+    _requested(catalog)                       # declared against a FINISHED formula, as a job does
     catalog.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'x' "
                     "WHERE formula_draft_id = 'fd-pc'")
-    _requested(catalog)
     _advertise_this_build(catalog)
 
     outcome = process_generation_once(catalog, owner="w1", inventory=INVENTORY)
@@ -743,14 +776,18 @@ def test_A_DIFFERENT_FORMULA_SEALS_A_DIFFERENT_ARTIFACT(catalog, spine, monkeypa
     original = load_sealed_artifact(catalog, first.artifact_id)
 
     # A SECOND build of the same group, from a formula computed over a DIFFERENT WINDOW. Nothing is
-    # deleted — `formula_draft` is append-only and `generation_request` records every attempt — so
-    # the second draft simply supersedes the first, which is how the restorer already reads them
-    # (`ORDER BY d.updated_at DESC`), and the second request is a NEW attempt at the same set,
-    # permitted because the first is terminal.
+    # deleted — `formula_draft` is append-only and `generation_request` records every attempt.
+    # ▲ AND IT IS A DIFFERENT BUILD SET NOW, which is the whole point of the pin: the formula is
+    # inside the set's identity, so "the same features under a different formula" can no longer
+    # share an identity with the first build. This used to work by the restorer taking
+    # `ORDER BY d.updated_at DESC` — the newest draft, whenever the worker looked — which is
+    # precisely the drift 1101 removed.
     _bypass_draft(catalog, draft_id="fd-pc2", window=90)
-    catalog.execute("UPDATE formula_draft SET updated_at = now() + interval '1 second' "
-                    "WHERE formula_draft_id = 'fd-pc2'")
-    second_id = _requested(catalog, request_id="req-pc2")
+    # ▲ NAMED, not inferred. The second build pins the second formula and therefore declares a
+    # DIFFERENT set — the old fixture nudged `updated_at` so the restorer would happen to pick the
+    # newer draft, which is exactly the implicit behaviour this migration replaced.
+    second_id = _requested(
+        catalog, request_id="req-pc2", draft_id="fd-pc2", set_id="bs-pc2")
     second = process_generation_once(catalog, owner="w2", inventory=INVENTORY)
 
     assert second.status == "generated", second.detail
