@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
 from tests.featuregen.materialize.test_end_to_end_v2 import (  # noqa: F401 — fixtures
     _advertise_this_build,
     catalog,
@@ -207,7 +208,7 @@ def _requested(conn, *, request_id="req-pc") -> str:
         "ON CONFLICT DO NOTHING")
     build_set, _ = record_build_set(
         conn, revision_id="bs-pc", target_reading_revision_id="trr-pc",
-        selection_revision_ids=["sel-pc"], declaration={"grain": "customer"},
+        selection_revision_ids=["sel-pc"], declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="t")
     approval = record_generation_authorization(
         conn, GenerationAuthorizationV1(

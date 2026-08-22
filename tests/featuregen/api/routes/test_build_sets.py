@@ -16,6 +16,9 @@ import ast
 import pathlib
 
 import pytest
+from tests.featuregen.materialize.crosswalk_fixtures import build_set_declaration
+
+from featuregen.materialize.build_set_declaration import encode_declaration
 
 SETS = "/build-sets"
 GENERATIONS = "/build-sets/generations"
@@ -58,7 +61,7 @@ def _seed(conn, *, environment="hdfc-local", group="customer_txn_features"):
             (name, f"opt-{name}", f"dec-{name}", f"sha256:{name}"))
     build_set, _ = record_build_set(
         conn, revision_id="bs-api", target_reading_revision_id="trr-bs",
-        selection_revision_ids=["sel-1", "sel-2"], declaration={"grain": "customer"},
+        selection_revision_ids=["sel-1", "sel-2"], declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
     approval = record_generation_authorization(
         conn, GenerationAuthorizationV1(
@@ -108,7 +111,7 @@ def test_A_BUILD_SET_IS_DECLARED_and_returned(client, conn, enabled, engineer_he
     response = client.post(SETS, json={
         "target_reading_revision_id": "trr-bs",
         "selection_revision_ids": ["sel-1", "sel-2"],
-        "declaration": {"grain": "customer"}}, headers=engineer_headers)
+        "declaration": encode_declaration(build_set_declaration())}, headers=engineer_headers)
 
     assert response.status_code == 201, response.text
     assert response.json()["selection_revision_ids"] == ["sel-1", "sel-2"]
@@ -121,7 +124,7 @@ def test_DECLARING_THE_SAME_BUILD_TWICE_IS_ONE_SET(client, conn, enabled,
     _seed(conn)
     payload = {"target_reading_revision_id": "trr-bs",
                "selection_revision_ids": ["sel-1", "sel-2"],
-               "declaration": {"grain": "customer"}}
+               "declaration": encode_declaration(build_set_declaration())}
 
     first = client.post(SETS, json=payload, headers=engineer_headers).json()
     second = client.post(SETS, json=payload, headers=engineer_headers).json()
@@ -203,7 +206,7 @@ def test_an_APPROVAL_FOR_A_DIFFERENT_SET_IS_REFUSED(client, conn, enabled,
     from featuregen.overlay.upload.build_set_store import record_build_set
     other, _ = record_build_set(
         conn, revision_id="bs-other", target_reading_revision_id="trr-bs",
-        selection_revision_ids=["sel-2", "sel-1"], declaration={"grain": "customer"},
+        selection_revision_ids=["sel-2", "sel-1"], declaration=build_set_declaration(),
         declared_by="user:ops", declared_at="2026-08-21T00:00:00Z")
 
     response = client.post(GENERATIONS, json=_body(other, approval), headers=engineer_headers)
@@ -257,3 +260,66 @@ def test_a_FLAG_OFF_DEPLOYMENT_ANSWERS_404_on_every_path(client, monkeypatch,
     assert client.post(GENERATIONS, json=_body("bs", "gar"),
                        headers=engineer_headers).status_code == 404
     assert client.get(f"{GENERATIONS}/req-1", headers=engineer_headers).status_code == 404
+
+
+# ══ THE DECLARATION REACHES THE JOB ════════════════════════════════════════════════════════════
+def test_the_QUEUED_JOB_CARRIES_THE_SETS_DECLARATION_not_nulls(client, conn, enabled,
+                                                               engineer_headers) -> None:
+    """▲ THE HOLE THIS CLOSES. The route used to send `spine_declaration=None`, `cadence=None`,
+    `availability_promise=None` and `operand_facts={}` — honest, because the lane refuses such a job
+    BY NAME rather than inventing values, but it meant a build requested through the API could never
+    run. The five declarations now come from the SET, which is where they were always declared.
+
+    Asserted on the QUEUE PAYLOAD rather than on a 202, because a route can return success while
+    enqueuing a job nothing can execute, and that is precisely what it used to do.
+    """
+    import json as _json
+
+    from featuregen.materialize.generation_lane import decode_job
+
+    build_set, approval = _seed(conn)
+
+    response = client.post(GENERATIONS, json=_body(build_set, approval),
+                           headers=engineer_headers)
+    assert response.status_code == 202, response.text
+
+    payload = conn.execute(
+        "SELECT payload FROM queue WHERE handler LIKE '%generation%' ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    job = decode_job(payload if isinstance(payload, dict) else _json.loads(payload))
+
+    declared = build_set_declaration()
+    assert job.spine_declaration == declared.spine_declaration
+    assert job.cadence == declared.cadence
+    assert job.availability_promise == declared.availability_promise
+
+
+def test_a_DECLARATION_THIS_BUILD_CANNOT_READ_IS_REFUSED_not_half_read(client, conn, enabled,
+                                                                      engineer_headers) -> None:
+    """A payload under an unknown encoding is refused WHOLE. Reading the half a build understands
+    is how a generation silently computes the wrong population."""
+    payload = {**encode_declaration(build_set_declaration()), "version": 99}
+
+    response = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs",
+        "selection_revision_ids": ["sel-1", "sel-2"],
+        "declaration": payload}, headers=engineer_headers)
+
+    assert response.status_code == 422, response.text
+    assert "refused rather than read in part" in response.text
+
+
+def test_an_INCOMPLETE_DECLARATION_IS_REFUSED_by_name(client, conn, enabled,
+                                                      engineer_headers) -> None:
+    """Each missing field decides a published number, so the refusal names what is absent rather
+    than reporting a generic validation failure."""
+    payload = encode_declaration(build_set_declaration())
+    payload.pop("cadence")
+
+    response = client.post(SETS, json={
+        "target_reading_revision_id": "trr-bs",
+        "selection_revision_ids": ["sel-1", "sel-2"],
+        "declaration": payload}, headers=engineer_headers)
+
+    assert response.status_code == 422, response.text
+    assert "cadence" in response.text

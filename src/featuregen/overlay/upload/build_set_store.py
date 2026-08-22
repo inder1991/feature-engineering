@@ -26,6 +26,11 @@ from enum import StrEnum
 
 from featuregen.canonical import jcs_sha256
 from featuregen.contracts.db import DbConn
+from featuregen.materialize.build_set_declaration import (
+    BuildSetDeclarationV1,
+    declaration_identity,
+    encode_declaration,
+)
 
 __all__ = [
     "BuildSetV1",
@@ -178,7 +183,7 @@ def record_build_set(
     revision_id: str,
     target_reading_revision_id: str,
     selection_revision_ids: Sequence[str],
-    declaration: Mapping[str, object],
+    declaration: BuildSetDeclarationV1,
     declared_by: str,
     declared_at: str,
 ) -> tuple[str, bool]:
@@ -187,6 +192,14 @@ def record_build_set(
     Returns ``(revision_id, created)``. ``created=False`` means this exact build was already
     declared — by this person a moment ago, or by a colleague last week. Either way there is nothing
     to add, and minting a second identical set would split its attempts across two roots.
+
+    ▲ **THE STORED PAYLOAD AND THE HASHED PAYLOAD ARE DIFFERENT, on purpose.** What is stored is
+    complete, provenance included, because who declared a population and why is worth keeping. What
+    is HASHED is `declaration_identity` — semantic only — because the spine carries `declared_by`
+    and `recorded_at`, and hashing those would make the same declaration made twice into two build
+    sets, one per clock read. "Two people asking for the same build get the same set" is the
+    property this protects, and it is the reason `SpineSourceDeclarationV1` grew `identity_payload`
+    in the first place.
     """
     if not selection_revision_ids:
         raise ValueError("a build set with no selections builds nothing")
@@ -196,7 +209,8 @@ def record_build_set(
             f"meaningful here, so a duplicate makes 'which position is this feature in' "
             f"unanswerable")
 
-    declaration_hash = jcs_sha256(dict(declaration))
+    declaration_hash = jcs_sha256(declaration_identity(declaration))
+    stored = encode_declaration(declaration)
     content = build_set_identity(
         target_reading_revision_id=target_reading_revision_id,
         selection_revision_ids=selection_revision_ids,
@@ -208,7 +222,7 @@ def record_build_set(
         "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s) "
         "ON CONFLICT (content_hash) DO NOTHING RETURNING revision_id",
         (revision_id, target_reading_revision_id, declaration_hash,
-         json.dumps(dict(declaration)), content, declared_by, declared_at)).fetchone()
+         json.dumps(stored), content, declared_by, declared_at)).fetchone()
     if inserted is None:
         existing = conn.execute(
             "SELECT revision_id FROM build_set_revision WHERE content_hash = %s",

@@ -577,3 +577,21 @@ def render(inputs: NodeAssemblyInputs, *, publisher_selection=None) -> SealedPro
         inputs.authorized, inputs.plan, environment_id=ENVIRONMENT,
         engine_versions=fixtures.ENGINE_VERSIONS, spine_input=inputs.spine_input,
         nodes=assemble_nodes(inputs), publisher_selection=publisher_selection)
+
+
+def build_set_declaration(**overrides):
+    """A COMPLETE build-set declaration — the five answers a generation cannot derive.
+
+    Shared because every caller of `record_build_set` now needs one, and a per-test hand-rolled
+    spine would drift from the one the rest of these fixtures already agree on.
+    """
+    from featuregen.materialize.build_set_declaration import BuildSetDeclarationV1
+
+    fields = {
+        "spine_declaration": SPINE_DECLARATION,
+        "cadence": CADENCE,
+        "availability_promise": AvailabilityPromiseV1(calendar_days=1),
+        "operand_facts": {},
+        "policy_realization_ids": {},
+    }
+    return BuildSetDeclarationV1(**{**fields, **overrides})

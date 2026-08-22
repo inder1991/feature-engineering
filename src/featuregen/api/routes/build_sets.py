@@ -57,6 +57,7 @@ from featuregen.api.deps import (
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.materialize.build_set_declaration import decode_declaration
 from featuregen.materialize.generation_authorization import load_generation_authorization
 from featuregen.materialize.generation_lane import (
     GenerationJobV2,
@@ -101,7 +102,12 @@ class BuildSetIn(BaseModel):
     #: ORDERED. The order a person picked features in is a fact about the build — it decides the
     #: published table's column order — so this is a list and never a set.
     selection_revision_ids: list[str] = Field(min_length=1)
-    declaration: dict[str, Any] = Field(default_factory=dict)
+    #: THE FIVE DECLARATIONS a generation cannot derive, in the shape
+    #: `build_set_declaration.decode_declaration` reads. Required, and not defaulted: each decides a
+    #: published number, and a route that filled them in would be choosing what gets published on
+    #: behalf of whoever clicked the button. Declared once per SET because two attempts at one build
+    #: must compute the same rows for the same population.
+    declaration: dict[str, Any]
 
 
 class GenerationIn(BaseModel):
@@ -134,12 +140,19 @@ def declare_build_set(
     attempts across two roots and make "how did this build go" a question with two answers.
     """
     try:
+        try:
+            declaration = decode_declaration(body.declaration)
+        except (ValueError, TypeError) as exc:
+            # 422 rather than 500: the body is the thing that is wrong, and naming which part of it
+            # is the difference between a caller fixing their request and guessing at it.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         revision_id, created = record_build_set(
             conn,
             revision_id=mint_id("bs"),
             target_reading_revision_id=body.target_reading_revision_id,
             selection_revision_ids=body.selection_revision_ids,
-            declaration=body.declaration,
+            declaration=declaration,
             declared_by=identity.subject,
             declared_at=_now(conn))
     except ValueError as exc:
@@ -195,11 +208,23 @@ def request_build(
                    f"{authorization.build_set_revision_id!r}, not "
                    f"{body.build_set_revision_id!r}: an approval permits a specific build")
 
-    if read_build_set(conn, body.build_set_revision_id) is None:
+    build_set = read_build_set(conn, body.build_set_revision_id)
+    if build_set is None:
         raise HTTPException(
             status_code=404,
             detail=f"no build set {body.build_set_revision_id!r}: its membership is what would be "
                    f"built, so there is nothing to build")
+
+    try:
+        declaration = decode_declaration(build_set.declaration)
+    except (ValueError, TypeError) as exc:
+        # The set was declared under an encoding this build cannot read WHOLE. Refusing beats
+        # generating from the half it understands — that is how a build silently computes the wrong
+        # population.
+        raise HTTPException(
+            status_code=409,
+            detail=f"build set {body.build_set_revision_id!r} cannot be read by this build: "
+                   f"{exc}") from exc
 
     request_id, created = request_generation(
         conn,
@@ -219,15 +244,16 @@ def request_build(
                 conn,
                 job=GenerationJobV2(
                     request_id=request_id,
-                    # ABSENT, NOT DEFAULTED — see the module docstring. Each of these decides a
-                    # published number, and the lane refuses a job missing them by name rather than
-                    # generating one against values this route invented.
-                    spine_declaration=None,
-                    cadence=None,
-                    availability_promise=None,
+                    # FROM THE BUILD SET, never from this request and never invented. Each decides
+                    # a published number, and they live on the SET because two attempts at one
+                    # build must compute the same rows for the same population.
+                    spine_declaration=declaration.spine_declaration,
+                    cadence=declaration.cadence,
+                    availability_promise=declaration.availability_promise,
                     physical_type_policy=body.physical_type_policy,
                     empty_values=dict(body.empty_values),
-                    operand_facts={},
+                    operand_facts=dict(declaration.operand_facts),
+                    policy_realization_ids=dict(declaration.policy_realization_ids),
                     engine_id=body.engine_id,
                     roles=tuple(body.roles),
                     compiled_at=now,
