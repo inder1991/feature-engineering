@@ -2979,6 +2979,15 @@ still follow step order.**
 | 1112 | **parent §9.1 / §10 / §10.3** | ▲ production **publication** attempt (composite FK to the exact materialization output) + ▲ **`method_certificate_revision` — the certificate parent that DOES NOT EXIST TODAY (R3)** + `production_attempt_member_certificate` keyed by `certificate_kind` with a **typed subject** (R12) | 7 |
 | 1113 | **parent §12.1 / §12.2** | `recipe_compiler_evaluation_contract` + the **governed case revision** (IR + dataset pin + expected rows + tolerances + runtime profile, one hash) | 9 |
 | 1114 | **parent §12.1** | `recipe_compiler_eval_attempt` + the compiler certificate record | 9 |
+| 1115 | **run-spine spec §6/§13 (foundation)** | `feature_run_identity` (composite-FK chain, write-once) + `feature_run_profile` + `feature_run_state` + the three additive UNIQUE chain indexes on `contract_generation_input` / `contract_considered_revision` / `catalog_metadata_snapshot` | foundation |
+| 1116 | **run-spine spec §9 (foundation)** | simple FKs: `formula_draft.considered_revision_id` and `feature_selection_revision.considered_revision_id` → `contract_considered_revision` (live-measured 0 orphans) | foundation |
+
+▲ **Ordering note (run-spine foundation).** 1115/1116 may APPLY before 1104–1114 exist: the two
+blocks are mutually independent (1115/1116's FKs reach only ≤1024 tables; nothing in 1100–1114
+references a spine table), and `migrations.py` applies pending files deterministically by name with
+a checksum ledger. This is a DOCUMENTED interleaving of two independent workstreams, not an
+accidental out-of-order convention — the rule "numbers match apply order" holds within each
+workstream.
 
 ▲ **Numbers are WRITE order, and they still follow step order** — which needs restating because this
 table has now been renumbered twice. Revision three moved the production-attempt migration so that
