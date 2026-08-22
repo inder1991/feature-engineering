@@ -27,13 +27,22 @@ import uuid
 
 import psycopg
 
-from featuregen.formula.author import AUTHOR_TASK
+from featuregen.formula.author import AUTHOR_PROMPT_ID_V3, AUTHOR_TASK
 from featuregen.formula.control import LeaseFence
 from featuregen.formula.critic import CRITIC_TASK
 from featuregen.formula.output_authority_v2 import OperandFactsV2
 from featuregen.formula.recipe_authoring import recipe_tool_runner_v2
 from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
 from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.upload.formula_draft_store import (
+    DraftStateV1,
+    advance,
+    request_draft,
+)
+
+
+class _NeverRaised(BaseException):
+    """A stand-in for "the caller expects no failure" — `except None` is a TypeError."""
 
 
 def unique(prefix: str) -> str:
@@ -44,7 +53,9 @@ def unique(prefix: str) -> str:
 
 @contextlib.contextmanager
 def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, facts_ref: str,
-                   progress_callback=None, tool_first: dict | None = None):
+                   progress_callback=None, tool_first: dict | None = None,
+                   run_id: str | None = None, draft_id: str | None = None,
+                   expect: type[BaseException] | None = None):
     """Author ONE real V3 run against a durable DSN, yield its ids, then remove every trace of it.
 
     The provider is a `FakeLLM` — this is about the DISPATCH AUDIT being real, not about reaching
@@ -52,10 +63,21 @@ def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, fa
     prompt and schema the v3 contract selected, and the dispatch chain reconciles, so
     `load_verified_checkpoint` replays the trace instead of refusing it.
     """
-    run_id = unique("far-durable")
+    run_id = run_id or unique("far-durable")
     message_id = unique("durable-evidence")
 
     with psycopg.connect(dsn, autocommit=True) as setup:
+        if draft_id is not None:
+            # A REAL draft row, because `_sync_from_trace` reads one. Without it the callback
+            # returns at `draft is None` and would report "retirement stopped the loop" from a
+            # code path that never looked at a retirement.
+            request_draft(
+                setup, formula_draft_id=draft_id, considered_revision_id=unique("crv"),
+                option_id="opt-1", planning_request_hash=unique("prh"),
+                catalog_snapshot_hash=unique("csh"), authoring_config_hash=unique("ach"),
+                definition_revision="1", requested_by="durable-evidence",
+                requested_at="2026-08-22T00:00:00Z")
+            advance(setup, draft_id, DraftStateV1.AUTHORING, authoring_run_id=run_id)
         queue_id = setup.execute(
             "INSERT INTO queue (message_id, partition_key, handler, payload, status, lease_owner, "
             "lease_expires_at, lease_fence) "
@@ -64,36 +86,95 @@ def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, fa
             (message_id, message_id)).fetchone()[0]
 
     monkeypatch.setenv("FEATUREGEN_DSN", dsn)
-    # `tool_first` scripts a TOOL CALL before the proposal, which is what creates a genuine
-    # between-turns moment. With a single final_proposal there is no "between", so a callback that
-    # only fires between turns can never be observed — which is not the same as it not firing.
-    author_turns = [FakeResponse(output={"turn_type": "final_proposal", "final_proposal": raw})]
-    if tool_first is not None:
-        author_turns.insert(0, FakeResponse(output={
-            "turn_type": "tool_call", "tool_call": tool_first}))
-    client = FakeLLM(script={
-        AUTHOR_TASK: author_turns,
-        CRITIC_TASK: FakeResponse(output={"findings": []}),
-    })
+    client = FakeLLM(script={CRITIC_TASK: FakeResponse(output={"findings": []})})
+    if tool_first is None:
+        client.script(task=AUTHOR_TASK, prompt_id=AUTHOR_PROMPT_ID_V3,
+                      responses=[FakeResponse(output={"turn_type": "final_proposal",
+                                                      "final_proposal": raw})])
+    else:
+        _script_two_turns(client, dsn, intent, raw, tool_first, allowed_refs)
 
+    expected: tuple[type[BaseException], ...] = (expect,) if expect is not None else (_NeverRaised,)
     try:
+        outcome: object = None
         with psycopg.connect(dsn) as conn:
-            result = run_authoring_v2_replay(
-                conn, intent, client, client, actor=None, authoring_run_id=run_id,
-                lease_fence=LeaseFence(queue_id, "worker-durable", 3),
-                facts_reader=lambda _p: ({facts_ref: OperandFactsV2(
-                    logical_type="decimal", unit="monetary", currency="fixed:AED")}, ()),
-                critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
-                tool_runner=recipe_tool_runner_v2(frozenset(allowed_refs)),
-                progress_callback=progress_callback,
-                formula_schema_version=3)
-            conn.commit()
-        yield run_id, result
+            try:
+                outcome = run_authoring_v2_replay(
+                    conn, intent, client, client, actor=None, authoring_run_id=run_id,
+                    lease_fence=LeaseFence(queue_id, "worker-durable", 3),
+                    facts_reader=lambda _p: ({facts_ref: OperandFactsV2(
+                        logical_type="decimal", unit="monetary", currency="fixed:AED")}, ()),
+                    critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
+                    tool_runner=recipe_tool_runner_v2(frozenset(allowed_refs)),
+                    progress_callback=progress_callback,
+                    formula_schema_version=3)
+                conn.commit()
+            except expected as exc:
+                # ▲ CAUGHT, NOT PROPAGATED — so the caller can still READ THE DATABASE. The audited
+                # `llm_call` rows are what "the loop stopped after one turn" is measured in, and
+                # `_erase` in the `finally` deletes them. Letting the failure escape `__enter__`
+                # would destroy the evidence before any assertion could reach it. Only the
+                # exception the caller NAMED is caught; anything else is a real failure and still
+                # escapes, uncleaned-up by nothing — the `finally` still runs.
+                conn.rollback()
+                outcome = exc
+        if expect is not None and not isinstance(outcome, expect):
+            raise AssertionError(
+                f"expected the run to raise {expect.__name__}; it completed instead: {outcome!r}")
+        yield run_id, outcome
     finally:
-        _erase(dsn, run_id, queue_id)
+        _erase(dsn, run_id, queue_id, draft_id)
+
+
+def _script_two_turns(client, dsn, intent, raw, tool_call, allowed_refs) -> None:
+    """Script a TOOL turn then the PROPOSAL, keyed by each turn's exact INPUT HASH.
+
+    ▲ **WHY BY HASH AND NOT BY TASK.** `FakeLLM.call` tracks the response POSITION in `self._calls`
+    keyed on `(task, prompt_id, input_hash)`. A tool result changes the next turn's inputs, so the
+    hash changes, the index resets to zero, and a task-keyed sequence hands back response ZERO —
+    the tool call — again, repeating until `max_turns`. Keying each turn by its own hash is what
+    makes a two-turn script actually run two turns, and it is how the existing multi-turn author
+    tests do it (`test_author.py::_hash_for`).
+
+    The hashes are computed by REPLICATING the audited seam's input assembly, not guessed: the same
+    `build_llm_inputs(redaction, catalog_metadata=build_turn_metadata(intent, trail))` the seam
+    builds. The tool result on the trail is the REAL one, produced by running the tool — a fabricated
+    result would hash differently and the second turn would never match.
+    """
+    from featuregen.formula.author import (
+        AUTHOR_INSTRUCTION_V3,
+        build_turn_metadata,
+        tool_trail_entry,
+    )
+    from featuregen.intake.llm import compute_input_hash
+    from featuregen.intake.redaction import RedactionResult, build_llm_inputs
+
+    runner = recipe_tool_runner_v2(frozenset(allowed_refs))
+    with psycopg.connect(dsn) as tool_conn:
+        result = runner(tool_conn, tool_call["tool_name"], tool_call.get("arguments", {}),
+                        roles=())
+
+    def _hash_for(trail: list[dict]) -> str:
+        redaction = RedactionResult(text=AUTHOR_INSTRUCTION_V3,
+                                    redaction_version="metadata-only",
+                                    redacted_spans=(), disposition="ok")
+        return compute_input_hash(build_llm_inputs(
+            redaction, catalog_metadata=build_turn_metadata(intent, trail),
+            raw_input_classification="clean"))
+
+    client.script(task=AUTHOR_TASK, prompt_id=AUTHOR_PROMPT_ID_V3, input_hash=_hash_for([]),
+                  responses=[FakeResponse(output={"turn_type": "tool_call",
+                                                  "tool_call": tool_call})])
+    after_tool = [tool_trail_entry(1, tool_call["tool_name"], result)]
+    client.script(task=AUTHOR_TASK, prompt_id=AUTHOR_PROMPT_ID_V3,
+                  input_hash=_hash_for(after_tool),
+                  responses=[FakeResponse(output={"turn_type": "final_proposal",
+                                                  "final_proposal": raw})])
 
 
 _APPEND_ONLY = (
+    ("formula_draft_retirement", "formula_draft_retirement_no_change"),
+    ("formula_draft", "formula_draft_no_identity_edit"),
     ("formula_authoring_trace_event", "formula_authoring_event_no_mutation"),
     ("formula_authoring_run", "formula_authoring_run_no_mutation"),
     ("llm_dispatch_subject", "llm_dispatch_subject_no_mutation"),
@@ -103,7 +184,7 @@ _APPEND_ONLY = (
 )
 
 
-def _erase(dsn: str, run_id: str, queue_id: int) -> None:
+def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None) -> None:
     """Remove exactly what this run wrote — ALL OF IT IN ONE TRANSACTION, or none of it.
 
     ▲ **THE GUARDS MUST NEVER BE LEFT OFF.** An earlier version disabled the append-only triggers on
@@ -141,6 +222,13 @@ def _erase(dsn: str, run_id: str, queue_id: int) -> None:
             cleanup.execute(
                 "DELETE FROM formula_authoring_run WHERE authoring_run_id = %s", (run_id,))
             cleanup.execute("DELETE FROM queue WHERE id = %s", (queue_id,))
+            if draft_id is not None:
+                # Retirement first: it REFERENCES the draft, and the FK is what orders this rather
+                # than a convention.
+                cleanup.execute(
+                    "DELETE FROM formula_draft_retirement WHERE formula_draft_id = %s", (draft_id,))
+                cleanup.execute(
+                    "DELETE FROM formula_draft WHERE formula_draft_id = %s", (draft_id,))
             _erase_hook()
 
             # FLUSH DEFERRED CONSTRAINT TRIGGERS FIRST. The deletes above leave pending FK trigger

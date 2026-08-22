@@ -1,9 +1,21 @@
-"""RELEASE GATE — a genuine, replayable, provider-authored V3 run qualifies as V3 evidence.
+"""THE TWO RELEASE GATES. Both need a real authoring run against a DURABLE database, which is the
+only reason they live apart from the rest of the formula tests.
 
-Everything else about `qualifies_as_v3_evidence_for_run` is proved by refusals. This is the one
-test that proves the intersection: a run with REAL provider calls under the v3 contract AND a trace
+**Gate 2 — a genuine, replayable, provider-authored V3 run qualifies as V3 evidence.** Everything
+else about `qualifies_as_v3_evidence_for_run` is proved by refusals. This is the one test that
+proves the INTERSECTION: a run with real provider calls under the v3 contract AND a trace
 `load_verified_checkpoint` replays. Asserting each half separately cannot establish it, and until it
 existed the evaluator had no basis to treat the qualifier as an activation authority.
+
+**Gate 1 — retirement stops the authoring loop between provider turns.** Measured in audited author
+calls against a control that runs the identical script, so retirement is the only variable. It found
+a real defect on its first run: `DraftRetired` was a bare `RuntimeError`, so the orchestrator folded
+the deliberate re-raise into `TECHNICAL_FAILURE` and the worker's `retired` arm was unreachable from
+the loop.
+
+Both need the durable DSN for the same underlying reason: the dispatch audit and `_record_llm_call_
+durable` write on their OWN connections, so nothing they record is visible — or reconcilable — from
+inside a rolled-back test transaction.
 """
 from __future__ import annotations
 
@@ -14,9 +26,10 @@ from tests.featuregen.formula.authoring_fixtures import (
     REF_DT,
     TABLE_REF,
 )
-from tests.featuregen.formula.durable_evidence import durable_v3_run
+from tests.featuregen.formula.durable_evidence import durable_v3_run, unique
 from tests.featuregen.materialize.test_admission_v2_s13 import _INTENT, _raw_v3
 
+from featuregen.formula.author import AUTHOR_TASK
 from featuregen.formula.authoring_versions import qualifies_as_v3_evidence_for_run
 from featuregen.overlay.upload.dispatch_audit import (
     formula_dispatch_reconciliation_failure,
@@ -68,39 +81,104 @@ def test_the_QUALIFIER_READS_THE_REPLAYED_PROPOSAL_not_the_raw_row(db, monkeypat
             assert proposal["formula_schema_version"] == 3
 
 
-# ══ GATE 1 IS STILL OPEN — and here is the ACTUAL obstacle ════════════════════════════════════
+# ══ GATE 1 — RETIREMENT STOPS THE LOOP BETWEEN PROVIDER TURNS ═════════════════════════════════
 #
-# The reviewed design is right: two arms driven by the IDENTICAL multi-turn script, so the tool
-# result is the same in both and RETIREMENT is the only variable, measured in AUDITED AUTHOR CALLS
-# rather than in the final disposition. That removes the coupling that sank the first attempt.
+# Everything else about retirement was already proved: `advance` refuses a retired draft under both
+# concurrency orderings, the worker returns `retired` with zero provider calls and completes its
+# queue item, and `_sync_from_trace` re-raises instead of swallowing. The unproved claim was
+# narrowly the ORDERING — that the raise reaches the authoring loop BETWEEN turns, so the run stops
+# instead of paying for the next one.
 #
-# ▲ CORRECTION TO A WRONG DIAGNOSIS I LEFT HERE. I recorded that the eight author calls came from a
-# malformed tool-argument shape and that the next implementer should fix it. **That was wrong** —
-# `{"tool_name": "get_column_metadata", "arguments": {"logical_ref": ...}}` already matches what
-# `recipe_authoring.py:316` expects. Do not spend time on it.
-#
-# The real cause is `FakeLLM.call` (`intake/llm.py:175`): the response POSITION is tracked in
-# `self._calls` keyed on `(task, prompt_id, input_hash)`. A tool result changes the next turn's
-# inputs, so the hash changes, `idx` resets to 0, and the task-key fallback sequence hands back
-# response ZERO — the tool call — again. The loop therefore repeats the tool turn until `max_turns`,
-# which is where eight comes from. Nothing about the run or the tool is malformed.
-#
-# So the script must be keyed by INPUT HASH rather than by task, the way the existing multi-turn
-# author tests do it:
-#   * first input hash                              -> the tool response
-#   * the input hash INCLUDING the canonical tool trail -> the final proposal
-# Assert the control makes exactly TWO audited author calls before writing the retirement arm, then
-# run the identical script with the retirement committed after call one and assert `DraftRetired`
-# plus exactly ONE audited call.
-#
-# Everything else about retirement is proved: `advance` refuses a retired draft under BOTH
-# concurrency orderings, the worker returns `retired` with ZERO provider calls and completes its
-# queue item, and `_sync_from_trace` re-raises rather than swallowing. The unproved claim is
-# narrowly the ORDERING — that the raise reaches the loop between turns.
-#
-# Confirmed by review: the V3 early return before the post-authoring callback
-# (`replay_authoring_v2.py:932` vs `935`) is a progress-REPORTING gap only. After the critic, V3
-# performs local derivation and persistence, so no additional provider spend rides on it.
+# The measurement is AUDITED AUTHOR CALLS, not the final disposition. A disposition conflates "the
+# loop stopped" with "the loop stopped for this reason"; `llm_call` rows are what the spend actually
+# is. Both arms run the IDENTICAL two-turn script against the IDENTICAL tool result, so retirement
+# is the only variable between them.
+
+_TOOL_CALL = {"tool_name": "get_column_metadata", "arguments": {"logical_ref": REF_AMT}}
+
+
+def _audited_author_calls(conn, run_id: str) -> int:
+    """What this run actually SPENT on authoring — one row per provider turn, durable.
+
+    Committed on the audit's own connection (`_record_llm_call_durable`), which is why it survives
+    the rollback of a run that raised and is readable from a different connection than the run's.
+    """
+    return conn.execute(
+        "SELECT count(*) FROM llm_call WHERE run_id = %s AND task = %s",
+        (run_id, AUTHOR_TASK)).fetchone()[0]
+
+
+def test_a_TWO_TURN_RUN_SPENDS_EXACTLY_TWO_AUTHOR_CALLS(db, monkeypatch, _dsn):
+    """THE CONTROL, and it has to hold before the retirement arm means anything.
+
+    Without it, "one audited call" proves nothing: a script that repeats its first turn forever, or
+    one that never reaches its second, would produce a small number for reasons having nothing to do
+    with retirement. This pins the denominator — an untouched run of this exact script is TWO.
+
+    ▲ It is also the test that the input-hash scripting works. `FakeLLM.call` tracks response
+    position by `(task, prompt_id, input_hash)`, so a script keyed on the task alone hands back the
+    TOOL turn again once the tool result changes the hash, and the loop repeats it until `max_turns`
+    without ever reaching the proposal. Whatever number that produces, it is not two — which is why
+    the count is asserted before the disposition.
+    """
+    import psycopg
+
+    with durable_v3_run(_dsn, monkeypatch, raw=_raw_v3(), intent=_INTENT, allowed_refs=_REFS,
+                        facts_ref=REF_AMT, tool_first=_TOOL_CALL) as (run_id, result):
+        # THE COUNT FIRST: it is the claim, and it is the more informative failure. A repeated
+        # first turn shows up here as the number it really is rather than as a disposition.
+        with psycopg.connect(_dsn) as check:
+            assert _audited_author_calls(check, run_id) == 2
+        assert result.authoring_disposition == "READY_FOR_OUTPUT_BINDING", result
+
+
+def test_RETIREMENT_STOPS_THE_LOOP_AFTER_ONE_AUTHOR_CALL(db, monkeypatch, _dsn):
+    """▲ THE GATE. Same script, same tool result, one difference: the draft is retired — COMMITTED,
+    from another connection — once the first author call has been paid for. The run must stop there.
+
+    ONE audited author call against the control's two is the entire claim. The second turn is what
+    withdrawing a draft is meant to avoid buying, and until this test existed nothing established
+    that `_sync_from_trace`'s re-raise actually reaches the loop rather than being folded into the
+    run's own error handling somewhere above it.
+
+    The retirement is committed on a SEPARATE autocommit connection because that is the only way it
+    can be true: `_sync_from_trace` opens its own connection, so a retirement sitting uncommitted in
+    the run's transaction is invisible to exactly the reader that has to see it.
+    """
+    import psycopg
+
+    from featuregen.overlay.upload.formula_draft_store import (
+        DraftRetired,
+        retire_formula_draft,
+    )
+    from featuregen.overlay.upload.formula_draft_worker import _sync_from_trace
+
+    draft_id = unique("draft-retire")
+    run_id = unique("far-durable")
+    retired: list[str] = []
+
+    def progress() -> None:
+        """The worker's own progress hook, plus the retirement that races it.
+
+        `author_formula` calls this before AND after each provider call, so the invocation that
+        follows call one is where a withdrawal would realistically land.
+        """
+        with psycopg.connect(_dsn, autocommit=True) as watch:
+            if not retired and _audited_author_calls(watch, run_id) == 1:
+                retire_formula_draft(watch, draft_id, reason="WITHDRAWN",
+                                     detail="withdrawn mid-run", retired_by="ops@bank")
+                retired.append(draft_id)
+        _sync_from_trace(draft_id)
+
+    with durable_v3_run(_dsn, monkeypatch, raw=_raw_v3(), intent=_INTENT, allowed_refs=_REFS,
+                        facts_ref=REF_AMT, tool_first=_TOOL_CALL, run_id=run_id,
+                        draft_id=draft_id, progress_callback=progress,
+                        expect=DraftRetired) as (_run_id, outcome):
+        assert retired == [draft_id], "the retirement never happened; the arm proves nothing"
+        assert "WITHDRAWN" in str(outcome), outcome
+        with psycopg.connect(_dsn) as check:
+            assert _audited_author_calls(check, run_id) == 1, (
+                "the loop paid for another turn after the draft was withdrawn")
 
 
 # ══ THE CLEANUP IS ATOMIC, AND PROVED WITHOUT CREATING ANY EVIDENCE ═══════════════════════════

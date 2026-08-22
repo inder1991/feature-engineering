@@ -42,6 +42,7 @@ from enum import StrEnum
 
 from featuregen.canonical import jcs_sha256
 from featuregen.contracts.db import DbConn
+from featuregen.formula.control import FormulaControlFlow
 
 __all__ = [
     "ADMISSION_POLICY_VERSION",
@@ -140,9 +141,26 @@ class RetirementDisagreement(RuntimeError):
     """
 
 
-class DraftRetired(RuntimeError):
+class DraftRetired(FormulaControlFlow):
     """This draft is retired: it is no longer the current answer and must not be advanced, restored
-    or compiled."""
+    or compiled.
+
+    ▲ **A CONTROL SIGNAL, NOT A SEMANTIC RESULT — and it has to be typed as one.** While this was a
+    bare `RuntimeError`, `_sync_from_trace`'s deliberate re-raise reached the replay orchestrator's
+    `except Exception` and was folded into `TECHNICAL_FAILURE (author:DraftRetired)`. Two things
+    went wrong there. The spend still stopped, so the harm was not money; the harm was that the
+    worker's `except DraftRetired` arm — the one that reports `retired`, leaves the draft's state
+    alone and completes the queue item — became UNREACHABLE from the authoring loop, and that a
+    withdrawal was recorded permanently, in a write-once run row, as though the software had
+    crashed. "Somebody withdrew this" and "this run failed" are different facts and the evidence
+    must not confuse them.
+
+    `FormulaControlFlow` is exactly this category ("must never be folded into a semantic result"),
+    every one of the orchestrator's handlers already re-raises it, and its nearest sibling
+    `LeaseFenceLost` says the same kind of thing: this worker no longer holds the right to spend on
+    this run. It remains a `RuntimeError` by inheritance, so no existing caller's `except` changes
+    meaning.
+    """
 
 
 @dataclass(frozen=True, slots=True)
