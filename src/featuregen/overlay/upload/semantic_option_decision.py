@@ -423,25 +423,37 @@ def _formula_schema_supported(recipe_id: str) -> bool:
         return False
 
 
-def _gold_evaluation_recorded(recipe_id: str) -> bool:
-    """C3 — has a gold + provider evaluation PASSED for this recipe's reviewed expectation?
+def _gold_evaluation_recorded(conn, recipe_id: str) -> bool:
+    """C3 — has a gold + provider evaluation PASSED for this recipe's reviewed expectation, under
+    the world that is current NOW?
 
-    ``False`` for every recipe today, but **not for the reason this docstring used to give.** It
-    claimed "NO store records a gold-evaluation outcome anywhere in the platform". That was WRONG:
-    migration 1029 creates ``recipe_formula_eval_run`` / ``_case`` / ``_attempt`` / ``_artifact``,
-    and has since long before this function was written. The error mattered — it justified a
-    hardcoded refusal on the grounds that there was nowhere to read from.
+    ▲ **THIS USED TO BE A HARDCODED `False`**, and its docstring named exactly what was missing: not
+    a store — migration 1029 has recorded evaluation outcomes for a long time — but *"a READER WITH
+    A VALIDITY CONTRACT"*, because *"a stale pass is not a pass"* and returning `True` for one would
+    launder an old verdict into a present authority.
 
-    What is genuinely missing is a READER WITH A VALIDITY CONTRACT. A passing artifact only counts
-    if it was produced under the world that is current now, so the reader must check it against the
-    recipe revision, blueprint hash, grammar version, policy versions, model configuration and code
-    revision it was produced under. **A stale pass is not a pass**, and returning ``True`` for one
-    would launder an old verdict into a present authority.
+    That reader now exists (`current_evaluation_validity`), and the validity contract it checks is
+    the evaluation contract of migration 1097: the grammar, output-policy and canonicalization
+    versions, the reviewed corpus, the expectation registry and the byte-frozen author and critic
+    provider contracts. All derivable from this build, so "was this produced under the current
+    world" is a hash comparison rather than a judgement.
 
-    So this stays ``False`` until that reader exists (plan task R4-3b) — a named absence with the
-    right name. The seam walkthrough patches it to ``True``, which is how the whole materialization
-    ladder is reachable in a test; that patch is deleted when the reader lands."""
-    return False
+    **It still answers `False` today, and for a reason that is now a NAMED one with a path to
+    `True`**: the reviewed corpus holds a single clean case, so no run over it is certifiable
+    (§0.10 step 5B). The difference from the old constant is not the answer — it is that the answer
+    is now derived, and it will change by itself when the reviewed corpus grows.
+
+    Keyed by EXPECTATION REF, never by recipe id: a recipe's ref is its own name for only 3 of the
+    317 registry recipes. A candidate the registry never minted, or a recipe declaring no formula,
+    has nothing to have evaluated — honestly `False`, not an error.
+    """
+    from featuregen.overlay.upload.current_evaluation_validity import current_evaluation_validity
+    from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+
+    definition = v2_recipe_by_id(recipe_id)
+    if definition is None or definition.formula is None:
+        return False
+    return current_evaluation_validity(conn, definition.formula.expectation_ref).is_current
 
 
 def _requirements_closed(conn, contract_id: str | None,
@@ -600,7 +612,7 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                 reviewed_expectation=has_reviewed_formula_expectation(
                     frozen.source_definition_id),
                 grammar_verdict="ok",
-                gold_validated=_gold_evaluation_recorded(frozen.source_definition_id),
+                gold_validated=_gold_evaluation_recorded(conn, frozen.source_definition_id),
                 engine_verdict="ok" if formula_supported else "unsupported_engine",
             )).state
         except Exception:                     # unfoldable → the frozen truth, never a promotion

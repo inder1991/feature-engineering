@@ -39,7 +39,10 @@ WHAT IS SEEDED, EACH NAMED (the C3 milestone's vocabulary, deliberately)
   at the live revision hash, by every role the recipe itself names — and they are recorded BEFORE
   the generation run, so the SERVED fold measures them (a review recorded afterwards clears the
   current layer and leaves the frozen one blocking, which is correct and is not a walkthrough).
-* The **gold/provider evaluation** has no store — ``_gold_evaluation_recorded`` is the documented
+* The **gold/provider evaluation** has a store and now a validity reader, but no CERTIFIABLE run:
+  the reviewed corpus holds one clean case (§0.10 step 5B), so ``_gold_evaluation_recorded``
+  derives ``False``. It is patched here for the same reason it always was — the walkthrough is
+  about the ladder being reachable, not about the corpus being complete. Formerly the documented
   hook C3 named, and it is seeded here for the same reason.
 * **Snapshot freshness** is seeded: snapshot minting rides the generation pipeline, not this test.
 * The **external validation results** are real rows in the real store — one
@@ -352,7 +355,7 @@ def test_the_seam_walks_from_a_served_candidate_to_a_build_verified_run(
     # ── Step 4 (§0.5 item 3): the activation fold ALLOWS execute_materialization, on a real
     # frozen row, with all four §0.3 codes cleared. ────────────────────────────────────────
     monkeypatch.setattr(semantic_option_decision, "_gold_evaluation_recorded",
-                        lambda recipe_id: True)
+                        lambda conn, recipe_id: True)
     monkeypatch.setattr(feature_metadata_snapshot, "compare_snapshot_to_current",
                         lambda conn, snapshot_id: SnapshotFreshness("current", None, None))
     option_id = _freeze_a_governed_option(
@@ -449,7 +452,7 @@ def test_the_route_closes_the_named_homework_only_through_the_LINKED_contract(
         catalog_source="posting_bank",
         target_ref="public.txns.attrited")
     monkeypatch.setattr(semantic_option_decision, "_gold_evaluation_recorded",
-                        lambda recipe_id: True)
+                        lambda conn, recipe_id: True)
     monkeypatch.setattr(feature_metadata_snapshot, "compare_snapshot_to_current",
                         lambda conn, snapshot_id: SnapshotFreshness("current", None, None))
 
