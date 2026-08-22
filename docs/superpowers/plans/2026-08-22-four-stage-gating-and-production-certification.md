@@ -1646,6 +1646,30 @@ certificate against a count is matching on the wrong thing.
 | `LLM_AUTHORED` | provider · model id · author contract ref + hash · critic contract ref + hash · formula schema version · grammar version · governing policy version |
 | `REVIEWED_RECIPE_BLUEPRINT` | blueprint revision id · blueprint content hash · expectation hash · **expectation generation (V1/V2)** · producer version · compiler version · grammar version |
 
+▲ **WHERE THE LLM PAYLOAD ACTUALLY COMES FROM — verified 2026-08-23, and it is not where this
+section implies.** The frozen author/critic configuration is persisted by exactly ONE writer,
+`recipe_formula_shadow.py:1178`, which is the **shadow evaluation** lane. **The production authoring
+lane freezes no configuration per run**, so a sealing-time derivation cannot read one.
+
+**It does not need to.** `llm_dispatch` carries, per call: `provider`, `model`,
+`provider_contract_hash`, `prompt_content_hash`, `schema_content_hash`, `authoring_run_id` and
+`call_role` — **live: 877 of 890 rows carry a contract hash.** That is the same evidence
+`derive_authoring_method` already reads, and it is strictly better than a frozen configuration for
+this purpose: **it records what was ACTUALLY SENT, not what configuration happened to be current.**
+
+▲ **This matters because the obvious alternative is the §10 backfill error moved to sealing time.**
+Deriving the identity from `current_formula_generation_settings()` at seal would record *today's*
+deployed configuration against a run authored under a different one — today's evidence, yesterday's
+bytes. **Derive from the run's dispatches, by role.** The version axis comes from
+`formula_authoring_run.versions` (`formula_schema`, `operation_grammar`, `disposition`, `critic`),
+which is already stored per run.
+
+▲ **One live consequence worth knowing before writing the migration:** of 890 dispatches only **3**
+carry an `authoring_run_id` and a `call_role`, and all three are `formula.author` — **there are no
+critic dispatches at all**. Consistent with all seven drafts being `FAILED`/`BLOCKED` (§11.1.2): the
+runs never reached the critic. So a fixture for this table cannot be harvested from live data, and
+`LLM_AUTHORED` identity requires both roles by §10's own payload.
+
 ▲ **Expectation generation is load-bearing, not decoration** — `has_reviewed_expectation()`
 (`recipe_formula_expectations_v2.py:53`) unions two registries and **two of the three reviewed
 recipes are Formula V1**, so "a reviewed expectation exists" does not by itself identify a
