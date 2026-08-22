@@ -353,6 +353,41 @@ def test_THE_STORED_CODE_IS_REAL_SPARK_for_this_group(built, catalog):
 
 
 # ══ HOW EACH SEALED MEMBER WAS AUTHORED ════════════════════════════════════════════════════════
+def test_THE_SEALED_ARTIFACT_RECORDS_ITS_MEMBERS_EXACT_METHOD_IDENTITY(built, catalog):
+    """▲ The hash a production certificate is MATCHED against, written by the same sealing act.
+
+    1099 says WHICH of two methods. A certificate covers a model, a pair of contracts, a grammar and
+    a schema — or a blueprint revision and the expectation it stood on. Matching a certificate
+    against "REVIEWED_RECIPE_BLUEPRINT" matches on the wrong thing, and would pass for a blueprint
+    the platform never evaluated.
+
+    Asserted from the STORE, and asserted to AGREE with 1099's row: the composite foreign key makes
+    a disagreement unwritable, and this is the test that would notice if that key were ever relaxed.
+    """
+    import json
+
+    _request_id, outcome = built
+    assert outcome.status == "generated", outcome.detail
+
+    rows = catalog.execute(
+        "SELECT member_name, authoring_method, method_identity_hash, method_identity_json "
+        "FROM sealed_artifact_member_method_identity WHERE artifact_id = %s",
+        (outcome.artifact_id,)).fetchall()
+
+    assert [r[0] for r in rows] == [FEATURE]
+    member_name, method, identity_hash, payload = rows[0]
+    assert method == "REVIEWED_RECIPE_BLUEPRINT"
+    assert identity_hash
+    payload = payload if isinstance(payload, dict) else json.loads(payload)
+    # It NAMES the blueprint it stood on — the whole point of an exact identity.
+    assert payload["blueprint_revision"]
+    assert payload["expectation_hash"]
+    assert payload["method"] == "REVIEWED_RECIPE_BLUEPRINT"
+    # And the version axis, because a certificate covers a grammar and a schema.
+    assert payload["formula_schema_version"]
+    assert payload["operation_grammar_version"]
+
+
 def test_THE_SEALED_ARTIFACT_RECORDS_HOW_ITS_MEMBER_WAS_AUTHORED(built, catalog):
     """▲ The row a production gate chooses a certificate from, written by the act that sealed.
 

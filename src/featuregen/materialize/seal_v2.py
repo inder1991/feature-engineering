@@ -52,6 +52,11 @@ from featuregen.materialize.artifact_manifest import (
     verify_bytes,
 )
 from featuregen.materialize.artifact_store import fetch_file, store_manifest
+from featuregen.materialize.method_identity import (
+    MethodIdentityUndecidable,
+    derive_method_identity,
+    record_method_identity,
+)
 from featuregen.materialize.authoring_provenance import (
     MemberAuthoringInputV1,
     MemberProvenanceRefused,
@@ -72,6 +77,7 @@ __all__ = [
     "ArtifactNotServable",
     "MemberAuthoringInputV1",
     "MemberProvenanceRefused",
+    "MethodIdentityUndecidable",
     "RealizationLinkV1",
     "SealedArtifactV2",
     "load_manifest",
@@ -211,6 +217,18 @@ def seal_v2(
     _require_provenance_covers(members, member_provenance)
     derived = derive_member_provenance(conn, member_provenance)
 
+    # ▲ THE EXACT METHOD IDENTITY, DERIVED HERE FOR THE SAME REASON, and refused here for the same
+    # reason. `derive_member_provenance` establishes WHICH of two methods; a production certificate
+    # covers a model, a pair of contracts, a grammar and a schema — so a member whose exact identity
+    # cannot be named from its run's evidence can never be certificate-matched, and sealing it would
+    # manufacture an artifact production must permanently refuse. Both derivations read only, and
+    # both happen before a single byte is written.
+    identities = tuple(
+        (item.member.member_name,
+         derive_method_identity(conn, authoring_run_id=item.member.authoring_run_id,
+                                authoring_method=item.provenance.authoring_method))
+        for item in derived)
+
     verdict, by_member = _fold_requirements(members, requirements)
 
     # Bytes first: a manifest that does not match its files must not leave a sealed row behind.
@@ -247,6 +265,12 @@ def seal_v2(
     # refused artifact was still authored somehow, and an operator asking "where did this formula
     # come from" about a build that failed is asking the same question as about one that passed.
     record_member_provenance(conn, manifest.artifact_id, derived)
+
+    # ▲ SAME TRANSACTION AS THE PROVENANCE ABOVE, all members or none. An artifact whose members
+    # have a method but no method IDENTITY is one production can never evaluate — and it would look
+    # complete, because 1099's rows are all there.
+    for member_name, identity in identities:
+        record_method_identity(conn, manifest.artifact_id, member_name, identity)
 
     # RECORDED ON BOTH PATHS. See the module docstring: the acceptance clause is that a refusal
     # keeps these, and a refused compilation depended on exactly the policies it depended on.
