@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -198,6 +199,11 @@ def qualifies_as_v3_evidence(stored: Mapping[str, object] | None) -> tuple[bool,
 def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool, tuple[str, ...]]:
     """THE authority: does this run carry the complete V3 identity, checked against the DATABASE?
 
+    A thin reading of :func:`v3_run_conformance`, which separates HOW THE RUN WAS CONDUCTED from
+    WHAT IT PRODUCED. Both are required here, because "may the evaluator treat this as v3
+    authoring evidence" needs both. A caller that legitimately expects an invalid artifact — an
+    adversarial evaluation case — asks `v3_run_conformance` instead.
+
     Returns ``(ok, disagreements)``. The manifest half is necessary and not sufficient — see
     :func:`qualifies_as_v3_evidence` for the interval it cannot see — so this adds the facts that
     live outside ``versions``:
@@ -214,6 +220,11 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     provider-authored run — an evaluator that accepted both under one contract would be reporting
     two populations as one.
     """
+    return v3_run_conformance(conn, authoring_run_id).as_evidence()
+
+
+def v3_run_conformance(conn, authoring_run_id: str) -> V3RunConformance:
+    """The same checks, reported as two separable facts. See :class:`V3RunConformance`."""
     row = conn.execute(
         "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
         (authoring_run_id,)).fetchone()
@@ -310,13 +321,57 @@ def qualifies_as_v3_evidence_for_run(conn, authoring_run_id: str) -> tuple[bool,
     # qualifier is for. Falling back to the raw row when the manifest is unreadable is deliberate
     # too: it lets the parse problems below name what is wrong instead of the whole run reading as
     # "no proposal".
+    conduct_problems = tuple(problems)
+
     produced = _verified_proposal(conn, authoring_run_id, problems)
     if produced is None:
         problems.append("<no terminal proposal> (a run that produced nothing evidences nothing)")
+        artifact_problems: tuple[str, ...] = tuple(problems[len(conduct_problems):])
     else:
-        problems.extend(_v3_parse_problems(produced))
+        artifact_problems = _v3_parse_problems(produced)
+        problems.extend(artifact_problems)
 
-    return (not problems), tuple(problems)
+    return V3RunConformance(
+        conduct_problems=conduct_problems, artifact_problems=tuple(artifact_problems))
+
+
+@dataclass(frozen=True, slots=True)
+class V3RunConformance:
+    """Two separable facts about a run, because two callers need different halves of them.
+
+    ▲ **WHY THEY MUST NOT BE ONE BOOLEAN.** An ADVERSARIAL evaluation case shows the provider a
+    malformed proposal on purpose and asks whether the platform refused it. Under a single
+    "qualifies as v3 evidence" flag, that case can NEVER pass: the deliberately-invalid artifact
+    fails the parse check, so a correct refusal and a broken lane produce the same answer. Split,
+    the question each caller is actually asking becomes askable —
+
+    * `conducted_under_v3` — was this run driven under the v3 author contract, with an auditable
+      provider call behind every turn and a trace that replays? True for a correct refusal.
+    * `artifact_is_v3` — did it produce something that genuinely parses as a V3 proposal? Expected
+      FALSE on an adversarial case, and required on a clean one.
+
+    `qualifies_as_v3_evidence_for_run` is both together, which remains the right question for
+    "may the evaluator treat this run as v3 authoring evidence".
+    """
+
+    conduct_problems: tuple[str, ...]
+    artifact_problems: tuple[str, ...]
+
+    @property
+    def conducted_under_v3(self) -> bool:
+        return not self.conduct_problems
+
+    @property
+    def artifact_is_v3(self) -> bool:
+        return not self.artifact_problems
+
+    @property
+    def problems(self) -> tuple[str, ...]:
+        return self.conduct_problems + self.artifact_problems
+
+    def as_evidence(self) -> tuple[bool, tuple[str, ...]]:
+        """The whole-run answer, in the shape the release gate already asserts on."""
+        return (self.conducted_under_v3 and self.artifact_is_v3), self.problems
 
 
 def _verified_proposal(conn, authoring_run_id: str, problems: list[str]):
