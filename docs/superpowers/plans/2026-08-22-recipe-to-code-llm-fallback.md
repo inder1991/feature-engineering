@@ -15,6 +15,25 @@ document carries their consequences and nothing more:
 | **3 — the money guard** | §3.3's *"two remedies, pick one"* is **gone**. Retirement decouples from identity; this plan still supplies exactly two facts and still touches no composition (parent §11.1.1) |
 | **5 — delete the legacy route** | ▲ **the parent explicitly supersedes this document's earlier "thin adapter" commitment.** Step 10's both-route equivalence test is replaced by route-absence and direct-queue-bypass |
 
+### ▲ What the PRINCIPAL-ARCHITECT VERDICT changed here — revision four
+
+The verdict of 2026-08-22 (against `3c52a9de`, suite green at 13,154) found **ten stop-ship items**
+across the pair. Six are wholly the parent's. **Four land on this document, and one of them moves a
+whole step:**
+
+| Finding | Consequence in this plan |
+|---|---|
+| ▲ **P0-2 — the step 2 / step 4 identity CYCLE** | **§3.1's resolver and §3.3's `formula_draft_authoring_plan` are PROMOTED into step 2.** Parent identity V2 composes `formula_strategy` and `strategy_identity_hash`; those facts cannot be created by a step that waits for V2. **Migration 1104 moves with them.** Step 4 keeps the lanes, not the contract |
+| ▲ **P0-9 — "Try AI formula" vs server-owned method** | D2's *"the client may explicitly request an LLM retry"* becomes a **durable server-authored `formula_method_override_revision`** (parent §11.3, migration 1108). The browser never sends a strategy; the resolver consumes the override as an input fact |
+| ▲ **P0-10 — spend authorization is not designed** | D5's *"selection never spends"* gets its durable half: `llm_spend_authorization_revision` (parent §11.2), checked **before every provider call and every repair turn** — which is step 4c item 5's loop |
+| ▲ **P0-1 — the sandbox lane does not exist** | steps 6–8 were *"not this plan's work"* on the assumption that `EXECUTE_SANDBOX` worked. **It does not** (parent §9.0). Step 10's cutover cannot delete the legacy handler until it is BUILT, and step 5b item 4's seven-stage UI describes two stages nothing currently performs |
+
+▲ **And one measurement in this document was wrong, in the direction that matters.** §1.2 and step 9
+repeat a docstring saying *"no `recipe_review_event` row exists yet"*. **Live: 996 approved rows,
+covering all 317 recipes, zero single-identity violations — and ZERO carrying a
+`formula_expectation_hash`** (parent §21). The rule is untouched; the scarcity is the opposite of
+what this plan assumed. See §1.2 and step 9.
+
 ---
 
 ## ▲ This is a CHILD IMPLEMENTATION PLAN
@@ -144,6 +163,15 @@ own docstring says why the two numbers must never be joined:
 > reviewed is a governance answer no derivation can supply, and no `recipe_review_event` row exists
 > yet."*
 
+▲ **CORRECTED — the last clause of that docstring is now FALSE, and the sentence around it is not.**
+Live measurement, 2026-08-22: **996 approved `recipe_review_event` rows**, covering **all 317**
+recipes, by 6 reviewers, with **zero** single-identity violations — and **zero** carrying a
+`formula_expectation_hash` (parent §21). So the honest statement is *"there are no qualifying
+formula-expectation approvals"*, never *"no review events exist"*. ▲ **The argument is untouched and
+is exactly why this section exists:** those 996 approve **recipes**; not one of them says a human
+looked at a **formula expectation**. Correct the docstring in step 2, and do not let the correction
+be read as removing the rule it justifies.
+
 `grep` across `deterministic_producer.py` and `replay_authoring_v2.py` for `has_reviewed`,
 `recipe_review_event` or `review_validity` returns **nothing**: the deterministic lane has no review
 check of its own. So a resolver written from `blueprint_derivable` would seal
@@ -265,6 +293,15 @@ The client never chooses a more favourable method label. It may explicitly reque
 after a deterministic defect — **that is a new draft identity and a new user action**, and the
 backend never silently changes method after a failure.
 
+▲ **P0-9 — and as written that sentence contradicted parent §7**, which rules that the client must
+not supply formula method. Both intentions are right; the **mechanism** was missing. **The retry is a
+durable, server-authored `formula_method_override_revision`** (parent §11.3, migration 1108): the
+browser asks for an override and never sends `formula_strategy=LLM_AUTHORED`; the server **verifies
+the deterministic refusal it names is recorded and current**, binds an actor, a reason, a spend
+authorization (parent §11.2) and an expiry; and the resolver below consumes the revision as an
+**input fact**. ▲ **The override changes the evidence, never the authority** — this selector remains
+the only thing that decides a method.
+
 ### D3 — A missing reviewed expectation is a route selector, not a code blocker
 
 It causes `LLM_AUTHORED` and the UI warning "AI formula required". ▲ **Two different codes are
@@ -323,6 +360,14 @@ Retirement is enforced only when the unique-index INSERT *loses*, so "selection 
 The parent decouples them; **the visible consequence in this plan is that a retired candidate must
 refuse before the coordinator ever counts it as a costed member** (step 5a item 1).
 
+▲ **P0-10 — and "an approved cost ceiling" had no owner anywhere.** This plan quotes one in step 5a,
+the parent's §4 has a blocker row for its absence, and **no table, migration or contract defined it**.
+A confirmation modal is a UI event: it authorizes nothing and survives nothing. **Parent §11.2's
+`llm_spend_authorization_revision` (migration 1105) is the durable half of D5**, and the consequence
+in this plan is specific: **step 4c's bounded author/critic loop and its automatic repair turns must
+check and consume the authorization before EVERY provider call**, not once per job. A bounded loop
+with an unbounded repair path is unbounded.
+
 ### D6 — One backend coordinator owns the journey
 
 The React client must not chain five write APIs and hope the browser stays open. A durable
@@ -336,8 +381,14 @@ One build set may contain a reviewed-blueprint member and an LLM-authored member
 method identity AND certificate binding are all PER MEMBER** — parent §10. The previous revision
 said "record the exact certificate revision used on a production publication attempt", which is
 per-**attempt**; a mixed artifact needs *several* certificates and one per attempt could only ever
-be right about one member. Corrected: `production_attempt_member_certificate (attempt_id,
-member_name, certificate_revision_id, method_identity_hash)`.
+be right about one member. ▲ **CORRECTED AGAIN in revision five — that shape is stale twice over
+(parent §10.3):** it omits `certificate_kind`, so it still permits only ONE certificate per member;
+and it matches every kind against `method_identity_hash`, which is an **authoring** identity, so a
+`COMPILER_RUNTIME` certificate would be matched against a subject it does not describe. The shape is
+`production_attempt_member_certificate (attempt_id, member_name, certificate_kind,
+certificate_revision_id, subject_identity_kind, subject_identity_hash)`. ▲ **And its parent —
+`method_certificate_revision` — DOES NOT EXIST YET**: there is no certificate table in the schema at
+all, only eval runs, cases and attempts (parent §10.3).
 
 ### D8 — *(deleted — see parent §14, "Certification is not feature approval")*
 
@@ -398,6 +449,28 @@ class FormulaStrategyDecisionV1:
     strategy_identity_hash: str
 ```
 
+▲ **REVISION FIVE — `strategy_identity_hash` needs an EXACT payload, and it did not have one.** It is
+folded into parent identity V2 (§11.1.1), so an under-specified payload is an under-specified draft
+identity — and every later reading of "was this the same strategy?" inherits the ambiguity. The JCS
+payload, versioned:
+
+```
+strategy_identity_version           -- so the composition can change without silence
+resolver_policy_version
+considered_revision_id · option_id
+reviewed_expectation_revision · expectation_hash · expectation_generation
+blueprint_revision · blueprint_content_hash · binding_hash        -- deterministic lane
+review_validity_evidence                                          -- WHY it counted as reviewed
+formula_method_override_revision_id                               -- parent 11.3, when present
+provider_contract_hash                                            -- LLM lane
+catalog_snapshot_hash · binding_plan_hash                         -- the frozen world it resolved in
+```
+
+▲ **`blueprint_derivable` and `blueprint_bindable` stay OUT** — measurements, per parent §11.1. And
+`§3.3`'s `formula_draft_authoring_plan` must carry every field above, not a subset: the plan row is
+what a worker re-reads instead of recomputing, so anything absent from it is a fact the worker will
+have to derive again, differently.
+
 ▲ `expectation_ref` is the only key that may be looked up in the reviewed registry — the registry's
 own docstring: *"The key is an EXPECTATION REF, never a recipe id. 295 of the 317 registry recipes
 declare a ref that is not their own name."*
@@ -433,8 +506,23 @@ the codes live in parent §5.
 
 ### 3.3 Durable authoring plan — and what it must NOT touch
 
+▲ **P0-2 — THIS TABLE AND ITS RESOLVER MOVED TO STEP 2.** The verdict found a cycle: parent §11.1.1
+composes identity V2 from `formula_strategy` and `strategy_identity_hash`, which this section
+creates — while step 2 below forbids writing a plan row until step 2 finishes. **Step 2 needed step
+4's facts; step 4 could not start until step 2 ended.**
+
+> **RULED: promote, do not split.** §3.1's resolver and this table become **step 2** work, and
+> **migration 1104 moves with them**. Parent identity **V2 activates at the END of step 2**, once
+> these facts are persisted. *(The verdict's alternative — 2A / resolver / 2B with an atomic
+> mid-programme activation — is recorded as the reversal path in parent §17. An identity that cannot
+> be composed without strategy facts is telling you the strategy contract is foundation.)*
+
+▲ **What stays at step 4 is the LANES, not the CONTRACT** — deterministic instantiation, the LLM
+fallback, the worker dispatch. Step 4 then *reads* a plan that already exists rather than defining
+the vocabulary the foundation depends on.
+
 Append-only `formula_draft_authoring_plan`, keyed one-to-one by `formula_draft_id`
-(**migration 1104** — parent §17 reserves the range; both plans had independently claimed 1100):
+(**migration 1104 — written in STEP 2**; parent §17 re-reserves the whole range):
 
 ```text
 formula_draft_id            candidate_origin            formula_strategy
@@ -450,6 +538,14 @@ Database checks enforce:
 * `LLM_AUTHORED` names the frozen provider contract and **cannot** claim a reviewed blueprint;
 * non-formula / model decisions never create a `formula_draft` row;
 * the plan can never be updated or deleted.
+
+▲ **REVISION FIVE — the identity companion can disagree with the draft.** Parent §11.1.1's
+`formula_draft_authoring_identity.config_hash` is not relationally tied to
+`formula_draft.authoring_config_hash`, so a V2 companion row can be attached to a draft whose stored
+config hash is something else — and the identity version then describes a draft it does not match.
+**Add a composite FK (or an equivalent unique target on `formula_draft (formula_draft_id,
+authoring_config_hash)`)** so the companion can only attach to the draft it actually describes. Same
+argument as parent §11.0.1: worker-time checking is not a constraint.
 
 #### ▲ P0 — the previous revision would have voided the money guard and every retirement
 
@@ -497,12 +593,16 @@ two governance rules.
 
 ### 3.4 Fix the generalized work-item model
 
-**Migration 1105** separates `authoring_work_item.origin` from authoring strategy. Before writing
-it, audit live row counts and values. Empty → replace the old constraint directly. Rows present →
-preserve them and backfill only facts the old constraint logically guaranteed; anything unprovable
-becomes legacy-undetermined and is **ineligible for sealing** (the same posture parent §10 takes
-toward existing provenance rows: `METHOD_IDENTITY_UNRECORDED` is the honest answer, regeneration the
-honest remedy).
+**Migration 1107** (▲ renumbered — parent §17) separates `authoring_work_item.origin` from authoring
+strategy. The audit this section demanded is **DONE: `authoring_work_item` is 0 rows** on the live
+cluster (parent §0.3), so **the empty branch applies and the old constraint is replaced directly** —
+no backfill, no legacy-undetermined rows, no sealing-eligibility question to answer.
+
+▲ **Re-measure inside the migration's transaction anyway.** The rule governs, not the reading — and
+if a row does appear, the "rows present" branch stands: preserve them, backfill only facts the old
+constraint logically guaranteed, and mark anything unprovable legacy-undetermined and **ineligible
+for sealing** (the same posture parent §10 takes toward existing provenance rows —
+`METHOD_IDENTITY_UNRECORDED` is the honest answer, regeneration the honest remedy).
 
 `AuthoringWorkItemV1` carries:
 
@@ -517,21 +617,42 @@ new invariant is strategy-based: `reviewed_blueprint_revision` is present **exac
 
 ### 3.5 Durable journey aggregate
 
-**Migration 1106**:
+**Migration 1109** (▲ renumbered — parent §17):
 
 * `code_generation_job` — immutable request identity, considered revision, target reading,
   environment, requested action, requester, status, terminal details;
-* `code_generation_job_member` — ordered option ids, selection revision, **`formula_draft_id` +
-  `formula_content_hash`**, strategy, member state, blockers;
+* `code_generation_job_member` — ordered option ids, selection revision, ▲ **the
+  `selection_formula_binding_id`** (parent §11.0.1) rather than a loose draft id and hash, strategy,
+  member state, blockers;
 * `code_generation_job_event` — append-only stage events;
 * links to build-set revision, **action authorization revision** (parent §0.1), generation request
   and sealed artifact.
 
-▲ **The job's members carry the pinned formula pair because the BUILD SET does** — parent §11: today
+▲ **The job's members carry the binding because the BUILD SET does** — parent §11: today
 `build_set_member` is `(revision_id, position, selection_revision_id)` and nothing else, and
 `restore_formula_v3.py:90` resolves the formula with `ORDER BY d.updated_at DESC LIMIT 1`. A newer
 draft landing between request and worker changes what the build MEANS while its `content_hash` stays
-put. The coordinator hands the parent's pinned pair through; it does not re-resolve.
+put. The coordinator hands the parent's binding through; it does not re-resolve.
+
+▲ **P0-6 — and a loose `(formula_draft_id, formula_content_hash)` pair was not enough.** It stops
+*latest-draft-wins* and still permits a valid READY formula **belonging to a different selection** to
+be pinned: the id exists, the hash matches, the build proceeds. Parent §11.0.1 makes the two agree in
+the database through `selection_formula_binding`, with composite foreign keys to both source
+identities. **This plan carries the binding id and never re-derives the pair from it.**
+
+▲ **REVISION FIVE — one job carries SEVERAL actions, so one authorization link is wrong** (parent
+§0.1.3). This journey performs `AUTHOR_FORMULA` then `GENERATE_PREVIEW`, and its workspace then shows
+sandbox execution and publication; a single `requested_action` with a single authorization cannot
+truthfully cover them:
+
+```text
+code_generation_job_action
+    job_id · action · resource_identity_hash
+    authorization_revision_id · decision_revision_id · state
+    PRIMARY KEY (job_id, action)
+```
+
+**Each worker claims ONE action stage and revalidates that stage's own authorization and decision.**
 
 States, closed and monotone:
 
@@ -539,6 +660,11 @@ States, closed and monotone:
 REQUESTED  PLANNING_FORMULAS  AUTHORING  READY_TO_BUILD  GENERATING_PREVIEW
 PREVIEW_READY  BLOCKED  FAILED  CANCELLED
 ```
+
+▲ **These states stop at `PREVIEW_READY` while §5b's workspace shows sandbox and production.** Settle
+which this aggregate is. ▲ **It is a PREVIEW COORDINATOR** — terminal at `PREVIEW_READY`, with
+immutable links to the sandbox and production attempts that follow. The alternative, owning the whole
+journey, would make it a second authority over acts it does not gate (parent §3).
 
 `BLOCKED` is a product outcome; `FAILED` is a platform failure. The job is idempotent on its exact
 request content, so a second click neither spends again nor creates a parallel build.
@@ -565,9 +691,13 @@ item:
    2026-08-22: `build_set_revision=0`, `build_set_member=0`, `generation_request=0`,
    `sealed_artifact_v2=0` — which is why parent §11.0 takes the immediate-`NOT NULL` branch.
    **Re-measure at deploy anyway**: the rule governs, not the reading.
-   ▲ **Two of them have NEVER been measured and size parent step 2's tombstone backfill:**
-   `formula_draft` and `formula_draft_retirement` (parent §11.1.1). Nothing else depends on them,
-   and nothing should proceed on a guess about them.
+   ▲ **MEASURED 2026-08-22 — this item is CLOSED** (parent §0.3). `formula_draft` = **7** (4
+   `FAILED`, 3 `BLOCKED`, 7 distinct identities) · `formula_draft_retirement` = **0** ·
+   `authoring_work_item` = **0** · `feature_selection_revision` = **0** · `formula_authoring_run` = 3.
+   ▲ **Two of those change a design rather than an estimate:** the tombstone backfill is **empty**,
+   and **no live draft is in a previewable state** — so parent §11.1.1's "return the legacy draft as
+   an auditable preview" branch has zero live subjects and must not assume one. **Re-measure inside
+   each migration's transaction**: five branches now turn on a live row count.
 3. Characterization tests pinning **317 / 298 / 19 / 295 / 3 / 90 / 1** — running the real
    registry, fold and deriver, not a hand-built fixture. ▲ **The last two are separate numbers on
    purpose** (§1.2): 90 derivable, 1 reviewed. A test that pins only "90" is how they get conflated.
@@ -577,27 +707,52 @@ item:
    any coverage claim**. This plan may not state a preview-coverage number until that row exists.
 4. Route-call enumeration tests showing which endpoints consult which policy today. ▲ **Its purpose
    changed with ruling 5:** it is no longer the before-state for a decision-equivalence comparison —
-   there will be no second route to compare with — it is the **deletion inventory**, the proof that
-   every act the legacy route performs already has a canonical home (parent §1 D2's replacement
-   table) before anything is removed.
+   there will be no second route to compare with — it is the **deletion inventory**, the **deletion
+   inventory**. ▲ **Revision five corrects what that inventory PROVES:** it shows every legacy act
+   has a **named** canonical home, which is not the same as a **working** one. Parent §9.0
+   established that sandbox execution does not exist — the route records a row no worker claims.
+   **It is a replacement checklist, not evidence of present equivalence**, and the deletion's entry
+   condition is that those replacements EXECUTE.
 5. Freeze applied migrations; corrections get new files; ledger verification runs in CI.
 
 **Acceptance:** no behavioural change; clean ledger; baselines recorded; the 90-vs-1 distinction is
 pinned by a test.
 
-### Step 2 (PARENT) — identity and authorization foundations
+### Step 2 (PARENT, ▲ with one CHILD contribution) — the enlarged foundation
 
-Not this plan's work. This plan **depends on all six** and must not duplicate any:
+▲ **REVISED by P0-2.** This step used to be entirely the parent's, and that is what created the
+cycle. **§3.1's strategy resolver and §3.3's `formula_draft_authoring_plan` (migration 1104) are now
+built HERE**, because parent identity V2 composes `formula_strategy` and `strategy_identity_hash` and
+cannot be activated without them. **Identity V2 activates at the END of this step.**
+
+▲ **The ordering inside the step is load-bearing, and it is the whole reason the promotion is safe:**
+
+```
+1. tombstones written and verified            (parent 11.1.1; the live backfill is EMPTY)
+2. the strategy resolver + authoring plan     (this plan's 3.1 and 3.3, migration 1104)
+3. identity V1 recorded explicitly            (parent 11.1.1)
+4. identity V2 composed and ACTIVATED         (parent 11.1.1, using the facts persisted at 2)
+```
+
+**The rest of the step is the parent's, and this plan depends on all of it and must not duplicate
+any:**
 server-derived roles (parent §0.1) · formula-draft pinning, `NOT NULL` on today's measurement
 (§11, §11.0) · the money-guard composition, identity **V1 preserved / V2 introduced** (§11.1,
 §11.1.1 — into which §3.3's two facts fold) · **retirement tombstones, written and verified BEFORE
 V2 activates** (§11.1.1) · immutable action authorization (§0.1) · per-member method identity
 (§10, §10.1).
 
-▲ **The one ordering this plan can break by starting early:** step 4 persists a strategy that step 2
-folds into the draft identity. Authoring drafts under V2 before the tombstones exist re-buys
-withdrawn formulas — so **no `formula_draft_authoring_plan` row may be written until step 2's
-tombstones are verified in place.**
+▲ **The ordering rule that used to sit here has been SUPERSEDED by the promotion, and the hazard it
+named has not gone away.** It said no `formula_draft_authoring_plan` row may be written until step 2's
+tombstones are verified — which, with the table now inside step 2, becomes an **intra-step** rule:
+**stage 2 of the sequence above never runs before stage 1**, and **identity V2 never activates before
+stage 2 completes**. Authoring drafts under V2 while tombstones are missing re-buys withdrawn
+formulas; composing V2 from strategy facts that are not yet persisted composes it from **absent**
+facts, which is the same class of defect as the constant it replaces.
+
+▲ **Also new here, and both are parent-owned but visible to this plan:** `llm_spend_authorization_revision`
+(parent §11.2 — D5's durable half) and `selection_formula_binding` (parent §11.0.1 — which §3.5's
+job members now carry instead of a loose pair).
 
 ### Step 3 (SHARED) — the shared action-decision service
 
@@ -630,17 +785,25 @@ claim 295 previews — see §0.
 
 ### Step 4 (CHILD) — recipe formula routing
 
-**4a — resolve and persist the strategy**
+▲ **MOVED TO STEP 2: the resolver and the authoring plan** (§3.1, §3.3, migration 1104) — P0-2. What
+remains at step 4 is everything that **reads** that contract: the two lanes, the worker dispatch, and
+the method override. Items 1, 2 and 7 of 4a below are therefore **built in step 2 and merely verified
+here**; they are left in place so the acceptance criteria stay whole.
 
-1. Implement the pure selector; table-driven tests over every combination, including the
-   `blueprint_derivable`-flips-nothing case (§3.1).
+**4a — resolve and persist the strategy** *(contract built in step 2; this step consumes it)*
+
+1. ▲ *(step 2)* Implement the pure selector; table-driven tests over every combination, including the
+   `blueprint_derivable`-flips-nothing case (§3.1). ▲ **And a `formula_method_override_revision`
+   present for this selection flips the strategy to `LLM_AUTHORED` — as an INPUT FACT, never as a
+   client-supplied label** (parent §11.3).
 2. Version-aware expectation resolver; **never union membership alone** (§1.3).
 3. `posted_debit_amount` resolves to executable V2 reviewed blueprint.
 4. The two V1 entries resolve to `v1_legacy` → `LLM_AUTHORED` (§1.3 — no V1 serving role to retire).
 5. Derivable-but-unreviewed resolves to `LLM_AUTHORED` + `BLUEPRINT_DERIVED_NOT_REVIEWED` (§1.2).
 6. Bind a reviewed blueprint against the **exact frozen candidate context**; a binding mismatch
    refuses deterministic authoring **by name**.
-7. Persist `formula_draft_authoring_plan` in the same transaction as the draft request/outbox.
+7. ▲ *(step 2)* Persist `formula_draft_authoring_plan` in the same transaction as the draft
+   request/outbox.
 8. Re-read the stored plan in the worker; **never recompute strategy** after a review or the registry
    moves.
 
@@ -657,7 +820,10 @@ claim 295 previews — see §0.
    renderer as an LLM proposal.
 5. Deterministic refusal → `REVIEWED_BLUEPRINT_NOT_EXECUTABLE`. **No silent LLM invocation.** An
    explicit "Try AI formula" action mints a new draft identity and shows the cost and provenance
-   change.
+   change. ▲ **It does so by creating a `formula_method_override_revision`** (parent §11.3), whose
+   `original_refusal_code` the **server verifies is recorded and current** — an override naming a
+   refusal that did not happen is refused, or "Try AI formula" is a client-chosen method with extra
+   steps.
 6. Replace `formula_drafts.py:269`'s hard-coded `"llm_authored"` with the stored, verified method.
 
 **4c — harden the LLM fallback**
@@ -672,7 +838,11 @@ claim 295 previews — see §0.
 4. Reject physical refs outside the frozen read set, missing grains, cross-currency sums without a
    conversion policy, unsupported joins, future leakage, undeclared row-selection values.
 5. Bounded author/critic loop. Automatic repair may fix schema/grammar; a missing **business**
-   decision becomes `NEEDS_USER_INPUT`, not another guess.
+   decision becomes `NEEDS_USER_INPUT`, not another guess. ▲ **The spend authorization is checked and
+   consumed BEFORE every provider call and every repair turn** (parent §11.2) — a bounded loop with
+   an unbounded repair path is unbounded, and an exhausted authorization **stops** the job with
+   `COST_AUTHORIZATION_EXHAUSTED` rather than silently truncating the critic and presenting the
+   result as final.
 6. Persist provider contract, dispatches, prompt/schema identities, result hash, critic evidence.
 7. Provider absence blocks **only LLM-strategy members** (parent §4's per-member row). Reviewed
    deterministic members in the same set remain usable.
@@ -695,6 +865,24 @@ its sealed member says `LLM_AUTHORED`.
    either is counted as a costed LLM member: `FORMULA_DRAFT_RETIRED` and
    `LEGACY_REGENERATION_NOT_APPROVED` (parent §11.1.1). A cost estimate that quotes work the
    platform will then refuse is a quote for a purchase nobody can make.
+   ▲ **And the plan endpoint READS a spend authorization; it never creates one** (parent §11.2). The
+   estimate is what a person approves; the approval is what the write endpoint below records. A plan
+   call that minted its own ceiling would be the modal-as-money-guard defect with a server address.
+   ▲ **It also `ask`s rather than `decide`s** (parent §7.1): a cost estimate is a question, and a
+   plan call that wrote a durable decision row would fill the audit with decisions nobody acted on.
+
+   ▲ **The legacy-draft rule is STATE-AWARE, and this plan previously stated it two ways** — refused
+   here during planning, returned as a preview in parent §11.1.1. One rule, keyed on state
+   (parent §11.1.2):
+
+   | Legacy V1 draft | Answer |
+   |---|---|
+   | `READY`, unretired | **previewable**, marked `LEGACY_CONFIG_UNPROVEN`; never production |
+   | `BLOCKED` / `FAILED` / `CANCELLED` | **no preview** — there is nothing to show |
+   | re-authoring under V2 | explicit regeneration **and** spend approval, one draft at a time |
+
+   ▲ **All seven live drafts are `FAILED` or `BLOCKED`** (parent §0.3), so the second row is today's
+   only real case — which is exactly why the first must not be written as though it were.
 2. `POST /code-generation-jobs` — the one explicit write/spend action. Records the request,
    immutable selection revisions and authoring plans in one transaction, then enqueues.
 3. The coordinator waits on **durable formula states**. It does not poll providers and does not hold
@@ -755,11 +943,28 @@ duplicate selections, LLM calls, build set or generation request · the whole jo
 keyboard and screen reader · every button label states what it writes or spends · **all** status and
 blocker wording comes from the backend.
 
-### Steps 6, 7, 8 (PARENT) — sandbox split, production boundary, gold relocation
+### Steps 6, 7, 8 (PARENT) — ▲ BUILD the sandbox lane, the production boundary, gold relocation
 
 Not this plan's work. The previous revision's Phase 5 proposed to build these and is **dissolved**
 into parent steps 3, 7 and 8. This plan consumes the result and, in step 5b item 4, renders the
 sandbox split honestly.
+
+▲ **P0-1 — and this section previously described step 6 as a re-gating. It is CONSTRUCTION.** The
+verdict found that the canonical sandbox execution lane **does not exist**: `POST
+/feature-execution/verifications` records a `verification_attempt` and promises a worker; the durable
+worker's handler set is `frozenset({"materialization.compile.v1"})` — one handler, and it is compile;
+`verification_request` (migration 1094) has no production writer; and `authorize_publication_v2`, the
+one module that reads its store, has **zero importers in `src/`** (parent §9.0).
+
+**Two consequences land directly on this document:**
+
+1. ▲ **Step 5b item 4's seven-stage workspace describes two stages nothing performs.** *"Sandbox
+   executed"* and *"Sandbox published"* are honest as UI only once parent §9.0's worker exists. Until
+   then the workspace must render them as **not yet reachable**, never as pending — a stage that
+   waits forever looks like a slow queue and is a missing consumer.
+2. ▲ **Step 10's cutover cannot delete the legacy queue handler on schedule.** `run_l1` inside the
+   legacy chain is the **only** concrete data execution in the codebase. The deletion's entry
+   condition is now *"the canonical lane actually executes"*, which was assumed and is false.
 
 ### Step 9 (SHARED) — the two evaluation programmes, and growing the corpus
 
@@ -807,6 +1012,23 @@ multi-person rule (`ReviewValidityV1.single_identity_violation`). Nine more clea
 least 27 approval events plus nine reviewed fixtures**, not nine signatures. ▲ **And after ruling 2,
 plus nine reviewed DATASETS with their expected rows** — the fixture alone no longer constitutes a
 compiler case.
+
+▲ **MEASURED — and the SHAPE of this supply problem is the opposite of what this plan assumed.**
+Live 2026-08-22: **996 approved `recipe_review_event` rows across all 317 recipes**, 6 reviewers,
+**zero** single-identity violations, role coverage of 3+ roles on 306 of 317 — and **zero rows
+carrying a `formula_expectation_hash`** (parent §21). **The reviewer population is established, the
+roles are covered and the multi-person rule is already honoured.** What is missing is the artifact
+those reviewers have never been shown. ▲ **The bottleneck is PRODUCING formula expectations and
+governed case revisions to review — not recruiting reviewers**, which is what a plan budgeting for
+signatures would have staffed for.
+
+▲ **And after the verdict a compiler case is ONE GOVERNED REVISION, not two reviewed artifacts**
+(parent §12.2): the approved IR, the frozen dataset manifest, the expected rows, the tolerance
+declarations and the runtime/execution profile are hashed together and approved **as one revision**.
+Approving the IR and the dataset separately would double the per-case approval count and would permit
+the hole it closes — **an approved IR paired with a dataset nobody approved is a certification of
+arithmetic against unknown inputs.** Synthetic datasets are the default; approved masked extracts are
+the governed exception.
 
 **Acceptance:** adding an approved expectation requires no source edit but still requires the full
 review/event/test-vector contract · revocation immediately stops new deterministic selection without
@@ -859,6 +1081,31 @@ reintroduction table:
     identity V2 before the tombstones exist** · **restoring `POST /materialization-runs` or leaving
     `enqueue_materialization` in place**.
 
+▲ **New scenarios the verdict requires** — concurrency, tamper and crash recovery, which this list
+had none of:
+
+21. ▲ **Retirement race**: a retirement committing between the request's tombstone read and its
+    INSERT **refuses the draft**, because both paths take the same lock on the retirement scope key
+    (parent §11.1.1). Assert on the queue: no outbox message exists.
+22. ▲ **Regeneration exception reachability**: a legacy draft **with** a valid, unexpired, unconsumed
+    exception regenerates **exactly once**; a second attempt refuses on `uses_consumed`.
+23. ▲ **Retirement scope**: an `EXACT_DRAFT` retirement does **not** refuse a differently-configured
+    request for the same candidate; a `CANDIDATE_ACROSS_CONFIGURATIONS` retirement does.
+24. ▲ **Cross-selection pin tamper**: a build-set member whose binding names a formula belonging to
+    **another selection** is refused **by the database**, not by a worker (parent §11.0.1).
+25. ▲ **Decision drift**: evidence moved between request and worker → `DECISION_DRIFT`, and the
+    worker does **not** silently re-decide (parent §7.1).
+26. ▲ **Forged output id**: `PUBLISH_PRODUCTION` naming a materialized-output id the caller supplied
+    publishes nothing; publication resolves its output from the attempt (parent §9.1).
+27. ▲ **Crash recovery**: the process dies between the external Spark work and the database commit;
+    on restart the lease expires, the work is reclaimed, and **nothing is written twice** (parent
+    §9.0 item 8, §9.1).
+28. ▲ **Spend exhaustion**: a repair loop that reaches its token or call ceiling **stops** with
+    `COST_AUTHORIZATION_EXHAUSTED` rather than truncating and reporting success (parent §11.2).
+29. ▲ **Entitlement revocation**: an actor's role is revoked between request and worker →
+    `ACTION_AUTHORIZATION_REVOKED`, even though the frozen `read_scope_result` still parses
+    (parent §0.1.1).
+
 ▲ Read pytest's summary line. `grep -c "^FAILED"` silently matches nothing against coloured output
 and reports a false pass.
 
@@ -884,6 +1131,10 @@ and reports a false pass.
    (`test_materialization_runs.py`, `test_materialization_e2e.py`, `test_seam_walkthrough.py`) are
    migrated. **No adapter, not even temporarily** (D9, parent D2/§8.3). Then run test 15's
    route-absence and direct-queue-bypass pair against the deployed image, not only in CI.
+   ▲ **PRECONDITION, P0-1: parent §9.0's sandbox worker must EXIST and execute first.** `run_l1`
+   inside the legacy chain is the only concrete data execution in the codebase — deleting the handler
+   before the canonical lane executes removes the platform's only working execution path and replaces
+   it with a route that returns 202 and a docstring.
 7. Keep the cluster branch-owned until its migration lineage is merged into main and the image
    carries the same migration set.
 
@@ -1138,6 +1389,17 @@ are marked — they are not this plan's to claim, and it cannot finish without t
 * **(PARENT)** ▲ **the legacy route, its producer and its handler are DELETED** — no adapter — and
   route-absence plus direct-queue-bypass tests pass against the deployed image. *(This replaces the
   previous "old and new APIs return the same decision", which named a route that no longer exists.)*
+* **(PARENT)** ▲ **the sandbox execution lane EXISTS and executes** — a durable verification worker
+  claims its request under a lease, runs `run_l1` outside the transaction, records an output revision
+  and stops before publication (parent §9.0). **Nothing in this plan's journey is real without it.**
+* ▲ **the client never sends a formula method** — "Try AI formula" creates a server-authored
+  `formula_method_override_revision` whose named refusal the server verifies (parent §11.3);
+* ▲ **every provider call and repair turn is covered by a durable spend authorization**, and an
+  exhausted one stops the job rather than truncating it (parent §11.2);
+* ▲ **a build-set member's formula is bound RELATIONALLY to its selection** — a formula belonging to
+  another selection cannot be pinned, and the database is what refuses it (parent §11.0.1);
+* ▲ **the strategy contract and its resolver ship in step 2**, so parent identity V2 composes from
+  persisted facts rather than from facts a later step would have created (P0-2).
 
 ▲ **What "done" does NOT mean.** Production stays closed for every recipe until the reviewed corpus
 grows past its single clean case — at least 27 approval events, nine reviewed fixtures **and, after
