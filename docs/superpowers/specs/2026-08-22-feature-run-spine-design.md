@@ -1,9 +1,17 @@
-# The Feature Run Spine — design, revision 3
+# The Feature Run Spine — design, revision 3.1
 
 **Date** 2026-08-23 · **Code baseline** `feature/asset-detail-reapply` @ `302b8e9a` · **Plan
 baseline** the four-stage gating plan at revision five (§0.1.0 included) and the recipe-to-code
 child plan · **Status** design. Revision 1 (`9072f4d9`) was rejected with ten P0 gaps; revision 2
-(`302b8e9a`) was rejected with eleven P0s and four P1s. Revision 3 folds that second review.
+(`302b8e9a`) was rejected with eleven P0s and four P1s. Revision 3 folds that second review;
+revision 3.1 **[R3.1]** folds the residuals of a 21-agent adversarial workflow pass (98 raw
+findings, per-finding refutation): the §0.1.2 composite authorization/decision group spelled on
+every durable attempt header, attach gated on input-identity equality, idempotency looked up
+before the CAS, the phantom `renderer_contract_revision` FK replaced with real renderer identity
+values, `preview_input_member` deleted as a second authority over the build set's own membership,
+a pre-spine ownership rule so the foundation's only current content is not invisible, derived (not
+static) availability with `GENERATE_PREVIEW` reason-coded during the foundation, and a total
+domain→rail status mapping requirement.
 
 **The standing verdicts this revision is written under:**
 
@@ -35,8 +43,8 @@ two axes: historical outcome and current eligibility (§6.7, §12). Changes are 
 ## 1. The problem, stated in code rather than in prose
 
 **The workflow's continuity currently lives in a URL query string.** `App.tsx:510` hands
-`FeatureExecutionScreen` nine separate identity fragments, each defaulting to `''`. Close the tab
-and the work is unrecoverable.
+`FeatureExecutionScreen` nine separate identity fragments, defaulting to `''`, `null` or a
+hardcoded mode. Close the tab and the work is unrecoverable.
 
 **Every stage already has a durable attempt record, and no two of them share a parent.**
 
@@ -139,11 +147,15 @@ feature_run_action_invocation            -- immutable; ONE user gesture, ONE act
     generation_run_id        FK
     action                                -- ActionV1 vocabulary only (§7)
     idempotency_key · request_content_hash
-    action_authorization_revision_id      -- composite FK, §6.4
-    action_decision_revision_id           -- composite FK, §6.4
     requested_by · requested_at
     UNIQUE (generation_run_id, action, idempotency_key)
 ```
+
+**[R3.1] The invocation groups; it never authorizes.** Authorization and decision are per
+*resource*, and one gesture spans many resources — so the §0.1.2 composite group lives on each
+attempt **header** (§6.4), minted per subject within the invocation's transaction. A single
+authorization column here would be exactly the "one authorization link per job" defect the child's
+revision five already corrected.
 
 One click ("prepare formulas for 12 candidates") → **one invocation** → twelve per-subject attempt
 headers → each header links one authoritative domain attempt → **invocation status is a read-time
@@ -161,15 +173,20 @@ plan; this spec records the requirement and cannot discharge it.
 ## 5. Coordination state and the trigger contract
 
 ```
-feature_run_state                        -- the ONLY mutable spine row per run
-    generation_run_id    PK/FK
-    state_version        bigint NOT NULL
+feature_run_state                        -- the only mutable COORDINATION row per run
+    generation_run_id    PK/FK           -- (feature_run_profile is mutable too — display only,
+    state_version        bigint NOT NULL --  never consulted by any coordination decision)
 ```
 
-Every run-centric mutation: `SELECT … FOR UPDATE` → validate `expected_state_version` → validate
-prerequisites → write immutable evidence (invocation, headers, inputs, links) → increment →
-commit. Attempt numbers are allocated under this lock. Rows are minted lazily on a run's first
-spine mutation (foundation mints none).
+**[R3.1] Idempotency is consulted BEFORE the CAS.** A client that times out and resends its key
+must get its original result back — but its first attempt already incremented `state_version`, so
+a CAS-first protocol would answer the retry with a version conflict and the key could never fire
+for the one case it exists for. Order: look up `(run, action, idempotency_key)` and return the
+stored invocation if present → then `SELECT … FOR UPDATE` → validate `expected_state_version` →
+validate prerequisites → write immutable evidence (invocation, headers, inputs, links) →
+increment → commit. Attempt numbers are allocated under the lock. Rows are minted lazily on a
+run's first spine mutation (foundation mints none), and the mint itself is
+`INSERT … ON CONFLICT DO NOTHING` followed by the locked read, so "first mutation" cannot race.
 
 **[R3] START gets a database-level one-time guard.** The CAS stops concurrent stale requests; it
 does not stop a later `/start` with a fresh version and a fresh key. So:
@@ -197,11 +214,15 @@ POST  /feature-runs/{run_id}/archive
 
 Fork endpoints are deliberately absent until §10's design work lands. There is no generic cancel.
 
-The trigger body carries `{ idempotency_key, expected_state_version, subject… }` and nothing else —
-no artifact id, draft id, build-set id, role, certificate, "latest" selection or upstream output;
-the server resolves everything from the run, creates or resolves the authorization for the current
-user (never accepts somebody else's — the `authorization_grantee` rule `7a2c78b9` enforces), and
-records who triggered. The plan endpoint reports pins and preconditions, never predicted byte
+The trigger body carries `{ idempotency_key, expected_state_version, subject }` — **[R3.1] the
+subject IS an identity the client names** (an authoring-subject revision, a build-set revision),
+and it is the only one: the client supplies no *other* id — no artifact id, draft id, role,
+certificate, "latest" selection or upstream output. The distinction is scope, not squeamishness
+about ids: naming the subject picks *which* governed thing to act on; everything the act then
+consumes is resolved by the server from the run. The server creates or resolves the authorization
+for the current user — never accepts somebody else's; the grantee-equality rule `7a2c78b9`
+enforced on the legacy table is re-expressed in 1100's `actor_subject` — and records who
+triggered. The plan endpoint reports pins and preconditions, never predicted byte
 equality and never an invented cost (the spend contract is P0-10, undesigned).
 
 ---
@@ -313,13 +334,23 @@ exists; the header records `member_count`; every loader recomputes `input_conten
 ordered child set and refuses a mismatch.
 
 ```
-preview_input_member
-    input_revision_id FK DEFERRABLE · position
-    selection_formula_binding_id FK -> selection_formula_binding      (parent 1101)
-    UNIQUE (input_revision_id, position)
-preview_input_catalog_snapshot   input_revision_id · snapshot_id FK · snapshot_content_hash
-preview_input_renderer           input_revision_id · renderer_contract_revision_id FK
+preview_input_catalog_snapshot
+    input_revision_id PK/FK DEFERRABLE · snapshot_id FK · snapshot_content_hash
+preview_input_renderer
+    input_revision_id PK/FK DEFERRABLE · renderer_version · renderer_build_hash
 ```
+
+**[R3.1] There is no `preview_input_member`, deliberately.** The preview's *subject* is a
+`build_set_revision`, and — once parent 1101 lands — that revision already IS the sealed ordered
+member set, binding ids included, inside its own `content_hash`. Re-recording members on the input
+revision would be a second authority over the same fact, the §2 violation this spec polices
+elsewhere. The input revision pins what the build set does **not**: the snapshot and the renderer.
+**[R3.1] The renderer pin is two identity values, not an FK** — revision 3 referenced
+`renderer_contract_revision`, a table that exists nowhere; the real renderer identity in this
+codebase is `renderer_version` (1079) and `renderer_build_hash` (1091, in
+`engine_operator_capability`'s primary key). Values pin; a phantom table does not. **[R3.1] Both
+1:1 children carry `input_revision_id` as their PRIMARY KEY** — without it, a "frozen" input could
+hold two snapshots.
 
 Attempt headers reference inputs by the full four-column FK. Every retry/re-execution of a subject
 references the same input revision; different inputs are a different question → fork.
@@ -352,12 +383,43 @@ authoring_attempt_link
 ```
 
 The same rule — a composite FK carrying the facts both sides must agree on, backed by an additive
-UNIQUE superset of the parent's PK — applies to verification, publication, authorization
-(`action_authorization_revision` keyed with its resource identity, per the in-flight 1100) and
-action-decision links. Where a domain attempt is **shared** (a draft is idempotent on
-`formula_identity_hash` and crosses runs; a generation request is one-per-build-set+environment),
-N headers legitimately link one domain row — each header is one run's *attachment*, recorded as
-this typed row, never inferred later.
+UNIQUE superset of the parent's PK — applies to verification and publication links.
+
+**[R3.1] The authorization/decision group is spelled, on every durable attempt header, per parent
+§0.1.2 (R6).** Revision 3 said "composite FK, §6.4" and never spelled it — the exact
+under-specification whose enforced form the in-flight migration 1100 already carries
+(`action_authorization_revision_act_key` on `(action, resource_identity_hash, authorization_id)`,
+with the six-action CHECK and `resource_identity_hash NOT NULL`). Every header carries, as a
+NOT NULL group:
+
+```
+    action
+    resource_identity_hash               -- derived from the §6.3 typed subject child; 1100's own
+                                         -- rule: "a hash cannot carry a foreign key, so the TYPED
+                                         -- CHILD TABLE holds the real reference and this is
+                                         -- derived from it" (1100:43)
+    action_authorization_revision_id     NOT NULL
+    action_decision_revision_id          NOT NULL
+    FOREIGN KEY (action, resource_identity_hash, action_authorization_revision_id)
+        REFERENCES action_authorization_revision (action, resource_identity_hash, authorization_id)
+    FOREIGN KEY (action, resource_identity_hash, action_decision_revision_id,
+                 action_authorization_revision_id)
+        REFERENCES action_decision_revision (...)                    -- parent migration 1106
+```
+
+A `GENERATE_PREVIEW` header citing a `PUBLISH_PRODUCTION` authorization on another resource is
+thereby unrepresentable — the false audit fact R6 exists to refuse.
+
+**[R3.1] Attaching to a shared domain attempt is gated on input identity.** Where a domain attempt
+is shared (a draft is idempotent on `formula_identity_hash` and crosses runs; a generation request
+is one-per-build-set+environment), N headers legitimately link one domain row — each header is one
+run's *attachment*, recorded as this typed row, never inferred later. But an attachment claims
+"this execution answers MY frozen question", so it is lawful only when the header's
+`input_content_hash` equals that of the input revision the live domain attempt was created from;
+anything else records an output against inputs that were never used — a false input→output fact.
+A mismatch refuses with `INPUT_IDENTITY_MISMATCH` → fork. Attachment is its own
+`attempt_purpose = ATTACH`, and its attempt number is allocated normally — the number counts this
+run's asks, not the world's executions.
 
 ### 6.5 Outputs: atomic binding, or honest incompleteness **[R3 — P0-5]**
 
@@ -447,6 +509,23 @@ Projection vocabulary (rail, not rows): `NOT_STARTED · UNAVAILABLE · WAITING_F
 IN_PROGRESS · SUCCEEDED · BLOCKED · FAILED · CANCELLED · UNKNOWN · NOT_APPLICABLE ·
 OUTPUT_BINDING_INCOMPLETE (§6.5)` — with 1090's `BLOCKED`-vs-`FAILED` distinction and `UNKNOWN`
 for unreconciled external effects.
+
+**[R3.1] Availability is DERIVED, never a static list.** "Five sockets" describes today's
+deployment, not a constant: availability folds the deployment switches (the whole
+`/feature-execution` and build-set surface 404s while `FEATUREGEN_MATERIALIZE_ENABLED` /
+`FEATUREGEN_GENERATION_V2_ENABLED` are off), proven capability, and pin state. In particular,
+**during the foundation `GENERATE_PREVIEW` itself renders `UNAVAILABLE` with
+`BUILD_SET_DECLARATION_WITHHELD_PRE_PIN`** — the same reason code its §13 backend refusal returns
+— because a stage whose declaration endpoint is refused is unavailable, and showing it "ready"
+while its only entrance 409s would be the false rail this section exists to prevent.
+
+**[R3.1] The domain→rail mapping must be TOTAL, per lane, written in the implementation plan** —
+every value of `formula_draft.state`, `generation_request.status`, `verification_request.status`
+and `publication_attempt.outcome` maps to exactly one rail value, proved exhaustive by test
+against the CHECK constraints (the `ACTIVATION_BLOCKER_DISPOSITIONS` pattern). Two rulings taken
+now: `generation_request.REFUSED` maps to `BLOCKED` (1092 calls REFUSED "a product result", 1090
+draws the same line); and `WAITING_FOR_USER` derives only from milestone prerequisites — no
+domain store carries a state that means it.
 
 ---
 
@@ -550,6 +629,15 @@ write-IDOR: triggering work on a run the caller is forbidden to inspect. Aligned
 | `platform_admin` | read and trigger any run |
 | other authenticated developer | neither, for that run |
 
+**[R3.1] Pre-spine runs need their own ownership rule, or the foundation ships an empty
+dashboard.** All twelve live runs are `PRE_SPINE` — none has an identity row, so a policy keyed
+only on `feature_run_identity.owner_subject` renders the foundation's entire current content
+invisible to everyone but `platform_admin`. The rule: a workflow-V1 run's owner is
+`feature_run_identity.owner_subject` (immutable); a pre-spine run's owner is the `subject` inside
+`feature_generation_run.actor` (the `identity_to_jsonb` envelope both writers store), read-only
+and labelled as mutable-row-derived; a pre-spine run whose actor carries no subject is visible to
+`platform_admin` only.
+
 §0.1.0's ruling ("any authenticated development user may trigger any implemented non-production
 stage") is honoured *within* object-level scope — its safeguards (server-side roles, recorded
 actor, no borrowed authorizations) all stand. If the owner later rules that every developer may
@@ -575,8 +663,8 @@ evidence. Route `#/runs/{run_id}` replaces the nine query-string fragments.
 
 The folds, each with its honest source: per-member authoring progress (headers by subject, status
 derived per linked draft); method mix (today every formula is LLM-authored — parent §0.2 fact 3 —
-and the column says so); member counts **only from a sealed ordered set** (`preview_input_member`
-or the build set), otherwise "N candidates chosen (accumulating)"; overall status as a worst-of
+and the column says so); member counts **only from a sealed ordered set** (the build-set revision,
+which post-1101 is that set — §6.2), otherwise "N candidates chosen (accumulating)"; overall status as a worst-of
 fold with `BLOCKED` outranking `IN_PROGRESS`; **[R3] two axes everywhere an output can age —
 outcome and current eligibility (§6.7)**; keyset pagination on a stable cursor; **[R3] a
 current-state view, not a fabricated timeline (§6.6)**.
@@ -662,7 +750,9 @@ All opened at the code baseline; ® = verified in the revision-2 review or re-ve
 | sandbox lane absent · publication settled only by tests | parent §9.0 · `publication_attempt_store.py:183` callers · `feature_execution.py:424` |
 | `publication_attempt` bare text ids | `1081:32` — live row count **unmeasured** |
 | six role bundles · tenant on the envelope | `permissions.py` · `envelopes.py:26` |
-| migrations 1100–1114 reserved; 1113/1114 = compiler evaluation | parent §17 (2898–2912) |
+| migrations 1100–1114 reserved; 1113/1114 = compiler evaluation | parent §17 allocation table (line numbers shift with the plan's in-flight edits — cite the section) |
+| ® 1100's composite shape: six-action CHECK, `resource_identity_hash NOT NULL`, `act_key` unique index, typed-child rule | in-flight `1100_action_authorization_revision.sql:43,72-78` |
+| ® `renderer_contract_revision` exists nowhere; real renderer identity = `renderer_version` (1079) + `renderer_build_hash` (1091 PK) | grep + `1091:77` |
 | §0.1.0 development ruling · server-owned authorization landed | parent plan · `7a2c78b9` |
 | `POST /build-sets` reachable whenever the V2 switch is on | `build_sets.py:80` |
 | ® owner live re-measurement 2026-08-23 | ledger 195 → 1099 · runs 12 · snapshots 12 · considered 5 · generation inputs 5 · **choices 0** · drafts 7 · selections/build sets/generation requests/verifications 0 · action-authorization table not deployed |
