@@ -332,3 +332,36 @@ def test_an_EVALUATION_ATTEMPT_IS_ASSEMBLED_FROM_THE_AUDIT_not_from_its_caller(d
         "this run authored a different formula from the reviewed one; a reproduction check that "
         "called it a match would pass every clean case that merely ran")
     assert outcome["exact_match"] is False
+
+
+def test_a_REAL_PROVIDER_AUTHORED_RUN_DERIVES_AS_LLM_AUTHORED(db, monkeypatch, _dsn):
+    """▲ THE AUTHORING METHOD, DERIVED FROM REAL EVIDENCE rather than from a monkeypatched count.
+
+    Every other test of `derive_authoring_method` fakes the database, which proves the branching and
+    nothing about the evidence. This one drives a genuine provider-authored V3 run — reconciled
+    dispatches and all — and asserts the derivation reads it as LLM_AUTHORED.
+
+    ▲ AND IT PINS THE DISTINCTION THE PRODUCTION CERTIFICATE TURNS ON. Nothing about this run says
+    "recipe" or "llm_intent"; the derivation never looks. `formula_draft_worker` always drives the
+    LLM author and critic, so a feature a user picked from a RECIPE recommendation lands here too —
+    LLM_AUTHORED, needing the LLM certificate. Choosing from `generation_source` instead would give
+    such a feature a recipe-compiler certificate that never covered how it was written.
+    """
+    import psycopg
+
+    from featuregen.materialize.authoring_provenance import (
+        LLM_AUTHORED,
+        derive_authoring_method,
+    )
+
+    with durable_v3_run(_dsn, monkeypatch, raw=_raw_v3(), intent=_INTENT, allowed_refs=_REFS,
+                        facts_ref=REF_AMT) as (run_id, _result):
+        with psycopg.connect(_dsn) as check:
+            got = derive_authoring_method(check, run_id)
+
+    assert got.authoring_method == LLM_AUTHORED
+    assert got.authoring_run_id == run_id
+    assert got.evidence["dispatches_reconciled"] is True
+    assert got.evidence["author_dispatch_count"] > 0
+    assert got.evidence["critic_dispatch_count"] > 0
+    assert len(got.evidence_hash) == 64
