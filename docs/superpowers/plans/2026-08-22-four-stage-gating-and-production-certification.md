@@ -1331,8 +1331,37 @@ defect a second time, in the lane the whole programme depends on.
 
 > **The rule, and it belongs in §15 beside the governance-function rule: EVERY LIFECYCLE TABLE HAS A
 > RECONCILER.** The domain row and the queue row have separate lifetimes, and today only the queue
-> row has an expiry. A reconciler moves an abandoned `CLAIMED`/`RUNNING` row out of the live set —
-> keyed off the lease it lost — so that a crash costs an attempt rather than the resource.
+> row has an expiry. A reconciler moves an abandoned `CLAIMED`/`RUNNING` row out of the live set, so
+> that a crash costs an attempt rather than the resource.
+
+##### ▲ DO NOT WRITE A NEW ONE — PORT THE EXISTING ONE. This is worse than "missing"
+
+**`src/featuregen/materialize/reconcile.py` already IS this reconciler**, it is **wired** into the
+worker (`runtime/worker.py:582`), and it is careful in ways a fresh implementation would not be. It
+reconciles **`materialization_request`** — the **LEGACY** chain — and contains **zero** references to
+`generation_request`.
+
+▲ **So the legacy lane has crash recovery and its replacement does not** — and §17 step 10 deletes
+the legacy route. **Carried out naively, this programme ends with strictly LESS crash recovery than
+the platform has today, on the lane everything runs through.** That is the opposite of the intent,
+and it is invisible unless someone notices the reconciler was never ported.
+
+▲ **And its prior art contains the trap that a naive port walks straight into.** The obvious
+detection — *"request is `CLAIMED`/`RUNNING` and its queue row is not leased"* — is **WRONG**, and
+`reconcile.py`'s own header says why: a request healthily awaiting redelivery after
+`fail_generation(permanent=False)` is byte-for-byte indistinguishable from an abandoned one on that
+signal. Terminalizing it does QUIET damage: *"the redelivery arrives, hits the terminal
+short-circuit, and the lane reports `replayed` — 'already done' — for a compile that never
+happened."*
+
+**The correct predicate is the one that module already derived: an abandoned request necessarily has
+an UNREACHABLE MESSAGE** (dead or absent), not merely an unleased one — plus its three-class analysis
+(dead worker + dead message · dead message + live claim, which only TIME resolves · stranded at
+`REQUESTED` behind a dead message, structurally invisible to a lease-based query).
+
+**Port it, with its classes, its ranking and its verdicts, onto `generation_request` and
+`verification_request`. Do not re-derive it** — the second derivation will omit the trap, because the
+trap is only obvious once it has bitten.
 
 #### ▲ 9.0.2 REUSE the right half of the claim pattern — C6
 
@@ -2631,10 +2660,13 @@ in (§9.0.1):
 > live states, is a permanent wedge with no operator remedy.**
 
 **The rule: a table with a status column and a live-state uniqueness guard does not ship without the
-thing that moves an abandoned row out of the live set.** The ingredients already exist — the queue
-has leases and fences, migration 1094 has the right REFUSED/FAILED vocabulary — but **no domain table
-has a reconciler**. That is the same failure as §15's original rule: machinery whose absence is
-invisible until the day it is needed.
+thing that moves an abandoned row out of the live set.**
+
+▲ **And the correction that makes this rule sharper than "nobody built one":** `materialize/
+reconcile.py` **IS** such a reconciler — wired, thorough, and written against the **legacy**
+`materialization_request`. **The machinery exists and was never carried onto the replacement lane.**
+So the failure mode is not neglect; it is a capability that quietly does not migrate, on a programme
+whose final step deletes the lane that has it. §9.0.1 owns the port.
 
 The rule: a merged governance function whose enforcement point is "next phase" is indistinguishable,
 from the outside, from a governance function that does nothing.

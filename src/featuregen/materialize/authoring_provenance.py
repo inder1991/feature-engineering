@@ -91,14 +91,25 @@ def derive_authoring_method(conn, authoring_run_id: str) -> AuthoringProvenanceV
         "review_bypassed_events": bypass,
     }
 
-    if llm_evidence and blueprint_evidence:
-        # BOTH is not "probably the LLM one". A run that drove a provider AND recorded a reviewed
-        # bypass is a run whose own trace disagrees with itself, and picking either method would
-        # certify against evidence that contradicts the choice.
+    # ▲ RAW DISPATCH PRESENCE, not the reconciled-gated boolean, and the difference is a
+    # mis-certification. A run whose dispatches did not RECONCILE still ATTEMPTED a provider;
+    # pairing that with a reviewed bypass is the clearest case there is of a trace disagreeing with
+    # itself. Gating this check on `llm_evidence` — which requires reconciliation — let exactly that
+    # combination fall THROUGH to `REVIEWED_RECIPE_BLUEPRINT` below: the STRONGEST method claim,
+    # minted from the WEAKEST evidence, into an append-only table nothing can correct afterwards.
+    #
+    # Unreachable while no production caller supplies `reviewed_blueprint` — which is why it was
+    # never seen. The deterministic lane is what makes both paths live at once, so the guard is
+    # widened BEFORE that lane exists rather than after it seals something.
+    provider_attempted = bool(author_refs) or bool(critic_refs)
+    if provider_attempted and blueprint_evidence:
+        # BOTH is not "probably the LLM one". Picking either method would certify against evidence
+        # that contradicts the choice.
         raise AuthoringMethodUndecidable(
-            f"authoring run {authoring_run_id} carries evidence of BOTH reconciled provider "
-            f"authoring and a reviewed-blueprint bypass; its trace disagrees with itself and no "
-            f"certificate can be chosen from it: {evidence}")
+            f"authoring run {authoring_run_id} carries evidence of BOTH provider authoring "
+            f"({'reconciled' if reconciled else 'UNRECONCILED'}) and a reviewed-blueprint bypass; "
+            f"its trace disagrees with itself and no certificate can be chosen from it: "
+            f"{evidence}")
     if llm_evidence:
         method = LLM_AUTHORED
     elif blueprint_evidence:

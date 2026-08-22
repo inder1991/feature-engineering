@@ -484,3 +484,63 @@ has leases and fences, 1094 has the right vocabulary — but **no domain table h
 **Recommendation: make "every lifecycle table has a reconciler" a standing rule in §15**, beside
 *"never land a governance function without its enforcement point"*. Both are the same failure —
 machinery whose absence is invisible until the day it is needed.
+
+---
+
+# Execution notes — corrections found while implementing
+
+Two findings changed materially the moment implementation started. Both are recorded here because
+each was *more* wrong in a direction the review had not considered.
+
+## C1 is sharper AND partly inverted — the reconciler EXISTS
+
+`src/featuregen/materialize/reconcile.py` **is** the reconciler C1 says is missing. It is wired into
+the worker (`runtime/worker.py:582`), it is thorough, and it reconciles **`materialization_request`**
+— the **legacy** chain. It contains **zero** references to `generation_request`.
+
+▲ **So the correct statement is not "no domain table has a reconciler". It is: the LEGACY lane has
+crash recovery and its REPLACEMENT does not — and §17 step 10 deletes the legacy route.** Carried out
+naively, this programme ends with **strictly less** crash recovery than the platform has today.
+
+▲ **And that module contains the trap my proposed fix would have walked into.** I was about to detect
+abandonment as *"request is `CLAIMED`/`RUNNING` and its queue row is not leased"*. `reconcile.py`'s
+header explains why that is wrong: a request healthily awaiting redelivery after a
+`permanent=False` release is byte-for-byte identical to an abandoned one on that signal, and
+terminalizing it does quiet damage — the redelivery hits the terminal short-circuit and reports
+*"already done"* for work that never happened. The correct predicate is an **unreachable message**,
+not an unleased one.
+
+**Revised instruction: PORT it, with its three abandonment classes and its ranking. Do not re-derive
+it** — a second derivation omits the trap, because the trap is only obvious after it has bitten.
+
+## B2's recommended fix is probably the WRONG product rule
+
+The defect is real: any `feature:generate` holder may consume any generation authorization. But the
+review's fix — *"the caller must BE the grantee"* — collides with what the code and its tests model:
+
+* `tests/featuregen/api/routes/test_build_sets.py` runs as `X-User: sam` against an approval seeded
+  `authorized_by="user:ops"`, and asserts success;
+* `record_generation_authorization`'s docstring calls `authorized_by` *"the act of a person taking
+  responsibility for a target"* — an **approver**, not necessarily the executor.
+
+▲ **That is segregation of duties, which in banking is frequently mandatory** — the approver must
+*not* be the executor. Requiring caller == grantee would forbid it.
+
+**So the finding stands and the remedy does not.** There is no rule at all today, and there are two
+opposite candidate rules:
+
+| Model | Rule | Consequence |
+|---|---|---|
+| **same-actor** | caller must be the grantee | simple; forbids the approve/execute split the fixtures model |
+| **segregation of duties** | approver ≠ executor, and the executor is independently entitled to execute in that environment/group | matches the fixtures and the docstring; needs an entitlement check that **does not exist** — `require_feature_generate` gates the route globally, not per environment |
+
+**This is an owner decision, not an engineering one.** §0.1.1.1 currently asserts the same-actor rule
+and must not be implemented until it is settled.
+
+## Delivered in this pass
+
+* **B4 fixed** — `derive_authoring_method`'s contradiction guard now uses raw dispatch presence, so
+  unreconciled provider calls plus a reviewed bypass **refuse** instead of sealing
+  `REVIEWED_RECIPE_BLUEPRINT`. Two tests added, and **verified to bite**: with the defect
+  reintroduced they fail `DID NOT RAISE`, confirming the old code silently returned the strongest
+  method claim. `2766 passed, 1 skipped` across `materialize/` and the build-set routes.

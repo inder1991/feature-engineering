@@ -62,6 +62,59 @@ def test_BOTH_KINDS_OF_EVIDENCE_IS_A_REFUSAL_not_a_preference(db, monkeypatch):
         mod.derive_authoring_method(_Both(), "far-both")
 
 
+def test_UNRECONCILED_CALLS_PLUS_A_BYPASS_IS_A_REFUSAL_not_a_reviewed_blueprint(db, monkeypatch):
+    """▲ The gap between the two tests above, and it sealed the STRONGEST claim on the WEAKEST
+    evidence.
+
+    The contradiction guard used to be gated on `llm_evidence`, which requires RECONCILED dispatches.
+    So a run that attempted a provider, failed to reconcile, AND recorded a reviewed bypass set
+    `llm_evidence = False`, skipped the guard, and fell through to `REVIEWED_RECIPE_BLUEPRINT` —
+    into an append-only provenance table, from a run whose provider calls could not be accounted for.
+
+    Unreachable while no production caller supplies `reviewed_blueprint`; the deterministic lane is
+    what makes both paths live at once. Widened before that lane exists.
+    """
+    import featuregen.materialize.authoring_provenance as mod
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_eval._dispatch_identity",
+        lambda conn, run_id: (["a-1"], ["c-1"], ["l-1"]))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.dispatch_audit.formula_dispatches_reconciled",
+        lambda conn, run_id: False)
+
+    class _BypassRecorded:
+        def execute(self, *_a, **_k):
+            class R:
+                def fetchone(self_inner): return (1,)
+            return R()
+
+    with pytest.raises(AuthoringMethodUndecidable, match="disagrees with itself"):
+        mod.derive_authoring_method(_BypassRecorded(), "far-unreconciled-plus-bypass")
+
+
+def test_the_REFUSAL_NAMES_WHICH_SIDE_WAS_UNRECONCILED(db, monkeypatch):
+    """An operator reading this refusal has to know whether the provider half reconciled — the two
+    cases have different remedies, and one message for both sends them to the wrong one."""
+    import featuregen.materialize.authoring_provenance as mod
+
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.recipe_formula_eval._dispatch_identity",
+        lambda conn, run_id: (["a-1"], ["c-1"], ["l-1"]))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.dispatch_audit.formula_dispatches_reconciled",
+        lambda conn, run_id: False)
+
+    class _BypassRecorded:
+        def execute(self, *_a, **_k):
+            class R:
+                def fetchone(self_inner): return (1,)
+            return R()
+
+    with pytest.raises(AuthoringMethodUndecidable, match="UNRECONCILED"):
+        mod.derive_authoring_method(_BypassRecorded(), "far-names-the-side")
+
+
 def test_a_REVIEW_BYPASSED_TRACE_IS_A_REVIEWED_BLUEPRINT(db, monkeypatch):
     """The stage a reviewed blueprint takes INSTEAD of a critic turn is what evidences it."""
     import featuregen.materialize.authoring_provenance as mod
