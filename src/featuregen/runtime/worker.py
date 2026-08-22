@@ -41,6 +41,7 @@ from featuregen.materialize.queue_lane import (
     process_materialization_once,
 )
 from featuregen.materialize.reconcile import reconcile_abandoned_requests
+from featuregen.materialize.reconcile_generation import reconcile_abandoned_generations
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
@@ -583,6 +584,26 @@ def run_worker_once(
 
     materialization_reconciled = _stage("materialization_reconcile")(
         _reconcile_materialization, 0)
+
+    def _reconcile_generations() -> int:
+        # ▲ THE SAME SWEEP FOR THE LANE THAT REPLACES THAT ONE. `reconcile_abandoned_requests` above
+        # serves the LEGACY `materialization_request` and has no idea `generation_request` exists —
+        # so before this stage, the canonical V2 lane had NO crash recovery at all, and the cutover
+        # that deletes the legacy route would have removed the only lane that did.
+        #
+        # The wedge is worse here than a stalled job: `generation_request_one_live_attempt` is
+        # UNIQUE over the live statuses, so one abandoned row makes that build set unbuildable in
+        # that environment PERMANENTLY, and the lane's redelivery path releases the message for
+        # retry for ever rather than terminalizing it.
+        #
+        # Gated on the GENERATION switch, not the materialization one: they are separate lanes with
+        # separate flags, and reading the wrong switch here would sweep for a lane this deployment
+        # does not run while leaving the one it does.
+        if not generation_enabled():
+            return 0
+        return len(reconcile_abandoned_generations(conn))
+
+    generations_reconciled = _stage("generation_reconcile")(_reconcile_generations, 0)
 
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so

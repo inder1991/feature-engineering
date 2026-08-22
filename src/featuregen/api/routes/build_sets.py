@@ -58,7 +58,10 @@ from featuregen.api.deps import (
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.materialize.build_set_declaration import decode_declaration
-from featuregen.materialize.generation_authorization import load_generation_authorization
+from featuregen.materialize.generation_authorization import (
+    authorization_grantee,
+    load_generation_authorization,
+)
 from featuregen.materialize.generation_lane import (
     GenerationJobV2,
     enqueue_generation,
@@ -207,6 +210,40 @@ def request_build(
             detail=f"authorization {body.generation_authorization_revision_id} approves build set "
                    f"{authorization.build_set_revision_id!r}, not "
                    f"{body.build_set_revision_id!r}: an approval permits a specific build")
+
+    # ▲ AN AUTHORIZATION IS PRESENTED, NOT MERELY REFERENCED. The check above proves the approval
+    # covers this BUILD SET; it says nothing about who may SPEND it. Without this, any caller
+    # holding `feature:generate` could name somebody else's approval and build under it — and the
+    # route would record them as `requested_by` while consuming an approval nobody agreed they
+    # could use. The audit would then read as though that were intended.
+    #
+    # ▲ THIS IS THE DEVELOPMENT POLICY, NOT A SEGREGATION-OF-DUTIES RULE (owner, 2026-08-22).
+    # The policy is "any authenticated development user may trigger any implemented NON-PRODUCTION
+    # stage, and the server records who". No approver, grantee, delegation or environment
+    # entitlement — those are premature while the tool is being built.
+    #
+    # What this check IS, is the safeguard that survives that simplification: *a client may not
+    # supply an authorization belonging to somebody else.* Permission is broad and SERVER-OWNED;
+    # it is never inferred from something the caller handed us. The distinction matters because the
+    # permissive half is temporary and the "server owns it" half is the production path.
+    #
+    # ▲ The fuller form of the same safeguard removes the choice entirely: the server RESOLVES or
+    # CREATES the authorization from the run and the current user, and
+    # `generation_authorization_revision_id` stops being a request field. This equality is the
+    # interim, and it is deliberately the strict direction — a request naming somebody else's
+    # approval is refused rather than silently re-pointed, so nothing depends on the leniency.
+    grantee = authorization_grantee(conn, body.generation_authorization_revision_id)
+    if grantee != identity.subject:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ACTION_AUTHORIZATION_NOT_HELD",
+                "detail": f"generation authorization "
+                          f"{body.generation_authorization_revision_id} was granted to "
+                          f"{grantee!r}, and an approval is spent by the person it was granted to",
+                "next_step": "request the build under your own approval, or have the approval "
+                             "re-issued to you",
+            })
 
     build_set = read_build_set(conn, body.build_set_revision_id)
     if build_set is None:

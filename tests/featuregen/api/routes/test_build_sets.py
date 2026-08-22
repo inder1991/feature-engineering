@@ -36,8 +36,15 @@ def engineer_headers():
     return {"X-User": "sam", "X-Roles": "feature_engineer"}
 
 
-def _seed(conn, *, environment="hdfc-local", group="customer_txn_features"):
-    """A target reading, two selections, a recorded build set and an approval for it."""
+def _seed(conn, *, environment="hdfc-local", group="customer_txn_features",
+          authorized_by="user:sam"):
+    """A target reading, two selections, a recorded build set and an approval for it.
+
+    ▲ `authorized_by` DEFAULTS TO THE CALLER (`user:sam`, the subject `engineer_headers` resolves
+    to). It used to default to `user:ops` while every request ran as `sam`, so the whole suite was
+    exercising a caller spending an authorization issued to somebody else — and asserting it
+    succeeded. The parameter stays so that refusal is itself testable.
+    """
     from featuregen.materialize.generation_authorization import (
         GenerationAuthorizationV1,
         record_generation_authorization,
@@ -68,7 +75,7 @@ def _seed(conn, *, environment="hdfc-local", group="customer_txn_features"):
             environment_id=environment, logical_group_name=group,
             build_set_revision_id=build_set,
             target_mode=TargetModeV1.EXPLORATION, target_ref=None),
-        authorized_by="user:ops", authorized_at="2026-08-21T00:00:00Z")
+        authorized_by=authorized_by, authorized_at="2026-08-21T00:00:00Z")
     # NO COMMIT. `make_client` overrides `get_conn` with this very connection, so the routes see
     # these rows uncommitted — and the root `conn` fixture rolls the whole thing back on teardown.
     # Committing here would make the seed permanent and leak `sel-1`, `bs-api` and an approval into
@@ -323,3 +330,43 @@ def test_an_INCOMPLETE_DECLARATION_IS_REFUSED_by_name(client, conn, enabled,
 
     assert response.status_code == 422, response.text
     assert "cadence" in response.text
+
+
+def test_AN_APPROVAL_GRANTED_TO_SOMEBODY_ELSE_CANNOT_BE_SPENT(
+        client, conn, enabled, engineer_headers) -> None:
+    """▲ The hole this closes: the route proved the approval covered the BUILD SET and never asked
+    who might SPEND it.
+
+    Any holder of `feature:generate` could name another person's approval and build under it. The
+    request would be recorded as theirs while consuming an approval nobody agreed they could use —
+    so the audit trail would read as if that were intended.
+
+    ▲ This is NOT segregation of duties, and it must not be read as the beginning of it. The
+    development policy is deliberately permissive — any authenticated development user may trigger
+    any implemented non-production stage. What this pins is the half that is NOT temporary:
+    permission is server-owned, so a caller cannot spend an authorization the server did not issue
+    to them. The eventual form removes the request field entirely and has the server resolve it.
+    """
+    build_set, approval = _seed(conn, authorized_by="user:ops")
+
+    response = client.post(GENERATIONS, json=_body(build_set, approval),
+                           headers=engineer_headers)
+
+    assert response.status_code == 403, response.text
+    body = response.json()["detail"]
+    assert body["code"] == "ACTION_AUTHORIZATION_NOT_HELD"
+    # It NAMES the grantee: "you may not" without "who may" sends somebody to the wrong person.
+    assert "user:ops" in body["detail"]
+
+
+def test_THE_REFUSED_BUILD_QUEUES_NOTHING(
+        client, conn, enabled, engineer_headers) -> None:
+    """▲ Asserted on the QUEUE, not on the response. A refusal that still enqueued would be a
+    refusal in the reply and a build in fact — and the reply is not what spends the compute."""
+    build_set, approval = _seed(conn, authorized_by="user:ops")
+    before = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
+
+    client.post(GENERATIONS, json=_body(build_set, approval), headers=engineer_headers)
+
+    after = conn.execute("SELECT count(*) FROM queue").fetchone()[0]
+    assert after == before

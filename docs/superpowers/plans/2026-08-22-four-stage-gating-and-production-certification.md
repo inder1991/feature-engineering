@@ -439,7 +439,85 @@ with a different operator remedy** — and reuse `WorkerIdentityResolver` rather
 resolver. ▲ Note its built-in resolver handles `local user:` subjects only; a non-local/OIDC
 deployment needs an adapter, and that is an operator prerequisite (§17 step 0b), not a code detail.
 
-#### ▲ 0.1.1.1 The caller must BE the grantee — R2, and it is LIVE
+### ▲ 0.1.0 THE DEVELOPMENT AUTHORIZATION POLICY — owner ruling, 2026-08-22, and it SUPERSEDES much of what follows
+
+> *"Because the tool is still under development, we do not need segregation of duties now. That
+> would be premature complexity."*
+
+**The policy, in full:**
+
+```
+any authenticated DEVELOPMENT user
+        -> may trigger any IMPLEMENTED, NON-PRODUCTION stage
+        -> and the server records WHO triggered it
+```
+
+| Action | Development policy |
+|---|---|
+| `AUTHOR_FORMULA` | **Allow** |
+| `GENERATE_PREVIEW` | **Allow** |
+| `EXECUTE_SANDBOX` | **Allow once a worker exists** (§9.0) |
+| `PUBLISH_SANDBOX` | **Allow once implemented** |
+| `MATERIALIZE_PRODUCTION` | ▲ **UNAVAILABLE** |
+| `PUBLISH_PRODUCTION` | ▲ **UNAVAILABLE** |
+
+▲ **The safeguards are NOT relaxed, and this is the whole point of the ruling:**
+
+1. **Roles are never accepted from the request body.** Development users get broad permissions
+   **server-side** (§0.1's `roles` deletion stands, unchanged and undiminished).
+2. **The triggering user is recorded**, so *"my runs"* and audit history work.
+3. ▲ **A client may not supply an authorization belonging to somebody else.** The server
+   **creates or resolves** it from the run and the current user.
+4. **Production actions stay unavailable** until production governance exists.
+5. **Kind is a DEVELOPMENT/SANDBOX environment**, whatever an action happens to be called.
+
+> ▲ **The principle, and it is the sentence to quote back at any future shortcut:**
+> *"'Allow everyone in development' must be an EXPLICIT SERVER POLICY — not permission inferred
+> from client-supplied roles."*
+>
+> The permissive half is temporary. The **server-owned** half is the production path, and it is
+> being built correctly now precisely so that tightening the policy later is a change of values
+> rather than a change of architecture.
+
+#### ▲ 0.1.0.1 What this SIMPLIFIES — migration 1100 shrinks
+
+```
+action_authorization_revision
+    authorization_id · action · resource_identity_hash
+    actor_subject · environment_id
+    policy_version    = 'development-v1'
+    permission_result = 'allowed'
+    evidence_hash
+```
+
+▲ **No approver, grantee, delegation, environment-entitlement or segregation-of-duties tables are
+needed now.** The following, specified in earlier revisions, are **DEFERRED to production
+readiness** and must not be built into the development path:
+
+| Deferred | Where it was specified |
+|---|---|
+| approver ≠ executor, and any four-eyes rule | §0.1.1.1 |
+| delegation records — issuer, scope, expiry | §0.1.1 |
+| per-environment / per-group entitlement checks | §0.1.1.1 |
+| revocation tri-state and `ACTION_AUTHORIZATION_UNVERIFIABLE` | §0.1.1 |
+| the legacy-authorization grantee question | §0.3 |
+
+▲ **`policy_version` is what makes the deferral safe rather than a hole.** Every development
+authorization is stamped `development-v1`, so the day production governance lands, *"which
+authorizations were issued under the permissive policy"* is a query rather than an archaeology
+exercise — and none of them can be mistaken for a governed approval.
+
+▲ **This becomes a RELEASE-READINESS requirement, not a blocker for current development** — and it
+belongs in §21 beside the corpus obligations, because both are things that must be true before live
+and neither gates the build.
+
+#### ▲ 0.1.1.1 A client may not spend an authorization it was not issued — R2, and it is LIVE
+
+▲ **SUPERSEDED IN FRAMING by §0.1.0, and RETAINED as safeguard 3.** Earlier revisions argued this as
+*"the caller must BE the grantee"*, on a segregation-of-duties reading. **That reading is refused for
+now** — the owner's ruling is that approving and running are one act in development. What survives,
+and what the check below actually enforces, is narrower and permanent: **permission is server-owned,
+so a caller cannot spend an authorization the server did not issue to them.**
 
 **Verified: any caller with `feature:generate` may spend another actor's approval.** `GenerationIn`
 (`build_sets.py:112`) carries `generation_authorization_revision_id` **from the client**, and the
@@ -449,8 +527,24 @@ coverage; it says nothing about who may consume it. `requested_by` then records 
 audit shows one person spending another's approval, and reads as if that were intended.
 
 > **The rule: an authorization is PRESENTED, not merely REFERENCED.** The requesting actor must be
-> the authorization's `actor_subject`, or hold a recorded delegation from them (the branch above).
-> Refuse otherwise with `ACTION_AUTHORIZATION_NOT_HELD` (§5).
+> the authorization's `actor_subject`. Refuse otherwise with `ACTION_AUTHORIZATION_NOT_HELD` (§5).
+> ▲ **Under §0.1.0 this is not a duties rule — it is the "server owns permission" safeguard**, and
+> the delegation branch is deferred with the rest of the production governance.
+
+▲ **IMPLEMENTED 2026-08-22** (`build_sets.py`, `authorization_grantee`): the route refuses 403
+`ACTION_AUTHORIZATION_NOT_HELD` and enqueues nothing. ▲ **The grantee had to be read separately**,
+because `load_generation_authorization` reconstructs only the five identity-bearing columns —
+`GenerationAuthorizationV1.identity_payload()` excludes the actor by design and `revision_id` is
+content-addressed over it, so folding the actor in would re-mint every authorization id.
+▲ **Five existing route tests failed on the change, and the failure was the finding**: they seeded
+`authorized_by="user:ops"` and ran as `user:sam`, so the suite had been asserting that spending
+somebody else's authorization succeeds.
+
+**The FULLER form of this safeguard, per §0.1.0 point 3:** the server **resolves or creates** the
+authorization from the run and the current user, and `generation_authorization_revision_id` stops
+being a request field at all. The equality above is the interim, deliberately strict — a request
+naming another user's approval is refused rather than silently re-pointed, so nothing comes to depend
+on the leniency.
 
 ### ▲ 0.1.2 Authorization and decision are bound RELATIONALLY to action and resource — R6
 
@@ -1362,6 +1456,22 @@ an UNREACHABLE MESSAGE** (dead or absent), not merely an unleased one — plus i
 **Port it, with its classes, its ranking and its verdicts, onto `generation_request` and
 `verification_request`. Do not re-derive it** — the second derivation will omit the trap, because the
 trap is only obvious once it has bitten.
+
+▲ **DONE for `generation_request`, 2026-08-22** — `materialize/reconcile_generation.py`, wired into
+the worker tick beside the legacy sweep and gated on the GENERATION switch (not the materialization
+one: separate lanes, separate flags). It reuses `UNREACHABLE_MESSAGE_STATUSES` from the legacy module
+rather than restating it, judges `REQUESTED` as well as `CLAIMED`/`RUNNING` so the
+stranded-behind-a-dead-message class is not structurally invisible, writes `FAILED` and never
+`REFUSED` (nothing was decided about the build set), and carries a separate gauge so watching the
+number cannot be the reason rows get terminalized.
+
+▲ **The trap test is the one to keep**: `test_a_RELEASED_MESSAGE_IS_NOT_ABANDONED` — **verified to
+bite**. Injecting the naive predicate (treating a `ready` message as unreachable) terminalizes a
+request that was healthily awaiting redelivery, which is precisely the quiet damage the legacy
+module's header warns about.
+
+▲ **STILL OWED: the same port for `verification_request`**, which cannot be written until §9.0's
+worker exists — that table has no lease, fence or attempts column today (migration 1110).
 
 #### ▲ 9.0.2 REUSE the right half of the claim pattern — C6
 
@@ -2725,8 +2835,21 @@ only working execution path and replaces it with a promise). Step 0 is new and i
 | **9** | **Both evaluation programmes**, and the **governed case revision** — one approval covering IR + dataset + expected rows + tolerances + runtime profile; a dedicated certification runner, dataset and namespace | **SHARED** | §12 · §12.1 · **§12.2** · Phase E · child step 9 |
 | **10** | **Both-METHOD, concurrency, tamper, bypass and crash-recovery journey tests, then DELETE the legacy route, its producer and its handler** — ▲ **not "both-route"**: after D2 there is one route, and what is tested is route absence and queue-bypass refusal (§8.3) | **SHARED** | §19 · Phases F/G · child step 10 |
 
+▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
+production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
+**UNAVAILABLE** until production governance exists. **They stay specified and they stop being
+near-term**: the decision service answers "unavailable" for both from day one (which is stricter than
+a certificate gate, and cheaper), and the boundary itself becomes **release-readiness work** (§21)
+rather than a step the current programme is blocked behind.
+
+**So the near-term path is 0 → 0b → 1 → 2 → 3 → 4 → 5 → 6**, ending at a working sandbox lane. Steps
+7–10 remain the plan of record for going live. ▲ **This does not weaken anything**: an action that is
+unavailable cannot be reached by a bypass either, and §8's closure work applies unchanged to the four
+actions that ARE available.
+
 ▲ **Step 2 is now the largest step in the programme, and that is the accepted cost of breaking the
-P0-2 cycle.** The alternative the verdict offered — 2A, then the resolver, then a 2B that activates
+P0-2 cycle** — though §0.1.0 removes a real slice of it: no delegation, entitlement, revocation
+tri-state or duties tables. The alternative the verdict offered — 2A, then the resolver, then a 2B that activates
 identity V2 atomically — is recorded in the preamble as the reversal path. It trades one large step
 for three coupled ones with a mid-programme activation, and the coupling was the defect.
 
@@ -3110,6 +3233,25 @@ is wanted later it can replace the scaling; what it must not do is stay unstated
 ---
 
 ## 21. Not engineering, and not blocking these phases
+
+### ▲ 21.0 The release-readiness list — deferred by §0.1.0, and owed before live
+
+The owner's development policy defers real governance rather than deleting it. **Each of these must
+be true before this tool goes live, and none of them blocks current development:**
+
+| Owed | Deferred from |
+|---|---|
+| production-specific approval, and **segregation of duties** (approver ≠ executor) | §0.1.0, §0.1.1.1 |
+| delegation records — issuer, scope, expiry — for work outliving its requester | §0.1.1 |
+| per-environment and per-group entitlement checks | §0.1.1.1 |
+| revocation as a tri-state, with `ACTION_AUTHORIZATION_UNVERIFIABLE` failing closed | §0.1.1 |
+| `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION` becoming available at all — the boundary, the state machines, the certificates | §9, §9.1, §10 |
+| every `development-v1` authorization re-examined, since none is a governed approval | §0.1.0.1 |
+
+▲ **`policy_version = 'development-v1'` is what makes this list actionable rather than aspirational.**
+It is stamped on every authorization issued under the permissive policy, so the question *"what was
+approved under the rules we no longer use?"* is one query. Without it, the deferral would be
+indistinguishable from an omission on the day somebody has to answer for it.
 
 ### ▲ MEASURED, and the previous framing was wrong in BOTH directions — ruling 4
 
