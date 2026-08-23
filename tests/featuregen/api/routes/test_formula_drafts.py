@@ -441,3 +441,56 @@ def test_AN_UNVERIFIED_REFUSAL_IS_A_409_NOT_AN_OVERRIDE(client, conn, engineer_h
     assert response.json()["detail"]["code"] == "OVERRIDE_REFUSAL_UNVERIFIED"
     assert conn.execute(
         "SELECT COUNT(*) FROM formula_method_override_revision").fetchone() == (0,)
+
+
+# ══ Stage I Task 5 — per-draft governance in the ONE composition ════════════════════════════════
+def test_EVERY_DRAFT_IS_DECIDED_AND_CEILINGED_in_its_one_transaction(client, conn,
+                                                                     engineer_headers):
+    """The request-time AUTHOR_FORMULA decision lands on the plan row (durable, worker-reread),
+    its resource is the CANDIDATE's scope key (§0.1.4 — one tuple, three uses), and the HTTP
+    path's spend hole is closed by the server-minted DEVELOPMENT ENVELOPE: bounded ceilings,
+    enforced per physical call at the dispatch seam — never an absent guard."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    _revision(conn, revision_id="crev-t5", snapshot_id="snap-t5")
+    response = client.post(DRAFT_PATH.format(rev="crev-t5", opt="opt-a"),
+                           headers=engineer_headers)
+    assert response.status_code == 202, response.text
+    draft_id = response.headers["X-Formula-Draft-Id"]
+
+    plan = conn.execute(
+        "SELECT action_decision_revision_id, llm_spend_authorization_id "
+        "FROM formula_draft_authoring_plan WHERE formula_draft_id = %s", (draft_id,)).fetchone()
+    assert plan[0], "the decision id is DURABLE where the worker re-reads it (AC4)"
+    assert plan[1], "an LLM draft without a caller ceiling carries the dev envelope (AC3)"
+
+    candidate = frozen_candidate(conn, "crev-t5", "opt-a")
+    scope = retirement_scope_key(
+        considered_revision_id=candidate.considered_revision_id, option_id="opt-a",
+        planning_request_hash=candidate.planning_request_hash,
+        catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+        definition_revision=candidate.definition_revision)
+    decision = conn.execute(
+        "SELECT action, resource_identity_hash, allowed FROM action_decision_revision "
+        "WHERE decision_id = %s", (plan[0],)).fetchone()
+    assert decision == ("AUTHOR_FORMULA", scope, True)
+
+    envelope = conn.execute(
+        "SELECT max_calls, pricing_version, actor_subject "
+        "FROM llm_spend_authorization_revision WHERE spend_authorization_id = %s",
+        (plan[1],)).fetchone()
+    assert envelope == (5, "development", "user:sam"), \
+        "bounded, marked development, and it names WHO — the §0.1.0 posture"
+
+
+def test_the_dev_envelope_is_ONE_ceiling_per_draft_config_not_one_per_click(client, conn,
+                                                                            engineer_headers):
+    _revision(conn, revision_id="crev-t5b", snapshot_id="snap-t5b")
+    first = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
+    second = client.post(DRAFT_PATH.format(rev="crev-t5b", opt="opt-a"), headers=engineer_headers)
+    assert second.json()["created"] is False
+    count = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert count == (1,), "a double-click neither re-decides the spend nor stacks ceilings"

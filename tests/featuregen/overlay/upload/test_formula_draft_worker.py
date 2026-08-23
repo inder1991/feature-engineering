@@ -337,7 +337,7 @@ def test_the_terminal_kinds_are_deliberately_unmapped():
 
 
 # ══ THE REVIEWED LANE'S REBUILD (owner ruling 2026-08-23 item 2) ═══════════════════════════════
-def _reviewed_plan(db, *, draft_id="fd-rev-1", pinned_hash=None):
+def _reviewed_plan(db, *, draft_id="fd-rev-1", pinned_hash=None, decision_id=None):
     """A draft whose PLAN pinned the shipped recipe's reviewed blueprint."""
     from tests.featuregen.materialize.provenance_fixtures import BLUEPRINT_RECIPE
 
@@ -363,10 +363,11 @@ def _reviewed_plan(db, *, draft_id="fd-rev-1", pinned_hash=None):
     db.execute(
         "INSERT INTO formula_draft_authoring_plan (formula_draft_id, candidate_origin, "
         "formula_strategy, strategy_identity_hash, recipe_id, expectation_ref, "
-        "expectation_generation, reviewed_blueprint_revision, reviewed_blueprint_hash) "
-        "VALUES (%s, 'recipe', 'REVIEWED_RECIPE_BLUEPRINT', 'sih-1', %s, %s, 'v2', %s, %s)",
+        "expectation_generation, reviewed_blueprint_revision, reviewed_blueprint_hash, "
+        "action_decision_revision_id) "
+        "VALUES (%s, 'recipe', 'REVIEWED_RECIPE_BLUEPRINT', 'sih-1', %s, %s, 'v2', %s, %s, %s)",
         (draft_id, BLUEPRINT_RECIPE, BLUEPRINT_RECIPE, BLUEPRINT_RECIPE,
-         pinned_hash or real_hash))
+         pinned_hash or real_hash, decision_id))
     return draft_id, real_hash
 
 
@@ -496,3 +497,69 @@ def test_THE_DEFAULT_LOADER_READS_THE_FROZEN_REVISION(db):
     loaded = worker_mod._frozen_grounding_context(db, "fd-ctx")
 
     assert loaded == context, "the exact frozen bytes, rehydrated"
+
+
+# ══ Stage I Task 5 — the worker's SECOND LOOK for authoring ═════════════════════════════════════
+def test_a_governed_draft_with_NO_decision_is_a_bypass_and_REFUSES(db):
+    """A plan row is a governed draft; the service writes the decision in the same transaction —
+    so NULL here is a hand-enqueued bypass or a pre-1119 plan, and absence never reads as
+    permission (the generation lane's exact shape)."""
+    from featuregen.overlay.upload.formula_draft_worker import (
+        _DraftBlocked,
+        _recheck_authoring_decision,
+    )
+
+    draft_id, _ = _reviewed_plan(db, draft_id="fd-nodec")
+    with pytest.raises(_DraftBlocked) as caught:
+        _recheck_authoring_decision(db, draft_id)
+    assert caught.value.blocker["code"] == "ACTION_DECISION_MISSING"
+
+
+def test_a_MOVED_PIN_refuses_as_drift_never_a_fresh_allowed(db):
+    """Tamper one pin after the decision — the strategy identity — and the recheck refuses BY
+    NAME. Re-evaluating would usually say "allowed" again, which is exactly the § 7.1 bypass."""
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.formula_draft_service import authoring_evidence_pins
+    from featuregen.overlay.upload.formula_draft_worker import (
+        _DraftBlocked,
+        _recheck_authoring_decision,
+    )
+    from featuregen.overlay.upload.retirement_scope import retirement_scope_key
+
+    scope = retirement_scope_key(
+        considered_revision_id="crev-rev", option_id="opt-rev", planning_request_hash="h1",
+        catalog_snapshot_hash="h2", definition_revision="r")
+    authorization = authorize_action(
+        db, action=ActionV1.AUTHOR_FORMULA, resource_identity_hash=scope,
+        actor_subject="user:s", environment_id="control-plane")
+
+    def _decided(strategy_identity_hash: str) -> str:
+        decision_id, _ = decide(
+            db, ActionRequestV1(
+                action=ActionV1.AUTHOR_FORMULA, resource_identity_hash=scope,
+                evidence_pins=authoring_evidence_pins(
+                    retirement_scope_key=scope, catalog_snapshot_hash="h2",
+                    strategy_identity_hash=strategy_identity_hash)),
+            authorization_id=authorization.authorization_id)
+        return decision_id
+
+    # Pins agree (the plan row carries sih-1, the decision pinned sih-1): silence.
+    ok, _ = _reviewed_plan(db, draft_id="fd-drift-ok", decision_id=_decided("sih-1"))
+    _recheck_authoring_decision(db, ok)
+
+    # The decision pinned a DIFFERENT strategy identity than the plan row carries — the plan
+    # table is append-only (no post-hoc tamper is even writable), so the divergence is decided
+    # in: the recheck must refuse by name rather than shrug.
+    bad, _ = _reviewed_plan(db, draft_id="fd-drift-bad", decision_id=_decided("sih-elsewhere"))
+    with pytest.raises(_DraftBlocked) as caught:
+        _recheck_authoring_decision(db, bad)
+    assert caught.value.blocker["code"] == "ACTION_DECISION_DRIFTED"
+
+
+def test_a_PRE_CONTRACT_draft_keeps_its_documented_legacy_path(db):
+    """No plan row at all: the draft predates the strategy contract and authors by LLM — the
+    recheck stays out of its way rather than inventing a refusal for history."""
+    from featuregen.overlay.upload.formula_draft_worker import _recheck_authoring_decision
+
+    _recheck_authoring_decision(db, "fd-never-existed")   # returns None, raises nothing
