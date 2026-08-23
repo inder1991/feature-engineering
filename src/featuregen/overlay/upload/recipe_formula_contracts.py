@@ -11,15 +11,13 @@ import json
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-from featuregen.formula.schema import (
-    AggregateFunction,
+from featuregen.formula.schema import AggregateFunction, FinalOperation, WindowBasis
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
-    FinalOperation,
     Inclusivity,
     NullInput,
     OverflowBehavior,
     RoundingMode,
-    WindowBasis,
     WindowUnit,
 )
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref

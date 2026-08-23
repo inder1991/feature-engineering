@@ -679,24 +679,27 @@ def test_the_v2_exemplar_recipe_reaches_a_work_item(make_client, conn, monkeypat
     ).fetchone()[0] >= 1
 
 
-def test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreement(
+def test_formula_shadow_CAPTURES_the_second_authorable_recipe(
     make_client, conn, monkeypatch
 ):
-    """The SECOND authorable recipe gets as far as its reviewed blueprint and is refused BY it —
-    a different, still-open defect, recorded rather than hidden.
+    """The SECOND authorable recipe now CAPTURES — the defect this test named is closed.
 
-    Before the E4 follow-up this run recorded ``CANDIDATE_MISSING``: the engine filled no
-    candidate-key map, so the capture never reached the blueprint at all. It now resolves an EXACT
-    candidate, finds the private context, and fails one step later — because the reviewed Formula-v1
-    blueprint for ``merchant_mcc_diversity`` was authored against the LEGACY template, whose grain
-    role was ``merchant``, while the V2 recipe computes per CUSTOMER. ``bind_formula_expectation``
-    refuses a source-entity role that is not one of the blueprint's grain key roles, which is
-    exactly right: silently authoring a merchant-grain formula for a customer-grain recipe is the
-    class of error the preflight exists to stop.
+    It used to record ``CANDIDATE_MISSING`` (no candidate map), then — after E4 — an EXACT
+    candidate refused one step later with ``FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED``: the reviewed
+    Formula-v1 blueprint was authored against the LEGACY template, whose grain role was
+    ``merchant``, while the V2 recipe computes per CUSTOMER. `bind_formula_expectation` refused a
+    source-entity role outside the blueprint's grain key roles, which was exactly right — silently
+    authoring a merchant-grain formula for a customer-grain recipe is what the preflight exists to
+    stop.
 
-    Re-keying a REVIEWED expectation to a different grain entity is a governance act, not a
-    follow-up fix, so it is named here and left open. The sibling test above proves the capture
-    path itself works end to end.
+    This test said that re-keying a REVIEWED expectation is a governance act rather than a
+    follow-up fix, and left it open. **That act has happened: the feature is per CUSTOMER.** The
+    recipe moved to the v2 lane, capture derives the customer-grain blueprint, and the refusal is
+    gone — the technical axis reads OK.
+
+    The remaining ``GRAIN_AUTHORITY_NO_VALUE`` on the AUTHORITY axis is unrelated and stays: this
+    fixture's catalog carries no governed grain value. Capture succeeding and authority having
+    nothing to attest are different statements, which is why they are different axes.
     """
     _arm_shadow(conn, monkeypatch)
     _merchant_catalog(conn)
@@ -721,17 +724,22 @@ def test_formula_shadow_reaches_the_reviewed_blueprint_and_names_its_disagreemen
     assert conn.execute(
         "SELECT count(*) FROM recipe_formula_shadow_expected_run "
         "WHERE generation_run_id=%s", (body["generation_run_id"],)).fetchone()[0] == 1
-    # The candidate RESOLVED (the map is filled) and the refusal names the blueprint's own rule —
-    # never CANDIDATE_MISSING, which would mean the engine handed the shadow nothing.
-    assert ("merchant_mcc_diversity", "CAPTURE_INPUT_INCOMPLETE", "NOT_EVALUATED",
-            "FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED") in observations
+    # The candidate RESOLVED and the capture SUCCEEDED — never CANDIDATE_MISSING, which would mean
+    # the engine handed the shadow nothing, and no longer a grain refusal, which the decision closed.
+    assert ("merchant_mcc_diversity", "CAPTURED", "GRAIN_AUTHORITY_NO_VALUE", "OK") in observations
+    assert all(row[3] != "FORMULA_SOURCE_ENTITY_ROLE_UNRESOLVED" for row in observations), (
+        "the merchant-grain/customer-grain disagreement is resolved; a refusal here means it came "
+        f"back — {observations}")
     assert all(row[3] != "CANDIDATE_MISSING" for row in observations), observations
     manifest = conn.execute(
         "SELECT capture_entries FROM recipe_formula_shadow_run_manifest "
         "WHERE generation_run_id=%s", (body["generation_run_id"],)).fetchone()[0]
     entry = next(e for e in manifest if e["recipe_id"] == "merchant_mcc_diversity")
     assert entry["candidate_resolution"] == "EXACT" and entry["recipe_candidate_key"]
-    # Nothing was enqueued: a refused preflight is an observation, never work a provider would run.
+    # Still nothing enqueued, and for a reason that is NOT the closed grain refusal: this fixture's
+    # authority axis is GRAIN_AUTHORITY_NO_VALUE, and enqueueing work whose grain nobody attested
+    # would send a provider to author over a population the catalog cannot vouch for. Capture
+    # succeeding and work being enqueued are separate gates, which is the point of the split.
     assert conn.execute(
         "SELECT count(*) FROM recipe_formula_shadow_work_item WHERE generation_run_id=%s",
         (body["generation_run_id"],)).fetchone()[0] == 0

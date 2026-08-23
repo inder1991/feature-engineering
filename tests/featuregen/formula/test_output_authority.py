@@ -39,16 +39,15 @@ from featuregen.formula.output_authority import (
     resolve_formula_output_policy,
 )
 from featuregen.formula.schema import (
-    AdditivityClass,
     AggregateExpression,
     AggregateFunction,
     DiffBody,
     ExpectedOutput,
     FormulaOutputPolicyV1,
-    SourceRelation,
     TypedFormulaProposalV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import AdditivityClass, SourceRelation
 from featuregen.overlay.field_authority import InfluenceTier
 from featuregen.overlay.upload.operational_facts import (
     OperationalValue,

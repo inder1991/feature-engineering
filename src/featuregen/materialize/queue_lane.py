@@ -84,7 +84,6 @@ from typing import Any
 
 import psycopg
 
-from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.codes import MaterializationRefused
 from featuregen.materialize.compile.chain import (
     ChainStage,
@@ -103,6 +102,7 @@ from featuregen.materialize.contract import (
     CadenceTrigger,
     ContractOverrides,
 )
+from featuregen.materialize.identifiers import FeatureNamePlanError
 from featuregen.materialize.inventory import ClusterInventoryV1, load_inventory
 from featuregen.materialize.metastore_sql import (
     MetastoreEndpoint,

@@ -36,7 +36,7 @@ def _idea_with_new_fields() -> FeatureIdea:
         derives_pairs=(("deposits", "public.accounts.balance"),),
         verification="DESIGN-CHECKED", critic_note="note", rationale="why",
         operation_kind="avg", measure_refs=(("deposits", "public.accounts.balance"),),
-        grain_ref=("deposits", "public.accounts.id"), time_ref=None, window="30d",
+        grain_refs=(("deposits", "public.accounts.id"),), time_ref=None, window="30d",
         grouping_refs=(("deposits", "public.accounts.cust_id"),),
         validation_status="NEEDS_EXTERNAL_VALIDATION",
         requirements=(Requirement("TYPE_IS_NUMERIC", ("deposits", "public.accounts.balance"),

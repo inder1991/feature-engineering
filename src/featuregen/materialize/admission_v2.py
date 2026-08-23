@@ -47,22 +47,32 @@ from featuregen.formula.turns import AuthoringIntent
 from featuregen.materialize import authoring_trace as _trace
 from featuregen.materialize.admission import (
     _payload_field,
-    _require_resolved,
     _terminal_event,
     _verify_payload_hash,
-    hive_identifier,
 )
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
-from featuregen.materialize.execution_proof_store import advertised_operators
+from featuregen.materialize.execution_proof_store import renderer_supported_operators
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 
 __all__ = [
     "AdmittedFeatureV2",
     "ResolvedFeatureInputV2",
     "admit_artifacts_v2",
-    "implied_operator_kinds",
+    "implied_operator_signatures",
 ]
+
+#: The one disposition that needs no explanation. Spelled here rather than imported from V1's
+#: `admission` module because what counts as ADMISSIBLE now differs between the two languages,
+#: and a shared constant beside two different rules reads as a shared rule.
+_RESOLVED = "RESOLVED"
+#: V3's terminal state when the only outstanding step is the compiler's output binding.
+_READY_FOR_OUTPUT_BINDING = "READY_FOR_OUTPUT_BINDING"
+#: The output axis that means "not asked yet", as opposed to `needs_authority`'s
+#: "asked, and the governed read failed". Admission distinguishes them; nothing else may
+#: collapse them back.
+_DEFERRED_OUTPUT = "deferred_to_compiler"
 
 #: The wire versions of the Formula-V2 LANGUAGE. Two members, not a floor: a version 4 nobody has
 #: defined must be refused rather than admitted by an inequality that happened to be open-ended.
@@ -104,12 +114,13 @@ class AdmittedFeatureV2:
     """
 
     __slots__ = ("feature_name", "proposal", "proposal_content_hash", "intent",
-                 "authoring_run_id", "operator_kinds")
+                 "authoring_run_id", "operator_kinds", "candidate_output", "output_intent")
 
     def __init__(self, *, feature_name: str,
                  proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
                  proposal_content_hash: str, intent: AuthoringIntent, authoring_run_id: str,
-                 operator_kinds: tuple[str, ...]) -> None:
+                 operator_kinds: tuple[str, ...],
+                 candidate_output=None, output_intent=None) -> None:
         self.feature_name = feature_name
         self.proposal = proposal
         self.proposal_content_hash = proposal_content_hash
@@ -118,12 +129,27 @@ class AdmittedFeatureV2:
         #: What the renderer would be asked to emit. Carried because it is what the ADVERTISED-set
         #: check was made against, so a later stage does not re-derive it from a different reading.
         self.operator_kinds = operator_kinds
+        #: The GOVERNED output policy the authoring run resolved, and the intent the author
+        #: DECLARED. Both were being dropped here, and dropping them is not a tidy: the two exist to
+        #: be reconciled against each other by `resolve_executable_output_v2`, and a stage that has
+        #: neither cannot do that. It can only re-resolve a policy from whatever facts its caller
+        #: happens to hand it — which answers a different question and answers it confidently.
+        #:
+        #: `None` is legitimate and means the run resolved no output (an `output_status` other than
+        #: `resolved`). It is NOT a default standing in for "we did not carry it": admission refuses
+        #: a RESOLVED run whose axes disagree, so a resolved run reaches here with its output.
+        self.candidate_output = candidate_output
+        self.output_intent = output_intent
 
 
-def implied_operator_kinds(
+def implied_operator_signatures(
     proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
-) -> tuple[str, ...]:
-    """The operator kinds this proposal's execution implies, sorted.
+) -> tuple[tuple[str, str], ...]:
+    """The operator SIGNATURES this proposal's execution implies, sorted.
+
+    A signature is ``(kind, variant)``. Kinds alone cannot express the truth this check exists to
+    enforce: `sum` is renderable and `avg` is not, and both are ``AGGREGATE``. Checking kinds would
+    admit a median against an engine that can only add up.
 
     DERIVED from what the proposal declares, never asserted beside it — the same rule C-C10 applies
     to subgraph requirements: an operator list a caller supplied is one that gets forgotten on the
@@ -136,19 +162,38 @@ def implied_operator_kinds(
     be checked against the advertised set instead of the real one.
     """
     from featuregen.formula.schema_v2 import body_expressions_v2
+    from featuregen.materialize.execution_proof_store import SOLE_VARIANT
 
-    kinds: set[str] = {OperatorKindV2.GOVERNED_SCAN.value, OperatorKindV2.AGGREGATE.value,
-                       OperatorKindV2.GROUP_ASSEMBLY.value}
+    signatures: set[tuple[str, str]] = {
+        (OperatorKindV2.GOVERNED_SCAN.value, SOLE_VARIANT),
+        (OperatorKindV2.GROUP_ASSEMBLY.value, SOLE_VARIANT),
+    }
+    # The FINAL COMBINATION is a variant too, and naming it here is what stops a `signed_sum` being
+    # admitted against a renderer that can only divide. The graph has no node for it yet (step 7),
+    # but the capability question is answerable now and the answer is load-bearing now.
+    signatures.add(("final_combine", str(getattr(proposal.body, "final_operation", "identity"))))
+
     for expression in body_expressions_v2(proposal.body):
+        # THE AGGREGATE'S OWN FUNCTION, not the bare kind. This is the whole point of the typed
+        # signature: `sum` and `avg` are both AGGREGATE and only one of them renders.
+        aggregation = getattr(expression, "aggregation", None)
+        signatures.add((OperatorKindV2.AGGREGATE.value,
+                        str(getattr(aggregation, "value", aggregation or "unknown"))))
+
         refs = getattr(expression, "authority_refs", None)
         if refs is not None and getattr(refs, "currency_conversion_ref", "").strip():
-            kinds |= {OperatorKindV2.AS_OF_FX_JOIN.value,
-                      OperatorKindV2.DUPLICATE_RATE_GATE.value,
-                      OperatorKindV2.MISSING_RATE_GATE.value,
-                      OperatorKindV2.DECIMAL_MULTIPLICATION.value}
-        if getattr(expression, "row_selections", ()):
-            kinds.add(OperatorKindV2.SEMANTIC_SELECTION.value)
-    return tuple(sorted(kinds))
+            signatures |= {
+                (OperatorKindV2.AS_OF_FX_JOIN.value, SOLE_VARIANT),
+                (OperatorKindV2.DUPLICATE_RATE_GATE.value, SOLE_VARIANT),
+                (OperatorKindV2.MISSING_RATE_GATE.value, SOLE_VARIANT),
+                (OperatorKindV2.DECIMAL_MULTIPLICATION.value, SOLE_VARIANT),
+            }
+        for selection in getattr(expression, "row_selections", ()) or ():
+            # Each selection names WHICH semantic rule, so each is its own capability question.
+            signatures.add((OperatorKindV2.SEMANTIC_SELECTION.value,
+                            str(getattr(selection, "kind", None)
+                                or getattr(selection, "selection_kind", SOLE_VARIANT))))
+    return tuple(sorted(signatures))
 
 
 def admit_artifacts_v2(
@@ -183,12 +228,18 @@ def _admit_one_v2(
 
     event = _terminal_event(conn, run_id)                        # 1 — shared with v1
     _verify_payload_hash(event, run_id)                          # 2 — shared with v1
-    _require_resolved(event, run_id)                             # 3 — shared with v1
-    proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 4
-    _verify_language_version(proposal, run_id)                   # 4b
+    # ▲ AUTHENTICATE THE PROPOSAL BEFORE JUDGING THE DISPOSITION. The disposition check below
+    # grants an exception that is V3's ALONE, so it must be able to ask what language this is — and
+    # the only trustworthy answer comes from a proposal whose hash has been proven against the
+    # immutable trace. Asking earlier would decide a governed question from an unauthenticated
+    # artifact.
+    proposal, content_hash = _verify_proposal_hash(event, result, run_id)   # 3
+    _verify_language_version(proposal, run_id)                   # 4
+    _verify_manifest_declares_the_language(conn, proposal, run_id)          # 4b
     _verify_axes_v2(event, result, run_id)                       # 5
-    _verify_intent_hash_v2(conn, item.intent, run_id)            # 6
-    kinds = _verify_advertised(conn, proposal, run_id, engine_id=engine_id)  # 7 (S13)
+    _require_admissible_disposition(event, result, proposal, run_id)        # 6
+    _verify_intent_hash_v2(conn, item.intent, run_id)            # 7
+    kinds = _verify_advertised(conn, proposal, run_id, engine_id=engine_id)  # 8 (S13)
 
     return AdmittedFeatureV2(
         feature_name=hive_identifier(item.intent.name),
@@ -197,7 +248,129 @@ def _admit_one_v2(
         intent=item.intent,
         authoring_run_id=run_id,
         operator_kinds=kinds,
+        # Carried from the VERIFIED result rather than re-derived. `result` has already survived
+        # checks 2, 4, 4b and 5 — the payload hash, the proposal hash, the language version and the
+        # axes — so these two fields are as proven as the proposal beside them.
+        candidate_output=result.candidate_output,
+        output_intent=result.output_intent,
     )
+
+
+# ── 6. the disposition ADMITS, which for V3 is not the same as RESOLVED ──────────────────────────
+def _require_admissible_disposition(
+    event: _trace.TerminalEvent,
+    result: AuthoringResultV2,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+    run_id: str,
+) -> None:
+    """``NOT_RESOLVED`` unless the run's verdict permits compilation.
+
+    ▲ **WHY THIS IS NOT V1's `_require_resolved`.** V1 and V2 resolve OUTPUT AUTHORITY during
+    authoring, so `RESOLVED` there means every question was answered. **V3 deliberately does not.**
+    A V3 run validates the formula, captures the author's intent and records review evidence;
+    resolving governed output type, unit, currency and additivity is the COMPILER's (C-A7), and
+    emitting `OUTPUT_POLICY_RESOLVED` at authoring time would claim governed metadata had been
+    consulted when nothing had consulted it. Such a run terminates `READY_FOR_OUTPUT_BINDING`.
+
+    **THE EXCEPTION IS V3's ALONE, and that is checked rather than assumed.** A V2 run reaches an
+    unresolved output too — `replay_authoring_v2` folds `needs_authority` when its governed-facts
+    read fails CLOSED — and that is a genuine failure a human must look at, not a deferral. An
+    earlier version of this function took only the terminal event, could not ask what language it
+    was holding, and therefore admitted exactly that: a V2 run whose authority lookup had failed.
+    The two are now different values on the axis AND different dispositions, and this function
+    additionally requires the authenticated proposal to be V3 before granting anything.
+
+    Every condition, and none of them redundant:
+
+    1. the proposal is `TypedFormulaProposalV3` — the language whose contract defers;
+    2. the disposition is `READY_FOR_OUTPUT_BINDING`;
+    3. the output axis is exactly `deferred_to_compiler` — never `needs_authority`,
+       `external_requirement` or `invalid_output`, none of which become true later on their own;
+    4. an `output_intent` exists — the thing the compiler reconciles against;
+    5. that intent was derived from THIS proposal, not carried over from another;
+    6. no `candidate_output` — a deferred run carrying an authoritative output has laundered a
+       guess into authority;
+    7. re-folding the RECORDED axes yields `RESOLVED` once the output axis is resolved, so a
+       payload whose disposition disagrees with its own axes is refused rather than believed.
+    """
+    disposition = _payload_field(event, "authoring_disposition")
+    if disposition == _RESOLVED:
+        return
+    if disposition == _READY_FOR_OUTPUT_BINDING and _is_v3_deferral(event, result, proposal):
+        return
+    raise MaterializationRefused(
+        CompilationRefusalCode.NOT_RESOLVED,
+        f"the terminal {event.kind} event of authoring run {run_id} records "
+        f"authoring_disposition={disposition!r}, which is neither {_RESOLVED} nor a V3 run whose "
+        f"only outstanding step is the governed output binding the compiler performs",
+    )
+
+
+def _is_v3_deferral(
+    event: _trace.TerminalEvent,
+    result: AuthoringResultV2,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+) -> bool:
+    """Conditions 1-7 above. Any one of them false refuses, and none is inferred from another."""
+    from featuregen.formula.result_v2 import _content_hash
+    from featuregen.formula.schema_v3 import TypedFormulaProposalV3 as _V3
+
+    if not isinstance(proposal, _V3):                                          # 1
+        return False
+    if _payload_field(event, "output_status") != _DEFERRED_OUTPUT:             # 3
+        return False
+    intent = result.output_intent                                              # 4
+    if intent is None:
+        return False
+    derived_from = getattr(intent, "derived_from_proposal_hash", None)         # 5
+    if not derived_from or derived_from != _content_hash(proposal):
+        return False
+    if result.candidate_output is not None:                                    # 6
+        return False
+    return _refolds_to_resolved(event)                                         # 7
+
+
+def _refolds_to_resolved(event: _trace.TerminalEvent) -> bool:
+    """Would this run be ``RESOLVED`` if its output authority were established?
+
+    Asked of :func:`_fold_v2` DIRECTLY, over the axes the terminal event recorded — which check 2
+    has already proven authentic against the payload's own digest — rather than by restating the
+    fold's precedence as a second list of conditions here. A second list is a second rule, and the
+    two would disagree the first time either moved.
+    """
+    from featuregen.formula.replay_authoring_v2 import _axes, _restore_review
+    from featuregen.formula.result_v2 import AuthoringAxesV2, _fold_v2
+
+    shared = dict(
+        structural_status=_payload_field(event, "structural_status"),
+        capability_status=_payload_field(event, "capability_status"),
+        # THE SWAP, and the only one. Everything else is exactly as recorded.
+        output_status="resolved",
+        expectation_status=_payload_field(event, "expectation_status"),
+        technical_status=_payload_field(event, "technical_status"),
+    )
+    try:
+        # WHICH AXES SHAPE, decided the way the RESTORER decides it (`_restore_terminal_result`):
+        # a run with a recorded `review` folds through the V2 axes and a run without it through
+        # V1's. Choosing wrongly is not a near miss — the v1-shaped builder REJECTS a bypass's
+        # `critic_status=None`, so a single shape here would fail closed on exactly one of the two
+        # legitimate paths and read as "this run is inadmissible".
+        review = _restore_review(_payload_field(event, "review"))
+        # ▲ `AuthoringAxesV2` has `review` WHERE V1 HAS `critic_status` — not in addition to it —
+        # and `_fold_v2` folds the V1-SHAPED projection, exactly as `derive_disposition_v2` does
+        # (`axes = axes.shared_axes()` before folding). A bypass projects to "clean" for folding
+        # only, which is what makes the deterministic path foldable at all. Getting either half
+        # wrong here does not misjudge a run — it raises, and this function turns a raise into a
+        # refusal, so every reviewed-blueprint run would read as inadmissible for a reason that is
+        # a typo in the caller rather than anything about the run.
+        axes = (AuthoringAxesV2(review=review, **shared).shared_axes()
+                if review is not None
+                else _axes(critic_status=_payload_field(event, "critic_status"), **shared))
+    except (TypeError, ValueError):
+        # An axis the vocabulary does not know is not a permissive one. `_validate_axes` fails
+        # closed for the same reason and this mirrors it rather than swallowing it.
+        return False
+    return _fold_v2(axes) == _RESOLVED
 
 
 # ── 4. the recorded candidate hash equals the supplied proposal's ────────────────────────────────
@@ -252,6 +425,57 @@ def _verify_language_version(
             f"be read under operations v1 never defined, and a version nobody has defined would "
             f"be read under a grammar that does not exist",
         )
+
+
+# ── 4b. the MANIFEST, the PROPOSAL and the RUNTIME TYPE all name one language ────────────────────
+def _verify_manifest_declares_the_language(
+    conn: DbConn,
+    proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3,
+    run_id: str,
+) -> None:
+    """Three records of one fact must agree: what the run DECLARED, what the proposal SAYS, and
+    what the proposal IS.
+
+    ▲ DEFENCE IN DEPTH, and the depth is the point. Authoring now refuses a schema mismatch at the
+    moment it happens (`FORMULA_SCHEMA_CONTRACT_MISMATCH`), which is where it belongs — the run
+    fails, names the mismatch, and nothing downstream ever sees it. This check exists for the runs
+    that did not come through today's authoring path: traces written before it, imported material,
+    and whatever a future orchestration mistake produces. Those are exactly the cases the authoring
+    check cannot cover, because it did not run.
+
+    The RUNTIME TYPE is compared as well as the declared integer, because they are separately
+    forgeable: `parse_versioned` dispatches on the declared field, so an object whose field says 3
+    while its class is `TypedFormulaProposalV2` would satisfy an integer comparison and then be
+    read by every downstream stage as v2 — which is the shape of the bug this whole family of
+    checks exists to catch.
+
+    A run with NO manifest is refused rather than waved through: a run that states nothing about
+    what decided it cannot be shown to agree with anything.
+    """
+    row = conn.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        (run_id,)).fetchone()
+    declared = (row[0] or {}).get("formula_schema") if row else None
+    if declared is None:
+        raise MaterializationRefused(
+            CompilationRefusalCode.AUTHORING_RUN_INCOMPLETE,
+            f"authoring run {run_id} records no formula_schema in its manifest, so what language "
+            f"it was opened under is unanswerable — and an unanswerable provenance is not a "
+            f"permissive one")
+    if declared != proposal.formula_schema_version:
+        raise MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"authoring run {run_id} declares formula_schema={declared!r} in its manifest but "
+            f"carries a version {proposal.formula_schema_version} proposal. The manifest is what "
+            f"every later reader is keyed on, so admitting this would file the artifact under a "
+            f"language it is not written in")
+    expected = TypedFormulaProposalV3 if declared == 3 else TypedFormulaProposalV2
+    if not isinstance(proposal, expected):
+        raise MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"authoring run {run_id} declares formula_schema={declared!r} and its proposal says so, "
+            f"but the object is a {type(proposal).__name__}: the declared field and the type are "
+            f"separately forgeable, and every stage below this one reads the TYPE")
 
 
 # ── 5. the SEVEN axes match the trace ────────────────────────────────────────────────────────────
@@ -317,23 +541,34 @@ def _verify_advertised(
     conn: DbConn, proposal: TypedFormulaProposalV2 | TypedFormulaProposalV3, run_id: str, *,
     engine_id: str,
 ) -> tuple[str, ...]:
-    """The check v1's docstring promised: the v2 path arrives with an engine that ADVERTISES it.
+    """The check v1's docstring promised, at the RENDERER-SUPPORT grain.
 
-    Advertised means ``renderer-dispatchable ∩ execution-proved`` — a renderer branch with no proof
-    is a branch nobody ran against reviewed gold, and a proof for an operator this build cannot emit
-    is a proof about a different build. Admitting on either half alone would let a feature into the
-    chain on half the evidence.
+    **Admission asks whether code can be produced, not whether anyone has proved it correct.** Those
+    are two different questions with two different answers and two different remedies, and this
+    function now answers only the first:
+
+    * *renderer-supported* gates CODE GENERATION — the user may read what was generated.
+    * *execution-qualified* (``advertised_operators``) is reported alongside, not required here.
+    * *artifact-verified* gates PUBLICATION, and is a fact about one artifact.
+
+    It used to require dispatch ∩ proof, which made admission unreachable in practice: nothing
+    populates proofs until a gold harness exists, so every formula refused, and the shortest route
+    to a working pipeline was to write a proof record for a proof nobody ran. Requiring less here
+    removes that temptation rather than relying on someone resisting it — and nothing is loosened
+    downstream, because publication still demands a current artifact verification.
     """
-    implied = implied_operator_kinds(proposal)
-    advertised = set(advertised_operators(conn, engine_id=engine_id))
-    missing = sorted(set(implied) - advertised)
+    implied = implied_operator_signatures(proposal)
+    supported = set(renderer_supported_operators(conn, engine_id=engine_id))
+    missing = sorted(set(implied) - supported)
     if missing:
+        named = ", ".join(f"{kind}:{variant}" for kind, variant in missing)
         raise MaterializationRefused(
             CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
-            f"authoring run {run_id} implies operators {missing}, which {engine_id!r} does not "
-            f"advertise. Advertised means renderer-dispatchable AND execution-proved: a renderer "
-            f"branch with no gold proof is a branch nobody ran, and a proof for an operator this "
-            f"build cannot emit is a proof about a different build",
+            f"authoring run {run_id} implies operators {named}, which {engine_id!r}'s renderer "
+            f"cannot emit in this build. This is the RENDERER-SUPPORT gate: it asks whether code "
+            f"can be produced at all, not whether anyone has proved it correct. An operator the "
+            f"renderer has no branch for cannot be compiled into anything, so there is nothing to "
+            f"show and nothing to verify",
         )
     return implied
 

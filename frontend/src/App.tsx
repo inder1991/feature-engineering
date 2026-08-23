@@ -1,6 +1,7 @@
 import type { ReactElement } from 'react'
 import {
   entityMapEnabled,
+  codeGenerationEnabled,
   featureExecutionEnabled,
   gateConsoleEnabled,
   materializationRunsEnabled,
@@ -11,6 +12,7 @@ import { SessionBar } from './SessionBar'
 import { AssetDetailScreen } from './screens/AssetDetailScreen'
 import { EntityMapScreen } from './screens/EntityMapScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
+import { CodeGenerationWorkspaceScreen } from './screens/CodeGenerationWorkspaceScreen'
 import { FeatureExecutionScreen } from './screens/FeatureExecutionScreen'
 import { MaterializationRunScreen } from './screens/MaterializationRunScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
@@ -20,6 +22,8 @@ import { OverviewScreen } from './screens/OverviewScreen'
 import { RecipeReviewScreen } from './screens/RecipeReviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
+import { RunDetailScreen } from './screens/RunDetailScreen'
+import { RunsScreen } from './screens/RunsScreen'
 import { AnalysisWorkspaceScreen } from './screens/AnalysisWorkspaceScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
@@ -135,6 +139,16 @@ const ICONS: Record<Route, ReactElement> = {
       <rect x="9.25" y="9.25" width="4" height="4" rx="0.75" />
     </NavIcon>
   ),
+  // A marked list: each run is one record in an append-only log. Distinct from 'review' (bare
+  // rules ending in a decision dot) — every row here is already a fact, not a question.
+  runs: (
+    <NavIcon>
+      <circle cx="3.75" cy="4.25" r="0.9" />
+      <circle cx="3.75" cy="8" r="0.9" />
+      <circle cx="3.75" cy="11.75" r="0.9" />
+      <path d="M6.75 4.25h6.5M6.75 8h6.5M6.75 11.75h4" />
+    </NavIcon>
+  ),
   integrations: (
     // Linked nodes: one instance (top) linking out to its services (below). A connection graph.
     <NavIcon>
@@ -221,7 +235,7 @@ const PAGES: PageHead[] = [
   },
   {
     route: 'workbench',
-    label: 'Generate features',
+    label: 'Discover candidates',
     eyebrow: 'CATALOG · GENERATE',
     title: 'Feature generation',
     description:
@@ -244,6 +258,15 @@ const PAGES: PageHead[] = [
     eyebrow: 'CATALOG · REGISTRY',
     title: 'Feature registry',
     description: 'Browse registered features — open one for its hypothesis, lineage, and consumers.',
+  },
+  {
+    route: 'runs',
+    label: 'Runs',
+    eyebrow: 'CATALOG · RUNS',
+    title: 'Feature runs',
+    description:
+      'Every feature-generation workflow, grouped by hypothesis — open a run to see exactly '
+      + 'what happened, stage by stage, and what its evidence pins.',
   },
   {
     route: 'search',
@@ -368,6 +391,22 @@ const SUGGESTED_PAGE = {
     + 'are proposals with the engine’s own statuses, and nothing here changes the catalog.',
 }
 
+// The run detail's page-head. Unlike the sheets above it SHARES its route with a list ('#/runs' and
+// '#/runs/<id>' are one destination, one rail item), so it cannot be keyed into DETAIL_PAGES — it is
+// selected by the same run_id param that decides which screen renders below. The detail opens with
+// its own hero (name, id, owner, hypothesis), so the list's title and description would restate one
+// run's record at lower quality: eyebrow only.
+const RUN_DETAIL_PAGE = {
+  route: 'runs' as Route,
+  label: 'Run detail',
+  eyebrow: 'CATALOG · RUNS',
+  title: 'Feature run',
+  description:
+    'One feature-generation run opened to its record — identity, milestones, authoring rows and '
+    + 'the stage rail, exactly as the spine derives them. Read-only.',
+  crumbOnly: true,
+}
+
 // A page head. `crumbOnly` suppresses the title + description for screens that open with their own
 // hero, leaving the eyebrow as a breadcrumb.
 type PageHead = {
@@ -413,7 +452,11 @@ export default function App() {
   // Overview's copy.
   // A detail route (absent from PAGES, so no rail item highlights) selects its dedicated page-head
   // instead of falling back to Overview's copy.
-  const page = DETAIL_PAGES[route] ?? (pages.find(p => p.route === route) ?? pages[0])
+  // Read ONCE, and by both the head and the screen below: a run_id that selected the detail head
+  // but not the detail screen would put a breadcrumb over the list.
+  const runId = params.get('run_id')
+  const page = (route === 'runs' && runId ? RUN_DETAIL_PAGE : DETAIL_PAGES[route])
+    ?? (pages.find(p => p.route === route) ?? pages[0])
   return (
     <div className="shell">
       <aside className="rail">
@@ -465,6 +508,12 @@ export default function App() {
         {route === 'registry' && (
           <RegistryScreen featureId={params.get('id')} navigate={navigate} />
         )}
+        {/* One route, two surfaces: '#/runs' is the grouped list, '#/runs/<id>' one run's record.
+            The id rides the PATH (nav.ts decodes it into run_id), so an absent param is the list —
+            never a detail sheet silently pointed at nothing. */}
+        {route === 'runs' && (runId
+          ? <RunDetailScreen runId={runId} />
+          : <RunsScreen navigate={navigate} />)}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'semantics' && (
           <SemanticsPendingScreen initialSource={params.get('source') ?? ''} />
@@ -517,6 +566,15 @@ export default function App() {
             goal={params.get('goal') ?? ''}
             targetMode={params.get('target_mode') ?? 'prediction'}
             targetRef={params.get('target_ref')}
+          />
+        )}
+        {/* Step 5b — the generation workspace: one durable build journey, watched from a job
+            id. A detail sheet like the materialization and execution sheets: a missing job id
+            renders an empty workspace that says so, never one pointed at something else. */}
+        {route === 'code-generation' && codeGenerationEnabled() && (
+          <CodeGenerationWorkspaceScreen
+            jobId={params.get('job_id') ?? ''}
+            navigate={navigate}
           />
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}

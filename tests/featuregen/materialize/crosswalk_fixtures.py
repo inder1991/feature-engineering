@@ -48,22 +48,24 @@ from featuregen.formula.schema import (
     FORMULA_SCHEMA_VERSION,
     OPERATION_GRAMMAR_VERSION,
     OUTPUT_POLICY_VERSION,
-    AdditivityClass,
     AggregateExpression,
     AggregateFunction,
+    FormulaOutputPolicyV1,
+    TypedFormulaV1,
+    UnaryBody,
+    WindowBasis,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
-    FormulaOutputPolicyV1,
     Grain,
     Inclusivity,
     NullInput,
     OverflowBehavior,
     RoundingMode,
     SourceRelation,
-    TypedFormulaV1,
-    UnaryBody,
-    WindowBasis,
-    WindowPolicy,
     WindowUnit,
 )
 from featuregen.materialize.admission import AdmittedFeature
@@ -575,3 +577,78 @@ def render(inputs: NodeAssemblyInputs, *, publisher_selection=None) -> SealedPro
         inputs.authorized, inputs.plan, environment_id=ENVIRONMENT,
         engine_versions=fixtures.ENGINE_VERSIONS, spine_input=inputs.spine_input,
         nodes=assemble_nodes(inputs), publisher_selection=publisher_selection)
+
+
+def build_set_declaration(**overrides):
+    """A COMPLETE build-set declaration — the five answers a generation cannot derive.
+
+    Shared because every caller of `record_build_set` now needs one, and a per-test hand-rolled
+    spine would drift from the one the rest of these fixtures already agree on.
+    """
+    from featuregen.materialize.build_set_declaration import BuildSetDeclarationV1
+
+    fields = {
+        "spine_declaration": SPINE_DECLARATION,
+        "cadence": CADENCE,
+        "availability_promise": AvailabilityPromiseV1(calendar_days=1),
+        "operand_facts": {},
+        "policy_realization_ids": {},
+    }
+    return BuildSetDeclarationV1(**{**fields, **overrides})
+
+
+# ── the pinned formula a build set now requires ─────────────────────────────────────────────────
+def bind_ready_formula(conn, selection_revision_id: str, *, draft_id: str | None = None) -> str:
+    """A READY formula draft for this selection's candidate, PINNED. Returns the binding id.
+
+    ▲ ONE helper rather than a copy per suite, for the reason this module already states about the
+    crosswalk bank: three hand-rolled copies of a load-bearing fixture is how two suites come to
+    assert against two different worlds and both pass.
+
+    It reads the candidate facts back OUT of the selection rather than taking them as arguments,
+    because migration 1101's composite keys refuse a draft that disagrees with its selection — a
+    fixture that let a caller pass its own values would mostly produce foreign-key violations, and
+    the one time it did not would be a test asserting against a binding that could not exist in
+    production.
+    """
+    from featuregen.overlay.upload.selection_formula_binding import (
+        record_selection_formula_binding,
+    )
+
+    selection = conn.execute(
+        "SELECT considered_revision_id, option_id, planning_request_hash "
+        "FROM feature_selection_revision WHERE revision_id = %s",
+        (selection_revision_id,)).fetchone()
+    if selection is None:
+        raise AssertionError(
+            f"bind_ready_formula needs selection {selection_revision_id!r} to exist first: a "
+            f"formula is pinned TO a choice, and there is no choice here")
+
+    draft = draft_id or f"fd-{selection_revision_id}"
+    # ▲ `formula_json` is REQUIRED, not decoration: `formula_draft_ready_carries_a_formula` checks
+    # that a READY draft has a content hash AND a non-empty formula. A fixture that set only the
+    # hash would be creating a state the schema forbids — and pinning a build to it would be
+    # pinning to a formula that does not exist.
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
+        "formula_identity_hash, state, formula_content_hash, formula_json, requested_by, "
+        "requested_at) "
+        "VALUES (%s, %s, %s, %s, 'sha256:snapshot', 'sha256:config', 'rev-1', %s, 'READY', %s, "
+        "%s::jsonb, 'user:sam', 't') ON CONFLICT (formula_draft_id) DO NOTHING",
+        (draft, selection[0], selection[1], selection[2],
+         f"sha256:identity-{draft}", f"sha256:formula-{draft}",
+         '{"formula_schema_version": 3, "fixture": true}'))
+
+    binding, _ = record_selection_formula_binding(
+        conn, selection_revision_id=selection_revision_id, formula_draft_id=draft)
+    return binding.binding_id
+
+
+def bind_ready_formulas(conn, selection_revision_ids) -> tuple[str, ...]:
+    """`bind_ready_formula` for an ordered set of selections, order preserved.
+
+    Order matters: it decides the published table's column order, so a helper returning a set would
+    quietly discard a fact about the build.
+    """
+    return tuple(bind_ready_formula(conn, s) for s in selection_revision_ids)

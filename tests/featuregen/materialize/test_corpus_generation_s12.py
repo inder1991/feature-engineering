@@ -12,6 +12,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+from tests.featuregen.materialize.fixtures import advertise_dispatch
 from tests.featuregen.materialize.test_subgraph_requirements_v2 import _fixed_aed_pilot, _fx_chain
 
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1, PolicyOccurrenceV1
@@ -28,8 +29,6 @@ from featuregen.materialize.corpus_generation import (
     generate_corpus,
     named_refusals,
 )
-from featuregen.materialize.execution_proof_store import record_renderer_dispatch
-from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.selection_revisions import BuildDeclarationV1, TargetModeV1
 
@@ -67,8 +66,7 @@ def _candidate(
 
 
 def _dispatch_all(db, *, except_kind: str | None = None):
-    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: kind.value != except_kind for kind in OperatorKindV2})
+    advertise_dispatch(db, engine_id=ENGINE, except_kind=except_kind)
 
 
 def _publish(db, dataset: str = "public.transactions"):

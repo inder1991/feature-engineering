@@ -4,9 +4,10 @@ The versioning law this module exists to keep: **Formula-v1 stays frozen** — i
 canonicalization and every stored hash are untouched by v2's existence, which is why the v2 body
 types are their OWN dataclasses even where they mirror v1 shape-for-shape (a shared body type
 would let a v2 evolution move v1 identity). The structural LEAVES that carry no versioned
-vocabulary — refs, filters, windows, grains, parameters, decimal policy — are imported from v1
-verbatim: they are frozen with it, and duplicating them would fork validation the two grammars
-must share.
+vocabulary — refs, filters, windows, grains, parameters, decimal policy — are imported from
+``schema_leaves`` verbatim: they are the same objects, and duplicating them would fork validation
+the grammars must share. They used to be imported from v1's own module, which said this schema
+depended on v1 when it depends only on things neither language owns.
 
 Increment 1's operation vocabulary: the v1 four (sum / count_rows / count_non_null /
 count_distinct) plus the first NEW group — **min, max, avg** — under the same body shapes
@@ -21,11 +22,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     MAX_PREDICATES,
     AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
+    ExpectedOutput,
     FilterNode,
     Grain,
     Inclusivity,
@@ -233,7 +235,11 @@ class TypedFormulaProposalV2:
     body: FormulaBodyV2
     parameters: tuple[ParameterDecl, ...]
     decimal: DecimalPolicy
-    expected_output: object | None
+    #: TYPED, since the v1 retirement made `ExpectedOutput` a shared leaf. It was ``object | None``
+    #: only because the type lived in a V1-named module — and that looseness is what let
+    #: `output_intent_v2` read it with `getattr(..., None)`, turning a renamed field into a silent
+    #: ``unit=None`` rather than a refusal.
+    expected_output: ExpectedOutput | None
     # increment 8: the allocation policy governing the SOURCE-grain → OUTPUT-grain rollup
     # (joint accounts, facility→obligor). "" = grains coincide or the rollup is a plain
     # per-entity aggregation needing no allocation. Identity-bearing.

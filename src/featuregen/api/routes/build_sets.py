@@ -1,0 +1,411 @@
+"""§0.10 step 3 — the user-reachable surface for declaring a build set and asking to build it.
+
+**The hole this closes.** `record_build_set` and `request_generation` are library functions with no
+caller anywhere in `src/`, and `generation_lane` consumes a queue nothing produces onto. A person
+could not ask for a build; every test that exercised the store constructed its rows itself. These
+are the three endpoints that make a build something a person can start and watch.
+
+**A ROUTE MUST NOT RUN THE CHAIN**, which is `materialization_runs.py`'s rule and holds identically
+here: `get_conn` holds ONE connection and ONE transaction open for the whole request, and a
+generation restores, admits, compiles, renders and seals. So these are PRODUCERS and READERS — they
+record, they enqueue, they read back. The generation itself happens in the worker, where the lane
+owns its own claim, its own lease and its own fence.
+
+**The request and its work item commit TOGETHER.** `request_generation` and `enqueue_generation` run
+in the same route transaction, deliberately: a request with no queue row is work nobody will ever
+pick up, and a queue row naming a rolled-back request is a job that can only fail. There is no
+outbox hop between them because there is no boundary for one to bridge.
+
+**`202`, not `201`.** A generation request is ACCEPTED, not completed — the artifact does not exist
+when this returns, and a `201` would say a thing was created that a caller could then fetch.
+
+**404 for a flag-off deployment**, byte-for-byte Starlette's own body, exactly as the sibling
+routes do: a `503` says "this exists and is unwell"; the flag says this deployment does not run V2
+generation at all.
+
+▲ **WHAT THIS SURFACE CANNOT YET CARRY, stated rather than defaulted.** `GenerationJobV2` freezes
+five declarations a generation cannot derive: the POPULATION (`spine_declaration`), the CADENCE, the
+AVAILABILITY PROMISE, the OPERAND FACTS, and the POLICY REALIZATION IDS. This body carries none of
+them, so a build requested here queues with all five absent and the lane refuses it at the
+population stage — by name, with the reason, and having recorded nothing.
+
+That refusal is the correct behaviour and it is not the finished behaviour. The alternative was to
+invent values, and every one of them decides a published number: a defaulted spine picks whose rows
+the features are computed for, a defaulted promise decides which day's data is considered available,
+and defaulted operand facts let a monetary sum cross currencies. A route that filled them in would
+be choosing what gets published on behalf of whoever clicked the button.
+
+The reason they are not here yet is a DESIGN question, not an omission of typing: a population is
+declared once per build set rather than per attempt, and `build_set_revision.declaration_json`
+already holds an untyped payload that is the natural home for it. Giving that payload a type is the
+next task on this surface, and until it lands the API can declare a set, queue an attempt, and
+report a truthful refusal — which is the whole of what it claims to do.
+"""
+from __future__ import annotations
+
+from typing import Annotated, Any
+
+import psycopg
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+from featuregen.aggregates.ids import mint_id
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    require_feature_generate,
+    require_feature_read,
+)
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.materialize.build_set_declaration import decode_declaration
+from featuregen.materialize.generation_authorization import (
+    authorization_grantee,
+    load_generation_authorization,
+)
+from featuregen.materialize.generation_lane import (
+    authorize_and_decide_generation,
+    GenerationJobV2,
+    enqueue_generation,
+    generation_enabled,
+)
+from featuregen.overlay.upload.build_set_store import (
+    read_build_set,
+    read_request,
+    record_build_set,
+    request_generation,
+)
+from featuregen.runs.pin import PRE_PIN_REASON_CODE, pin_exists
+from featuregen.runtime.observability import counters, log
+from featuregen.runtime.queue import QueueIdempotencyConflict
+
+
+def require_generation_enabled() -> None:
+    """The deployment's switch, consulted BEFORE anything else on every route here.
+
+    The same function object the worker stage calls, over the same truthy set — a route that
+    re-implemented the check would 404 for a deployment whose worker was happily draining.
+
+    ▲ And the same function object `runs.projection._generate_preview_stage` calls, for the same
+    reason in the other direction: the rail marks `GENERATE_PREVIEW` UNAVAILABLE
+    (`GENERATION_DISABLED`) exactly when this dependency would 404 it. One switch, three readers.
+    """
+    if not generation_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+router = APIRouter(dependencies=[Depends(require_generation_enabled)])
+_Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
+_Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
+
+
+def _refuse_pre_pin(conn: psycopg.Connection) -> None:
+    """Spec §7 [R3.1]: while the 1101 binding table is absent, every build set written closes the
+    zero-row NOT NULL branch — so declaration is withheld, server-side.
+
+    **Self-retiring by design.** There is no flag and nothing to remember to remove: the moment
+    migration 1101 applies, `to_regclass` returns the relation and this refusal disappears with zero
+    code change. It is a guard whose whole purpose is to stop being reachable.
+
+    Called FIRST in both producers, ahead of every validation and lookup, because the thing being
+    protected is the WRITE and a guard placed after one has already done the damage.
+
+    ▲ Same fact AND the same code string as the run rail's `GENERATE_PREVIEW` entry — the one it
+    reports once its own switch check has passed, since a switched-off deployment has no entrance to
+    describe. The sharing is now MECHANICAL rather than remembered: both the probe and the string
+    come from `runs.pin`, so the two cannot drift apart. The rail tells a person the entrance is
+    shut; this is the entrance shutting. What is NOT shared is this refusal — the 409 and its
+    operator sentence are built here, because the rail's audience is a person watching a run and
+    this one's is a caller who just tried to write.
+    """
+    if not pin_exists(conn):
+        raise HTTPException(status_code=409, detail={
+            "code": PRE_PIN_REASON_CODE,
+            "message": "build-set declaration is withheld until the selection→formula binding "
+                       "(migration 1101) exists — a build set written before the pin would force "
+                       "a nullable column and a backfill of exactly the rows the pin constrains",
+        })
+
+
+def _now(conn: psycopg.Connection) -> str:
+    """The DATABASE's clock, not this process's. Two API replicas with drifting clocks would
+    otherwise stamp one lifecycle with times that go backwards."""
+    return conn.execute("SELECT now()").fetchone()[0].isoformat()
+
+
+class BuildSetIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_reading_revision_id: str = Field(min_length=1)
+    #: ORDERED. The order a person picked features in is a fact about the build — it decides the
+    #: published table's column order — so this is a list and never a set.
+    #:
+    #: ▲ BINDINGS, NOT SELECTIONS. A member names the selection AND the exact formula it will be
+    #: built from (migration 1101). Naming only the selection left the formula to be resolved at
+    #: build time as "the newest draft", so a re-author between the decision and the build changed
+    #: what the build meant while its identity stayed put.
+    selection_formula_binding_ids: list[str] = Field(min_length=1)
+    #: THE FIVE DECLARATIONS a generation cannot derive, in the shape
+    #: `build_set_declaration.decode_declaration` reads. Required, and not defaulted: each decides a
+    #: published number, and a route that filled them in would be choosing what gets published on
+    #: behalf of whoever clicked the button. Declared once per SET because two attempts at one build
+    #: must compute the same rows for the same population.
+    declaration: dict[str, Any]
+
+
+class GenerationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    build_set_revision_id: str = Field(min_length=1)
+    generation_authorization_revision_id: str = Field(min_length=1)
+    physical_type_policy: str = Field(min_length=1)
+    #: Per feature, and possibly `null` — "had no rows" and "summed to zero" are different published
+    #: answers, so there is no default and `compile_generation_v2` refuses a mapping that does not
+    #: describe exactly the members being built.
+    empty_values: dict[str, str | None]
+    engine_id: str = Field(min_length=1)
+    roles: list[str] = Field(default_factory=list)
+
+
+# ── declare ──────────────────────────────────────────────────────────────────────────────────────
+@router.post("/build-sets", status_code=201,
+             dependencies=[Depends(require_feature_generate)])
+def declare_build_set(
+    body: BuildSetIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """Record a build set — *"build these features, together, against this target"*.
+
+    `201` here and `202` on the generation below, and the difference is real: a build set IS created
+    by this call and a caller can fetch it back. Nothing is queued.
+
+    **Idempotent on CONTENT.** Declaring the same members against the same target twice returns the
+    existing set with `created: false`, because minting a second identical set would split its
+    attempts across two roots and make "how did this build go" a question with two answers.
+    """
+    _refuse_pre_pin(conn)
+    try:
+        try:
+            declaration = decode_declaration(body.declaration)
+        except (ValueError, TypeError) as exc:
+            # 422 rather than 500: the body is the thing that is wrong, and naming which part of it
+            # is the difference between a caller fixing their request and guessing at it.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        revision_id, created = record_build_set(
+            conn,
+            revision_id=mint_id("bs"),
+            target_reading_revision_id=body.target_reading_revision_id,
+            selection_formula_binding_ids=body.selection_formula_binding_ids,
+            declaration=declaration,
+            declared_by=identity.subject,
+            declared_at=_now(conn))
+    except ValueError as exc:
+        # 422: an empty set, or one naming a feature twice. Both are caller errors whose message
+        # names exactly what is wrong, and neither is a governed verdict about any feature.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # ▲ READ BACK OUT OF THE SET, not echoed from the request — BOTH lists. The request names pins
+    # and the selections are RESOLVED from them, so echoing would report what the caller sent rather
+    # than what was recorded. That matters most on the idempotent path, where `revision_id` is an
+    # EXISTING set: the body happens to match it today because both are inside the identity, and a
+    # response that depends on that coincidence is one identity change away from lying.
+    recorded = read_build_set(conn, revision_id)
+    counters.incr("featuregen.build_set.declared")
+    log("featuregen.build_set.declared", revision_id=revision_id, created=created,
+        members=len(recorded.selection_formula_binding_ids))
+    return {
+        "build_set_revision_id": revision_id,
+        "created": created,
+        "selection_revision_ids": list(recorded.selection_revision_ids),
+        "selection_formula_binding_ids": list(recorded.selection_formula_binding_ids),
+        "detail": ("the build set was recorded" if created else
+                   "this exact build was already declared; its attempts belong to that set"),
+    }
+
+
+# ── ask to build ─────────────────────────────────────────────────────────────────────────────────
+@router.post("/build-sets/generations", status_code=202,
+             dependencies=[Depends(require_feature_generate)])
+def request_build(
+    body: GenerationIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """Start an attempt at a build set, or return the LIVE one.
+
+    **The double-click answer is `created: false`, not a second compile.** Idempotency is on the
+    WORK — the build set and the environment — rather than on a caller-supplied key, because a
+    client minting a fresh key per click would defeat a key-based guard and a generation costs real
+    compute. A retry after a FAILURE is still allowed: the guard protects against double-clicks, not
+    against recovery.
+
+    **The environment is read off the AUTHORIZATION, never taken from the body.** An authorization
+    names what a generation is authorized FOR, environment included; letting a caller supply a
+    second one would let a build authorized for one cluster be requested against another, and the
+    composite foreign key would then refuse the write with a message about keys rather than about
+    permission.
+    """
+    _refuse_pre_pin(conn)
+    authorization = load_generation_authorization(
+        conn, body.generation_authorization_revision_id)
+    if authorization is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no generation authorization {body.generation_authorization_revision_id!r}: "
+                   f"a build is requested against an approval, and there is no such approval")
+    if authorization.build_set_revision_id != body.build_set_revision_id:
+        # 409 rather than 422: both halves exist and are individually valid, and what is wrong is
+        # the RELATION between them. An approval for a different set does not permit this build.
+        raise HTTPException(
+            status_code=409,
+            detail=f"authorization {body.generation_authorization_revision_id} approves build set "
+                   f"{authorization.build_set_revision_id!r}, not "
+                   f"{body.build_set_revision_id!r}: an approval permits a specific build")
+
+    # ▲ AN AUTHORIZATION IS PRESENTED, NOT MERELY REFERENCED. The check above proves the approval
+    # covers this BUILD SET; it says nothing about who may SPEND it. Without this, any caller
+    # holding `feature:generate` could name somebody else's approval and build under it — and the
+    # route would record them as `requested_by` while consuming an approval nobody agreed they
+    # could use. The audit would then read as though that were intended.
+    #
+    # ▲ THIS IS THE DEVELOPMENT POLICY, NOT A SEGREGATION-OF-DUTIES RULE (owner, 2026-08-22).
+    # The policy is "any authenticated development user may trigger any implemented NON-PRODUCTION
+    # stage, and the server records who". No approver, grantee, delegation or environment
+    # entitlement — those are premature while the tool is being built.
+    #
+    # What this check IS, is the safeguard that survives that simplification: *a client may not
+    # supply an authorization belonging to somebody else.* Permission is broad and SERVER-OWNED;
+    # it is never inferred from something the caller handed us. The distinction matters because the
+    # permissive half is temporary and the "server owns it" half is the production path.
+    #
+    # ▲ The fuller form of the same safeguard removes the choice entirely: the server RESOLVES or
+    # CREATES the authorization from the run and the current user, and
+    # `generation_authorization_revision_id` stops being a request field. This equality is the
+    # interim, and it is deliberately the strict direction — a request naming somebody else's
+    # approval is refused rather than silently re-pointed, so nothing depends on the leniency.
+    grantee = authorization_grantee(conn, body.generation_authorization_revision_id)
+    if grantee != identity.subject:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "ACTION_AUTHORIZATION_NOT_HELD",
+                "detail": f"generation authorization "
+                          f"{body.generation_authorization_revision_id} was granted to "
+                          f"{grantee!r}, and an approval is spent by the person it was granted to",
+                "next_step": "request the build under your own approval, or have the approval "
+                             "re-issued to you",
+            })
+
+    build_set = read_build_set(conn, body.build_set_revision_id)
+    if build_set is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no build set {body.build_set_revision_id!r}: its membership is what would be "
+                   f"built, so there is nothing to build")
+
+    try:
+        declaration = decode_declaration(build_set.declaration)
+    except (ValueError, TypeError) as exc:
+        # The set was declared under an encoding this build cannot read WHOLE. Refusing beats
+        # generating from the half it understands — that is how a build silently computes the wrong
+        # population.
+        raise HTTPException(
+            status_code=409,
+            detail=f"build set {body.build_set_revision_id!r} cannot be read by this build: "
+                   f"{exc}") from exc
+
+    # ▲ THE REQUEST-TIME DECISION (§8.2), recorded so the worker's second look has something to
+    # compare against. Server-owned end to end: the authorization is minted from the authenticated
+    # identity and the decision's pins are read from the recorded build set — nothing here comes
+    # from the request body. The OLD generation_authorization stays authoritative for 1095's chain
+    # until 1100b's contract migration; this is the NEW model's expand half running beside it.
+    decision_id, decision = authorize_and_decide_generation(
+        conn,
+        build_set_revision_id=body.build_set_revision_id,
+        build_set_content_hash=build_set.content_hash,
+        generation_authorization_revision_id=body.generation_authorization_revision_id,
+        environment_id=authorization.environment_id,
+        actor_subject=identity.subject,
+        member_names=tuple(build_set.selection_revision_ids))
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": "ACTION_REFUSED",
+            "blockers": list(decision.blockers),
+            "detail": "the generation decision refused; nothing was queued"})
+
+    request_id, created = request_generation(
+        conn,
+        request_id=mint_id("gen"),
+        build_set_revision_id=body.build_set_revision_id,
+        environment_id=authorization.environment_id,
+        requested_by=identity.subject,
+        requested_at=_now(conn),
+        generation_authorization_revision_id=body.generation_authorization_revision_id,
+        action_decision_revision_id=decision_id)
+
+    if created:
+        # SAME TRANSACTION as the request above. See the module docstring: a request with no queue
+        # row is work nobody will ever pick up.
+        now = _now(conn)
+        try:
+            enqueue_generation(
+                conn,
+                job=GenerationJobV2(
+                    request_id=request_id,
+                    # FROM THE BUILD SET, never from this request and never invented. Each decides
+                    # a published number, and they live on the SET because two attempts at one
+                    # build must compute the same rows for the same population.
+                    spine_declaration=declaration.spine_declaration,
+                    cadence=declaration.cadence,
+                    availability_promise=declaration.availability_promise,
+                    physical_type_policy=body.physical_type_policy,
+                    empty_values=dict(body.empty_values),
+                    operand_facts=dict(declaration.operand_facts),
+                    policy_realization_ids=dict(declaration.policy_realization_ids),
+                    engine_id=body.engine_id,
+                    roles=tuple(body.roles),
+                    compiled_at=now,
+                    sealed_at=now,
+                    action_decision_revision_id=decision_id),
+                environment_id=authorization.environment_id,
+                logical_group_name=authorization.logical_group_name)
+        except QueueIdempotencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    counters.incr("featuregen.generation.requested")
+    log("featuregen.generation.requested", request_id=request_id, created=created,
+        build_set_revision_id=body.build_set_revision_id,
+        environment_id=authorization.environment_id)
+    return {
+        "request_id": request_id,
+        "created": created,
+        "environment_id": authorization.environment_id,
+        "logical_group_name": authorization.logical_group_name,
+        "detail": ("the build was queued" if created else
+                   "an attempt at this build set is already in flight in this environment"),
+    }
+
+
+# ── watch ────────────────────────────────────────────────────────────────────────────────────────
+@router.get("/build-sets/generations/{request_id}",
+            dependencies=[Depends(require_feature_read)])
+def read_generation(request_id: str, conn: _Conn) -> dict[str, Any]:
+    """One attempt as stored: where it got to, and what it produced or refused.
+
+    `stage_label` is SERVER-OWNED. A screen that mapped statuses to words itself would be a second
+    vocabulary, and the two would describe one status with two different sentences the first time
+    either changed.
+    """
+    request = read_request(conn, request_id)
+    if request is None:
+        raise HTTPException(status_code=404, detail=f"no generation request {request_id!r}")
+
+    return {
+        "request_id": request.request_id,
+        "build_set_revision_id": request.build_set_revision_id,
+        "environment_id": request.environment_id,
+        "generation_authorization_revision_id": request.generation_authorization_revision_id,
+        "status": request.status.value,
+        "stage_label": request.stage_label,
+        "sealed_artifact_id": request.sealed_artifact_id,
+        # EVERY refusal, not the fact that there were some: fixing one of four is four round trips.
+        "refusals": [dict(refusal) for refusal in request.refusals],
+        "failure_reason": request.failure_reason,
+    }

@@ -21,8 +21,10 @@ The three things a v2 run needs that the v1 seams cannot give it:
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
+
+from featuregen.formula.authoring_result_leaves import AuthorityFailure
 
 # The C1 slot→field mapping, the empty-fact projection and the fail-closed attribution come from
 # the LIVE v2 reader rather than being restated: ``authoring_v2`` is the one place that mapping
@@ -49,7 +51,6 @@ from featuregen.formula.measure_facts import (
 from featuregen.formula.operations_v2 import operation_rule
 from featuregen.formula.output_authority import ExprFacts
 from featuregen.formula.output_authority_v2 import OperandFactsV2
-from featuregen.formula.result import AuthorityFailure
 from featuregen.formula.schema import (
     DiffBody,
     RatioBody,
@@ -250,128 +251,6 @@ class FrozenRecipeReadContext:
         return facts_by_ref, tuple(failures)
 
 
-def recipe_tool_runner(
-    allowed_refs: frozenset[str],
-    *,
-    frozen_context: FrozenRecipeReadContext | None = None,
-):
-    """Return a runner that cannot search for or substitute operands outside the frozen recipe."""
-
-    def _run(conn, tool_name: str, arguments: Mapping[str, Any], *, roles=()):
-        if tool_name not in _ALLOWED_TOOLS:
-            return {"error": "tool is unavailable for frozen recipe authoring"}
-        if (
-            tool_name == "get_column_metadata"
-            and arguments.get("logical_ref") not in allowed_refs
-        ):
-            return {"error": "logical_ref is outside the frozen recipe bindings"}
-        if tool_name == "get_column_metadata" and frozen_context is not None:
-            return frozen_context.get_column_metadata(str(arguments["logical_ref"]))
-        return run_tool(conn, tool_name, arguments, roles=tuple(roles))
-
-    return _run
-
-
-def recipe_expectation_validator(expectation: Mapping[str, Any]):
-    """Build an exact validator for the current unary recipe-authoring vocabulary."""
-    expressions = expectation.get("expressions")
-    expected_expression = (
-        expressions[0]
-        if isinstance(expressions, list) and len(expressions) == 1
-        else None
-    )
-
-    def _validate(proposal: TypedFormulaProposalV1) -> tuple[str, ...]:
-        violations: list[str] = []
-        if expectation.get("final_operation") != "identity" or not isinstance(
-            proposal.body, UnaryBody
-        ):
-            return ("FINAL_OPERATION_NOT_PRESERVED",)
-        if not isinstance(expected_expression, Mapping):
-            return ("EXPECTATION_SHAPE_INVALID",)
-        expression = proposal.body.expr
-        checks = {
-            "AGGREGATION_NOT_PRESERVED": (
-                expression.aggregation.value,
-                expected_expression.get("aggregation"),
-            ),
-            "OPERAND_NOT_PRESERVED": (
-                expression.operand,
-                expected_expression.get("operand_ref"),
-            ),
-            "SOURCE_RELATION_NOT_PRESERVED": (
-                expression.source_relation.table_ref,
-                expected_expression.get("source_relation_ref"),
-            ),
-            "EVENT_TIME_NOT_PRESERVED": (
-                expression.window.event_time_ref,
-                expected_expression.get("event_time_ref"),
-            ),
-            "WINDOW_LENGTH_NOT_PRESERVED": (
-                expression.window.length,
-                expected_expression.get("window_length"),
-            ),
-            "GRAIN_ENTITY_NOT_PRESERVED": (
-                proposal.grain.entity,
-                expectation.get("grain_entity"),
-            ),
-            "GRAIN_KEYS_NOT_PRESERVED": (
-                list(proposal.grain.keys),
-                expectation.get("grain_key_refs"),
-            ),
-            "DECIMAL_POLICY_NOT_PRESERVED": (
-                {
-                    "precision": proposal.decimal.precision,
-                    "scale": proposal.decimal.scale,
-                    "rounding": proposal.decimal.rounding.value,
-                    "overflow": proposal.decimal.overflow.value,
-                },
-                expectation.get("decimal"),
-            ),
-        }
-        for code, (actual, expected) in checks.items():
-            if actual != expected:
-                violations.append(code)
-
-        expected_window = expected_expression.get("window")
-        if not isinstance(expected_window, Mapping):
-            violations.append("WINDOW_POLICY_EXPECTATION_INVALID")
-        else:
-            actual_window = asdict(expression.window)
-            actual_window.pop("event_time_ref")
-            actual_window.pop("length")
-            actual_window = {
-                key: value.value if hasattr(value, "value") else value
-                for key, value in actual_window.items()
-            }
-            expected_policy = {
-                key: expected_window[key]
-                for key in (
-                    "basis",
-                    "unit",
-                    "start_inclusive",
-                    "end_inclusive",
-                    "timezone",
-                    "empty_window",
-                    "null_input",
-                )
-            }
-            if actual_window != expected_policy:
-                violations.append("WINDOW_POLICY_NOT_PRESERVED")
-        if expression.filter is not None:
-            violations.append("UNAUTHORED_FILTER")
-        if proposal.parameters:
-            violations.append("UNAUTHORED_PARAMETERS")
-        return tuple(violations)
-
-    return _validate
-
-
-# ── the v2 siblings ──────────────────────────────────────────────────────────────────────────────
-
-#: The window keys a v2 expectation POLICY carries beside its event-time ref and its length — the
-#: nine v1 ones plus ``offset_periods``. Read off ``WindowPolicyExpectationV2``'s own field names by
-#: the comparison below, never re-listed as literals here.
 _WINDOW_POLICY_KEYS_V2: tuple[str, ...] = (
     "basis", "unit", "start_inclusive", "end_inclusive", "timezone",
     "empty_window", "null_input", "offset_periods",
@@ -400,7 +279,7 @@ def recipe_tool_runner_v2(
     """
     from featuregen.formula.capability_v2 import classify_formula_capability_v2
     from featuregen.formula.parse_v2 import parse_proposal_v2
-    from featuregen.formula.schema import SchemaError
+    from featuregen.formula.schema_leaves import SchemaError
 
     def _list_supported_operations_v2() -> dict:
         return {

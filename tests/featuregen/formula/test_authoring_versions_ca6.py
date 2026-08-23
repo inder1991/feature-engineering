@@ -46,11 +46,37 @@ _MODULE = "featuregen.formula.replay_authoring_v2"
 
 
 # ══ the constants moved, and are asserted ════════════════════════════════════════════════════════
-def test_the_three_constants_are_at_VERSION_2():
-    """C-A6's gate: "version constants moved and asserted"."""
-    assert DISPOSITION_POLICY_VERSION_V2 == 2
+def test_the_constants_state_WHICH_POLICY_decided_a_run():
+    """C-A6's gate — "version constants moved and asserted" — restated for the second move.
+
+    ▲ THE THREE NO LONGER MOVE TOGETHER, and that is the point rather than an oversight. C-A6
+    bumped all three at once because one change touched all three. Adding
+    READY_FOR_OUTPUT_BINDING touched exactly two:
+
+      * the DISPOSITION policy gained a member, so its version moved;
+      * the REPLAY orchestrator now records `deferred_to_compiler` where it recorded
+        `needs_authority`, so its version moved;
+      * the NON-REPLAY orchestrator did not change, and is pinned at 2 to say so. It cannot author
+        a V3 run at all — `authoring_v2._parse_v2` refuses anything that is not a
+        `TypedFormulaProposalV2` as `invalid_formula`, and V3 is not a subclass of V2 — so bumping
+        it would claim a change nobody made, which is the same lie as failing to bump one that did.
+    """
+    assert DISPOSITION_POLICY_VERSION_V2 == 3
+    assert AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY == 3
     assert AUTHORING_ORCHESTRATOR_VERSION_V2 == 2
-    assert AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY == 2
+
+
+def test_the_NON_REPLAY_orchestrator_genuinely_cannot_author_V3():
+    """The evidence for pinning it at 2, asserted rather than asserted-about."""
+    from tests.featuregen.materialize.test_pilot_v2 import _raw_v3
+
+    from featuregen.formula.authoring_v2 import _parse_v2
+    from featuregen.formula.schema_v2 import TypedFormulaProposalV2
+    from featuregen.formula.schema_v3 import TypedFormulaProposalV3
+
+    assert not issubclass(TypedFormulaProposalV3, TypedFormulaProposalV2)
+    status, parsed = _parse_v2(_raw_v3())
+    assert (status, parsed) == ("invalid_formula", None)
 
 
 # ══ classification ═══════════════════════════════════════════════════════════════════════════════
@@ -243,7 +269,7 @@ def test_A_CHANGED_INTENT_STILL_REFUSES_ON_THE_LEGACY_PATH(db, monkeypatch):
         run_authoring_v2_replay(
             db, other, None, None, actor=None, authoring_run_id=run_id,
             facts_reader=_monetary_facts, tool_runner=run_tool,
-            critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref})
+            critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref}, formula_schema_version=2)
 
 
 # ══ acceptance #8 — a V3 run records schema 3 ════════════════════════════════════════════════════
@@ -296,3 +322,73 @@ def test_REVIEW_BYPASSED_is_an_ALTERNATIVE_to_the_critic_stage_not_a_successor()
     assert '"REVIEW_BYPASSED": lambda value: value == "EXPECTATION_VALIDATED"' in table
     assert '"OUTPUT_POLICY_RESOLVED": lambda value: value in {' in table
     assert '"CRITIC_COMPLETED", "REVIEW_BYPASSED"' in table
+
+
+# ══ what the SECOND bump does to runs already in the database ══════════════════════════════════
+def test_a_PRE_BUMP_run_classifies_UNKNOWN_and_that_is_the_decision():
+    """▲ THE REGENERATION DECISION, asserted rather than assumed.
+
+    `legacy_bundle_v1` recognises exactly ONE earlier generation — the pre-C-A6 one. A run written
+    by the software immediately before READY_FOR_OUTPUT_BINDING (orchestrator 2, disposition 2)
+    matches neither that nor the current bundle, so it classifies UNKNOWN and
+    `run_authoring_v2_replay` refuses it with `RecoveryRequiresReconciliation`.
+
+    ▲ WHAT THIS DOES **NOT** BREAK, because the difference decides whether anything must be
+    regenerated. Restoring a TERMINAL trace is unaffected: `restore_formula_v3._restore_result`
+    reads the manifest and passes that same bundle back into `load_verified_checkpoint`, so the
+    identity compare is stored-against-stored and cannot fail on a bump. Materialization of
+    already-authored formulas keeps working. What the bump stops is RESUMING an incomplete run,
+    which builds its bundle from live constants — and stopping that is the intended behaviour, not
+    a cost: resuming would append new-policy events under a manifest naming the old one.
+
+    So the trade is smaller than a second legacy adapter would suggest, and this is where the
+    decision is written down if it ever stops being right.
+    """
+    from featuregen.formula.authoring_versions import BundleClassV2, classify_version_bundle
+
+    # Built from the REAL constants, not this file's synthetic `_current()` — the claim is about
+    # what happens to bytes written by the shipped software one commit ago.
+    real_current = {
+        "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
+        "formula_schema": 3, "operation_grammar": 1, "critic": 1,
+        "disposition": DISPOSITION_POLICY_VERSION_V2,
+        "authoring_v2": AUTHORING_ORCHESTRATOR_VERSION_V2,
+        "frozen_configuration_policy": None, "canonicalization": 1, "output_policy": 1,
+    }
+    pre_bump = {**real_current, "orchestrator": 2, "disposition": 2}
+
+    assert classify_version_bundle(real_current, current=real_current) is BundleClassV2.CURRENT
+    assert classify_version_bundle(pre_bump, current=real_current) is BundleClassV2.UNKNOWN
+
+
+def test_the_CURRENT_bundle_carries_the_two_axes_that_were_missing():
+    """`canonicalization` and `output_policy` are CLASSIFIED, not merely written. A key the
+    classifier does not compare is a key a run may differ on while still reading as CURRENT."""
+    from featuregen.formula.authoring_versions import VERSION_KEYS
+
+    assert "canonicalization" in VERSION_KEYS
+    assert "output_policy" in VERSION_KEYS
+
+
+def test_a_RUN_RECORDS_ITS_CANONICALIZATION_AND_OUTPUT_POLICY(db, monkeypatch):
+    """The production manifest, read back from the database. Both axes were reachable only through
+    a frozen configuration the production draft worker does not supply, so for every run this
+    platform actually authors, neither was recorded anywhere."""
+    from tests.featuregen.materialize.test_pilot_v2 import _raw_v3
+    from tests.featuregen.materialize.test_production_chain_v2 import (
+        _author_run,
+        _considered,
+    )
+
+    _considered(db)
+    _author_run(db, monkeypatch, run_id="far-versions", raw=_raw_v3())
+
+    stored = db.execute(
+        "SELECT versions FROM formula_authoring_run WHERE authoring_run_id = %s",
+        ("far-versions",)).fetchone()[0]
+
+    assert stored["formula_schema"] == 3
+    assert stored["canonicalization"] == 1, "the v3 canonicalization lineage, recorded"
+    assert stored["output_policy"] == 1
+    assert stored["disposition"] == 3
+    assert stored["orchestrator"] == 3

@@ -29,10 +29,8 @@ from tests.featuregen.formula.authoring_fixtures import (
 from featuregen.formula import replay_authoring
 from featuregen.formula.author import AUTHOR_TASK, run_tool
 from featuregen.formula.critic import CRITIC_TASK
-from featuregen.formula.frozen_configuration import (
-    freeze_current_configuration,
-    freeze_current_configuration_v2,
-)
+from featuregen.formula.frozen_configuration import freeze_current_configuration_v2
+from featuregen.formula.frozen_configuration_v1 import freeze_current_configuration
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2, OperandFactsV2
 from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
 from featuregen.formula.replay_trace import run_status
@@ -107,6 +105,10 @@ def _run(db, *, raw: dict | None = None, client: FakeLLM | None = None, run_id: 
     # kwarg entirely; the seam now refuses omission, so the tool set a test runs against is written
     # down. Behaviour is unchanged — what changed is that it is visible.
     kwargs.setdefault("tool_runner", run_tool)
+    # STATED, not inherited, for the reason above and now for a second one: the orchestrator no
+    # longer defaults the schema, and the schema SELECTS the provider contract a run is driven
+    # under. A helper that fixed it would drive every caller's run under one grammar.
+    kwargs.setdefault("formula_schema_version", 2)
     return run_authoring_v2_replay(
         db, _INTENT, llm, llm, actor=None, authoring_run_id=run_id,
         facts_reader=facts_reader,
@@ -321,7 +323,7 @@ def test_a_broken_critic_is_technical_never_clean(db) -> None:
         CRITIC_TASK: FakeResponse(output=None)})
     result = run_authoring_v2_replay(
         db, _INTENT, llm, llm, actor=None, authoring_run_id="far_v2_critic",
-        facts_reader=_monetary_facts, tool_runner=run_tool)
+        facts_reader=_monetary_facts, tool_runner=run_tool, formula_schema_version=2)
     assert result.authoring_disposition == "TECHNICAL_FAILURE"
     assert result.candidate_output is None
 
@@ -344,7 +346,7 @@ _SETTINGS = {"provider": "fake", "model": "test"}
 
 def test_a_v2_frozen_configuration_verifies_and_never_reaches_the_provider_on_drift(
         db, monkeypatch) -> None:
-    frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS)
+    frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS, formula_schema_version=2)
     monkeypatch.setattr(
         "featuregen.formula.replay_authoring_v2.current_formula_generation_settings",
         lambda: _SETTINGS)
@@ -378,7 +380,7 @@ def test_a_v1_frozen_configuration_is_DRIFT_for_a_v2_run(db, monkeypatch) -> Non
     v1_frozen = freeze_current_configuration(
         generation_settings=_SETTINGS, author_instruction=AUTHOR_INSTRUCTION,
         author_prompt_id=AUTHOR_PROMPT_ID)
-    v2_frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS)
+    v2_frozen = freeze_current_configuration_v2(generation_settings=_SETTINGS, formula_schema_version=2)
     assert v1_frozen.configuration_hash != v2_frozen.configuration_hash
     assert v1_frozen.author.prompt_id != v2_frozen.author.prompt_id
     assert v1_frozen.author.output_schema_id != v2_frozen.author.output_schema_id

@@ -10,7 +10,7 @@ import dataclasses
 import pytest
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.materialize.bound_formula_v2 import (
     BoundFormulaRevisionV2,
     ExecutableOutputPolicyV2,

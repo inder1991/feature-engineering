@@ -129,10 +129,6 @@ ACTIVATION_BLOCKER_DISPOSITIONS: Mapping[str, tuple[BlockerDisposition, str]] = 
         BlockerDisposition.CARRIED,
         "The unit of analysis disagrees with the declared grain; the numbers would be computed per "
         "one thing and published per another"),
-    R.READINESS_NOT_MATERIALIZATION_READY: (
-        BlockerDisposition.CARRIED,
-        "The measured serving fold says this cannot be materialized; generating anyway produces an "
-        "artifact that cannot run"),
     R.SNAPSHOT_STALE_REGENERATE: (
         BlockerDisposition.CARRIED,
         "The sealed metadata snapshot no longer matches the catalog, so the facts the formula was "
@@ -148,6 +144,13 @@ ACTIVATION_BLOCKER_DISPOSITIONS: Mapping[str, tuple[BlockerDisposition, str]] = 
         "C-A9's re-pin gate exists for the same reason"),
 
     # ── DROPPED: human semantic confirmation ─────────────────────────────────────────────────────
+    R.READINESS_NOT_MATERIALIZATION_READY: (
+        BlockerDisposition.DROPPED,
+        "§6 (four-stage ruling 2026-08-22): recipe readiness is a discovery/maturity PROJECTION "
+        "and stopped authorizing executable actions. Every enforcing fact the ladder folded into "
+        "it gates by its own name — review by RECIPE_REVIEW_NOT_CURRENT, the engine by "
+        "FORMULA_SCHEMA_UNSUPPORTED, validation by EXTERNAL_VALIDATION_OUTSTANDING's own action — "
+        "so dropping the summary loses nothing that refuses"),
     R.PROPOSED_METADATA_ONLY: (
         BlockerDisposition.DROPPED,
         "Human semantic confirmation of column meaning. A governed V2 formula stands on a reviewed "
@@ -162,6 +165,17 @@ ACTIVATION_BLOCKER_DISPOSITIONS: Mapping[str, tuple[BlockerDisposition, str]] = 
         "Per-FORMULA human review. C-A5's deterministic path authors from an already-reviewed "
         "blueprint and records `REVIEW_BYPASSED` rather than claiming a critic ran — the review "
         "moved upstream to the recipe, it did not disappear"),
+    R.FORMULA_REVIEW_UNMEASURED: (
+        BlockerDisposition.DROPPED,
+        "§6: the honest half of what FORMULA_SCHEMA_UNSUPPORTED falsely claimed — engine support "
+        "unmeasured BECAUSE unreviewed. Review is not this chain's gate (see FORMULA_NOT_REVIEWED "
+        "directly above), and the governance fact rides that code, not this one"),
+    R.ENGINE_CAPABILITY_UNMEASURED: (
+        BlockerDisposition.DROPPED,
+        "§6: a serving-time engine projection that did not run. The chain measures the engine "
+        "ITSELF at generate (RENDERER_CANNOT_DISPATCH is evaluator-only and CARRIED); the "
+        "fail-closed weight of an unmeasured projection sits on the production acts in "
+        "action_dispositions, which this chain never performs"),
     R.EXTERNAL_VALIDATION_OUTSTANDING: (
         BlockerDisposition.DROPPED,
         "Partner-facing external attestation, which gates a DIFFERENT action (Delivery I) and is "

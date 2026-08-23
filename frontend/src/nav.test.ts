@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useHashRoute } from './nav'
+import { parseHash, useHashRoute } from './nav'
 
 beforeEach(() => {
   window.location.hash = ''
@@ -110,6 +110,46 @@ describe('useHashRoute', () => {
     expect(result.current.route).toBe('search')
     expect(result.current.params.getAll('source')).toEqual(['deposits', 'cards'])
     expect(result.current.params.get('q')).toBe('balance')
+  })
+})
+
+// The runs route is the ONE path-param route: '#/runs' is the list, '#/runs/<id>' the detail.
+// It is unflagged — GET /feature-runs is always-on, like the asset route's reads.
+describe('the runs route', () => {
+  it('parses #/runs as the runs list', () => {
+    expect(parseHash('#/runs').route).toBe('runs')
+  })
+
+  it('parses #/runs/grun_x as detail with run_id param', () => {
+    const { route, params } = parseHash('#/runs/grun_x')
+    expect(route).toBe('runs')
+    expect(params.get('run_id')).toBe('grun_x')
+  })
+
+  it('leaves the list with no run_id, so the list and the detail never collide', () => {
+    expect(parseHash('#/runs').params.get('run_id')).toBeNull()
+  })
+
+  it('percent-decodes the id and keeps any query params alongside it', () => {
+    const { route, params } = parseHash('#/runs/fgr%2Fa.b?tab=evidence')
+    expect(route).toBe('runs')
+    expect(params.get('run_id')).toBe('fgr/a.b')
+    expect(params.get('tab')).toBe('evidence')
+  })
+
+  it('survives a malformed escape instead of crashing the render', () => {
+    // decodeURIComponent throws on '%zz'; parseHash runs inside a render, so a corrupt link must
+    // degrade to a 404-able id, never to a blank app.
+    const { route, params } = parseHash('#/runs/grun_%zz')
+    expect(route).toBe('runs')
+    expect(params.get('run_id')).toBe('grun_%zz')
+  })
+
+  it('resolves #/runs through the hash hook too', () => {
+    window.location.hash = '#/runs/grun_7'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('runs')
+    expect(result.current.params.get('run_id')).toBe('grun_7')
   })
 })
 

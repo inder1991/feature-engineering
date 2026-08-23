@@ -338,7 +338,7 @@ FRAUD_RECIPES: tuple[RecipeDefinitionV2, ...] = (
             included="posted card transactions carrying an MCC",
             excluded="reversed and technical events",
             policy_refs=(FRAUD_ELIGIBLE,)),
-        formula=FormulaReferenceV2(formula_schema_version="formula-v1",
+        formula=FormulaReferenceV2(formula_schema_version="formula-v2",
                                    expectation_ref="merchant_mcc_diversity",
                                    result_class="distinct_count"),
         replaces_legacy_ids=("merchant_mcc_diversity",)),

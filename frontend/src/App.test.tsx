@@ -15,6 +15,19 @@ vi.mock('./api', async importOriginal => {
     getTableSuggestionsV4: vi.fn(),
   }
 })
+// The two runs surfaces are mocked to markers so the wiring test asserts WHICH screen App chose
+// for a given hash, not what that screen renders — Tasks 12-13 replace both bodies, and a test
+// that pinned their copy would fail for the wrong reason. The prop each marker echoes is the one
+// App must pass through.
+vi.mock('./screens/RunsScreen', () => ({
+  RunsScreen: ({ navigate }: { navigate: unknown }) => (
+    <p>runs-list-screen navigate:{typeof navigate}</p>
+  ),
+}))
+vi.mock('./screens/RunDetailScreen', () => ({
+  RunDetailScreen: ({ runId }: { runId: string }) => <p>run-detail-screen for {runId}</p>,
+}))
+
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
 const listIntegrations = vi.mocked(api.listIntegrations)
@@ -49,14 +62,15 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders twelve nav items in order (Recipe reviews after Governance) and lands on Overview by default', () => {
+  it('renders thirteen nav items in order (Runs after Registry) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
-      'Generate features',
+      'Discover candidates',
       'Ask a question',
       'Registry',
+      'Runs',
       'Search',
       'Ingest',
       'Integrations',
@@ -69,14 +83,14 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'The loop' })).toBeInTheDocument()
     expect(
-      screen.getByText(/once data is in, generate features is where the engine works for you/i),
+      screen.getByText(/once data is in, discover candidates is where the engine works for you/i),
     ).toBeInTheDocument()
   })
 
   it('nav click navigates and updates location.hash', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Generate features' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Discover candidates' }))
     expect(window.location.hash).toBe('#/workbench')
     expect(
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),
@@ -133,6 +147,42 @@ describe('app shell', () => {
     expect(getTableSuggestions).toHaveBeenCalledWith('core_banking', 'public.comp_fin_tran')
   })
 
+  it('routes #/runs to the run list and #/runs/<id> to that run, one rail item for both', () => {
+    window.location.hash = '#/runs'
+    render(<App />)
+    expect(screen.getByText('CATALOG · RUNS')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Feature runs' })).toBeInTheDocument()
+    expect(screen.getByText(/runs-list-screen navigate:function/)).toBeInTheDocument()
+    expect(screen.queryByText(/run-detail-screen/)).not.toBeInTheDocument()
+
+    // The id rides the PATH, not the query string, and the rail item stays current for the
+    // detail: one destination, two surfaces.
+    arriveAt('#/runs/grun_x')
+    expect(screen.getByText('run-detail-screen for grun_x')).toBeInTheDocument()
+    expect(screen.queryByText(/runs-list-screen/)).not.toBeInTheDocument()
+    const nav = within(screen.getByRole('navigation'))
+    expect(nav.getByRole('button', { name: 'Runs' })).toHaveAttribute('aria-current', 'page')
+    // The detail opens with its own hero (name, id, owner), so the page head drops to the
+    // breadcrumb: the list's title and description would restate one run's record at lower
+    // quality, and its copy ("Every feature-generation workflow…") describes the wrong surface.
+    expect(screen.getByText('CATALOG · RUNS')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Feature runs' })).not.toBeInTheDocument()
+
+    // An empty id is the LIST — '#/runs/' parses to run_id='', and a detail sheet pointed at
+    // nothing would ask the server for a run whose id is the empty string.
+    arriveAt('#/runs/')
+    expect(screen.getByText(/runs-list-screen/)).toBeInTheDocument()
+    expect(screen.queryByText(/run-detail-screen/)).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Feature runs' })).toBeInTheDocument()
+
+    // The query form is the same destination as the path form: navigate('runs', {run_id}) writes
+    // it, so the list's own row click has to land on the detail exactly as a shared link does.
+    arriveAt('#/runs?run_id=grun_x')
+    expect(screen.getByText('run-detail-screen for grun_x')).toBeInTheDocument()
+    expect(screen.queryByText(/runs-list-screen/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { level: 1, name: 'Feature runs' })).not.toBeInTheDocument()
+  })
+
   it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {
     render(<App />)
     await userEvent.click(screen.getByRole('button', { name: 'Go to Ingest' }))
@@ -177,9 +227,9 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Review queue' })).toBeInTheDocument()
   })
 
-  it('overview loop Generate features link navigates to the workbench route', async () => {
+  it('overview loop Discover candidates link navigates to the workbench route', async () => {
     render(<App />)
-    await userEvent.click(screen.getByRole('link', { name: 'Generate features' }))
+    await userEvent.click(screen.getByRole('link', { name: 'Discover candidates' }))
     expect(window.location.hash).toBe('#/workbench')
     expect(
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),

@@ -287,6 +287,16 @@ def test_the_dataset_story_names_an_explicit_population_from_the_declared_grain(
     assert story.cross_dataset is False
     assert R.POPULATION_DATASET_UNDECLARED not in story.codes
 
+    # ▲ AND THE GRAIN COLUMN, WHICH THIS FOLD USED TO DISCARD. `population_ref` answers "whose
+    # rows?"; authoring needs "keyed by WHICH column?" — `formula_draft_worker._frozen_facts`
+    # refuses a draft at REQUESTED, before any provider call, when `grain_refs` is empty. The ref
+    # here is the one the governed binder actually selected, not a second lookup.
+    assert story.population_key_ref == "public.transactions.acct_ref"
+
+    # It must survive into the BINDING PLAN, which is what the serving projection reads (the
+    # projection holds no connection and can only carry what the plan established).
+    assert bound.binding_plan["grain_refs"] == [[SOURCE, "public.transactions.acct_ref"]]
+
 
 def test_an_undeclared_grain_makes_the_population_named_setup_work(db):
     """Same catalog, grain flag withheld: the entity key still BINDS (meaning matched), but the
@@ -558,3 +568,35 @@ def test_a_capitalized_uoa_matches_the_lowercase_grain():
     plan, refusals = fold_frozen_binding_plan(
         request, verdicts, story, "pit", "", "bank", uoa_entity="Account")
     assert plan is None and refusals == (R.UOA_MISMATCH,)
+
+
+def test_the_GRAIN_REACHES_THE_PROJECTED_FEATURE_IDEA(db):
+    """▲ THE END OF THE CHAIN, on the real candidate rather than a hand-built one.
+
+    Two earlier tests here constructed a `DatasetStoryV1` themselves and asserted against their own
+    fixtures — they would have passed unchanged if production stopped assigning or projecting the
+    grain entirely, which is precisely the regression they were meant to catch. This drives the real
+    fold and the real projection and asserts on what authoring would actually receive.
+
+    `FeatureIdea.grain_refs` is the field `_frozen_facts` reads. Empty here means no formula is ever
+    authored for this candidate, whatever its origin.
+    """
+    from featuregen.overlay.upload.semantic_projection import _served_idea
+    from featuregen.overlay.upload.typed_gauntlet import validate_candidate
+
+    _catalog(db)
+    candidates = v2_recipe_candidates(
+        db, catalog_source=SOURCE,
+        scope=ConfirmedScope(primary=EXEMPLAR.primary_objective))
+    bound = next(c for c in candidates
+                 if c.recipe_id == EXEMPLAR.recipe_id and c.binding_state == "bound")
+
+    idea = _served_idea(
+        type("A", (), {"candidate": bound})(), validate_candidate(bound),
+        catalog_source=SOURCE)
+
+    assert idea.grain_refs == ((SOURCE, "public.transactions.acct_ref"),), (
+        "the projected idea carries no grain, so the draft worker would refuse this candidate at "
+        "REQUESTED with GRAIN_NOT_RESOLVED before any provider call")
+    # The table half must still be there too — they answer different questions.
+    assert idea.grain_table == "transactions"

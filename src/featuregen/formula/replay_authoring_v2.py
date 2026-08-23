@@ -56,7 +56,8 @@ from typing import TYPE_CHECKING, Any, cast
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.audited import current_formula_generation_settings
-from featuregen.formula.author import AUTHOR_TURN_CONTRACT_V2, author_formula
+from featuregen.formula.author import author_contract_for, author_formula
+from featuregen.formula.authoring_result_leaves import AuthoringAxes, AuthorityFailure
 from featuregen.formula.authoring_v2 import (
     AUTHORING_ORCHESTRATOR_VERSION_V2,
     OutputResolutionV2,
@@ -96,6 +97,7 @@ from featuregen.formula.frozen_configuration import (
     verify_frozen_configuration_v2,
 )
 from featuregen.formula.output_authority_v2 import (
+    OUTPUT_POLICY_VERSION_V2,
     FormulaOutputPolicyV2,
     OperandFactsV2,
     resolve_output_v2,
@@ -112,10 +114,6 @@ from featuregen.formula.replay_trace import (
     load_verified_checkpoint,
     open_authoring_run,
 )
-from featuregen.formula.result import (
-    AuthoringAxes,
-    AuthorityFailure,
-)
 from featuregen.formula.result_v2 import (
     DISPOSITION_POLICY_VERSION_V2,
     AuthoringAxesV2,
@@ -123,12 +121,16 @@ from featuregen.formula.result_v2 import (
     ReviewedBlueprintBypassV2,
     derive_disposition_v2,
 )
-from featuregen.formula.schema import AdditivityClass, SchemaError
+from featuregen.formula.schema_leaves import AdditivityClass, SchemaError
 from featuregen.formula.schema_v2 import (
+    CANONICALIZATION_VERSION_V2,
     OPERATION_GRAMMAR_VERSION_V2,
     TypedFormulaProposalV2,
 )
-from featuregen.formula.schema_v3 import TypedFormulaProposalV3
+from featuregen.formula.schema_v3 import (
+    CANONICALIZATION_VERSION_V3,
+    TypedFormulaProposalV3,
+)
 from featuregen.overlay.field_evidence import canonical_hash
 
 if TYPE_CHECKING:
@@ -144,7 +146,14 @@ __all__ = [
 #: The wiring version of THIS orchestrator (stage order, resume points, axis mapping). Its own
 #: number beside ``authoring_v2``'s: the two modules can be re-wired independently, and a frozen
 #: run's manifest must name the one that decided it.
-AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 2   # C-A6: see `authoring_versions` for the policy
+AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY = 3   # the V3 branch now records
+#   `output_status="deferred_to_compiler"` where it recorded `needs_authority`. That is a
+#   change in what this orchestrator WRITES, so it is a change in which orchestrator wrote a
+#   run — see `authoring_versions` for the policy. The non-replay `AUTHORING_ORCHESTRATOR_
+#   VERSION_V2` is deliberately NOT bumped alongside it: `authoring_v2._parse_v2` refuses
+#   anything that is not a `TypedFormulaProposalV2` as `invalid_formula`, and V3 is not a
+#   subclass of V2, so that orchestrator cannot author a V3 run and its behaviour is
+#   genuinely unchanged. Bumping it would claim a change nobody made.
 
 #: The facts reader's contract: one v2 proposal in, the ref-keyed bundle plus the governed reads
 #: that failed CLOSED out. The worker injects ``FrozenRecipeReadContext.formula_facts_v2``.
@@ -473,8 +482,9 @@ def run_authoring_v2_replay(
     critic_metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
-    formula_schema_version: int = 2,
+    formula_schema_version: int,
     reviewed_blueprint: Any | None = None,
+    spend=None,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
     resumably, under a lease, against a frozen configuration.
@@ -483,6 +493,9 @@ def run_authoring_v2_replay(
     the same call site; the types they carry are v2's.
     """
     _require_tool_runner(tool_runner)
+    # BEFORE the run is opened and before any provider call: a schema with no contract has no
+    # instruction to hold a model to and no schema to validate its answer against.
+    turn_contract = author_contract_for(formula_schema_version)
     versions: dict[str, Any] = {
         "orchestrator": AUTHORING_ORCHESTRATOR_VERSION_V2_REPLAY,
         # C-A6 — RECORDED, not hardcoded. A v3 run must not inherit `2`: the manifest would then
@@ -494,6 +507,18 @@ def run_authoring_v2_replay(
         # The non-replay v2 orchestrator's own wiring version rides along: a run must name which
         # v2 stage-mapping decided it, and the two modules move independently.
         "authoring_v2": AUTHORING_ORCHESTRATOR_VERSION_V2,
+        # ▲ THE TWO AXES THE MANIFEST WAS MISSING, and their absence was load-bearing. An evaluator
+        # asking "under exactly what did this run decide?" could not answer from the manifest: the
+        # canonicalization version decides the BYTES a proposal hashes to, and the output-policy
+        # version decides what a governed output MEANS. Both were reachable only through a frozen
+        # configuration, which the production draft worker does not supply — so for every run this
+        # platform actually authors, neither was recorded anywhere.
+        #
+        # Version-DISPATCHED, never hardcoded, for `formula_schema`'s stated reason: a v3 run must
+        # not inherit v2's canonicalization identity, and the two lineages are separate by design.
+        "canonicalization": (CANONICALIZATION_VERSION_V3 if formula_schema_version == 3
+                             else CANONICALIZATION_VERSION_V2),
+        "output_policy": OUTPUT_POLICY_VERSION_V2,
     }
     if frozen_configuration is not None:
         versions["frozen_configuration_policy"] = (
@@ -622,11 +647,18 @@ def run_authoring_v2_replay(
                 progress_callback=progress_callback,
                 lease_fence=lease_fence,
                 resume_turns=checkpoint.author_turns,
-                turn_contract=AUTHOR_TURN_CONTRACT_V2,
+                # SELECTED from the schema this run declares, never fixed. It was
+                # `AUTHOR_TURN_CONTRACT_V2` unconditionally, whose instruction says
+                # "MUST declare formula_schema_version 2" — so every run this
+                # platform opened as v3 asked its provider for v2 and got it.
+                turn_contract=turn_contract,
                 # C-A8 — ALWAYS passed, never omitted. `author_formula`'s own default is `run_tool`,
                 # the V1 tool set, so omitting this kwarg silently authored a v2 formula against v1
                 # tools. `_require_tool_runner` refuses above rather than letting that happen.
                 tool_runner=tool_runner,
+                # §11.2 — the job's approved ceiling, if the plan named one; every physical call
+                # this run makes reserves against it at the dispatch seam.
+                spend=spend,
             )
         except FormulaControlFlow:
             raise
@@ -669,6 +701,22 @@ def run_authoring_v2_replay(
         _terminal(conn, run_id, seq, "failed", result,
                   lease_fence=lease_fence, extra={"reason": str(exc)})
         return result
+    # ▲ THE RUN MUST HAVE PRODUCED WHAT IT ASKED FOR. A TECHNICAL failure, deliberately, and not
+    # `invalid_formula`: an invalid formula says the requested FEATURE is structurally or
+    # semantically wrong and a person can respond by changing the hypothesis. This says the
+    # provider or the platform returned an artifact under a different PROTOCOL — nothing about the
+    # feature is known to be wrong, and nobody can fix it from the product side. The draft becomes
+    # FAILED naming the mismatch rather than BLOCKED as though the candidate were at fault.
+    #
+    # A live provider response should normally be rejected by the turn schema long before this,
+    # since the two contracts hold a model to different shapes. This protects the paths where no
+    # response schema runs: replayed material, the deterministic producer, and imports.
+    if proposal.formula_schema_version != formula_schema_version:
+        return _technical_failure(
+            conn, run_id, seq,
+            f"FORMULA_SCHEMA_CONTRACT_MISMATCH requested_schema={formula_schema_version} "
+            f"produced_schema={proposal.formula_schema_version}",
+            lease_fence=lease_fence)
     if checkpoint.raw_proposal is None:
         append_event(
             conn,
@@ -758,6 +806,7 @@ def run_authoring_v2_replay(
                 metadata_loader=critic_metadata_loader,
                 progress_callback=progress_callback,
                 lease_fence=lease_fence,
+                spend=spend,
             )
         except FormulaControlFlow:
             raise
@@ -863,10 +912,16 @@ def run_authoring_v2_replay(
                 structural_status="ok", capability_status="ok",
                 # The output is UNRESOLVED and says so. S5 resolves it; claiming "resolved" here
                 # would assert an authority nobody consulted.
-                output_status="needs_authority", expectation_status="not_provided",
+                #
+                # ▲ `deferred_to_compiler`, not `needs_authority`. Both are unresolved, and they
+                # mean opposite things: `needs_authority` is a V1/V2 run whose governed-facts read
+                # FAILED and which a human must look at, while this is a V3 run that succeeded at
+                # everything it owns. Spelling them the same made admission unable to tell a
+                # working pipeline from a stalled one — and briefly admitted the stalled one.
+                output_status="deferred_to_compiler", expectation_status="not_provided",
                 review=bypass_for(reviewed_blueprint), technical_status="ok")
         else:
-            axes_v3 = _axes(output_status="needs_authority",
+            axes_v3 = _axes(output_status="deferred_to_compiler",
                             critic_status=_critic_status(list(findings)))
         result = derive_disposition_v2(
             axes_v3,

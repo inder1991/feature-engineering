@@ -36,9 +36,9 @@ import datetime as _datetime
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
-from featuregen.materialize.admission import hive_identifier
 from featuregen.materialize.codes import MaterializationRefused, PublicationRefusalCode
 from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_hash
+from featuregen.materialize.identifiers import hive_identifier
 
 __all__ = [
     "SANDBOX_NAMESPACE",

@@ -18,7 +18,7 @@ from featuregen.formula.output_authority_v2 import (
     resolve_output_v2,
 )
 from featuregen.formula.parse_v2 import parse_proposal_v2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 
 _GOLD_V2 = Path(__file__).parent / "gold_v2"
 
@@ -106,8 +106,8 @@ def test_materialization_admission_refuses_any_non_v1_schema_version():
                          / "01_sum_txn_amt_90d.json").read_text())["proposal"]
     proposal = parse_proposal_v1(v1_doc)
     from featuregen.formula.replay_authoring import _formula
-    from featuregen.formula.schema import AdditivityClass as A
     from featuregen.formula.schema import FormulaOutputPolicyV1
+    from featuregen.formula.schema_leaves import AdditivityClass as A
 
     output = FormulaOutputPolicyV1(output_type="decimal(38,6)", unit=None, currency=None,
                                    output_additivity=A.NON_ADDITIVE,

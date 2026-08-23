@@ -38,7 +38,7 @@ from tests.featuregen.materialize.test_ir import (
     seed_catalog,
 )
 
-from featuregen.formula.schema import OverflowBehavior, RoundingMode
+from featuregen.formula.schema_leaves import OverflowBehavior, RoundingMode
 from featuregen.materialize.admission import FeatureNamePlanError
 from featuregen.materialize.classify import CLASSIFICATION_POLICY_VERSION
 from featuregen.materialize.codes import MaterializationRefused, ValidationGateCode

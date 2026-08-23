@@ -7,14 +7,13 @@ is worse than none: it converts "I checked" into false confidence.
 from __future__ import annotations
 
 import pytest
-
-from featuregen.analysis.plan import Finding, GroundedPlan
-from featuregen.analysis.preview import preview
-from featuregen.data_agent.sql_hive import HiveDialect
-from featuregen.data_agent.sql_postgres import PostgresDialect
 from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs, _plan
 from tests.featuregen.data_agent.pilot_fixture import CURRENT_MONTH, PREVIOUS_MONTH
 
+from featuregen.analysis.plan import Finding
+from featuregen.analysis.preview import preview
+from featuregen.data_agent.sql_hive import HiveDialect
+from featuregen.data_agent.sql_postgres import PostgresDialect
 
 # ── what will be computed ────────────────────────────────────────────────────────────────────────
 
@@ -136,9 +135,10 @@ def test_a_blocked_preview_still_shows_its_findings():
 def test_running_the_previewed_sql_produces_the_previewed_shape(db):
     """The end of the chain: what the preview showed is what executes, and it returns the fixture's
     hand-counted answer."""
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.data_agent.analysis import run_analysis
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     grounded, inputs = _grounded(), _inputs()

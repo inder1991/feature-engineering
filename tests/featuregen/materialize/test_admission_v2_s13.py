@@ -37,20 +37,30 @@ from featuregen.materialize.admission_v2 import (
     AdmittedFeatureV2,
     ResolvedFeatureInputV2,
     admit_artifacts_v2,
-    implied_operator_kinds,
+    implied_operator_signatures,
 )
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.execution_proof_store import (
     PILOT_MUTATIONS,
+    SOLE_VARIANT,
     MutationOutcomeV1,
     record_execution_proof,
     record_renderer_dispatch,
     set_execution_proof,
+    unqualified_operators,
 )
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
 from featuregen.overlay.upload.publication_revisions import OperatorExecutionProofV1
 
 ENGINE = "kedro-pyspark"
+#: What the pilot formulas actually need, as SIGNATURES. `sum` specifically — advertising the bare
+#: AGGREGATE kind would make the tests pass for a median too, which is exactly the confusion the
+#: typed signature removes.
+_PILOT_SIGNATURES = frozenset({
+    ("aggregate", "sum"), ("aggregate", "count_rows"), ("aggregate", "count_non_null"),
+    ("aggregate", "count_distinct"),
+    ("final_combine", "identity"), ("final_combine", "ratio"), ("final_combine", "difference"),
+})
 _ACTOR = make_actor()
 _INTENT = AuthoringIntent(
     "posted_debit_amount_30d",
@@ -88,6 +98,18 @@ def _raw(body: dict | None = None, **overrides) -> dict:
             "decimal": {"precision": 38, "scale": 6, "rounding": "half_even",
                         "overflow": "error"},
             **overrides}
+
+
+def _raw_v3(body: dict | None = None, **overrides) -> dict:
+    """The SAME feature in the v3 wire shape — version 3, and the `row_selections` slot v3 exists
+    for. Derived from `_raw()` rather than written out again so the two fixtures cannot drift into
+    describing different features while claiming to differ only in version."""
+    raw = _raw(body=body, **overrides)
+    raw["formula_schema_version"] = 3
+    expr = raw["body"].get("expr")
+    if isinstance(expr, dict):
+        expr.setdefault("row_selections", [])
+    return raw
 
 
 def _client(raw: dict | None = None, findings=None) -> FakeLLM:
@@ -131,13 +153,44 @@ def _free_form_run(db, raw: dict | None = None, *, intent: AuthoringIntent = _IN
         facts_reader=_monetary_facts,
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
         tool_runner=recipe_tool_runner_v2(
-            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})))
+            frozenset({TABLE_REF, REF_AMT, REF_DT, REF_CIF})),
+        # DERIVED from the proposal this run is scripted to return, so a fixture cannot ask for one
+        # grammar and script another — the mismatch authoring now refuses outright.
+        formula_schema_version=(raw if raw is not None else _raw()).get(
+            "formula_schema_version", 2))
 
 
-def _advertise(db, *, kinds: set[str] | None = None):
-    """Advertise operators: dispatchable AND execution-proved, which is what advertised MEANS."""
+def _dispatch_only(db):
+    """Renderer support recorded and NO proofs attached — the honest state of this platform today."""
     record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: True for kind in OperatorKindV2})
+        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+        **{sig: True for sig in _PILOT_SIGNATURES}})
+
+
+def _proof_hash_for(db) -> str:
+    """One recorded proof, for tests that need something to attach rather than a whole advertisement."""
+    return record_execution_proof(
+        db,
+        OperatorExecutionProofV1(
+            signature="pilot-operator-graph", signature_version=1,
+            compiler_version="formula-compiler@1", renderer_version="kedro-renderer@1",
+            physical_type_policy="formula-v2/physical-types@1", topology_version=1,
+            gold_corpus_hash="sha256:gold", generated_project_hash="sha256:project",
+            mutation_set_version=1, engine_versions=RUNTIMES),
+        tuple(MutationOutcomeV1(mutation_name=name, detected=True) for name in PILOT_MUTATIONS))
+
+
+def _advertise(db, *, kinds: set[str] | None = None, signatures=None):
+    """Advertise operators: dispatchable AND execution-proved, which is what advertised MEANS.
+
+    Signatures now, not bare kinds — `("aggregate", "sum")` is advertised while
+    `("aggregate", "avg")` is not, and a fixture that advertised the KIND would let a median through
+    a check whose whole purpose is to stop one.
+    """
+    wanted = signatures if signatures is not None else _PILOT_SIGNATURES
+    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
+        **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+        **{sig: True for sig in wanted}})
     proof_hash = record_execution_proof(
         db,
         OperatorExecutionProofV1(
@@ -147,8 +200,13 @@ def _advertise(db, *, kinds: set[str] | None = None):
             gold_corpus_hash="sha256:gold", generated_project_hash="sha256:project",
             mutation_set_version=1, engine_versions=RUNTIMES),
         tuple(MutationOutcomeV1(mutation_name=name, detected=True) for name in PILOT_MUTATIONS))
-    for kind in (kinds if kinds is not None else {k.value for k in OperatorKindV2}):
-        set_execution_proof(db, engine_id=ENGINE, operator_kind=kind, proof_hash=proof_hash)
+    if kinds is not None:
+        proved = {(k, SOLE_VARIANT) for k in kinds}
+    else:
+        proved = {(k.value, SOLE_VARIANT) for k in OperatorKindV2} | set(wanted)
+    for kind, variant in sorted(proved):
+        set_execution_proof(db, engine_id=ENGINE, operator_kind=kind,
+                            operator_variant=variant, proof_hash=proof_hash)
 
 
 @pytest.fixture
@@ -201,34 +259,70 @@ def test_THE_TOOL_SEAM_IS_THE_V2_ONE(catalog):
     with pytest.raises(ToolRunnerRequired, match="wrong catalog surface"):
         run_authoring_v2_replay(
             catalog, _INTENT, client, client, actor=None, authoring_run_id="far_s13_notools",
-            facts_reader=_monetary_facts, tool_runner=None)
+            facts_reader=_monetary_facts, tool_runner=None, formula_schema_version=2)
 
 
 # ══ the ADVERTISED-set gate (S13's two clauses meeting) ════════════════════════════════════════
 def test_AN_UNADVERTISED_OPERATOR_REFUSES_ADMISSION(catalog):
-    """The check v1's docstring promised. Nothing is advertised, so nothing is admitted."""
+    """The renderer has no branch for it, so there is nothing to compile and nothing to show."""
     result = _free_form_run(catalog)
     with pytest.raises(MaterializationRefused) as raised:
         admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
     assert raised.value.code is CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED
-    assert "does not advertise" in raised.value.detail
+    assert "cannot emit in this build" in raised.value.detail
 
 
-def test_DISPATCHABLE_WITHOUT_A_PROOF_IS_NOT_ENOUGH(catalog):
-    """Advertised means renderer-dispatchable AND execution-proved. A renderer branch with no gold
-    proof is a branch nobody ran against reviewed gold."""
-    record_renderer_dispatch(catalog, engine_id=ENGINE, dispatchable={
-        kind.value: True for kind in OperatorKindV2})
+def test_DISPATCHABLE_WITHOUT_A_PROOF_IS_ENOUGH_TO_GENERATE_CODE(catalog):
+    """The policy this step deliberately changed, and why.
+
+    This test previously asserted the opposite: dispatch without a gold proof refused admission.
+    That rule made admission unreachable in practice — nothing populates proofs until a gold harness
+    exists (step 6), so EVERY formula refused, and the shortest route to a working pipeline became
+    writing a proof record for a proof nobody ran. The rule intended to guarantee honesty was
+    manufacturing the exact dishonesty it existed to prevent.
+
+    The three claims are now separate. Renderer-support gates CODE GENERATION: the formula compiles
+    and a person may read what was produced. Execution-qualification is reported beside it, not
+    required. Artifact-verification gates PUBLICATION, and nothing here loosens that.
+
+    Showing someone unverified code while saying it is unverified is honest. Refusing to show it
+    until somebody forges a proof is not.
+    """
+    _dispatch_only(catalog)
     result = _free_form_run(catalog)
-    with pytest.raises(MaterializationRefused, match="does not advertise"):
-        admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
+
+    admitted = admit_artifacts_v2(
+        catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
+    assert admitted, "a compilable formula was refused for the platform's own missing evidence"
+
+    # And the gap is NAMED, so "unverified" is something a user and an operator can both act on.
+    unqualified = unqualified_operators(
+        catalog, engine_id=ENGINE,
+        signatures=implied_operator_signatures(result.candidate_proposal))
+    assert ("aggregate", "sum") in unqualified
+    assert set(unqualified) == set(implied_operator_signatures(result.candidate_proposal)), (
+        "nothing has been proved, so every implied operator should be reported unqualified")
+
+
+def test_a_PROVED_operator_stops_being_reported_as_unqualified(catalog):
+    """The other direction: qualification is a real state, not a permanent disclaimer."""
+    _advertise(catalog)
+    result = _free_form_run(catalog)
+
+    assert unqualified_operators(
+        catalog, engine_id=ENGINE,
+        signatures=implied_operator_signatures(result.candidate_proposal)) == ()
 
 
 def test_ONE_MISSING_OPERATOR_IS_ENOUGH_TO_REFUSE(catalog):
-    """Per operator, not per engine: a feature using the one unadvertised operator must refuse even
-    though every other one is advertised."""
-    every = {kind.value for kind in OperatorKindV2}
-    _advertise(catalog, kinds=every - {OperatorKindV2.AGGREGATE.value})
+    """Per SIGNATURE, not per engine and not per kind.
+
+    Sharpened by the typed capability model: the engine advertises the AGGREGATE kind and every
+    other operator, and is missing only `("aggregate", "sum")`. Under the old kind-level model this
+    feature would have been admitted — the kind was advertised — and rendered against a renderer
+    that cannot sum. That is the whole reason the variant exists.
+    """
+    _advertise(catalog, signatures=_PILOT_SIGNATURES - {("aggregate", "sum")})
     result = _free_form_run(catalog)
     with pytest.raises(MaterializationRefused) as raised:
         admit_artifacts_v2(catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
@@ -248,8 +342,10 @@ def test_THE_OPERATORS_ARE_DERIVED_FROM_THE_PROPOSAL(catalog):
     """An operator list a caller supplied is one that gets forgotten on the feature it mattered
     for — C-C10's rule, applied here."""
     result = _free_form_run(catalog)
-    kinds = implied_operator_kinds(result.candidate_proposal)
-    assert set(kinds) == {"governed_scan", "aggregate", "group_assembly"}
+    signatures = implied_operator_signatures(result.candidate_proposal)
+    assert set(signatures) == {
+        ("governed_scan", SOLE_VARIANT), ("group_assembly", SOLE_VARIANT),
+        ("aggregate", "sum"), ("final_combine", "identity")}
 
 
 def test_a_DECLARED_CURRENCY_CONVERSION_implies_the_FX_operators_and_its_gates(catalog):
@@ -262,7 +358,7 @@ def test_a_DECLARED_CURRENCY_CONVERSION_implies_the_FX_operators_and_its_gates(c
     result = _free_form_run(catalog, raw)
     assert result.candidate_proposal is not None
 
-    kinds = set(implied_operator_kinds(result.candidate_proposal))
+    kinds = {kind for kind, _variant in implied_operator_signatures(result.candidate_proposal)}
     assert {"as_of_fx_join", "duplicate_rate_gate", "missing_rate_gate",
             "decimal_multiplication"} <= kinds
 
@@ -274,7 +370,7 @@ def test_the_admitted_artifact_CARRIES_the_kinds_it_was_checked_against(catalog)
     result = _free_form_run(catalog)
     admitted = admit_artifacts_v2(
         catalog, [ResolvedFeatureInputV2(_INTENT, result)], engine_id=ENGINE)
-    assert admitted[0].operator_kinds == implied_operator_kinds(result.candidate_proposal)
+    assert admitted[0].operator_kinds == implied_operator_signatures(result.candidate_proposal)
 
 
 # ══ the checks that make admission a PROOF rather than a formality ════════════════════════════
@@ -382,13 +478,30 @@ def test_admission_is_ALL_OR_NOTHING(catalog):
 
 
 def test_the_shared_checks_are_IMPORTED_not_reimplemented():
-    """Checks 1, 2 and 3 read one trace row and carry no grammar. Two readings of one record
+    """Checks 1 and 2 read one trace row and carry no grammar. Two readings of one record
     eventually disagree about what a tampered payload looks like."""
     import inspect
 
     from featuregen.materialize import admission, admission_v2
 
     source = inspect.getsource(admission_v2)
-    for shared in ("_terminal_event", "_verify_payload_hash", "_require_resolved"):
+    for shared in ("_terminal_event", "_verify_payload_hash"):
         assert "from featuregen.materialize.admission import" in source or shared in source
         assert getattr(admission_v2, shared) is getattr(admission, shared)
+
+
+def test_the_DISPOSITION_CHECK_IS_NOT_SHARED_and_that_is_the_point():
+    """Check 3 USED to be `admission._require_resolved`, and sharing it broke the V3 chain.
+
+    V1 and V2 resolve output authority DURING authoring, so `RESOLVED` there means every question
+    was answered. V3 defers it to the compiler by design and therefore always terminates
+    `NEEDS_REVIEW` — so the shared rule refused every V3 formula that had ever been authored, and
+    nothing noticed because nothing had put one through admission.
+
+    Pinned as a NON-identity so a later tidy that "restores consistency" by re-sharing the check
+    fails here, with the reason, instead of silently closing the chain again.
+    """
+    from featuregen.materialize import admission, admission_v2
+
+    assert not hasattr(admission_v2, "_require_resolved")
+    assert admission_v2._require_admissible_disposition is not admission._require_resolved

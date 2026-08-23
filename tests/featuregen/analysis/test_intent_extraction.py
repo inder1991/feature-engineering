@@ -118,13 +118,14 @@ def test_the_extracted_plan_flows_through_grounding_and_execution(db):
     hand-counted answer. Without this the pieces could each pass and not compose."""
     from datetime import UTC, datetime
 
+    from tests.featuregen.analysis.test_plan_to_execution import _inputs
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.analysis.plan import GroundedPlan
     from featuregen.analysis.windows import PartitionGranularity, resolve_window_partitions
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _inputs
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     plan = _extract(db, _llm(), _QUESTION, _candidates()).plan

@@ -3,11 +3,10 @@ from __future__ import annotations
 import pytest
 
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
-from featuregen.formula.frozen_configuration import (
-    ConfigurationDrifted,
+from featuregen.formula.frozen_configuration import ConfigurationDrifted, verify_provider_contract
+from featuregen.formula.frozen_configuration_v1 import (
     freeze_current_configuration,
     verify_frozen_configuration,
-    verify_provider_contract,
 )
 from featuregen.formula.turns import AUTHOR_TURN_V1_SCHEMA
 
@@ -89,7 +88,7 @@ def test_complete_configuration_verification_covers_policy_material(monkeypatch)
         author_prompt_id=AUTHOR_PROMPT_ID,
     )
     monkeypatch.setattr(
-        "featuregen.formula.frozen_configuration._operation_grammar_material",
+        "featuregen.formula.frozen_configuration_v1._operation_grammar_material",
         lambda: {"changed": True},
     )
     with pytest.raises(ConfigurationDrifted):

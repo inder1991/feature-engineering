@@ -40,14 +40,8 @@ from tests.featuregen.materialize import fixtures
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.canonical import formula_content_hash
-from featuregen.formula.schema import (
-    DiffBody,
-    Grain,
-    RatioBody,
-    UnaryBody,
-    ZeroDenominator,
-    body_expressions,
-)
+from featuregen.formula.schema import DiffBody, RatioBody, UnaryBody, body_expressions
+from featuregen.formula.schema_leaves import Grain, ZeroDenominator
 from featuregen.materialize import ir as ir_module
 from featuregen.materialize.admission import AdmittedFeature
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
@@ -1299,7 +1293,7 @@ def test_a_body_outside_child_1s_discriminated_union_is_a_CALLER_error(catalog):
     """A body Child-1's grammar has no shape for is a forged object, not a governed verdict —
     Child-1's own `SchemaError` says so, and inventing a §14 code for it would fork the
     vocabulary."""
-    from featuregen.formula.schema import SchemaError
+    from featuregen.formula.schema_leaves import SchemaError
 
     class _Body:
         final_operation = None

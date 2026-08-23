@@ -18,12 +18,12 @@ from featuregen.overlay.upload.contract.govern import feature_detail
 from featuregen.overlay.upload.features import (
     FeatureFreshness,
     FeatureSpec,
+    IdeaNotConsumableError,
     consumers_of_feature,
     feature_freshness,
     features_affected_by,
     features_for_consumer,
     list_features,
-    IdeaNotConsumableError,
     register_consumer,
     register_feature,
 )

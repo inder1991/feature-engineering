@@ -658,7 +658,7 @@ def test_recipe_renders_the_real_operation_label_not_an_invented_sql_verb():
         operation_kind="trend_90d",
         measure_refs=((SOURCE, f"public.{TABLE}.bal_amt"), (SOURCE, f"public.{TABLE}.cif_id"),
                       (SOURCE, f"public.{TABLE}.as_of_dt")),
-        grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
+        grain_refs=((SOURCE, f"public.{TABLE}.cif_id"),),
         time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="90d"), "")
     assert line == "trend_90d(bal_amt) BY cif_id OVER 90d [as_of_dt]"
 
@@ -670,7 +670,7 @@ def test_recipe_does_not_render_the_grain_or_time_column_as_a_measure():
                  measure_refs=((SOURCE, f"public.{TABLE}.cif_id"),
                                (SOURCE, f"public.{TABLE}.txn_amt"),
                                (SOURCE, f"public.{TABLE}.as_of_dt")),
-                 grain_ref=(SOURCE, f"public.{TABLE}.cif_id"),
+                 grain_refs=((SOURCE, f"public.{TABLE}.cif_id"),),
                  time_ref=(SOURCE, f"public.{TABLE}.as_of_dt"), window="30d")
     assert render_recipe(idea, "") == "inflow_outflow_30d(txn_amt) BY cif_id OVER 30d [as_of_dt]"
 
@@ -681,7 +681,7 @@ def test_recipe_omits_the_clauses_that_do_not_apply():
     line = render_recipe(_idea(
         operation_kind="product_breadth",
         measure_refs=((SOURCE, f"public.{TABLE}.setl_stat"), (SOURCE, f"public.{TABLE}.cif_id")),
-        grain_ref=(SOURCE, f"public.{TABLE}.cif_id")), "")
+        grain_refs=((SOURCE, f"public.{TABLE}.cif_id"),)), "")
     assert line == "product_breadth(setl_stat) BY cif_id"
     assert "OVER" not in line and "[" not in line
     assert line == line.strip()
@@ -693,7 +693,7 @@ def test_recipe_renders_multiple_measures_in_a_stable_order():
                  measure_refs=((SOURCE, f"public.{TABLE}.txn_amt"),
                                (SOURCE, f"public.{TABLE}.bal_amt"),
                                (SOURCE, f"public.{TABLE}.cif_id")),
-                 grain_ref=(SOURCE, f"public.{TABLE}.cif_id"))
+                 grain_refs=((SOURCE, f"public.{TABLE}.cif_id"),))
     assert render_recipe(idea, "") == "payment_ratio(txn_amt, bal_amt) BY cif_id"
     assert render_recipe(idea, "") == render_recipe(idea, "")
 

@@ -46,20 +46,32 @@ def evaluate_verify(
     *,
     sealed_artifact_hash: str,
     inventory_observation_id: str,
-    environment_id: str,
     execution_permitted: bool,
-    activation_blockers: Sequence[str] = (),
+    # ▲ NO DEFAULT — §8.1's rule, applied to every gate at once rather than one at a time. An
+    # explicit empty tuple is a CLAIM ("the caller consulted the fold and it carried nothing");
+    # an omitted argument was indistinguishable from a caller that never asked.
+    activation_blockers: Sequence[str],
 ) -> EvaluatorVerdictV1:
     """§0.3's Verify gate: the exact sealed artifact · execution permission · environment
     compatibility.
 
+    **THE ENVIRONMENT IS DERIVED, NEVER ACCEPTED.** This took an ``environment_id`` argument and
+    compared it against the artifact's — so a caller supplying the artifact's own environment passed
+    the check trivially, whatever cluster the observation actually belonged to. Both sides now come
+    from persisted rows: the artifact's environment from the sealed artifact, the observation's from
+    the observation. A security-relevant value duplicated in the request body is one the client gets
+    to choose, and the whole purpose of this comparison is that the client does not.
+
+    **The observation is LOADED, not merely non-blank.** It used to be checked for emptiness and
+    then ignored, which made "environment compatibility" a comparison with nothing on one side of
+    it: an observation id naming a row that does not exist, or one belonging to another cluster,
+    reached the same verdict as a correct one.
+
     Args:
         sealed_artifact_hash: the artifact id being verified. THE EXACT one — a verification not
             tied to a specific artifact verifies whatever happened to be rendered.
-        inventory_observation_id: the environment observation the run would execute against.
-            Carried so a caller cannot verify against one cluster and claim another.
-        environment_id: the environment that observation belongs to, compared against the one the
-            artifact was SEALED for.
+        inventory_observation_id: the environment observation the run would execute against. Its
+            environment is LOADED here, not supplied — see below.
         execution_permitted: whether the caller may execute. Passed in rather than derived, because
             read scope is decided by the shipped predicate at Gate 2 and re-deciding it here would
             be a second opinion about a governed question.
@@ -83,11 +95,16 @@ def evaluate_verify(
     blockers = list(carried_blockers(tuple(activation_blockers)))
 
     sealed = load_sealed_artifact(conn, sealed_artifact_hash)
+    observed_environment = _observation_environment(conn, inventory_observation_id)
     if sealed is None or not sealed.servable:
         blockers.append(R.ARTIFACT_NOT_SERVABLE)
-    elif sealed.environment_id != environment_id:
+    elif observed_environment is None or sealed.environment_id != observed_environment:
         # Checked only when the artifact IS servable: reporting both would tell an operator to fix
         # an environment mismatch on an artifact that could not run in either.
+        #
+        # A MISSING observation lands here rather than in its own blocker, deliberately: from this
+        # gate's side "the cluster you named was never observed" and "it is a different cluster" are
+        # the same answer — nothing establishes that this artifact can run where you are pointing it.
         blockers.append(R.ENVIRONMENT_INCOMPATIBLE)
 
     if not execution_permitted:
@@ -98,6 +115,19 @@ def evaluate_verify(
                               blockers=ordered)
 
 
+def _observation_environment(conn: DbConn, observation_id: str) -> str | None:
+    """Which environment an inventory observation belongs to, or ``None`` if there is no such row.
+
+    Loaded rather than accepted. The caller naming the observation is the caller that wants the
+    verification to pass, so its environment is exactly the field they must not be allowed to
+    assert.
+    """
+    row = conn.execute(
+        "SELECT environment_id FROM generation_inventory_observation WHERE observation_id = %s",
+        (observation_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def evaluate_publish_sandbox(
     conn: DbConn,
     *,
@@ -106,7 +136,7 @@ def evaluate_publish_sandbox(
     staleness: StalenessV1,
     publication_permitted: bool,
     capability_attestation: str,
-    activation_blockers: Sequence[str] = (),
+    activation_blockers: Sequence[str],
 ) -> EvaluatorVerdictV1:
     """§0.3's Publish gate: a current passing verification · the exact staging output · publication
     permission and capability.

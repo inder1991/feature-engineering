@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from featuregen.formula.schema import DecimalPolicy, OverflowBehavior, RoundingMode
+from featuregen.formula.schema_leaves import DecimalPolicy, OverflowBehavior, RoundingMode
 from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.formula.schema_v3 import SelectionKind, SemanticRowSelectionV1
 from featuregen.materialize.expression_ir import AvailabilityBasis, PitSpec
@@ -80,13 +80,23 @@ def _pilot() -> OperatorGraphV2:
 
 
 # ══ the vocabulary is CLOSED ═════════════════════════════════════════════════════════════════════
-def test_the_vocabulary_is_exactly_the_thirteen_c10a_froze():
+def test_the_vocabulary_is_the_fourteen_the_graph_needs_to_describe_a_WHOLE_feature():
+    """C-C10a froze thirteen. FINAL_COMBINE is the fourteenth, and its absence was a gap.
+
+    With thirteen the graph could describe every step of a feature EXCEPT the one that produces its
+    value: a ratio's two aggregates had nowhere to be divided. So the graph could not claim to be
+    the executable form of ANY feature, not merely of exotic ones — which is why the V2-only plan
+    rules it a derived view and adds this node rather than leaving it implied.
+
+    It is also where capability per final operation hangs: `ratio` and `signed_sum` are different
+    renderer abilities, and without a kind there was nowhere to record which one an engine has.
+    """
     assert [kind.value for kind in OperatorKindV2] == [
         "governed_scan", "pit_availability_filter", "semantic_selection", "eligible_status_filter",
         "linked_reversal_survivor", "as_of_fx_join", "duplicate_rate_gate", "missing_rate_gate",
         "quote_inversion", "decimal_multiplication", "aggregate", "spine_left_join",
-        "group_assembly"]
-    assert len(OperatorKindV2) == 13
+        "group_assembly", "final_combine"]
+    assert len(OperatorKindV2) == 14
 
 
 def test_every_kind_has_exactly_one_payload_type():

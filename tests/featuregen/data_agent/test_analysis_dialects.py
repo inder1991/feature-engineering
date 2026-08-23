@@ -22,11 +22,11 @@ These tests assert the property directly, so it stays caught without a cluster.
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.data_agent.test_analysis_ir import _ir
 
 from featuregen.data_agent.analysis import compile_analysis
 from featuregen.data_agent.sql_hive import HiveDialect
 from featuregen.data_agent.sql_postgres import PostgresDialect
-from tests.featuregen.data_agent.test_analysis_ir import _ir
 
 _COLUMNS = ("cif_id", "tran_month", "tran_status", "reversal_flag", "segment", "sector",
             "effective_from", "effective_to")

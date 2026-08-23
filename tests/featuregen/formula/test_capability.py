@@ -20,14 +20,12 @@ from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
     DiffBody,
-    Grain,
-    SourceRelation,
     TypedFormulaProposalV1,
     UnaryBody,
     WindowBasis,
-    WindowUnit,
     validate_semantics,
 )
+from featuregen.formula.schema_leaves import Grain, SourceRelation, WindowUnit
 
 # A second catalog source ("core"), distinct from the factories' "ftr" source.
 OTHER_TABLE_REF = "core::bank.transactions"

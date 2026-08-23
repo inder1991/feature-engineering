@@ -148,7 +148,7 @@ def test_the_numeric_shape_is_the_formulas_DECLARED_decimal():
 def test_the_shape_is_DESIRED_not_resolved():
     """Whether it survives contact with the operands' real types is C-C6's answer, and it can
     refuse — recording the intent separately is what lets that refusal say which side disagreed."""
-    from featuregen.formula.schema import DecimalPolicy, OverflowBehavior, RoundingMode
+    from featuregen.formula.schema_leaves import DecimalPolicy, OverflowBehavior, RoundingMode
     from featuregen.materialize.physical_types_v2 import (
         DecimalTypeV2,
         PhysicalTypeRefusalV2,

@@ -18,10 +18,21 @@ def test_compilation_codes_are_exactly_the_spec_set():
     assert {c.value for c in CompilationRefusalCode} == {
         "AUTHORING_RUN_INCOMPLETE", "TERMINAL_PAYLOAD_TAMPERED", "NOT_RESOLVED",
         "FORMULA_HASH_MISMATCH", "FORMULA_SCHEMA_UNSUPPORTED", "AXES_MISMATCH", "INTENT_HASH_MISMATCH",
+        # Step 3 (§8.2): the request-time decision, re-checked at the worker. MISSING is a queue
+        # bypass (nothing was ever answered); DRIFTED is evidence that moved between the answer and
+        # the act — a refusal a person re-requests, never a re-decision.
+        "ACTION_DECISION_MISSING", "ACTION_DECISION_DRIFTED",
         "READ_SCOPE_INSUFFICIENT", "PROHIBITED_INPUT", "COLUMN_NOT_GOVERNED",
+        # Step 6. Deliberately NOT folded into READ_SCOPE_INSUFFICIENT: read scope is a fact about
+        # the CALLER and someone else may be permitted, leakage is a fact about the FEATURE and is
+        # wrong for everyone. One code would send half the operators who hit it to the wrong remedy.
+        "TARGET_LEAKAGE_DETECTED",
         "AMBIGUOUS_TABLE_NAME",
         "JOIN_PATH_NOT_VERIFIED", "JOIN_PATH_DENIED_BY_READ_SCOPE",
-        "GRAIN_PATH_NOT_GOVERNED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
+        "GRAIN_PATH_NOT_GOVERNED",
+    "GRAIN_NOT_RESOLVED",
+    "POLICY_REFERENCE_UNRESOLVABLE",
+    "CANDIDATE_REGENERATION_REQUIRED", "JOIN_FANOUT_UNSUPPORTED", "JOIN_CARDINALITY_UNKNOWN",
         "SPINE_SOURCE_NOT_DECLARED", "SPINE_DECLARATION_REJECTED_BY_FACTS",
         "PARTITION_MAPPING_NOT_DECLARED", "PHYSICAL_SCHEMA_NOT_RESOLVED", "SOURCE_ENGINE_UNSUPPORTED", "AVAILABILITY_TIME_NOT_GOVERNED",
         "OUTPUT_TYPE_NOT_GOVERNED", "PHYSICAL_TYPE_UNSUPPORTED", "MULTIPLE_MATERIALIZATION_CONTRACTS",
@@ -33,7 +44,10 @@ def test_publication_codes_are_exactly_the_spec_set():
     """CAPABILITY_UNPROVEN / GROUP_BINDING_CONFLICT are PUBLICATION decisions —
     they are not compilation refusals and not runtime gates."""
     assert {c.value for c in PublicationRefusalCode} == {
-        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED"}
+        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED",
+        # Step 14. Capability is about the ENVIRONMENT, this is about the ARTIFACT — an environment
+        # can be perfectly capable of publishing a feature nobody has checked.
+        "VERIFICATION_ABSENT"}
 
 
 def test_gate_codes_are_exactly_the_spec_set():

@@ -68,7 +68,7 @@ from featuregen.formula.result import (
 )
 from featuregen.formula.result import _fold as _fold_v1
 from featuregen.formula.result_v2 import derive_disposition_v2
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.trace import run_status
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.formula.turns_v2 import AUTHOR_TURN_SCHEMA_ID_V2, AUTHOR_TURN_V2_SCHEMA
@@ -189,15 +189,52 @@ def test_run_authoring_v2_never_constructs_AuthoringResult() -> None:
     assert not hasattr(authoring_v2, "AuthoringResultV2")
 
 
-def test_the_v2_fold_is_the_v1_fold_over_every_axis_combination() -> None:
-    """The §F precedence is RESTATED in ``result_v2``, never re-decided. Pinned over the complete
-    cross-product so the restatement cannot drift into a second policy."""
+#: The one axis value V1 cannot produce, and the only place the two folds may differ. V3 defers its
+#: output binding to the compiler (C-A7); V1 resolves output during authoring and has no such state,
+#: so its fold has no arm for this and would call it NEEDS_REVIEW.
+_V3_ONLY_OUTPUT = "deferred_to_compiler"
+
+
+def test_the_v2_fold_is_the_v1_fold_EVERYWHERE_V1_CAN_REACH() -> None:
+    """The §F precedence is RESTATED in ``result_v2``, never re-decided — pinned over the complete
+    cross-product so the restatement cannot drift into a second policy.
+
+    ▲ The pin is now over the axis values V1 CAN PRODUCE, which is a real narrowing and is stated
+    rather than quietly dropped. V2's vocabulary gained `deferred_to_compiler` for V3's benefit, and
+    on that value alone the two folds MUST differ — see the test below, which pins the difference so
+    it cannot become a silent divergence.
+    """
+    v1_reachable = [s for s in get_args(OutputStatus) if s != _V3_ONLY_OUTPUT]
     combos = list(itertools.product(
-        get_args(StructuralStatus), get_args(CapabilityStatus), get_args(OutputStatus),
+        get_args(StructuralStatus), get_args(CapabilityStatus), v1_reachable,
         get_args(ExpectationStatus), get_args(CriticStatus), get_args(TechnicalStatus)))
     assert len(combos) == 432
     for combo in combos:
         assert _fold_v1(AuthoringAxes(*combo)) == _fold_v2_of(AuthoringAxes(*combo))
+
+
+def test_the_two_folds_DIFFER_on_the_V3_deferral_and_ONLY_there() -> None:
+    """The divergence, pinned in both directions.
+
+    V1 has no concept of an output binding deferred to a later stage, so it folds the value it does
+    not know to NEEDS_REVIEW — which is exactly the wrong answer for a V3 run and exactly why V2's
+    fold gained an arm. Asserting the difference here means a later "consistency" fix that deletes
+    the arm fails with the reason instead of silently sending every V3 run back to human review.
+    """
+    clean = dict(structural_status="ok", capability_status="ok", expectation_status="not_provided",
+                 critic_status="clean", technical_status="ok")
+    deferred = AuthoringAxes(output_status=_V3_ONLY_OUTPUT, **clean)
+
+    assert _fold_v2_of(deferred) == "READY_FOR_OUTPUT_BINDING"
+    assert _fold_v1(deferred) == "NEEDS_REVIEW"
+
+    # And the arm is CONDITIONAL: a deferral with anything else outstanding is still NEEDS_REVIEW,
+    # so "deferred" never means "waved through".
+    assert _fold_v2_of(AuthoringAxes(
+        output_status=_V3_ONLY_OUTPUT, **{**clean, "critic_status": "blocking"})) == "NEEDS_REVIEW"
+    assert _fold_v2_of(AuthoringAxes(
+        output_status=_V3_ONLY_OUTPUT,
+        **{**clean, "expectation_status": "mismatch"})) == "NEEDS_REVIEW"
 
 
 def _fold_v2_of(axes: AuthoringAxes) -> str:

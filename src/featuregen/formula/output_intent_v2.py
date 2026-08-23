@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.formula.schema import AdditivityClass, DecimalPolicy
+from featuregen.formula.schema_leaves import AdditivityClass, DecimalPolicy, ExpectedOutput
 from featuregen.formula.schema_v3 import TypedFormulaProposalV3, body_expressions_v3
 
 __all__ = [
@@ -153,8 +153,20 @@ def derive_output_intent_v2(
     unit: str | None = None
     currency: str | None = None
     if present:
-        unit = getattr(expectation, "unit", None)
-        currency = getattr(expectation, "currency", None)
+        # ATTRIBUTE ACCESS, not `getattr(..., None)`. The loose form was here because
+        # `expected_output` was declared `object | None`, and it turned a renamed or missing field
+        # into a silent `unit=None` while `authored_expectation_present` stayed True — the caller
+        # would then see an expectation that exists and carries nothing, which
+        # `AuthoredOutputIntentV2` does not refuse (it validates only the converse,
+        # values-without-expectation). Now the field is typed `ExpectedOutput | None`, so a shape
+        # this code cannot read raises here instead of being reported as an empty expectation.
+        if not isinstance(expectation, ExpectedOutput):
+            raise TypeError(
+                f"expected_output carries {type(expectation).__name__}, not ExpectedOutput: an "
+                f"output expectation this build cannot read must fail rather than be reported as "
+                f"present-and-empty, which is indistinguishable from an author who declared nothing")
+        unit = expectation.unit
+        currency = expectation.currency
         # `ExpectedOutput` carries no additivity — it is not something a model is asked to guess,
         # and inventing a default here would put a value into the intent that nobody authored.
         additivity = None

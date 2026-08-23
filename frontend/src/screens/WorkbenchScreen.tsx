@@ -57,7 +57,7 @@
 //   row or pull it out of view while its registration is being written.
 // - Scope edits bump the generation sequence so an in-flight round (generate or feedback) that
 //   resolves after the edit is discarded, never applied against the new scope.
-import { Fragment, type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
+import { Fragment, type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
   type OptionActionsEntry,
@@ -73,7 +73,9 @@ import {
   contractOptionDetail,
   type OptionDetailResp,
   type OptionDecisionRecord,
+  type FormulaDraftStatus,
 } from '../api'
+import { FormulaDraftAction } from './FormulaDraftAction'
 import { getSession } from '../session'
 
 // ---- Phase 1B feature flags -------------------------------------------------------------------
@@ -1241,6 +1243,22 @@ export function WorkbenchScreen() {
   // GLOBAL selection across set views: candidate key -> the lens it was picked from (null for
   // drafts and flat-list picks). Keys carry the fetch sequence, so cleared rounds stay inert.
   const [selected, setSelected] = useState<Record<string, string | null>>({})
+  // option_id -> the state of ITS formula draft, reported upward by each row's FormulaDraftAction.
+  // Kept here and nowhere else so the tray can say "2 formulas ready · 2 require authoring" without
+  // the tray knowing anything about drafting, and without a second reader asking the draft API.
+  const [draftStates, setDraftStates] = useState<Record<string, FormulaDraftStatus['state']>>({})
+  const onDraftStateChange = useCallback(
+    (optionId: string, state: FormulaDraftStatus['state'] | null) => {
+      setDraftStates(prev => {
+        if (state === null) {
+          if (!(optionId in prev)) return prev          // no draft: nothing to forget
+          const { [optionId]: _gone, ...rest } = prev
+          return rest
+        }
+        if (prev[optionId] === state) return prev       // same answer: no re-render
+        return { ...prev, [optionId]: state }
+      })
+    }, [])
   const [registered, setRegistered] = useState<Record<string, Registration>>({})
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [screenedTarget, setScreenedTarget] = useState<string | null>(null)
@@ -1485,6 +1503,30 @@ export function WorkbenchScreen() {
   const selectedCandidates = allCandidates.filter(
     c => c.key in selected && !registered[c.key] && !governed[c.key])
   const selectedCount = selectedCandidates.length
+  // "2 formulas ready · 1 blocked · 1 needs authoring" — what the selection would cost to prepare,
+  // said before anyone presses anything. Derived from the rows' reported draft states rather than
+  // fetched, so building this sentence spends nothing.
+  //
+  // NEEDS AUTHORING counts what has no draft AND what did not finish — a FAILED draft needs
+  // authoring again, and folding it into "ready" would promise a formula that is not there.
+  // BLOCKED is counted separately because it is neither: the formula exists and cannot run here,
+  // which is a different remedy from asking for one.
+  const draftSummary: string | null = (() => {
+    if (selectedCount === 0) return null
+    let ready = 0
+    let blocked = 0
+    for (const candidate of selectedCandidates) {
+      const optionId = candidate.kind === 'generated' ? candidate.idea.option_id : null
+      const state = optionId ? draftStates[optionId] : undefined
+      if (state === 'READY') ready += 1
+      else if (state === 'BLOCKED') blocked += 1
+    }
+    const needsAuthoring = selectedCount - ready - blocked
+    const parts = [`${ready} formula${ready === 1 ? '' : 's'} ready`]
+    if (blocked > 0) parts.push(`${blocked} blocked`)
+    if (needsAuthoring > 0) parts.push(`${needsAuthoring} need${needsAuthoring === 1 ? 's' : ''} authoring`)
+    return parts.join(' · ')
+  })()
   // Only fresh, unrefined generated candidates are governable: they came through the CURRENT intent's
   // considered set AND still match its persisted snapshot. A draft is the human's own definition; a
   // KEPT candidate was pinned from a PRIOR generation; and a REFINED candidate's idea was mutated in
@@ -3895,6 +3937,19 @@ export function WorkbenchScreen() {
                           Also available — {c.idea.param_alternatives}
                         </p>
                       )}
+                      {/* DRAFT FORMULA — per candidate, and deliberately NOT the checkbox above.
+                          Selecting a candidate must never spend; asking for its formula is a
+                          separate, explicit act with its own button, and it does not select.
+                          Requires the opaque option_id on a v2 revision: without both, there is no
+                          frozen candidate to author against. */}
+                      {c.kind === 'generated' && c.idea.option_id && consideredRevisionId && (
+                        <FormulaDraftAction
+                          consideredRevisionId={consideredRevisionId}
+                          optionId={c.idea.option_id}
+                          candidateName={displayName}
+                          onStateChange={onDraftStateChange}
+                        />
+                      )}
                       {/* D3 (UI-02): the audit drawer — the STORED decision record on demand,
                           by exact (revision, option) key. Only options with decision rows
                           (engine candidates on a v2 revision) offer it. */}
@@ -4171,6 +4226,19 @@ export function WorkbenchScreen() {
                   {selectedCount} selected
                 </span>
               </div>
+              {/* HOW MANY OF THE SELECTED ONES HAVE A FORMULA — the number that decides whether
+                  the next step is cheap or expensive, shown BEFORE it is taken. Counted from the
+                  per-candidate draft states the rows report upward, so the tray never asks the
+                  draft API anything and selecting still costs nothing.
+
+                  Only the SELECTED candidates are counted. A user who drafted six formulas while
+                  browsing and selected two needs "2 selected · 1 ready", not a tally of everything
+                  they looked at. */}
+              {selectedCount > 0 && draftSummary !== null && (
+                <p className="micro-label tabular-nums" style={{ margin: '4px 0 0' }}>
+                  {draftSummary}
+                </p>
+              )}
               {confirmingBatch ? (
                 <>
                   <p style={{ fontWeight: 500 }}>
@@ -4257,13 +4325,19 @@ export function WorkbenchScreen() {
                         flow. Shown only when a governing intent exists (from the last
                         considered-set call — generate or feedback) and at least one selected
                         candidate is a fresh generated one (governable). */}
+                    {/* SELECT AND DRAFT, named for what it does. This runs `/contract/draft`,
+                        whose FIRST act is to record a Gate-1 choice — so pressing it chooses, and a
+                        label that said only "draft" would select behind the user's back. The
+                        per-candidate "Draft formula" button on each row is the one that drafts
+                        WITHOUT choosing; these are two different acts and read as two. */}
                     {intentId !== null && governableCount > 0 && (
                       <button
                         type="button"
                         className="btn"
+                        title="Records your choice, then drafts and governs the specification"
                         onClick={() => setConfirmingGovern(true)}
                       >
-                        Govern {governableCount}
+                        Select and draft {governableCount}
                       </button>
                     )}
                     <button

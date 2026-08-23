@@ -40,12 +40,8 @@ from featuregen.formula.capability import (
 )
 from featuregen.formula.operations import to_path_aggregation
 from featuregen.formula.parse import parse_proposal_v1
-from featuregen.formula.schema import (
-    OPERATION_GRAMMAR_VERSION,
-    AggregateFunction,
-    FinalOperation,
-    SchemaError,
-)
+from featuregen.formula.schema import OPERATION_GRAMMAR_VERSION, AggregateFunction, FinalOperation
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.turns import TOOL_NAMES
 from featuregen.overlay.upload.column_authority import logical_ref_of, read_column_facts
 from featuregen.overlay.upload.lineage import lineage_graph

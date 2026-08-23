@@ -38,7 +38,6 @@ from psycopg.rows import dict_row
 
 from featuregen.config import get_settings
 from featuregen.formula.audited import current_formula_generation_settings
-from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
 from featuregen.formula.control import (
     LeaseFence,
     LeaseFenceLost,
@@ -47,14 +46,11 @@ from featuregen.formula.control import (
 from featuregen.formula.frozen_configuration import (
     ConfigurationDrifted,
     load_frozen_configuration_json,
-    verify_frozen_configuration,
     verify_frozen_configuration_v2,
 )
 from featuregen.formula.recipe_authoring import (
     FrozenRecipeReadContext,
-    recipe_expectation_validator,
     recipe_expectation_validator_v2,
-    recipe_tool_runner,
     recipe_tool_runner_v2,
 )
 from featuregen.formula.recipe_egress import (
@@ -62,8 +58,8 @@ from featuregen.formula.recipe_egress import (
     RecipeEgressViolation,
     validate_recipe_provider_payload,
 )
-from featuregen.formula.replay_authoring import run_authoring
 from featuregen.formula.replay_authoring_v2 import run_authoring_v2_replay
+from featuregen.formula.schema_v2 import FORMULA_SCHEMA_VERSION_V2
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.identity.current_principal import (
     PrincipalResolutionStatus,
@@ -92,12 +88,22 @@ from featuregen.runtime.queue import (
 
 #: The generation a payload that DECLARES nothing is: the v1 shape carries no version key and never
 #: did, and every work item written before A4 is exactly that shape.
-DEFAULT_EXPECTATION_SCHEMA = "formula-v1"
-#: The expectation generations this worker can author, each through its own complete chain.
-AUTHORABLE_EXPECTATION_SCHEMAS = frozenset(
-    {DEFAULT_EXPECTATION_SCHEMA, FORMULA_EXPECTATION_SCHEMA_V2})
+#: The expectation generations this worker can author. ONE, since the v1 arm was retired: every
+#: capturable recipe declares ``formula-v2`` (asserted registry-wide over all 317 in
+#: ``test_expectation_lane_invariant``), and ``build_recipe_authoring_egress`` — the single
+#: serialization owner for the provider payload — writes that declaration into every v2 work item.
+AUTHORABLE_EXPECTATION_SCHEMAS = frozenset({FORMULA_EXPECTATION_SCHEMA_V2})
 #: A declaration this build has never heard of. A statement about US, never about the recipe.
 EXPECTATION_SCHEMA_UNKNOWN = "EXPECTATION_SCHEMA_UNKNOWN"
+#: NO declaration at all. Kept DISTINCT from UNKNOWN because the diagnosis differs: unknown is a
+#: work item from a NEWER build — somebody else's deploy — and undeclared is OUR producer failing to
+#: say which lane it wants. An operator handed one word for both investigates the wrong thing.
+#:
+#: This used to be ``DEFAULT_EXPECTATION_SCHEMA = "formula-v1"``: absence silently selected the v1
+#: arm, correct while the v1 payload shape genuinely carried no version key. Nothing produces that
+#: shape now, so absence can only be a producer bug, and defaulting it would route a bug down a lane
+#: that no longer exists.
+EXPECTATION_SCHEMA_UNDECLARED = "EXPECTATION_SCHEMA_UNDECLARED"
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,18 +113,20 @@ class FormulaShadowWorkerOutcome:
     observation_id: str | None = None
 
 
-def declared_expectation_schema(row: Mapping[str, Any]) -> str:
+def declared_expectation_schema(row: Mapping[str, Any]) -> str | None:
     """The expectation generation this work item DECLARES, read from its frozen provider input.
 
-    Absence is ``formula-v1``: the v1 payload shape carries no version key and never did (see
-    ``recipe_egress``), and every work item written before A4 is exactly that shape.
+    ``None`` when the work item declares nothing. That used to mean ``formula-v1`` — the v1 payload
+    shape carries no version key and never did — which was true while anything produced that shape.
+    Nothing does, so absence means a producer that failed to declare, and the caller terminalizes it
+    rather than choosing a lane on its behalf.
     """
     provider_input = row.get("provider_input_json")
     expectation = (provider_input.get("formula_expectation")
                    if isinstance(provider_input, Mapping) else None)
     declared = (expectation.get("formula_schema_version")
                 if isinstance(expectation, Mapping) else None)
-    return DEFAULT_EXPECTATION_SCHEMA if declared is None else str(declared)
+    return None if declared is None else str(declared)
 
 
 def _plain(value: Any) -> Any:
@@ -292,6 +300,8 @@ def process_recipe_formula_shadow_once(
 
         declared_schema = declared_expectation_schema(row)
         if declared_schema not in AUTHORABLE_EXPECTATION_SCHEMAS:
+            unauthorable = (EXPECTATION_SCHEMA_UNDECLARED if declared_schema is None
+                            else EXPECTATION_SCHEMA_UNKNOWN)
             # Every axis stays NOT_EVALUATED, exactly like the integrity terminal: we stopped
             # before evaluating anything. authoring_axis is NOT_RUN, not UNSUPPORTED — the
             # latter is a capability verdict about a PROPOSAL, and no proposal exists.
@@ -302,9 +312,10 @@ def process_recipe_formula_shadow_once(
                 "configuration_axis": "NOT_EVALUATED",
                 "delivery_axis": "NOT_DISPATCHED",
                 "authoring_axis": "NOT_RUN",
-                "technical_axis": EXPECTATION_SCHEMA_UNKNOWN,
+                "technical_axis": unauthorable,
             })
-        authors_v2 = declared_schema == FORMULA_EXPECTATION_SCHEMA_V2
+        # Nothing below branches on the lane: reaching here IS `formula-v2`, because the frozenset
+        # above has one member. A boolean kept for one value is a branch waiting to be re-added.
 
         frozen_identity = row["request_identity_json"]
         principal = resolve_current_principal(
@@ -376,18 +387,10 @@ def process_recipe_formula_shadow_once(
             # MATERIAL inside it is not. A v2 work item frozen under the v1 author identity is
             # DRIFT, and verifying it as v1 would author a v2 formula under a prompt no v2 run
             # uses — A3 made the two identities distinct for exactly this.
-            if authors_v2:
-                verify_frozen_configuration_v2(
-                    configuration,
-                    generation_settings=current_formula_generation_settings(),
-                )
-            else:
-                verify_frozen_configuration(
-                    configuration,
-                    generation_settings=current_formula_generation_settings(),
-                    author_instruction=AUTHOR_INSTRUCTION,
-                    author_prompt_id=AUTHOR_PROMPT_ID,
-                )
+            verify_frozen_configuration_v2(
+                configuration,
+                generation_settings=current_formula_generation_settings(),
+            )
         except ConfigurationDrifted:
             return _terminalize(conn, claim, row, axes={
                 "authorization_axis": "AUTHORIZED_CURRENT",
@@ -479,45 +482,31 @@ def process_recipe_formula_shadow_once(
             lease_owner=claim.lease_owner,
             lease_fence=claim.lease_fence,
         )
-        if authors_v2:
-            # Every seam is the v2 one, and the pairing is the point: a v2 proposal validated by
-            # the v1 validator, or resolved over a body-path-keyed fact bundle, would produce a
-            # confident verdict out of the wrong evidence.
-            result = run_authoring_v2_replay(
-                conn,
-                intent,
-                client,
-                critic,
-                roles=principal.principal.role_claims,
-                actor=principal.principal,
-                frozen_configuration=configuration,
-                proposal_validator=recipe_expectation_validator_v2(expectation),
-                tool_runner=recipe_tool_runner_v2(
-                    _formula_refs(expectation), frozen_context=frozen_reads),
-                authoring_run_id=deterministic_run_id,
-                facts_reader=frozen_reads.formula_facts_v2,
-                critic_metadata_loader=frozen_reads.get_column_metadata,
-                progress_callback=renew_lease,
-                lease_fence=fence,
-            )
-        else:
-            result = run_authoring(
-                conn,
-                intent,
-                client,
-                critic,
-                roles=principal.principal.role_claims,
-                actor=principal.principal,
-                frozen_configuration=configuration,
-                proposal_validator=recipe_expectation_validator(expectation),
-                tool_runner=recipe_tool_runner(
-                    _formula_refs(expectation), frozen_context=frozen_reads),
-                authoring_run_id=deterministic_run_id,
-                facts_reader=frozen_reads.formula_facts,
-                critic_metadata_loader=frozen_reads.get_column_metadata,
-                progress_callback=renew_lease,
-                lease_fence=fence,
-            )
+        # Every seam is the v2 one, and the pairing is the point: a v2 proposal validated by the
+        # v1 validator, or resolved over a body-path-keyed fact bundle, would produce a confident
+        # verdict out of the wrong evidence. There is no longer an alternative to pair wrongly.
+        result = run_authoring_v2_replay(
+            conn,
+            intent,
+            client,
+            critic,
+            # EXPLICIT, because the orchestrator no longer defaults. This is the v2 shadow lane:
+            # every capturable recipe declares formula-v2 (asserted registry-wide in
+            # `test_expectation_lane_invariant`), and the contract the provider is driven under is
+            # now selected from this number rather than fixed.
+            formula_schema_version=FORMULA_SCHEMA_VERSION_V2,
+            roles=principal.principal.role_claims,
+            actor=principal.principal,
+            frozen_configuration=configuration,
+            proposal_validator=recipe_expectation_validator_v2(expectation),
+            tool_runner=recipe_tool_runner_v2(
+                _formula_refs(expectation), frozen_context=frozen_reads),
+            authoring_run_id=deterministic_run_id,
+            facts_reader=frozen_reads.formula_facts_v2,
+            critic_metadata_loader=frozen_reads.get_column_metadata,
+            progress_callback=renew_lease,
+            lease_fence=fence,
+        )
         result_json = _plain(result)
         if not formula_dispatches_reconciled(conn, deterministic_run_id):
             dispatch_count = _dispatch_count(conn, deterministic_run_id)

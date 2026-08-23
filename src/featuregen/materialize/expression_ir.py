@@ -67,15 +67,15 @@ from enum import Enum, StrEnum
 from typing import Any
 
 from featuregen.contracts.db import DbConn
-from featuregen.formula.canonical import filter_plain
-from featuregen.formula.schema import (
-    AggregateExpression,
-    AggregateFunction,
+from featuregen.formula.canonical_leaves import filter_plain
+from featuregen.formula.schema import AggregateExpression
+from featuregen.formula.schema_leaves import (
     FilterNode,
     FilterPredicate,
     ParameterRef,
     TypedLiteral,
 )
+from featuregen.formula.schema_v2 import AggregateExpressionV2, AggregateFunctionV2
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.inputs import PhysicalInputRequirement, derive_requirement
@@ -104,6 +104,16 @@ from featuregen.overlay.upload.crosswalk_observation import SOURCE_TO_TARGET, TA
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.operational_facts import read_operational_value
 from featuregen.overlay.upload.upload_catalog import table_ref as _catalog_table_ref
+
+#: What this compiler actually accepts. It was annotated `AggregateExpression` (V1) and has compiled
+#: V2 expressions since `compile_ir_v2` existed — the annotation was simply untrue, and it was the
+#: last thing making the SHARED expression compiler import the V1 language.
+#:
+#: The union rather than a protocol, because the fields read below (`aggregation`, `operand`,
+#: `source_relation`, `filter`, `window`, `second_operand`) are a closed set that both dataclasses
+#: declare. A protocol would accept anything shaped right, including a half-built object from a
+#: caller who forgot a field, and this compiler's whole job is to refuse those by name.
+CompilableExpression = AggregateExpression | AggregateExpressionV2
 
 __all__ = [
     "BODY_PATHS",
@@ -335,10 +345,33 @@ class ExpressionExecutionIR:
     join_plan: JoinPlan
     pit: PitSpec
     input_requirements: tuple[PhysicalInputRequirement, ...]
-    aggregation: AggregateFunction
+    #: NORMALIZED to V2's vocabulary at construction — see :func:`_as_v2_aggregate`. This field was
+    #: annotated ``AggregateFunction`` and carried whatever the formula happened to hold, so a V2
+    #: formula put an ``AggregateFunctionV2`` behind a V1 annotation and every ``is
+    #: AggregateFunction.X`` downstream silently took the else-branch.
+    aggregation: AggregateFunctionV2
     filter_tree: Mapping[str, Any] | None
     non_physical_refs: tuple[NonPhysicalRef, ...]
     operand_type: OperandTypeEvidence
+
+    def __post_init__(self) -> None:
+        """The aggregate must BE a V2 member, not merely equal to one.
+
+        Enforced rather than annotated, because the annotation alone was what let this drift: a V1
+        member behind it compares EQUAL to its V2 twin and HASHES EQUAL, so it finds the right entry
+        in the renderer's dispatch table and fails every ``is`` comparison against the same member.
+        The result is a renderer that emits code down the wrong arm — no exception, no wrong type,
+        just a different feature.
+
+        A ``TypeError`` rather than a governed refusal: a compiled IR carrying the wrong vocabulary
+        is a caller assembling the object wrongly, not a verdict about somebody's formula.
+        """
+        if type(self.aggregation) is not AggregateFunctionV2:
+            raise TypeError(
+                f"{self.expr_path} carries a {type(self.aggregation).__name__} aggregate "
+                f"({self.aggregation!r}): the compiled IR speaks V2's vocabulary, and a member of "
+                f"another enum with the same value compares equal, hashes equal, and is NOT "
+                f"identical — which passes every dispatch and fails every branch")
 
     def identity_payload(self) -> dict[str, Any]:
         """What this expression IS — no provenance, no run-time value.
@@ -551,7 +584,7 @@ def _governed_availability(
                    if basis is AvailabilityBasis.EVENT_TIME_PLUS_LAG else None))
 
 
-def _operand_type_evidence(conn: DbConn, expr: AggregateExpression) -> OperandTypeEvidence:
+def _operand_type_evidence(conn: DbConn, expr: CompilableExpression) -> OperandTypeEvidence:
     """The governed C1 logical type of THIS expression's operand, or a marker saying why there is
     none (§6, Task 8.1).
 
@@ -746,7 +779,7 @@ def _normalized_filter(node: FilterNode) -> FilterNode:
         node, children=tuple(_normalized_filter(child) for child in node.children))
 
 
-def _normalized_expression(expr: AggregateExpression) -> AggregateExpression:
+def _normalized_expression(expr: CompilableExpression) -> CompilableExpression:
     """``expr`` with every AUTHORING-SIDE logical ref folded to its canonical spelling.
 
     Applied ONCE, at the top of :func:`compile_expression` before the first ``tables.resolve``, so
@@ -833,7 +866,7 @@ def compile_expression(
     conn: DbConn,
     *,
     expr_path: str,
-    expr: AggregateExpression,
+    expr: CompilableExpression,
     grain_keys: Iterable[str],
     roles: Iterable[str] = (),
     inventory: ClusterInventoryV1,
@@ -959,6 +992,10 @@ def compile_expression(
     if unaccounted is not None:
         return unaccounted
 
+    aggregation = _as_v2_aggregate(expr.aggregation, expr_path)
+    if isinstance(aggregation, MaterializationRefused):
+        return aggregation
+
     # Read LAST, after every refusal: the evidence describes an expression that compiled, and a
     # catalog read performed for a plan that was then refused is a read nothing needed.
     operand_type = _operand_type_evidence(conn, expr)
@@ -979,11 +1016,41 @@ def compile_expression(
             window_end_inclusive=expr.window.end_inclusive.value,
             window_timezone=expr.window.timezone),
         input_requirements=tables.requirements((source_table_ref, *joined_tables)),
-        aggregation=expr.aggregation,
+        aggregation=aggregation,
         filter_tree=(None if expr.filter is None
                      else filter_plain(expr.filter, f"{expr_path}.filter")),
         non_physical_refs=tuple(_classify_non_physical(expr, expr_path)),
         operand_type=operand_type)
+
+
+def _as_v2_aggregate(
+    aggregation: object, expr_path: str,
+) -> AggregateFunctionV2 | MaterializationRefused:
+    """Cross a formula's aggregate into V2's vocabulary — ONCE, here, and by name.
+
+    **The crossing has to be explicit because the accidental version of it half-works.**
+    ``AggregateFunctionV2.SUM is AggregateFunction.SUM`` is ``False`` while
+    ``AggregateFunctionV2.SUM == AggregateFunction.SUM`` is ``True`` and the two HASH EQUAL — so a
+    V2 member looked up in a V1-keyed dispatch table finds the right entry, and the same member
+    compared with ``is`` takes the else-branch. Dispatch that works and identity that does not is
+    the worst of both: the renderer emits code, and emits the wrong one.
+
+    Compiling both languages into one vocabulary removes the question rather than answering it
+    everywhere it is asked.
+
+    Returns:
+        The V2 member, or a refusal naming the aggregate. An aggregate outside V2's vocabulary is a
+        statement about the formula's language rather than about this expression, so it refuses
+        rather than passing an unrecognised member downstream to be compared against nothing.
+    """
+    try:
+        return AggregateFunctionV2(str(aggregation))
+    except ValueError:
+        return MaterializationRefused(
+            CompilationRefusalCode.FORMULA_SCHEMA_UNSUPPORTED,
+            f"{expr_path} aggregates with {aggregation!r}, which is not in V2's vocabulary: the "
+            f"compiled IR speaks one aggregate language, and a member outside it would be compared "
+            f"against every arm of the renderer's dispatch and match none")
 
 
 def _column_of(column_ref: str) -> str | None:
@@ -1310,7 +1377,7 @@ def join_key_ref(catalog_source: str, step_ref: str) -> str:
 
 
 def _refuse_unaccounted(
-    expr: AggregateExpression, grain: tuple[str, ...], expr_path: str, read: frozenset[str]
+    expr: CompilableExpression, grain: tuple[str, ...], expr_path: str, read: frozenset[str]
 ) -> MaterializationRefused | None:
     """§2.1 — every ref reachable from the expression was READ or explicitly classified.
 

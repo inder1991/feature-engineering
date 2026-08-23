@@ -10,6 +10,11 @@ from typing import Any, Literal, cast
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula.audited import current_formula_generation_settings
 from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID, author_formula
+from featuregen.formula.authoring_result_leaves import (
+    DISPOSITION_POLICY_VERSION,
+    AuthoringAxes,
+    AuthorityFailure,
+)
 from featuregen.formula.capability import (
     CAPABILITY_POLICY_VERSION,
     classify_formula_capability,
@@ -26,10 +31,9 @@ from featuregen.formula.critic import (
     CriticReview,
     critique,
 )
-from featuregen.formula.frozen_configuration import (
-    FrozenAuthorCriticConfigurationV1,
-    verify_frozen_configuration,
-)
+from featuregen.formula.frozen_configuration import FrozenAuthorCriticConfigurationV1
+from featuregen.formula.frozen_configuration_v1 import verify_frozen_configuration
+from featuregen.formula.intent_material import _intent_material
 from featuregen.formula.output_authority import (
     ExprFacts,
     ExternalRequirement,
@@ -43,24 +47,17 @@ from featuregen.formula.replay_trace import (
     load_verified_checkpoint,
     open_authoring_run,
 )
-from featuregen.formula.result import (
-    DISPOSITION_POLICY_VERSION,
-    AuthoringAxes,
-    AuthoringResult,
-    AuthorityFailure,
-    derive_disposition,
-)
+from featuregen.formula.result import AuthoringResult, derive_disposition
 from featuregen.formula.schema import (
     OUTPUT_POLICY_VERSION,
-    AdditivityClass,
     DiffBody,
     FormulaOutputPolicyV1,
     RatioBody,
-    SchemaError,
     TypedFormulaProposalV1,
     TypedFormulaV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import AdditivityClass, SchemaError
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.operational_facts import read_operational_value
 
@@ -76,16 +73,6 @@ def _actor_json(actor: IdentityEnvelope | None) -> dict | None:
         "authenticated": actor.authenticated,
         "auth_method": actor.auth_method,
         "role_claims": list(actor.role_claims),
-    }
-
-
-def _intent_material(intent) -> dict:
-    return {
-        "name": intent.name,
-        "hypothesis": intent.hypothesis,
-        "target_entity": intent.target_entity,
-        "target_grain_keys": list(intent.target_grain_keys),
-        "recipe_authoring_context": getattr(intent, "recipe_authoring_context", None),
     }
 
 

@@ -16,11 +16,7 @@ import pytest
 from tests.featuregen.formula import factories as f
 
 from featuregen.formula.canonical import canonical_json, formula_content_hash
-from featuregen.formula.schema import (
-    FilterBool,
-    FilterBoolOp,
-    SchemaError,
-)
+from featuregen.formula.schema_leaves import FilterBool, FilterBoolOp, SchemaError
 
 # ---- stability + shape ----
 

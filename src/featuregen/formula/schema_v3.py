@@ -27,8 +27,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     DecimalPolicy,
+    ExpectedOutput,
     FilterNode,
     Grain,
     LogicalRef,
@@ -184,7 +185,11 @@ class TypedFormulaProposalV3:
     body: FormulaBodyV3
     parameters: tuple[ParameterDecl, ...]
     decimal: DecimalPolicy
-    expected_output: object | None
+    #: TYPED, since the v1 retirement made `ExpectedOutput` a shared leaf. It was ``object | None``
+    #: only because the type lived in a V1-named module — and that looseness is what let
+    #: `output_intent_v2` read it with `getattr(..., None)`, turning a renamed field into a silent
+    #: ``unit=None`` rather than a refusal.
+    expected_output: ExpectedOutput | None
     allocation_policy_ref: str = ""
 
 

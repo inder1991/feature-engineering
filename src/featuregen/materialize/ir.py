@@ -69,9 +69,9 @@ from featuregen.formula.schema import (
     FinalOperation,
     FormulaOutputPolicyV1,
     RatioBody,
-    ZeroDenominator,
     body_expressions,
 )
+from featuregen.formula.schema_leaves import ZeroDenominator
 from featuregen.materialize.admission import AdmittedFeature
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused

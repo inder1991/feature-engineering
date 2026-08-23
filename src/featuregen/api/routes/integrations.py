@@ -81,7 +81,6 @@ from featuregen.connectors.openmetadata import (
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.ingest import ingest_upload
-from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -90,6 +89,7 @@ from featuregen.overlay.upload.ingestion_run import (
     terminalize_run,
     terminalize_run_durable,
 )
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
 from featuregen.overlay.upload.stage_report import StageRecorder, record_stage

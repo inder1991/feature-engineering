@@ -39,6 +39,15 @@ ACTIVATION_ACTIONS = ("save_idea", "create_contract", "author_formula",
 
 MATERIALIZATION_READY = "MATERIALIZATION_READY"
 
+# ── §6 — the formula-schema-support TRI-STATE. `_formula_schema_supported` used to return a bool
+# whose False conflated "the engine said no" with "nobody measured", so an unreviewed recipe was
+# told "engine support not implemented" — a FALSE STATEMENT that sent operators to the engine team
+# for a governance problem. Four values, and each failure surfaces under its own name.
+SCHEMA_SUPPORT_SUPPORTED = "supported"                        # classify ran and said yes
+SCHEMA_SUPPORT_UNSUPPORTED = "unsupported"                    # classify ran and said NO
+SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED = "unmeasured_unreviewed"  # nothing reviewed to measure
+SCHEMA_SUPPORT_UNMEASURED_ENGINE = "unmeasured_engine"        # measurement absent or it raised
+
 
 class ActivationPolicyError(ValueError):
     """An unknown action or malformed facts — a PROGRAMMER error, never a user outcome."""
@@ -85,7 +94,9 @@ class CurrentActivationStateV1:
     #                                             (this workflow is new; it has no compat debt)
     effective_readiness: str = ""               # current effective readiness, re-folded
     formula_expectation_revision: str = ""
-    formula_schema_supported: bool = False      # the execution engine ADVERTISES this schema
+    formula_schema_support: str = SCHEMA_SUPPORT_UNMEASURED_ENGINE  # §6 tri-state; the field
+    #                                             was a bool, renamed so no caller can hand the
+    #                                             new str to the old truthiness check unnoticed
     requirements_closed: bool = False           # every typed requirement has a recorded result
     execution_authority_evaluated: bool = False  # the C2 execution floor was actually folded
     execution_floor_met: bool = False           # every bound operand clears execution_at_governed
@@ -184,11 +195,27 @@ def _materialization_blockers(frozen: FrozenOptionFactsV1,
             R.FORMULA_NOT_REVIEWED,
             "author and review a formula expectation for this recipe — execution is "
             "unavailable until then (contract-authoring is not affected)"))
-    if not current.formula_schema_supported:
+    support = current.formula_schema_support
+    if support == SCHEMA_SUPPORT_UNSUPPORTED:
+        # §6: reserved for the case it names — classify_demands_for_engine RAN and said no.
         blockers.append(BlockerV1(
             R.FORMULA_SCHEMA_UNSUPPORTED,
-            "the execution engine does not advertise this formula schema — engine support "
-            "not implemented; never downgrade to an older schema"))
+            "the execution engine was asked and does not advertise this formula schema — "
+            "never downgrade to an older schema"))
+    elif support == SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED:
+        # §6: missing review must not wear an engine-capability code. FORMULA_NOT_REVIEWED
+        # (above) already carries the governance fact; this names why support is unmeasured.
+        blockers.append(BlockerV1(
+            R.FORMULA_REVIEW_UNMEASURED,
+            "engine support was never measured — no reviewed formula expectation exists to "
+            "measure; a governance gap, not an engine one"))
+    elif support != SCHEMA_SUPPORT_SUPPORTED:
+        # Unknown engine, the classification raised, or an unrecognized value: an unmeasured
+        # engine is not a supported one, and an unrecognized measurement is an unmeasured one.
+        blockers.append(BlockerV1(
+            R.ENGINE_CAPABILITY_UNMEASURED,
+            "the engine-capability measurement did not run or did not resolve — re-measure "
+            "before relying on an engine claim"))
     if (frozen.formula_expectation_revision
             and frozen.formula_expectation_revision != current.formula_expectation_revision):
         blockers.append(BlockerV1(R.ACTIVATION_STATE_DRIFTED, _REGENERATE_STEP))
@@ -239,5 +266,7 @@ def decide_all_actions(frozen: FrozenOptionFactsV1,
 
 __all__ = ["ACTIVATION_ACTIONS", "ACTIVATION_POLICY_VERSION", "ActivationDecisionV1",
            "ActivationPolicyError", "BlockerV1", "CurrentActivationStateV1",
-           "FrozenOptionFactsV1", "MATERIALIZATION_READY", "activation_decision",
+           "FrozenOptionFactsV1", "MATERIALIZATION_READY", "SCHEMA_SUPPORT_SUPPORTED",
+           "SCHEMA_SUPPORT_UNSUPPORTED", "SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED",
+           "SCHEMA_SUPPORT_UNMEASURED_ENGINE", "activation_decision",
            "decide_all_actions"]

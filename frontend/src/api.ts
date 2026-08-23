@@ -1711,8 +1711,165 @@ export function contractConsideredSet(
   })
 }
 
+// ── Draft formula: ASYNC, and NOT a selection ────────────────────────────────────────────────────
+// Requesting a formula for one candidate. Returns 202 immediately with an id to poll — never a
+// formula, because producing one is two model calls plus validation plus admission and none of that
+// belongs on an HTTP request.
+//
+// **This does not select the candidate.** `contractDraft` below records a Gate-1 choice as its first
+// act; this deliberately does not, so a user can read a formula and THEN decide. Two functions
+// because they are two different acts, not one function with a flag.
+//
+// **A double-click costs nothing.** The server is idempotent on the formula identity, so a second
+// request returns the first draft with `created: false` — which is why the caller can report
+// "already drafting" instead of a spend that did not happen.
+export interface FormulaDraftRequested {
+  formula_draft_id: string
+  status: string
+  stage: string
+  created: boolean
+  detail: string
+}
+
+export interface FormulaDraftStatus {
+  formula_draft_id: string
+  considered_revision_id: string
+  option_id: string
+  state: 'REQUESTED' | 'AUTHORING' | 'CRITIC_REVIEW' | 'VALIDATING' | 'ADMISSION'
+       | 'READY' | 'BLOCKED' | 'FAILED' | 'CANCELLED'
+  // The words to SHOW. Server-owned, so the API and the screen cannot describe one state with two
+  // different sentences.
+  stage: string
+  terminal: boolean
+  formula_source: string
+  authoring_run_id: string | null
+  formula_content_hash: string | null
+  formula: Record<string, unknown> | null
+  // BLOCKED is a product result and these are the answer, not an error payload.
+  blockers: { code: string; reason: string }[]
+  failure_reason: string | null
+}
+
+export function requestFormulaDraft(
+  revisionId: string,
+  optionId: string,
+): Promise<FormulaDraftRequested> {
+  return post(
+    `/considered-revisions/${encodeURIComponent(revisionId)}`
+    + `/options/${encodeURIComponent(optionId)}/formula-drafts`,
+    {},
+  )
+}
+
+export function getFormulaDraft(formulaDraftId: string): Promise<FormulaDraftStatus> {
+  return request(`/formula-drafts/${encodeURIComponent(formulaDraftId)}`)
+}
+
+// ── Step 5a — the durable recipe-to-code coordinator ─────────────────────────────────────────────
+// One explicit user act, driven server-side to a preview: strategies resolve, drafts author,
+// bindings pin, the build set declares, the decision service decides, the generation seals.
+// The PLAN is a question (writes nothing, quotes the cost basis); the POST is the act.
+
+export interface CodeGenMemberPlan {
+  position: number
+  selection_revision_id: string
+  considered_revision_id: string
+  option_id: string
+  // SERVER vocabulary, verbatim: 'REVIEWED_RECIPE_BLUEPRINT' | 'LLM_AUTHORED' | ... A badge is
+  // never computed in the browser beyond mapping these exact strings to plain words.
+  formula_strategy: string
+  blockers: string[]
+  warnings: string[]
+}
+
+export interface CodeGenerationPlan {
+  job_content_identity_hash: string
+  members: CodeGenMemberPlan[]
+  deterministic_members: number
+  llm_members: number
+  estimated_provider_calls: number
+  call_envelope_per_llm_member: number
+  spend_approval_required: boolean
+  spend_approval: {
+    spend_authorization_id: string; max_calls: number; max_tokens: number
+    max_cost: string; currency: string
+  } | null
+  decision_preview: { allowed: boolean; blockers: string[]; warnings: string[] }
+  detail: string
+}
+
+export interface CodeGenerationRequestBody {
+  considered_revision_id: string
+  target_reading_revision_id: string
+  selection_revision_ids: string[]
+  environment_id: string
+  logical_group_name: string
+  declaration: Record<string, unknown>
+  execution_parameters: Record<string, unknown>
+  spend_approval?: {
+    max_calls: number; max_tokens: number; max_cost: string; currency: string
+    pricing_version: string; expires_at: string
+  }
+}
+
+export interface CodeGenerationJobMember {
+  position: number
+  selection_revision_id: string
+  option_id: string
+  formula_strategy: string
+  member_state: string
+  formula_draft_id: string | null
+  selection_formula_binding_id: string | null
+  blockers: string[]
+  warnings: string[]
+}
+
+export interface CodeGenerationJob {
+  job_id: string
+  status: string
+  terminal: boolean
+  requested_by: string
+  build_set_revision_id: string | null
+  generation_request_id: string | null
+  sealed_artifact_id: string | null
+  environment_id: string
+  logical_group_name: string
+  terminal_detail: Record<string, unknown> | null
+  members: CodeGenerationJobMember[]
+  actions: {
+    action: string; resource_identity_hash: string | null
+    authorization_revision_id: string | null; decision_revision_id: string | null; state: string
+  }[]
+  events: { event_seq: number; stage: string; detail: Record<string, unknown>
+    recorded_at: string }[]
+}
+
+export function planCodeGeneration(body: CodeGenerationRequestBody): Promise<CodeGenerationPlan> {
+  return post('/code-generation-jobs/plan', body)
+}
+
+export function requestCodeGeneration(
+  body: CodeGenerationRequestBody,
+): Promise<{ job_id: string; created: boolean; detail: string }> {
+  return post('/code-generation-jobs', body)
+}
+
+export function getCodeGenerationJob(jobId: string): Promise<CodeGenerationJob> {
+  return request(`/code-generation-jobs/${encodeURIComponent(jobId)}`)
+}
+
+export function cancelCodeGenerationJob(
+  jobId: string,
+): Promise<{ job_id: string; status: string; detail: string }> {
+  return post(`/code-generation-jobs/${encodeURIComponent(jobId)}/cancel`, {})
+}
+
 // Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
 // the draft. In confirmation-required mode chosen_option_id is the opaque option_id, never display name.
+//
+// SELECT AND DRAFT, in that order — its first act is to record a Gate-1 choice, so calling it IS
+// choosing. `requestFormulaDraft` above is the one that only drafts. Any control wired to this must
+// say so; a button labelled "Draft formula" on this call would select behind the user's back.
 export function contractDraft(
   intentId: string,
   chosenSource: 'anchor' | 'alternative',
@@ -4357,4 +4514,93 @@ export function getPublicationStatus(
     logical_group_name: logicalGroupName,
   })
   return request(`/feature-execution/publications?${query}`)
+}
+
+// ---------------------------------------------------------------------------
+// Feature run spine (read-only). The server DERIVES every field below from the
+// stores that already hold the evidence — there is no run-lifecycle table and
+// no write endpoint, so this client has reads only, by design.
+// ---------------------------------------------------------------------------
+
+export interface FeatureRunSummary {
+  generation_run_id: string
+  display_name: string | null
+  // True when the run predates the identity spine, so it has no run_identity row. It is an
+  // honest gap in the record, never a failure of the run.
+  pre_spine: boolean
+  owner_subject: string | null
+  created_at: string
+}
+
+export interface FeatureRunGroup {
+  // Grouping happens WITHIN a page, so one intent's runs can open two groups (or split across a
+  // page boundary) and a null intent_id is the "no intent" bucket, not a shared intent.
+  intent_id: string | null
+  hypothesis: string | null
+  runs: FeatureRunSummary[]
+}
+
+export interface FeatureRunList {
+  groups: FeatureRunGroup[]
+  // Opaque keyset cursor minted by the server; null means this was the last page.
+  next_cursor: string | null
+}
+
+export interface RunRailStage {
+  stage: string
+  state: string
+  // Why a stage is UNAVAILABLE — a socket whose machinery does not exist yet. NOT_STARTED (a
+  // stage that could actually run) carries none.
+  reason_code: string | null
+}
+
+export interface RunAuthoringRow {
+  formula_draft_id: string
+  option_id: string
+  // Two axes, never one field: state/rail_state is the immutable historical outcome, eligibility
+  // is derived at read time from the retirement row.
+  state: string
+  rail_state: string
+  eligibility: 'current' | 'withdrawn'
+  retirement_reason: string | null
+}
+
+export interface FeatureRunDetail {
+  generation_run_id: string
+  pre_spine: boolean
+  owner_subject: string | null
+  display_name: string | null
+  description: string | null
+  intent: { intent_id: string; hypothesis: string } | null
+  identity: {
+    run_identity_hash: string
+    considered_revision_id: string
+    metadata_snapshot_id: string
+  } | null
+  milestones: {
+    choose_candidates: {
+      option_id: string
+      considered_revision_id: string
+      chosen_at: string
+    }[]
+    // Nothing can write a binding in the foundation, so this is always empty today.
+    bind_selections: unknown[]
+  }
+  authoring: RunAuthoringRow[]
+  rail: RunRailStage[]
+}
+
+export function listFeatureRuns(cursor?: string): Promise<FeatureRunList> {
+  // The cursor is `${created_at}|${generation_run_id}` — `:`, `+` and `|` all mean something else
+  // in a query string, so the opaque value is encoded whole; a cursor that reaches the route
+  // mangled is a 422, not a silently different page. The parameter is omitted entirely for the
+  // first page rather than sent empty.
+  const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  return request(`/feature-runs${q}`)
+}
+
+export function getFeatureRunDetail(runId: string): Promise<FeatureRunDetail> {
+  // 404 covers both absence and denial on this route, deliberately — a 403 would confirm the id
+  // exists. The client must not try to tell them apart.
+  return request(`/feature-runs/${encodeURIComponent(runId)}`)
 }

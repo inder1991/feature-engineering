@@ -113,6 +113,10 @@ class DatasetStoryV1:
     dataset_tables: tuple[str, ...]
     cross_dataset: bool
     codes: tuple[str, ...]
+    #: The grain COLUMN's object ref — the key `population_ref`'s rows are identified by. Same
+    #: governed origin as the table: the bound entity-key operand whose grain flag was DECLARED.
+    #: Defaulted (and therefore last) so every existing construction site stays valid.
+    population_key_ref: str | None = None
 
 
 def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
@@ -123,6 +127,7 @@ def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
     operands_by_role = {op.role: op for op in request.operands}
     tables: list[str] = []
     population: str | None = None
+    population_key: str | None = None
     for verdict in verdicts:
         if verdict.status != "bound" or not verdict.selected_ref:
             continue
@@ -135,6 +140,10 @@ def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
         if (operand is not None and operand.operand_class == "entity_key"
                 and column.is_grain and population is None):
             population = column.table
+            # The same governed fact, keeping BOTH halves. `population_ref` answers "whose rows?";
+            # this answers "keyed by which column?" — which is what authoring needs and what was
+            # being dropped on the floor here.
+            population_key = verdict.selected_ref
     codes: list[str] = []
     if population is None:
         codes.append(R.POPULATION_DATASET_UNDECLARED)
@@ -142,6 +151,7 @@ def fold_dataset_story(request, verdicts, context) -> DatasetStoryV1:
         codes.append(R.RELATIONSHIP_REQUIRED)
     return DatasetStoryV1(
         population_ref=population,
+        population_key_ref=population_key,
         population_basis="declared_grain" if population else "undeclared",
         dataset_tables=tuple(tables),
         cross_dataset=len(tables) > 1,
@@ -267,6 +277,20 @@ def fold_frozen_binding_plan(request, verdicts, story, pit_text: str,
         "catalog_source": catalog_source,
         "source_table": story.dataset_tables[0] if story.dataset_tables else "",
         "population_ref": story.population_ref,
+        # WHAT THIS FEATURE IS COMPUTED PER — the grain COLUMN, not just its table.
+        # `formula_draft_worker._frozen_facts` refuses a draft at REQUESTED, before any provider
+        # call, when `idea.grain_refs` is empty ("authoring against a guessed grain produces a
+        # formula for a feature nobody asked for"), and the serving projection takes no `conn` and
+        # so could never resolve it. Every governed-path candidate therefore carried no grain and
+        # could never be authored — LLM-proposed ones included.
+        #
+        # ▲ TAKEN FROM THE STORY, which already had it. The fold below binds the population from
+        # the entity-key operand whose `is_grain` flag was DECLARED in the upload, so the ref is
+        # already bound and already governed. An earlier attempt re-queried `graph_node` per
+        # recipe — which the lens forbids (zero reloads, a fixed query budget) and its own tests
+        # caught immediately. The fact was in hand; only the table half was being kept.
+        "grain_refs": ([[catalog_source, story.population_key_ref]]
+                       if story.population_key_ref else []),
         "read_set": list(read_set),
         "role_bindings": {role: ref for role, ref in sorted(bound.items())},
         "pit": pit_text,

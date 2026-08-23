@@ -48,7 +48,8 @@ UNREVIEWED = "balance_slope"
 #: Every rule that lives ONLY on the materialization rung — the closed set this suite measures
 #: against, so "these blocked and that one cleared" is provable rather than asserted.
 MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REVIEWED,
-                        R.FORMULA_SCHEMA_UNSUPPORTED, R.EXTERNAL_VALIDATION_OUTSTANDING,
+                        R.FORMULA_SCHEMA_UNSUPPORTED, R.FORMULA_REVIEW_UNMEASURED,
+                        R.ENGINE_CAPABILITY_UNMEASURED, R.EXTERNAL_VALIDATION_OUTSTANDING,
                         R.EXECUTION_AUTHORITY_UNEVALUATED, R.EXECUTION_AUTHORITY_UNMET}
 
 #: What a BOUND option with a frozen plan actually blocks on today, MEASURED rather than assumed:
@@ -60,9 +61,10 @@ MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REV
 #: fell at C2 for THIS (reviewed) exemplar: the engine registry advertises its one demand.
 BLOCKING_TODAY = {R.READINESS_NOT_MATERIALIZATION_READY, R.EXECUTION_AUTHORITY_UNMET}
 #: An unreviewed recipe carries two MORE codes, coupled by design: no review means no reviewed
-#: demands for C2 to compare, so `FORMULA_SCHEMA_UNSUPPORTED` stays exactly as long as
-#: `FORMULA_NOT_REVIEWED` does.
-UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_SCHEMA_UNSUPPORTED}
+#: demands for C2 to compare. §6's tri-state renamed the second half of the coupling — the
+#: unmeasured support question surfaces as `FORMULA_REVIEW_UNMEASURED`, never as the false
+#: engine claim `FORMULA_SCHEMA_UNSUPPORTED` used to make here.
+UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_REVIEW_UNMEASURED}
 
 
 @pytest.fixture(autouse=True)
@@ -188,7 +190,7 @@ def test_an_allowed_option_mints_a_request_carrying_its_provenance(
         return dataclasses.replace(
             genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id,
                     contract_id=contract_id),
-            effective_readiness="MATERIALIZATION_READY", formula_schema_supported=True,
+            effective_readiness="MATERIALIZATION_READY", formula_schema_support="supported",
             requirements_closed=True, execution_authority_evaluated=True,
             execution_floor_met=True, authoring_floor_met=True, review_current=True,
             policy_revisions_current=True, uoa_current=True, snapshot_freshness="current")
@@ -266,7 +268,7 @@ def test_the_option_key_is_part_of_the_requests_IDENTITY(client, admin_headers, 
         return dataclasses.replace(
             genuine(conn, frozen=frozen, snapshot_id=snapshot_id, intent_id=intent_id,
                     contract_id=contract_id),
-            effective_readiness="MATERIALIZATION_READY", formula_schema_supported=True,
+            effective_readiness="MATERIALIZATION_READY", formula_schema_support="supported",
             requirements_closed=True, execution_authority_evaluated=True,
             execution_floor_met=True, authoring_floor_met=True, review_current=True,
             policy_revisions_current=True, uoa_current=True, snapshot_freshness="current")

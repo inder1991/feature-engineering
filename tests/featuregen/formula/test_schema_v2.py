@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from featuregen.formula.parse_v2 import parse_proposal_v2, parse_versioned
-from featuregen.formula.schema import SchemaError, TypedFormulaProposalV1
+from featuregen.formula.schema import TypedFormulaProposalV1
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.schema_v2 import TypedFormulaProposalV2
 
 _GOLD_V1 = Path(__file__).parent / "gold_fixtures"
@@ -131,7 +132,7 @@ def test_the_at_cutoff_group_and_the_rule_table_are_total():
     the rule table is TOTAL over the enum (a member without a rule cannot ship), and additivity is
     a view over it — last_known is honestly SEMI-additive, like the balances it reads."""
     from featuregen.formula.operations_v2 import OPERATION_RULES
-    from featuregen.formula.schema import AdditivityClass
+    from featuregen.formula.schema_leaves import AdditivityClass
     from featuregen.formula.schema_v2 import AGGREGATE_ADDITIVITY_V2, AggregateFunctionV2
 
     for name in ("13_last_known_balance_at_cutoff.json", "14_first_known_balance_in_window.json",

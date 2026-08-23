@@ -346,9 +346,11 @@ def test_author_reasoning_and_tool_trace_never_reach_the_critic(db):
 
 
 def test_critique_signature_has_no_slot_for_an_author_trace():
+    """`spend` (2026-08-23) is §11.2's ceiling binding — a money-guard fact about the CALL, not
+    author material; the pinned point stands: nothing here can carry the author's reasoning."""
     assert set(inspect.signature(critique).parameters) == {
         "conn", "intent", "proposal", "client", "roles", "actor", "authoring_run_id",
-        "provider_contract", "metadata_loader", "progress_callback", "lease_fence"}
+        "provider_contract", "metadata_loader", "progress_callback", "lease_fence", "spend"}
 
 
 def test_findings_hash_is_order_independent_end_to_end(db):

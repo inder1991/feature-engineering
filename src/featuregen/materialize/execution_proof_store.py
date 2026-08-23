@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
 from featuregen.materialize.operator_graph_v2 import OperatorKindV2
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.publication_revisions import OperatorExecutionProofV1
 
 __all__ = [
@@ -176,41 +177,91 @@ def proof_for_bytes(conn: DbConn, generated_project_hash: str) -> str | None:
     return None if row is None else row[0]
 
 
-def record_renderer_dispatch(
-    conn: DbConn, *, engine_id: str, dispatchable: Mapping[str, bool],
-) -> None:
-    """Record fact ONE for every operator kind: whether this build's renderer can emit it.
+#: The typed signature a capability row is about. A KIND is the shape of execution (small, closed,
+#: changes rarely); a VARIANT is which one within that kind. `("aggregate", "sum")` is supported
+#: while `("aggregate", "avg")` is not, and a table keyed on the kind alone can state neither.
+OperatorSignature = tuple[str, str]
 
-    ``dispatchable`` must cover the whole vocabulary. A kind left out would read as "not
-    dispatchable" to any caller that defaults, and as "unknown" to one that does not — and the
-    renderer either has a branch or it does not, so there is no third answer to record.
+#: The variant recorded for a kind that genuinely has only one form. Not an empty string: a blank
+#: would read as "unknown variant" to anyone scanning the column, and the CHECK forbids it anyway.
+SOLE_VARIANT = "*"
+
+
+def renderer_build_hash() -> str:
+    """A fingerprint of WHAT THIS BUILD'S RENDERER CAN EMIT.
+
+    Derived from the renderer describing itself, never typed out — the same discipline
+    `engine_capability.py` already applies to its advertised aggregations, and for a stronger
+    reason: this value decides whether an execution proof still means anything.
+
+    An execution proof says "we ran this and the number was right". That is a claim ABOUT A BUILD.
+    Without a fingerprint, changing the renderer leaves the proof green while the code it was about
+    no longer exists — the proof outlives its subject. With one, a moved renderer simply has no rows
+    yet, and an operator with no row for the current build is unsupported, which is exactly true.
+
+    Derived from the DISPATCH SURFACE rather than from module bytes. A comment or a docstring should
+    not invalidate every proof in the system; a changed set of emittable operations must.
     """
+    from featuregen.materialize.render.nodes_compute import renderable_aggregations
+
+    surface = {
+        "aggregations": sorted(fn.value for fn in renderable_aggregations()),
+        "kinds": sorted(kind.value for kind in OperatorKindV2),
+    }
+    return f"rbh-{canonical_hash(surface)[:32]}"
+
+
+def record_renderer_dispatch(
+    conn: DbConn,
+    *,
+    engine_id: str,
+    dispatchable: Mapping[OperatorSignature, bool],
+    build_hash: str | None = None,
+) -> None:
+    """Record fact ONE for every operator SIGNATURE: whether this build's renderer can emit it.
+
+    ``dispatchable`` must cover every kind in the vocabulary — a kind left out would read as "not
+    dispatchable" to a caller that defaults and as "unknown" to one that does not, and the renderer
+    either has a branch or it does not. Variants are NOT exhaustively required: a kind may carry
+    many, and which ones exist is the calculation vocabulary's business, not the topology's.
+
+    Writes are scoped to ``build_hash``, so recording dispatch for a new build never silently
+    inherits an older build's proofs.
+    """
+    build = build_hash or renderer_build_hash()
     vocabulary = {kind.value for kind in OperatorKindV2}
-    missing = sorted(vocabulary - set(dispatchable))
+    covered = {kind for kind, _variant in dispatchable}
+    missing = sorted(vocabulary - covered)
     if missing:
         raise ValueError(
             f"the dispatch record omits {missing}: the renderer either has a branch for an operator "
             f"or it does not, so an omitted kind is not a third answer — it is a claim nobody made "
             f"that a caller will read as one")
-    unknown = sorted(set(dispatchable) - vocabulary)
+    unknown = sorted(covered - vocabulary)
     if unknown:
         raise ValueError(
             f"the dispatch record names {unknown}, which are not operator kinds: advertising a "
             f"capability for something the graph vocabulary cannot express advertises nothing")
 
-    for kind, can_render in sorted(dispatchable.items()):
+    for (kind, variant), can_render in sorted(dispatchable.items()):
         conn.execute(
-            "INSERT INTO engine_operator_capability (engine_id, operator_kind, "
-            "renderer_dispatchable) VALUES (%s, %s, %s) "
-            "ON CONFLICT (engine_id, operator_kind) DO UPDATE SET "
-            "renderer_dispatchable = EXCLUDED.renderer_dispatchable",
-            (engine_id, kind, can_render))
+            "INSERT INTO engine_operator_capability (engine_id, operator_kind, operator_variant, "
+            "renderer_build_hash, renderer_dispatchable) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (engine_id, operator_kind, operator_variant, renderer_build_hash) "
+            "DO UPDATE SET renderer_dispatchable = EXCLUDED.renderer_dispatchable",
+            (engine_id, kind, variant, build, can_render))
 
 
 def set_execution_proof(
-    conn: DbConn, *, engine_id: str, operator_kind: str, proof_hash: str,
+    conn: DbConn,
+    *,
+    engine_id: str,
+    operator_kind: str,
+    proof_hash: str,
+    operator_variant: str = SOLE_VARIANT,
+    build_hash: str | None = None,
 ) -> None:
-    """Attach fact TWO — a proof — to an operator's capability row.
+    """Attach fact TWO — a proof — to one operator signature under one build.
 
     Separate from :func:`record_renderer_dispatch` because the two facts are established by
     different things at different times: dispatch by building the renderer, proof by running the
@@ -218,51 +269,110 @@ def set_execution_proof(
     of a build.
 
     Raises:
-        ValueError: no capability row for this operator, so there is nothing to attach a proof to —
-            an operator with a proof and no dispatch record would be "proved" for a renderer that
-            cannot emit it.
+        ValueError: no capability row for this signature under this build, so there is nothing to
+            attach a proof to. This now also catches a proof aimed at a build whose renderer never
+            recorded the operator — previously invisible, because the build was not part of the key.
     """
+    build = build_hash or renderer_build_hash()
     changed = conn.execute(
         "UPDATE engine_operator_capability SET execution_proof_hash = %s "
-        "WHERE engine_id = %s AND operator_kind = %s",
-        (proof_hash, engine_id, operator_kind)).rowcount
+        "WHERE engine_id = %s AND operator_kind = %s AND operator_variant = %s "
+        "AND renderer_build_hash = %s",
+        (proof_hash, engine_id, operator_kind, operator_variant, build)).rowcount
     if changed != 1:
         raise ValueError(
-            f"no capability row for ({engine_id!r}, {operator_kind!r}): a proof attached to an "
-            f"operator with no dispatch record would claim an operator is proved for a renderer "
-            f"that may not be able to emit it at all")
+            f"no capability row for ({engine_id!r}, {operator_kind!r}, {operator_variant!r}) under "
+            f"build {build!r}: a proof attached to an operator with no dispatch record would claim "
+            f"an operator is proved for a renderer that may not be able to emit it at all")
 
 
-def advertised_operators(conn: DbConn, *, engine_id: str) -> tuple[str, ...]:
-    """The operators this engine ADVERTISES — ``renderer-dispatchable ∩ execution-proved`` (S13).
+def advertised_operators(
+    conn: DbConn, *, engine_id: str, build_hash: str | None = None,
+) -> tuple[OperatorSignature, ...]:
+    """The signatures this engine ADVERTISES — ``renderer-dispatchable ∩ execution-proved``, FOR ONE
+    BUILD.
 
     The intersection, computed in ONE place, because that is what "supported" means (invariant 11)
     and three surfaces computing it three ways is how one of them starts advertising an operator on
-    half the evidence. An operator with no capability row is absent, never assumed: this build has
-    not established either fact about it.
+    half the evidence. A signature with no capability row is absent, never assumed.
 
     Deliberately NOT the union and not the dispatchable set. A renderer branch with no proof is a
     branch nobody has run against reviewed gold; a proof for an operator this build cannot emit is a
-    proof about a different build. Advertising either would be advertising half a claim.
+    proof about a different build — and scoping the read to ``build_hash`` is what makes that last
+    sentence enforceable rather than merely true.
     """
-    return tuple(row[0] for row in conn.execute(
-        "SELECT operator_kind FROM engine_operator_capability "
-        "WHERE engine_id = %s AND renderer_dispatchable AND execution_proof_hash IS NOT NULL "
-        "ORDER BY operator_kind", (engine_id,)).fetchall())
+    build = build_hash or renderer_build_hash()
+    return tuple((row[0], row[1]) for row in conn.execute(
+        "SELECT operator_kind, operator_variant FROM engine_operator_capability "
+        "WHERE engine_id = %s AND renderer_build_hash = %s "
+        "AND renderer_dispatchable AND execution_proof_hash IS NOT NULL "
+        "ORDER BY operator_kind, operator_variant", (engine_id, build)).fetchall())
+
+
+def renderer_supported_operators(
+    conn: DbConn, *, engine_id: str, build_hash: str | None = None,
+) -> tuple[OperatorSignature, ...]:
+    """The signatures this build's renderer CAN EMIT — dispatch only, no proof required.
+
+    **This is the gate for CODE GENERATION, and it is deliberately weaker than
+    :func:`advertised_operators`.** The three claims a capability row can support are not the same
+    claim, and conflating them is what made the earlier model unusable:
+
+    * *renderer-supported* — this build can emit it. Decides whether a formula compiles into code a
+      person can READ. Derivable from the renderer, cheap, and true or false today.
+    * *execution-qualified* — someone ran it against reviewed gold and the number was right
+      (:func:`advertised_operators`). Decides whether the platform will vouch for it.
+    * *artifact-verified* — THIS generated artifact passed on-demand verification. Decides
+      publication, and is a fact about one artifact rather than about an operator.
+
+    Requiring the second before generating code made the first unreachable: the shortest path to a
+    green pipeline became writing a proof record for a proof nobody ran, which is the one lie the
+    whole structure exists to prevent. Showing a user unverified code and SAYING it is unverified is
+    honest; refusing to show it until someone forges a proof is not.
+    """
+    build = build_hash or renderer_build_hash()
+    return tuple((row[0], row[1]) for row in conn.execute(
+        "SELECT operator_kind, operator_variant FROM engine_operator_capability "
+        "WHERE engine_id = %s AND renderer_build_hash = %s AND renderer_dispatchable "
+        "ORDER BY operator_kind, operator_variant", (engine_id, build)).fetchall())
+
+
+def unqualified_operators(
+    conn: DbConn, *, engine_id: str, signatures: Sequence[OperatorSignature],
+    build_hash: str | None = None,
+) -> tuple[OperatorSignature, ...]:
+    """Which of ``signatures`` this build can emit but has NOT proved.
+
+    The gap between supported and qualified, named rather than inferred. A surface that shows
+    generated code needs this to say *what* is unverified about it — "unverified" alone tells a user
+    nothing they can act on, and tells an operator nothing to go and prove.
+    """
+    qualified = set(advertised_operators(conn, engine_id=engine_id, build_hash=build_hash))
+    supported = set(renderer_supported_operators(
+        conn, engine_id=engine_id, build_hash=build_hash))
+    return tuple(sorted((set(signatures) & supported) - qualified))
 
 
 def capability_of(
-    conn: DbConn, *, engine_id: str, operator_kind: str,
+    conn: DbConn,
+    *,
+    engine_id: str,
+    operator_kind: str,
+    operator_variant: str = SOLE_VARIANT,
+    build_hash: str | None = None,
 ) -> CapabilityV1 | None:
-    """Both facts for one operator, or ``None`` if this build has never recorded it.
+    """Both facts for one signature under one build, or ``None`` if this build never recorded it.
 
-    ``None`` rather than a default: an engine or operator this build has never heard of must be
-    treated as unsupported by the caller, and returning a fabricated row would make "never recorded"
-    indistinguishable from "recorded as unsupported".
+    ``None`` rather than a default: an engine, operator or build this code has never heard of must
+    be treated as unsupported by the caller, and returning a fabricated row would make "never
+    recorded" indistinguishable from "recorded as unsupported".
     """
+    build = build_hash or renderer_build_hash()
     row = conn.execute(
         "SELECT renderer_dispatchable, execution_proof_hash FROM engine_operator_capability "
-        "WHERE engine_id = %s AND operator_kind = %s", (engine_id, operator_kind)).fetchone()
+        "WHERE engine_id = %s AND operator_kind = %s AND operator_variant = %s "
+        "AND renderer_build_hash = %s",
+        (engine_id, operator_kind, operator_variant, build)).fetchone()
     if row is None:
         return None
     return CapabilityV1(engine_id=engine_id, operator_kind=operator_kind,

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
+from featuregen.materialize.boundary_v2 import FeatureGroupPlanV2
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.group_plan import (
     SYSTEM_COLUMNS,
@@ -51,6 +52,7 @@ from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
 from featuregen.materialize.render.nodes_compute import (
     _LOCK_DEPTH,
     _RENDERED_WIDTH,
+    RenderablePlan,
     _call_lines,
     _comment,
     _dataset,
@@ -163,7 +165,7 @@ def _literal_rows(name: str, rows: list[str], *, brackets: str = "()",
 
 
 def render_assembly_node(
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     *,
     spine_dataset: str,
     staging_datasets: Mapping[str, str],
@@ -194,7 +196,7 @@ def render_assembly_node(
         ValueError: a dataset name is missing or unusable, or a planned feature has no staging or
             manifest dataset — which would be a column nothing staged and nothing could prove.
     """
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering assembly needs the FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"published columns, the landing keys and every ir_hash §9 gates against are the "
@@ -262,7 +264,7 @@ def _assembly_signature(staged: list[str], documents: list[str]) -> list[str]:
     ]
 
 
-def _assembly_docstring(plan: FeatureGroupPlanV1, columns: tuple[str, ...]) -> list[str]:
+def _assembly_docstring(plan: RenderablePlan, columns: tuple[str, ...]) -> list[str]:
     landing = ", ".join(_safe_text(name, "a landing key column")
                         for name in plan.entity_key_columns)
     return [
@@ -282,7 +284,7 @@ def _assembly_docstring(plan: FeatureGroupPlanV1, columns: tuple[str, ...]) -> l
     ]
 
 
-def _manifest_gate_lines(plan: FeatureGroupPlanV1, columns: tuple[str, ...],
+def _manifest_gate_lines(plan: RenderablePlan, columns: tuple[str, ...],
                          documents: list[str]) -> list[str]:
     """§9's manifest gates, in ``check_completeness``'s order and with its codes.
 
@@ -513,7 +515,7 @@ def _system_column_lines() -> list[str]:
 
 
 def render_gate_node(
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     *,
     assembled_dataset: str,
     published_dataset: str,
@@ -537,7 +539,7 @@ def render_gate_node(
         TypeError: ``plan`` is not a ``FeatureGroupPlanV1``.
         ValueError: a dataset name is missing or unusable.
     """
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering §9's gates needs the FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"expected schema and its hash are the plan's, and a gate that inferred them from the "
@@ -586,7 +588,7 @@ def render_gate_node(
     )
 
 
-def _gate_docstring(plan: FeatureGroupPlanV1) -> list[str]:
+def _gate_docstring(plan: RenderablePlan) -> list[str]:
     return [
         '    """§9\'s blocking gates. Any failure rejects the group; the previous partition stays.',
         "",
@@ -715,7 +717,7 @@ def _key_uniqueness_lines(keys: tuple[str, ...]) -> list[str]:
     ]
 
 
-def _schema_hash_lines(plan: FeatureGroupPlanV1) -> list[str]:
+def _schema_hash_lines(plan: RenderablePlan) -> list[str]:
     """The assembled schema hash, over the OBSERVED order.
 
     Not redundant with the checks above, and the reason is the order: once presence, types and

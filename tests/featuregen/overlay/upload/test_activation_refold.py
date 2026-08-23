@@ -124,7 +124,7 @@ def test_all_four_materialization_codes_can_clear_together(db, monkeypatch):
     roles at the frozen revision), the execution/authoring floors (seeded ``field_evidence``
     read through the real resolver pins), the engine verdict (C1/C2, no patching), the
     activation fold itself. What is SEEDED, each named where the plan pre-authorized seeding:
-    the gold/provider evaluation (no store exists — `_gold_evaluation_recorded` is the
+    the gold/provider evaluation (a store and a validity reader now exist, but no certifiable run does: the reviewed corpus holds one clean case — `_gold_evaluation_recorded` derives `False`, formerly the
     documented hook) and snapshot freshness (scaffolding for the contract rung — snapshot
     minting rides the generation pipeline, not this test)."""
     definition = v2_recipe_by_id(EXEMPLAR)
@@ -170,14 +170,14 @@ def test_all_four_materialization_codes_can_clear_together(db, monkeypatch):
         "'vh', 'human', 'confirmed', 'active', 'test', 'snap', 'ih')")
 
     monkeypatch.setattr(semantic_option_decision, "_gold_evaluation_recorded",
-                        lambda recipe_id: True)
+                        lambda conn, recipe_id: True)
     monkeypatch.setattr(feature_metadata_snapshot, "compare_snapshot_to_current",
                         lambda conn, snapshot_id: SnapshotFreshness("current", None, None))
 
     current = assemble_current_activation_state(
         db, frozen=frozen, snapshot_id="snap-ms")
     assert current.effective_readiness == "MATERIALIZATION_READY"
-    assert current.formula_schema_supported is True
+    assert current.formula_schema_support == "supported"
     assert current.requirements_closed is True or frozen.validation_status == "DESIGN_CHECKED"
     assert current.execution_authority_evaluated and current.execution_floor_met
 

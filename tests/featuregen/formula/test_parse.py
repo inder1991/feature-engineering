@@ -9,12 +9,19 @@ from __future__ import annotations
 import pytest
 
 from featuregen.formula import schema as s
+from featuregen.formula import schema_leaves as _leaves
 from featuregen.formula.parse import parse_proposal_v1
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
-    DecimalPolicy,
     ExpectedOutput,
+    RatioBody,
+    TypedFormulaProposalV1,
+    UnaryBody,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    DecimalPolicy,
     FilterBool,
     FilterBoolOp,
     FilterPredicate,
@@ -25,14 +32,10 @@ from featuregen.formula.schema import (
     ParamClass,
     ParameterDecl,
     ParameterRef,
-    RatioBody,
     RoundingMode,
     SchemaError,
     SourceRelation,
-    TypedFormulaProposalV1,
     TypedLiteral,
-    UnaryBody,
-    WindowPolicy,
     ZeroDenominator,
 )
 
@@ -165,12 +168,12 @@ TYPED_WINDOW = WindowPolicy(
     event_time_ref=EVENT_TS,
     basis=s.WindowBasis.TRAILING,
     length=90,
-    unit=s.WindowUnit.DAY,
+    unit=_leaves.WindowUnit.DAY,
     start_inclusive=Inclusivity.INCLUSIVE,
     end_inclusive=Inclusivity.EXCLUSIVE,
     timezone="UTC",
-    empty_window=s.EmptyWindowResult.NULL,
-    null_input=s.NullInput.IGNORE,
+    empty_window=_leaves.EmptyWindowResult.NULL,
+    null_input=_leaves.NullInput.IGNORE,
 )
 
 
@@ -217,7 +220,7 @@ class TestConstruction:
                 precision=18,
                 scale=6,
                 rounding=RoundingMode.HALF_EVEN,
-                overflow=s.OverflowBehavior.ERROR,
+                overflow=_leaves.OverflowBehavior.ERROR,
             ),
             expected_output=ExpectedOutput(
                 output_type="decimal", unit="ratio", currency=None
@@ -308,7 +311,7 @@ class TestConstruction:
                 precision=18,
                 scale=6,
                 rounding=RoundingMode.HALF_EVEN,
-                overflow=s.OverflowBehavior.ERROR,
+                overflow=_leaves.OverflowBehavior.ERROR,
             ),
             expected_output=None,
         )

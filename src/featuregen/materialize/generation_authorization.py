@@ -100,6 +100,25 @@ def record_generation_authorization(
     return authorization.revision_id
 
 
+def authorization_grantee(conn: DbConn, revision_id: str) -> str | None:
+    """WHO authorized this generation, or ``None`` if there is no such authorization.
+
+    ▲ **Deliberately NOT on :class:`GenerationAuthorizationV1`.** That dataclass's
+    ``identity_payload`` excludes the actor by design — *"No actor, no timestamp — those are
+    provenance"* — and ``revision_id`` is content-addressed over it. Folding the grantee in would
+    re-mint every authorization id in existence, so the actor is read separately and the identity is
+    left alone.
+
+    This exists because the route needs an answer ``load_generation_authorization`` cannot give: it
+    reconstructs the five identity-bearing columns and nothing else, so the grantee was
+    unreachable — which is why nothing checked it.
+    """
+    row = conn.execute(
+        "SELECT authorized_by FROM generation_authorization WHERE revision_id = %s",
+        (revision_id,)).fetchone()
+    return None if row is None else row[0]
+
+
 def load_generation_authorization(
     conn: DbConn, revision_id: str,
 ) -> GenerationAuthorizationV1 | None:

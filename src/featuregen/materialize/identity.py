@@ -50,9 +50,10 @@ from types import MappingProxyType
 from typing import Any
 
 from featuregen.materialize import binding, compile, render
-from featuregen.materialize.admission import hive_identifier
+from featuregen.materialize.boundary_v2 import CompilationIdentityV2
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.group_plan import FeatureGroupPlanV1, group_plan_hash
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.ir import (
     FormulaExecutionIRV1,
     bridge_realization_dependencies,
@@ -294,6 +295,17 @@ def build_compilation_identity(
 # ── phase 2: the rendered artifact ───────────────────────────────────────────────────────────────
 
 
+#: The completed first-phase identities this module can seal bytes against. Both carry the same
+#: `identity_payload`, which is all §7's phase split needs — the lock states the compilation and the
+#: project hash, and neither reads a field the two do not share.
+#:
+#: ▲ This was `CompilationIdentity` alone, and it is the SAME class of bug §0.8 records one level
+#: deeper: `render/` was widened to accept a V2 token and plan, `render_project` duly derived a
+#: `CompilationIdentityV2`, and then sealing refused it. Nothing caught it because no test rendered
+#: a V2 token END TO END until the item-9 run did.
+SealableCompilation = CompilationIdentity | CompilationIdentityV2
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedArtifactIdentity:
     """The compilation identity PLUS the hash of the bytes that were rendered from it (§7).
@@ -303,11 +315,11 @@ class RenderedArtifactIdentity:
     have been known then.
     """
 
-    compilation: CompilationIdentity
+    compilation: SealableCompilation
     generated_project_hash: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.compilation, CompilationIdentity):
+        if not isinstance(self.compilation, CompilationIdentity | CompilationIdentityV2):
             raise TypeError(
                 f"a rendered identity is built ON a completed compilation identity, got "
                 f"{type(self.compilation).__name__}: the second phase does not replace the first, "
@@ -392,7 +404,7 @@ def generated_project_hash(files: Mapping[str, str]) -> str:
     return materialize_hash({"files": digests})
 
 
-def seal_project(compilation: CompilationIdentity, files: Mapping[str, str]) -> SealedProject:
+def seal_project(compilation: SealableCompilation, files: Mapping[str, str]) -> SealedProject:
     """Hash the rendered files, mint ``GENERATED.lock`` from that hash, and seal the two together.
 
     This is the ONLY path that writes a lock. A renderer that supplied its own would either state a
@@ -400,13 +412,14 @@ def seal_project(compilation: CompilationIdentity, files: Mapping[str, str]) -> 
     circularity §7's phase split exists to remove.
 
     Raises:
-        TypeError: ``compilation`` is not a :class:`CompilationIdentity`, or a file is not text.
+        TypeError: ``compilation`` is not a :data:`SealableCompilation`, or a file is not text.
         ValueError: ``files`` already contains a lock, or a path is not project-relative.
     """
-    if not isinstance(compilation, CompilationIdentity):
+    if not isinstance(compilation, CompilationIdentity | CompilationIdentityV2):
         raise TypeError(
-            f"seal_project requires a CompilationIdentity, got {type(compilation).__name__}: the "
-            f"first phase must be COMPLETE before the bytes that embed it are hashed")
+            f"seal_project requires a completed compilation identity, got "
+            f"{type(compilation).__name__}: the first phase must be COMPLETE before the bytes that "
+            f"embed it are hashed")
     if GENERATED_LOCK_FILENAME in files:
         raise ValueError(
             f"the rendered files already contain {GENERATED_LOCK_FILENAME}: the lock is minted from "

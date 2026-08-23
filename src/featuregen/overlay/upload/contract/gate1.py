@@ -115,7 +115,11 @@ def _ground_template_outcomes(*args, **kwargs):
 # more than one catalog (which has NO such plan) can never be a recommendation — it is surfaced as a
 # rejection carrying this reason string instead.
 GOVERNED_CROSS_CATALOG_PLAN_REQUIRED = "governed_cross_catalog_plan_required"
-CONSIDERED_CANONICALIZATION_VERSION = "contract-considered-v2"
+#: Bumped to v3 with the typed computation. A v2 revision's options were sealed under an identity
+#: that did not include what they compute, so v2 and v3 identities are not comparable and must not
+#: be: reusing the version would let a v2 option be read as though its empty typed block were a
+#: declaration of "computes nothing".
+CONSIDERED_CANONICALIZATION_VERSION = "contract-considered-v3"
 
 
 class Gate1Error(Exception):
@@ -1247,6 +1251,27 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
          "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
          "requirements": requirements_to_json(f.requirements),
          "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
+         # ── THE TYPED COMPUTATION, which this serializer used to DROP ENTIRELY ──────────────
+         # operation_kind, measure_refs, grain_refs, time_ref, window and grouping_refs are what
+         # the candidate actually COMPUTES: which operation, over which measure, per which grain,
+         # as of which time column, over which window, grouped how. All six were absent from the
+         # emitted dict, so `_idea_from_json` restored an idea that had lost them and the canonical
+         # candidate identity was a hash over the feature's DESCRIPTION rather than its computation.
+         #
+         # The consequence was not cosmetic: two candidates aggregating different measures over
+         # different windows produced the SAME identity whenever their name, derives_from and
+         # aggregation string matched. Downstream, the draft worker's grain branch was dead code
+         # and every formula was authored against a grain nobody declared.
+         #
+         # Emitted unconditionally rather than only-when-set, unlike the carry-through fields
+         # below: an absent execution field is not a default, it is a candidate that cannot be
+         # executed, and the reader now refuses rather than filling one in.
+         "operation_kind": f.operation_kind,
+         "measure_refs": [list(p) for p in f.measure_refs],
+         "grain_refs": [list(p) for p in f.grain_refs],
+         "time_ref": list(f.time_ref) if f.time_ref else None,
+         "window": f.window,
+         "grouping_refs": [list(p) for p in f.grouping_refs],
          # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
          # options), persisted with the considered set so drafting reconstructs the EXACT plan.
          "origin": f.origin, "path_authority": f.path_authority,
@@ -1324,7 +1349,7 @@ def _candidate_identity(
     feature: FeatureIdea,
 ) -> dict:
     return {
-        "version": "considered-candidate-v2",
+        "version": "considered-candidate-v3",
         "path": path,
         "source": source,
         "lens": lens,
@@ -1544,6 +1569,16 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         aggregation=d.get("aggregation"), grain_table=d.get("grain_table"),
         operation_class=d.get("operation_class", ""),
         derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])),
+        # The typed computation, restored. A pre-regeneration snapshot carries none of these keys
+        # and deserializes to the empty defaults — which is CORRECT and is exactly what
+        # `requires_regeneration` detects: the candidate is readable and auditable, and it cannot be
+        # executed, because the identity it was sealed under does not describe what it computes.
+        operation_kind=d.get("operation_kind", ""),
+        measure_refs=tuple(tuple(p) for p in d.get("measure_refs", [])),
+        grain_refs=tuple(tuple(p) for p in d.get("grain_refs", [])),
+        time_ref=tuple(d["time_ref"]) if d.get("time_ref") else None,
+        window=d.get("window"),
+        grouping_refs=tuple(tuple(p) for p in d.get("grouping_refs", [])),
         verification=d.get("verification", "DESIGN-CHECKED"),      # was dropped pre-3A-ii
         critic_note=d.get("critic_note", ""),                      # was dropped pre-3A-ii
         rationale=d.get("rationale", ""),                          # was dropped pre-3A-ii

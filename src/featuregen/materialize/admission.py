@@ -79,7 +79,6 @@ establish that the artifact in hand IS that run's verdict.
 from __future__ import annotations
 
 import re
-import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -94,12 +93,14 @@ from featuregen.contracts.db import DbConn
 # re-exported here and quietly become a public entry point.
 from featuregen.formula.canonical import formula_content_hash as _formula_content_hash
 from featuregen.formula.result import AuthoringResult
-from featuregen.formula.schema import SchemaError, TypedFormulaV1
+from featuregen.formula.schema import TypedFormulaV1
 from featuregen.formula.schema import body_expressions as _body_expressions
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.materialize import authoring_trace as _trace
 from featuregen.materialize.authoring_trace import authoring_intent_hash as _authoring_intent_hash
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
+from featuregen.materialize.identifiers import FeatureNamePlanError, hive_identifier
 
 __all__ = [
     "AdmittedFeature",
@@ -130,17 +131,6 @@ _HIVE_IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _NON_HIVE_CHARS = re.compile(r"[^a-z0-9_]")
 
 
-class FeatureNamePlanError(Exception):
-    """A feature NAME the plan cannot express as a distinct Hive column — a PLAN error.
-
-    Deliberately NOT a :class:`~featuregen.materialize.codes.MaterializationRefused`, and
-    deliberately not one of the §14 codes: the closed vocabulary has no member for it because it is
-    not a governed verdict about an artifact. It is the same class of failure as
-    ``canonical.materialize_hash``'s ``TypeError`` on a non-mapping — a defect at the call site,
-    where the caller assembled the batch. Spec §1.2 says so in as many words: *"a post-normalization
-    collision within a group is a plan error, never a silent overwrite."* Raising it loudly is the
-    point; the alternative is two features quietly writing one column.
-    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,27 +474,6 @@ def _split_table_ref(table_ref: str) -> tuple[str, str, str]:
 
 # ── the feature name (spec §1.2, final paragraph) ────────────────────────────────────────────────
 
-def hive_identifier(name: str) -> str:
-    """``intent.name`` folded to a Hive identifier — the physical column the feature will occupy.
-
-    Deterministic and conservative: NFKC-normalize, strip, lower-case, and map every character Hive
-    does not accept in an unquoted identifier to ``_``. Nothing is collapsed or truncated, because
-    both would map two distinct names onto one column — the very thing the collision check exists to
-    prevent. A name that cannot be expressed at all (empty, not starting with a letter, longer than
-    Hive's 128-character bound) is a plan error, not a name to invent a mangling for.
-
-    PUBLIC because the group plan (§9/§10.2) names the same columns and must reach the SAME answer:
-    a second normalizer would be a second chance to disagree about which column a feature occupies,
-    and the disagreement would surface as a schema gate failing on a name nobody chose. It is
-    idempotent, so re-applying it to an already-admitted ``feature_name`` is a validation."""
-    folded = _NON_HIVE_CHARS.sub("_", unicodedata.normalize("NFKC", name).strip().lower())
-    if not _HIVE_IDENTIFIER.fullmatch(folded):
-        raise FeatureNamePlanError(
-            f"feature name {name!r} does not normalize to a Hive identifier "
-            f"(got {folded!r}: it must start with a letter and be at most 128 characters of "
-            "[a-z0-9_])"
-        )
-    return folded
 
 
 def _reject_name_collisions(admitted: tuple[AdmittedFeature, ...]) -> None:

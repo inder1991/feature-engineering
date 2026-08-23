@@ -61,7 +61,8 @@ _GOLD_V2 = Path(__file__).resolve().parents[2] / "formula" / "gold_v2"
 #: Every rule that lives ONLY on the materialization rung — the closed set A5 is measured
 #: against, so "one code fell" is provable rather than asserted.
 MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REVIEWED,
-                        R.FORMULA_SCHEMA_UNSUPPORTED, R.EXTERNAL_VALIDATION_OUTSTANDING,
+                        R.FORMULA_SCHEMA_UNSUPPORTED, R.FORMULA_REVIEW_UNMEASURED,
+                        R.ENGINE_CAPABILITY_UNMEASURED, R.EXTERNAL_VALIDATION_OUTSTANDING,
                         R.EXECUTION_AUTHORITY_UNEVALUATED, R.EXECUTION_AUTHORITY_UNMET}
 #: What still blocks the reviewed exemplar after A5 **and C2**. ``EXTERNAL_VALIDATION_OUTSTANDING``
 #: is absent from both rows because this fixture's idea is ``DESIGN_CHECKED`` (its rule short-
@@ -71,9 +72,10 @@ MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REV
 #: REVIEWED row only.
 STILL_BLOCKING = {R.READINESS_NOT_MATERIALIZATION_READY, R.EXECUTION_AUTHORITY_UNEVALUATED}
 #: The unreviewed discriminator carries TWO more codes, coupled by design: an unreviewed recipe
-#: has no reviewed demands for C2 to compare, so ``FORMULA_SCHEMA_UNSUPPORTED`` stays exactly as
-#: long as ``FORMULA_NOT_REVIEWED`` does. Review is the gate that opens the capability question.
-UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_SCHEMA_UNSUPPORTED}
+#: has no reviewed demands for C2 to compare. §6's tri-state renamed the second half — support is
+#: UNMEASURED because unreviewed (`FORMULA_REVIEW_UNMEASURED`), never the false engine claim
+#: `FORMULA_SCHEMA_UNSUPPORTED` used to make here. Review still opens the capability question.
+UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_REVIEW_UNMEASURED}
 
 
 def _candidate(recipe_id: str) -> V2RecipeCandidateV1:
@@ -151,17 +153,33 @@ def test_the_v2_registry_pins_reviewed_fixtures():
         assert has_reviewed_expectation(ref) is True
 
 
-def test_the_merchant_v1_entry_is_untouched():
-    """D-7 restated at A5: the reviewed v1 expectation for ``merchant_mcc_diversity`` still
-    declares MERCHANT grain while its definition computes per customer. No task here re-keyed
-    it, substituted the derived customer-grain blueprint for it, or made the disagreement
-    invisible — that decision belongs to a human."""
+def test_the_merchant_v1_entry_is_RETIRED_by_an_explicit_decision():
+    """D-7's disagreement, RESOLVED 2026-08-19 — per customer, decided by a human as required.
+
+    The reviewed v1 expectation declared MERCHANT grain while the definition computed per CUSTOMER.
+    This test used to forbid any task from re-keying it or substituting the derived customer-grain
+    blueprint, because a per-merchant count published as per-customer is a different number wearing
+    the same name. That decision has now been made explicitly: **per customer**.
+
+    The entry is RETIRED IN PLACE rather than re-keyed, and that is forced rather than chosen: its
+    v1 template declares needs ``merchant``/``mcc``/``event_ts`` and no ``customer``, so the v1
+    shape cannot express the answer — `validate_expectation_registry` refuses the re-key by name.
+    Editing the template to add a need would rewrite a reviewed artifact to say something it was
+    never reviewed for. So the recipe moves to the v2 lane, the capture path derives the
+    customer-grain blueprint, and the stale entry survives unselected until the v1 registry is
+    deleted with the rest of the v1 stack.
+    """
     blueprint = RECIPE_FORMULA_EXPECTATIONS["merchant_mcc_diversity"]
+    # The stale entry is untouched — retiring is not rewriting.
     assert (blueprint.grain.entity, blueprint.grain.key_roles) == ("merchant", ("merchant",))
     assert v2_recipe_by_id("merchant_mcc_diversity").output_grain == "customer"
-    # And the capture path still resolves the REVIEWED v1 object itself, by identity.
+
+    # And nothing selects it any more: capture now derives the customer-grain v2 blueprint.
     resolved = capture_blueprint_for("merchant_mcc_diversity")
-    assert resolved is not None and resolved.blueprint is blueprint
+    assert resolved is not None and resolved.blueprint is not blueprint
+    assert resolved.declared_schema_version == "formula-v2"
+    assert (resolved.blueprint.grain.entity, resolved.blueprint.grain.key_roles) == (
+        "customer", ("customer",))
 
 
 def test_a_review_event_records_the_blueprint_it_covers(conn):
@@ -182,11 +200,15 @@ def test_a_review_event_records_the_blueprint_it_covers(conn):
 
 
 def test_the_v1_and_v2_generations_hash_their_own_blueprint():
-    """``capture_blueprint_hash`` resolves exactly as ``CaptureBlueprintV1.bind`` does, so a
-    ``formula-v1`` recipe records its REVIEWED v1 blueprint (D-7: merchant grain), never the
-    customer-grain blueprint its definition derives. (Measured: the v1 and v2 content hashers
-    agree byte for byte on a v1 blueprint today — both are ``_plain(asdict(...))`` over sorted
-    JSON — so it is the BLUEPRINT choice, not the hasher choice, that this pins.)"""
+    """``capture_blueprint_hash`` resolves exactly as ``CaptureBlueprintV1.bind`` does: each recipe
+    records the blueprint ITS OWN declaration names.
+
+    This used to pin `merchant_mcc_diversity` on the v1 side, hashing the reviewed merchant-grain
+    entry rather than the customer-grain one its definition derives. That recipe moved to the v2
+    lane on an explicit per-customer decision, so it now hashes the DERIVED blueprint — and the
+    stale v1 entry, which nothing selects, hashes to something different. Both facts are asserted:
+    the recipe follows its declaration, and the retired entry was not rewritten to match.
+    """
     from featuregen.overlay.upload.recipe_formula_blueprint_derivation import (
         derive_blueprint_v2,
     )
@@ -195,10 +217,12 @@ def test_the_v1_and_v2_generations_hash_their_own_blueprint():
         expectation_content_hash_v2,
     )
 
-    v1 = capture_blueprint_hash("merchant_mcc_diversity")
-    assert v1 == expectation_content_hash(RECIPE_FORMULA_EXPECTATIONS["merchant_mcc_diversity"])
+    merchant = capture_blueprint_hash("merchant_mcc_diversity")
     derived = derive_blueprint_v2(v2_recipe_by_id("merchant_mcc_diversity"))
-    assert v1 != expectation_content_hash_v2(derived)     # the two coexist; neither replaced
+    assert merchant == expectation_content_hash_v2(derived)      # follows its declaration
+    # The retired v1 entry still hashes to its own, different bytes: retiring is not rewriting.
+    assert merchant != expectation_content_hash(
+        RECIPE_FORMULA_EXPECTATIONS["merchant_mcc_diversity"])
 
     v2 = capture_blueprint_hash(EXEMPLAR)
     assert v2 == expectation_content_hash_v2(derive_blueprint_v2(v2_recipe_by_id(EXEMPLAR)))

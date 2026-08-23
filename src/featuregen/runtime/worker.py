@@ -26,16 +26,27 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 from psycopg.rows import dict_row
 
+from featuregen.api.routes.formula_drafts import (
+    FORMULA_DRAFT_HANDLER,
+    FORMULA_DRAFT_TOPIC,
+)
 from featuregen.contracts import Command, Projection
+from featuregen.materialize.generation_lane import (
+    generation_enabled,
+    generation_inventory_from_env,
+    process_generation_once,
+)
 from featuregen.materialize.queue_lane import (
     materialization_enabled,
     process_materialization_once,
 )
 from featuregen.materialize.reconcile import reconcile_abandoned_requests
+from featuregen.materialize.reconcile_generation import reconcile_abandoned_generations
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
+from featuregen.overlay.upload.formula_draft_worker import process_formula_draft_once
 from featuregen.overlay.upload.ingestion_run import reconcile_ingestion_runs
 from featuregen.overlay.upload.recipe_formula_shadow import (
     RECIPE_FORMULA_SHADOW_HANDLER,
@@ -70,6 +81,13 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 # deployment adds real routes (or swaps in an external-bus publisher) by passing `publish=`.
 _DEFAULT_RELAY_ROUTE: dict[str, str] = {
     RECIPE_FORMULA_SHADOW_TOPIC: RECIPE_FORMULA_SHADOW_HANDLER,
+    # A draft's outbox message must become a queue row, or the work is never claimed. Found LIVE:
+    # without this entry the relay had no route for the topic, marked the outbox row `sent`, and
+    # enqueued nothing — the request returned a cheerful 202 and the draft sat at REQUESTED forever.
+    # An unrouted topic is silently dropped by design (the relay's job is to drain the outbox, not
+    # to know every topic), which is exactly why this route and the route-REQUIRED entry below have
+    # to be declared together.
+    FORMULA_DRAFT_TOPIC: FORMULA_DRAFT_HANDLER,
 }
 
 
@@ -102,10 +120,18 @@ def _relay_publisher_from_env(
     if configured_formula_handler not in (None, RECIPE_FORMULA_SHADOW_HANDLER):
         raise ValueError("the reserved recipe-formula shadow route cannot be overridden")
     routes[RECIPE_FORMULA_SHADOW_TOPIC] = RECIPE_FORMULA_SHADOW_HANDLER
+    configured_draft_handler = routes.get(FORMULA_DRAFT_TOPIC)
+    if configured_draft_handler not in (None, FORMULA_DRAFT_HANDLER):
+        raise ValueError("the reserved formula-draft route cannot be overridden")
+    routes[FORMULA_DRAFT_TOPIC] = FORMULA_DRAFT_HANDLER
     required = os.environ.get("FEATUREGEN_RELAY_REQUIRED", "").strip()
     route_required = frozenset({
         *(t.strip() for t in required.split(",") if t.strip()),
         RECIPE_FORMULA_SHADOW_TOPIC,
+        # ROUTE-REQUIRED, so a deployment that loses this route DEAD-LETTERS loudly instead of
+        # marking the message sent and dropping paid work on the floor. The silent-drop is what
+        # made this defect survive a green suite and a clean deploy.
+        FORMULA_DRAFT_TOPIC,
     })
     return make_queue_publisher(routes, route_required=route_required)
 
@@ -128,7 +154,11 @@ class WorkerTick:
     errors: int
     external_dispatched: int = 0
     formula_processed: int = 0
+    #: How many per-candidate "Draft formula" jobs this tick drove to a terminal state.
+    formula_drafts_processed: int = 0
     materialization_processed: int = 0
+    #: §0.10 step 3 — how many V2 generation jobs this tick drove to a terminal request.
+    generation_processed: int = 0
     #: Phase G §3.3 — how many stranded materialization requests this tick gave a terminal verdict.
     #: Candidates LEFT ALONE (a deliverable message, a live claim, a class with no legal terminal)
     #: are not counted here: this is the number of durable state changes, not the sweep's size.
@@ -455,6 +485,21 @@ def run_worker_once(
 
     formula_processed = _stage("recipe_formula_shadow")(_drain_formula, 0)
 
+    def _drain_formula_drafts() -> int:
+        # ONE draft per tick, deliberately NOT `batch`. A tick is documented as one bounded
+        # non-blocking pass, and a draft is two provider calls in series; draining a backlog of them
+        # inside one tick would hold the timers, the relay, the projections and every poller for the
+        # sum of them. A queued backlog still drains — one per tick, on ticks a second apart — which
+        # costs nothing next to a draft's own duration.
+        #
+        # NO KILL SWITCH of its own, unlike the materialization lane below. A draft is queued only
+        # by an explicit per-candidate user action; there is no background producer that could fill
+        # this lane, so an idle deployment claims nothing and the stage costs one query per tick.
+        outcome = process_formula_draft_once(conn, owner=f"{owner}:draft")
+        return 0 if outcome.status == "idle" else 1
+
+    formula_drafts_processed = _stage("formula_draft")(_drain_formula_drafts, 0)
+
     def _drain_materialization() -> int:
         # THE KILL SWITCH (T9), read from the environment EVERY tick and BEFORE the claim. Nothing
         # caches it, so the first tick after this process's environment says otherwise obeys — and
@@ -491,6 +536,29 @@ def run_worker_once(
 
     materialization_processed = _stage("materialization")(_drain_materialization, 0)
 
+    def _drain_generation() -> int:
+        # §0.10 step 3's fenced V2 lane, beside the V1 one and switched independently. THE SAME
+        # DISCIPLINE, for the same reasons stated at length above: the switch is read from the
+        # environment every tick and BEFORE the claim, off is silent and byte-identical to the tick
+        # that existed before this lane did, and it stops the NEXT claim rather than interrupting
+        # one in flight.
+        #
+        # A SEPARATE SWITCH from materialization, deliberately. The two lanes drive different
+        # chains over different tables, and a deployment cutting traffic from V1 to V2 needs to run
+        # them in either combination — including both, during the cutover §0.10 step 7 describes.
+        # One switch would make "V2 only" and "V1 only" the same setting.
+        if not generation_enabled():
+            return 0
+        # ONE job per tick, for the V1 lane's reason: a tick is one bounded non-blocking pass, and
+        # a generation restores, admits, compiles, renders and seals. It is far shorter than a V1
+        # compile — no subprocess, no provider — but draining a backlog inside one tick would still
+        # hold the timers, the relay and every poller for the sum of them.
+        outcome = process_generation_once(
+            conn, owner=f"{owner}:generate", inventory=generation_inventory_from_env())
+        return 0 if outcome.status == "idle" else 1
+
+    generation_processed = _stage("generation")(_drain_generation, 0)
+
     def _reconcile_materialization() -> int:
         # Phase G §3.3. It runs HERE — beside the lane, on the tick — because the alternative was a
         # function with no scheduler, and a reconciler nothing runs is a deferral wearing a costume.
@@ -516,6 +584,95 @@ def run_worker_once(
 
     materialization_reconciled = _stage("materialization_reconcile")(
         _reconcile_materialization, 0)
+
+    def _reconcile_generations() -> int:
+        # ▲ THE SAME SWEEP FOR THE LANE THAT REPLACES THAT ONE. `reconcile_abandoned_requests` above
+        # serves the LEGACY `materialization_request` and has no idea `generation_request` exists —
+        # so before this stage, the canonical V2 lane had NO crash recovery at all, and the cutover
+        # that deletes the legacy route would have removed the only lane that did.
+        #
+        # The wedge is worse here than a stalled job: `generation_request_one_live_attempt` is
+        # UNIQUE over the live statuses, so one abandoned row makes that build set unbuildable in
+        # that environment PERMANENTLY, and the lane's redelivery path releases the message for
+        # retry for ever rather than terminalizing it.
+        #
+        # Gated on the GENERATION switch, not the materialization one: they are separate lanes with
+        # separate flags, and reading the wrong switch here would sweep for a lane this deployment
+        # does not run while leaving the one it does.
+        if not generation_enabled():
+            return 0
+        return len(reconcile_abandoned_generations(conn))
+
+    generations_reconciled = _stage("generation_reconcile")(_reconcile_generations, 0)
+
+    def _reconcile_spend() -> int:
+        # ▲ §15.1's rule applied to MONEY: a reservation is a lifecycle state only a live worker can
+        # leave. An expired unsettled one already released its budget by arithmetic — this stage
+        # re-charges the ones whose dispatch outcome says (or cannot deny) that the money was
+        # spent, and settles transport failures at zero explicitly. Reconciled against the outcome,
+        # never assumed — assuming unspent is the error that buys the tokens twice.
+        from datetime import UTC, datetime
+
+        from featuregen.overlay.upload.llm_spend import reconcile_expired_spend
+
+        tallies = reconcile_expired_spend(conn, now=datetime.now(UTC))
+        return tallies["recharged_worst_case"] + tallies["released_transport_failed"]
+
+    spend_reconciled = _stage("spend_reconcile")(_reconcile_spend, 0)
+
+    def _verifications() -> int:
+        # §9.0 — the sandbox verification lane, behind its OWN switch (default OFF, same
+        # discipline as generation: flag off is byte-identical to the tick before the lane
+        # existed). One request per tick, like the other lanes.
+        from featuregen.materialize.verification_lane import (
+            process_verification_once,
+            reconcile_abandoned_verifications,
+            verification_enabled,
+        )
+
+        if not verification_enabled():
+            return 0
+        outcome = process_verification_once(conn, owner=owner)
+        reconciled = len(reconcile_abandoned_verifications(conn))
+        return (1 if outcome is not None else 0) + reconciled
+
+    verifications_processed = _stage("verification")(_verifications, 0)
+
+    def _code_generation_jobs() -> int:
+        # Step 5a — the preview coordinator. Rides the GENERATION switch (child D9: no new
+        # rollout flags — the journey ends in a generation, so a deployment with generation off
+        # cannot run any of it). One job, one stage, per tick; the lease paces the waits.
+        from featuregen.materialize.code_generation_coordinator import (
+            process_code_generation_once,
+        )
+        from featuregen.materialize.generation_lane import generation_enabled
+
+        if not generation_enabled():
+            return 0
+        return 1 if process_code_generation_once(conn, worker_id=owner) else 0
+
+    code_generation_processed = _stage("code_generation")(_code_generation_jobs, 0)
+
+    def _production_reconcile() -> int:
+        # §15.1 for the step-7 tables — gated on the ACTIONS being available, not on a new flag:
+        # while §0.1.0 keeps both production acts unavailable, no row can exist to reconcile, and
+        # a sweep over provably-empty tables would tax every tick of every deployment (the
+        # byte-identity rule test_materialization_flag enforces). The day the owner opens the
+        # policy, this stage starts sweeping in the same deploy — no operator step to remember.
+        from featuregen.materialize.action_authorization import ActionV1, action_available
+        from featuregen.materialize.production_reconcile import (
+            reconcile_unknown_materializations,
+            sweep_publication_pointer_invariant,
+        )
+        from featuregen.materialize.queue_lane import materialization_enabled
+
+        if not (materialization_enabled() and action_available(ActionV1.MATERIALIZE_PRODUCTION)):
+            return 0
+        tallies = reconcile_unknown_materializations(conn)
+        sweep_publication_pointer_invariant(conn)
+        return sum(v for k, v in tallies.items() if k != "held")
+
+    production_reconciled = _stage("production_reconcile")(_production_reconcile, 0)
 
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
@@ -608,7 +765,9 @@ def run_worker_once(
         errors=errors,
         external_dispatched=external_dispatched,
         formula_processed=formula_processed,
+        formula_drafts_processed=formula_drafts_processed,
         materialization_processed=materialization_processed,
+        generation_processed=generation_processed,
         materialization_reconciled=materialization_reconciled,
     )
 

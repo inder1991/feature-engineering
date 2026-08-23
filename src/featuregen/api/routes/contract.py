@@ -154,6 +154,7 @@ from featuregen.overlay.upload.taxonomy.recognizer import (
 )
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 from featuregen.overlay.upload.taxonomy.versions import RANKING_MAPPING_VERSION
+from featuregen.runs.run_identity import record_run_identity
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
@@ -877,6 +878,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
         raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
             status_code=409,
             detail="a concurrent request updated this intent; re-fetch and retry") from e
+    # 6b. Run-spine foundation (spec §6.1): the identity row joins the SAME transaction that created
+    # the input lineage, considered revision and snapshot — it sits HERE, after the builder returned,
+    # because those are the very rows it hashes. Chain-incomplete paths (no sealed recognition, so no
+    # generation input; legacy/unscoped) return None and stay PRE_SPINE — never fabricated.
+    record_run_identity(conn, generation_run_id, identity)
     # 7. The per-stage disposition lens over the MODE'S applicability universe + this run's
     #    grounding outcome (the ids the builder actually returned live in the same universe).
     dispositions = evaluate_dispositions(

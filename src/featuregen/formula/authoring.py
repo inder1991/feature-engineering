@@ -65,6 +65,15 @@ from typing import TYPE_CHECKING, Any
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.formula._jcs import dumps as _jcs_dumps
 from featuregen.formula.author import author_formula
+from featuregen.formula.authoring_result_leaves import (
+    DISPOSITION_POLICY_VERSION,
+    AuthoringAxes,
+    AuthorityFailure,
+    CriticStatus,
+    ExpectationStatus,
+    OutputStatus,
+    StructuralStatus,
+)
 from featuregen.formula.capability import CAPABILITY_POLICY_VERSION, classify_formula_capability
 from featuregen.formula.critic import CRITIC_POLICY_VERSION, CriticFinding, critique
 from featuregen.formula.operations import to_path_aggregation
@@ -76,16 +85,7 @@ from featuregen.formula.output_authority import (
     resolve_formula_output_policy,
 )
 from featuregen.formula.parse import parse_proposal_v1
-from featuregen.formula.result import (
-    DISPOSITION_POLICY_VERSION,
-    AuthoringAxes,
-    AuthorityFailure,
-    CriticStatus,
-    ExpectationStatus,
-    OutputStatus,
-    StructuralStatus,
-    derive_disposition,
-)
+from featuregen.formula.result import derive_disposition
 from featuregen.formula.schema import (
     CANONICALIZATION_VERSION,
     FORMULA_SCHEMA_VERSION,
@@ -96,11 +96,11 @@ from featuregen.formula.schema import (
     FinalOperation,
     FormulaOutputPolicyV1,
     RatioBody,
-    SchemaError,
     TypedFormulaProposalV1,
     TypedFormulaV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import SchemaError
 from featuregen.formula.trace import TraceEventKind, append_event, open_authoring_run
 from featuregen.formula.turns import AuthoringIntent, AuthorTurnRecord, TurnKind
 from featuregen.intake.llm import LLMClient

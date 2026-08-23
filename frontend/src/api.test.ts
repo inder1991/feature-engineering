@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ApiError, type AssetDetail, completeSemantics, contractConfirm, contractConsideredSet,
   contractDraft, type ContractDraft, createIntegration, createSync, deleteIntegration, deleteSync,
-  discoverServices, type DiscoveredService, type FeatureIdea, getAssetDetail, getIntegration,
+  discoverServices, type DiscoveredService, type FeatureIdea, getAssetDetail,
+  getFeatureRunDetail, getIntegration,
   getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
-  listContracts, listIntegrations, listSyncs, patchIntegration, patchSync, postFieldDecision,
+  listContracts, listFeatureRuns, listIntegrations, listSyncs, patchIntegration, patchSync,
+  postFieldDecision,
   getTableSuggestionsV4,
   previewSync, recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog,
   SUGGESTIONS_UNSUPPORTED_CONTRACT_VERSION, type Sync,
@@ -996,5 +998,31 @@ describe('asset detail + field-correction client (Delivery F/G)', () => {
       new Response(JSON.stringify({ detail: 'requires permission catalog:read' }), { status: 403 }))
     const err = await getTableSuggestionsV4('core_banking', 't').catch((e: unknown) => e)
     expect(err).toMatchObject({ status: 403, errorCode: null })
+  })
+})
+
+describe('feature run spine client (read-only list + detail)', () => {
+  it('listFeatureRuns hits /feature-runs and percent-encodes the opaque cursor', async () => {
+    fetchMock.mockImplementation(ok({ groups: [], next_cursor: null }))
+    // No cursor is the first page, and it asks for it by leaving the parameter off the wire
+    // altogether — the route's own default, not a value the client invents.
+    await listFeatureRuns()
+    expect(fetchMock.mock.calls[0][0]).toBe('/feature-runs')
+    // The server mints the cursor as `${created_at.isoformat()}|${generation_run_id}`, so it
+    // carries `:`, `+` and `|` — every one of which means something else in a query string. It is
+    // opaque to the client: encode it whole so the server reads back the bytes it issued.
+    await listFeatureRuns('2026-08-23T00:00:00+00:00|grun_x')
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      '/feature-runs?cursor=2026-08-23T00%3A00%3A00%2B00%3A00%7Cgrun_x')
+  })
+
+  it('getFeatureRunDetail path-encodes the opaque run id', async () => {
+    fetchMock.mockImplementation(ok({ generation_run_id: 'grun_x' }))
+    await getFeatureRunDetail('grun_x')
+    expect(fetchMock.mock.calls[0][0]).toBe('/feature-runs/grun_x')
+    // Run ids are opaque strings, not a validated slug: one carrying a space or a slash must land
+    // as ONE path segment, or the request 404s against a route that never saw it.
+    await getFeatureRunDetail('grun x/y')
+    expect(fetchMock.mock.calls[1][0]).toBe('/feature-runs/grun%20x%2Fy')
   })
 })

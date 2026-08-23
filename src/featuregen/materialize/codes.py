@@ -53,18 +53,49 @@ class CompilationRefusalCode(StrEnum):
     AXES_MISMATCH = "AXES_MISMATCH"
     INTENT_HASH_MISMATCH = "INTENT_HASH_MISMATCH"
 
+    # The action decision (§8.2) — the request-time answer the worker re-checks before the act.
+    #: The job carries no request-time decision. However well-formed the message looks, an act with
+    #: no decision is a QUEUE BYPASS: nothing was ever answered about it, so nothing may run.
+    ACTION_DECISION_MISSING = "ACTION_DECISION_MISSING"
+    #: The decision exists and its evidence moved between the answer and the act. ▲ A REFUSAL a
+    #: person re-requests, never a re-decision — re-evaluating usually returns "allowed" again, and
+    #: the act then proceeds under a verdict nobody was shown.
+    ACTION_DECISION_DRIFTED = "ACTION_DECISION_DRIFTED"
+
     # Read scope and safety classification.
     READ_SCOPE_INSUFFICIENT = "READ_SCOPE_INSUFFICIENT"
     PROHIBITED_INPUT = "PROHIBITED_INPUT"
     #: a physical read names a column the governed catalog does not describe — §11's L1 would
     #: call it COLUMN_ABSENT, but compile must not emit a read nobody governs.
     COLUMN_NOT_GOVERNED = "COLUMN_NOT_GOVERNED"
+    #: The compilation reads its own prediction target, or takes knowledge from after the cutoff.
+    #: Distinct from READ_SCOPE_INSUFFICIENT, and the distinction is the remedy: read scope is a
+    #: fact about the CALLER (someone else may be permitted), leakage is a fact about the FEATURE
+    #: (it is wrong for everyone). A model trained on a leaking feature scores beautifully in
+    #: backtest and fails in production, so this refuses the build rather than annotating it.
+    TARGET_LEAKAGE_DETECTED = "TARGET_LEAKAGE_DETECTED"
 
     # Physical resolution and join planning (§3).
     AMBIGUOUS_TABLE_NAME = "AMBIGUOUS_TABLE_NAME"
     JOIN_PATH_NOT_VERIFIED = "JOIN_PATH_NOT_VERIFIED"
     JOIN_PATH_DENIED_BY_READ_SCOPE = "JOIN_PATH_DENIED_BY_READ_SCOPE"
     GRAIN_PATH_NOT_GOVERNED = "GRAIN_PATH_NOT_GOVERNED"
+    #: The candidate does not say what grain it is computed PER. Distinct from
+    #: GRAIN_PATH_NOT_GOVERNED, which is about a grain that IS declared and whose path is not
+    #: approved: this one is the absence itself. It exists because the alternative was a fallback
+    #: that treated every operand ref as a grain key — a guess that produced a plausible, wrong
+    #: answer rather than a refusal anybody could act on.
+    GRAIN_NOT_RESOLVED = "GRAIN_NOT_RESOLVED"
+    #: The formula declares a policy and nothing says which realization decides it. Distinct from a
+    #: realization whose CONTENT is missing: this one is unbound, that one is unstored, and the
+    #: remedies differ — bind it, or supply its content.
+    POLICY_REFERENCE_UNRESOLVABLE = "POLICY_REFERENCE_UNRESOLVABLE"
+    #: The candidate was frozen under a canonicalization that did not carry its typed computation
+    #: (operation, measures, grain, time, window, grouping). Those candidates are readable and
+    #: auditable, and they cannot be EXECUTED: the identity they were sealed under does not describe
+    #: what they compute, so a build from one would be a build of something nobody can name. The
+    #: remedy is regeneration, which the message says.
+    CANDIDATE_REGENERATION_REQUIRED = "CANDIDATE_REGENERATION_REQUIRED"
     JOIN_FANOUT_UNSUPPORTED = "JOIN_FANOUT_UNSUPPORTED"
     JOIN_CARDINALITY_UNKNOWN = "JOIN_CARDINALITY_UNKNOWN"
 
@@ -113,6 +144,13 @@ class PublicationRefusalCode(StrEnum):
     GROUP_BINDING_CONFLICT = "GROUP_BINDING_CONFLICT"
     #: The probe proved the environment offers no supported publish mechanism.
     PUBLISH_MECHANISM_UNSUPPORTED = "PUBLISH_MECHANISM_UNSUPPORTED"
+    #: No PASSING verification exists for this exact sealed artifact in this environment. Distinct
+    #: from CAPABILITY_UNPROVEN, and the distinction is what each one is about: capability is about
+    #: the ENVIRONMENT (can anything be published here atomically), this is about the ARTIFACT (does
+    #: this one produce the right numbers). An environment can be perfectly capable of publishing a
+    #: feature nobody has checked. Covers "never asked", "still running" and "refused" alike —
+    #: every one of them is equally not-evidence at this door.
+    VERIFICATION_ABSENT = "VERIFICATION_ABSENT"
 
 
 class ValidationGateCode(StrEnum):

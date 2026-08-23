@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from featuregen.formula.schema import (
-    AdditivityClass,
     AggregateFunction,
     DiffBody,
     FormulaBody,
@@ -33,6 +32,7 @@ from featuregen.formula.schema import (
     TypedFormulaProposalV1,
     UnaryBody,
 )
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.overlay.upload.operational_facts import OperationalValue
 
 __all__ = [

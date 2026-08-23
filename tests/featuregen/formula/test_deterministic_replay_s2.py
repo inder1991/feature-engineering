@@ -194,7 +194,7 @@ def test_OMITTING_the_blueprint_still_takes_the_AUTHORED_path(db, monkeypatch):
         db, _INTENT, None, None, actor=None, authoring_run_id="far_s2_authored",
         facts_reader=_monetary_facts,
         critic_metadata_loader=lambda ref: {"found": True, "logical_ref": ref},
-        tool_runner=lambda **kw: {})
+        tool_runner=lambda **kw: {}, formula_schema_version=3)
 
     assert reached == ["author"], "the authored path was taken"
     assert result.authoring_disposition == "TECHNICAL_FAILURE"
@@ -225,10 +225,16 @@ def test_A_NON_EMPTY_CURRENCY_CONVERSION_REF_YIELDS_AN_INTENT(db, monkeypatch):
 
 
 def test_the_intent_is_PROVISIONAL_and_the_output_says_so(db, monkeypatch):
-    """"needs_authority" is the truthful status: S5 resolves it, and claiming "resolved" here would
-    assert an authority nobody consulted."""
+    """"deferred_to_compiler" is the truthful status: the compiler resolves it, and claiming
+    "resolved" here would assert an authority nobody consulted.
+
+    ▲ It is NOT `needs_authority`, which this asserted until the two were separated. That value
+    means a governed read was attempted and FAILED, and a human must look — the opposite of a V3
+    run that succeeded at everything it owns. Spelling them the same made admission unable to tell
+    the two apart, and it briefly admitted the failed one.
+    """
     result = _run(db, "far_s2_provisional", monkeypatch)
-    assert result.output_status == "needs_authority"
+    assert result.output_status == "deferred_to_compiler"
     assert result.candidate_proposal is not None, "the artifact is still carried"
 
 

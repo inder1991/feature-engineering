@@ -1,15 +1,13 @@
 """Reviewed Formula-v1 blueprints for authorable recipe anchors."""
 from __future__ import annotations
 
-from featuregen.formula.schema import (
-    AggregateFunction,
+from featuregen.formula.schema import AggregateFunction, FinalOperation, WindowBasis
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
-    FinalOperation,
     Inclusivity,
     NullInput,
     OverflowBehavior,
     RoundingMode,
-    WindowBasis,
     WindowUnit,
 )
 from featuregen.overlay.upload.recipe_formula_contracts import (

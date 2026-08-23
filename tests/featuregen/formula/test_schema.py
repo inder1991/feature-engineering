@@ -9,31 +9,34 @@ import dataclasses
 import pytest
 
 from featuregen.formula import schema as s
+from featuregen.formula import schema_leaves as _leaves
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
-    DecimalPolicy,
     DiffBody,
+    FinalOperation,
+    RatioBody,
+    TypedFormulaProposalV1,
+    UnaryBody,
+    WindowPolicy,
+    validate_semantics,
+)
+from featuregen.formula.schema_leaves import (
+    DecimalPolicy,
     FilterBool,
     FilterBoolOp,
     FilterPredicate,
     FilterPredicateOp,
-    FinalOperation,
     Grain,
     Inclusivity,
     LiteralType,
     ParamClass,
     ParameterDecl,
     ParameterRef,
-    RatioBody,
     RoundingMode,
     SchemaError,
     SourceRelation,
-    TypedFormulaProposalV1,
     TypedLiteral,
-    UnaryBody,
-    WindowPolicy,
-    validate_semantics,
 )
 
 # ---------------------------------------------------------------- builders
@@ -51,12 +54,12 @@ def make_window(**over) -> WindowPolicy:
         event_time_ref=EVENT_TS,
         basis=s.WindowBasis.TRAILING,
         length=30,
-        unit=s.WindowUnit.DAY,
+        unit=_leaves.WindowUnit.DAY,
         start_inclusive=Inclusivity.INCLUSIVE,
         end_inclusive=Inclusivity.EXCLUSIVE,
         timezone="UTC",
-        empty_window=s.EmptyWindowResult.NULL,
-        null_input=s.NullInput.IGNORE,
+        empty_window=_leaves.EmptyWindowResult.NULL,
+        null_input=_leaves.NullInput.IGNORE,
     )
     kw.update(over)
     return WindowPolicy(**kw)
@@ -86,7 +89,7 @@ def make_proposal(**over) -> TypedFormulaProposalV1:
             precision=18,
             scale=2,
             rounding=RoundingMode.HALF_EVEN,
-            overflow=s.OverflowBehavior.ERROR,
+            overflow=_leaves.OverflowBehavior.ERROR,
         ),
         expected_output=None,
     )
@@ -126,17 +129,17 @@ class TestEnumExactValues:
 
     def test_window_enums(self):
         assert {e.value for e in s.WindowBasis} == {"trailing", "calendar_period"}
-        assert {e.value for e in s.WindowUnit} == {"day", "week", "month", "quarter", "year"}
+        assert {e.value for e in _leaves.WindowUnit} == {"day", "week", "month", "quarter", "year"}
         assert {e.value for e in Inclusivity} == {"inclusive", "exclusive"}
-        assert {e.value for e in s.EmptyWindowResult} == {"null", "zero", "error"}
-        assert {e.value for e in s.NullInput} == {"ignore", "propagate", "zero"}
-        assert {e.value for e in s.ZeroDenominator} == {"null", "zero", "error"}
+        assert {e.value for e in _leaves.EmptyWindowResult} == {"null", "zero", "error"}
+        assert {e.value for e in _leaves.NullInput} == {"ignore", "propagate", "zero"}
+        assert {e.value for e in _leaves.ZeroDenominator} == {"null", "zero", "error"}
 
     def test_numeric_policy_enums(self):
         assert {e.value for e in RoundingMode} == {
             "half_up", "half_even", "down", "up", "floor", "ceiling",
         }
-        assert {e.value for e in s.OverflowBehavior} == {"error", "saturate"}
+        assert {e.value for e in _leaves.OverflowBehavior} == {"error", "saturate"}
 
     def test_literal_and_param_enums(self):
         assert {e.value for e in LiteralType} == {
@@ -145,7 +148,7 @@ class TestEnumExactValues:
         assert {e.value for e in ParamClass} == {"semantic", "operational"}
 
     def test_filter_enums(self):
-        assert {e.value for e in s.FilterKind} == {"bool", "predicate"}
+        assert {e.value for e in _leaves.FilterKind} == {"bool", "predicate"}
         assert {e.value for e in FilterBoolOp} == {"and", "or", "not"}
         assert {e.value for e in FilterPredicateOp} == {
             "equal", "not_equal", "greater_than", "greater_or_equal",
@@ -154,16 +157,16 @@ class TestEnumExactValues:
         assert FilterPredicateOp.GREATER_OR_EQUAL == "greater_or_equal"
 
     def test_additivity_class_values(self):
-        assert {e.value for e in s.AdditivityClass} == {
+        assert {e.value for e in _leaves.AdditivityClass} == {
             "additive", "non_additive", "semi_additive",
         }
 
 
 class TestDataclassShape:
     def test_hard_limit_constants(self):
-        assert s.MAX_FILTER_DEPTH == 4
-        assert s.MAX_PREDICATES == 16
-        assert s.MAX_IN_LIST == 64
+        assert _leaves.MAX_FILTER_DEPTH == 4
+        assert _leaves.MAX_PREDICATES == 16
+        assert _leaves.MAX_IN_LIST == 64
 
     def test_dataclasses_frozen(self):
         p = make_proposal()
@@ -182,16 +185,16 @@ class TestDataclassShape:
         ratio = RatioBody(
             numerator=make_expr(),
             denominator=make_expr(),
-            zero_denominator=s.ZeroDenominator.NULL,
+            zero_denominator=_leaves.ZeroDenominator.NULL,
         )
         assert ratio.final_operation is FinalOperation.RATIO
         diff = DiffBody(minuend=make_expr(), subtrahend=make_expr())
         assert diff.final_operation is FinalOperation.DIFFERENCE
 
     def test_filter_kind_discriminators_fixed(self):
-        assert eq_pred().kind is s.FilterKind.PREDICATE
+        assert eq_pred().kind is _leaves.FilterKind.PREDICATE
         node = FilterBool(op=FilterBoolOp.AND, children=(eq_pred(), eq_pred()))
-        assert node.kind is s.FilterKind.BOOL
+        assert node.kind is _leaves.FilterKind.BOOL
 
     def test_authoritative_identity_object_exists(self):
         formula = s.TypedFormulaV1(
@@ -204,13 +207,13 @@ class TestDataclassShape:
             parameters=(),
             decimal=DecimalPolicy(
                 precision=18, scale=2,
-                rounding=RoundingMode.HALF_EVEN, overflow=s.OverflowBehavior.ERROR,
+                rounding=RoundingMode.HALF_EVEN, overflow=_leaves.OverflowBehavior.ERROR,
             ),
             output=s.FormulaOutputPolicyV1(
                 output_type="decimal(18,2)",
                 unit=None,
                 currency="USD",
-                output_additivity=s.AdditivityClass.ADDITIVE,
+                output_additivity=_leaves.AdditivityClass.ADDITIVE,
                 external_type_required=False,
             ),
         )
@@ -230,8 +233,8 @@ class TestValidProposals:
         assert validate_semantics(p) is None
 
     def test_valid_filter_at_max_depth_passes(self):
-        node: s.FilterNode = eq_pred()
-        for _ in range(s.MAX_FILTER_DEPTH - 1):  # depth: predicate=1, each NOT +1
+        node: _leaves.FilterNode = eq_pred()
+        for _ in range(_leaves.MAX_FILTER_DEPTH - 1):  # depth: predicate=1, each NOT +1
             node = FilterBool(op=FilterBoolOp.NOT, children=(node,))
         assert validate_semantics(proposal_with_filter(node)) is None
 
@@ -261,7 +264,7 @@ class TestValidProposals:
         body = RatioBody(
             numerator=make_expr(filter=flt),
             denominator=make_expr(aggregation=AggregateFunction.COUNT_ROWS, operand=None),
-            zero_denominator=s.ZeroDenominator.NULL,
+            zero_denominator=_leaves.ZeroDenominator.NULL,
         )
         assert validate_semantics(make_proposal(body=body, parameters=(param,))) is None
 
@@ -302,7 +305,7 @@ class TestPredicateInvariants:
             validate_semantics(proposal_with_filter(node))
 
     def test_in_rejects_right_set_over_max_in_list(self):
-        entries = tuple(lit_str(f"v{i:03d}") for i in range(s.MAX_IN_LIST + 1))
+        entries = tuple(lit_str(f"v{i:03d}") for i in range(_leaves.MAX_IN_LIST + 1))
         node = FilterPredicate(op=FilterPredicateOp.IN, left=CHANNEL, right_set=entries)
         with pytest.raises(SchemaError, match="MAX_IN_LIST"):
             validate_semantics(proposal_with_filter(node))
@@ -350,8 +353,8 @@ class TestFilterShapeLimits:
             validate_semantics(proposal_with_filter(node))
 
     def test_filter_depth_over_max_rejected(self):
-        node: s.FilterNode = eq_pred()
-        for _ in range(s.MAX_FILTER_DEPTH):  # predicate=1 + 4 NOTs = depth 5
+        node: _leaves.FilterNode = eq_pred()
+        for _ in range(_leaves.MAX_FILTER_DEPTH):  # predicate=1 + 4 NOTs = depth 5
             node = FilterBool(op=FilterBoolOp.NOT, children=(node,))
         with pytest.raises(SchemaError, match="MAX_FILTER_DEPTH"):
             validate_semantics(proposal_with_filter(node))
@@ -359,7 +362,7 @@ class TestFilterShapeLimits:
     def test_predicate_count_over_max_rejected(self):
         node = FilterBool(
             op=FilterBoolOp.AND,
-            children=tuple(eq_pred() for _ in range(s.MAX_PREDICATES + 1)),
+            children=tuple(eq_pred() for _ in range(_leaves.MAX_PREDICATES + 1)),
         )
         with pytest.raises(SchemaError, match="MAX_PREDICATES"):
             validate_semantics(proposal_with_filter(node))
@@ -442,7 +445,7 @@ class TestSameTableContainment:
             denominator=make_expr(
                 aggregation=AggregateFunction.COUNT_NON_NULL, operand=OTHER_TABLE_COL
             ),
-            zero_denominator=s.ZeroDenominator.NULL,
+            zero_denominator=_leaves.ZeroDenominator.NULL,
         )
         with pytest.raises(SchemaError, match="body.denominator"):
             validate_semantics(make_proposal(body=body))
@@ -491,7 +494,7 @@ class TestDecimalPolicy:
         p = make_proposal(
             decimal=DecimalPolicy(
                 precision=18, scale=-1,
-                rounding=RoundingMode.HALF_EVEN, overflow=s.OverflowBehavior.ERROR,
+                rounding=RoundingMode.HALF_EVEN, overflow=_leaves.OverflowBehavior.ERROR,
             )
         )
         with pytest.raises(SchemaError, match="scale"):
@@ -501,7 +504,7 @@ class TestDecimalPolicy:
         p = make_proposal(
             decimal=DecimalPolicy(
                 precision=2, scale=5,
-                rounding=RoundingMode.HALF_EVEN, overflow=s.OverflowBehavior.ERROR,
+                rounding=RoundingMode.HALF_EVEN, overflow=_leaves.OverflowBehavior.ERROR,
             )
         )
         with pytest.raises(SchemaError, match="precision"):

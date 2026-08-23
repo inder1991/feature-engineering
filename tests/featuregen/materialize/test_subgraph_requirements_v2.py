@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from featuregen.formula.schema import DecimalPolicy, OverflowBehavior, RoundingMode
+from featuregen.formula.schema_leaves import DecimalPolicy, OverflowBehavior, RoundingMode
 from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize.operator_graph_v2 import (
     AggregateV2,

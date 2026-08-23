@@ -1653,13 +1653,28 @@ class FeatureIdea:
     # ── Slice 3 typed computation operands (deterministically resolved from the proposal) ──
     operation_kind: str = ""                              # "sum"|"count"|"avg"|"ratio"|"recency"|...
     measure_refs: tuple[tuple[str, str], ...] = ()        # (catalog_source, object_ref) columns aggregated
-    grain_ref: tuple[str, str] | None = None              # the grain the feature is computed per
+    # ORDERED, and PLURAL, because a formula may be grained on more than one key — a feature per
+    # (customer, product) is two keys and their order decides the published column order. The old
+    # singular could not say that, and silently answered "the first one" for anything that had two.
+    grain_refs: tuple[tuple[str, str], ...] = ()          # the grain the feature is computed per
     time_ref: tuple[str, str] | None = None               # the point-in-time column
     window: str | None = None                             # e.g. "90d"
     # D3 1b: the TYPED operation class (closed RESULT_CLASS_ADDITIVITY vocabulary, e.g.
     # "sum"/"ratio"/"recency") — the browsing axis. "" for conceptual patterns and
     # free-form ideas; a heading is a fact about the feature, never a prompt name.
     operation_class: str = ""
+
+    @property
+    def grain_ref(self) -> tuple[str, str] | None:
+        """The FIRST grain key, for the display surfaces that show one.
+
+        Derived rather than stored, so the singular and the plural cannot disagree — which they
+        would, the first time something set one and read the other. Callers that care about a
+        multi-key grain must read :attr:`grain_refs`; this is a convenience for headings and card
+        text, and it says so.
+        """
+        return self.grain_refs[0] if self.grain_refs else None
+
     grouping_refs: tuple[tuple[str, str], ...] = ()       # group-by columns
     # ── Slice 3 tri-state honest status (a NEW axis; `verification` above is unchanged) ──
     validation_status: str = "DESIGN_CHECKED"             # in VALIDATION_STATES
@@ -2611,7 +2626,8 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         derives_from=derives, aggregation=aggregation, grain_table=grain_table,
         derives_pairs=tuple(pairs), rationale=str(raw.get("rationale", "")),
         operation_kind=_norm_agg(aggregation), measure_refs=tuple(pairs),
-        grain_ref=grain_operand, time_ref=time_operand, window=_window_of(aggregation),
+        grain_refs=((grain_operand,) if grain_operand else ()),
+        time_ref=time_operand, window=_window_of(aggregation),
         grouping_refs=(), validation_status=status, requirements=tuple(requirements),
         # PROVENANCE, from the gate that already ran above: the policy revisions that licensed this
         # candidate's personal-data operands, or () when it binds none.

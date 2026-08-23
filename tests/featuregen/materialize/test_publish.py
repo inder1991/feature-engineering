@@ -653,9 +653,18 @@ def test_INSERT_OVERWRITE_is_not_a_member_of_the_mechanism_vocabulary() -> None:
     assert not any("OVERWRITE" in member for member in members), members
 
 
-def test_the_three_publication_refusal_codes_are_the_ones_this_task_routes() -> None:
+def test_the_publication_refusal_codes_are_the_ones_publication_routes() -> None:
+    """Step 14 added a fourth, and the addition is the point rather than an oversight.
+
+    The first three are about the ENVIRONMENT — can anything be published here, atomically, under
+    this binding. `VERIFICATION_ABSENT` is about the ARTIFACT: does this one produce the right
+    numbers. An environment can be perfectly capable of publishing a feature nobody has checked, so
+    folding it into `CAPABILITY_UNPROVEN` would send an operator to re-run a capability probe that
+    would pass and change nothing.
+    """
     assert {code.value for code in PublicationRefusalCode} == {
-        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED"}
+        "CAPABILITY_UNPROVEN", "GROUP_BINDING_CONFLICT", "PUBLISH_MECHANISM_UNSUPPORTED",
+        "VERIFICATION_ABSENT"}
 
 
 @pytest.mark.parametrize("record", [ProbeObservation, ProbeResult,

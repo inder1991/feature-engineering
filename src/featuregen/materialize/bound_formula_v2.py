@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.materialize.canonical import materialize_hash
 from featuregen.materialize.physical_types_v2 import PHYSICAL_TYPE_POLICY_V2
 

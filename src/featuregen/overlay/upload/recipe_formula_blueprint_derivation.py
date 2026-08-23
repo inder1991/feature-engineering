@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     Inclusivity,
     NullInput,

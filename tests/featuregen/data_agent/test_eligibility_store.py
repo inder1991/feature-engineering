@@ -151,11 +151,12 @@ def test_the_stored_policy_reproduces_the_fixtures_hand_counted_answer(db):
     """The point of storing it: a policy read back from the table filters the pilot rows exactly as
     the hand-written one does, including the traps — C4's current month is only reversals, and C6's
     only previous transaction is reversed."""
+    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     _record(db)

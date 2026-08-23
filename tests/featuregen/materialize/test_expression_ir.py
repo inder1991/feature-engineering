@@ -29,6 +29,10 @@ from tests.featuregen.materialize import fixtures
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
+    WindowBasis,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     FilterBool,
     FilterBoolOp,
@@ -40,10 +44,9 @@ from featuregen.formula.schema import (
     ParameterRef,
     SourceRelation,
     TypedLiteral,
-    WindowBasis,
-    WindowPolicy,
     WindowUnit,
 )
+from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize import expression_ir
 from featuregen.materialize.codes import CompilationRefusalCode, MaterializationRefused
 from featuregen.materialize.expression_ir import (
@@ -853,10 +856,26 @@ def test_no_filter_means_no_filter_tree(catalog):
     assert ir.filter_tree is None
 
 
-def test_the_aggregation_is_CARRIED_never_rederived(catalog):
+def test_the_aggregation_is_CARRIED_and_NORMALIZED_to_one_vocabulary(catalog):
+    """The aggregate is not re-derived — and it is crossed into V2's vocabulary exactly once, here.
+
+    It used to be carried verbatim, which meant the compiled IR spoke whichever language its formula
+    did. A V1 member and its V2 twin compare EQUAL and HASH EQUAL, so the renderer's dispatch table
+    answered either one while every ``is`` comparison against the same member failed — dispatch by
+    coincidence, identity by accident, and a feature rendered down the wrong arm.
+    """
     ir = _compile(catalog, expr=_expr(aggregation=AggregateFunction.COUNT_DISTINCT))
     assert isinstance(ir, ExpressionExecutionIR)
-    assert ir.aggregation is AggregateFunction.COUNT_DISTINCT
+    assert ir.aggregation is AggregateFunctionV2.COUNT_DISTINCT
+    assert ir.aggregation.value == AggregateFunction.COUNT_DISTINCT.value   # the same aggregate
+
+
+def test_an_IR_CANNOT_BE_BUILT_carrying_the_OTHER_vocabulary(catalog):
+    """Enforced by the type, not by the annotation: the annotation is what let this drift."""
+    ir = _compile(catalog)
+    assert isinstance(ir, ExpressionExecutionIR)
+    with pytest.raises(TypeError, match="passes every dispatch and fails every branch"):
+        dataclasses.replace(ir, aggregation=AggregateFunction.SUM)
 
 
 def test_count_rows_has_no_operand_and_still_compiles(catalog):
@@ -1009,14 +1028,16 @@ def _one_expression_formula(expr, *, output_type="numeric"):
         FORMULA_SCHEMA_VERSION,
         OPERATION_GRAMMAR_VERSION,
         OUTPUT_POLICY_VERSION,
+        FormulaOutputPolicyV1,
+        TypedFormulaV1,
+        UnaryBody,
+    )
+    from featuregen.formula.schema_leaves import (
         AdditivityClass,
         DecimalPolicy,
-        FormulaOutputPolicyV1,
         Grain,
         OverflowBehavior,
         RoundingMode,
-        TypedFormulaV1,
-        UnaryBody,
     )
 
     return TypedFormulaV1(

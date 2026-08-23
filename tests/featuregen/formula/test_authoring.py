@@ -67,11 +67,8 @@ from featuregen.formula.result import (
     IncoherentResultError,
     derive_disposition,
 )
-from featuregen.formula.schema import (
-    AdditivityClass,
-    FormulaOutputPolicyV1,
-    TypedFormulaV1,
-)
+from featuregen.formula.schema import FormulaOutputPolicyV1, TypedFormulaV1
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.trace import TraceEventKind, run_status
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -515,7 +512,11 @@ def test_forbids_authored_artifact_agrees_with_the_fold_on_every_axis_combinatio
         expected = _fold(axes) in ("UNSUPPORTED", "REJECTED", "TECHNICAL_FAILURE")
         assert forbids_authored_artifact(axes) is expected, axes
         checked += 1
-    assert checked == 3 * 2 * 4 * 3 * 3 * 2
+    # DERIVED from the vocabulary rather than multiplied out here: the axis sets grow (V2 added
+    # `deferred_to_compiler` for V3's deferral), and a hand-multiplied constant makes that growth
+    # look like a broken test instead of a wider cross-product.
+    assert checked == len(list(_all_axes()))
+    assert checked > 0, "an empty cross-product would pass every assertion above vacuously"
 
 
 # ── carry-forward #4: technical outcomes never fabricate ─────────────────────────────────────────

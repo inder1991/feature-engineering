@@ -24,7 +24,7 @@ from enum import StrEnum
 from typing import Any
 
 from featuregen.canonical import jcs_sha256
-from featuregen.materialize.admission import hive_identifier
+from featuregen.materialize.identifiers import hive_identifier
 
 __all__ = [
     "AuthoringWorkItemV1",

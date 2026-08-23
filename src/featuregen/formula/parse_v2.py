@@ -21,14 +21,14 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import best_match
 
-from featuregen.formula.parse import (
+from featuregen.formula.parse import parse_proposal_v1
+from featuregen.formula.parse_leaves import (
     _build_expected_output,
     _build_filter,
     _build_parameter,
     _plain,
-    parse_proposal_v1,
 )
-from featuregen.formula.schema import (
+from featuregen.formula.schema_leaves import (
     DecimalPolicy,
     OverflowBehavior,
     RoundingMode,
@@ -56,7 +56,7 @@ def _validator_v2() -> Draft202012Validator:
 
 
 def _build_window_v2(data: dict[str, Any]):
-    from featuregen.formula.schema import (
+    from featuregen.formula.schema_leaves import (
         EmptyWindowResult,
         Inclusivity,
         NullInput,
@@ -131,7 +131,7 @@ def _build_body_v2(data: dict[str, Any]) -> FormulaBodyV2:
 def parse_proposal_v2(raw: Mapping[str, Any]) -> TypedFormulaProposalV2:
     """Parse an untrusted raw dict into a validated ``TypedFormulaProposalV2`` — v1's exact
     order (shape, construction, semantics), against the v2 schema and vocabulary."""
-    from featuregen.formula.schema import Grain
+    from featuregen.formula.schema_leaves import Grain
 
     try:
         data = _plain(raw)

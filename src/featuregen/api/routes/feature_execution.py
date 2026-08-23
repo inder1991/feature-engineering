@@ -39,8 +39,14 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from featuregen.aggregates.ids import mint_id
-from featuregen.api.deps import get_conn, get_identity, require_confirmer
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    require_feature_generate,
+    require_feature_read,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.permissions import FEATURE_GENERATE, has_permission
 from featuregen.materialize.evaluate_execution import (
     evaluate_publish_sandbox,
     evaluate_verify,
@@ -103,15 +109,39 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 
 
-def _explained(blockers: tuple[str, ...]) -> list[dict[str, str]]:
-    """Each blocker with the reason the disposition table gives it.
+#: Service-level codes with served sentences — they live in the decision service, not the
+#: evaluator table, so the display layer explains them here rather than crashing on them.
+_SERVICE_CODE_WORDS: dict[str, str] = {
+    "ACTION_UNAVAILABLE": "this act is not available under the development policy (§0.1.0): "
+                          "production acts open with production governance, not by absence of "
+                          "a rule",
+    "ACTION_AUTHORIZATION_MISSING": "the act references no recorded authorization",
+    "ACTION_AUTHORIZATION_NOT_FOR_THIS_ACT": "the named authorization covers a different act "
+                                             "or resource",
+    "ACTION_AUTHORIZATION_REFUSED": "the recorded authorization was refused",
+}
 
-    Read from that table rather than restated here, so the workspace and a corpus report explain a
-    code the same way. A code with no disposition raises through the lookup — an unexplained code on
-    a screen is how a blocker stops being understood.
+
+def _explained(blockers: tuple[str, ...]) -> list[dict[str, str]]:
+    """Each blocker with the reason its OWN layer gives it.
+
+    Read from the evaluator disposition table where the code lives there, from the service
+    vocabulary where it lives in the decision service — and NEVER a raise: §5 names the old
+    behaviour (an unknown code raising through this function at DISPLAY time) as the wrong layer
+    and the wrong moment. The build already ran; the screen's job is to say so, and a code this
+    function cannot explain renders its de-underscored words with the code beside it rather than
+    a 500 in place of an answer.
     """
-    return [{"code": code, "reason": ACTIVATION_BLOCKER_DISPOSITIONS[code][1]}
-            for code in blockers]
+    explained: list[dict[str, str]] = []
+    for code in blockers:
+        if code in ACTIVATION_BLOCKER_DISPOSITIONS:
+            reason = ACTIVATION_BLOCKER_DISPOSITIONS[code][1]
+        elif code in _SERVICE_CODE_WORDS:
+            reason = _SERVICE_CODE_WORDS[code]
+        else:
+            reason = code.lower().replace("_", " ")
+        explained.append({"code": code, "reason": reason})
+    return explained
 
 
 # ── generate ─────────────────────────────────────────────────────────────────────────────────────
@@ -133,7 +163,7 @@ class GenerationRequestIn(BaseModel):
 
 
 @router.post("/feature-execution/generations", status_code=201,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def authorize_generation(
     body: GenerationRequestIn, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -182,9 +212,9 @@ def authorize_generation(
 
 # ── verify eligibility ───────────────────────────────────────────────────────────────────────────
 @router.get("/feature-execution/{artifact_id}/verify-eligibility",
-            dependencies=[Depends(require_confirmer)])
+            dependencies=[Depends(require_feature_read)])
 def verify_eligibility(
-    artifact_id: str, inventory_observation_id: str, environment_id: str,
+    artifact_id: str, inventory_observation_id: str,
     conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
     """May this artifact be verified? A QUESTION — it records nothing.
@@ -194,8 +224,12 @@ def verify_eligibility(
     """
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=artifact_id,
-        inventory_observation_id=inventory_observation_id, environment_id=environment_id,
-        execution_permitted=_may_execute(identity))
+        inventory_observation_id=inventory_observation_id,
+        execution_permitted=_may_execute(identity),
+        # ▲ EXPLICIT-EMPTY IS A CLAIM (§8.1): this route consults no activation fold today, and
+        # says so — an omitted argument was indistinguishable from a caller that never asked. The
+        # carried set arrives when §7's decision service absorbs these gates (step 6's worker).
+        activation_blockers=())
     return {"action": verdict.action.value, "allowed": verdict.allowed,
             "blockers": _explained(verdict.blockers)}
 
@@ -203,21 +237,40 @@ def verify_eligibility(
 def _may_execute(identity: IdentityEnvelope) -> bool:
     """Whether this caller may execute against a cluster.
 
-    Derived from the role claims the request arrived with, and NOT re-derived from the catalog: read
-    scope over the group's physical reads is Gate 2's decision and was made when the artifact was
-    authorized. This is the coarser "may this person run things at all".
+    Asked as a PERMISSION, not as a list of role names — the same question the route guard asks, so
+    the two cannot disagree. They used to: the routes demanded the raw ``platform-admin`` claim
+    while this function accepted ``feature_engineer``, so a feature engineer was rejected by the
+    guard before the function that would have authorised them ever ran. Three vocabularies for one
+    idea, and the narrowest of them won by accident of ordering.
+
+    Kept as a separate check even though the guard now asks the same thing: it is what produces the
+    EXPLAINED refusal (``EXECUTION_AUTHORITY_UNMET``) rather than a bare 403, and a later change
+    that widens the guard should not silently widen who may run a cluster job.
+
+    Derived from the claims the request arrived with, and NOT re-derived from the catalog: read
+    scope over the group's physical reads is Gate 2's decision, made when the artifact was
+    authorised. This is the coarser "may this person run things at all".
     """
-    return bool({"feature_engineer", "platform_admin"} & set(identity.role_claims))
+    return has_permission(identity.role_claims, FEATURE_GENERATE)
 
 
 def _may_publish(identity: IdentityEnvelope) -> bool:
     """Whether this caller may publish. STRICTLY narrower than execution: publication makes a number
-    visible to everyone downstream, and the two are separate grants for that reason."""
+    visible to everyone downstream, and the two are separate grants for that reason.
+
+    Still expressed as a ROLE rather than a permission because there is no ``feature:publish``
+    permission in the catalogue yet, and inventing one here — in a route module — would put a
+    second permission vocabulary next to the real one. The narrowing is deliberate and the
+    asymmetry is recorded rather than hidden: a feature engineer REACHES this route (the guard is
+    ``feature:generate``) and is refused by name, which is the answer they can act on. A bare 403
+    from the guard would have told them only that something, somewhere, said no.
+    """
     return "platform_admin" in set(identity.role_claims)
 
 
 # ── code view ────────────────────────────────────────────────────────────────────────────────────
-@router.get("/feature-execution/{artifact_id}/code", dependencies=[Depends(require_confirmer)])
+@router.get("/feature-execution/{artifact_id}/code",
+            dependencies=[Depends(require_feature_read)])
 def artifact_code(artifact_id: str, conn: _Conn) -> dict[str, Any]:
     """The generated project's files, verified on the way out.
 
@@ -267,17 +320,20 @@ class VerificationRequestIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sealed_artifact_id: str = Field(min_length=1)
-    generation_authorization_revision_id: str = Field(min_length=1)
     check_set_hash: str = Field(min_length=1)
     inventory_observation_id: str = Field(min_length=1)
-    environment_id: str = Field(min_length=1)
+    #: `generation_authorization_revision_id` and `environment_id` are NOT fields here, and their
+    #: absence is the point. Both are properties OF THE ARTIFACT, recorded when it was sealed, and
+    #: both end up inside the verification identity — so accepting them from the request body let
+    #: the caller choose two security-relevant values that the server already knows. `extra="forbid"`
+    #: means an old client still sending them gets a 422 rather than being quietly ignored.
     #: Counted from 1 by the caller, because the caller is the one who knows this is a RETRY. A
     #: server-chosen next-attempt would make two concurrent clicks two attempts nobody asked for.
     attempt: int = Field(ge=1)
 
 
 @router.post("/feature-execution/verifications", status_code=202,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def request_verification(
     body: VerificationRequestIn, response: Response, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -290,40 +346,84 @@ def request_verification(
     verdict = evaluate_verify(
         conn, sealed_artifact_hash=body.sealed_artifact_id,
         inventory_observation_id=body.inventory_observation_id,
-        environment_id=body.environment_id, execution_permitted=_may_execute(identity))
+        execution_permitted=_may_execute(identity),
+        activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,
             detail={"detail": "verification is not allowed for this artifact",
                     "blockers": _explained(verdict.blockers)})
 
-    identity_v1 = VerificationExecutionIdentityV1(
-        generation_authorization_revision_id=body.generation_authorization_revision_id,
-        check_set_hash=body.check_set_hash,
-        inventory_observation_id=body.inventory_observation_id,
-        attempt=body.attempt)
-    try:
-        execution_hash = record_verification_attempt(
-            conn, identity_v1, sealed_artifact_id=body.sealed_artifact_id,
-            staging_root=STAGING_ROOT, started_at=_now(conn))
-    except StagingPathCollision as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # DERIVED FROM THE ARTIFACT, not from the body. The verification identity says which approval
+    # the run is being verified under; taking that from the request would let a caller verify one
+    # artifact while citing somebody else's approval, and the resulting attempt would look
+    # perfectly well-formed. `evaluate_verify` has already established the artifact is servable, so
+    # this load succeeds — but it is re-read rather than assumed, because "the gate passed" is not
+    # a value.
+    sealed = load_sealed_artifact(conn, body.sealed_artifact_id)
+    if sealed is None:                                            # pragma: no cover — gate-covered
+        raise HTTPException(status_code=409,
+                            detail={"detail": "the artifact disappeared between the gate and the "
+                                              "record; nothing was written"})
 
-    response.headers[VERIFICATION_ID_HEADER] = execution_hash
-    counters.incr("featuregen.verify.requested")
-    log("featuregen.verify.requested", execution_hash=execution_hash,
-        artifact_id=body.sealed_artifact_id, attempt=body.attempt)
+    # ▲ THE ROUTE RECORDS A REQUEST, NOT AN ATTEMPT — §9.0, and this is the correction the old
+    # docstring's own promise demanded. It used to write `verification_attempt` HERE: an attempt
+    # that never ran, minted at request time, while "a worker executes it" was a sentence with no
+    # worker behind it. Now the LIFECYCLE row is created (1094's store, gaining its first
+    # production caller), the request-time decision is recorded, and the job is enqueued in the
+    # same transaction — the attempt evidence is written by the worker WHEN EXECUTION HAPPENS.
+    from featuregen.materialize.action_authorization import ActionV1, authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.materialize.verification_lane import (
+        enqueue_verification,
+        verification_evidence_pins,
+    )
+    from featuregen.overlay.upload.verification_request_store import request_verification
+
+    request_id, created = request_verification(
+        conn, request_id=mint_id("vfr"),
+        sealed_artifact_id=body.sealed_artifact_id,
+        environment_id=sealed.environment_id,
+        requested_by=identity.subject, requested_at=_now(conn))
+    if created:
+        authorization = authorize_action(
+            conn, action=ActionV1.EXECUTE_SANDBOX,
+            resource_identity_hash=body.sealed_artifact_id,
+            actor_subject=identity.subject, environment_id=sealed.environment_id)
+        decision_id, _decision = decide(
+            conn,
+            ActionRequestV1(
+                action=ActionV1.EXECUTE_SANDBOX,
+                resource_identity_hash=body.sealed_artifact_id,
+                evidence_pins=verification_evidence_pins(
+                    sealed_artifact_id=body.sealed_artifact_id,
+                    environment_id=sealed.environment_id)),
+            authorization_id=authorization.authorization_id)
+        conn.execute(
+            "UPDATE verification_request SET action_decision_revision_id = %s "
+            "WHERE request_id = %s", (decision_id, request_id))
+        enqueue_verification(
+            conn, request_id=request_id,
+            sealed_artifact_id=body.sealed_artifact_id,
+            environment_id=sealed.environment_id)
+
+    response.headers[VERIFICATION_ID_HEADER] = request_id
+    counters.incr("featuregen.verify.requested" if created
+                  else "featuregen.verify.deduplicated")
+    log("featuregen.verify.requested", request_id=request_id,
+        artifact_id=body.sealed_artifact_id, created=created)
     return {
-        "execution_hash": execution_hash,
+        "request_id": request_id,
+        "created": created,
         "sealed_artifact_id": body.sealed_artifact_id,
-        "attempt": body.attempt,
-        "staging_path": identity_v1.staging_path(STAGING_ROOT),
-        "detail": "the verification request was recorded; a worker executes it",
+        "detail": ("the verification was requested; the durable worker executes it"
+                   if created else
+                   "a verification of this artifact is already live in this environment"),
     }
 
 
 @router.get("/feature-execution/verifications/{execution_hash}",
-            dependencies=[Depends(require_confirmer)])
+            dependencies=[Depends(require_feature_read)])
 def verification_result(execution_hash: str, conn: _Conn) -> dict[str, Any]:
     """What became of one verification — and its THREE-WAY staleness, never a boolean.
 
@@ -382,7 +482,7 @@ class PublicationRequestIn(BaseModel):
 
 
 @router.post("/feature-execution/publications", status_code=202,
-             dependencies=[Depends(require_confirmer)])
+             dependencies=[Depends(require_feature_generate)])
 def request_publication(
     body: PublicationRequestIn, response: Response, conn: _Conn, identity: _Identity,
 ) -> dict[str, Any]:
@@ -397,7 +497,8 @@ def request_publication(
         conn, verified_output_revision_id=body.verified_output_revision_id,
         staging_path=body.staging_path, staleness=staleness,
         publication_permitted=_may_publish(identity),
-        capability_attestation=body.capability_attestation)
+        capability_attestation=body.capability_attestation,
+        activation_blockers=())   # explicit-empty is a claim — §8.1; see verify_eligibility
     if not verdict.allowed:
         raise HTTPException(
             status_code=409,
@@ -436,7 +537,8 @@ def request_publication(
     }
 
 
-@router.get("/feature-execution/publications", dependencies=[Depends(require_confirmer)])
+@router.get("/feature-execution/publications",
+            dependencies=[Depends(require_feature_read)])
 def publication_status(
     environment_id: str, logical_group_name: str, conn: _Conn,
 ) -> dict[str, Any]:
@@ -475,10 +577,32 @@ def _staleness_of(conn: psycopg.Connection, verified_output_revision_id: str) ->
         return StalenessV1.NEITHER
     if row[0] == "unpinned":
         return StalenessV1.NEITHER
-    # The pinned policies are compared against what is CURRENT for each family. Until a caller
-    # supplies the current set this reports CURRENT for a pinned/observed output, which is what the
-    # stored record says; drift detection is the worker's, over the realization pointers.
-    return StalenessV1.CURRENT
+
+    # THE COMPARISON THIS FUNCTION IS NAMED FOR. An earlier version returned CURRENT for every
+    # pinned output without comparing anything — a positive assurance it had not earned, and the
+    # worst possible default: policy drift after a verification is EXACTLY the case this answers,
+    # and reporting it as current tells an operator the verification still holds when nobody
+    # checked. Found by review.
+    pinned = frozenset(row[1] or ())
+    if not pinned:
+        # A pinned output that names no policies cannot be compared against anything. The column is
+        # CHECKed non-empty at the schema, so this is unreachable for rows written through the
+        # store — it is here because "unreachable" is a claim about today's writers.
+        return StalenessV1.NEITHER
+
+    current = frozenset(r[0] for r in conn.execute(
+        "SELECT revision_id FROM policy_realization_current").fetchall())
+    if not current:
+        # NOTHING is recorded as current, so "has it moved?" has no answer — not "no, it has not".
+        # NEITHER is the vocabulary's word for undecidable-on-content, and `is_unverifiable` is what
+        # the surfaces render. This is the LIVE state today: no production code publishes a policy
+        # realization, so the pointer table is empty and every pinned output is honestly
+        # unverifiable rather than dishonestly current.
+        return StalenessV1.NEITHER
+
+    # A pinned realization that is no longer the current one for its family is drift, and drift is
+    # what makes a passed verification untrue. Any single one is enough.
+    return StalenessV1.CURRENT if pinned <= current else StalenessV1.STALE
 
 
 def _now(conn: psycopg.Connection) -> str:
@@ -488,3 +612,206 @@ def _now(conn: psycopg.Connection) -> str:
     when something started — and so a test can freeze it in one place.
     """
     return str(conn.execute("SELECT now()").fetchone()[0])
+
+
+# ══ §9 — the two PRODUCTION acts: real endpoints, refusing honestly from day one ═════════════════
+# Both flows exist end-to-end; §0.1.0 keeps both ACTIONS unavailable, so today every request ends
+# at the decision service's refusal — which is the point: an evaluator nothing calls is a
+# description of a gate, and these are the callers. The day the owner opens the policy, the same
+# code records the attempt, binds the certificates per member, and enqueues — nothing here needs
+# rewriting to go live, only permitting.
+
+class ProductionMaterializationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sealed_artifact_id: str = Field(min_length=1)
+    environment_id: str = Field(min_length=1)
+    logical_group_name: str = Field(min_length=1)
+    target_ref: str | None = None
+
+
+class ProductionPublicationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # ▲ The MATERIALIZATION ATTEMPT, never an output id — §9.1: an output id is the single most
+    # valuable thing in this system to forge, because it is exactly the difference between
+    # publishing the values that were certified and publishing some others. The server resolves
+    # the attempt's output through the composite FK's parent.
+    materialization_attempt_id: str = Field(min_length=1)
+
+
+def _production_ask(conn, *, action, resource_identity_hash: str, sealed_artifact_id: str):
+    """The §7 preflight for a production act: member facts from the certificate reader, folded
+    through the one decision service — the same fold a real decision will run."""
+    from featuregen.materialize.action_decision import ActionRequestV1, ask
+    from featuregen.materialize.method_certificates import member_certificate_facts
+
+    facts = member_certificate_facts(conn, sealed_artifact_id=sealed_artifact_id)
+    decision = ask(conn, ActionRequestV1(
+        action=action,
+        resource_identity_hash=resource_identity_hash,
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}))
+    return decision, facts
+
+
+@router.post("/feature-execution/production-materializations", status_code=202)
+def request_production_materialization(
+    body: ProductionMaterializationIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """MATERIALIZE_PRODUCTION — gate, attempt record, certificate bindings, queue. In that order.
+
+    Today the gate refuses (`ACTION_UNAVAILABLE` under the development policy) and the response
+    carries the FULL per-member answer — which certificates are missing, which identities were
+    never recorded — so "how far is this feature from production" is readable before production
+    exists (§21's measurement, served rather than estimated).
+    """
+    from featuregen.materialize.action_authorization import ActionV1
+
+    decision, facts = _production_ask(
+        conn, action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        sealed_artifact_id=body.sealed_artifact_id)
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": ("ACTION_UNAVAILABLE" if "ACTION_UNAVAILABLE" in decision.blockers
+                     else "ACTION_REFUSED"),
+            "blockers": _explained(tuple(decision.blockers)),
+            "per_member": [
+                {"member_name": v.member_name, "allowed": v.allowed,
+                 "blockers": _explained(tuple(v.blockers))}
+                for v in decision.per_member],
+            "detail": ("production materialization is not available under the development "
+                       "policy (§0.1.0); the per-member answer above is what would gate it "
+                       "once it is" if "ACTION_UNAVAILABLE" in decision.blockers else
+                       "the decision refused; nothing was recorded")})
+
+    # ── FROM HERE DOWN runs the day the policy opens — the same request, permitted. ─────────────
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.materialize.action_authorization import authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.production_attempt_store import (
+        record_materialization_attempt,
+    )
+
+    authorization = authorize_action(
+        conn, action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        actor_subject=identity.subject, environment_id=body.environment_id)
+    decision_id, decided = decide(conn, ActionRequestV1(
+        action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}),
+        authorization_id=authorization.authorization_id)
+    attempt_id, created = record_materialization_attempt(
+        conn, attempt_id=mint_id("pma"), sealed_artifact_id=body.sealed_artifact_id,
+        environment_id=body.environment_id, logical_group_name=body.logical_group_name,
+        action_decision_revision_id=decision_id, requested_by=identity.subject,
+        requested_at=_now(conn), target_ref=body.target_ref)
+    if created:
+        # ▲ The certificate BINDINGS, stored on the attempt at decision time (§10.3): publication
+        # COMPARES against these rows — a verdict re-derived later must never quietly replace
+        # what was decided here.
+        for member_name, member in facts.items():
+            certificate = member.get("certificate")
+            if certificate is not None:
+                conn.execute(
+                    "INSERT INTO production_attempt_member_certificate (attempt_id, "
+                    "member_name, certificate_kind, certificate_revision_id, "
+                    "subject_identity_kind, subject_identity_hash, method_artifact_id) "
+                    "VALUES (%s, %s, 'AUTHORING_METHOD', %s, 'AUTHORING_METHOD', %s, %s)",
+                    (attempt_id, member_name, certificate.certificate_revision_id,
+                     member["method_identity_hash"], body.sealed_artifact_id))
+    return {"attempt_id": attempt_id, "created": created,
+            "detail": "the production materialization was recorded; the worker drives it"}
+
+
+@router.post("/feature-execution/production-publications", status_code=202)
+def request_production_publication(
+    body: ProductionPublicationIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """PUBLISH_PRODUCTION — the act whose partial failure is visible to the bank, so its machine
+    was written first (spec §1) and its output is SERVER-RESOLVED from the named attempt."""
+    from featuregen.materialize.action_authorization import ActionV1
+    from featuregen.overlay.upload.production_attempt_store import (
+        MaterializationStatusV1,
+        read_materialization,
+    )
+
+    materialization = read_materialization(conn, body.materialization_attempt_id)
+    if materialization is None:
+        raise HTTPException(status_code=404, detail=f"no production materialization "
+                            f"{body.materialization_attempt_id!r}")
+    if materialization["status"] is not MaterializationStatusV1.SUCCEEDED:
+        raise HTTPException(status_code=409, detail={
+            "code": "MATERIALIZATION_NOT_SUCCEEDED",
+            "status": materialization["status"].value,
+            "detail": "publication publishes what a SUCCEEDED materialization produced; this "
+                      "one has not"})
+    output = conn.execute(
+        "SELECT output_revision_id FROM materialized_output_revision WHERE attempt_id = %s",
+        (body.materialization_attempt_id,)).fetchone()
+    if output is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "OUTPUT_REVISION_MISSING",
+            "detail": "the materialization succeeded but recorded no output identity — a "
+                      "platform inconsistency; nothing can be published from it"})
+
+    decision, facts = _production_ask(
+        conn, action=ActionV1.PUBLISH_PRODUCTION,
+        resource_identity_hash=output[0],
+        sealed_artifact_id=materialization["sealed_artifact_id"])
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": ("ACTION_UNAVAILABLE" if "ACTION_UNAVAILABLE" in decision.blockers
+                     else "ACTION_REFUSED"),
+            "blockers": _explained(tuple(decision.blockers)),
+            "detail": ("production publication is not available under the development policy "
+                       "(§0.1.0)" if "ACTION_UNAVAILABLE" in decision.blockers else
+                       "the decision refused; nothing was recorded")})
+
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.materialize.action_authorization import authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.production_attempt_store import (
+        record_publication_attempt,
+    )
+
+    authorization = authorize_action(
+        conn, action=ActionV1.PUBLISH_PRODUCTION, resource_identity_hash=output[0],
+        actor_subject=identity.subject, environment_id=materialization["environment_id"])
+    decision_id, _decided = decide(conn, ActionRequestV1(
+        action=ActionV1.PUBLISH_PRODUCTION, resource_identity_hash=output[0],
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}),
+        authorization_id=authorization.authorization_id)
+    attempt_id, created = record_publication_attempt(
+        conn, attempt_id=mint_id("ppa"),
+        materialization_attempt_id=body.materialization_attempt_id,
+        output_revision_id=output[0],
+        environment_id=materialization["environment_id"],
+        logical_group_name=materialization["logical_group_name"],
+        action_decision_revision_id=decision_id, requested_by=identity.subject,
+        requested_at=_now(conn))
+    return {"attempt_id": attempt_id, "created": created,
+            "detail": "the production publication was recorded; the worker drives it"}
+
+
+@router.get("/feature-execution/production-active")
+def production_active(
+    environment_id: str, logical_group_name: str, conn: _Conn,
+) -> dict[str, Any]:
+    """"What is actually out there right now" — §9.1's question, answered by the pointer read.
+
+    ``active: null`` is the honest answer for a group nothing has ever published — and today, for
+    every group, since the acts are unavailable. Never an invented revision.
+    """
+    from featuregen.overlay.upload.production_attempt_store import current_active_revision
+
+    return {"environment_id": environment_id, "logical_group_name": logical_group_name,
+            "active": current_active_revision(
+                conn, environment_id=environment_id, logical_group_name=logical_group_name)}

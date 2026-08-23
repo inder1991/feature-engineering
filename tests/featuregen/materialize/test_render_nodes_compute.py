@@ -49,16 +49,16 @@ from tests.featuregen.materialize.test_ir import (
 )
 from tests.featuregen.materialize.test_render_project import ENVIRONMENT, _compiled
 
-from featuregen.formula.schema import (
-    AggregateFunction,
+from featuregen.formula.schema import FinalOperation
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
-    FinalOperation,
     Grain,
     NullInput,
     OverflowBehavior,
     RoundingMode,
     ZeroDenominator,
 )
+from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import (
     AvailabilityPromiseV1,
@@ -2023,7 +2023,7 @@ def test_it_refuses_an_aggregate_whose_OPERAND_does_not_match_its_kind(compiled,
     """`operand is None` IFF COUNT_ROWS is Child-1's own grammar rule, checked in both directions:
     an operand under a row count describes a different expression from the one it says it is."""
     expression = compiled[0].irs[0].expressions[0]
-    counted = dataclasses.replace(expression, aggregation=AggregateFunction.COUNT_ROWS)
+    counted = dataclasses.replace(expression, aggregation=AggregateFunctionV2.COUNT_ROWS)
     ir = dataclasses.replace(compiled[0].irs[0], expressions=(counted,))
     with pytest.raises(ValueError, match="count_rows aggregate carries operand"):
         _calculate(compiled, feature, ir=ir)
@@ -2067,7 +2067,7 @@ def test_it_refuses_a_LITERAL_that_is_not_the_type_it_declares(compiled, feature
 
 
 def test_it_refuses_arguments_that_are_not_what_they_must_be(compiled, feature):
-    with pytest.raises(TypeError, match="FormulaExecutionIRV1"):
+    with pytest.raises(TypeError, match=r"a compiled IR \(V1 or V2\)"):
         _calculate(compiled, feature, ir="total_debit_amount_30d")
     with pytest.raises(TypeError, match="PlannedFeature"):
         _calculate(compiled, "total_debit_amount_30d")
@@ -2114,7 +2114,7 @@ def test_the_count_variant_renders_its_own_golden(compiled, feature):
     """A BIGINT feature: no rounding, no overflow check, a COUNT DISTINCT and no operand policy to
     apply. Rendered from the SAME code path, so the golden is evidence the branches are branches."""
     expression = dataclasses.replace(compiled[0].irs[0].expressions[0],
-                                     aggregation=AggregateFunction.COUNT_DISTINCT)
+                                     aggregation=AggregateFunctionV2.COUNT_DISTINCT)
     ir = dataclasses.replace(compiled[0].irs[0], expressions=(expression,))
     counted = dataclasses.replace(feature, physical_type=dataclasses.replace(
         feature.physical_type, sql_type="BIGINT", nullable=False, rounding=None, overflow=None))

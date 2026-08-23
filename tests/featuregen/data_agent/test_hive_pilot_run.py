@@ -24,10 +24,6 @@ import os
 import subprocess
 
 import pytest
-
-from featuregen.data_agent.analysis import run_analysis
-from featuregen.data_agent.connection import DataSourceConnectionV1, open_connection
-from featuregen.data_agent.sql_hive import HiveDialect
 from tests.featuregen.data_agent.hive_pilot_fixture import (
     HIVE_DATABASE,
     TRANSACTION_TABLE,
@@ -35,6 +31,10 @@ from tests.featuregen.data_agent.hive_pilot_fixture import (
 )
 from tests.featuregen.data_agent.pilot_fixture import EXPECTED
 from tests.featuregen.data_agent.test_analysis_ir import _ir
+
+from featuregen.data_agent.analysis import run_analysis
+from featuregen.data_agent.connection import DataSourceConnectionV1, open_connection
+from featuregen.data_agent.sql_hive import HiveDialect
 
 _HOST = os.environ.get("HIVE_TEST_HOST", "localhost")
 _PORT = int(os.environ.get("HIVE_TEST_PORT", "10000"))

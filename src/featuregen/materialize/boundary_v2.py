@@ -43,7 +43,7 @@ from enum import StrEnum
 from typing import Any
 
 from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.schema import ZeroDenominator
+from featuregen.formula.schema_leaves import ZeroDenominator
 from featuregen.formula.schema_v2 import AuthorityRefsV2, FinalOperationV2
 from featuregen.formula.schema_v3 import SemanticRowSelectionV1
 from featuregen.materialize.canonical import materialize_hash
@@ -489,6 +489,16 @@ class AuthorizedCompilationV2:
     def ordered_planned(self) -> tuple[PlannedFormulaExecutionIRV2, ...]:
         """The planned IRs by FEATURE NAME — never by the order they were compiled in."""
         return tuple(sorted(self.planned, key=lambda planned: planned.ir.feature_name))
+
+    @property
+    def irs(self) -> tuple[FormulaExecutionIRV2, ...]:
+        """The compiled IRs this token covers, ordered by feature name.
+
+        Named to match V1's attribute deliberately: the project renderer asks a token for the IRs it
+        authorized, and that question has one answer in both languages. A differently-spelled
+        accessor would force the renderer to know which token it holds in order to ask.
+        """
+        return tuple(planned.ir for planned in self.ordered_planned())
 
     @property
     def ir_hashes(self) -> tuple[str, ...]:

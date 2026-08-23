@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from featuregen.formula.schema import DecimalPolicy, OverflowBehavior, RoundingMode
+from featuregen.formula.schema_leaves import DecimalPolicy, OverflowBehavior, RoundingMode
 from featuregen.materialize.physical_types import PHYSICAL_TYPE_POLICY_VERSION
 from featuregen.materialize.physical_types_v2 import (
     FLOAT_OPERAND_REFUSED,

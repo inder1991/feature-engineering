@@ -942,7 +942,7 @@ def test_rendering_requires_GATE_2s_token(catalog, db) -> None:  # noqa: F811
     """§1.3: one denied element anywhere refuses the whole compilation, and no contract, group plan
     or PROJECT is produced. A bare list of IRs never showed the group's read set was authorized."""
     authorized, plan, spine_input = _compiled(db, SUM_30D)
-    with pytest.raises(TypeError, match="AuthorizedCompilation"):
+    with pytest.raises(TypeError, match="Gate 2's authorization token"):
         render_project(list(authorized.irs), plan, environment_id=ENVIRONMENT,  # type: ignore[arg-type]
                        engine_versions=fixtures.ENGINE_VERSIONS, spine_input=spine_input,
                        nodes=_nodes(project_datasets(authorized, plan, spine_input=spine_input)))

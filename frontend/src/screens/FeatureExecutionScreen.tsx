@@ -54,8 +54,20 @@ interface Props {
 }
 
 // The stage a feature has reached. Derived from what the server returned — never stored, and never
-// a fifth value invented to cover a gap.
-type Stage = 'generated' | 'verifying' | 'verified' | 'published'
+// a value invented to cover a gap.
+//
+// **THERE IS NO 'published' HERE, AND THAT IS THE POINT.** The publication endpoint reports
+// BLOCKING attempts only: `blocked` is true for STARTED or UNKNOWN_RECONCILIATION_REQUIRED, and
+// false means "nothing is outstanding" — which covers never-attempted, succeeded and failed alike.
+// It cannot tell this screen that something was published, so this screen must not say so.
+//
+// It used to. `publication?.blocked ? 'published'` mapped the ONE state meaning "nobody knows
+// whether the swap landed" onto the word for success — reporting the platform's own uncertainty as
+// a completed publication, on the screen whose whole premise is honest absence. Found by review.
+//
+// Restoring a 'published' stage needs the server to expose the ACTIVE REVISION, not merely the
+// absence of a blocker. Until it does, the honest ceiling is "verified".
+type Stage = 'generated' | 'verifying' | 'verified' | 'publishing' | 'publication_uncertain'
 
 function BlockerList({ blockers }: { blockers: ExecutionBlocker[] }) {
   // Each code with the server's own reason. A code alone sends everyone to the same shrug.
@@ -133,8 +145,12 @@ export function FeatureExecutionScreen(props: Props) {
     return () => { live = false }
   }, [artifactId, environmentId, inventoryObservationId, logicalGroupName, identity])
 
+  // An outstanding attempt is reported as what it IS. The two blocking outcomes are different
+  // things — one is in flight, one is unknown — and only the second needs a human.
   const stage: Stage = publication?.blocked
-    ? 'published'
+    ? (publication.blocking_outcome === 'unknown_reconciliation_required'
+        ? 'publication_uncertain'
+        : 'publishing')
     : verification?.verified_output
       ? 'verified'
       : verification
@@ -247,10 +263,28 @@ export function FeatureExecutionScreen(props: Props) {
           <p className="absent">This artifact has not been verified in this session.</p>
         )}
 
+        {/* NOT "published". An outstanding attempt is reported with the server's own sentence and
+            its outcome, and the uncertain one is an ALERT because it is the one a person has to
+            resolve — the swap may or may not have landed, and nothing else will decide that. */}
         {publication?.blocked && (
-          <p className="warning">
+          <p
+            className={publication.blocking_outcome === 'unknown_reconciliation_required'
+              ? 'error' : 'warning'}
+            role={publication.blocking_outcome === 'unknown_reconciliation_required'
+              ? 'alert' : undefined}
+          >
             {publication.detail} (attempt <code>{publication.blocking_attempt_id}</code>,{' '}
             {publication.blocking_outcome})
+          </p>
+        )}
+
+        {/* HONEST ABSENCE about publication itself. "No attempt is outstanding" is not "published":
+            it covers never-attempted, succeeded and failed alike, and this screen is not told which.
+            Saying so is better than implying the feature is live. */}
+        {publication && !publication.blocked && (
+          <p className="absent">
+            No publication attempt is outstanding for this group. That is not the same as published
+            — this view is told which attempts are blocking, not which revision is active.
           </p>
         )}
 

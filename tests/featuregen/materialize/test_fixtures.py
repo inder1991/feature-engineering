@@ -31,7 +31,7 @@ from featuregen.formula.author import AUTHOR_TASK
 from featuregen.formula.authoring import run_authoring
 from featuregen.formula.canonical import formula_content_hash
 from featuregen.formula.critic import CRITIC_TASK
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.intake.llm import FakeLLM, FakeResponse
 
 _ACTOR = make_actor(subject="user:materialize-author", roles=("feature_engineer",))

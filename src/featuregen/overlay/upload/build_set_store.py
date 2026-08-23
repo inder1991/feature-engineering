@@ -1,0 +1,422 @@
+"""The build set a person declared, and the attempts made to build it.
+
+**Two objects, deliberately separate.** A BUILD SET is a declaration — *"build these features,
+together, against this target"*. A GENERATION REQUEST is an attempt to act on one. A set may be
+attempted more than once (after a provider outage, after an engine gains a capability), and each
+attempt has its own status, its own refusals and its own artifact. Folding them together would make
+a retry indistinguishable from a second, different build.
+
+**The set is immutable and content-addressed.** Every artifact downstream — group plan, contract,
+sealed project, published columns — is derived from its membership. If the set could be edited, a
+sealed artifact could stop matching the request it came from while both still looked current.
+Changing your mind mints a new set.
+
+**All or nothing.** There is no partial success, and its absence is a decision. A group's identity IS
+its membership: building four of five features silently delivers something nobody asked for, under a
+contract nobody chose, and the person who asked would have to notice to know. A refusal naming the
+feature that could not be built is actionable; a quiet four-fifths is not. This is the same rule
+``admit_artifacts_v2`` already applies to a batch, and it applies with more force here.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+
+from featuregen.canonical import jcs_sha256
+from featuregen.contracts.db import DbConn
+from featuregen.materialize.build_set_declaration import (
+    BuildSetDeclarationV1,
+    declaration_identity,
+    encode_declaration,
+)
+
+__all__ = [
+    "BuildSetV1",
+    "GenerationRequestV1",
+    "GenerationStatusV1",
+    "InvalidStatusMove",
+    "RequestMovedUnderneath",
+    "build_set_identity",
+    "advance_request",
+    "read_build_set",
+    "read_request",
+    "record_build_set",
+    "request_generation",
+]
+
+
+class GenerationStatusV1(StrEnum):
+    """Where an attempt has got to.
+
+    Explicit states rather than a pair of booleans, so "still running" is distinguishable from "the
+    worker died" and from "nothing consumes this table" — the gap S11's verification attempts have
+    and this deliberately does not.
+    """
+
+    REQUESTED = "REQUESTED"
+    CLAIMED = "CLAIMED"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    #: The build could not be made from what was asked for. A PRODUCT result, naming which member.
+    REFUSED = "REFUSED"
+    #: The platform could not finish. An OPERATIONAL result, and somebody's to fix.
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (GenerationStatusV1.SUCCEEDED, GenerationStatusV1.REFUSED,
+                        GenerationStatusV1.FAILED, GenerationStatusV1.CANCELLED)
+
+    @property
+    def is_live(self) -> bool:
+        """Whether an attempt in this state blocks another for the same set and environment."""
+        return self in (GenerationStatusV1.REQUESTED, GenerationStatusV1.CLAIMED,
+                        GenerationStatusV1.RUNNING)
+
+
+#: The one legal path forward, plus the terminals reachable from any live state. A table rather than
+#: `if` chains so "can a request go from RUNNING back to CLAIMED" has one answer — no, and a retry is
+#: a NEW attempt against the same set.
+_NEXT: Mapping[GenerationStatusV1, frozenset[GenerationStatusV1]] = {
+    GenerationStatusV1.REQUESTED: frozenset({GenerationStatusV1.CLAIMED}),
+    GenerationStatusV1.CLAIMED: frozenset({GenerationStatusV1.RUNNING}),
+    GenerationStatusV1.RUNNING: frozenset({GenerationStatusV1.SUCCEEDED}),
+    GenerationStatusV1.SUCCEEDED: frozenset(),
+    GenerationStatusV1.REFUSED: frozenset(),
+    GenerationStatusV1.FAILED: frozenset(),
+    GenerationStatusV1.CANCELLED: frozenset(),
+}
+
+#: Reachable from any LIVE state. A build can be refused at any point (a member with no formula, an
+#: operator the renderer cannot emit), the platform can fail at any point, and a user may cancel.
+_FROM_ANYWHERE = frozenset({GenerationStatusV1.REFUSED, GenerationStatusV1.FAILED,
+                            GenerationStatusV1.CANCELLED})
+
+
+class RequestMovedUnderneath(RuntimeError):
+    """Another writer advanced this request between the validation read and the write.
+
+    A distinct type from :class:`InvalidStatusMove` because the remedies are opposite. An invalid
+    move is a BUG in the caller — it asked for a step the lifecycle does not have, and the fix is in
+    the code. This is a RACE the design anticipates: the move was legal, and lost. A worker that
+    catches it should stop working on this request, not retry the move.
+    """
+
+
+class InvalidStatusMove(ValueError):
+    """A status move the lifecycle does not permit.
+
+    Raised rather than ignored: a worker that skipped RUNNING would produce a SUCCEEDED request
+    whose history says it was never worked on, and nothing downstream could tell.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class BuildSetV1:
+    """A build set as stored: what was declared, in order."""
+
+    revision_id: str
+    target_reading_revision_id: str
+    selection_revision_ids: tuple[str, ...]
+    #: ▲ POSITIONALLY PARALLEL to `selection_revision_ids` — member *i* of one is member *i* of the
+    #: other. The formula a build resolves comes from HERE, not from "the latest draft for this
+    #: selection", which is what let a build change meaning under a stable identity.
+    selection_formula_binding_ids: tuple[str, ...]
+    declaration: Mapping[str, object]
+    content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationRequestV1:
+    """One attempt at one build set."""
+
+    request_id: str
+    build_set_revision_id: str
+    environment_id: str
+    #: WHICH approval permitted this work. Carried on the object, not left to a second query: a
+    #: reader that has to fetch it separately is a reader that can forget to, and every downstream
+    #: check about "was this authorized" would then be optional.
+    generation_authorization_revision_id: str
+    #: WHICH request-time decision this attempt runs under (1106/1108). ▲ On the ROW, not only in
+    #: the queue payload: the queue row is the work item and this is the record — a redelivered or
+    #: reaped message takes the payload's copy with it, and "which decision did this attempt run
+    #: under" must survive that. `None` predates the column (nullable expand — the running image
+    #: writes this table, which is the 1095 lesson); the WORKER refuses a missing decision at act
+    #: time regardless, so a nullable column is not a nullable gate.
+    action_decision_revision_id: str | None
+    status: GenerationStatusV1
+    sealed_artifact_id: str | None
+    refusals: tuple[Mapping[str, str], ...]
+    failure_reason: str | None
+
+    @property
+    def stage_label(self) -> str:
+        """The words a screen shows. Server-owned, so the API and the UI cannot describe one status
+        with two different sentences."""
+        return {
+            GenerationStatusV1.REQUESTED: "Queued",
+            GenerationStatusV1.CLAIMED: "Starting…",
+            GenerationStatusV1.RUNNING: "Preparing features…",
+            GenerationStatusV1.SUCCEEDED: "Code ready",
+            GenerationStatusV1.REFUSED: "Cannot be built",
+            GenerationStatusV1.FAILED: "Could not finish",
+            GenerationStatusV1.CANCELLED: "Cancelled",
+        }[self.status]
+
+
+def build_set_identity(
+    *,
+    target_reading_revision_id: str,
+    selection_formula_binding_ids: Sequence[str],
+    declaration_hash: str,
+) -> str:
+    """*Is this the same build somebody already declared?*
+
+    Content-addressed over the target, the ORDERED members and the declaration. Two people asking
+    for the same build get the same set, which makes a re-request cheap rather than a duplicate.
+
+    Order is inside the identity because the order a person chose features in is a fact about the
+    build — the dataclass says so, and a hash over a set would quietly disagree with it.
+
+    ▲ **THE MEMBERS ARE BINDINGS, NOT SELECTIONS, AND THAT IS THE POINT.** Hashing selection ids
+    made two builds of the same features under DIFFERENT formulas one identity — so a re-request
+    after a re-author returned the earlier set and built something else under an id somebody was
+    watching. A binding names the selection *and* the exact formula content, so a pin that did not
+    change identity is not a pin.
+    """
+    return jcs_sha256({
+        "target_reading_revision_id": target_reading_revision_id,
+        "selection_formula_binding_ids": list(selection_formula_binding_ids),
+        "declaration_hash": declaration_hash,
+    })
+
+
+def record_build_set(
+    conn: DbConn,
+    *,
+    revision_id: str,
+    target_reading_revision_id: str,
+    selection_formula_binding_ids: Sequence[str],
+    declaration: BuildSetDeclarationV1,
+    declared_by: str,
+    declared_at: str,
+) -> tuple[str, bool]:
+    """Record a build set, or return the EXISTING one with the same content.
+
+    Returns ``(revision_id, created)``. ``created=False`` means this exact build was already
+    declared — by this person a moment ago, or by a colleague last week. Either way there is nothing
+    to add, and minting a second identical set would split its attempts across two roots.
+
+    ▲ **THE STORED PAYLOAD AND THE HASHED PAYLOAD ARE DIFFERENT, on purpose.** What is stored is
+    complete, provenance included, because who declared a population and why is worth keeping. What
+    is HASHED is `declaration_identity` — semantic only — because the spine carries `declared_by`
+    and `recorded_at`, and hashing those would make the same declaration made twice into two build
+    sets, one per clock read. "Two people asking for the same build get the same set" is the
+    property this protects, and it is the reason `SpineSourceDeclarationV1` grew `identity_payload`
+    in the first place.
+    """
+    if not selection_formula_binding_ids:
+        raise ValueError("a build set with no members builds nothing")
+    if len(set(selection_formula_binding_ids)) != len(selection_formula_binding_ids):
+        raise ValueError(
+            f"the same binding appears twice: {list(selection_formula_binding_ids)!r}. Order is "
+            f"meaningful here, so a duplicate makes 'which position is this feature in' "
+            f"unanswerable")
+
+    # ▲ RESOLVED FROM THE BINDING, never accepted beside it. The member stores the selection too —
+    # every reader uses it — so taking it from the caller would let the member name one selection
+    # while its binding named another, which is the exact disagreement 1101 exists to forbid. The
+    # composite foreign key refuses that row anyway; resolving here means it never gets built.
+    selections: list[str] = []
+    for binding_id in selection_formula_binding_ids:
+        row = conn.execute(
+            "SELECT selection_revision_id FROM selection_formula_binding WHERE binding_id = %s",
+            (binding_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                f"selection-formula binding {binding_id!r} does not exist: a build set member "
+                f"names the formula it will be built from, and there is no such pin")
+        selections.append(row[0])
+    if len(set(selections)) != len(selections):
+        raise ValueError(
+            f"two members bind the same selection: {selections!r}. One feature cannot occupy two "
+            f"positions in one build")
+
+    declaration_hash = jcs_sha256(declaration_identity(declaration))
+    stored = encode_declaration(declaration)
+    content = build_set_identity(
+        target_reading_revision_id=target_reading_revision_id,
+        selection_formula_binding_ids=selection_formula_binding_ids,
+        declaration_hash=declaration_hash)
+
+    inserted = conn.execute(
+        "INSERT INTO build_set_revision (revision_id, target_reading_revision_id, "
+        "declaration_hash, declaration_json, content_hash, declared_by, declared_at) "
+        "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s) "
+        "ON CONFLICT (content_hash) DO NOTHING RETURNING revision_id",
+        (revision_id, target_reading_revision_id, declaration_hash,
+         json.dumps(stored), content, declared_by, declared_at)).fetchone()
+    if inserted is None:
+        existing = conn.execute(
+            "SELECT revision_id FROM build_set_revision WHERE content_hash = %s",
+            (content,)).fetchone()
+        return existing[0], False
+
+    for position, (binding_id, selection) in enumerate(
+            zip(selection_formula_binding_ids, selections, strict=True)):
+        conn.execute(
+            "INSERT INTO build_set_member (revision_id, position, selection_revision_id, "
+            "selection_formula_binding_id) VALUES (%s, %s, %s, %s)",
+            (revision_id, position, selection, binding_id))
+    return revision_id, True
+
+
+def read_build_set(conn: DbConn, revision_id: str) -> BuildSetV1 | None:
+    """One build set with its members IN ORDER, or ``None``."""
+    row = conn.execute(
+        "SELECT target_reading_revision_id, declaration_json, content_hash "
+        "FROM build_set_revision WHERE revision_id = %s", (revision_id,)).fetchone()
+    if row is None:
+        return None
+    rows = conn.execute(
+        "SELECT selection_revision_id, selection_formula_binding_id FROM build_set_member "
+        "WHERE revision_id = %s ORDER BY position", (revision_id,)).fetchall()
+    # ▲ BOTH, in one read. The selections are what most readers want; the bindings are what a
+    # BUILD must resolve its formula through, and fetching them separately would reintroduce the
+    # window where the two answers come from different moments.
+    return BuildSetV1(revision_id=revision_id, target_reading_revision_id=row[0],
+                      selection_revision_ids=tuple(r[0] for r in rows),
+                      selection_formula_binding_ids=tuple(r[1] for r in rows),
+                      declaration=row[1] if isinstance(row[1], dict) else {},
+                      content_hash=row[2])
+
+
+def request_generation(
+    conn: DbConn,
+    *,
+    request_id: str,
+    build_set_revision_id: str,
+    environment_id: str,
+    requested_by: str,
+    requested_at: str,
+    generation_authorization_revision_id: str,
+    action_decision_revision_id: str | None = None,
+) -> tuple[str, bool]:
+    """Start an attempt, or return the LIVE one for this set and environment.
+
+    Returns ``(request_id, created)``. ``created=False`` is the double-click answer: an attempt is
+    already in flight and asking again must not start a second compile of the same thing.
+
+    ``generation_authorization_revision_id`` names WHICH approval permits this work. It travels
+    inside a COMPOSITE foreign key with the build set and the environment, so a request naming an
+    authorization issued for a different set or cluster is not caught — it cannot be written. REQUIRED,
+    with no default. A default of ``None`` would mean absence had two meanings — "predates the
+    chain" and "a caller forgot" — and a column whose absence means two things cannot distinguish
+    them.
+
+    Idempotent on the WORK — the build set and environment — rather than on a caller-supplied key,
+    because a client minting a fresh key per click would defeat a key-based guard and generation
+    costs real compute. The partial index scopes this to LIVE attempts only, so a retry after a
+    failure is allowed: the guard protects against double-clicks, not against recovery.
+    """
+    inserted = conn.execute(
+        "INSERT INTO generation_request (request_id, build_set_revision_id, environment_id, "
+        "status, requested_by, requested_at, generation_authorization_revision_id, "
+        "action_decision_revision_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT DO NOTHING RETURNING request_id",
+        (request_id, build_set_revision_id, environment_id,
+         GenerationStatusV1.REQUESTED.value, requested_by, requested_at,
+         generation_authorization_revision_id, action_decision_revision_id)).fetchone()
+    if inserted is not None:
+        return inserted[0], True
+
+    live = conn.execute(
+        "SELECT request_id FROM generation_request "
+        "WHERE build_set_revision_id = %s AND environment_id = %s "
+        "AND status IN ('REQUESTED','CLAIMED','RUNNING')",
+        (build_set_revision_id, environment_id)).fetchone()
+    if live is None:
+        raise RuntimeError(
+            f"generation request {request_id!r} was refused by the live-attempt guard but no live "
+            f"attempt exists for {build_set_revision_id!r} in {environment_id!r}: the two readings "
+            f"disagree, and proceeding would start work nobody could find")
+    return live[0], False
+
+
+def advance_request(
+    conn: DbConn,
+    request_id: str,
+    to: GenerationStatusV1,
+    *,
+    sealed_artifact_id: str | None = None,
+    refusals: Sequence[Mapping[str, str]] = (),
+    failure_reason: str | None = None,
+) -> GenerationStatusV1:
+    """Move ONE step and return the new status. The caller commits.
+
+    **The move is COMPARE-AND-SET, not read-then-write.** The status is read to validate the move
+    against the lifecycle, and the UPDATE then re-states it in its own WHERE clause, so the row is
+    only written if it is still what was validated. Without that, two workers holding the same
+    request both read REQUESTED, both find CLAIMED legal, and both write it — the second silently
+    overwriting the first, with a lifecycle table that permitted every individual step. A lifecycle
+    enforced by a check that reads before it writes is a lifecycle with a window in it.
+
+    This is a SECOND line of defence, not the first: the queue lease is what stops two workers
+    holding one request. It is here because the two mechanisms fail differently — a lease can expire
+    while its holder is still alive, and an expired lease's holder must not be able to finish the
+    job as though nothing happened.
+
+    Raises:
+        InvalidStatusMove: the move is not on the lifecycle's path. A worker that skipped RUNNING
+            would produce a SUCCEEDED request whose history says it was never worked on.
+        RequestMovedUnderneath: the row changed between the read and the write.
+    """
+    row = conn.execute(
+        "SELECT status FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
+    if row is None:
+        raise InvalidStatusMove(f"generation request {request_id} does not exist")
+
+    current = GenerationStatusV1(row[0])
+    permitted = _NEXT[current] | (frozenset() if current.is_terminal else _FROM_ANYWHERE)
+    if to not in permitted:
+        raise InvalidStatusMove(
+            f"generation request {request_id} cannot move {current.value} → {to.value}. "
+            f"Permitted: {sorted(s.value for s in permitted) or 'nothing — it is terminal'}. "
+            f"A retry is a NEW attempt against the same build set, never a step backwards")
+
+    moved = conn.execute(
+        "UPDATE generation_request SET status = %s, "
+        "sealed_artifact_id = COALESCE(%s, sealed_artifact_id), "
+        "refusals = CASE WHEN %s::jsonb IS NULL THEN refusals ELSE %s::jsonb END, "
+        "failure_reason = %s, updated_at = now() "
+        "WHERE request_id = %s AND status = %s RETURNING status",
+        (to.value, sealed_artifact_id,
+         None if not refusals else json.dumps([dict(r) for r in refusals]),
+         None if not refusals else json.dumps([dict(r) for r in refusals]),
+         failure_reason, request_id, current.value)).fetchone()
+    if moved is None:
+        raise RequestMovedUnderneath(
+            f"generation request {request_id} was {current.value} when this move was validated and "
+            f"is not any more: another worker advanced it. This move is ABANDONED rather than "
+            f"applied — {current.value} → {to.value} was checked against a status that no longer "
+            f"holds, and writing it anyway would overwrite whatever the other worker decided")
+    return to
+
+
+def read_request(conn: DbConn, request_id: str) -> GenerationRequestV1 | None:
+    """One attempt as stored, or ``None``."""
+    row = conn.execute(
+        "SELECT build_set_revision_id, environment_id, status, sealed_artifact_id, refusals, "
+        "failure_reason, generation_authorization_revision_id, action_decision_revision_id "
+        "FROM generation_request WHERE request_id = %s", (request_id,)).fetchone()
+    if row is None:
+        return None
+    return GenerationRequestV1(
+        request_id=request_id, build_set_revision_id=row[0], environment_id=row[1],
+        generation_authorization_revision_id=row[6], action_decision_revision_id=row[7],
+        status=GenerationStatusV1(row[2]), sealed_artifact_id=row[3],
+        refusals=tuple(row[4] or ()), failure_reason=row[5])

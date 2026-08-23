@@ -6,8 +6,6 @@ it could parse the file perfectly. Fixing one without the other changes nothing 
 """
 from __future__ import annotations
 
-import io
-
 CIB_HEADERS = (
     '"schema.table.column","term_name","description_business_definition","data_domain",'
     '"data_type","pci_flag","security_classification","attribute_category"'

@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import psycopg
 import pytest
-from tests.featuregen.materialize.test_subgraph_requirements_v2 import _fixed_aed_pilot, _fx_chain
+from tests.featuregen.materialize.fixtures import advertise_dispatch
+from tests.featuregen.materialize.test_subgraph_requirements_v2 import (
+    TXN,
+    _fixed_aed_pilot,
+    _fx_chain,
+    _scan,
+)
 
 from featuregen.formula.policy_occurrences import PolicyOccurrenceSetV1, PolicyOccurrenceV1
 from featuregen.formula.policy_realization import (
@@ -21,6 +27,8 @@ from featuregen.formula.policy_realization import (
     family_key_for,
 )
 from featuregen.formula.policy_store import publish_policy_realization
+from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
+from featuregen.materialize.engine_capability import renderer_dispatch_surface
 from featuregen.materialize.evaluate_generate import (
     evaluate_generate,
     undispatchable_kinds,
@@ -28,6 +36,7 @@ from featuregen.materialize.evaluate_generate import (
 )
 from featuregen.materialize.execution_proof_store import (
     PILOT_MUTATIONS,
+    SOLE_VARIANT,
     MutationOutcomeV1,
     ProofIncomplete,
     advertised_operators,
@@ -37,7 +46,14 @@ from featuregen.materialize.execution_proof_store import (
     record_renderer_dispatch,
     set_execution_proof,
 )
-from featuregen.materialize.operator_graph_v2 import OperatorKindV2
+from featuregen.materialize.operator_graph_v2 import (
+    AggregateV2,
+    FinalCombineV2,
+    GroupAssemblyV2,
+    OperatorGraphV2,
+    OperatorKindV2,
+    OperatorNodeV2,
+)
 from featuregen.overlay.upload import semantic_eligibility_reasons as R
 from featuregen.overlay.upload.publication_revisions import OperatorExecutionProofV1
 
@@ -161,8 +177,7 @@ def test_a_proof_is_APPEND_ONLY(db):
 
 # ══ ACCEPTANCE 3 — capability is renderer-dispatchable ∧ execution-proved ══════════════════════
 def _dispatch_all(db, *, dispatchable: bool = True, except_kind: str | None = None):
-    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-        kind.value: (dispatchable and kind.value != except_kind) for kind in OperatorKindV2})
+    advertise_dispatch(db, engine_id=ENGINE, dispatchable=dispatchable, except_kind=except_kind)
 
 
 def test_THE_TWO_FACTS_ARE_RECORDED_SEPARATELY(db):
@@ -213,13 +228,15 @@ def test_a_dispatch_record_must_cover_the_WHOLE_vocabulary(db):
     """The renderer either has a branch or it does not, so an omitted kind is not a third answer —
     it is a claim nobody made that a caller will read as one."""
     with pytest.raises(ValueError, match="omits"):
-        record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={"aggregate": True})
+        record_renderer_dispatch(db, engine_id=ENGINE,
+                                 dispatchable={("aggregate", SOLE_VARIANT): True})
 
 
 def test_a_dispatch_record_naming_a_NON_OPERATOR_is_refused(db):
     with pytest.raises(ValueError, match="not operator kinds"):
         record_renderer_dispatch(db, engine_id=ENGINE, dispatchable={
-            **{kind.value: True for kind in OperatorKindV2}, "teleportation": True})
+            **{(kind.value, SOLE_VARIANT): True for kind in OperatorKindV2},
+            ("teleportation", SOLE_VARIANT): True})
 
 
 def test_a_proof_cannot_be_attached_where_there_is_NO_DISPATCH_RECORD(db):
@@ -303,6 +320,49 @@ def test_an_UNDISPATCHABLE_OPERATOR_refuses_generation(db):
     assert _generate(db, graph=_fx_chain()).allowed is True
 
 
+#: Arity is the vocabulary's business, not this file's — an identity takes one term and a signed
+#: sum at least two, and ``FinalCombineV2`` refuses the wrong count outright.
+_TERMS = {"identity": ("body.expr",), "signed_sum": ("body.debits", "body.credits")}
+
+
+def _combining_graph(final_operation: str) -> OperatorGraphV2:
+    """A whole feature: scan → aggregate → FINAL_COMBINE → assembly. Every feature ends this way,
+    which is why a gate that could not ask about the final operation refused all of them."""
+    scan = _scan()
+    aggregate = OperatorNodeV2(
+        OperatorKindV2.AGGREGATE,
+        AggregateV2(AggregateFunctionV2.SUM, f"{TXN}.txn_amt", (f"{TXN}.acct_id",)),
+        inputs=(scan.node_id,))
+    combined = OperatorNodeV2(
+        OperatorKindV2.FINAL_COMBINE,
+        FinalCombineV2(FinalOperationV2(final_operation), _TERMS[final_operation]),
+        inputs=(aggregate.node_id,))
+    assembled = OperatorNodeV2(OperatorKindV2.GROUP_ASSEMBLY, GroupAssemblyV2(("f",)),
+                               inputs=(combined.node_id,))
+    return OperatorGraphV2(nodes=(scan, aggregate, combined, assembled))
+
+
+def test_the_gate_asks_PER_SIGNATURE_against_the_REAL_surface(db):
+    """The defect the end-to-end run found, pinned against the renderer's own advertisement.
+
+    The honest surface records ``final_combine/*`` as False and ``final_combine/identity`` as True
+    — the renderer emits three specific operations, not "any final combination". A gate that asked
+    by KIND therefore refused EVERY graph, because every feature ends in a FINAL_COMBINE, including
+    graphs whose every operator this build can emit. Nothing about the refusal looked wrong: the
+    capability row said False and it was read correctly. The wrong thing was the question.
+    """
+    record_renderer_dispatch(db, engine_id=ENGINE, dispatchable=renderer_dispatch_surface())
+
+    surface = renderer_dispatch_surface()
+    assert surface[("final_combine", SOLE_VARIANT)] is False
+    assert surface[("final_combine", "identity")] is True
+
+    assert undispatchable_kinds(db, _combining_graph("identity"), engine_id=ENGINE) == ()
+    # ...and an operation this build genuinely cannot emit is still named, per variant.
+    assert undispatchable_kinds(db, _combining_graph("signed_sum"), engine_id=ENGINE) == (
+        "final_combine/signed_sum",)
+
+
 def test_an_UNRECORDED_operator_counts_as_undispatchable(db):
     """Treating an unrecorded operator as renderable is how a project that cannot run gets
     generated."""
@@ -384,7 +444,7 @@ def test_THE_ADVERTISED_SET_IS_DISPATCHABLE_INTERSECT_PROVED(db):
                         proof_hash=proof_hash)
     # dispatchable but NOT proved: every other kind, left alone
 
-    assert advertised_operators(db, engine_id=ENGINE) == ("aggregate",)
+    assert advertised_operators(db, engine_id=ENGINE) == (("aggregate", SOLE_VARIANT),)
 
 
 def test_an_UNRECORDED_operator_is_not_advertised(db):

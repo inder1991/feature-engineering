@@ -32,7 +32,8 @@ from tests.featuregen.materialize.test_render_nodes_compute import (
     lock_tree,  # noqa: F401 — fixture re-export
 )
 
-from featuregen.formula.schema import AggregateFunction, EmptyWindowResult, NullInput
+from featuregen.formula.schema import AggregateFunction
+from featuregen.formula.schema_leaves import EmptyWindowResult, NullInput
 from featuregen.formula.schema_v2 import AggregateFunctionV2
 from featuregen.materialize import engine_capability
 from featuregen.materialize.engine_capability import (
@@ -43,14 +44,14 @@ from featuregen.materialize.expression_ir import RefRole
 from featuregen.materialize.render import nodes_compute
 
 
-def _with_aggregation(ir, aggregation: AggregateFunction):
+def _with_aggregation(ir, aggregation: AggregateFunctionV2):
     """The compiled SUM IR, re-aggregated — everything else stays exactly what was compiled.
 
     ``COUNT_ROWS`` additionally sheds the OPERAND role from its read set, because Child-1's
     grammar gives it no operand at all and the renderer refuses a read set that names one.
     """
     expression = ir.expressions[0]
-    if aggregation is AggregateFunction.COUNT_ROWS:
+    if aggregation is AggregateFunctionV2.COUNT_ROWS:
         stripped = tuple(
             dataclasses.replace(
                 ref, roles=tuple(role for role in ref.roles if role is not RefRole.OPERAND))
@@ -83,11 +84,20 @@ def _staged_values(compiled, feature, lock_tree, aggregation):  # noqa: F811
 #: NULL for C1 (``null_input=IGNORE``), one 7 for C2. Four different numbers out of one input is
 #: what tells the four rendering paths apart; a dispatch that wired two members to the same Spark
 #: call would collide on at least one row here.
+# Keyed on V2's members, like the renderer's own dispatch. A V1-keyed map answered a V2 lookup
+# anyway — the two enums hash equal — so keying it either way "worked", which is exactly why the
+# one that matches the code under test is the one to use.
 _EXPECTED = {
-    AggregateFunction.SUM: {"C1": 20, "C2": 7},
-    AggregateFunction.COUNT_NON_NULL: {"C1": 2, "C2": 1},
-    AggregateFunction.COUNT_DISTINCT: {"C1": 1, "C2": 1},
-    AggregateFunction.COUNT_ROWS: {"C1": 3, "C2": 1},
+    AggregateFunctionV2.SUM: {"C1": 20, "C2": 7},
+    AggregateFunctionV2.COUNT_NON_NULL: {"C1": 2, "C2": 1},
+    AggregateFunctionV2.COUNT_DISTINCT: {"C1": 1, "C2": 1},
+    AggregateFunctionV2.COUNT_ROWS: {"C1": 3, "C2": 1},
+    # Step 11, over the same projection: C1 holds 10, 10 and NULL; C2 holds 7. Every one of these
+    # SKIPS the null — which is why C1 averages 10 rather than 6.67, and the divisor is the reason
+    # to state the expectation as a number rather than as "the average".
+    AggregateFunctionV2.AVG: {"C1": 10, "C2": 7},
+    AggregateFunctionV2.MIN: {"C1": 10, "C2": 7},
+    AggregateFunctionV2.MAX: {"C1": 10, "C2": 7},
 }
 
 
@@ -95,7 +105,7 @@ _EXPECTED = {
 def test_every_advertised_aggregation_has_a_rendering_path(
         compiled, feature, lock_tree, aggregation):  # noqa: F811
     """Render each advertised member and RUN it — the advertisement is executable, not prose."""
-    member = AggregateFunction(aggregation)
+    member = AggregateFunctionV2(aggregation)
     values = _staged_values(compiled, feature, lock_tree, member)
     expected = _EXPECTED[member]
     assert {cif: (value if value is None else int(value))
@@ -106,12 +116,12 @@ def test_every_renderable_aggregation_is_advertised():
     """The converse — the pair is exhaustive in both directions, member for member."""
     renderable = {member.value for member in nodes_compute.renderable_aggregations()}
     assert renderable == KEDRO_PYSPARK_ENGINE.supported_aggregations
-    # And the renderer's own self-description covers Child-1's v1 vocabulary exactly: every v1
-    # member renders. The v2-only vocabulary is NOT advertised — that gap is the whole point of
-    # the engine arm (`unsupported_engine`), so pin a representative slice of it.
-    assert renderable == {member.value for member in AggregateFunction}
-    for v2_only in ("avg", "min", "max", "percentile", "last_known", "slope"):
-        assert AggregateFunctionV2(v2_only).value not in renderable
+    # The renderer covers Child-1's v1 vocabulary and, since step 11, the three ordinary aggregates
+    # V2 added. It is deliberately NOT the whole V2 vocabulary — that remaining gap is the point of
+    # the engine arm (`unsupported_engine`), so pin a representative slice of what is still absent.
+    assert renderable == {member.value for member in AggregateFunction} | {"avg", "min", "max"}
+    for still_absent in ("percentile", "median", "last_known", "slope", "stddev", "zscore"):
+        assert AggregateFunctionV2(still_absent).value not in renderable
 
 
 def test_window_offset_and_future_horizon_advertisements_match_the_renderer():

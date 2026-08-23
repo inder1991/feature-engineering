@@ -54,10 +54,12 @@ def test_intraday_peak_cannot_compile_from_daily_snapshots():
     assert "not evidence of intraday behaviour" in peak.output.empty_population_policy
 
 
-def test_obligor_facility_count_stays_atomic_and_authorable():
+def test_obligor_facility_count_stays_atomic_and_AUTHORS_ON_THE_V2_LANE():
+    """Converted with `merchant_mcc_diversity` — see that test for why. Atomicity and readiness are
+    unchanged; only the authoring lane moved."""
     r = BY_ID["obligor_facility_count"]
     assert r.readiness == "FORMULA_AUTHORABLE"
-    assert r.formula.formula_schema_version == "formula-v1"
+    assert r.formula.formula_schema_version == "formula-v2"
     assert r.formula.expectation_ref == "obligor_facility_count"
     from featuregen.overlay.upload.recipe_formula_expectations import (
         RECIPE_FORMULA_EXPECTATIONS,

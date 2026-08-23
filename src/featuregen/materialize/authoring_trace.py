@@ -31,7 +31,7 @@ rather than re-implementations —
   ASCII-escaping either, so ``overlay.field_evidence.canonical_hash`` is wrong here too. The two
   differ only on non-ASCII payloads, which is precisely the kind of near-miss a second copy of a
   hasher produces. ``test_admission.py`` pins the borrow against a real run's stored hash.
-* ``replay_authoring._intent_material`` is the projection ``run_authoring`` hashed into the manifest
+* ``intent_material._intent_material`` is the projection every authoring run hashes into the manifest
   before any provider call. It covers FIVE fields — ``name``, ``hypothesis``, ``target_entity``,
   ``target_grain_keys`` **and ``recipe_authoring_context``** — where 1020's
   ``authoring.authoring_intent_hash`` covered four. Moving lanes therefore WIDENS what check 6
@@ -58,7 +58,7 @@ from featuregen.contracts.db import DbConn
 # Bound PRIVATELY on purpose: these are this module's implementation, borrowed from the writer so
 # the two sides of a proof cannot drift, and NOT part of `formula/`'s public API that Phase G may
 # rely on. A re-export would make an unassigned module's private helper into a materialize contract.
-from featuregen.formula.replay_authoring import _intent_material as _intent_projection
+from featuregen.formula.intent_material import _intent_material as _intent_projection
 from featuregen.formula.replay_trace import _hash as _digest
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.overlay.field_evidence import canonical_hash

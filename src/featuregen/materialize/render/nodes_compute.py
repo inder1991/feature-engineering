@@ -84,22 +84,29 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, TypeVar
 
-from featuregen.formula.schema import (
-    AggregateFunction,
+from featuregen.formula.schema_leaves import (
     EmptyWindowResult,
     FilterBoolOp,
     FilterKind,
     FilterPredicateOp,
-    FinalOperation,
     LiteralType,
     NullInput,
     OverflowBehavior,
     RoundingMode,
     ZeroDenominator,
 )
-from featuregen.materialize.admission import hive_identifier
+
+# The renderer speaks ONE operation vocabulary, and it is V2's. `EmptyWindowResult`, `NullInput`,
+# `FilterKind` and the rest above are the SAME objects in `schema` and `schema_v2` — re-exported,
+# genuinely version-neutral — so comparing them with `is` is correct and stays.
+from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
+from featuregen.materialize.boundary_v2 import (
+    FeatureGroupPlanV2,
+    FormulaExecutionIRV2,
+)
 from featuregen.materialize.codes import ValidationGateCode
 from featuregen.materialize.contract import MaterializationContractV1
+from featuregen.materialize.contract_v2 import MaterializationContractV2
 from featuregen.materialize.expression_ir import (
     AvailabilityBasis,
     ExpressionExecutionIR,
@@ -112,6 +119,7 @@ from featuregen.materialize.group_plan import (
     PlannedFeature,
     StagingStatus,
 )
+from featuregen.materialize.identifiers import hive_identifier
 from featuregen.materialize.identity import GENERATED_LOCK_FILENAME
 from featuregen.materialize.inputs import PhysicalInputRequirement
 from featuregen.materialize.inventory import (
@@ -203,6 +211,12 @@ _DAYS_PER_UNIT: dict[str, int] = {"day": 1, "week": 7}
 _PERIOD_START: dict[str, str] = {"week": "week", "month": "month", "quarter": "quarter",
                                  "year": "year"}
 
+from featuregen.materialize.render.renderable import (  # noqa: E402
+    RenderableContract,
+    RenderableIR,
+    RenderablePlan,
+)
+
 #: The two window bases (``formula.schema.WindowBasis``). Closed, and rendered as two different
 #: anchors rather than one anchor with a flag.
 _TRAILING = "trailing"
@@ -270,27 +284,39 @@ _VERIFIED_STATUS = "VERIFIED"
 #: reduction lands it; a row that reaches no entity carries a null key and lands on nobody.
 _HOP_JOIN_HOW = "left"
 
-#: The body paths each ``FinalOperation`` compiles to, **in slot order**. The order is semantic and
+#: The body paths each ``FinalOperationV2`` compiles to, **in slot order**. The order is semantic and
 #: not a convenience: a numerator rendered where the denominator belongs inverts every value in the
 #: column, and nothing downstream would say so. Keying the caller's projections and policies by
 #: these paths — rather than pairing them positionally — is what makes that swap unrepresentable.
 #: The paths themselves are Child-1's (``expression_ir.BODY_PATHS``), mirrored here as an ORDERED
 #: mapping because that module's set says which paths exist and not which operation owns which.
-_BODY_SLOTS: Mapping[FinalOperation, tuple[str, ...]] = {
-    FinalOperation.IDENTITY: ("body.expr",),
-    FinalOperation.RATIO: ("body.numerator", "body.denominator"),
-    FinalOperation.DIFFERENCE: ("body.minuend", "body.subtrahend"),
+_BODY_SLOTS: Mapping[FinalOperationV2, tuple[str, ...]] = {
+    FinalOperationV2.IDENTITY: ("body.expr",),
+    FinalOperationV2.RATIO: ("body.numerator", "body.denominator"),
+    FinalOperationV2.DIFFERENCE: ("body.minuend", "body.subtrahend"),
 }
 
 #: Spark's aggregate for each member of Child-1's closed vocabulary. ``COUNT_ROWS`` is absent
 #: because it has no operand to substitute into (``schema.py`` [c9]) and is rendered on its own.
-_AGGREGATE_CALLS: dict[AggregateFunction, str] = {
-    AggregateFunction.SUM: "F.sum",
-    AggregateFunction.COUNT_NON_NULL: "F.count",
-    AggregateFunction.COUNT_DISTINCT: "F.countDistinct",
+#: Keyed on V2's members deliberately. A V1-keyed table ALREADY answered a V2 lookup — the two
+#: enums hash equal and compare equal as strings — so dispatch worked while `is` comparisons
+#: against the same members did not. Working by coincidence and failing by identity is worse than
+#: either, because it renders code rather than refusing.
+_AGGREGATE_CALLS: dict[AggregateFunctionV2, str] = {
+    AggregateFunctionV2.SUM: "F.sum",
+    AggregateFunctionV2.COUNT_NON_NULL: "F.count",
+    AggregateFunctionV2.COUNT_DISTINCT: "F.countDistinct",
+    # Step 11 — the ordinary aggregates, and they are ordinary: `_aggregate_expression` substitutes
+    # into this table, so each renders through the SAME null-input, zero-coalesce and propagation
+    # branches a sum does. None of them needs an overflow gate — `_needs_overflow_gate` asks for
+    # SUM specifically, and min/max are bounded by their operand while an average is bounded by the
+    # largest one.
+    AggregateFunctionV2.AVG: "F.avg",
+    AggregateFunctionV2.MIN: "F.min",
+    AggregateFunctionV2.MAX: "F.max",
 }
 
-def renderable_aggregations() -> frozenset[AggregateFunction]:
+def renderable_aggregations() -> frozenset[AggregateFunctionV2]:
     """The aggregates THIS renderer can emit — the dispatch's keys plus ``COUNT_ROWS``.
 
     ``COUNT_ROWS`` is not in :data:`_AGGREGATE_CALLS` because it has no operand to substitute into
@@ -299,7 +325,7 @@ def renderable_aggregations() -> frozenset[AggregateFunction]:
     capability advertisement (D-5) derives from it, so an aggregate added to the vocabulary is
     advertised only once it has been GIVEN a rendering in this module.
     """
-    return frozenset(_AGGREGATE_CALLS) | {AggregateFunction.COUNT_ROWS}
+    return frozenset(_AGGREGATE_CALLS) | {AggregateFunctionV2.COUNT_ROWS}
 
 
 #: The two ``RoundingMode`` members a Spark function implements EXACTLY. The other four would have
@@ -359,8 +385,8 @@ _LOCK_DEPTH = 4
 
 def render_spine_node(
     spine: SpineSpec,
-    plan: FeatureGroupPlanV1,
-    contract: MaterializationContractV1,
+    plan: RenderablePlan,
+    contract: RenderableContract,
     *,
     spine_input: PhysicalInputRequirement,
     source_dataset: str,
@@ -396,12 +422,12 @@ def render_spine_node(
             f"rendering the spine needs the SpineSpec §4 validated, got {type(spine).__name__}: it "
             f"is the record that the governed facts did not refute the declaration, and a bare "
             f"declaration would render a population nothing checked")
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering the spine needs the FeatureGroupPlanV1, got {type(plan).__name__}: the plan "
             f"is what states the COLUMN names the published table carries, and a spine that named "
             f"its own would land its keys under names the group never planned")
-    if not isinstance(contract, MaterializationContractV1):
+    if not isinstance(contract, MaterializationContractV1 | MaterializationContractV2):
         raise TypeError(
             f"rendering the spine needs the MaterializationContractV1, got "
             f"{type(contract).__name__}: the §8 cutoff is derived from ITS cadence, and a cutoff "
@@ -480,7 +506,7 @@ def _column(ref: str, what: str) -> str:
 
 
 def _key_columns(
-    spine: SpineSpec, plan: FeatureGroupPlanV1, contract: MaterializationContractV1,
+    spine: SpineSpec, plan: RenderablePlan, contract: RenderableContract,
 ) -> tuple[tuple[str, str], ...]:
     """``(source column, published column)`` per key, positionally — never re-derived.
 
@@ -890,7 +916,7 @@ def projection_func_name(feature_column: str, expr_path: str) -> str:
 
 def render_projection_node(
     expression: ExpressionExecutionIR,
-    contract: MaterializationContractV1,
+    contract: RenderableContract,
     *,
     feature_column: str,
     source_dataset: str,
@@ -940,7 +966,7 @@ def render_projection_node(
             f"rendering a projection needs the compiled ExpressionExecutionIR, got "
             f"{type(expression).__name__}: the PIT spec, the read set and the join plan are what "
             f"decide which rows the feature may see, and none of them can be inferred from a name")
-    if not isinstance(contract, MaterializationContractV1):
+    if not isinstance(contract, MaterializationContractV1 | MaterializationContractV2):
         raise TypeError(
             f"rendering a projection needs the MaterializationContractV1, got "
             f"{type(contract).__name__}: §8's cutoff is derived from ITS cadence, and a cutoff "
@@ -2158,9 +2184,9 @@ def calculation_func_name(feature_column: str) -> str:
 
 
 def render_calculation_node(
-    ir: FormulaExecutionIRV1,
+    ir: RenderableIR,
     feature: PlannedFeature,
-    plan: FeatureGroupPlanV1,
+    plan: RenderablePlan,
     *,
     empty_window: Mapping[str, EmptyWindowResult],
     null_input: Mapping[str, NullInput],
@@ -2171,7 +2197,7 @@ def render_calculation_node(
 ) -> RenderedNode:
     """Render the node that computes ONE feature and writes its own §9 evidence.
 
-    Every ``FinalOperation`` renders: an ``IDENTITY`` body is one aggregate staged as the feature, a
+    Every renderable ``FinalOperationV2`` emits: an ``IDENTITY`` body is one aggregate staged as the
     ``RATIO`` is two aggregates divided under the formula's own ``zero_denominator`` policy, and a
     ``DIFFERENCE`` is two aggregates subtracted. The two operands of a final operation are FULL
     aggregates — each has its own governed filter, its own point-in-time projection and its own
@@ -2220,9 +2246,14 @@ def render_calculation_node(
             keys, the rounding mode has no exact Spark rendering, or a governed filter names a run
             parameter.
     """
-    if not isinstance(ir, FormulaExecutionIRV1):
+    # BOTH compiled IRs, because there is one renderer. This was `FormulaExecutionIRV1` alone, and
+    # it was the only one of the ten V1-enum gates that was SAFE: it refused loudly. The other nine
+    # compared `is` against a V1 enum member and silently took the else-branch, so removing this
+    # check on its own would have converted the one honest refusal into a wrong number. They move
+    # together or not at all.
+    if not isinstance(ir, FormulaExecutionIRV1 | FormulaExecutionIRV2):
         raise TypeError(
-            f"rendering a calculation needs the compiled FormulaExecutionIRV1, got "
+            f"rendering a calculation needs a compiled IR (V1 or V2), got "
             f"{type(ir).__name__}: the aggregate, the grain and the governed filter are what decide "
             f"the number, and none of them can be inferred from a column name")
     if not isinstance(feature, PlannedFeature):
@@ -2230,7 +2261,7 @@ def render_calculation_node(
             f"rendering a calculation needs the PlannedFeature, got {type(feature).__name__}: §6's "
             f"resolved PhysicalType carries the rounding and overflow obligations the rendered code "
             f"must discharge, and a bare type string carries neither")
-    if not isinstance(plan, FeatureGroupPlanV1):
+    if not isinstance(plan, FeatureGroupPlanV1 | FeatureGroupPlanV2):
         raise TypeError(
             f"rendering a calculation needs the FeatureGroupPlanV1, got {type(plan).__name__}: the "
             f"landing key columns and the business-date column are the plan's, and a staged row "
@@ -2321,8 +2352,8 @@ def _signature_lines(func_name: str, slots: tuple[_Slot, ...]) -> list[str]:
 # ── what the caller must have got right (calculation) ────────────────────────────────────────────
 
 
-def _staged_column(ir: FormulaExecutionIRV1, feature: PlannedFeature,
-                   plan: FeatureGroupPlanV1) -> str:
+def _staged_column(ir: RenderableIR, feature: PlannedFeature,
+                   plan: RenderablePlan) -> str:
     """The ONE published column this node stages, proved to be the same one in all three objects."""
     column = hive_identifier(ir.feature_name)
     if feature.column_name != column:
@@ -2386,7 +2417,7 @@ class _Slot:
         return "the" if not self.local else f"`{self.expr_path}`'s"
 
 
-def _body_slots(ir: FormulaExecutionIRV1, column: str,
+def _body_slots(ir: RenderableIR, column: str,
                 empty_window: Mapping[str, EmptyWindowResult],
                 null_input: Mapping[str, NullInput],
                 projection_datasets: Mapping[str, str]) -> tuple[_Slot, ...]:
@@ -2437,14 +2468,14 @@ def _body_slots(ir: FormulaExecutionIRV1, column: str,
     return tuple(slots)
 
 
-def _one_zero_denominator(ir: FormulaExecutionIRV1) -> None:
+def _one_zero_denominator(ir: RenderableIR) -> None:
     """``zero_denominator`` is declared for a RATIO and for nothing else (``ir.py``).
 
     Both directions refuse. A ratio without one has no declared answer for the ÷0 case and the
     renderer would have to choose one; anything else WITH one describes a division that is not in the
     body, so the two objects disagree about what the feature is.
     """
-    if ir.final_operation is FinalOperation.RATIO:
+    if _final_operation(ir) is FinalOperationV2.RATIO:
         _zero_denominator(ir)
         return
     if ir.zero_denominator is not None:
@@ -2454,7 +2485,38 @@ def _one_zero_denominator(ir: FormulaExecutionIRV1) -> None:
             f"that body for it to govern, so the compiled objects disagree about what the feature is")
 
 
-def _zero_denominator(ir: FormulaExecutionIRV1) -> ZeroDenominator:
+def _final_operation(ir: RenderableIR) -> FinalOperationV2:
+    """The IR's final operation in the ONE vocabulary this renderer compares against.
+
+    **This is the crossing that was silently wrong.** ``FinalOperationV2.RATIO is
+    FinalOperation.RATIO`` is ``False`` — different enum object, same name, same value — so a V2
+    ratio did not fail here. It took the else-branch and rendered a DIFFERENT operation: in this
+    codebase, a wrong number in a credit model rather than an error anybody would see.
+
+    Made total by a closed table rather than by a constructor call, so an operation this renderer
+    has no arm for is refused BY NAME instead of being converted successfully and then matching
+    nothing. ``signed_sum`` is exactly that case today: V2's vocabulary has it and no branch below
+    emits it.
+    """
+    operation = _RENDERABLE_OPERATIONS.get(str(ir.final_operation))
+    if operation is None:
+        raise ValueError(
+            f"{ir.feature_name!r} declares final operation {ir.final_operation!r}, which this "
+            f"renderer has no arm for (it emits "
+            f"{sorted(_RENDERABLE_OPERATIONS)}). Converting it anyway would produce a value that "
+            f"matched no branch and rendered as the fall-through, which is a different feature "
+            f"wearing this one's name")
+    return operation
+
+
+#: DERIVED from `_BODY_SLOTS`, never listed again: an operation this renderer can emit is exactly
+#: one whose terms it knows where to stage. A second list would be a second answer to one question,
+#: and the two would disagree the first time either was edited.
+_RENDERABLE_OPERATIONS: Mapping[str, FinalOperationV2] = {
+    operation.value: operation for operation in _BODY_SLOTS}
+
+
+def _zero_denominator(ir: RenderableIR) -> ZeroDenominator:
     """A RATIO's declared ÷0 policy — TOTAL, so every ratio branch reads exactly one answer."""
     if ir.zero_denominator is None:
         raise ValueError(
@@ -2484,7 +2546,7 @@ def _per_path(declared: Mapping[str, _Declared], paths: tuple[str, ...], what: s
     return declared
 
 
-def _grain_key_columns(ir: FormulaExecutionIRV1, plan: FeatureGroupPlanV1,
+def _grain_key_columns(ir: RenderableIR, plan: RenderablePlan,
                        slots: tuple[_Slot, ...]) -> tuple[str, ...]:
     """The columns the aggregate groups by — the LANDING keys, in the plan's order.
 
@@ -2523,7 +2585,7 @@ def _operand_column(expression: ExpressionExecutionIR, read_set: tuple[str, ...]
     """
     operands = sorted({ref.column for ref in expression.physical_read_set
                        if RefRole.OPERAND in ref.roles and ref.column is not None})
-    if expression.aggregation is AggregateFunction.COUNT_ROWS:
+    if expression.aggregation is AggregateFunctionV2.COUNT_ROWS:
         if operands:
             raise ValueError(
                 f"a count_rows aggregate carries operand column(s) {operands}: Child-1's grammar "
@@ -2546,7 +2608,7 @@ def _operand_column(expression: ExpressionExecutionIR, read_set: tuple[str, ...]
 # ── the rendered calculation body ────────────────────────────────────────────────────────────────
 
 
-def _calculation_docstring(ir: FormulaExecutionIRV1, column: str,
+def _calculation_docstring(ir: RenderableIR, column: str,
                            keys: tuple[str, ...], slots: tuple[_Slot, ...]) -> list[str]:
     landing = f"({', '.join(_safe_text(key, 'a landing key column') for key in keys)}, business_dt)"
     if len(slots) == 1:
@@ -2581,9 +2643,9 @@ def _calculation_docstring(ir: FormulaExecutionIRV1, column: str,
     ]
 
 
-def _final_operation_note(ir: FormulaExecutionIRV1) -> str:
+def _final_operation_note(ir: RenderableIR) -> str:
     """The docstring paragraph naming the operation between the two operands, and its own policy."""
-    if ir.final_operation is FinalOperation.RATIO:
+    if _final_operation(ir) is FinalOperationV2.RATIO:
         return (
             f"The final operation is a RATIO, and the formula's declared zero_denominator policy is "
             f"`{_zero_denominator(ir).value}`. A denominator of ZERO and an ABSENT denominator are "
@@ -2821,7 +2883,7 @@ def _counts_operands(slot: _Slot, physical: PhysicalType) -> bool:
     type) no gate is rendered, so a count would be a column this node invented for nobody.
     """
     return (physical.overflow is OverflowBehavior.ERROR
-            and slot.expression.aggregation is AggregateFunction.SUM)
+            and slot.expression.aggregation is AggregateFunctionV2.SUM)
 
 
 def _operand_count_note(slot: _Slot) -> str:
@@ -2906,7 +2968,7 @@ def _aggregate_expression(slot: _Slot, physical: PhysicalType) -> list[str]:
     """``aggregate = …`` — a NAMED binding, because the propagate form is two aggregates deep."""
     aggregation, operand, nulls = slot.expression.aggregation, slot.operand, slot.nulls
     name = f"{slot.local}aggregate"
-    if aggregation is AggregateFunction.COUNT_ROWS:
+    if aggregation is AggregateFunctionV2.COUNT_ROWS:
         return [f"    {name} = F.count(F.lit(1))"]
     value = f"F.col({operand!r})"
     if nulls is NullInput.ZERO:
@@ -2942,7 +3004,7 @@ def _typed_literal(value: str, physical: PhysicalType) -> str:
 
 def _null_input_note(slot: _Slot) -> str:
     aggregation, nulls, operand = slot.expression.aggregation, slot.nulls, slot.operand
-    if aggregation is AggregateFunction.COUNT_ROWS:
+    if aggregation is AggregateFunctionV2.COUNT_ROWS:
         return (f"§8 rule 4 — the declared null_input is `{nulls.value}` and this aggregate has no "
                 f"operand at all, so there is no value for it to act on. Stated rather than "
                 f"skipped: a policy silently not applied reads exactly like one that was.")
@@ -3069,7 +3131,7 @@ def _empty_window_lines(slot: _Slot, physical: PhysicalType) -> list[str]:
         f"    staged = staged.drop({marker!r})"]
 
 
-def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_Slot, ...],
+def _final_operation_lines(ir: RenderableIR, column: str, slots: tuple[_Slot, ...],
                            physical: PhysicalType) -> list[str]:
     """The operation BETWEEN the operands — nothing at all for an identity body.
 
@@ -3078,12 +3140,12 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
     window has already been given the value its declaration asks for, and the operation combines
     whatever the two declarations produced.
     """
-    if ir.final_operation is FinalOperation.IDENTITY:
+    if _final_operation(ir) is FinalOperationV2.IDENTITY:
         return []
     prelude = _operand_overflow_section(slots, physical)
     values = [f"    {slot.local}value = F.col({slot.value_column!r})" for slot in slots]
     names = [f"{slot.local}value" for slot in slots]
-    if ir.final_operation is FinalOperation.DIFFERENCE:
+    if _final_operation(ir) is FinalOperationV2.DIFFERENCE:
         minuend, subtrahend = names
         body = [
             *_comment(
@@ -3122,7 +3184,7 @@ def _final_operation_lines(ir: FormulaExecutionIRV1, column: str, slots: tuple[_
             *_operand_drop_lines(slots)]
 
 
-def _operation_overflow_lines(ir: FormulaExecutionIRV1, column: str, names: list[str],
+def _operation_overflow_lines(ir: RenderableIR, column: str, names: list[str],
                               physical: PhysicalType) -> list[str]:
     """§9's ``OVERFLOW_VIOLATION`` for the final operation's OWN arithmetic — the remaining NULL.
 
@@ -3141,7 +3203,7 @@ def _operation_overflow_lines(ir: FormulaExecutionIRV1, column: str, names: list
     operation = ir.final_operation.value
     guards = f"{left}.isNotNull() & {right}.isNotNull()"
     zero_message = ""
-    if ir.final_operation is FinalOperation.RATIO:
+    if _final_operation(ir) is FinalOperationV2.RATIO:
         policy = _zero_denominator(ir)
         if policy is ZeroDenominator.NULL:
             guards += " & (~denominator_is_zero)"

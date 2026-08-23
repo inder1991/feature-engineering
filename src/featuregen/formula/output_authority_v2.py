@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from featuregen.formula.operations_v2 import operation_rule
-from featuregen.formula.schema import AdditivityClass
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.schema_v2 import (
     CompositeBodyV2,
     DiffBodyV2,

@@ -10,8 +10,6 @@ from enum import Enum
 from typing import Any
 
 from featuregen.formula._jcs import dumps as jcs_dumps
-from featuregen.formula.author import AUTHOR_PROMPT_VERSION
-from featuregen.formula.capability import CAPABILITY_POLICY_VERSION, classify_formula_capability
 from featuregen.formula.critic import (
     CRITIC_INSTRUCTION,
     CRITIC_POLICY_VERSION,
@@ -20,26 +18,8 @@ from featuregen.formula.critic import (
     CRITIC_SCHEMA_ID,
     CRITIC_SCHEMA_VERSION,
 )
-from featuregen.formula.output_authority import resolve_formula_output_policy
-from featuregen.formula.result import DISPOSITION_POLICY_VERSION, derive_disposition
-from featuregen.formula.schema import (
-    CANONICALIZATION_VERSION,
-    FORMULA_SCHEMA_VERSION,
-    OPERATION_GRAMMAR_VERSION,
-    OUTPUT_POLICY_VERSION,
-    AdditivityClass,
-    AggregateFunction,
-    FinalOperation,
-    WindowBasis,
-    WindowUnit,
-    validate_semantics,
-)
+from featuregen.formula.schema_leaves import AdditivityClass, WindowUnit
 from featuregen.formula.tools import TOOLS
-from featuregen.formula.turns import (
-    AUTHOR_TURN_SCHEMA_ID,
-    AUTHOR_TURN_SCHEMA_VERSION,
-    AUTHOR_TURN_V1_SCHEMA,
-)
 
 FROZEN_CONFIGURATION_POLICY_VERSION = 1
 
@@ -266,6 +246,20 @@ def verify_provider_contract(
             f"{frozen.role} provider contract changed after observation")
 
 
+
+
+
+
+
+
+
+
+# ── the v2 generation ────────────────────────────────────────────────────────────────────────────
+
+
+# SHARED, and the sharing is the correction: an earlier pass moved this into the v1 module with the
+# v1 freeze, and BOTH freezes hash it — the v2 one broke instantly. The tool registry is what the
+# model is handed, and neither generation gets to be frozen against a registry it was not shown.
 def _tool_registry_material() -> dict:
     return {
         name: {
@@ -275,117 +269,6 @@ def _tool_registry_material() -> dict:
         }
         for name, spec in sorted(TOOLS.items())
     }
-
-
-def _operation_grammar_material() -> dict:
-    return {
-        "version": OPERATION_GRAMMAR_VERSION,
-        "aggregate_functions": _enum_values(AggregateFunction),
-        "final_operations": _enum_values(FinalOperation),
-        "window_basis": _enum_values(WindowBasis),
-        "window_units": _enum_values(WindowUnit),
-        "additivity": _enum_values(AdditivityClass),
-        "semantic_validator_sha256": _hash_bytes(
-            inspect.getsource(validate_semantics).encode("utf-8")),
-        "capability_classifier_sha256": _hash_bytes(
-            inspect.getsource(classify_formula_capability).encode("utf-8")),
-        "output_authority_sha256": _hash_bytes(
-            inspect.getsource(resolve_formula_output_policy).encode("utf-8")),
-    }
-
-
-def freeze_current_configuration(
-    *,
-    generation_settings: Mapping[str, Any],
-    author_instruction: str,
-    author_prompt_id: str,
-    author_prompt_version: int = AUTHOR_PROMPT_VERSION,
-) -> FrozenAuthorCriticConfigurationV1:
-    """Freeze every byte/policy that can change authoring output under stable labels."""
-    author = freeze_provider_contract(
-        role="author",
-        generation_settings=generation_settings,
-        prompt_id=author_prompt_id,
-        prompt_version=author_prompt_version,
-        instruction=author_instruction,
-        output_schema_id=AUTHOR_TURN_SCHEMA_ID,
-        output_schema_version=AUTHOR_TURN_SCHEMA_VERSION,
-        output_schema=AUTHOR_TURN_V1_SCHEMA,
-    )
-    critic = freeze_provider_contract(
-        role="critic",
-        generation_settings=generation_settings,
-        prompt_id=CRITIC_PROMPT_ID,
-        prompt_version=1,
-        instruction=CRITIC_INSTRUCTION,
-        output_schema_id=CRITIC_SCHEMA_ID,
-        output_schema_version=CRITIC_SCHEMA_VERSION,
-        output_schema=CRITIC_SCHEMA,
-    )
-    tool_registry_hash = _hash_bytes(_canonical_bytes(_tool_registry_material()))
-    operation_grammar_hash = _hash_bytes(_canonical_bytes(_operation_grammar_material()))
-    critic_policy_hash = _hash_bytes(_canonical_bytes({
-        "version": CRITIC_POLICY_VERSION,
-        "schema_hash": critic.schema_content_hash,
-        "prompt_hash": critic.prompt_content_hash,
-    }))
-    disposition_policy_hash = _hash_bytes(_canonical_bytes({
-        "version": DISPOSITION_POLICY_VERSION,
-        "fold_sha256": _hash_bytes(
-            inspect.getsource(derive_disposition).encode("utf-8")),
-    }))
-    version_vector = {
-        "formula_schema": FORMULA_SCHEMA_VERSION,
-        "operation_grammar": OPERATION_GRAMMAR_VERSION,
-        "output_policy": OUTPUT_POLICY_VERSION,
-        "canonicalization": CANONICALIZATION_VERSION,
-        "capability_policy": CAPABILITY_POLICY_VERSION,
-        "critic_policy": CRITIC_POLICY_VERSION,
-        "disposition_policy": DISPOSITION_POLICY_VERSION,
-    }
-    envelope = {
-        "author_contract_hash": author.contract_hash,
-        "critic_contract_hash": critic.contract_hash,
-        "tool_registry_hash": tool_registry_hash,
-        "operation_grammar_hash": operation_grammar_hash,
-        "critic_policy_hash": critic_policy_hash,
-        "disposition_policy_hash": disposition_policy_hash,
-        "version_vector": version_vector,
-        "configuration_policy_version": FROZEN_CONFIGURATION_POLICY_VERSION,
-    }
-    return FrozenAuthorCriticConfigurationV1(
-        author=author,
-        critic=critic,
-        tool_registry_hash=tool_registry_hash,
-        operation_grammar_hash=operation_grammar_hash,
-        critic_policy_hash=critic_policy_hash,
-        disposition_policy_hash=disposition_policy_hash,
-        version_vector_json=_canonical_bytes(version_vector).decode("utf-8"),
-        configuration_policy_version=FROZEN_CONFIGURATION_POLICY_VERSION,
-        configuration_hash=_hash_bytes(_canonical_bytes(envelope)),
-    )
-
-
-def verify_frozen_configuration(
-    frozen: FrozenAuthorCriticConfigurationV1,
-    *,
-    generation_settings: Mapping[str, Any],
-    author_instruction: str,
-    author_prompt_id: str,
-    author_prompt_version: int = AUTHOR_PROMPT_VERSION,
-) -> None:
-    current = freeze_current_configuration(
-        generation_settings=generation_settings,
-        author_instruction=author_instruction,
-        author_prompt_id=author_prompt_id,
-        author_prompt_version=author_prompt_version,
-    )
-    if current.configuration_hash != frozen.configuration_hash:
-        raise ConfigurationDrifted(
-            "author/critic configuration changed after observation")
-
-
-# ── the v2 generation ────────────────────────────────────────────────────────────────────────────
 
 
 def _operation_grammar_material_v2() -> dict:
@@ -440,6 +323,7 @@ def _operation_grammar_material_v2() -> dict:
 def freeze_current_configuration_v2(
     *,
     generation_settings: Mapping[str, Any],
+    formula_schema_version: int,
 ) -> FrozenAuthorCriticConfigurationV1:
     """Freeze a **Formula-v2** run's configuration — the same ENVELOPE, entirely v2 material.
 
@@ -463,11 +347,7 @@ def freeze_current_configuration_v2(
     caller that could pass a different one could freeze a v2 work item under a prompt no v2 run
     would ever use.
     """
-    from featuregen.formula.author import (
-        AUTHOR_INSTRUCTION_V2,
-        AUTHOR_PROMPT_ID_V2,
-        AUTHOR_PROMPT_VERSION_V2,
-    )
+    from featuregen.formula.author import author_contract_for
     from featuregen.formula.result_v2 import (
         DISPOSITION_POLICY_VERSION_V2,
         AuthoringAxesV2,
@@ -476,28 +356,28 @@ def freeze_current_configuration_v2(
     )
     from featuregen.formula.schema_v2 import (
         CANONICALIZATION_VERSION_V2,
-        FORMULA_SCHEMA_VERSION_V2,
         OPERATION_GRAMMAR_VERSION_V2,
-    )
-    from featuregen.formula.turns_v2 import (
-        AUTHOR_TURN_SCHEMA_ID_V2,
-        AUTHOR_TURN_SCHEMA_VERSION_V2,
-        AUTHOR_TURN_V2_SCHEMA,
     )
 
     from featuregen.formula.output_authority_v2 import (  # isort: skip
         OUTPUT_POLICY_VERSION_V2,
     )
 
+    # ▲ THE WHOLE AUTHOR IDENTITY COMES FROM THE REQUESTED SCHEMA — prompt, instruction and turn
+    # schema, not just the canonicalization axis. It was fixed at v2's, so a configuration could
+    # seal `formula_schema: 3` while freezing the v2 prompt that instructs a model to produce v2.
+    # Selecting through the same closed mapping the orchestrator uses makes that combination
+    # unconstructible rather than merely discouraged.
+    turn_contract = author_contract_for(formula_schema_version)
     author = freeze_provider_contract(
         role="author",
         generation_settings=generation_settings,
-        prompt_id=AUTHOR_PROMPT_ID_V2,
-        prompt_version=AUTHOR_PROMPT_VERSION_V2,
-        instruction=AUTHOR_INSTRUCTION_V2,
-        output_schema_id=AUTHOR_TURN_SCHEMA_ID_V2,
-        output_schema_version=AUTHOR_TURN_SCHEMA_VERSION_V2,
-        output_schema=AUTHOR_TURN_V2_SCHEMA,
+        prompt_id=turn_contract.prompt_id,
+        prompt_version=turn_contract.prompt_version,
+        instruction=turn_contract.instruction,
+        output_schema_id=turn_contract.schema_id,
+        output_schema_version=turn_contract.schema_version,
+        output_schema=turn_contract.schema,
     )
     critic = freeze_provider_contract(
         role="critic",
@@ -531,11 +411,31 @@ def freeze_current_configuration_v2(
         "review_projection_sha256": _hash_bytes(
             inspect.getsource(AuthoringAxesV2.shared_axes).encode("utf-8")),
     }))
+    # ▲ VERSION-DISPATCHED, not hardcoded. This vector is folded into `configuration_hash`, so
+    # sealing `formula_schema: 2` for a V3 run would mint a configuration identity stating that a
+    # v2 formula was authored — and every later reader keyed on the hash would agree with it. The
+    # canonicalization axis travels with the schema because the two are one lineage: v3 canonical
+    # bytes include `row_selections`, which v2's projection never saw.
+    # The wire schemas this freezer can seal a configuration FOR — CLOSED, and checked. Built here
+    # rather than at module scope because the version constants are imported inside this function,
+    # which is where the rest of the v2 material is resolved too.
+    from featuregen.formula.schema_v3 import CANONICALIZATION_VERSION_V3
+
+    freezable: Mapping[int, int] = {
+        2: CANONICALIZATION_VERSION_V2,
+        3: CANONICALIZATION_VERSION_V3,
+    }
+    canonicalization = freezable.get(formula_schema_version)
+    if canonicalization is None:
+        raise ValueError(
+            f"cannot freeze a configuration for formula schema {formula_schema_version!r}: this "
+            f"freezer knows the canonicalization lineage of {sorted(freezable)} only, and "
+            f"sealing an unknown one would state a provenance it cannot support")
     version_vector = {
-        "formula_schema": FORMULA_SCHEMA_VERSION_V2,
+        "formula_schema": formula_schema_version,
         "operation_grammar": OPERATION_GRAMMAR_VERSION_V2,
         "output_policy": OUTPUT_POLICY_VERSION_V2,
-        "canonicalization": CANONICALIZATION_VERSION_V2,
+        "canonicalization": canonicalization,
         "critic_policy": CRITIC_POLICY_VERSION,
         "disposition_policy": DISPOSITION_POLICY_VERSION_V2,
     }
@@ -567,7 +467,25 @@ def verify_frozen_configuration_v2(
     *,
     generation_settings: Mapping[str, Any],
 ) -> None:
-    current = freeze_current_configuration_v2(generation_settings=generation_settings)
+    """Re-freeze and compare, UNDER THE SCHEMA THE SEAL ITSELF DECLARES.
+
+    ▲ The schema is read back out of `frozen.version_vector_json` rather than defaulted. When this
+    function re-froze under a fixed schema, a configuration sealed for V3 could never verify: the
+    re-freeze produced a v2 vector, the hashes differed, and the caller was told the configuration
+    had DRIFTED — a false report of the one condition it exists to detect, and one that names
+    nothing about what actually differed.
+
+    A seal that does not declare its schema is refused rather than assumed: comparing it against a
+    guess would answer "has this drifted?" with "it depends what I assumed it was".
+    """
+    declared = json.loads(frozen.version_vector_json).get("formula_schema")
+    if declared is None:
+        raise ConfigurationDrifted(
+            "the frozen v2 configuration declares no formula_schema in its version vector, so "
+            "there is no schema to re-freeze under — and re-freezing under a guess would compare "
+            "this seal against a configuration nobody sealed")
+    current = freeze_current_configuration_v2(
+        generation_settings=generation_settings, formula_schema_version=declared)
     if current.configuration_hash != frozen.configuration_hash:
         raise ConfigurationDrifted(
             "author/critic v2 configuration changed after observation")

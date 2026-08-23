@@ -32,38 +32,41 @@ digest of those canonical UTF-8 bytes.
 from __future__ import annotations
 
 import hashlib
-import unicodedata
-from enum import Enum
-from typing import TypeVar
 
 from featuregen.formula._jcs import dumps as _jcs_dumps
+from featuregen.formula.canonical_leaves import (
+    _enum_value,
+    _identity_bool,
+    _identity_int,
+    _nfc,
+    _opt_nfc,
+    _ref,
+    _utf16_key,
+    filter_plain,
+)
 from featuregen.formula.schema import (
     AggregateExpression,
     AggregateFunction,
-    DecimalPolicy,
     DiffBody,
-    FilterBool,
-    FilterBoolOp,
-    FilterNode,
-    FilterPredicate,
-    FilterPredicateOp,
     FormulaBody,
     FormulaOutputPolicyV1,
+    RatioBody,
+    TypedFormulaV1,
+    UnaryBody,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    DecimalPolicy,
     Grain,
     LiteralType,
     ParamClass,
     ParameterDecl,
-    ParameterRef,
-    RatioBody,
     SchemaError,
     SourceRelation,
-    TypedFormulaV1,
-    TypedLiteral,
-    UnaryBody,
-    WindowPolicy,
 )
-from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 
+#: `filter_plain` is re-exported so existing callers keep working; it LIVES in `canonical_leaves`
+#: now, because it is the one canonicalizer and it is not V1's.
 __all__ = ["canonical_json", "filter_plain", "formula_content_hash"]
 
 
@@ -82,62 +85,6 @@ def _canonical_bytes(f: TypedFormulaV1) -> bytes:
 
 
 # ---- leaf helpers ----
-
-_E = TypeVar("_E", bound=Enum)
-
-
-def _nfc(value: str, path: str) -> str:
-    if not isinstance(value, str):
-        raise SchemaError(f"{path}: expected a string, got {type(value).__name__}")
-    return unicodedata.normalize("NFC", value)
-
-
-def _opt_nfc(value: str | None, path: str) -> str | None:
-    return None if value is None else _nfc(value, path)
-
-
-def _identity_int(value: int, path: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise SchemaError(f"{path}: expected an int, got {value!r}")
-    return value
-
-
-def _identity_bool(value: bool, path: str) -> bool:
-    if not isinstance(value, bool):
-        raise SchemaError(f"{path}: expected a bool, got {value!r}")
-    return value
-
-
-def _enum_value(member: _E, enum_cls: type[_E], path: str) -> str:
-    if not isinstance(member, enum_cls):
-        raise SchemaError(f"{path}: expected {enum_cls.__name__}, got {member!r}")
-    return member.value
-
-
-def _ref(ref: str, path: str) -> str:
-    """`object_ref`-normalize a LogicalRef (NFC first, then the `_norm` fold)."""
-    try:
-        source, schema, table, column = parse_ref(_nfc(ref, path))
-    except ValueError as exc:
-        raise SchemaError(f"{path}: {ref!r} is not a parseable logical_ref") from exc
-    components = (source, schema, table) + (() if column is None else (column,))
-    if any(not component.strip() for component in components):
-        raise SchemaError(f"{path}: {ref!r} has an empty logical_ref component")
-    return normalize_ref(source, schema, table, column)
-
-
-def _utf16_key(value: str) -> bytes:
-    """The JCS property-name collation (UTF-16 code units), reused for string sets."""
-    return value.encode("utf-16-be")
-
-
-def _child_hash(plain: dict) -> bytes:
-    """§E associative-child sort key: the sha256 of the child's own JCS bytes."""
-    return hashlib.sha256(_jcs_dumps(plain)).digest()
-
-
-# ---- structure converters (dataclass tree -> plain JSON-able tree) ----
-
 
 def _formula_plain(f: TypedFormulaV1) -> dict:
     if not isinstance(f, TypedFormulaV1):
@@ -228,87 +175,6 @@ def _window_plain(window: WindowPolicy, path: str) -> dict:
         "timezone": _nfc(window.timezone, f"{path}.timezone"),
         "empty_window": window.empty_window.value,
         "null_input": window.null_input.value,
-    }
-
-
-def filter_plain(node: FilterNode, path: str) -> dict:
-    """The §E canonical plain form of one filter subtree.
-
-    Public since Spec-A Task 6 (it was the private ``_filter_plain``), for the same reason
-    ``join_path.table_of_ref`` was made public in Task 3: an ADAPTER must ask the question the
-    canonical form already answers. ``materialize.expression_ir`` carries a per-expression filter
-    into its own identity, and a second rendering there could disagree with ``formula_content_hash``
-    about what the filter IS — two hashes naming one filter. There is one canonicalizer.
-    """
-    if isinstance(node, FilterPredicate):
-        return _predicate_plain(node, path)
-    if isinstance(node, FilterBool):
-        if node.op is FilterBoolOp.NOT:
-            # NOT is never flattened, collapsed, or sorted.
-            children = [
-                filter_plain(child, f"{path}.children[{i}]")
-                for i, child in enumerate(node.children)
-            ]
-        else:
-            # Associative AND/OR: flatten nested same-op children FIRST, then
-            # sort the flattened children by their own canonical JCS hash.
-            flattened = _flatten_same_op(node.op, node.children)
-            children = sorted(
-                (filter_plain(child, f"{path}.children[*]") for child in flattened),
-                key=_child_hash,
-            )
-        return {"kind": node.kind.value, "op": node.op.value, "children": children}
-    raise SchemaError(
-        f"{path}: filter node must be FilterPredicate | FilterBool, got {type(node).__name__}"
-    )
-
-
-def _flatten_same_op(
-    op: FilterBoolOp, children: tuple[FilterNode, ...]
-) -> list[FilterNode]:
-    flattened: list[FilterNode] = []
-    for child in children:
-        if isinstance(child, FilterBool) and child.op is op:
-            flattened.extend(_flatten_same_op(op, child.children))
-        else:
-            flattened.append(child)
-    return flattened
-
-
-def _predicate_plain(node: FilterPredicate, path: str) -> dict:
-    plain: dict = {
-        "kind": node.kind.value,
-        "op": _enum_value(node.op, FilterPredicateOp, f"{path}.op"),
-        "left": _ref(node.left, f"{path}.left"),
-        "right_literal": None
-        if node.right_literal is None
-        else _literal_plain(node.right_literal, f"{path}.right_literal"),
-        "right_param": None,
-        "right_set": None,
-    }
-    if node.right_param is not None:
-        if not isinstance(node.right_param, ParameterRef):
-            raise SchemaError(f"{path}.right_param: expected a ParameterRef")
-        plain["right_param"] = {"name": _nfc(node.right_param.name, f"{path}.right_param.name")}
-    if node.right_set is not None:
-        members = [
-            _literal_plain(member, f"{path}.right_set[{i}]")
-            for i, member in enumerate(node.right_set)
-        ]
-        # §E: sorted + deduplicated, keyed on each member's canonical JCS bytes
-        # (dedup runs AFTER NFC + value normalization, so equivalent forms merge).
-        deduped = {_jcs_dumps(member): member for member in members}
-        plain["right_set"] = [member for _, member in sorted(deduped.items())]
-    return plain
-
-
-def _literal_plain(literal: TypedLiteral, path: str) -> dict:
-    if not isinstance(literal, TypedLiteral):
-        raise SchemaError(f"{path}: expected a TypedLiteral, got {type(literal).__name__}")
-    return {
-        "type": _enum_value(literal.type, LiteralType, f"{path}.type"),
-        # Values are ALREADY canonical strings (§A); NFC only, never re-typed.
-        "value": _nfc(literal.value, f"{path}.value"),
     }
 
 

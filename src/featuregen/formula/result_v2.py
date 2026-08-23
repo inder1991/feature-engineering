@@ -32,10 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import get_args
 
-from featuregen.formula.canonical_v2 import proposal_content_hash_v2
-from featuregen.formula.canonical_v3 import proposal_content_hash_v3
-from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
-from featuregen.formula.result import (
+from featuregen.formula.authoring_result_leaves import (
     AuthoringAxes,
     AuthoringDisposition,
     AuthorityFailure,
@@ -47,6 +44,9 @@ from featuregen.formula.result import (
     StructuralStatus,
     TechnicalStatus,
 )
+from featuregen.formula.canonical_v2 import proposal_content_hash_v2
+from featuregen.formula.canonical_v3 import proposal_content_hash_v3
+from featuregen.formula.output_authority_v2 import FormulaOutputPolicyV2
 from featuregen.formula.schema_v2 import TypedFormulaProposalV2
 from featuregen.formula.schema_v3 import TypedFormulaProposalV3
 
@@ -59,10 +59,33 @@ __all__ = [
 #: Version of the v2 fold precedence + coherence rules stamped on every v2 result. Its own pin:
 #: v1's :data:`~featuregen.formula.result.DISPOSITION_POLICY_VERSION` must be free to move without
 #: restamping v2 runs, and vice versa.
-DISPOSITION_POLICY_VERSION_V2 = 2   # C-A6: REVIEW_BYPASSED is a disposition this version knows
+DISPOSITION_POLICY_VERSION_V2 = 3   # READY_FOR_OUTPUT_BINDING is a disposition this version
+                                    # knows — the same reason 1 -> 2 was C-A6's REVIEW_BYPASSED.
+#
+# ▲ WHY A BUMP, WHEN NO EXISTING TRACE FOLDS DIFFERENTLY. Nothing already recorded changes
+# meaning: `deferred_to_compiler` did not exist before, so no axis set that was expressible
+# under version 2 folds to a different disposition under version 3, and every stored result
+# re-folds to exactly what it folded then. The bump is not about rescuing old bytes — it is
+# about what the NUMBER identifies. Two runs both stamped `disposition: 2` would otherwise mean
+# different policies: one written by software that could never produce READY_FOR_OUTPUT_BINDING,
+# one written by software that can.
+#
+# AND THE FINE-GRAINED PIN DOES NOT COVER PRODUCTION. `frozen_configuration` hashes
+# `inspect.getsource(_fold_v2)` into `disposition_policy_hash`, so a FROZEN run's seal moves
+# automatically when this fold changes — which is why the integer looks redundant. It is not:
+# the production formula-draft worker supplies no frozen configuration at all, so for every run
+# this platform actually authors, that source hash is recorded nowhere and this integer is the
+# ONLY pin on which policy decided the run. The coarse one is load-bearing exactly where the
+# fine one is absent.
 
 #: The output statuses under which NO authoritative output policy can exist (§F honesty core).
-_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({"needs_authority", "external_requirement"})
+_UNRESOLVED_OUTPUT: frozenset[str] = frozenset({
+    "needs_authority", "external_requirement",
+    # V3's deferral belongs here too: no authoritative output exists YET, so a result
+    # carrying a `candidate_output` would be laundering a guess into authority exactly as
+    # `needs_authority` would. What differs is the DISPOSITION, not the honesty core.
+    "deferred_to_compiler",
+})
 
 _AXIS_VOCABULARY: tuple[tuple[str, frozenset[str]], ...] = (
     ("structural_status", frozenset(get_args(StructuralStatus))),
@@ -223,6 +246,17 @@ def _fold_v2(axes: AuthoringAxes) -> AuthoringDisposition:
         or axes.capability_status == "unsupported_capability"
     ):
         return "UNSUPPORTED"
+    # V3's DEFERRAL, and it sits here on purpose: after the three arms that outrank it, before the
+    # general unresolved-output arm, and conditioned on the two axes that arm also folds. So a
+    # deferred run whose critic blocked, or whose expectation mismatched, falls through to
+    # NEEDS_REVIEW — because it genuinely does need one. Only a run with nothing else outstanding
+    # reaches the state that says so.
+    if (
+        axes.output_status == "deferred_to_compiler"
+        and axes.critic_status != "blocking"
+        and axes.expectation_status != "mismatch"
+    ):
+        return "READY_FOR_OUTPUT_BINDING"
     if (
         axes.output_status in _UNRESOLVED_OUTPUT
         or axes.critic_status == "blocking"

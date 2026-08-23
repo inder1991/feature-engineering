@@ -19,6 +19,20 @@ about, and an inner join loses them silently.
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.data_agent.pilot_fixture import (
+    CURRENT_MONTH,
+    CUSTOMER_SCHEMA,
+    CUSTOMER_TABLE,
+    DIMENSION_TABLE,
+    EXPECTED,
+    PILOT_JOIN_EVIDENCE,
+    PREVIOUS_MONTH,
+    REPORT_CUTOFF,
+    TRANSACTION_SCHEMA,
+    TRANSACTION_TABLE,
+    binding,
+    create_pilot_tables,
+)
 
 from featuregen.data_agent.analysis import (
     AnalysisExecutionIRV1,
@@ -42,20 +56,6 @@ from featuregen.data_agent.eligibility import (
     TransactionEligibilityPolicyV1,
 )
 from featuregen.data_agent.sql_postgres import PostgresDialect
-from tests.featuregen.data_agent.pilot_fixture import (
-    CURRENT_MONTH,
-    CUSTOMER_SCHEMA,
-    CUSTOMER_TABLE,
-    DIMENSION_TABLE,
-    REPORT_CUTOFF,
-    EXPECTED,
-    PILOT_JOIN_EVIDENCE,
-    binding,
-    PREVIOUS_MONTH,
-    TRANSACTION_SCHEMA,
-    TRANSACTION_TABLE,
-    create_pilot_tables,
-)
 
 
 @pytest.fixture

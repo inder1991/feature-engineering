@@ -27,6 +27,7 @@ from featuregen.api.routes import (
     dataset_policies,
     entity,
     entity_map,
+    feature_runs,
     features,
     gate,
     governance,
@@ -211,6 +212,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(admin.router)
     app.include_router(uploads.router)
     app.include_router(ingestion_runs.router)
+    # `GET /feature-runs` — the read-only run spine (list + detail), object-level scoped.
+    app.include_router(feature_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
     app.include_router(recipe_funnel.router)
@@ -258,7 +261,13 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # Imported HERE rather than added to the module-level `from featuregen.api.routes import (...)`
     # block: that block is being edited by a concurrent session, and this task is additive-only in
     # this file. `create_app` already uses local imports for the same reason elsewhere.
-    from featuregen.api.routes import feature_execution, materialization_runs
+    from featuregen.api.routes import (
+        build_sets,
+        code_generation_jobs,
+        feature_execution,
+        formula_drafts,
+        materialization_runs,
+    )
 
     app.include_router(materialization_runs.router)
     # S11 — the user-reachable generate / code-view / verify / publish surface. Behind the SAME
@@ -266,6 +275,21 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     # worker never runs. Registered here, next to the lane it belongs to, rather than in the
     # module-level import block that a concurrent session is editing.
     app.include_router(feature_execution.router)
+    # §0.10 step 3 — declare a build set, ask to build it, watch the attempt. Behind its
+    # OWN switch rather than the materialization one: the two lanes drive different chains,
+    # and a deployment cutting traffic from V1 to V2 needs to run them in either
+    # combination. One switch would make "V2 only" and "V1 only" the same setting.
+    app.include_router(build_sets.router)
+    # Step 5a — the preview coordinator's surface (plan / request / watch / cancel). Behind the
+    # generation switch by construction: it shares `build_sets.require_generation_enabled`, since
+    # the journey it coordinates ends in a generation and a flag-off deployment must not quote
+    # costs for work its worker never runs.
+    app.include_router(code_generation_jobs.router)
+    # Draft formula (async). NOT behind the materialization switch: drafting a formula for
+    # inspection runs no cluster job and publishes nothing, so gating it on the materialization
+    # flag would tie "may I look at a formula" to "does this deployment materialize" — two
+    # unrelated questions. Its own cost control is the formula-identity idempotency.
+    app.include_router(formula_drafts.router)
 
     @app.get("/health")
     def health() -> dict:

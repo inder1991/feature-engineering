@@ -168,11 +168,12 @@ def test_two_windows_sharing_a_label_are_refused():
 def test_the_resolved_partitions_drive_the_bridge_end_to_end(db):
     """The point of all of it: a plan with calendar windows, resolved to partitions, translated to an
     IR, executed, and reconciled against the fixture's hand-counted answer."""
+    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs, _plan
+    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
+
     from featuregen.analysis.execution import plan_to_execution_ir
     from featuregen.data_agent.analysis import run_analysis
     from featuregen.data_agent.sql_postgres import PostgresDialect
-    from tests.featuregen.analysis.test_plan_to_execution import _grounded, _inputs, _plan
-    from tests.featuregen.data_agent.pilot_fixture import EXPECTED, create_pilot_tables
 
     create_pilot_tables(db)
     windows = (_w("previous", offset=1), _w("current"))

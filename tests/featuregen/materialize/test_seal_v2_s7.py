@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen.materialize.provenance_fixtures import evidenced_members
 from tests.featuregen.materialize.test_subgraph_requirements_v2 import RATES, _fx_chain, _scan
 
 from featuregen.materialize.artifact_manifest import ManifestIntegrityError, manifest_for
@@ -43,19 +44,57 @@ LINKS = (
 )
 
 
+def _authorization(db) -> str:
+    """A real approval for this environment and group — the artifact's FK target.
+
+    Seeded through `record_generation_authorization` rather than a raw INSERT: the composite keys
+    below only mean something if the row they point at was made the way production makes it.
+    """
+    from featuregen.materialize.generation_authorization import (
+        GenerationAuthorizationV1,
+        record_generation_authorization,
+    )
+    from featuregen.overlay.upload.selection_revisions import TargetModeV1
+
+    db.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, "
+               "redacted_hypothesis) VALUES ('int-seal','h','hypothesis','h') "
+               "ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+               "VALUES ('trr-seal','int-seal','exploration','h') ON CONFLICT DO NOTHING")
+    db.execute("INSERT INTO build_set_revision (revision_id, target_reading_revision_id, "
+               "declaration_hash, declaration_json, content_hash, declared_by, declared_at) "
+               "VALUES ('bs-seal','trr-seal','dh','{}'::jsonb,'ch','user:ops','2026-08-20') "
+               "ON CONFLICT DO NOTHING")
+    return record_generation_authorization(
+        db, GenerationAuthorizationV1(
+            environment_id=ENV, logical_group_name=GROUP, build_set_revision_id="bs-seal",
+            target_mode=TargetModeV1.EXPLORATION, target_ref=None),
+        authorized_by="user:ops", authorized_at="2026-08-20T00:00:00Z")
+
+
 def _manifest(artifact_id: str = "art-1", files=None):
     return manifest_for(artifact_id, files or FILES,
                         content_reference=lambda path: content_reference_for(
                             (files or FILES)[path]))
 
 
-def _seal(db, *, graph=None, artifact_id: str = "art-1", files=None, links=LINKS):
+def _seal(db, *, graph=None, artifact_id: str = "art-1", files=None, links=LINKS,
+          columns=("f",)):
+    """Seal, with REAL authoring provenance for every column the graph publishes.
+
+    `evidenced_members` drives a genuine deterministic reviewed-blueprint run per column, because
+    `seal_v2` derives the method from a run's own evidence and refuses a run that establishes none.
+    A hand-built record would be refused here, which is the design working.
+    """
     payload = files or FILES
     return seal_v2(
         db, graph if graph is not None else _fx_chain(), _manifest(artifact_id, payload), payload,
         environment_id=ENV, logical_group_name=GROUP,
         compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
-        project_digest="sha256:project", realizations=links, sealed_at="2026-08-17T00:00:00Z")
+        project_digest="sha256:project", realizations=links,
+        member_provenance=evidenced_members(db, *columns, run_prefix=f"far-{artifact_id}"),
+        sealed_at="2026-08-17T00:00:00Z",
+        generation_authorization_revision_id=_authorization(db))
 
 
 # ══ ACCEPTANCE 1 — deleting the FX duplicate-rate gate refuses, links INTACT ════════════════════
@@ -139,7 +178,8 @@ def test_a_gate_ON_A_BRANCH_THAT_NEVER_SEES_THE_JOIN_refuses_too(db):
     graph = OperatorGraphV2(nodes=(*rest, stray, assembled))
 
     assert OperatorKindV2.DUPLICATE_RATE_GATE in graph.kinds, "the gate really is present"
-    sealed = _seal(db, graph=graph)
+    # TWO published columns, so TWO provenance rows: the assembly above publishes `f` and `g`.
+    sealed = _seal(db, graph=graph, columns=("f", "g"))
     assert sealed.servable is False
     # The links are kept here too — the refusal is about position, not about the policies.
     assert realization_links_of(db, "art-1")
@@ -224,7 +264,9 @@ def test_the_manifest_is_verified_BEFORE_anything_is_written(db):
                 {**FILES, "src/pipeline.py": "different bytes entirely"},
                 environment_id=ENV, logical_group_name=GROUP,
                 compilation_identity_hash="sha256:c", group_plan_hash="sha256:p",
-                project_digest="sha256:d", realizations=LINKS, sealed_at="t")
+                project_digest="sha256:d", realizations=LINKS,
+                member_provenance=evidenced_members(db, "f"), sealed_at="t",
+                generation_authorization_revision_id=_authorization(db))
     assert db.execute(
         "SELECT count(*) FROM sealed_artifact_v2").fetchone()[0] == 0
 
@@ -302,7 +344,8 @@ def test_a_sealed_artifact_must_name_its_ENVIRONMENT(db):
         seal_v2(db, _fx_chain(), _manifest(), FILES, environment_id="  ",
                 logical_group_name=GROUP, compilation_identity_hash="sha256:c",
                 group_plan_hash="sha256:p", project_digest="sha256:d", realizations=LINKS,
-                sealed_at="t")
+                member_provenance=(), sealed_at="t",
+                generation_authorization_revision_id=_authorization(db))
 
 
 def test_a_realization_link_with_a_BLANK_HALF_is_refused(db):
@@ -334,12 +377,13 @@ def test_the_migration_forbids_a_PASS_that_carries_findings(db):
     reader happened to trust."""
     with pytest.raises(psycopg.errors.CheckViolation):
         db.execute(
-            "INSERT INTO sealed_artifact_v2 (artifact_id, environment_id, logical_group_name, "
+            "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+            "environment_id, logical_group_name, "
             "compilation_identity_hash, group_plan_hash, project_digest, subgraph_satisfied, "
             "triggered_requirements, subgraph_findings, sealed_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, true, '[]'::jsonb, "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, true, '[]'::jsonb, "
             "'[{\"code\": \"X\"}]'::jsonb, %s)",
-            ("art-bad", ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+            ("art-bad", _authorization(db), ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
 
 
 def test_the_migration_forbids_a_REFUSAL_with_no_findings(db):
@@ -347,8 +391,95 @@ def test_the_migration_forbids_a_REFUSAL_with_no_findings(db):
     check that failed for its own reasons."""
     with pytest.raises(psycopg.errors.CheckViolation):
         db.execute(
-            "INSERT INTO sealed_artifact_v2 (artifact_id, environment_id, logical_group_name, "
+            "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+            "environment_id, logical_group_name, "
             "compilation_identity_hash, group_plan_hash, project_digest, subgraph_satisfied, "
             "triggered_requirements, subgraph_findings, sealed_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, false, '[]'::jsonb, '[]'::jsonb, %s)",
-            ("art-bad", ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, false, '[]'::jsonb, '[]'::jsonb, %s)",
+            ("art-bad", _authorization(db), ENV, GROUP, "sha256:c", "sha256:p", "sha256:d", "t"))
+
+
+# ══ A GROUP IS ONE ARTIFACT AND MANY GRAPHS ════════════════════════════════════════════════════
+def _named(column: str, *, duplicate_gate: bool = True):
+    """An FX chain assembling ONE named column — one member of a multi-feature group."""
+    from featuregen.materialize.operator_graph_v2 import (
+        GroupAssemblyV2,
+        OperatorGraphV2,
+        OperatorKindV2,
+        OperatorNodeV2,
+    )
+
+    base = _fx_chain(duplicate_gate=duplicate_gate)
+    assembled = OperatorNodeV2(
+        OperatorKindV2.GROUP_ASSEMBLY, GroupAssemblyV2((column,)),
+        inputs=(base.terminal.node_id,))
+    return OperatorGraphV2(nodes=(*base.nodes, assembled))
+
+
+def test_EVERY_MEMBER_OF_A_GROUP_IS_CHECKED(db):
+    """`compile_generation_v2` produces one graph per feature and the artifact is the GROUP's
+    project — one manifest, one publication target. Sealing checked ONE graph and recorded that
+    verdict as though it covered all of them."""
+    sealed = _seal_many(db, [_named("alpha"), _named("beta")])
+    assert sealed.servable is True
+
+
+def test_ONE_BAD_MEMBER_REFUSES_THE_WHOLE_ARTIFACT(db):
+    """All-or-nothing, the rule the rest of the chain uses. A group is published as one row per
+    key, so a partially-satisfied group would publish some columns computed under requirements
+    nobody checked."""
+    sealed = _seal_many(db, [_named("alpha"), _named("beta", duplicate_gate=False)])
+
+    assert sealed.servable is False
+    assert {f.code for f in sealed.verdict.findings} == {MISSING_OPERATOR}
+
+
+def test_A_FINDING_NAMES_THE_MEMBER_THAT_RAISED_IT(db):
+    """A finding that names only the requirement sends an operator to read every graph in the group
+    to discover which one failed. The member is read off the graph's own assembly, so there is no
+    second place to say which member a graph is and nothing to disagree with."""
+    _seal_many(db, [_named("alpha"), _named("beta", duplicate_gate=False)],
+               artifact_id="art-named")
+    stored = db.execute(
+        "SELECT subgraph_findings FROM sealed_artifact_v2 WHERE artifact_id='art-named'"
+    ).fetchone()[0]
+
+    assert [f["feature_name"] for f in stored] == ["beta"]
+    assert stored[0]["code"] == MISSING_OPERATOR
+
+
+def test_TWO_GRAPHS_CLAIMING_THE_SAME_COLUMN_IS_A_CALLER_ERROR(db):
+    """One column cannot be computed two ways in one group, and a verdict keyed on the columns
+    could not say which graph it judged."""
+    with pytest.raises(ValueError, match="two member graphs publish"):
+        _seal_many(db, [_named("alpha"), _named("alpha")])
+
+
+def test_SEALING_NO_GRAPHS_AT_ALL_IS_REFUSED(db):
+    """The one result that must not be reachable: a satisfied verdict over nothing."""
+    with pytest.raises(ValueError, match="was given no graphs"):
+        _seal_many(db, [])
+
+
+def test_a_SINGLE_GRAPH_IS_STILL_A_ONE_MEMBER_GROUP(db):
+    """Not a compatibility shim — that is what a single-feature group IS. The callers that predate
+    multi-member sealing keep saying exactly the same thing."""
+    sealed = _seal(db)
+    assert sealed.servable is True
+
+
+def _seal_many(db, graphs, *, artifact_id: str = "art-many", columns=None):
+    payload = FILES
+    if columns is None:
+        # Derived from the graphs rather than restated, so a test that changes what a member
+        # publishes does not silently seal provenance for a column nobody publishes.
+        columns = sorted({name for graph in graphs
+                          for name in graph.terminal.payload.column_names})
+    return seal_v2(
+        db, graphs, _manifest(artifact_id, payload), payload,
+        environment_id=ENV, logical_group_name=GROUP,
+        compilation_identity_hash="sha256:compilation", group_plan_hash="sha256:plan",
+        project_digest="sha256:project", realizations=LINKS,
+        member_provenance=evidenced_members(db, *columns, run_prefix=f"far-{artifact_id}"),
+        sealed_at="2026-08-20T00:00:00Z",
+        generation_authorization_revision_id=_authorization(db))

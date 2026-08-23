@@ -59,9 +59,17 @@ from featuregen.formula.schema import (
     FORMULA_SCHEMA_VERSION,
     OPERATION_GRAMMAR_VERSION,
     OUTPUT_POLICY_VERSION,
-    AdditivityClass,
     AggregateExpression,
     AggregateFunction,
+    FormulaOutputPolicyV1,
+    RatioBody,
+    TypedFormulaV1,
+    UnaryBody,
+    WindowBasis,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
     FilterBool,
@@ -69,20 +77,14 @@ from featuregen.formula.schema import (
     FilterNode,
     FilterPredicate,
     FilterPredicateOp,
-    FormulaOutputPolicyV1,
     Grain,
     Inclusivity,
     LiteralType,
     NullInput,
     OverflowBehavior,
-    RatioBody,
     RoundingMode,
     SourceRelation,
-    TypedFormulaV1,
     TypedLiteral,
-    UnaryBody,
-    WindowBasis,
-    WindowPolicy,
     WindowUnit,
     ZeroDenominator,
 )
@@ -456,3 +458,35 @@ def intent_for(name: str, *, hypothesis: str | None = None,
         target_entity=grain.entity,
         target_grain_keys=grain.keys,
         recipe_authoring_context=recipe_authoring_context)
+
+
+# ══ engine capability ════════════════════════════════════════════════════════════════════════════
+def advertise_dispatch(db, *, engine_id: str, dispatchable: bool = True,
+                       except_kind: str | None = None) -> None:
+    """Advertise the whole operator vocabulary to ``engine_id`` — every kind AND every variant.
+
+    The gate asks per SIGNATURE, not per kind: an AGGREGATE node carrying SUM is a question about
+    ``aggregate/SUM``, which ``aggregate/*`` does not answer. A helper that recorded only the
+    sole-variant rows would leave every graph carrying a typed function undispatchable, for a
+    reason none of the tests using it is about — so the variants are recorded here, once, rather
+    than remembered by each caller.
+
+    This says YES to everything, which the real renderer does not: the honest surface is
+    :func:`~featuregen.materialize.engine_capability.renderer_dispatch_surface`, derived from what
+    ``render/`` can actually emit. Tests about the gate's OTHER inputs use this so a capability gap
+    cannot masquerade as the thing they are checking; tests about capability itself use the real
+    surface.
+    """
+    from featuregen.formula.schema_v2 import AggregateFunctionV2, FinalOperationV2
+    from featuregen.materialize.execution_proof_store import SOLE_VARIANT, record_renderer_dispatch
+    from featuregen.materialize.operator_graph_v2 import OperatorKindV2
+
+    def can(kind: str) -> bool:
+        return dispatchable and kind != except_kind
+
+    surface: dict[tuple[str, str], bool] = {
+        (kind.value, SOLE_VARIANT): can(kind.value) for kind in OperatorKindV2}
+    surface.update({("aggregate", fn.value): can("aggregate") for fn in AggregateFunctionV2})
+    surface.update({("final_combine", op.value): can("final_combine")
+                    for op in FinalOperationV2})
+    record_renderer_dispatch(db, engine_id=engine_id, dispatchable=surface)

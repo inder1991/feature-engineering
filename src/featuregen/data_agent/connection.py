@@ -161,7 +161,7 @@ def open_connection(connection: DataSourceConnectionV1, *,
         module_name, package = _DRIVERS[connection.kind]
         try:
             module = __import__(module_name, fromlist=["connect"])
-        except ImportError as exc:
+        except ImportError:
             # Deliberately does not echo the secret or the exception's own text, which on some
             # drivers includes the connection string.
             raise ConnectionError_(

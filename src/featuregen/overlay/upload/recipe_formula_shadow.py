@@ -26,9 +26,7 @@ from psycopg.types.json import Jsonb
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.formula.audited import current_formula_generation_settings
-from featuregen.formula.author import AUTHOR_INSTRUCTION, AUTHOR_PROMPT_ID
 from featuregen.formula.frozen_configuration import (
-    freeze_current_configuration,
     freeze_current_configuration_v2,
     frozen_configuration_json,
 )
@@ -36,6 +34,7 @@ from featuregen.formula.recipe_egress import (
     RecipeEgressViolation,
     build_recipe_authoring_egress,
 )
+from featuregen.formula.schema_v2 import FORMULA_SCHEMA_VERSION_V2
 from featuregen.overlay.upload.contract.scope_records import (
     GenerationInputUnavailable,
     generation_input_for_run,
@@ -1115,19 +1114,21 @@ def _capture_selected_entry(
             expectation=expectation,
         )
         # The frozen configuration is the GENERATION's, because the worker verifies it as that
-        # generation's: a v2 work item frozen under the v1 author identity would drift at the
-        # first dispatch, and authoring it as v1 would audit a v2 run under a prompt no v2 run
-        # uses. A v1 capture is untouched — same call, same bytes, same sealed work items.
-        configuration = (
-            freeze_current_configuration_v2(
-                generation_settings=current_formula_generation_settings())
-            if isinstance(expectation, BoundRecipeFormulaExpectationV2)
-            else freeze_current_configuration(
-                generation_settings=current_formula_generation_settings(),
-                author_instruction=AUTHOR_INSTRUCTION,
-                author_prompt_id=AUTHOR_PROMPT_ID,
-            )
-        )
+        # generation's: a work item frozen under the wrong author identity drifts at the first
+        # dispatch, and auditing a run under a prompt it never used proves nothing.
+        #
+        # There is one generation left to freeze. The v1 arm here was reachable only for a v1 BOUND
+        # expectation, and `capture_blueprint_for` cannot produce one: every capturable recipe
+        # declares formula-v2 (asserted registry-wide in `test_expectation_lane_invariant`). It went
+        # with the worker's arm, because a freeze whose worker cannot verify it is worse than
+        # neither.
+        configuration = freeze_current_configuration_v2(
+            generation_settings=current_formula_generation_settings(),
+            # EXPLICIT, because the freezer no longer defaults. The comment above states why this
+            # lane is v2: every capturable recipe declares formula-v2, asserted registry-wide in
+            # `test_expectation_lane_invariant`. Naming it here makes that a stated fact rather
+            # than one inherited from a parameter default somebody else may change.
+            formula_schema_version=FORMULA_SCHEMA_VERSION_V2)
     except RecipeFormulaPreflightError as exc:
         write_observation(
             conn,

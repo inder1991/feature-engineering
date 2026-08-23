@@ -38,8 +38,35 @@ FORMULA_SHADOW_QUEUE_HANDLERS = frozenset({"recipe_formula_shadow.author.v1"})
 # imports THIS one; `test_queue_lane.py` asserts the two spellings agree, so a rename cannot
 # silently leave `claim_one` free to steal a governed request.
 MATERIALIZATION_QUEUE_HANDLERS = frozenset({"materialization.compile.v1"})
+# The per-candidate "Draft formula" lane. Dedicated for the same reason as the three sets above —
+# the message carries no run-stream `event_id`, so `process_one` would dead-letter it — and for one
+# more that is specific to this lane: `process_one` runs its handler INSIDE `with
+# conn.transaction()`, and a draft is two provider calls plus validation plus admission. Riding the
+# general lane would therefore hold one database transaction open across both models, which is the
+# exact shape the async design exists to prevent. Here the handler owns its own connection and
+# commits between every stage. Spelled here rather than imported from the route module for
+# `MATERIALIZATION_QUEUE_HANDLERS`'s reason: that module imports this one, and a test asserts the
+# two spellings agree so a rename cannot leave `claim_one` free to steal a draft.
+FORMULA_DRAFT_QUEUE_HANDLERS = frozenset({"formula_draft.author.v1"})
+# §0.10 step 3 — the V2 GENERATION lane, which drives a `generation_request` from a declared build
+# set to a sealed artifact. Dedicated for the same reason as the four sets above: the message
+# carries no run-stream `event_id`, so `process_one` would dead-letter it. It is a SEPARATE set from
+# `MATERIALIZATION_QUEUE_HANDLERS` rather than a second handler inside it because the two lanes
+# drive different lifecycles over different tables — V1's `materialization_request` and V2's
+# `generation_request` — and one shared set would let either consumer claim the other's work and
+# then fail to find the row it expects. Spelled here rather than imported for that set's reason:
+# `materialize/generation_lane.py` imports THIS module, and a test asserts the two spellings agree.
+GENERATION_QUEUE_HANDLERS = frozenset({"generation.v2.build"})
+#: ▲ The sandbox VERIFICATION lane (§9.0) — its OWN handler set and its own partition namespace
+#: (`verification:{environment}:{artifact}`), per §9.0.2's decision: sharing the generation set
+#: would make the partition exclusion serialize a verification against a compile that happens to
+#: share a partition key, and they are different acts. The guarantee is the same one the others
+#: lean on: `queue_one_inflight_per_partition`, the partial unique index — the NOT-IN predicate is
+#: the optimization, and the UniqueViolation catch is the handler.
+VERIFICATION_QUEUE_HANDLERS = frozenset({"verification.v2.run"})
 _DEDICATED_HANDLERS = (
-    CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS | MATERIALIZATION_QUEUE_HANDLERS)
+    CONTROL_SIGNAL_HANDLERS | FORMULA_SHADOW_QUEUE_HANDLERS | MATERIALIZATION_QUEUE_HANDLERS
+    | FORMULA_DRAFT_QUEUE_HANDLERS | GENERATION_QUEUE_HANDLERS | VERIFICATION_QUEUE_HANDLERS)
 
 
 class BackpressureError(RuntimeError):
@@ -463,6 +490,176 @@ def fail_materialization(
     return row is not None
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationQueueClaim:
+    """A leased V2 generation job (§0.10 step 3).
+
+    A SEPARATE type from the other lanes' claims, for the reason
+    :class:`MaterializationQueueClaim` records: every terminal write below is a fence-guarded UPDATE
+    keyed on ``(id, lease_owner, lease_fence)``, and one shared type would let this lane's claim be
+    handed to another lane's completion by nothing worse than a typo.
+    """
+
+    id: int
+    message_id: str
+    partition_key: str
+    handler: str
+    payload: Mapping[str, Any]
+    attempts: int
+    max_attempts: int
+    lease_owner: str
+    lease_fence: int
+
+
+def claim_generation(
+    conn: psycopg.Connection,
+    *,
+    owner: str,
+    lease_seconds: float = 300,
+) -> GenerationQueueClaim | None:
+    """Lease one V2 generation job with a monotonically increasing fence.
+
+    ``lease_seconds`` HAS a default here, unlike :func:`claim_materialization`, and the difference
+    is a property of the work rather than a difference of opinion. A V1 compile's duration is
+    dominated by the L0 build proof — a configured subprocess timeout — so the only honest lease
+    there is one derived from that configuration. A V2 generation compiles, renders and seals: it
+    runs no subprocess, calls no provider, and its cost is bounded by the size of the build set. A
+    default is therefore a statement about the work, not a number nothing keeps in step.
+
+    The partition exclusion is what stops two generations of one logical group in one environment:
+    the lane keys the partition on exactly that pair, and sealing is atomic per group.
+    """
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(GENERATION_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return GenerationQueueClaim(
+        id=row["id"],
+        message_id=row["message_id"],
+        partition_key=row["partition_key"],
+        handler=row["handler"],
+        payload=row["payload"],
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"],
+    )
+
+
+def renew_generation(
+    conn: psycopg.Connection,
+    claim: GenerationQueueClaim,
+    *,
+    lease_seconds: float = 300,
+) -> bool:
+    """Extend a held generation lease, refusing a stale fence."""
+    row = conn.execute(
+        "UPDATE queue SET lease_expires_at=now() + make_interval(secs => %s) "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def claim_verification(
+    conn: psycopg.Connection, *, owner: str, lease_seconds: float = 120.0,
+) -> GenerationQueueClaim | None:
+    """One leased verification job, or ``None``. The generation claim's exact shape over the
+    verification handler set — same fence, same partition exclusion, same UniqueViolation-as-miss —
+    reusing the claim dataclass because the fields ARE the same and a third copy would be a third
+    place for the fence discipline to drift."""
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(VERIFICATION_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return GenerationQueueClaim(
+        id=row["id"], message_id=row["message_id"], partition_key=row["partition_key"],
+        handler=row["handler"], payload=row["payload"], attempts=row["attempts"],
+        max_attempts=row["max_attempts"], lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"])
+
+
+def complete_generation(conn: psycopg.Connection, claim: GenerationQueueClaim) -> bool:
+    """Mark a generation job done, refusing a stale fence."""
+    row = conn.execute(
+        "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def fail_generation(
+    conn: psycopg.Connection,
+    claim: GenerationQueueClaim,
+    *,
+    error: str,
+    permanent: bool,
+) -> bool:
+    """Fail a generation job — retry with backoff, or dead-letter — refusing a stale fence."""
+    status = "dead" if permanent or claim.attempts >= claim.max_attempts else "ready"
+    row = conn.execute(
+        "UPDATE queue SET status=%s, last_error=%s, lease_owner=NULL, lease_expires_at=NULL, "
+        "available_at=CASE WHEN %s='ready' THEN now() + make_interval(secs => %s) "
+        "ELSE available_at END "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() RETURNING id",
+        (status, error, status, compute_backoff(claim.attempts),
+         claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    if row is not None and status == "dead":
+        _record_dead_letter(
+            claim.id, error=error,
+            reason="generation_permanent" if permanent else "generation_retry_exhausted")
+    return row is not None
+
+
 def complete(conn: psycopg.Connection, queue_id: int) -> None:
     """Mark a claimed item done and release its lease."""
     with conn.cursor() as cur:
@@ -528,3 +725,149 @@ def queue_depth(conn: psycopg.Connection, *, partition_key: str | None = None) -
                 (partition_key,),
             )
         return int(cur.fetchone()[0])
+
+
+@dataclass(frozen=True, slots=True)
+class FormulaDraftQueueClaim:
+    """A leased "Draft formula" job.
+
+    A SEPARATE type from :class:`FormulaQueueClaim` and :class:`MaterializationQueueClaim` for the
+    reason the latter records: every terminal write below is a fence-guarded UPDATE keyed on
+    ``(id, lease_owner, lease_fence)``, and one shared type would let this lane's claim be handed to
+    another lane's completion by nothing worse than a typo.
+    """
+
+    id: int
+    message_id: str
+    partition_key: str
+    handler: str
+    payload: Mapping[str, Any]
+    attempts: int
+    max_attempts: int
+    lease_owner: str
+    lease_fence: int
+
+
+def claim_formula_draft(
+    conn: psycopg.Connection,
+    *,
+    owner: str,
+    lease_seconds: float = 600,
+) -> FormulaDraftQueueClaim | None:
+    """Lease one draft job with a monotonically increasing fence.
+
+    The default lease is longer than the shadow lane's because the work is two provider calls in
+    series rather than one, and a lease that expires mid-draft would let a second worker start the
+    same authoring — which is a second bill, not merely a second attempt.
+    """
+    row = None
+    try:
+        with conn.transaction():
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "WITH c AS ("
+                    " SELECT id FROM queue"
+                    " WHERE status='ready' AND available_at <= now()"
+                    "   AND handler = ANY(%s)"
+                    "   AND partition_key NOT IN "
+                    "       (SELECT partition_key FROM queue WHERE status='leased')"
+                    " ORDER BY priority, available_at, id"
+                    " FOR UPDATE SKIP LOCKED LIMIT 1"
+                    ") "
+                    "UPDATE queue q SET status='leased', lease_owner=%s, "
+                    " lease_expires_at=now() + make_interval(secs => %s), "
+                    " attempts=q.attempts + 1, lease_fence=q.lease_fence + 1 "
+                    "FROM c WHERE q.id=c.id RETURNING q.*",
+                    (list(FORMULA_DRAFT_QUEUE_HANDLERS), owner, lease_seconds),
+                )
+                row = cur.fetchone()
+    except psycopg.errors.UniqueViolation:
+        return None
+    if row is None:
+        return None
+    return FormulaDraftQueueClaim(
+        id=row["id"],
+        message_id=row["message_id"],
+        partition_key=row["partition_key"],
+        handler=row["handler"],
+        payload=row["payload"],
+        attempts=row["attempts"],
+        max_attempts=row["max_attempts"],
+        lease_owner=row["lease_owner"],
+        lease_fence=row["lease_fence"],
+    )
+
+
+def renew_formula_draft(
+    conn: psycopg.Connection,
+    claim: FormulaDraftQueueClaim,
+    *,
+    lease_seconds: float = 600,
+) -> bool:
+    """Extend a held draft lease, refusing a stale fence.
+
+    Called BETWEEN stages, never during one: each stage commits before the next begins, so there is
+    always a moment with no open transaction in which to renew. That is what makes a long draft
+    safe without a long lease.
+    """
+    row = conn.execute(
+        "UPDATE queue SET lease_expires_at=now() + make_interval(secs => %s) "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (lease_seconds, claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def complete_formula_draft(
+    conn: psycopg.Connection, claim: FormulaDraftQueueClaim
+) -> bool:
+    """Mark a draft job done, refusing a stale fence."""
+    row = conn.execute(
+        "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() "
+        "RETURNING id",
+        (claim.id, claim.lease_owner, claim.lease_fence),
+    ).fetchone()
+    return row is not None
+
+
+def fail_formula_draft(
+    conn: psycopg.Connection,
+    claim: FormulaDraftQueueClaim,
+    *,
+    error: str,
+    permanent: bool,
+) -> bool:
+    """Fail a draft job, retryably or for good, refusing a stale fence.
+
+    RETRY IS NOT FREE HERE, which is why the worker sets ``permanent`` for anything it can name. A
+    retryable failure re-runs the authoring stage and buys the answer again; a message that
+    exhausted its attempts against a deterministic fault would have bought it `max_attempts` times.
+    """
+    status = "dead" if permanent or claim.attempts >= claim.max_attempts else "ready"
+    row = conn.execute(
+        "UPDATE queue SET status=%s, last_error=%s, lease_owner=NULL, lease_expires_at=NULL, "
+        "available_at=CASE WHEN %s='ready' THEN now() + make_interval(secs => %s) "
+        "ELSE available_at END "
+        "WHERE id=%s AND status='leased' AND lease_owner=%s AND lease_fence=%s "
+        "AND lease_expires_at > now() RETURNING id",
+        (
+            status,
+            error,
+            status,
+            compute_backoff(claim.attempts),
+            claim.id,
+            claim.lease_owner,
+            claim.lease_fence,
+        ),
+    ).fetchone()
+    if row is not None and status == "dead":
+        _record_dead_letter(
+            claim.id,
+            error=error,
+            reason="formula_draft_permanent" if permanent else "formula_draft_retry_exhausted",
+        )
+    return row is not None

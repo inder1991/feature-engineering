@@ -50,7 +50,8 @@ from featuregen.formula.gold import (
     score_gold,
 )
 from featuregen.formula.result import AuthoringAxes, derive_disposition
-from featuregen.formula.schema import AdditivityClass, FormulaOutputPolicyV1
+from featuregen.formula.schema import FormulaOutputPolicyV1
+from featuregen.formula.schema_leaves import AdditivityClass
 from featuregen.formula.turns import AuthoringIntent
 from featuregen.intake.llm import FakeLLM, FakeResponse
 

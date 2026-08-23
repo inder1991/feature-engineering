@@ -10,16 +10,22 @@ transactions) over a trailing-90-day window on
 from __future__ import annotations
 
 from featuregen.formula.schema import (
-    AdditivityClass,
     AggregateExpression,
     AggregateFunction,
+    FormulaBody,
+    FormulaOutputPolicyV1,
+    RatioBody,
+    TypedFormulaV1,
+    WindowBasis,
+    WindowPolicy,
+)
+from featuregen.formula.schema_leaves import (
+    AdditivityClass,
     DecimalPolicy,
     EmptyWindowResult,
     FilterNode,
     FilterPredicate,
     FilterPredicateOp,
-    FormulaBody,
-    FormulaOutputPolicyV1,
     Grain,
     Inclusivity,
     LiteralType,
@@ -27,13 +33,9 @@ from featuregen.formula.schema import (
     OverflowBehavior,
     ParamClass,
     ParameterDecl,
-    RatioBody,
     RoundingMode,
     SourceRelation,
-    TypedFormulaV1,
     TypedLiteral,
-    WindowBasis,
-    WindowPolicy,
     WindowUnit,
     ZeroDenominator,
 )
