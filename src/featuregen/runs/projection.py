@@ -211,7 +211,8 @@ def _production_stage(action: ActionV1) -> dict:
     return {"stage": str(action), "state": "NOT_STARTED", "reason_code": None}
 
 
-def _bind_selections_milestone(conn, run_id: str, choice_count: int) -> tuple[dict, list[dict]]:
+def _bind_selections_milestone(conn, run_id: str,
+                               chosen: set[tuple[str, str]]) -> tuple[dict, list[dict]]:
     """The `BIND_SELECTIONS` milestone — its rail entry AND its evidence — from 1101's pins.
 
     A binding pins one SELECTION to the formula that will be built for it, and it reaches this run
@@ -221,27 +222,36 @@ def _bind_selections_milestone(conn, run_id: str, choice_count: int) -> tuple[di
     the join costs nothing and reads as "whose choice is this" rather than "which revision did the
     pin copy".
 
-    ▲ THE DENOMINATOR IS THE RUN'S CHOICE COUNT, and it is the only honest one available. Nothing
-    freezes "the selections this run intends to bind" — a `feature_selection_revision` row is
-    written when somebody selects, so counting selections would grow the denominator with the
-    numerator and the milestone would read complete at every moment of a half-done job. Choices are
-    decided earlier, in a store that stands still, so they are what progress is measured against.
+    ▲ THE QUESTION IS MEMBERSHIP, NOT SIZE. `chosen` is the SET of candidates this run's gate-1
+    choices name, and the numerator is what the bound candidates and that set have IN COMMON. Two
+    sets of the same size are not the same set: comparing counts alone read `SUCCEEDED "2 of 2
+    bound"` over a run with two choices and two bindings on entirely different candidates —
+    complete, with neither chosen candidate holding a formula. A selection may legitimately exist
+    for a candidate no choice covers, so those rows are real and stay in the evidence below; what
+    they may not do is count towards choices they do not touch.
+
+    ▲ THE DENOMINATOR IS THE CHOICE SET, and it is the only honest one available. Nothing freezes
+    "the selections this run intends to bind" — a `feature_selection_revision` row is written when
+    somebody selects, so counting selections would grow the denominator with the numerator and the
+    milestone would read complete at every moment of a half-done job. Choices are decided earlier,
+    in a store that stands still, so they are what progress is measured against.
 
     THE STATES, in the order they earn it:
 
-      * nothing bound — NOT_STARTED, and no detail: the state already says it, and "0 of 5 bound"
+      * no pins at all — NOT_STARTED, and no detail: the state already says it, and "0 of 5 bound"
         would only repeat the choices milestone rendered beside it;
-      * bound == chosen (and something WAS bound) — SUCCEEDED. `> 0` is not pedantry: without it an
-        untouched run reads `0 == 0` and claims completion for work nobody started;
-      * bound < chosen — IN_PROGRESS, and the detail carries both numbers. Never SUCCEEDED here: a
+      * pins, but no choices on the record — IN_PROGRESS with the COUNT ALONE. That is the world the
+        platform is actually in (`contract_gate1_choice_revision` holds zero live rows). A
+        denominator of nothing is not a denominator, and with nothing to be equal to the stage
+        cannot claim to be finished;
+      * every choice bound — SUCCEEDED. Reachable only through the intersection, so it means each
+        chosen candidate has a formula and not merely that some arithmetic matched. The empty run
+        cannot arrive here: with no pins the first branch already answered;
+      * otherwise — IN_PROGRESS, and the detail carries both numbers. This is where a partially
+        bound run sits, and where a run whose pins are all on unchosen candidates sits at `0 of 2`:
+        the stage has been worked on, just not on anything a person chose. Never SUCCEEDED — a
         stage reported done while three choices carry no formula sends a person to the next
-        entrance, which is the one that refuses;
-      * anything else — IN_PROGRESS with the COUNT ALONE. That is the world the platform is
-        actually in (`contract_gate1_choice_revision` holds zero live rows), and it also covers a
-        run holding more bindings than choices, which one candidate selected under two target
-        readings produces honestly. A denominator smaller than its numerator has stopped describing
-        the work, so it is not written; and with no denominator there is nothing to be equal to, so
-        the stage cannot claim to be finished.
+        entrance, which is the one that refuses.
 
     PRE-1101 THE MILESTONE CANNOT RUN AT ALL. There is no store a binding could live in, so the
     entry is UNAVAILABLE with the pin's own reason code — the same string `GENERATE_PREVIEW`
@@ -274,20 +284,24 @@ def _bind_selections_milestone(conn, run_id: str, choice_count: int) -> tuple[di
                  "considered_revision_id": ccr_of, "option_id": opt,
                  "recorded_at": at.isoformat()}
                 for bid, sel, draft, ccr_of, opt, at in rows]
-    # ▲ COUNTED IN CANDIDATES, NOT IN ROWS, because the denominator is: 1025's choices are unique
-    # per `(run, considered revision, option)`. 1101's uniqueness is `(selection, draft)`, so one
+    # ▲ COUNTED IN CANDIDATES, NOT IN ROWS, because the choices are: 1025's are unique per
+    # `(run, considered revision, option)`. 1101's uniqueness is `(selection, draft)`, so one
     # selection pinned to two drafts — two build sets declared either side of a re-authoring — is
     # two rows for ONE choice, and counting rows would report two of five choices bound with four
-    # still carrying nothing. The list below keeps both rows; only the numerator folds them.
-    bound = len({(b["considered_revision_id"], b["option_id"]) for b in bindings})
-    if bound == 0:
+    # still carrying nothing. The list above keeps both rows; only the numerator folds them.
+    bound_candidates = {(b["considered_revision_id"], b["option_id"]) for b in bindings}
+    # THE INTERSECTION IS THE NUMERATOR — the choices that actually carry a formula. It can never
+    # exceed the denominator, which is why no "more bound than chosen" case appears below: a pin on
+    # a candidate nobody chose is simply not one of these choices being bound.
+    bound = len(bound_candidates & chosen) if chosen else len(bound_candidates)
+    if not bindings:
         state, detail = "NOT_STARTED", None
-    elif bound == choice_count:
-        state, detail = "SUCCEEDED", f"{bound} of {choice_count} bound"
-    elif bound < choice_count:
-        state, detail = "IN_PROGRESS", f"{bound} of {choice_count} bound — accumulating"
-    else:
+    elif not chosen:
         state, detail = "IN_PROGRESS", f"{bound} bound"
+    elif bound == len(chosen):
+        state, detail = "SUCCEEDED", f"{bound} of {len(chosen)} bound"
+    else:
+        state, detail = "IN_PROGRESS", f"{bound} of {len(chosen)} bound — accumulating"
     # `detail` rides THIS entry only, and every branch of it. A stage with a count to state says the
     # count; the eight others have nothing to put there, and a null on each of them would be a field
     # every client must test for and no stage would ever fill.
@@ -418,7 +432,13 @@ def run_detail(conn, identity: IdentityEnvelope, run_id: str) -> dict | None:
     current = _current_by_candidate(history)
     # ONE derivation, two surfaces: the rail entry and the milestone's own rows are the same
     # reading of the same pins, so the count on the rail and the list under it cannot disagree.
-    bind_stage, bindings = _bind_selections_milestone(conn, run_id, len(choices))
+    #
+    # The CANDIDATES chosen, not how many: what the milestone asks is whether the things a person
+    # chose have formulas, and a count cannot answer that — two sets of the same size can be
+    # disjoint. 1025 keys a choice by `(run, considered revision, option)`, so the pair is the
+    # candidate and the set is duplicate-free by construction.
+    bind_stage, bindings = _bind_selections_milestone(
+        conn, run_id, {(ccr_of, opt) for opt, ccr_of, _ in choices})
     rail = [
         {"stage": "CHOOSE_CANDIDATES",
          "state": "SUCCEEDED" if choices else "NOT_STARTED", "reason_code": None},

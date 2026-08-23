@@ -449,6 +449,32 @@ def test_one_choice_pinned_twice_is_one_choice_bound(db):
     assert len(out["milestones"]["bind_selections"]) == 2
 
 
+def test_bindings_on_candidates_nobody_chose_bind_none_of_the_choices(db):
+    """The numerator is a MEMBERSHIP question, not a size one — the milestone's worst failure mode.
+
+    ▲ REPRODUCED BEFORE IT WAS FIXED: two choices and two bindings on entirely DIFFERENT candidates
+    read `SUCCEEDED "2 of 2 bound"` while neither chosen candidate had a formula. Two sets of the
+    same size are not the same set, and the whole point of this milestone is to answer "do the
+    things a person chose have formulas yet". Counting is the last step, not the question.
+
+    The bindings are real and stay in the evidence list — a selection can exist for a candidate no
+    gate-1 choice covers, and hiding it would be its own dishonesty. What it may not do is count
+    towards choices it does not touch.
+    """
+    c = seed_run_chain(db, run_id="rd-bx")
+    _seed_choice(db, c, "o1")
+    _seed_choice(db, c, "o2")
+    _seed_binding(db, c, "o8")
+    _seed_binding(db, c, "o9")
+
+    out = run_detail(db, _ADMIN, "rd-bx")
+    assert _bind_stage(out) == {"stage": "BIND_SELECTIONS", "state": "IN_PROGRESS",
+                                "reason_code": None, "detail": "0 of 2 bound — accumulating"}
+    # NOT_STARTED would be the other half of the lie: two pins exist, so the stage HAS been worked
+    # on — just not on anything this run's choices name.
+    assert len(out["milestones"]["bind_selections"]) == 2
+
+
 def test_the_binding_milestone_is_unavailable_before_the_pin_lands(db):
     """Pre-1101 there is no store a binding could live in, so the milestone cannot RUN.
 
