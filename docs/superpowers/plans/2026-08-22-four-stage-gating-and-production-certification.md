@@ -2966,6 +2966,19 @@ only working execution path and replaces it with a promise). Step 0 is new and i
 | **9** | **Both evaluation programmes**, and the **governed case revision** — one approval covering IR + dataset + expected rows + tolerances + runtime profile; a dedicated certification runner, dataset and namespace | **SHARED** | §12 · §12.1 · **§12.2** · Phase E · child step 9 |
 | **10** | **Both-METHOD, concurrency, tamper, bypass and crash-recovery journey tests, then DELETE the legacy route, its producer and its handler** — ▲ **not "both-route"**: after D2 there is one route, and what is tested is route absence and queue-bypass refusal (§8.3) | **SHARED** | §19 · Phases F/G · child step 10 |
 
+▲ **EXECUTION STATUS — 2026-08-23.** Steps **2 and 3 are DONE** (step 3 closed with §5's
+474-cell `ACTION_DISPOSITIONS` table in `materialize/action_dispositions.py` — 79 vocabulary codes
+× 6 actions, CI-proved over `REASON_FAMILIES` × `ActionV1`, applied per-member inside the decision
+service's fold with a recorded `dropped` channel — and §6's tri-state: `_formula_schema_supported`
+returns `supported | unsupported | unmeasured_unreviewed | unmeasured_engine`, the activation
+policy emits `FORMULA_REVIEW_UNMEASURED` / `ENGINE_CAPABILITY_UNMEASURED` where a FALSE
+`FORMULA_SCHEMA_UNSUPPORTED` used to stand, the policy-emitted count moved 16 → 18 under the
+three-part-commit rule, and `READINESS_NOT_MATERIALIZATION_READY` is DROPPED in the evaluator
+chain — readiness authorizes nothing executable). Step **4** is done except §11.3's method-override
+revision (deferred with its migration slot). Step **6 is DONE** (the §9.0 verification worker,
+behind `FEATUREGEN_VERIFICATION_V2_ENABLED` default OFF; §12.2 wiring waits on step 9's runner).
+**Next engineering: step 5.** Steps 0/0b remain OPERATOR; 7–10 are release-readiness per §0.1.0.
+
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`
 **UNAVAILABLE** until production governance exists. **They stay specified and they stop being

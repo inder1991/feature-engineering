@@ -36,8 +36,9 @@ def _offset_blueprint():
 
 
 def test_a_supported_v2_formula_flips_formula_schema_supported():
-    """The exemplar's one demand (``sum``, no offset, no horizon) is advertised — True at last."""
-    assert _formula_schema_supported(EXEMPLAR) is True
+    """The exemplar's one demand (``sum``, no offset, no horizon) is advertised — supported,
+    and only this value and "unsupported" are entitled to speak about the engine (§6)."""
+    assert _formula_schema_supported(EXEMPLAR) == "supported"
 
 
 def test_a_reviewed_v1_expectation_answers_through_the_same_resolver():
@@ -45,13 +46,14 @@ def test_a_reviewed_v1_expectation_answers_through_the_same_resolver():
     platform's one executable formula generation reads as supported, through the exact resolver
     whose hash a review event covers (A5). D-7's grain disagreement is a DIFFERENT question and
     stays open; nothing here re-keys it."""
-    assert _formula_schema_supported(REVIEWED_V1) is True
+    assert _formula_schema_supported(REVIEWED_V1) == "supported"
 
 
-def test_an_unreviewed_recipe_stays_unsupported():
-    """No review → no reviewed demands to compare → False, coupled with FORMULA_NOT_REVIEWED
-    (the exact-intersection tests assert the coupling on real rows)."""
-    assert _formula_schema_supported(UNREVIEWED) is False
+def test_an_unreviewed_recipe_is_UNMEASURED_never_an_engine_claim():
+    """§6: no review → nothing to measure. The old bool said "unsupported" here, which told the
+    operator the ENGINE said no when the engine was never asked — a false statement that sent a
+    governance problem to the engine team. The tri-state names the actual gap."""
+    assert _formula_schema_supported(UNREVIEWED) == "unmeasured_unreviewed"
 
 
 def test_an_offset_formula_is_unsupported_when_the_engine_does_not_advertise_offsets(
@@ -69,19 +71,19 @@ def test_an_offset_formula_is_unsupported_when_the_engine_does_not_advertise_off
     monkeypatch.setattr(
         recipe_formula_shadow, "capture_blueprint_for",
         lambda recipe_id: recipe_formula_shadow.CaptureBlueprintV1(declared, offset))
-    assert _formula_schema_supported(EXEMPLAR) is False
+    assert _formula_schema_supported(EXEMPLAR) == "unsupported"
 
 
 def test_an_unresolvable_expectation_fails_closed(monkeypatch):
     """The plan's "unparseable pinned fixture" case, corrected to the buildable seam: the pinned
     fixture lives under ``tests/`` and production never parses it (the pin test does). What
-    production CAN hit is a resolver that raises or resolves nothing — both are False, never an
-    exception."""
+    production CAN hit is a resolver that raises or resolves nothing — both are UNMEASURED
+    (§6: measurement absence, not an engine verdict), never an exception."""
     monkeypatch.setattr(recipe_formula_shadow, "capture_blueprint_for",
                         lambda recipe_id: (_ for _ in ()).throw(RuntimeError("boom")))
-    assert _formula_schema_supported(EXEMPLAR) is False
+    assert _formula_schema_supported(EXEMPLAR) == "unmeasured_engine"
     monkeypatch.setattr(recipe_formula_shadow, "capture_blueprint_for", lambda recipe_id: None)
-    assert _formula_schema_supported(EXEMPLAR) is False
+    assert _formula_schema_supported(EXEMPLAR) == "unmeasured_engine"
 
 
 def test_an_unknown_engine_is_unsupported_never_a_default():

@@ -73,6 +73,10 @@ class MemberVerdictV1:
     allowed: bool
     blockers: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    #: §5.1 — codes whose disposition at THIS action is DROP: this action is not their gate.
+    #: Recorded, never discarded: "which facts did this decision decline to fold" must stay
+    #: answerable, or a DROP is indistinguishable from a code nobody saw.
+    dropped: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,15 +147,24 @@ def _fold(conn, request: ActionRequestV1, *, authorization_id: str | None) -> Ac
         if authorization.permission_result != "allowed":
             blockers.append("ACTION_AUTHORIZATION_REFUSED")
 
+    # ▲ §5: the DISPOSITION TABLE is authoritative per (code, action) — the caller supplies
+    # FACTS, and the table decides which of them refuse THIS action, which proceed-with-warning,
+    # and which this action is not the gate for. Applied here, at decision time — not at display
+    # time, which is where an unknown code used to surface, after the build had already run.
+    from featuregen.materialize.action_dispositions import fold_member_codes
+
     members = sorted(set(request.member_names)
                      | set(request.member_blockers) | set(request.member_warnings))
-    verdicts = tuple(
-        MemberVerdictV1(
-            member_name=name,
-            allowed=not tuple(request.member_blockers.get(name, ())),
-            blockers=tuple(request.member_blockers.get(name, ())),
-            warnings=tuple(request.member_warnings.get(name, ())))
-        for name in members)
+    verdicts = []
+    for name in members:
+        m_blockers, m_warnings, m_dropped = fold_member_codes(
+            request.action,
+            tuple(request.member_blockers.get(name, ())),
+            tuple(request.member_warnings.get(name, ())))
+        verdicts.append(MemberVerdictV1(
+            member_name=name, allowed=not m_blockers,
+            blockers=m_blockers, warnings=m_warnings, dropped=m_dropped))
+    verdicts = tuple(verdicts)
 
     allowed = not blockers and all(v.allowed for v in verdicts)
     warnings = tuple(sorted({w for v in verdicts for w in v.warnings}))
@@ -208,7 +221,8 @@ def decide(
     # id, a same-id conflict IS the identical decision, and DO NOTHING is genuinely idempotent.
     canonical_members = [
         {"member_name": v.member_name, "allowed": v.allowed,
-         "blockers": list(v.blockers), "warnings": list(v.warnings)}
+         "blockers": list(v.blockers), "warnings": list(v.warnings),
+         "dropped": list(v.dropped)}
         for v in decision.per_member]
     decision_id = jcs_sha256({
         "action": str(request.action),
@@ -280,7 +294,8 @@ def recheck(conn, decision_id: str, *, current_pins: Mapping[str, str]) -> Actio
         allowed=row[0],
         per_member=tuple(
             MemberVerdictV1(member_name=v["member_name"], allowed=v["allowed"],
-                            blockers=tuple(v["blockers"]), warnings=tuple(v["warnings"]))
+                            blockers=tuple(v["blockers"]), warnings=tuple(v["warnings"]),
+                            dropped=tuple(v.get("dropped", ())))
             for v in verdicts),
         blockers=tuple(row[1] if isinstance(row[1], list) else json.loads(row[1])),
         warnings=tuple(row[2] if isinstance(row[2], list) else json.loads(row[2])),

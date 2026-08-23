@@ -102,6 +102,51 @@ POLICY_FAMILY_UNVERIFIABLE = "POLICY_FAMILY_UNVERIFIABLE"  # C5: a family's fact
 HISTORY_DEPTH_INSUFFICIENT = "HISTORY_DEPTH_INSUFFICIENT"  # C9: window exceeds DECLARED depth
 ACTIVATION_STATE_DRIFTED = "ACTIVATION_STATE_DRIFTED"
 
+# ── The four-stage-gating programme (2026-08-22 plan §5) ─────────────────────────────────────────
+# Every code below lands under §5's THREE-PART-COMMIT rule: its definition here, a family row
+# below, and a row in `materialize/action_dispositions.py` covering ALL SIX actions — the CI
+# exhaustiveness tests refuse a code that skips any part.
+
+# §10 — method identity and certification (production gates; §4.1: the SEALED method decides)
+METHOD_CERTIFICATE_MISSING = "METHOD_CERTIFICATE_MISSING"
+METHOD_CERTIFICATE_STALE = "METHOD_CERTIFICATE_STALE"
+METHOD_CERTIFICATE_MISMATCHED = "METHOD_CERTIFICATE_MISMATCHED"
+METHOD_IDENTITY_UNRECORDED = "METHOD_IDENTITY_UNRECORDED"
+
+# §11.2 — buying a formula is an authorized act (conditions of PURCHASE, not of what exists)
+PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+COST_AUTHORIZATION_MISSING = "COST_AUTHORIZATION_MISSING"
+COST_AUTHORIZATION_EXHAUSTED = "COST_AUTHORIZATION_EXHAUSTED"
+
+# §11 / §11.0.1 — the build set must PIN its formula, relationally
+FORMULA_DRAFT_NOT_PINNED = "FORMULA_DRAFT_NOT_PINNED"
+SELECTION_FORMULA_BINDING_MISSING = "SELECTION_FORMULA_BINDING_MISSING"
+
+# §0.1 / §7.1 — the authorization and decision spine
+ACTION_AUTHORIZATION_MISSING = "ACTION_AUTHORIZATION_MISSING"
+ACTION_AUTHORIZATION_REVOKED = "ACTION_AUTHORIZATION_REVOKED"
+ACTION_DECISION_MISSING = "ACTION_DECISION_MISSING"
+DECISION_DRIFT = "DECISION_DRIFT"
+
+# §4.1 / §6 — honest downstream gates and honest measurement absence
+FORMULA_NOT_AUTHORED = "FORMULA_NOT_AUTHORED"
+FORMULA_REVIEW_UNMEASURED = "FORMULA_REVIEW_UNMEASURED"
+ENGINE_CAPABILITY_UNMEASURED = "ENGINE_CAPABILITY_UNMEASURED"
+
+# child §3.2 — the authoring-route selector, surfaced (warnings and refusals BY NAME)
+LLM_AUTHORING_REQUIRED = "LLM_AUTHORING_REQUIRED"
+REVIEWED_LANE_UNAVAILABLE = "REVIEWED_LANE_UNAVAILABLE"
+REVIEWED_EXPECTATION_LEGACY_VERSION = "REVIEWED_EXPECTATION_LEGACY_VERSION"
+REVIEWED_BLUEPRINT_NOT_EXECUTABLE = "REVIEWED_BLUEPRINT_NOT_EXECUTABLE"
+BLUEPRINT_DERIVED_NOT_REVIEWED = "BLUEPRINT_DERIVED_NOT_REVIEWED"
+FORMULA_VALIDATION_FAILED = "FORMULA_VALIDATION_FAILED"
+CATALOG_SNAPSHOT_NOT_FROZEN = "CATALOG_SNAPSHOT_NOT_FROZEN"
+
+# §11.1 — the money guard and identity V1/V2
+LEGACY_CONFIG_UNPROVEN = "LEGACY_CONFIG_UNPROVEN"
+FORMULA_DRAFT_RETIRED = "FORMULA_DRAFT_RETIRED"
+LEGACY_REGENERATION_NOT_APPROVED = "LEGACY_REGENERATION_NOT_APPROVED"
+
 #: code -> product family. A code absent from this table cannot ship — the pin test enforces.
 REASON_FAMILIES: dict[str, str] = {
     TARGET_LEAKAGE_BLOCKED: "structurally_unsuitable",
@@ -157,6 +202,33 @@ REASON_FAMILIES: dict[str, str] = {
     OUTPUT_POLICY_INCOMPLETE: "needs_setup",
     POLICY_FAMILY_UNVERIFIABLE: "needs_setup",
     HISTORY_DEPTH_INSUFFICIENT: "structurally_unsuitable",
+    # ── four-stage-gating (§5) ──────────────────────────────────────────────────────────────────
+    METHOD_CERTIFICATE_MISSING: "needs_setup",
+    METHOD_CERTIFICATE_STALE: "needs_setup",
+    METHOD_CERTIFICATE_MISMATCHED: "needs_setup",
+    METHOD_IDENTITY_UNRECORDED: "needs_setup",
+    PROVIDER_UNAVAILABLE: "needs_setup",
+    COST_AUTHORIZATION_MISSING: "undecided",
+    COST_AUTHORIZATION_EXHAUSTED: "undecided",
+    FORMULA_DRAFT_NOT_PINNED: "needs_setup",
+    SELECTION_FORMULA_BINDING_MISSING: "needs_setup",
+    ACTION_AUTHORIZATION_MISSING: "needs_setup",
+    ACTION_AUTHORIZATION_REVOKED: "needs_setup",
+    ACTION_DECISION_MISSING: "needs_setup",
+    DECISION_DRIFT: "needs_setup",
+    FORMULA_NOT_AUTHORED: "needs_setup",
+    FORMULA_REVIEW_UNMEASURED: "needs_setup",
+    ENGINE_CAPABILITY_UNMEASURED: "needs_data_check",
+    LLM_AUTHORING_REQUIRED: "needs_setup",
+    REVIEWED_LANE_UNAVAILABLE: "needs_setup",
+    REVIEWED_EXPECTATION_LEGACY_VERSION: "needs_setup",
+    REVIEWED_BLUEPRINT_NOT_EXECUTABLE: "needs_setup",
+    BLUEPRINT_DERIVED_NOT_REVIEWED: "undecided",
+    FORMULA_VALIDATION_FAILED: "needs_setup",
+    CATALOG_SNAPSHOT_NOT_FROZEN: "needs_setup",
+    LEGACY_CONFIG_UNPROVEN: "structurally_unsuitable",
+    FORMULA_DRAFT_RETIRED: "undecided",
+    LEGACY_REGENERATION_NOT_APPROVED: "undecided",
 }
 
 #: UI/primary precedence: hard structural truths first, then authority, then setup/checks —

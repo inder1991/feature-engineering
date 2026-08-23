@@ -186,3 +186,17 @@ def test_THE_LANE_POSTURE_IS_NOT_IN_THE_IDENTITY_but_the_strategy_it_changes_is(
     # Different strategies, so different identities — through the strategy axis.
     assert lane_on.strategy is not lane_off.strategy
     assert lane_on.strategy_identity_hash != lane_off.strategy_identity_hash
+
+
+def test_every_code_the_resolver_can_emit_is_in_the_closed_vocabulary():
+    """§5: the resolver's four warnings and the worker's refusal are REASON CODES, not private
+    strings — each holds a row in REASON_FAMILIES, so the product test over the six-action
+    disposition table covers them mechanically. The set here is the resolver's CLOSED warning
+    channel; extending it means adding a vocabulary code first (the three-part commit)."""
+    from featuregen.overlay.upload import semantic_eligibility_reasons as R
+
+    for code in ("REVIEWED_LANE_UNAVAILABLE", "REVIEWED_EXPECTATION_LEGACY_VERSION",
+                 "BLUEPRINT_DERIVED_NOT_REVIEWED", "LLM_AUTHORING_REQUIRED",
+                 "REVIEWED_BLUEPRINT_NOT_EXECUTABLE"):
+        assert code in R.REASON_FAMILIES, code
+        assert getattr(R, code) == code

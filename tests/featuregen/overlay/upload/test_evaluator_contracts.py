@@ -39,7 +39,11 @@ def _codes_the_activation_policy_emits() -> set[str]:
 
 # ══ THE GATE — the table is complete over what the system emits ══════════════════════════════════
 def test_THE_TABLE_IS_COMPLETE_OVER_THE_CODES_THE_POLICY_EMITS():
-    """Sixteen from the activation policy, plus exactly the two the EVALUATORS add — and no more.
+    """Eighteen from the activation policy, plus exactly the six the EVALUATORS add — and no more.
+
+    Eighteen, not sixteen, since §6's tri-state: `FORMULA_REVIEW_UNMEASURED` and
+    `ENGINE_CAPABILITY_UNMEASURED` are what the policy emits where a false
+    `FORMULA_SCHEMA_UNSUPPORTED` used to stand for unmeasured support.
 
     Stated as an equality against a named set rather than loosened to "⊇ what the policy emits":
     a superset check would let a genuinely lost code back in, which is the failure this test
@@ -47,7 +51,7 @@ def test_THE_TABLE_IS_COMPLETE_OVER_THE_CODES_THE_POLICY_EMITS():
     constant has to be extended, and a reason written beside the disposition.
     """
     emitted = _codes_the_activation_policy_emits()
-    assert len(emitted) == 16, sorted(emitted)
+    assert len(emitted) == 18, sorted(emitted)
     assert emitted | EVALUATOR_ONLY_BLOCKERS == set(ACTIVATION_BLOCKER_DISPOSITIONS), (
         sorted((emitted | EVALUATOR_ONLY_BLOCKERS) ^ set(ACTIVATION_BLOCKER_DISPOSITIONS)))
     assert not emitted & EVALUATOR_ONLY_BLOCKERS, (
@@ -89,7 +93,12 @@ def test_every_row_states_a_REASON():
 
 # ══ the rule, applied consistently ═══════════════════════════════════════════════════════════════
 def test_the_DROPPED_set_is_exactly_the_semantic_confirmation_gates():
-    """The plan's rule: human semantic confirmation is dropped; legality and possibility are not."""
+    """The plan's rule: human semantic confirmation is dropped; legality and possibility are not.
+
+    Three more since the four-stage plan's §6: readiness — a maturity PROJECTION that stopped
+    authorizing executable actions (its enforcing facts gate by their own names) — and the two
+    honest-absence codes the tri-state emits where a false engine claim used to stand.
+    """
     dropped = {code for code, (d, _) in ACTIVATION_BLOCKER_DISPOSITIONS.items()
                if d is BlockerDisposition.DROPPED}
     assert dropped == {
@@ -97,6 +106,9 @@ def test_the_DROPPED_set_is_exactly_the_semantic_confirmation_gates():
         R.SEMANTIC_AUTHORITY_INSUFFICIENT,
         R.FORMULA_NOT_REVIEWED,
         R.EXTERNAL_VALIDATION_OUTSTANDING,
+        R.READINESS_NOT_MATERIALIZATION_READY,
+        R.FORMULA_REVIEW_UNMEASURED,
+        R.ENGINE_CAPABILITY_UNMEASURED,
     }
 
 

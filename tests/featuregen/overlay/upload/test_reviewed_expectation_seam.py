@@ -61,7 +61,8 @@ _GOLD_V2 = Path(__file__).resolve().parents[2] / "formula" / "gold_v2"
 #: Every rule that lives ONLY on the materialization rung — the closed set A5 is measured
 #: against, so "one code fell" is provable rather than asserted.
 MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REVIEWED,
-                        R.FORMULA_SCHEMA_UNSUPPORTED, R.EXTERNAL_VALIDATION_OUTSTANDING,
+                        R.FORMULA_SCHEMA_UNSUPPORTED, R.FORMULA_REVIEW_UNMEASURED,
+                        R.ENGINE_CAPABILITY_UNMEASURED, R.EXTERNAL_VALIDATION_OUTSTANDING,
                         R.EXECUTION_AUTHORITY_UNEVALUATED, R.EXECUTION_AUTHORITY_UNMET}
 #: What still blocks the reviewed exemplar after A5 **and C2**. ``EXTERNAL_VALIDATION_OUTSTANDING``
 #: is absent from both rows because this fixture's idea is ``DESIGN_CHECKED`` (its rule short-
@@ -71,9 +72,10 @@ MATERIALIZATION_ONLY = {R.READINESS_NOT_MATERIALIZATION_READY, R.FORMULA_NOT_REV
 #: REVIEWED row only.
 STILL_BLOCKING = {R.READINESS_NOT_MATERIALIZATION_READY, R.EXECUTION_AUTHORITY_UNEVALUATED}
 #: The unreviewed discriminator carries TWO more codes, coupled by design: an unreviewed recipe
-#: has no reviewed demands for C2 to compare, so ``FORMULA_SCHEMA_UNSUPPORTED`` stays exactly as
-#: long as ``FORMULA_NOT_REVIEWED`` does. Review is the gate that opens the capability question.
-UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_SCHEMA_UNSUPPORTED}
+#: has no reviewed demands for C2 to compare. §6's tri-state renamed the second half — support is
+#: UNMEASURED because unreviewed (`FORMULA_REVIEW_UNMEASURED`), never the false engine claim
+#: `FORMULA_SCHEMA_UNSUPPORTED` used to make here. Review still opens the capability question.
+UNREVIEWED_EXTRA = {R.FORMULA_NOT_REVIEWED, R.FORMULA_REVIEW_UNMEASURED}
 
 
 def _candidate(recipe_id: str) -> V2RecipeCandidateV1:

@@ -177,7 +177,7 @@ def test_all_four_materialization_codes_can_clear_together(db, monkeypatch):
     current = assemble_current_activation_state(
         db, frozen=frozen, snapshot_id="snap-ms")
     assert current.effective_readiness == "MATERIALIZATION_READY"
-    assert current.formula_schema_supported is True
+    assert current.formula_schema_support == "supported"
     assert current.requirements_closed is True or frozen.validation_status == "DESIGN_CHECKED"
     assert current.execution_authority_evaluated and current.execution_floor_met
 

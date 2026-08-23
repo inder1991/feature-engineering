@@ -371,7 +371,7 @@ def test_the_seam_walks_from_a_served_candidate_to_a_build_verified_run(
     current = assemble_current_activation_state(
         conn, frozen=frozen, snapshot_id=frozen.snapshot_id)
     assert current.effective_readiness == "MATERIALIZATION_READY", current
-    assert current.formula_schema_supported is True
+    assert current.formula_schema_support == "supported"
     assert current.execution_authority_evaluated and current.execution_floor_met
     decision = activation_decision(frozen, current, "execute_materialization")
     assert decision.blockers == (), [b.code for b in decision.blockers]

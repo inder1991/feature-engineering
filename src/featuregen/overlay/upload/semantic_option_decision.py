@@ -380,17 +380,31 @@ def _latest_confirmed_uoa(conn, intent_id: str) -> str | None:
     return row[0] if row is not None else None
 
 
-def _formula_schema_supported(recipe_id: str) -> bool:
-    """C2 — can the selected engine run this recipe's REVIEWED formula expectation?
+def _formula_schema_supported(recipe_id: str) -> str:
+    """C2 + §6 — can the selected engine run this recipe's REVIEWED formula expectation?
+
+    Returns one of ``activation_policy``'s ``SCHEMA_SUPPORT_*`` values, because the old bool's
+    ``False`` was three different facts wearing one engine-capability claim — and for an
+    unreviewed recipe the claim was FALSE: engine support was never measured. Now:
+
+    * no reviewed expectation → ``UNMEASURED_UNREVIEWED`` — a governance gap, named as one;
+    * reviewed but nothing bindable to classify, unknown engine, or any raise →
+      ``UNMEASURED_ENGINE`` — measurement absence, still fail-closed downstream;
+    * ``classify_demands_for_engine`` actually ran → ``SUPPORTED`` or ``UNSUPPORTED``, the only
+      two outcomes entitled to speak about the engine.
 
     The reviewed object production can resolve is the CAPTURE BLUEPRINT
     (``recipe_formula_shadow.capture_blueprint_for`` — the same object a review event's hash
     covers, chosen by the recipe's own declared schema version). Its expressions carry exactly
-    the engine-relevant demands; the pinned ``gold_v2`` fixture stays the TEST-side proof (it
-    lives under ``tests/`` and a deployed backend has no tests tree — the plan's "parse the
-    pinned fixture here" was not buildable). Every failure path — unreviewed, no bindable
-    blueprint, unknown engine, any error — is ``False``, the dataclass's fail-closed posture.
+    the engine-relevant demands; the pinned ``gold_v2`` fixture stays the TEST-side proof.
     """
+    from featuregen.overlay.upload.activation_policy import (
+        SCHEMA_SUPPORT_SUPPORTED,
+        SCHEMA_SUPPORT_UNMEASURED_ENGINE,
+        SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED,
+        SCHEMA_SUPPORT_UNSUPPORTED,
+    )
+
     try:
         from featuregen.formula.capability_v2 import classify_demands_for_engine
         from featuregen.formula.schema_v2 import WindowBasisV2
@@ -401,10 +415,10 @@ def _formula_schema_supported(recipe_id: str) -> bool:
         from featuregen.overlay.upload.recipe_formula_shadow import capture_blueprint_for
 
         if not has_reviewed_formula_expectation(recipe_id):
-            return False
+            return SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED
         capture = capture_blueprint_for(recipe_id)
         if capture is None:
-            return False
+            return SCHEMA_SUPPORT_UNMEASURED_ENGINE
         blueprint = capture.blueprint
         if isinstance(blueprint, RecipeFormulaExpectationBlueprintV2):
             demands = {expr.aggregation.value for expr in blueprint.expressions}
@@ -416,11 +430,13 @@ def _formula_schema_supported(recipe_id: str) -> bool:
             demands = {expr.aggregation.value for expr in blueprint.expressions}
             uses_offset = False
             uses_future = False
-        return classify_demands_for_engine(
+        verdict = classify_demands_for_engine(
             demands, uses_window_offset=uses_offset, uses_future_horizon=uses_future,
-            engine=engine_capability_for("kedro-pyspark")) == "ok"
-    except Exception:                         # unresolvable → unsupported, fail closed
-        return False
+            engine=engine_capability_for("kedro-pyspark"))
+        return (SCHEMA_SUPPORT_SUPPORTED if verdict == "ok"
+                else SCHEMA_SUPPORT_UNSUPPORTED)
+    except Exception:                         # measurement absent → unmeasured, fail closed
+        return SCHEMA_SUPPORT_UNMEASURED_ENGINE
 
 
 def _gold_evaluation_recorded(conn, recipe_id: str) -> bool:
@@ -581,8 +597,12 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
     # advertisement. Only a recipe has a reviewed expectation to ask about; every other
     # source keeps the fail-closed default.
     is_recipe = frozen.generation_source == "recipe" and bool(frozen.source_definition_id)
-    formula_supported = (_formula_schema_supported(frozen.source_definition_id)
-                         if is_recipe else False)
+    from featuregen.overlay.upload.activation_policy import (
+        SCHEMA_SUPPORT_SUPPORTED,
+        SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED,
+    )
+    formula_support = (_formula_schema_supported(frozen.source_definition_id)
+                       if is_recipe else SCHEMA_SUPPORT_UNMEASURED_UNREVIEWED)
 
     # C3 — effective readiness is a RE-FOLD at the durable write, not an inheritance. The
     # serving fold's measured blockers (temporal/binding/policy — nothing here can re-measure
@@ -613,7 +633,8 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
                     frozen.source_definition_id),
                 grammar_verdict="ok",
                 gold_validated=_gold_evaluation_recorded(conn, frozen.source_definition_id),
-                engine_verdict="ok" if formula_supported else "unsupported_engine",
+                engine_verdict=("ok" if formula_support == SCHEMA_SUPPORT_SUPPORTED
+                                else "unsupported_engine"),
             )).state
         except Exception:                     # unfoldable → the frozen truth, never a promotion
             effective = frozen.readiness
@@ -625,7 +646,7 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
         snapshot_freshness=freshness,
         effective_readiness=effective,
         formula_expectation_revision=frozen.formula_expectation_revision,
-        formula_schema_supported=formula_supported,
+        formula_schema_support=formula_support,
         # C3 — a real read over the validation store, keyed by the governed contract the
         # caller names; no contract or no recorded pass fails closed.
         requirements_closed=_requirements_closed(

@@ -39,7 +39,7 @@ CLEAN_CURRENT = CurrentActivationStateV1(
     snapshot_freshness="current",
     effective_readiness="MATERIALIZATION_READY",
     formula_expectation_revision="fx1",
-    formula_schema_supported=True,
+    formula_schema_support="supported",
     requirements_closed=True,
     execution_authority_evaluated=True,
     execution_floor_met=True,
@@ -122,7 +122,7 @@ def test_formula_blocked_readiness_does_NOT_block_contract_creation():
     frozen = replace(CLEAN_FROZEN, readiness="FORMULA_BLOCKED",
                      has_reviewed_formula_expectation=False, formula_expectation_revision="")
     current = replace(CLEAN_CURRENT, effective_readiness="FORMULA_BLOCKED",
-                      formula_schema_supported=False, formula_expectation_revision="")
+                      formula_schema_support="unsupported", formula_expectation_revision="")
     assert activation_decision(frozen, current, "create_contract").allowed
     materialize = activation_decision(frozen, current, "execute_materialization")
     assert not materialize.allowed
@@ -146,7 +146,7 @@ def test_authoring_is_allowed_while_formula_readiness_is_blocked():
     frozen = replace(CLEAN_FROZEN, readiness="FORMULA_BLOCKED",
                      has_reviewed_formula_expectation=False, formula_expectation_revision="")
     current = replace(CLEAN_CURRENT, effective_readiness="FORMULA_BLOCKED",
-                      formula_schema_supported=False, formula_expectation_revision="")
+                      formula_schema_support="unsupported", formula_expectation_revision="")
     assert activation_decision(frozen, current, "author_formula").allowed
 
 
@@ -154,7 +154,7 @@ def test_authoring_is_allowed_while_formula_readiness_is_blocked():
 
 @pytest.mark.parametrize("current_break, expected", [
     (dict(effective_readiness="FORMULA_VALIDATED"), R.READINESS_NOT_MATERIALIZATION_READY),
-    (dict(formula_schema_supported=False), R.FORMULA_SCHEMA_UNSUPPORTED),
+    (dict(formula_schema_support="unsupported"), R.FORMULA_SCHEMA_UNSUPPORTED),
     (dict(formula_expectation_revision="fx2"), R.ACTIVATION_STATE_DRIFTED),
     (dict(execution_authority_evaluated=False), R.EXECUTION_AUTHORITY_UNEVALUATED),
     (dict(execution_floor_met=False), R.EXECUTION_AUTHORITY_UNMET),
@@ -261,3 +261,46 @@ def test_unlicensed_personal_data_refuses_the_governed_contract():
     assert not decision.allowed
     assert "PERSONAL_DATA_POLICY_REQUIRED" in codes(decision)
     assert activation_decision(frozen, CLEAN_CURRENT, "save_idea").allowed
+
+
+# ── §6 — the schema-support tri-state: each failure surfaces under its own name ────────────────
+
+def test_unmeasured_because_unreviewed_is_named_a_GOVERNANCE_gap_not_an_engine_one():
+    """The old bool told an unreviewed recipe "engine support not implemented" — a FALSE
+    statement that sent an operator to the engine team for a governance problem. §6: missing
+    review must never wear an engine-capability code."""
+    decision = activation_decision(
+        CLEAN_FROZEN,
+        replace(CLEAN_CURRENT, formula_schema_support="unmeasured_unreviewed"),
+        "execute_materialization")
+    assert R.FORMULA_REVIEW_UNMEASURED in codes(decision)
+    assert R.FORMULA_SCHEMA_UNSUPPORTED not in codes(decision)
+    assert R.ENGINE_CAPABILITY_UNMEASURED not in codes(decision)
+
+
+def test_unmeasured_because_the_engine_is_unknown_gets_its_OWN_code():
+    decision = activation_decision(
+        CLEAN_FROZEN,
+        replace(CLEAN_CURRENT, formula_schema_support="unmeasured_engine"),
+        "execute_materialization")
+    assert R.ENGINE_CAPABILITY_UNMEASURED in codes(decision)
+    assert R.FORMULA_SCHEMA_UNSUPPORTED not in codes(decision)
+
+
+def test_an_UNRECOGNIZED_support_value_is_an_unmeasured_one_fail_closed():
+    """An unrecognized measurement is an unmeasured one — never a pass, never a crash."""
+    decision = activation_decision(
+        CLEAN_FROZEN, replace(CLEAN_CURRENT, formula_schema_support="banana"),
+        "execute_materialization")
+    assert R.ENGINE_CAPABILITY_UNMEASURED in codes(decision)
+
+
+def test_FORMULA_SCHEMA_UNSUPPORTED_is_reserved_for_a_measured_no():
+    """§6: the code is entitled to speak only when classify_demands_for_engine actually ran and
+    actually said no — and then none of the unmeasured codes ride along."""
+    decision = activation_decision(
+        CLEAN_FROZEN, replace(CLEAN_CURRENT, formula_schema_support="unsupported"),
+        "execute_materialization")
+    assert R.FORMULA_SCHEMA_UNSUPPORTED in codes(decision)
+    assert R.FORMULA_REVIEW_UNMEASURED not in codes(decision)
+    assert R.ENGINE_CAPABILITY_UNMEASURED not in codes(decision)

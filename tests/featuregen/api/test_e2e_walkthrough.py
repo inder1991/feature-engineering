@@ -259,7 +259,12 @@ def test_the_whole_workflow_walks_end_to_end(make_client, conn, monkeypatch):
     # appears), and what still refuses is the honest remainder — no executable formula.
     mat_blocked = _blocker_codes(entry2, "request_materialization")
     assert "READINESS_NOT_MATERIALIZATION_READY" in mat_blocked, mat_blocked
-    assert "FORMULA_SCHEMA_UNSUPPORTED" in mat_blocked, mat_blocked
+    # §6's tri-state made the remainder MORE honest: complaint_count's reviews were just
+    # recorded (step 2b) but nothing bindable exists to classify against the engine, so the
+    # code names MEASUREMENT ABSENCE — the old FORMULA_SCHEMA_UNSUPPORTED here was a false
+    # engine claim (the engine was never asked), which is exactly what §6 retired.
+    assert "ENGINE_CAPABILITY_UNMEASURED" in mat_blocked, mat_blocked
+    assert "FORMULA_SCHEMA_UNSUPPORTED" not in mat_blocked, mat_blocked
     assert "EXECUTION_AUTHORITY_UNEVALUATED" not in mat_blocked, mat_blocked
     assert "EXECUTION_AUTHORITY_UNMET" not in mat_blocked, mat_blocked
     assert "request_materialization" not in entry2["allowed_actions"]
