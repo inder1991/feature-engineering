@@ -3005,8 +3005,26 @@ override could expire mid-transaction and keep being honoured, failing open); th
 assembler resolves the candidate's current override ITSELF (the grain_refs lesson), so the
 resolver's existing override branch finally has a writer feeding it; and the route verifies,
 records, and never accepts a formula method from the body. **The near-term path 0→6 is now
-ENGINEERING-COMPLETE**; what remains anywhere is operator work (0/0b, migrations to live, corpus
-growth) and steps 7–10 as release-readiness per §0.1.0.
+ENGINEERING-COMPLETE**, and **step 7's release-readiness engineering is BUILT** (2026-08-23):
+the state machines were WRITTEN FIRST as revision five demands
+(docs/superpowers/specs/2026-08-23-production-acts-state-machines.md — publication first, all
+eight decisions made, including publication's designed-out UNKNOWN state: the active pointer is
+a database row so swap and terminal commit together); migrations **1113/1114** carry both attempt
+machines, `materialized_output_revision`, the `production_active_revision` CAS pointer,
+`method_certificate_revision` (§10.3's missing parent) and the typed per-member bindings with
+their conditional FK to the sealed identity; the method-level certificate reader answers the
+question `current_evaluation_validity` cannot (keyed on identity hash, honest `None` →
+`METHOD_CERTIFICATE_MISSING` — the day-one hard block); both §9 endpoints EXIST and refuse
+`ACTION_UNAVAILABLE` today with the FULL per-member certificate answer served (§21's
+"how far from production", readable now), while the same code records attempt + decision +
+certificate bindings the day the policy opens (proved by test with the availability set opened);
+`publish_swap` is fence-CAS (a zombie loses inside the statement); the reconcilers ship WITH the
+machines (§15.1), gated on action availability so the flag-off tick stays byte-identical; and
+`_explained` stopped raising at display time (§5's named defect — service codes and unknown
+codes now render instead of 500ing). What remains: steps 8-remainder (the production evaluators'
+consult of the reader is IN the routes; the §12 programme), 9 (evaluation programmes + corpus —
+migrations renumber past the peer's 1115/1116), 10 (journey tests + legacy deletion), and all
+operator work.
 
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`

@@ -143,6 +143,11 @@ def test_THE_SIX_ROUTES_ARE_REGISTERED(monkeypatch):
         "/feature-execution/verifications/{execution_hash}",
         "/feature-execution/{artifact_id}/code",
         "/feature-execution/{artifact_id}/verify-eligibility",
+        # Step 7 (§9): the two PRODUCTION acts — real endpoints that refuse honestly under the
+        # development policy — and the pointer read ("what is actually out there right now").
+        "/feature-execution/production-materializations",
+        "/feature-execution/production-publications",
+        "/feature-execution/production-active",
     }
 
 

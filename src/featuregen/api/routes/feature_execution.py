@@ -109,15 +109,39 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 
 
-def _explained(blockers: tuple[str, ...]) -> list[dict[str, str]]:
-    """Each blocker with the reason the disposition table gives it.
+#: Service-level codes with served sentences — they live in the decision service, not the
+#: evaluator table, so the display layer explains them here rather than crashing on them.
+_SERVICE_CODE_WORDS: dict[str, str] = {
+    "ACTION_UNAVAILABLE": "this act is not available under the development policy (§0.1.0): "
+                          "production acts open with production governance, not by absence of "
+                          "a rule",
+    "ACTION_AUTHORIZATION_MISSING": "the act references no recorded authorization",
+    "ACTION_AUTHORIZATION_NOT_FOR_THIS_ACT": "the named authorization covers a different act "
+                                             "or resource",
+    "ACTION_AUTHORIZATION_REFUSED": "the recorded authorization was refused",
+}
 
-    Read from that table rather than restated here, so the workspace and a corpus report explain a
-    code the same way. A code with no disposition raises through the lookup — an unexplained code on
-    a screen is how a blocker stops being understood.
+
+def _explained(blockers: tuple[str, ...]) -> list[dict[str, str]]:
+    """Each blocker with the reason its OWN layer gives it.
+
+    Read from the evaluator disposition table where the code lives there, from the service
+    vocabulary where it lives in the decision service — and NEVER a raise: §5 names the old
+    behaviour (an unknown code raising through this function at DISPLAY time) as the wrong layer
+    and the wrong moment. The build already ran; the screen's job is to say so, and a code this
+    function cannot explain renders its de-underscored words with the code beside it rather than
+    a 500 in place of an answer.
     """
-    return [{"code": code, "reason": ACTIVATION_BLOCKER_DISPOSITIONS[code][1]}
-            for code in blockers]
+    explained: list[dict[str, str]] = []
+    for code in blockers:
+        if code in ACTIVATION_BLOCKER_DISPOSITIONS:
+            reason = ACTIVATION_BLOCKER_DISPOSITIONS[code][1]
+        elif code in _SERVICE_CODE_WORDS:
+            reason = _SERVICE_CODE_WORDS[code]
+        else:
+            reason = code.lower().replace("_", " ")
+        explained.append({"code": code, "reason": reason})
+    return explained
 
 
 # ── generate ─────────────────────────────────────────────────────────────────────────────────────
@@ -588,3 +612,206 @@ def _now(conn: psycopg.Connection) -> str:
     when something started — and so a test can freeze it in one place.
     """
     return str(conn.execute("SELECT now()").fetchone()[0])
+
+
+# ══ §9 — the two PRODUCTION acts: real endpoints, refusing honestly from day one ═════════════════
+# Both flows exist end-to-end; §0.1.0 keeps both ACTIONS unavailable, so today every request ends
+# at the decision service's refusal — which is the point: an evaluator nothing calls is a
+# description of a gate, and these are the callers. The day the owner opens the policy, the same
+# code records the attempt, binds the certificates per member, and enqueues — nothing here needs
+# rewriting to go live, only permitting.
+
+class ProductionMaterializationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sealed_artifact_id: str = Field(min_length=1)
+    environment_id: str = Field(min_length=1)
+    logical_group_name: str = Field(min_length=1)
+    target_ref: str | None = None
+
+
+class ProductionPublicationIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # ▲ The MATERIALIZATION ATTEMPT, never an output id — §9.1: an output id is the single most
+    # valuable thing in this system to forge, because it is exactly the difference between
+    # publishing the values that were certified and publishing some others. The server resolves
+    # the attempt's output through the composite FK's parent.
+    materialization_attempt_id: str = Field(min_length=1)
+
+
+def _production_ask(conn, *, action, resource_identity_hash: str, sealed_artifact_id: str):
+    """The §7 preflight for a production act: member facts from the certificate reader, folded
+    through the one decision service — the same fold a real decision will run."""
+    from featuregen.materialize.action_decision import ActionRequestV1, ask
+    from featuregen.materialize.method_certificates import member_certificate_facts
+
+    facts = member_certificate_facts(conn, sealed_artifact_id=sealed_artifact_id)
+    decision = ask(conn, ActionRequestV1(
+        action=action,
+        resource_identity_hash=resource_identity_hash,
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}))
+    return decision, facts
+
+
+@router.post("/feature-execution/production-materializations", status_code=202)
+def request_production_materialization(
+    body: ProductionMaterializationIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """MATERIALIZE_PRODUCTION — gate, attempt record, certificate bindings, queue. In that order.
+
+    Today the gate refuses (`ACTION_UNAVAILABLE` under the development policy) and the response
+    carries the FULL per-member answer — which certificates are missing, which identities were
+    never recorded — so "how far is this feature from production" is readable before production
+    exists (§21's measurement, served rather than estimated).
+    """
+    from featuregen.materialize.action_authorization import ActionV1
+
+    decision, facts = _production_ask(
+        conn, action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        sealed_artifact_id=body.sealed_artifact_id)
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": ("ACTION_UNAVAILABLE" if "ACTION_UNAVAILABLE" in decision.blockers
+                     else "ACTION_REFUSED"),
+            "blockers": _explained(tuple(decision.blockers)),
+            "per_member": [
+                {"member_name": v.member_name, "allowed": v.allowed,
+                 "blockers": _explained(tuple(v.blockers))}
+                for v in decision.per_member],
+            "detail": ("production materialization is not available under the development "
+                       "policy (§0.1.0); the per-member answer above is what would gate it "
+                       "once it is" if "ACTION_UNAVAILABLE" in decision.blockers else
+                       "the decision refused; nothing was recorded")})
+
+    # ── FROM HERE DOWN runs the day the policy opens — the same request, permitted. ─────────────
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.materialize.action_authorization import authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.production_attempt_store import (
+        record_materialization_attempt,
+    )
+
+    authorization = authorize_action(
+        conn, action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        actor_subject=identity.subject, environment_id=body.environment_id)
+    decision_id, decided = decide(conn, ActionRequestV1(
+        action=ActionV1.MATERIALIZE_PRODUCTION,
+        resource_identity_hash=body.sealed_artifact_id,
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}),
+        authorization_id=authorization.authorization_id)
+    attempt_id, created = record_materialization_attempt(
+        conn, attempt_id=mint_id("pma"), sealed_artifact_id=body.sealed_artifact_id,
+        environment_id=body.environment_id, logical_group_name=body.logical_group_name,
+        action_decision_revision_id=decision_id, requested_by=identity.subject,
+        requested_at=_now(conn), target_ref=body.target_ref)
+    if created:
+        # ▲ The certificate BINDINGS, stored on the attempt at decision time (§10.3): publication
+        # COMPARES against these rows — a verdict re-derived later must never quietly replace
+        # what was decided here.
+        for member_name, member in facts.items():
+            certificate = member.get("certificate")
+            if certificate is not None:
+                conn.execute(
+                    "INSERT INTO production_attempt_member_certificate (attempt_id, "
+                    "member_name, certificate_kind, certificate_revision_id, "
+                    "subject_identity_kind, subject_identity_hash, method_artifact_id) "
+                    "VALUES (%s, %s, 'AUTHORING_METHOD', %s, 'AUTHORING_METHOD', %s, %s)",
+                    (attempt_id, member_name, certificate.certificate_revision_id,
+                     member["method_identity_hash"], body.sealed_artifact_id))
+    return {"attempt_id": attempt_id, "created": created,
+            "detail": "the production materialization was recorded; the worker drives it"}
+
+
+@router.post("/feature-execution/production-publications", status_code=202)
+def request_production_publication(
+    body: ProductionPublicationIn, conn: _Conn, identity: _Identity,
+) -> dict[str, Any]:
+    """PUBLISH_PRODUCTION — the act whose partial failure is visible to the bank, so its machine
+    was written first (spec §1) and its output is SERVER-RESOLVED from the named attempt."""
+    from featuregen.materialize.action_authorization import ActionV1
+    from featuregen.overlay.upload.production_attempt_store import (
+        MaterializationStatusV1,
+        read_materialization,
+    )
+
+    materialization = read_materialization(conn, body.materialization_attempt_id)
+    if materialization is None:
+        raise HTTPException(status_code=404, detail=f"no production materialization "
+                            f"{body.materialization_attempt_id!r}")
+    if materialization["status"] is not MaterializationStatusV1.SUCCEEDED:
+        raise HTTPException(status_code=409, detail={
+            "code": "MATERIALIZATION_NOT_SUCCEEDED",
+            "status": materialization["status"].value,
+            "detail": "publication publishes what a SUCCEEDED materialization produced; this "
+                      "one has not"})
+    output = conn.execute(
+        "SELECT output_revision_id FROM materialized_output_revision WHERE attempt_id = %s",
+        (body.materialization_attempt_id,)).fetchone()
+    if output is None:
+        raise HTTPException(status_code=409, detail={
+            "code": "OUTPUT_REVISION_MISSING",
+            "detail": "the materialization succeeded but recorded no output identity — a "
+                      "platform inconsistency; nothing can be published from it"})
+
+    decision, facts = _production_ask(
+        conn, action=ActionV1.PUBLISH_PRODUCTION,
+        resource_identity_hash=output[0],
+        sealed_artifact_id=materialization["sealed_artifact_id"])
+    if not decision.allowed:
+        raise HTTPException(status_code=409, detail={
+            "code": ("ACTION_UNAVAILABLE" if "ACTION_UNAVAILABLE" in decision.blockers
+                     else "ACTION_REFUSED"),
+            "blockers": _explained(tuple(decision.blockers)),
+            "detail": ("production publication is not available under the development policy "
+                       "(§0.1.0)" if "ACTION_UNAVAILABLE" in decision.blockers else
+                       "the decision refused; nothing was recorded")})
+
+    from featuregen.aggregates.ids import mint_id
+    from featuregen.materialize.action_authorization import authorize_action
+    from featuregen.materialize.action_decision import ActionRequestV1, decide
+    from featuregen.overlay.upload.production_attempt_store import (
+        record_publication_attempt,
+    )
+
+    authorization = authorize_action(
+        conn, action=ActionV1.PUBLISH_PRODUCTION, resource_identity_hash=output[0],
+        actor_subject=identity.subject, environment_id=materialization["environment_id"])
+    decision_id, _decided = decide(conn, ActionRequestV1(
+        action=ActionV1.PUBLISH_PRODUCTION, resource_identity_hash=output[0],
+        member_names=tuple(facts),
+        member_blockers={name: tuple(f["blockers"])
+                         for name, f in facts.items() if f["blockers"]}),
+        authorization_id=authorization.authorization_id)
+    attempt_id, created = record_publication_attempt(
+        conn, attempt_id=mint_id("ppa"),
+        materialization_attempt_id=body.materialization_attempt_id,
+        output_revision_id=output[0],
+        environment_id=materialization["environment_id"],
+        logical_group_name=materialization["logical_group_name"],
+        action_decision_revision_id=decision_id, requested_by=identity.subject,
+        requested_at=_now(conn))
+    return {"attempt_id": attempt_id, "created": created,
+            "detail": "the production publication was recorded; the worker drives it"}
+
+
+@router.get("/feature-execution/production-active")
+def production_active(
+    environment_id: str, logical_group_name: str, conn: _Conn,
+) -> dict[str, Any]:
+    """"What is actually out there right now" — §9.1's question, answered by the pointer read.
+
+    ``active: null`` is the honest answer for a group nothing has ever published — and today, for
+    every group, since the acts are unavailable. Never an invented revision.
+    """
+    from featuregen.overlay.upload.production_attempt_store import current_active_revision
+
+    return {"environment_id": environment_id, "logical_group_name": logical_group_name,
+            "active": current_active_revision(
+                conn, environment_id=environment_id, logical_group_name=logical_group_name)}

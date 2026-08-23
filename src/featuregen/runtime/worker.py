@@ -653,6 +653,27 @@ def run_worker_once(
 
     code_generation_processed = _stage("code_generation")(_code_generation_jobs, 0)
 
+    def _production_reconcile() -> int:
+        # §15.1 for the step-7 tables — gated on the ACTIONS being available, not on a new flag:
+        # while §0.1.0 keeps both production acts unavailable, no row can exist to reconcile, and
+        # a sweep over provably-empty tables would tax every tick of every deployment (the
+        # byte-identity rule test_materialization_flag enforces). The day the owner opens the
+        # policy, this stage starts sweeping in the same deploy — no operator step to remember.
+        from featuregen.materialize.action_authorization import ActionV1, action_available
+        from featuregen.materialize.production_reconcile import (
+            reconcile_unknown_materializations,
+            sweep_publication_pointer_invariant,
+        )
+        from featuregen.materialize.queue_lane import materialization_enabled
+
+        if not (materialization_enabled() and action_available(ActionV1.MATERIALIZE_PRODUCTION)):
+            return 0
+        tallies = reconcile_unknown_materializations(conn)
+        sweep_publication_pointer_invariant(conn)
+        return sum(v for k, v in tallies.items() if k != "held")
+
+    production_reconciled = _stage("production_reconcile")(_production_reconcile, 0)
+
     def _dispatch_external() -> int:
         # External commands own their OWN transactions (claim + call + finalize each commit), so
         # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).
