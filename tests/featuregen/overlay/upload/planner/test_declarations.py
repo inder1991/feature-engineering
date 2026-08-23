@@ -426,6 +426,27 @@ def test_temporal_anchor_catalog_is_absent_when_no_anchor_is_bound():
     assert out.reason_codes == (c.ReasonCode.temporal_anchor_missing,)
 
 
+def test_anchor_catalog_source_is_not_contract_identity_material():
+    """S1A-4a, closing a hole the literal pins cannot: the pinned plan in `test_plan.py` binds NO
+    temporal anchor, so its `anchor_catalog_source` is "" and that pin alone says nothing about a
+    plan that HAS one. Prove it directly — two plans identical but for the qualifying catalog on a
+    genuinely bound anchor mint the SAME contract_id."""
+    plan = _plan(
+        bindings=(_binding("entity", "public.accounts.account_id",
+                           join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),),
+        segments=())
+    at = _NOW
+    ops = dataclasses.replace(plan, temporal_declaration=dataclasses.replace(
+        _temporal_anchored("public.transactions.business_dt"), anchor_catalog_source="ops"))
+    rev = dataclasses.replace(plan, temporal_declaration=dataclasses.replace(
+        _temporal_anchored("public.transactions.business_dt"), anchor_catalog_source="rev"))
+    assert ops.temporal_declaration.anchor_catalog_source == "ops"      # non-vacuous
+    assert rev.temporal_declaration.anchor_catalog_source == "rev"
+    assert c.make_contract_id(ops, resolved_at_compilation=at) == \
+        c.make_contract_id(rev, resolved_at_compilation=at)
+    assert ops.physical_plan_id == rev.physical_plan_id
+
+
 def test_temporal_bitemporal_interval_is_valid_not_ambiguous():
     # valid_from + valid_to TOGETHER describe one validity interval (F17) — never flagged
     # ambiguous merely because two temporal roles are present. Neither is a primary PIT anchor.

@@ -192,11 +192,26 @@ _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 #                        binding the ref was chosen from. The ambiguity decision is still taken
 #                        over the distinct REFS, so no declaration outcome moves.
 #
-# Not a shadow-engine perturbation and not a single-source perturbation either: `output_grain_ref`
-# is emitted only on a source_to_target_resolved path, which single-source `plan_bindings` never
-# produces, and the temporal change is a pure widening of what is RECORDED about a choice that is
-# made identically. Both are proved identity-neutral by the pre-change literal pins in
-# `test_plan.py::test_new_plan_facts_move_no_identity`, and proof 2 (RUNTIME) still passes.
+# Neither is a shadow-engine perturbation. State the basis precisely, because the obvious argument
+# is FALSE: it is NOT true that these fields only appear on cross-catalog plans. A single-catalog
+# run whose recipe rolls transaction -> account INSIDE one catalog produces a
+# source_to_target_resolved plan with a populated `output_grain_ref`
+# (`test_plan.py::test_zero_bridge_rollup_output_grain_is_its_own_catalog` is exactly that, with one
+# seeded catalog), and that same plan compiles, so `anchor_catalog_source` is reachable
+# single-source too. The real basis is narrower and checkable:
+#
+#   * NEITHER FIELD IS IDENTITY MATERIAL. `output_grain_ref` enters no hash and no persisted payload
+#     anywhere in the tree (audited: `fingerprint.contract_input_hash` / `planner_input_hash` /
+#     `declarations_output_hash`, `shadow_capture`'s row + declarations payload, `PlanEnvelopeV1`,
+#     `plan_dependency_pins`, gate1's governed trace — every one is an EXPLICIT projection).
+#     `make_binding_plan`'s material excludes both, pinned by pre-change literals in
+#     `test_plan.py::test_new_plan_facts_move_no_identity`.
+#   * `anchor_catalog_source` is the ONE exception and is disclosed, not hidden: it rides inside
+#     `dataclasses.asdict(plan.temporal_declaration)`, so it does enter `declarations_output_hash`
+#     and the `planner_shadow_plan_observation.declarations` payload — a shadow-lane OUTPUT
+#     stability signal, keyed on by nothing, and a one-time shift.
+#   * Neither field appears in any value proof 2 (RUNTIME) compares, and proof 2 still passes.
+#   * No production caller reads either field yet.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
         "_grain_key_ref", "assemble_paths",
@@ -413,8 +428,14 @@ def test_contracts_file_branch_diff_is_additive_only():
         if line not in allowed_version_source_move | allowed_shared_material_extraction
     ]
     assert not removed, (
-        f"NEUTRALITY VIOLATION: {_CONTRACTS_FILE} removed or changed an existing line — this "
-        "branch may only APPEND new MULTISOURCE_*/MAX_* constants to it (design §12). "
+        f"NEUTRALITY VIOLATION: {_CONTRACTS_FILE} removed or changed an existing line that no "
+        "exception covers. This branch may only APPEND to it (design §12), plus exactly two "
+        "reviewed exceptions, each an EXACT-LINE allow-set defined in this test: "
+        "`allowed_version_source_move` (three released input versions centralized into "
+        "taxonomy.versions) and `allowed_shared_material_extraction` (S1A-4a: the physical-id "
+        "material moved into `_physical_plan_material` so `make_binding_plan` and "
+        "`full_physical_plan_hash` cannot drift apart). Anything else is an escalation — add a "
+        "line to an allow-set only with an owner-directed reason, never to make this pass. "
         f"Removed/changed lines:\n" + "\n".join(removed))
     # Sanity when this test is run on the original A branch: the branch appended the capability
     # constant. On a later integration branch the merge base may already contain A, in which case

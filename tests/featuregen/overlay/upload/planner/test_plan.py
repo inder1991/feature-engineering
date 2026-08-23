@@ -12,6 +12,7 @@ from featuregen.overlay.upload.planner.contracts import (
     PathResolutionStatus,
     PlanResolutionStatus,
     ReplayStrength,
+    full_physical_plan_hash,
 )
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
@@ -357,8 +358,6 @@ def test_no_compile_ctx_leaves_every_plan_not_compiled(db):
 # from ONE shared material builder so the two can never drift apart.
 # ---------------------------------------------------------------------------------------------
 
-from featuregen.overlay.upload.planner.contracts import full_physical_plan_hash
-
 # Identity pins captured on the PRE-change checkout (task S1A-4a), by running the `_c8_fixture`
 # compile flow below before `output_grain_ref` / `anchor_catalog_source` existed. Both new fields
 # are non-identity-bearing: neither may move a physical plan id or a contract id.
@@ -439,6 +438,14 @@ def test_new_plan_facts_move_no_identity(db):
     (cross,) = _cross(result)
     assert cross.physical_plan_id == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID
     assert cross.contract_id == _PINNED_C8_CROSS_CONTRACT_ID
-    # ...and the un-hashed facts ARE populated on that very plan (a vacuous pin would prove nothing)
+    # ...and the un-hashed fact IS populated on that very plan (a vacuous pin would prove nothing)
     assert cross.output_grain_ref == ("rev", "public.accounts.account_id")
     assert full_physical_plan_hash(cross)[:16] == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID[len("bp_"):]
+    # The temporal half of this pin is deliberately NOT claimed here: `_txn_template` declares no
+    # temporal need, so this plan binds no anchor and `anchor_catalog_source` is "". Stating that
+    # plainly rather than implying the contract_id pin covers a populated anchor — the populated
+    # case is proved directly by
+    # `test_declarations.py::test_anchor_catalog_source_is_not_contract_identity_material`.
+    assert cross.temporal_declaration is not None
+    assert cross.temporal_declaration.anchor_binding is None
+    assert cross.temporal_declaration.anchor_catalog_source == ""
