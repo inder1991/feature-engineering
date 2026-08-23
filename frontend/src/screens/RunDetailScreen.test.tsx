@@ -436,3 +436,108 @@ it('states WHICH choices carry a formula, and leaves HOW MANY to the rail', asyn
   expect(within(rowOf('BIND_SELECTIONS')).getByText('2 of 5 bound — accumulating'))
     .toBeInTheDocument()
 })
+
+// ── review fixes: the quote describes a SET, and an answer belongs to the run it asked about ─────
+const THREE_CHOSEN: api.FeatureRunDetail = {
+  ...DETAIL,
+  milestones: {
+    ...DETAIL.milestones,
+    choose_candidates: [
+      { option_id: 'o2', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:01+00:00' },
+      { option_id: 'o3', considered_revision_id: 'c', chosen_at: '2026-08-23T00:00:02+00:00' },
+    ],
+  },
+}
+
+it('retires a cost quote the moment the set it described changes', async () => {
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  prepareRunCode.mockRejectedValueOnce(new api.ApiError(
+    409, 'confirm the ceiling', null, 'COST_AUTHORIZATION_MISSING',
+    { code: 'COST_AUTHORIZATION_MISSING', llm_members: 1, estimated_provider_calls: 45 }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+
+  // Quote ONE candidate, and confirm the ceiling it quoted.
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  await waitFor(() => expect(screen.getByText(/up to 45 provider calls/)).toBeInTheDocument())
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), '200000')
+  await userEvent.type(screen.getByLabelText(/Cost ceiling/), '12.50')
+
+  // ...then add a second candidate. The quote was for ONE draft; sending it now would have the
+  // person authorize 45 calls for work the server never quoted at 45.
+  prepareRunCode.mockRejectedValueOnce(new api.ApiError(
+    409, 'confirm the ceiling', null, 'COST_AUTHORIZATION_MISSING',
+    { code: 'COST_AUTHORIZATION_MISSING', llm_members: 2, estimated_provider_calls: 90 }))
+  await userEvent.click(screen.getByRole('checkbox', { name: /o3/ }))
+  expect(screen.queryByText(/up to 45 provider calls/)).toBeNull()
+  expect(screen.getByRole('button', { name: /records a code-generation job/ })).toBeInTheDocument()
+
+  // The next click RE-ASKS, and the ceiling that goes out is the one quoted for the new set.
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  await waitFor(() => expect(screen.getByText(/up to 90 provider calls/)).toBeInTheDocument())
+  prepareRunCode.mockResolvedValue({
+    job_id: 'cgj-2', created: true, declaration_source_job_id: 'cgj-old',
+    detail: 'recorded', run: THREE_CHOSEN,
+  })
+  await userEvent.click(screen.getByRole('button', { name: /cost ceiling/ }))
+  await waitFor(() => expect(prepareRunCode).toHaveBeenCalledTimes(3))
+  expect(prepareRunCode.mock.calls[2][1]).toMatchObject({
+    option_ids: ['o2', 'o3'], spend_approval: { max_calls: 90 },
+  })
+})
+
+it('refuses to confirm a ceiling that is not a number', async () => {
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  prepareRunCode.mockRejectedValue(new api.ApiError(
+    409, 'confirm the ceiling', null, 'COST_AUTHORIZATION_MISSING',
+    { code: 'COST_AUTHORIZATION_MISSING', llm_members: 1, estimated_provider_calls: 45 }))
+  render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+  await waitFor(() => expect(screen.getByText(/up to 45 provider calls/)).toBeInTheDocument())
+
+  await userEvent.type(screen.getByLabelText(/Cost ceiling/), '12.50')
+  // Free text: `Number('twelve')` is NaN, NaN serialises to `null`, and the server answers a raw
+  // 422 about a missing field instead of the number the person thought they had set.
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), 'twelve')
+  expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeDisabled()
+  // Zero is the same refusal for the same reason: a ceiling of nothing authorizes nothing.
+  await userEvent.clear(screen.getByLabelText(/Token ceiling/))
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), '0')
+  expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeDisabled()
+
+  await userEvent.clear(screen.getByLabelText(/Token ceiling/))
+  await userEvent.type(screen.getByLabelText(/Token ceiling/), '200000')
+  expect(screen.getByRole('button', { name: /cost ceiling/ })).toBeEnabled()
+})
+
+it('never lands a prepare answer under a run the screen has since moved to', async () => {
+  getFeatureRunDetail.mockResolvedValue(THREE_CHOSEN)
+  let land: (v: unknown) => void = () => {}
+  prepareRunCode.mockImplementation(() => new Promise(resolve => { land = resolve }) as never)
+  const { rerender } = render(<RunDetailScreen runId={RUN_ID} />)
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: /o2/ })).toBeInTheDocument())
+  await userEvent.click(screen.getByRole('checkbox', { name: /o2/ }))
+  await userEvent.click(screen.getByRole('button', { name: /Prepare formulas/ }))
+
+  // App does not key this screen, so a deep link to another run changes the prop under the
+  // in-flight request.
+  getFeatureRunDetail.mockResolvedValue({ ...DETAIL, generation_run_id: 'grun_other' })
+  rerender(<RunDetailScreen runId="grun_other" />)
+  await waitFor(() => expect(getFeatureRunDetail).toHaveBeenCalledWith('grun_other'))
+
+  land({
+    job_id: 'cgj-stale', created: true, declaration_source_job_id: 'cgj-old',
+    detail: 'recorded',
+    run: { ...THREE_CHOSEN, jobs: [{ job_id: 'cgj-stale', status: 'REQUESTED',
+      requested_at: '2026-08-23T01:00:00+00:00', actions: [] }] },
+  })
+
+  // The previous run's record — and the job it just minted — must not appear under this address.
+  await waitFor(() => expect(screen.getByText(/No code-generation job has been requested/))
+    .toBeInTheDocument())
+  expect(screen.queryByText('cgj-stale')).toBeNull()
+  expect(screen.queryByTestId('prepare-status')).toBeNull()
+})

@@ -34,7 +34,7 @@
 //
 // **HONEST ABSENCE.** A pre-spine run has no identity record, an unnamed run has no name, and a
 // run with no chosen candidates has no milestones. Each says so; none is filled in.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ApiError,
   type FeatureRunDetail,
@@ -126,9 +126,15 @@ export function RunDetailScreen({ runId }: { runId: string }) {
   const [maxCost, setMaxCost] = useState('')
   const [prepareError, setPrepareError] = useState('')
   const [prepareNotice, setPrepareNotice] = useState('')
+  // WHICH run this screen is pointed at RIGHT NOW. The load effect guards itself with a local
+  // `live` flag, but the POST needs the same protection and cannot use it: its promise outlives the
+  // effect that started none of it. A prepare answer landing after a run -> run deep link would put
+  // the previous run's record — and its jobs — under the new address.
+  const pointedAt = useRef(runId)
 
   useEffect(() => {
     let live = true
+    pointedAt.current = runId
     // App does not key this screen, so a run -> run deep link changes the prop in place: clear the
     // previous run first, or its record would stand under the new address until the fetch lands.
     setRun(null)
@@ -195,6 +201,9 @@ export function RunDetailScreen({ runId }: { runId: string }) {
         : {}),
     }).then(
       response => {
+        // The answer belongs to the run it was asked ABOUT, not to whichever run this screen is
+        // showing when it lands — the load effect's `live` rule, for the write.
+        if (pointedAt.current !== runId) return
         // The run comes back READ from the store, so the jobs list below is the store's and not a
         // patch of this screen's own making.
         setRun(response.run)
@@ -204,6 +213,7 @@ export function RunDetailScreen({ runId }: { runId: string }) {
           + `${response.declaration_source_job_id})`)
       },
       err => {
+        if (pointedAt.current !== runId) return
         const asked = costQuote(err)
         if (asked) setQuote(asked)
         // The server's sentence, verbatim — this screen owns no vocabulary for a refusal.
@@ -429,10 +439,17 @@ export function RunDetailScreen({ runId }: { runId: string }) {
                   type="checkbox"
                   checked={picked.includes(candidate.option_id)}
                   disabled={!run.prepare_code.available || busy}
-                  onChange={() => setPicked(current =>
-                    current.includes(candidate.option_id)
-                      ? current.filter(o => o !== candidate.option_id)
-                      : [...current, candidate.option_id])}
+                  onChange={() => {
+                    // ▲ THE QUOTE DESCRIBES A SET, so changing the set retires it. A ceiling
+                    // confirmed for two candidates would otherwise be sent as the ceiling for
+                    // three — the person would be agreeing to a number the server never quoted
+                    // for the work it is about to authorize. The next click re-asks.
+                    setQuote(null)
+                    setPicked(current =>
+                      current.includes(candidate.option_id)
+                        ? current.filter(o => o !== candidate.option_id)
+                        : [...current, candidate.option_id])
+                  }}
                 />
                 {' '}
                 <span className="mono">{candidate.option_id}</span>
@@ -471,8 +488,12 @@ export function RunDetailScreen({ runId }: { runId: string }) {
       <button
         type="button"
         className="btn"
+        // `Number(maxTokens) > 0` is ONE guard covering empty, non-numeric and zero: the field is
+        // free text, `Number('twelve')` is NaN, and NaN serialises to `null` — which the server
+        // refuses as a raw 422 about a missing field rather than the number the person typed. A
+        // trim check alone let that through.
         disabled={!run.prepare_code.available || picked.length === 0 || busy
-          || (quote !== null && (!maxTokens.trim() || !maxCost.trim()))}
+          || (quote !== null && (!(Number(maxTokens) > 0) || !maxCost.trim()))}
         onClick={() => prepare(quote !== null)}
       >
         {quote === null
