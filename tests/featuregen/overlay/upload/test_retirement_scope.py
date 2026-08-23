@@ -27,6 +27,17 @@ CANDIDATE = dict(
     catalog_snapshot_hash="h-snap", definition_revision="rev-1")
 
 
+@pytest.fixture(autouse=True)
+def _considered_revision_exists(db):
+    """Migration 1116 makes `formula_draft.considered_revision_id` a real foreign key, so the one
+    revision every draft in this file names has to exist. Seeding only — nothing here asserts on
+    the chain, and no test in this file commits, so the rolled-back fixture needs no teardown
+    (the committed-test variant lives in test_formula_draft_retirement.py)."""
+    from tests.featuregen.runs._chain import seed_run_chain
+
+    seed_run_chain(db, run_id="rs", considered_revision_id="crev-1")
+
+
 def _request(conn, *, draft_id="fd-1", config="cfg-1", **over):
     facts = {**CANDIDATE, **over}
     return request_draft(
