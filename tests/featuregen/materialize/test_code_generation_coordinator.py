@@ -102,7 +102,7 @@ def test_REQUESTED_requests_every_draft_through_the_ONE_service(db, monkeypatch)
     job_id = _job(db, "req")
     requested: list[tuple[str, str]] = []
 
-    def fake(conn, *, revision_id, option_id, formula_draft_id, requested_by, now):
+    def fake(conn, *, revision_id, option_id, formula_draft_id, requested_by, now, **kwargs):
         requested.append((option_id, requested_by))
         position = int(option_id.split("-")[1])
         return _FakeRequested(_seed_draft(conn, job_id, position))
@@ -134,7 +134,7 @@ def test_MEMBER_REFUSALS_BLOCK_THE_JOB_with_one_complete_answer(db, monkeypatch)
 
     job_id = _job(db, "blk")
 
-    def fake(conn, *, revision_id, option_id, formula_draft_id, requested_by, now):
+    def fake(conn, *, revision_id, option_id, formula_draft_id, requested_by, now, **kwargs):
         raise RetiredAtRequest(
             "retired", candidate=FrozenCandidateV1(revision_id, None, "s", "p", "d"),
             config_hash="cfg")
@@ -156,7 +156,7 @@ def test_AUTHORING_waits_on_DURABLE_draft_states_then_advances(db, monkeypatch):
     job_id = _job(db, "wait")
     monkeypatch.setattr(
         formula_draft_service, "request_draft_for_candidate",
-        lambda conn, *, revision_id, option_id, formula_draft_id, requested_by, now:
+        lambda conn, *, revision_id, option_id, formula_draft_id, requested_by, now, **kw:
         _FakeRequested(_seed_draft(conn, job_id, int(option_id.split("-")[1]))))
     process_code_generation_once(db, worker_id="w1")
     assert read_job(db, job_id).status is JobStatusV1.AUTHORING
@@ -185,7 +185,7 @@ def test_a_BLOCKED_draft_blocks_its_member_with_the_drafts_own_blockers(db, monk
     job_id = _job(db, "dblk", n_members=1)
     monkeypatch.setattr(
         formula_draft_service, "request_draft_for_candidate",
-        lambda conn, *, revision_id, option_id, formula_draft_id, requested_by, now:
+        lambda conn, *, revision_id, option_id, formula_draft_id, requested_by, now, **kw:
         _FakeRequested(_seed_draft(conn, job_id, 0)))
     process_code_generation_once(db, worker_id="w1")
 
@@ -334,3 +334,67 @@ def test_A_COORDINATOR_CRASH_FAILS_THE_JOB_with_the_posture_named(db, monkeypatc
     assert job.status is JobStatusV1.FAILED
     assert job.terminal_detail["failure"] == "coordinator crash"
     assert "provider registry exploded" in job.terminal_detail["traceback"]
+
+
+# ══ §11.2 — the spend thread: ceiling → plan row → per-call binding ═════════════════════════════
+def test_THE_JOBS_CEILING_RIDES_EVERY_MEMBERS_PLAN_ROW(db):
+    """Through the REAL service: the coordinator resolves the recorded ceiling once and every
+    LLM member's authoring plan carries it to the worker's dispatch seam."""
+    from tests.featuregen.api.routes.test_formula_drafts import _revision
+
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+
+    tag = "spendthread"
+    revision = _revision(db, revision_id=f"crev-{tag}", snapshot_id=f"snap-{tag}")
+    db.execute(
+        "INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
+        "VALUES (%s,'int-1','exploration','h') ON CONFLICT DO NOTHING", (f"trr-{tag}",))
+    selection = f"sel-{tag}"
+    db.execute(
+        "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
+        "considered_revision_id, option_id, decision_id, planning_request_hash, "
+        "binding_plan_hash, content_hash) VALUES (%s,%s,%s,'opt-a',%s,'sha256:ask',"
+        "'sha256:plan',%s)",
+        (selection, f"trr-{tag}", revision, f"dec-{selection}", f"ch-{selection}"))
+    declaration = build_set_declaration()
+    job_id, _ = create_job(
+        db, job_id=f"cgj-{tag}", considered_revision_id=revision,
+        target_reading_revision_id=f"trr-{tag}", environment_id="hdfc-local",
+        logical_group_name=f"grp-{tag}", declaration=encode_declaration(declaration),
+        declaration_identity=declaration_identity(declaration),
+        execution_parameters=_PARAMS,
+        members=(JobMemberSpecV1(position=0, selection_revision_id=selection,
+                                 considered_revision_id=revision, option_id="opt-a",
+                                 formula_strategy="LLM_AUTHORED"),),
+        requested_by="user:sam", requested_at="2026-08-23T00:00:00Z")
+    identity = db.execute(
+        "SELECT content_identity_hash FROM code_generation_job WHERE job_id = %s",
+        (job_id,)).fetchone()[0]
+    spend_id = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:sam", job_identity=identity,
+        member_identities=[selection], provider_contract_hash="sha256:contract",
+        max_calls=5, max_tokens=100_000, currency="USD", max_cost="10.00",
+        pricing_version="p@1", expires_at="2026-12-31T00:00:00Z")
+
+    process_code_generation_once(db, worker_id="w1")   # REAL service — no fakes
+
+    member = read_members(db, job_id)[0]
+    assert member.member_state is MemberStateV1.AUTHORING
+    plan = db.execute(
+        "SELECT llm_spend_authorization_id FROM formula_draft_authoring_plan "
+        "WHERE formula_draft_id = %s", (member.formula_draft_id,)).fetchone()
+    assert plan == (spend_id,), "the ceiling rides the PLAN to the dispatch seam"
+
+    # And the worker-side binding derives the approval's OWN per-call arithmetic.
+    from featuregen.overlay.upload.formula_draft_worker import _spend_binding_for
+
+    binding = _spend_binding_for(db, member.formula_draft_id)
+    assert binding.spend_authorization_id == spend_id
+    assert binding.call_tokens == 20_000          # ceil(100000 / 5)
+    assert str(binding.call_cost) == "2.00"       # 10.00 / 5, Decimal arithmetic
+
+
+def test_a_draft_with_no_ceiling_binds_NOTHING(db):
+    from featuregen.overlay.upload.formula_draft_worker import _spend_binding_for
+
+    assert _spend_binding_for(db, "fd-none") is None

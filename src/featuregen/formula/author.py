@@ -289,6 +289,7 @@ def author_formula(
     lease_fence: LeaseFence | None = None,
     resume_turns: Sequence[dict] = (),
     turn_contract: AuthorTurnContract = AUTHOR_TURN_CONTRACT_V1,
+    spend=None,
 ) -> tuple[dict | None, list[AuthorTurnRecord]]:
     """Author one TypedFormula proposal via a bounded sequential-turn loop.
 
@@ -394,7 +395,8 @@ def author_formula(
             schema_content_hash=(
                 provider_contract.schema_content_hash
                 if provider_contract is not None else None),
-            lease_fence=lease_fence)
+            lease_fence=lease_fence,
+            spend=spend)
         if progress_callback is not None:
             progress_callback()
         usage = dict(result.usage or {})

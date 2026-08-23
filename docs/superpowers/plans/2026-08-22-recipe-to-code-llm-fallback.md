@@ -870,8 +870,32 @@ its sealed member says `LLM_AUTHORED`.
 > **STATUS 2026-08-23: 5a DONE** — see the parent's execution-status block (§17) for the build
 > record; migration renumbered to **1111** at write time (1109/1110 were taken by the V1-companion
 > backfill and the verification substrate). The aggregate is a PREVIEW coordinator exactly as
-> §3.5 settled: terminal at `PREVIEW_READY`, links to what follows. Owed: the spend-thread wire
-> (the recorded §11.2 ceiling into the dispatch seam) and **5b**, below.
+> §3.5 settled: terminal at `PREVIEW_READY`, links to what follows.
+>
+> **The spend-thread is WIRED** (same day): the recorded ceiling rides
+> `formula_draft_authoring_plan.llm_spend_authorization_id` (1105's file) from the coordinator's
+> write to the worker, which derives the per-call worst case from the approval's OWN arithmetic
+> (`max_tokens/max_calls`, `max_cost/max_calls`) and threads a `SpendBindingV1` through
+> `run_authoring_v2_replay` → `author_formula`/`critique` → `audited_formula_call`, which folds
+> it into WHICHEVER dispatch context is in effect — so every physical call reserves at the seam
+> and exhaustion refuses BEFORE egress.
+>
+> **5b SHIPPED IN PART** (2026-08-23): `CodeGenerationWorkspaceScreen` (the SEVEN-stage journey —
+> sandbox execution and publication stay separate acts, linking to the execution workspace once
+> code is sealed; every word server-owned; warnings displayed; honest absence; cancel as the one
+> write) + `PrepareCodeGenerationAction` (plan-is-a-question → rail wording in per-selection
+> METHODS → cost confirmation exactly when an LLM member exists → the one explicit act) + api.ts
+> client, `#/code-generation` route behind `VITE_CODE_GENERATION` (mirroring the server switch),
+> Vite proxy + nginx prefixes (`/code-generation-jobs`, `/build-sets`), and item 7's fix — the
+> gold line on `SuggestionCard` is WARNING-shaped and names what it withholds (certification,
+> never the build). 15 new frontend tests; suite 1,051.
+>
+> ▲ **The HONEST GAP, stated rather than papered over**: items 1–3's decision-rail integration
+> has NO HOST SURFACE — no frontend screen lists `feature_selection_revision` rows today, so
+> there is nowhere to mount "Prepare formulas and code" against real selections. The component
+> is built and tested against the contract; it mounts wherever the selection surface lands.
+> Items 8–9 (clearing actions, conceptual-pattern affordances) ride existing screens and remain
+> open with it.
 
 **5a — the coordinator**
 

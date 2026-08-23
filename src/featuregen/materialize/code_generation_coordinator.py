@@ -105,13 +105,22 @@ def _plan_formulas(conn, job: CodeGenJobV1) -> None:
         request_draft_for_candidate,
     )
 
+    # §11.2 — the ceiling the write endpoint recorded for THIS job, if any: resolved once and
+    # handed to every member's draft request, so the plan rows carry it to the dispatch seam.
+    spend_row = conn.execute(
+        "SELECT spend_authorization_id FROM llm_spend_authorization_revision "
+        "WHERE job_identity = %s AND expires_at > now() "
+        "ORDER BY authorized_at DESC LIMIT 1", (job.content_identity_hash,)).fetchone()
+    spend_authorization_id = None if spend_row is None else spend_row[0]
+
     for member in read_members(conn, job.job_id):
         if member.member_state is not MemberStateV1.SELECTED:
             continue
         try:
             result = request_draft_for_candidate(
                 conn, revision_id=member.considered_revision_id, option_id=member.option_id,
-                formula_draft_id=mint_id("fd"), requested_by=job.requested_by, now=_now(conn))
+                formula_draft_id=mint_id("fd"), requested_by=job.requested_by, now=_now(conn),
+                spend_authorization_id=spend_authorization_id)
         except RetiredAtRequest:
             update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
                           blockers=["FORMULA_DRAFT_RETIRED"])

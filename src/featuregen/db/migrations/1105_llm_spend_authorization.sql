@@ -144,3 +144,12 @@ END $$;
 -- and the test database is fresh — so this is immediate, with no nullable phase to carry forward.
 ALTER TABLE formula_draft_regeneration_exception
     ALTER COLUMN llm_spend_authorization_id SET NOT NULL;
+
+-- ▲ Step 5a's spend-thread (2026-08-23, this file is not yet applied anywhere durable): the
+-- authoring PLAN is the carrier that gets a job's approved ceiling from the coordinator's write
+-- to the worker's dispatch seam. Nullable BY DESIGN — an ad-hoc per-candidate draft has no job
+-- ceiling and 1104's reviewed plans make no provider calls at all; when it IS named, every
+-- physical call the run makes reserves against it inside `record_dispatch`'s own transaction.
+ALTER TABLE formula_draft_authoring_plan
+    ADD COLUMN IF NOT EXISTS llm_spend_authorization_id text
+        REFERENCES llm_spend_authorization_revision(spend_authorization_id);

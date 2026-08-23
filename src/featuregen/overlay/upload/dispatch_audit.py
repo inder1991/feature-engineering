@@ -506,6 +506,20 @@ def formula_dispatches_reconciled(conn, authoring_run_id: str) -> bool:
 
 
 @dataclass(frozen=True)
+class SpendBindingV1:
+    """One job's approved ceiling, bound to EVERY physical call an authoring run makes (§11.2).
+
+    ``call_tokens``/``call_cost`` are the WORST CASE reserved per call — the approval's own
+    arithmetic (``max_tokens / max_calls``, ``max_cost / max_calls``), so the two ceilings are
+    enforced JOINTLY: a call that would push past either refuses before egress.
+    """
+
+    spend_authorization_id: str
+    call_tokens: int
+    call_cost: object   # Decimal-compatible; the reservation writer casts
+
+
+@dataclass(frozen=True)
 class DispatchAuditContext:
     """The ingestion-audit context a call site threads into ``audited_structured_call``: WHICH
     ingestion run + stage this logical call serves, and WHICH catalog objects/fields it is about.

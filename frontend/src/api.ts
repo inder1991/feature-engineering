@@ -1765,6 +1765,105 @@ export function getFormulaDraft(formulaDraftId: string): Promise<FormulaDraftSta
   return request(`/formula-drafts/${encodeURIComponent(formulaDraftId)}`)
 }
 
+// ── Step 5a — the durable recipe-to-code coordinator ─────────────────────────────────────────────
+// One explicit user act, driven server-side to a preview: strategies resolve, drafts author,
+// bindings pin, the build set declares, the decision service decides, the generation seals.
+// The PLAN is a question (writes nothing, quotes the cost basis); the POST is the act.
+
+export interface CodeGenMemberPlan {
+  position: number
+  selection_revision_id: string
+  considered_revision_id: string
+  option_id: string
+  // SERVER vocabulary, verbatim: 'REVIEWED_RECIPE_BLUEPRINT' | 'LLM_AUTHORED' | ... A badge is
+  // never computed in the browser beyond mapping these exact strings to plain words.
+  formula_strategy: string
+  blockers: string[]
+  warnings: string[]
+}
+
+export interface CodeGenerationPlan {
+  job_content_identity_hash: string
+  members: CodeGenMemberPlan[]
+  deterministic_members: number
+  llm_members: number
+  estimated_provider_calls: number
+  call_envelope_per_llm_member: number
+  spend_approval_required: boolean
+  spend_approval: {
+    spend_authorization_id: string; max_calls: number; max_tokens: number
+    max_cost: string; currency: string
+  } | null
+  decision_preview: { allowed: boolean; blockers: string[]; warnings: string[] }
+  detail: string
+}
+
+export interface CodeGenerationRequestBody {
+  considered_revision_id: string
+  target_reading_revision_id: string
+  selection_revision_ids: string[]
+  environment_id: string
+  logical_group_name: string
+  declaration: Record<string, unknown>
+  execution_parameters: Record<string, unknown>
+  spend_approval?: {
+    max_calls: number; max_tokens: number; max_cost: string; currency: string
+    pricing_version: string; expires_at: string
+  }
+}
+
+export interface CodeGenerationJobMember {
+  position: number
+  selection_revision_id: string
+  option_id: string
+  formula_strategy: string
+  member_state: string
+  formula_draft_id: string | null
+  selection_formula_binding_id: string | null
+  blockers: string[]
+  warnings: string[]
+}
+
+export interface CodeGenerationJob {
+  job_id: string
+  status: string
+  terminal: boolean
+  requested_by: string
+  build_set_revision_id: string | null
+  generation_request_id: string | null
+  sealed_artifact_id: string | null
+  environment_id: string
+  logical_group_name: string
+  terminal_detail: Record<string, unknown> | null
+  members: CodeGenerationJobMember[]
+  actions: {
+    action: string; resource_identity_hash: string | null
+    authorization_revision_id: string | null; decision_revision_id: string | null; state: string
+  }[]
+  events: { event_seq: number; stage: string; detail: Record<string, unknown>
+    recorded_at: string }[]
+}
+
+export function planCodeGeneration(body: CodeGenerationRequestBody): Promise<CodeGenerationPlan> {
+  return post('/code-generation-jobs/plan', body)
+}
+
+export function requestCodeGeneration(
+  body: CodeGenerationRequestBody,
+): Promise<{ job_id: string; created: boolean; detail: string }> {
+  return post('/code-generation-jobs', body)
+}
+
+export function getCodeGenerationJob(jobId: string): Promise<CodeGenerationJob> {
+  return request(`/code-generation-jobs/${encodeURIComponent(jobId)}`)
+}
+
+export function cancelCodeGenerationJob(
+  jobId: string,
+): Promise<{ job_id: string; status: string; detail: string }> {
+  return post(`/code-generation-jobs/${encodeURIComponent(jobId)}/cancel`, {})
+}
+
 // Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
 // the draft. In confirmation-required mode chosen_option_id is the opaque option_id, never display name.
 //

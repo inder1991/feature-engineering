@@ -429,6 +429,7 @@ def critique(
     metadata_loader: Callable[[str], dict] | None = None,
     progress_callback: Callable[[], None] | None = None,
     lease_fence: LeaseFence | None = None,
+    spend=None,
 ) -> CriticReview:
     """Run the independent critic ONCE over ``proposal`` against ``intent``.
 
@@ -481,6 +482,7 @@ def critique(
         schema_content_hash=(
             provider_contract.schema_content_hash if provider_contract is not None else None),
         lease_fence=lease_fence,
+        spend=spend,
     )
     if progress_callback is not None:
         progress_callback()

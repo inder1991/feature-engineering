@@ -2989,11 +2989,14 @@ composing the REAL chain: bindings → build set → server-minted approval → 
 ceiling lands durable and content-addressed via `authorize_spend` keyed on the job identity), and
 the worker tick stage riding the generation switch (child D9 — no new flags). 30 new tests; the
 route test caught a real spelling bug (lowercase strategy compare → LLM members counted zero →
-spend never required). **OWED inside step 5**: (a) *5a-spend-thread* — the draft worker must
-resolve the job's recorded spend authorization into `DispatchAuditContext.spend_authorization_id`
-so the ceiling RESERVES at the physical seam (today it is durable but not yet consulted on this
-path); (b) **5b — the frontend journey**. Steps 0/0b remain OPERATOR; 7–10 are release-readiness
-per §0.1.0.
+spend never required). **The spend-thread is WIRED** (same day — the ceiling rides the
+authoring plan to the worker, which threads a `SpendBindingV1` through the author/critic stack
+into the dispatch context; per-call worst case is the approval's own arithmetic, so both
+ceilings enforce jointly and exhaustion refuses BEFORE egress). **5b shipped in part** — the
+seven-stage workspace, the plan-then-confirm action, route/proxy wiring, and the gold-line
+warning reshape; the child plan records the honest gap (no frontend surface lists selections
+yet, so the rail integration has no host). Remaining near-term: §11.3's method-override
+migration. Steps 0/0b remain OPERATOR; 7–10 are release-readiness per §0.1.0.
 
 ▲ **REVISION FIVE-b — §0.1.0's development policy RE-WEIGHTS this order.** Steps **7 and 8** build the
 production boundary; the owner has ruled `MATERIALIZE_PRODUCTION` and `PUBLISH_PRODUCTION`

@@ -1,6 +1,7 @@
 import type { ReactElement } from 'react'
 import {
   entityMapEnabled,
+  codeGenerationEnabled,
   featureExecutionEnabled,
   gateConsoleEnabled,
   materializationRunsEnabled,
@@ -11,6 +12,7 @@ import { SessionBar } from './SessionBar'
 import { AssetDetailScreen } from './screens/AssetDetailScreen'
 import { EntityMapScreen } from './screens/EntityMapScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
+import { CodeGenerationWorkspaceScreen } from './screens/CodeGenerationWorkspaceScreen'
 import { FeatureExecutionScreen } from './screens/FeatureExecutionScreen'
 import { MaterializationRunScreen } from './screens/MaterializationRunScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
@@ -564,6 +566,15 @@ export default function App() {
             goal={params.get('goal') ?? ''}
             targetMode={params.get('target_mode') ?? 'prediction'}
             targetRef={params.get('target_ref')}
+          />
+        )}
+        {/* Step 5b — the generation workspace: one durable build journey, watched from a job
+            id. A detail sheet like the materialization and execution sheets: a missing job id
+            renders an empty workspace that says so, never one pointed at something else. */}
+        {route === 'code-generation' && codeGenerationEnabled() && (
+          <CodeGenerationWorkspaceScreen
+            jobId={params.get('job_id') ?? ''}
+            navigate={navigate}
           />
         )}
         {route === 'entity-map' && entityMapEnabled() && <EntityMapScreen navigate={navigate} />}

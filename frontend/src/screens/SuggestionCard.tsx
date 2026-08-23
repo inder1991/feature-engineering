@@ -206,9 +206,16 @@ const COMPUTATION_KIND_WORDS: Record<string, string> = {
 
 // Each blocker in banking language; the machine code stays beside it for the auditor. An unknown
 // code renders its de-underscored words — same rule as the states.
+// ▲ Codes that are WARNING-shaped, not blocker-shaped (child 5b item 7 / the gold ruling): gold
+// evidence withholds the production CERTIFICATION, never the artifact — building, previewing and
+// sandbox-running all proceed. Rendering it as a blocker line told users a build was stopped
+// that nothing stops. The line does not disappear; it changes shape.
+const WARNING_SHAPED_CODES = new Set(['gold_evaluation_unproven'])
+
 const BLOCKER_WORDS: Record<string, string> = {
   gold_evaluation_unproven:
-    'the worked examples that prove this formula have not been run yet',
+    'the worked examples that prove this formula have not been run yet — this withholds '
+    + 'production certification, not building or sandbox runs',
   ambiguous_operand_binding:
     'more than one column could supply an input and nobody has picked one',
   no_reviewed_formula_expectation:
@@ -996,7 +1003,9 @@ function SuggestionDetail({
               : (
                 <ul className="sfc-omit">
                   {s.execution.readiness_blockers.map(b => (
-                    <li key={b.code}>
+                    <li key={b.code}
+                        className={WARNING_SHAPED_CODES.has(b.code) ? 'sfc-warning' : undefined}>
+                      {WARNING_SHAPED_CODES.has(b.code) ? '\u26a0 ' : ''}
                       {BLOCKER_WORDS[b.code] ?? b.code.replace(/_/g, ' ')}
                       {' '}({BLOCKER_GROUP_WORDS[b.group] ?? b.group.replace(/_/g, ' ')}
                       {' '}· <span className="mono">{b.code}</span>)

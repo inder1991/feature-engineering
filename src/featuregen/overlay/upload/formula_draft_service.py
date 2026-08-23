@@ -159,7 +159,7 @@ def frozen_candidate(conn, revision_id: str, option_id: str) -> FrozenCandidateV
 
 def request_draft_for_candidate(
     conn, *, revision_id: str, option_id: str, formula_draft_id: str, requested_by: str,
-    now: str,
+    now: str, spend_authorization_id: str | None = None,
 ) -> DraftRequestedV1:
     """Record a formula-draft request and enqueue its work — the ONE write composition.
 
@@ -230,8 +230,9 @@ def request_draft_for_candidate(
             "INSERT INTO formula_draft_authoring_plan (formula_draft_id, candidate_origin, "
             "formula_strategy, strategy_identity_hash, recipe_id, recipe_revision_hash, "
             "expectation_ref, expectation_generation, reviewed_blueprint_revision, "
-            "reviewed_blueprint_hash, provider_contract_hash, method_override_revision_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "reviewed_blueprint_hash, provider_contract_hash, method_override_revision_id, "
+            "llm_spend_authorization_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (draft_id, facts.candidate_origin, str(decision.strategy),
              decision.strategy_identity_hash, facts.recipe_id, facts.recipe_revision_hash,
              facts.expectation_ref if facts.recipe_id else None,
@@ -240,7 +241,12 @@ def request_draft_for_candidate(
              if decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT else None,
              assembled.reviewed_blueprint_hash
              if decision.strategy is FormulaStrategy.REVIEWED_RECIPE_BLUEPRINT else None,
-             provider_contract, facts.method_override_revision_id))
+             provider_contract, facts.method_override_revision_id,
+             # §11.2 — the job's ceiling rides the PLAN, and only where a provider will be
+             # called: a reviewed plan spends nothing, and pinning a ceiling to it would claim a
+             # purchase that cannot happen.
+             (spend_authorization_id
+              if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)))
 
         # ▲ AND THE IDENTITY COMPANION — version 2, explicitly. Its composite FK to
         # (formula_draft_id, authoring_config_hash) is what makes "this companion describes that

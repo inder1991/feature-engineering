@@ -6,7 +6,7 @@ export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
   | 'integrations' | 'governance' | 'dashboard' | 'gate' | 'asset' | 'suggested'
   | 'analysis' | 'entity-map' | 'recipes' | 'materialization' | 'feature-execution'
-  | 'runs'
+  | 'runs' | 'code-generation'
 
 // 'asset' is the catalog asset-detail screen (Delivery G). It carries source + object_ref via the
 // existing params mechanism (a Details action on a search hit navigates('asset', {source,
@@ -55,6 +55,14 @@ export function featureExecutionEnabled(): boolean {
   return import.meta.env.VITE_FEATURE_EXECUTION === '1'
 }
 
+// Step 5b's generation workspace mirrors the SERVER's generation switch the same way:
+// every /code-generation-jobs route 404s while `FEATUREGEN_GENERATION_V2_ENABLED` is off, so a
+// reachable screen with an unreachable API behind it would be a surface that can only ever show
+// an error. Flag-off, '#/code-generation' parses like any unknown hash: absent, not broken.
+export function codeGenerationEnabled(): boolean {
+  return import.meta.env.VITE_CODE_GENERATION === '1'
+}
+
 // decodeURIComponent THROWS a URIError on a malformed escape ('%zz'), and parseHash runs inside a
 // render — an unguarded call would turn a corrupt link into a blank app. URLSearchParams tolerates
 // the same input by leaving it literal, so the path param behaves identically: pass the raw
@@ -84,6 +92,7 @@ export function parseHash(hash: string): { route: Route; params: URLSearchParams
     || (path === 'entity-map' && entityMapEnabled())
     || (path === 'materialization' && materializationRunsEnabled())
     || (path === 'feature-execution' && featureExecutionEnabled())
+    || (path === 'code-generation' && codeGenerationEnabled())
   const route = known ? (path as Route) : 'overview'
   return { route, params: new URLSearchParams(query) }
 }

@@ -493,7 +493,38 @@ def _author(
         progress_callback=progress,
         formula_schema_version=_DRAFT_FORMULA_SCHEMA_VERSION,
         reviewed_blueprint=reviewed,
+        # §11.2 — the ceiling the coordinator recorded, if the plan carries one: every physical
+        # call this run makes reserves worst-case against it at the dispatch seam, and
+        # exhaustion refuses BEFORE egress (PROVIDER_AUTH_ERROR, fail closed).
+        spend=_spend_binding_for(conn, draft_id),
     )
+
+
+def _spend_binding_for(conn, draft_id: str):
+    """The plan row's approved ceiling as a per-call worst-case binding, or ``None``.
+
+    Per-call worst case is the APPROVAL'S OWN ARITHMETIC — ``max_tokens / max_calls`` and
+    ``max_cost / max_calls`` — so both ceilings are enforced jointly without this worker inventing
+    a price: reserving ceiling/calls per call means the approved call count exactly exhausts the
+    approved totals.
+    """
+    from decimal import Decimal
+
+    from featuregen.overlay.upload.dispatch_audit import SpendBindingV1
+
+    row = conn.execute(
+        "SELECT a.spend_authorization_id, a.max_calls, a.max_tokens, a.max_cost "
+        "  FROM formula_draft_authoring_plan p "
+        "  JOIN llm_spend_authorization_revision a "
+        "    ON a.spend_authorization_id = p.llm_spend_authorization_id "
+        " WHERE p.formula_draft_id = %s", (draft_id,)).fetchone()
+    if row is None:
+        return None
+    spend_authorization_id, max_calls, max_tokens, max_cost = row
+    return SpendBindingV1(
+        spend_authorization_id=spend_authorization_id,
+        call_tokens=-(-int(max_tokens) // int(max_calls)),        # ceil division
+        call_cost=Decimal(str(max_cost)) / int(max_calls))
 
 
 def _frozen_grounding_context(conn, draft_id: str):

@@ -395,14 +395,22 @@ def read_code_generation_job(job_id: str, conn: _Conn) -> dict[str, Any]:
     job = read_job(conn, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"no code-generation job {job_id!r}")
+    # The sealed artifact, once the generation the job watches has one — read from the request
+    # row, never derived: the workspace's "Code ready" stage and its link into the execution
+    # screen both hang off this, and honest absence (null) is the answer until sealing happens.
+    sealed = None if job.generation_request_id is None else conn.execute(
+        "SELECT sealed_artifact_id FROM generation_request WHERE request_id = %s",
+        (job.generation_request_id,)).fetchone()
     return {
         "job_id": job.job_id,
         "status": job.status.value,
         "terminal": job.status.is_terminal,
         "requested_by": job.requested_by,
-        "environment_id": job.environment_id,
         "build_set_revision_id": job.build_set_revision_id,
         "generation_request_id": job.generation_request_id,
+        "sealed_artifact_id": None if sealed is None else sealed[0],
+        "environment_id": job.environment_id,
+        "logical_group_name": job.logical_group_name,
         "terminal_detail": job.terminal_detail,
         "members": [
             {"position": m.position, "selection_revision_id": m.selection_revision_id,

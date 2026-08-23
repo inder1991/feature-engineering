@@ -484,6 +484,7 @@ def run_authoring_v2_replay(
     lease_fence: LeaseFence | None = None,
     formula_schema_version: int,
     reviewed_blueprint: Any | None = None,
+    spend=None,
 ) -> AuthoringResultV2:
     """Author, parse, govern output semantics, independently critique, and fold ONE v2 result —
     resumably, under a lease, against a frozen configuration.
@@ -655,6 +656,9 @@ def run_authoring_v2_replay(
                 # the V1 tool set, so omitting this kwarg silently authored a v2 formula against v1
                 # tools. `_require_tool_runner` refuses above rather than letting that happen.
                 tool_runner=tool_runner,
+                # §11.2 — the job's approved ceiling, if the plan named one; every physical call
+                # this run makes reserves against it at the dispatch seam.
+                spend=spend,
             )
         except FormulaControlFlow:
             raise
@@ -802,6 +806,7 @@ def run_authoring_v2_replay(
                 metadata_loader=critic_metadata_loader,
                 progress_callback=progress_callback,
                 lease_fence=lease_fence,
+                spend=spend,
             )
         except FormulaControlFlow:
             raise

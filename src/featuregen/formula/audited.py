@@ -93,7 +93,8 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
                          provider_contract_hash: str | None = None,
                          prompt_content_hash: str | None = None,
                          schema_content_hash: str | None = None,
-                         lease_fence: LeaseFence | None = None) -> AuditedCallResult:
+                         lease_fence: LeaseFence | None = None,
+                         spend=None) -> AuditedCallResult:
     """Run one governed authoring call and return its full disposition (see ``AuditedCallResult``).
 
     Delegates to ``drive_audited_structured_call`` — never re-implementing the egress/schema/repair
@@ -117,6 +118,17 @@ def audited_formula_call(conn, client: LLMClient, *, authoring_run_id: str, task
         schema_content_hash=schema_content_hash,
         lease_fence=lease_fence,
     )
+    if spend is not None:
+        # ▲ Folded into WHICHEVER context is in effect — supplied or built — so a caller passing a
+        # richer context cannot accidentally shed the money guard. The reservation itself happens
+        # at the PHYSICAL seam (`record_dispatch`), per call, bound to the dispatch_ref.
+        import dataclasses as _dc
+
+        effective_dispatch_audit = _dc.replace(
+            effective_dispatch_audit,
+            spend_authorization_id=spend.spend_authorization_id,
+            spend_call_tokens=spend.call_tokens,
+            spend_call_cost=spend.call_cost)
     logical_material = {
         "authoring_run_id": authoring_run_id,
         "task": task,
