@@ -129,6 +129,11 @@ _BEHAVIOURAL_ENGINE_FILES = (
 )
 _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 
+#: The pseudo-symbol `_definition_asts` files every name-binding-free top-level statement under —
+#: imports included. Defined here rather than beside that function so the allow-list below can name
+#: it symbolically: a branch that changes only an import must still say so, by name.
+_MODULE_BODY = "<module-level statements and imports>"
+
 # Top-level symbols whose EXECUTABLE code a branch may deliberately change in a behavioural engine
 # file, each with the reason. Per SYMBOL, never per file: everything else in the same file is still
 # held to behavioural identity, so this exception cannot grow silently into a blanket exemption.
@@ -212,16 +217,58 @@ _CONTRACTS_FILE = "src/featuregen/overlay/upload/planner/contracts.py"
 #     stability signal, keyed on by nothing, and a one-time shift.
 #   * Neither field appears in any value proof 2 (RUNTIME) compares, and proof 2 still passes.
 #   * No production caller reads either field yet.
+#
+# S1B-2, THE TYPED UNMET HOP A REJECTED PLAN CARRIES OUT (cross-catalog Stage 1). At the frontier's
+# dead end the assembler already held the failing relationship, the exact `_Position`, and — inside
+# the bool-returning taxonomy probe — the realizing catalogs with their endpoint key columns. All of
+# it was discarded; only a reason-code string escaped, so the bridge-demand ledger (S1B-1, live) had
+# no evidence source. The changed symbols:
+#
+#   `_hop_realizable_elsewhere` / `_hop_realizers`
+#                        — the SAME probe over the SAME cached rows, returning the facts it was
+#                          already computing instead of a bool. The RENAME is why two names appear:
+#                          the old one is gone from the head file, so the per-symbol differ reports
+#                          both halves of one change.
+#   `_near_side_key_refs`, `MAX_NEAR_SIDE_COLUMNS_WALKED`
+#                        — new: the near-side key columns a bridge out of this dead end would
+#                          anchor on, resolved AT the refusal site through the same governed
+#                          `key_entity` reading the transitions use, cached per
+#                          (catalog, table, entity) and capped.
+#   `assemble_paths`     — already listed: mints the dead-end reject with the typed hop attached,
+#                          and threads the two caches + the (consulted, never spent) compile budget.
+#   `<module-level ...>` — two imports: `RealizerFactV1`/`UnmetHopV1` from contracts, and a
+#                          TYPE_CHECKING-only `CompileBudget` (no runtime import graph change).
+#   `_assemble_rollups`  — plan.py: passes the run-owned budget the assembler now consults.
+#
+# The basis, stated so it is checkable rather than asserted:
+#
+#   * VERDICTS ARE UNMOVED. The routing is the identical three-way decision on the identical inputs
+#     (`budget_blocked` -> bounded_out_max_bridges; a realizer exists -> unsanctioned_bridge; else
+#     missing_realization) — `realizers` non-empty is exactly the old probe's True. Every
+#     pre-existing reject-verdict test still passes untouched.
+#   * `unmet_hop` IS NOT IDENTITY MATERIAL. It is a defaulted, appended `BindingPlanV1` field that
+#     enters neither `_physical_plan_material` nor `make_contract_id`, pinned by the S1A-4a literals
+#     in `test_plan.py::test_the_unmet_hop_moves_no_identity` and, non-vacuously, by
+#     `test_the_same_reject_keeps_its_id_whether_or_not_the_hop_is_carried`.
+#   * THE BUDGET GATES EVIDENCE, NEVER A PLAN. It is consulted (clock vs deadline) and never spent:
+#     `remaining`/`stopped_by_time` are untouched, so a walk skipped past the deadline cannot
+#     masquerade as the compile pass's truncation. Which plans exist does not depend on it.
+#   * ONE REAL COST DELTA, DELIBERATE: the realizer probe now also runs on the budget-blocked
+#     branch, which used to short-circuit past it. A capacity refusal is still somebody's missing
+#     crossing, and the underlying catalog reads are already cached per run.
+#   * Proof 2 (RUNTIME) compares no value any of this touches, and still passes.
 _ALLOWED_BEHAVIOURAL_CHANGES: dict[str, frozenset[str]] = {
     "src/featuregen/overlay/upload/planner/assembly.py": frozenset({
         "_grain_key_ref", "assemble_paths",
+        "_hop_realizable_elsewhere", "_hop_realizers", "_near_side_key_refs",
+        "MAX_NEAR_SIDE_COLUMNS_WALKED", _MODULE_BODY,
     }),
     "src/featuregen/overlay/upload/planner/declarations.py": frozenset({
         "_hop_evidence", "CARDINALITY_SOURCE_BRIDGE_FAR_GRAIN", "CompilerContext",
         "build_compiler_context", "compile_temporal",
     }),
     "src/featuregen/overlay/upload/planner/plan.py": frozenset({
-        "METADATA_RESOLUTION_MODES", "plan_bindings",
+        "METADATA_RESOLUTION_MODES", "plan_bindings", "_assemble_rollups",
     }),
     "src/featuregen/overlay/upload/planner/candidates.py": frozenset({
         "discover_ingredient_candidates",
@@ -245,9 +292,6 @@ def _executable_ast(source: str) -> str:
     constant, default, decorator or import can differ without changing this string. The mutation
     controls in ``test_ast_identity_survives_prose_and_catches_code`` prove both halves of that."""
     return ast.dump(_strip_docstrings(ast.parse(source)))
-
-
-_MODULE_BODY = "<module-level statements and imports>"
 
 
 def _definition_asts(source: str) -> dict[str, str]:

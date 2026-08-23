@@ -449,3 +449,208 @@ def test_new_plan_facts_move_no_identity(db):
     assert cross.temporal_declaration is not None
     assert cross.temporal_declaration.anchor_binding is None
     assert cross.temporal_declaration.anchor_catalog_source == ""
+
+
+# ---------------------------------------------------------------------------------------------
+# Task S1B-2 — the TYPED UNMET HOP a rejected plan carries out.
+#
+# At the frontier's dead end the assembler holds the failing `EntityRelationshipRefV1`, the exact
+# `_Position`, and (inside the taxonomy probe) the realizing catalogs with their endpoint key
+# columns. Before this task all of it was discarded and only a reason-code string escaped, so the
+# demand ledger (S1B-1) had nothing to record. `unmet_hop` carries it — on REJECTED plans only, as
+# a defaulted, never-hashed field.
+# ---------------------------------------------------------------------------------------------
+
+from featuregen.overlay.upload.planner import assembly as _assembly
+
+
+def _far_realizer_split(db):
+    """`ops` holds the transaction-grain table with an account FK and NO intra-catalog join; `rev`
+    holds a transactions table that DOES declare the transaction -> account join (so `rev` VALIDLY
+    realizes the hop) plus the account-grain landing table. NO bridge is seeded, so the roll-up
+    from `ops` dead-ends while a realizer demonstrably exists one catalog away — the exact shape
+    the bridge-demand queue exists to surface."""
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer"), "account_id"),
+    ])
+    _seed(db, "rev", [
+        (CanonicalRow("rev", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("rev", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+
+
+def _rejects(result):
+    return [p for p in result.candidate_plans
+            if p.path_resolution_status is PathResolutionStatus.source_to_target_rejected]
+
+
+def test_unsanctioned_bridge_reject_carries_the_hop_and_its_far_realizer(db):
+    _far_realizer_split(db)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    ops_rejects = [p for p in _rejects(result) if p.catalog_source == "ops"]
+    assert len(ops_rejects) == 1
+    reject = ops_rejects[0]
+    assert reject.primary_reason_code is ReasonCode.unsanctioned_bridge
+    hop = reject.unmet_hop
+    assert hop is not None
+    # the semantic hop, verbatim from the governed registry entry the frontier was traversing
+    assert hop.relationship_id == "transaction_to_account"
+    assert hop.relationship_version
+    assert (hop.from_entity, hop.to_entity) == ("transaction", "account")
+    assert hop.cardinality == "many_to_one"
+    # the EXACT physical position the search died on
+    assert (hop.position_entity, hop.position_catalog, hop.position_table_ref) == (
+        "transaction", "ops", "public.transactions")
+    assert hop.hop_index == 0
+    assert hop.verdict == ReasonCode.unsanctioned_bridge.value
+    # ...and the realizer that makes this a BRIDGE demand rather than a realization gap: the far
+    # catalog plus the two key columns a bridge would have to connect.
+    assert len(hop.realizers) == 1
+    (realizer,) = hop.realizers
+    assert realizer.catalog_source == "rev"
+    assert realizer.to_object_ref == "public.accounts"
+    assert realizer.from_key_ref == "public.transactions.account_id"
+    assert realizer.to_key_ref == "public.accounts.account_id"
+    # the near-side key column a bridge would anchor on, resolved AT the refusal site
+    assert hop.near_side_key_refs == ("public.transactions.account_id",)
+
+
+def test_missing_realization_reject_carries_the_hop_with_no_realizers(db):
+    """The measured verdict for the plain `_split` seeds with no bridge: `rev` holds ONLY the
+    account-grain table, so no catalog anywhere realizes transaction -> account and the honest
+    verdict is `missing_realization` with an EMPTY realizer tuple — a realization gap, not
+    somebody's unbuilt bridge."""
+    _split(db)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    (reject,) = _rejects(result)
+    assert reject.primary_reason_code is ReasonCode.missing_realization
+    hop = reject.unmet_hop
+    assert hop is not None
+    assert hop.verdict == ReasonCode.missing_realization.value
+    assert hop.realizers == ()
+    assert hop.relationship_id == "transaction_to_account"
+    assert hop.near_side_key_refs == ("public.transactions.account_id",)
+
+
+def test_a_resolved_plan_carries_no_unmet_hop(db):
+    _split(db)
+    _seed_bridge(db, "bfk_unmet_none", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    (cross,) = _cross(result)
+    assert cross.unmet_hop is None                      # it crossed: nothing went unmet
+    assert all(p.unmet_hop is None for p in result.candidate_plans
+               if p.path_resolution_status is PathResolutionStatus.ingredient_binding_only)
+
+
+def _diamond(db):
+    """Four transaction-grain catalogs bridged as a diamond (ops-m1-hub, ops-m2-hub) at the
+    TRANSACTION entity, with nothing anywhere realizing transaction -> account. Only `ops` carries
+    the measure the recipe needs, so exactly ONE frontier search runs — and it reaches `hub` twice,
+    by two different two-bridge routes, giving two dead ends on the SAME table within ONE
+    `assemble_paths` call. That is the shape the near-side cache exists for."""
+    for src in ("ops", "m1", "m2", "hub"):
+        rows = [
+            (CanonicalRow(src, "transactions", "transaction_id", "integer", is_grain=True),
+             "transaction_id"),
+            (CanonicalRow(src, "transactions", "account_id", "integer"), "account_id"),
+        ]
+        if src == "ops":
+            rows.append((CanonicalRow(src, "transactions", "amount", "numeric",
+                                      additivity="additive", currency="USD"), "monetary_flow"))
+        _seed(db, src, rows)
+    for key, left, right in (("bfk_dx", "ops", "m1"), ("bfk_dy", "ops", "m2"),
+                             ("bfk_dz1", "m1", "hub"), ("bfk_dz2", "m2", "hub")):
+        _seed_bridge(db, key, "transaction", left, "public.transactions.transaction_id",
+                     right, "public.transactions.transaction_id")
+    return _txn_template(extra_needs=(Need(role="amt", concept="monetary_flow"),))
+
+
+def test_repeated_dead_ends_on_one_table_walk_its_columns_once(db, monkeypatch):
+    tmpl = _diamond(db)
+    calls: list[tuple[str, str]] = []
+    real = _assembly._table_columns
+
+    def counted(conn, catalog, table_ref):
+        calls.append((catalog, table_ref))
+        return real(conn, catalog, table_ref)
+
+    monkeypatch.setattr(_assembly, "_table_columns", counted)
+    result = plan_bindings(db, template=tmpl, target_entity="account",
+                           scope=_scope("ops", "m1", "m2", "hub"), roles=(), now=_NOW)
+    hub_rejects = [p for p in _rejects(result)
+                   if p.unmet_hop is not None and p.unmet_hop.position_catalog == "hub"]
+    assert len(hub_rejects) == 2, "two distinct two-bridge routes both dead-end on hub"
+    assert len({p.physical_plan_id for p in hub_rejects}) == 2   # two REAL plans, not one twice
+    for p in hub_rejects:
+        assert p.primary_reason_code is ReasonCode.bounded_out_max_bridges
+        assert p.unmet_hop.verdict == ReasonCode.bounded_out_max_bridges.value
+        assert p.unmet_hop.near_side_key_refs == ("public.transactions.account_id",)
+    # THE PIN. `hub.public.transactions` is read once per expanded hub state by
+    # `reposition_bridges` (2 states) plus ONCE by the near-side walk — 3, not 4. Without the
+    # cache the second dead end would walk the same table again.
+    assert calls.count(("hub", "public.transactions")) == 3
+
+
+def test_an_expired_compile_budget_skips_the_near_side_walk(db):
+    """The near-side walk is a governed `key_entity` read per column on a hot path, so it consults
+    the run's compile budget first. Past the deadline the hop is still carried — relationship,
+    position, verdict and realizers are all free — and only the walked evidence is honestly
+    absent."""
+    _far_realizer_split(db)
+    past = CompileBudget(remaining=5, deadline_monotonic=0.0, clock=lambda: 1.0)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW, budget=past)
+    (reject,) = [p for p in _rejects(result) if p.catalog_source == "ops"]
+    hop = reject.unmet_hop
+    assert hop is not None
+    assert hop.relationship_id == "transaction_to_account"
+    assert hop.realizers and hop.realizers[0].catalog_source == "rev"
+    assert hop.near_side_key_refs == ()
+    # the walk skip is NOT a compile-budget stop: it must not claim the run's truncation reason
+    assert past.stopped_by_time is None and past.remaining == 5
+
+
+def test_the_unmet_hop_moves_no_identity(db):
+    """The S1A-4a literal pins, re-run with `unmet_hop` in the world: a defaulted plan field that
+    never enters `_physical_plan_material` or `make_contract_id`."""
+    scope = _c8_fixture(db)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                           roles=(), now=_NOW, compile_ctx=ctx)
+    (cross,) = _cross(result)
+    assert cross.physical_plan_id == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID
+    assert cross.contract_id == _PINNED_C8_CROSS_CONTRACT_ID
+    assert full_physical_plan_hash(cross)[:16] == _PINNED_C8_CROSS_PHYSICAL_PLAN_ID[len("bp_"):]
+
+
+def test_the_same_reject_keeps_its_id_whether_or_not_the_hop_is_carried(db):
+    """Non-vacuous half of the pin above: a plan that DOES carry a populated `unmet_hop` mints the
+    identical physical id as the same plan with the field cleared."""
+    from dataclasses import replace as _replace
+
+    from featuregen.overlay.upload.planner.contracts import make_binding_plan
+    _far_realizer_split(db)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account",
+                           scope=_scope("ops", "rev"), roles=(), now=_NOW)
+    (reject,) = [p for p in _rejects(result) if p.catalog_source == "ops"]
+    assert reject.unmet_hop is not None
+    bare = make_binding_plan(
+        recipe_id=reject.recipe_id, target_entity=reject.target_entity,
+        catalog_source=reject.catalog_source, ingredient_bindings=reject.ingredient_bindings,
+        path_segments=reject.path_segments, resolution_status=reject.resolution_status,
+        path_resolution_status=reject.path_resolution_status,
+        primary_reason_code=reject.primary_reason_code, reason_codes=reject.reason_codes,
+        safety=reject.safety, preference_rank=reject.preference_rank,
+        preference_reasons=reject.preference_reasons, candidate_role=reject.candidate_role)
+    assert bare.unmet_hop is None
+    assert bare.physical_plan_id == reject.physical_plan_id
+    assert _replace(reject, unmet_hop=None) == bare

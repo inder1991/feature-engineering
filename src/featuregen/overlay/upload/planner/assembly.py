@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 from featuregen.overlay.upload.binding_roles import JoinRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_bridges
@@ -29,8 +30,10 @@ from featuregen.overlay.upload.planner.contracts import (
     IngredientBindingV1,
     PathResolutionStatus,
     PlanResolutionStatus,
+    RealizerFactV1,
     ReasonCode,
     SegmentKind,
+    UnmetHopV1,
     make_binding_plan,
 )
 from featuregen.overlay.upload.planner.order import _agg_quality
@@ -46,6 +49,10 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
     RealizationAuthority,
 )
 from featuregen.overlay.upload.templates import Template
+
+if TYPE_CHECKING:      # the budget is CONSULTED, never constructed here — a type-only import keeps
+    # the frontier free of `planner.declarations`' import graph (config, projections, safety).
+    from featuregen.overlay.upload.planner.declarations import CompileBudget
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,32 +480,95 @@ def _child(state: _State, move: _Move, *, advance: bool) -> _State:
         used_bridge_fact_keys=used)
 
 
-def _hop_realizable_elsewhere(
+def _hop_realizers(
         conn, hop: EntityRelationshipRefV1, scope: CatalogScopeV1, current_catalog: str,
-        cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]]) -> bool:
-    """The dead-end taxonomy probe: does ANY OTHER authorized catalog hold a VALID realization of
-    this hop? True -> the dead end is an UNSANCTIONED crossing (a realizer exists but no VERIFIED
-    bridge reaches it); False -> missing_realization. Only in-scope catalogs are consulted —
-    an inaccessible catalog is never probed, never revealed."""
+        cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]]
+) -> tuple[RealizerFactV1, ...]:
+    """The dead-end taxonomy probe: WHICH other authorized catalogs hold a VALID realization of
+    this hop, and over which key columns. Non-empty -> the dead end is an UNSANCTIONED crossing (a
+    realizer exists but no AVAILABLE bridge reaches it); empty -> missing_realization. Only
+    in-scope catalogs are consulted — an inaccessible catalog is never probed, never revealed.
+
+    S1B-2 turned this from a bool into the FACTS behind it. The realizing catalog and its
+    ``from_key_ref``/``to_key_ref`` endpoints were already being computed and thrown away, and they
+    are exactly what a bridge-demand row needs: they name the two columns somebody would have to
+    link. Deterministic — catalogs in frozen scope order, realizations by ``realization_id``.
+
+    (The pre-S1B-2 docstring said "no VERIFIED bridge reaches it". That has not been true since
+    ``active_bridges`` began admitting DRAFT/PARTIALLY_CONFIRMED links as well — see the Task-B3
+    banner above, which corrected the same dead claim in the transition physics.)"""
+    facts: list[RealizerFactV1] = []
     for cat in scope.authorized_catalog_sources:
         if cat == current_catalog:
             continue
         if cat not in cache:
             cache[cat] = derive_catalog_realizations(conn, cat).realizations
-        if any(r.from_object_grain == hop.from_entity and r.to_object_grain == hop.to_entity
-               for r in cache[cat]):
-            return True
-    return False
+        facts.extend(
+            RealizerFactV1(catalog_source=cat, to_object_ref=r.to_object_ref,
+                           from_key_ref=r.from_key_ref, to_key_ref=r.to_key_ref)
+            for r in sorted((r for r in cache[cat]
+                             if r.from_object_grain == hop.from_entity
+                             and r.to_object_grain == hop.to_entity),
+                            key=lambda r: r.realization_id))
+    return tuple(facts)
+
+
+#: How many of a table's columns the near-side walk will look at. Structural, never logged: the
+#: walk exists to name a plausible bridge anchor for a human, and a table wide enough to exceed
+#: this has already given them more candidates than they can use. It is deliberately NOT one of
+#: `contracts.py`'s `MAX_*` planner bounds — those are versioned by PLANNER_BOUNDS_VERSION because
+#: they can change which plans exist, and this one cannot: it bounds EVIDENCE on an already-minted
+#: refusal, never a verdict, a segment or an identity.
+MAX_NEAR_SIDE_COLUMNS_WALKED = 50
+
+
+def _near_side_key_refs(conn, pos: _Position, to_entity: str,
+                        cache: dict[tuple[str, str, str], tuple[str, ...]],
+                        budget: CompileBudget | None) -> tuple[str, ...]:
+    """The columns ON THE CURRENT TABLE that are keyed to the hop's far entity — i.e. the near-side
+    anchors a bridge out of this dead end would have to be built on. Resolved AT the refusal site
+    (never threaded down from :func:`rollup_bridges`, which computes this only in the case where a
+    bridge already exists and so is silent about exactly the tables that need one), through the
+    same governed ``key_entity`` reading every other transition uses.
+
+    Bounded three ways, because this runs on a hot path:
+
+    * a cache keyed on ``(catalog, table_ref, to_entity)``, threaded like ``realization_cache``, so
+      repeated dead ends on one table cost ONE walk. The entity is part of the key deliberately:
+      the answer is a function of the hop's far entity as well as the table, and two hops dead-
+      ending on the same table would otherwise read each other's answer;
+    * ``MAX_NEAR_SIDE_COLUMNS_WALKED`` columns, in ``_table_columns``' deterministic order;
+    * the run's compile budget. Past the deadline the walk is SKIPPED and the result is honestly
+      empty rather than cached — the hop still carries everything that was already in hand. The
+      skip deliberately does not touch ``budget.stopped_by_time``/``remaining``: that pair records
+      what truncated the CONTRACT COMPILE, and evidence collection is not a compile."""
+    key = (pos.catalog, pos.table_ref, to_entity)
+    if key in cache:
+        return cache[key]
+    if budget is not None and budget.clock() >= budget.deadline_monotonic:
+        return ()                       # unknown, not empty — and never cached as if it were known
+    refs = tuple(
+        col_ref
+        for col_ref, _is_grain in _table_columns(
+            conn, pos.catalog, pos.table_ref)[:MAX_NEAR_SIDE_COLUMNS_WALKED]
+        if key_entity(conn, pos.catalog, col_ref) == to_entity)
+    cache[key] = refs
+    return refs
 
 
 def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySemanticPathV1,
                    scope: CatalogScopeV1, ingredient_bindings: tuple[IngredientBindingV1, ...],
-                   template: Template, target_entity: str) -> AssemblyV1:
+                   template: Template, target_entity: str,
+                   budget: CompileBudget | None = None) -> AssemblyV1:
     """The bounded frontier search for ONE (source binding x semantic path): realize every hop of
     ``semantic_path`` from ``source_position`` by (R) intra-catalog realization or (B) governed
     roll-up bridge, with same-entity repositions that may unlock a crossing. A state with every
     hop realized AND the target entity held is a COMPLETE executable path (an EXACT zero-hop path
-    completes in place — the zero-bridge roll-up). Read-only, pure, deterministic."""
+    completes in place — the zero-bridge roll-up). Read-only, pure, deterministic.
+
+    ``budget`` is CONSULTED, never spent: the only thing it gates is the near-side column walk on
+    a dead end (see :func:`_near_side_key_refs`). Which plans exist, and their identities, do not
+    depend on it — passing None simply collects that evidence unconditionally."""
     hops = semantic_path.hops
     prefix = (BindingPathSegmentV1(segment_kind=SegmentKind.direct_catalog,
                                    catalog_source=source_position.catalog),)
@@ -507,7 +577,8 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
     def _mint(state: _State, *, resolution_status: PlanResolutionStatus,
               path_status: PathResolutionStatus, primary: ReasonCode | None,
               role: CandidateRole,
-              output_grain_ref: tuple[str, str] | None = None) -> BindingPlanV1:
+              output_grain_ref: tuple[str, str] | None = None,
+              unmet_hop: UnmetHopV1 | None = None) -> BindingPlanV1:
         return make_binding_plan(
             recipe_id=template.id, target_entity=target_entity,
             catalog_source=source_position.catalog, ingredient_bindings=ingredient_bindings,
@@ -515,7 +586,7 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
             path_resolution_status=path_status, primary_reason_code=primary,
             reason_codes=(primary,) if primary is not None else (), safety=safety,
             preference_rank=-1, preference_reasons=(), candidate_role=role,
-            output_grain_ref=output_grain_ref)
+            unmet_hop=unmet_hop, output_grain_ref=output_grain_ref)
 
     start = _State(hop_index=0, position=source_position, segments=(), bridge_count=0,
                    participating=(source_position.catalog,), used_bridge_fact_keys=frozenset())
@@ -527,6 +598,7 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
     complete: list[BindingPlanV1] = []
     rejected: list[BindingPlanV1] = []
     realization_cache: dict[str, tuple[CatalogEntityRelationshipV1, ...]] = {}
+    near_side_cache: dict[tuple[str, str, str], tuple[str, ...]] = {}
     states_expanded = 0
     bridge_transitions = 0
     realizations_truncated = False
@@ -598,11 +670,17 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
             if not r_moves and not usable_roll and not usable_repo:
                 # fail-closed dead end -> a first-class rejected candidate carrying the evidence
                 # trail it DID accumulate; a completing segment is NEVER fabricated.
+                # S1B-2: the realizers are computed ONCE and used twice — to route the verdict
+                # exactly as before, and to ride out on the typed hop. They are now computed on the
+                # budget-blocked branch too (which used to short-circuit past the probe): a
+                # capacity refusal is still somebody's missing crossing, and the catalog reads are
+                # already cached per run.
+                realizers = (() if hop is None else _hop_realizers(
+                    conn, hop, scope, state.position.catalog, realization_cache))
                 if budget_blocked:
                     status = PlanResolutionStatus.bounded_out
                     primary = ReasonCode.bounded_out_max_bridges
-                elif hop is not None and _hop_realizable_elsewhere(
-                        conn, hop, scope, state.position.catalog, realization_cache):
+                elif hop is not None and realizers:
                     status = PlanResolutionStatus.unresolved
                     primary = ReasonCode.unsanctioned_bridge
                 else:
@@ -611,7 +689,19 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                 rejected.append(_mint(
                     state, resolution_status=status,
                     path_status=PathResolutionStatus.source_to_target_rejected, primary=primary,
-                    role=CandidateRole.rejected))
+                    role=CandidateRole.rejected,
+                    unmet_hop=None if hop is None else UnmetHopV1(
+                        relationship_id=hop.relationship_id,
+                        relationship_version=hop.relationship_version,
+                        from_entity=hop.from_entity, to_entity=hop.to_entity,
+                        cardinality=hop.cardinality.value,
+                        position_entity=state.position.entity,
+                        position_catalog=state.position.catalog,
+                        position_table_ref=state.position.table_ref,
+                        hop_index=state.hop_index, verdict=primary.value,
+                        realizers=realizers,
+                        near_side_key_refs=_near_side_key_refs(
+                            conn, state.position, hop.to_entity, near_side_cache, budget))))
                 continue
 
             for m in r_moves:                       # same tier: the hop advances, no crossing
@@ -630,7 +720,10 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
     deeper_tiers_not_explored = any(
         cursors[j] < len(levels[j]) for j in range(level + 1, MAX_BRIDGES_PER_PLAN + 1))
     if not complete and frontier_states_truncated:
-        # bounded out with nothing complete -> an explicit rejected candidate, never a silent drop
+        # bounded out with nothing complete -> an explicit rejected candidate, never a silent drop.
+        # It is minted from `start`, which realized no hop at all, so it carries NO unmet_hop: the
+        # search stopped before reaching a specific crossing, and naming whichever hop the frontier
+        # happened to be sitting on would invent a demand nobody has. Honest absence.
         rejected.append(_mint(
             start, resolution_status=PlanResolutionStatus.bounded_out,
             path_status=PathResolutionStatus.source_to_target_rejected,

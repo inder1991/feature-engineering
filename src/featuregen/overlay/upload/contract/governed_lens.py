@@ -98,6 +98,7 @@ from featuregen.overlay.upload.planner.contracts import (
     ContractResolutionStatus,
     PathResolutionStatus,
     ReasonCode,
+    UnmetHopV1,
     full_physical_plan_hash,
 )
 from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
@@ -645,15 +646,39 @@ def _rejection_reason(result: BindingPlanningResultV1) -> str:
     return result.contract_result_status.value
 
 
+def _unmet_hop_demand(hop: UnmetHopV1) -> dict:
+    """ONE unmet hop in the DEMAND MATERIAL shape ``governed_observation_store``'s
+    ``record_bridge_demand`` reads — its ``_HOP_TEXT_FIELDS`` plus ``hop_index``, ``verdict`` and
+    the two JSONB evidence lists, under exactly those names and nothing else.
+
+    JSON-native throughout (the two lists become ``jsonb`` columns), so the ledger can persist this
+    without knowing the planner's dataclasses. ``cardinality`` and ``position_entity`` are
+    deliberately NOT serialized: ``bridge_demand_observation`` has no column for either, and the
+    store would silently drop them — they stay on the typed ``UnmetHopV1`` where a reader who
+    wants them can find them. ``to_endpoint_hint`` stays out entirely (S1B-1's advisory column,
+    never the planner's to fill)."""
+    return {"relationship_id": hop.relationship_id,
+            "relationship_version": hop.relationship_version,
+            "from_entity": hop.from_entity, "to_entity": hop.to_entity,
+            "position_catalog": hop.position_catalog,
+            "position_table_ref": hop.position_table_ref,
+            "hop_index": hop.hop_index, "verdict": hop.verdict,
+            "realizers": [{"catalog_source": r.catalog_source,
+                           "to_object_ref": r.to_object_ref,
+                           "from_key_ref": r.from_key_ref,
+                           "to_key_ref": r.to_key_ref} for r in hop.realizers],
+            "near_side_key_refs": list(hop.near_side_key_refs)}
+
+
 def _rejection(request: FeaturePlanningRequestV1, result: BindingPlanningResultV1) -> dict:
-    """The evidence-bearing refusal. ``unmet_hops`` is forward-compatible: the planner does not
-    carry ``unmet_hop`` on a rejected candidate yet, so today this reads empty rather than
-    pretending the hops are known."""
-    unmet = [hop for hop in (getattr(plan, "unmet_hop", None)
-                             for plan in result.candidate_plans
-                             if plan.path_resolution_status
-                             is PathResolutionStatus.source_to_target_rejected)
-             if hop is not None]
+    """The evidence-bearing refusal. ``unmet_hops`` carries one entry per source→target-REJECTED
+    candidate that named the hop it died on (S1B-2). It stays EMPTY, honestly, for a refusal that
+    has no unmet hop behind it at all — a contract-compile refusal on a path that DID resolve
+    source→target mints no rejected candidate, and the frontier-truncation reject deliberately
+    names no hop."""
+    unmet = [_unmet_hop_demand(plan.unmet_hop) for plan in result.candidate_plans
+             if plan.path_resolution_status is PathResolutionStatus.source_to_target_rejected
+             and plan.unmet_hop is not None]
     return {"lens": _LENS, "reason": _rejection_reason(result),
             "recipe_id": request.source_definition_id,
             "request_hash": request.source_content_hash,

@@ -157,7 +157,7 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
     # computed from the tier-1 plans EXACTLY as before; an assembler DB error propagates to the
     # per-recipe savepoint in run_shadow_planner (never hidden by a bare except).
     asm = _assemble_rollups(conn, template=template, target_entity=target_entity, scope=scope,
-                            resolved_plans=resolved)
+                            resolved_plans=resolved, budget=budget)
     candidate_plans = ordered.plans + asm.plans
     bounding = BoundingMetricsV1(cols_trunc, combos_trunc, plans_trunc, scope.catalog_consideration_truncated,
                                  total_cols, total_combos, len(candidate_plans),
@@ -252,10 +252,15 @@ class _AssemblyRollupsV1:
 
 
 def _assemble_rollups(conn, *, template: Template, target_entity: str | None, scope: CatalogScopeV1,
-                      resolved_plans: Sequence[BindingPlanV1]) -> _AssemblyRollupsV1:
+                      resolved_plans: Sequence[BindingPlanV1],
+                      budget: CompileBudget | None = None) -> _AssemblyRollupsV1:
     """Run the 3B.3b assembler for the recipe's source->target roll-up: one bounded frontier search per
     (deduped tier-1 source binding x governed semantic path). Only RESOLVED tier-1 plans supply source
-    bindings, so nothing here ever runs on a recipe whose tier-1 outcome was not resolved."""
+    bindings, so nothing here ever runs on a recipe whose tier-1 outcome was not resolved.
+
+    S1B-2: the run-owned ``budget`` is threaded through so the assembler can consult (never spend)
+    it before the dead-end near-side column walk. It gates EVIDENCE only — no plan, verdict or
+    identity depends on it — which is why it is defaulted rather than required."""
     elig = ingredient_eligibility(template)
     if elig.reason is ReasonCode.unsupported_multi_grain_ingredients:
         # the recipe cannot do a cross-catalog roll-up at all (a REQUIRED second-entity grain) —
@@ -293,7 +298,7 @@ def _assemble_rollups(conn, *, template: Template, target_entity: str | None, sc
             for path in paths:
                 one = assemble_paths(conn, source_position=position, semantic_path=path, scope=scope,
                                      ingredient_bindings=plan.ingredient_bindings, template=template,
-                                     target_entity=target_entity)
+                                     target_entity=target_entity, budget=budget)
                 r_trunc |= one.bounding.realizations_truncated
                 b_trunc |= one.bounding.bridge_transitions_truncated
                 f_trunc |= one.bounding.frontier_states_truncated

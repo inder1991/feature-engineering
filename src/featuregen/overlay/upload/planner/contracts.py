@@ -508,6 +508,37 @@ class PhysicalReadSetV1:
 
 
 @dataclass(frozen=True, slots=True)
+class RealizerFactV1:
+    """One in-scope catalog that VALIDLY realizes the unmet hop — with the concrete key
+    columns a bridge would connect. Previously computed and discarded by the bool-returning
+    probe."""
+    catalog_source: str
+    to_object_ref: str
+    from_key_ref: str
+    to_key_ref: str
+
+
+@dataclass(frozen=True, slots=True)
+class UnmetHopV1:
+    """The exact hop the frontier could not cross — carried on REJECTED plans only.
+    Identity-safe: a defaulted BindingPlanV1 field never enters physical_plan_id or
+    contract_id material (both build from enumerated arguments — the S1A-4a literal pins
+    prove the discipline)."""
+    relationship_id: str
+    relationship_version: str
+    from_entity: str
+    to_entity: str
+    cardinality: str
+    position_entity: str
+    position_catalog: str
+    position_table_ref: str
+    hop_index: int
+    verdict: str
+    realizers: tuple[RealizerFactV1, ...] = ()
+    near_side_key_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class BindingPlanV1:
     # renamed from plan_id in 3B.3c (F11): minted over the PHYSICAL path under the frozen
     # PHYSICAL_PLAN_VERSION; the ranking tie-break; IMMUTABLE through contract compilation.
@@ -550,6 +581,13 @@ class BindingPlanV1:
     # ingredient-binding-only plan reached no output grain to report. Defaulted + appended, and
     # deliberately NOT physical_plan_id material (see `_physical_plan_material`).
     output_grain_ref: tuple[str, str] | None = None
+    # S1B-2 — the hop the frontier could NOT cross, on a `source_to_target_rejected` plan only.
+    # It is the demand ledger's evidence source: the failing relationship, the exact position that
+    # dead-ended, the catalogs that already realize the hop elsewhere, and the near-side key
+    # columns a bridge would anchor on. None everywhere else — including the frontier-truncation
+    # reject, which never reached a hop to name. Defaulted + appended, and NOT identity material
+    # (a fact ABOUT a refusal may not redefine which physical path was refused).
+    unmet_hop: UnmetHopV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -694,6 +732,7 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
                       preference_rank: int,
                       preference_reasons: tuple[str, ...],
                       candidate_role: CandidateRole,
+                      unmet_hop: UnmetHopV1 | None = None,
                       output_grain_ref: tuple[str, str] | None = None) -> BindingPlanV1:
     """The ONE canonical constructor: derives participating_catalogs (ordered by first traversal, dedup,
     catalog_source first), bridge_count, tier, and a physical_plan_id over the canonical content + the
@@ -733,6 +772,7 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
         safety=safety, preference_rank=preference_rank, preference_reasons=preference_reasons,
         participating_catalogs=tuple(participating), bridge_count=bridge_count,
         path_resolution_status=path_resolution_status, candidate_role=candidate_role,
+        unmet_hop=unmet_hop,
         output_grain_ref=output_grain_ref)
 
 

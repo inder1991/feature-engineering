@@ -224,13 +224,21 @@ def _fully_annotated_request(recipe) -> FeaturePlanningRequestV1:
         for op in base.operands))
 
 
-def _cross_plan(db, request, *, target_entity: str = "account"):
-    """The one source→target-resolved candidate for this request, compiled."""
+def _plan_result(db, request, *, target_entity: str = "account"):
+    """The FULL planning result for this request, compiled — the same call ``_cross_plan``
+    projects one candidate out of, so a test that needs the whole candidate set (e.g. to state
+    that NO plan was rejected) reads the identical run rather than a second, differently-built
+    one."""
     scope = resolve_catalog_scope(db, roles=(), target_entity=target_entity, now=_NOW)
-    result = plan_planning_request(
+    return plan_planning_request(
         db, request=request, target_entity=target_entity, scope=scope, roles=(), now=_NOW,
         compile_ctx=build_compiler_context(db, scope, (), _NOW),
         budget=CompileBudget(remaining=64, deadline_monotonic=1e9, clock=lambda: 0.0))
+
+
+def _cross_plan(db, request, *, target_entity: str = "account"):
+    """The one source→target-resolved candidate for this request, compiled."""
+    result = _plan_result(db, request, target_entity=target_entity)
     crossings = [p for p in result.candidate_plans
                  if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved]
     assert len(crossings) == 1, f"expected one roll-up candidate, got {len(crossings)}"
@@ -357,11 +365,78 @@ def test_as_shipped_recipe_request_reaches_the_g3_boundary(db):
     assert rejection["recipe_id"] == RECIPE_ID
     assert rejection["request_hash"] == shipped[0].source_content_hash
     assert rejection["reason"] == ReasonCode.physical_cardinality_unavailable.value
+    # `unmet_hops` is EMPTY here, and after S1B-2 that is a measured structural fact rather than a
+    # placeholder: this refusal is a CONTRACT-compile refusal on a path that resolved
+    # source→target, so the run mints no `source_to_target_rejected` candidate at all and there is
+    # no unmet hop in existence to report. Measured on this exact seed: 3 candidate plans, 0
+    # rejected. `test_a_dead_end_rejection_carries_the_typed_unmet_hops` below drives the populated
+    # case through the same lens.
     assert rejection["unmet_hops"] == []
+    assert [p.path_resolution_status for p in _plan_result(db, shipped[0]).candidate_plans] == [
+        PathResolutionStatus.ingredient_binding_only,
+        PathResolutionStatus.ingredient_binding_only,
+        PathResolutionStatus.source_to_target_resolved]
 
     # the control: the SAME seed, the SAME recipe, with the binding roles the platform derives
     control, control_rejections = _options(db, [_plannable_request(recipe)])
     assert control_rejections == [] and len(control) == 1
+
+
+def _no_bridge_far_realizer(db) -> None:
+    """The same recipe operands in `ops`, an account-grain landing table in `rev`, and NO bridge
+    anywhere — but `arc` declares the transaction -> account join, so the hop is realizable one
+    catalog away. `arc` deliberately lacks the recipe's time operand, so it produces no tier-1
+    binding of its own and exactly one frontier search runs, from `ops`."""
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer"), "account_id"),
+        (CanonicalRow("ops", "transactions", "event_ts", "timestamp"), "event_timestamp"),
+    ])
+    _seed(db, "rev", [
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _seed(db, "arc", [
+        (CanonicalRow("arc", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("arc", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("arc", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _freshness(db, "ops", "rev", "arc")
+
+
+def test_a_dead_end_rejection_carries_the_typed_unmet_hops(db):
+    """S1B-2 through the lens: when the frontier genuinely dead-ends, the rejection the lens hands
+    back carries the DEMAND MATERIAL — the hop, where it died, and the far catalog that already
+    realizes it — in exactly the shape ``governed_observation_store.record_bridge_demand``
+    consumes."""
+    _no_bridge_far_realizer(db)
+    recipe = v2_recipe_by_id(RECIPE_ID)
+    options, rejections = _options(db, [_plannable_request(recipe)])
+    assert options == []
+    assert len(rejections) == 1
+    rejection = rejections[0]
+    assert rejection["reason"] == ReasonCode.unsanctioned_bridge.value
+    hops = rejection["unmet_hops"]
+    assert len(hops) == 1
+    hop = hops[0]
+    assert hop["relationship_id"] == "transaction_to_account"
+    assert hop["from_entity"] == "transaction" and hop["to_entity"] == "account"
+    assert hop["position_catalog"] == "ops"
+    assert hop["position_table_ref"] == "public.transactions"
+    assert hop["hop_index"] == 0
+    assert hop["verdict"] == ReasonCode.unsanctioned_bridge.value
+    assert hop["near_side_key_refs"] == ["public.transactions.account_id"]
+    assert hop["realizers"] == [{"catalog_source": "arc",
+                                 "to_object_ref": "public.accounts",
+                                 "from_key_ref": "public.transactions.account_id",
+                                 "to_key_ref": "public.accounts.account_id"}]
+    # every key the demand store reads, present and JSON-shaped: the ledger can record this row
+    # without the planner and the store having to agree on anything but these names.
+    assert set(hop) == {"relationship_id", "relationship_version", "from_entity", "to_entity",
+                        "position_catalog", "position_table_ref", "hop_index", "verdict",
+                        "realizers", "near_side_key_refs"}
 
 
 def test_the_annotating_fixtures_no_longer_compensate_for_g1():
