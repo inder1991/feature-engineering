@@ -809,3 +809,49 @@ def test_the_APPROVED_ceiling_is_the_one_enforced_never_a_dev_envelope_over_it(
         "SELECT COUNT(*) FROM llm_spend_authorization_revision "
         "WHERE pricing_version = 'development'").fetchone()
     assert envelopes == (0,), "no dev envelope was minted over the approval"
+
+
+def test_a_SPENT_approved_ceiling_refuses_at_the_door_with_the_coupon_unburned(
+        client, conn, engineer_headers):
+    """Task 7 review item 1, the route chain: an approved ceiling spent to zero must 409 with
+    COST_AUTHORIZATION_EXHAUSTED — the code the run-spine projection reports for the same state,
+    two doors one answer — and the naming coupon survives unconsumed, because a refusal that
+    burns the approval turns the remedy into a second governance act."""
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.llm_spend import reserve_spend
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    _revision(conn, revision_id="crev-dead", snapshot_id="snap-dead")
+    candidate = frozen_candidate(conn, "crev-dead", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, failure_reason, requested_by, "
+        "requested_at) VALUES ('fd-dead', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-dead', "
+        "'FAILED', 'boom', 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision))
+    record_tombstone(conn, formula_draft_id="fd-dead",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+    governance = {"X-User": "owner", "X-Roles": "platform_admin"}
+    approved = client.post("/formula-drafts/fd-dead/regeneration-exceptions",
+                           json=_CEILING, headers=governance)
+    assert approved.status_code == 201, approved.text
+    spend = approved.json()["spend_authorization_id"]
+    now = conn.execute("SELECT now()").fetchone()[0]
+    reserve_spend(conn, spend_authorization_id=spend, calls=_CEILING["max_calls"],
+                  tokens=_CEILING["max_tokens"], cost=_CEILING["max_cost"], now=now)
+
+    refused = client.post(DRAFT_PATH.format(rev="crev-dead", opt="opt-a"),
+                          headers=engineer_headers)
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "COST_AUTHORIZATION_EXHAUSTED"
+    unburned = conn.execute(
+        "SELECT bool_and(uses_consumed = 0) FROM formula_draft_regeneration_exception "
+        "WHERE llm_spend_authorization_id = %s", (spend,)).fetchone()
+    assert unburned == (True,), "the refusal left every naming coupon unconsumed"
+    envelopes = conn.execute(
+        "SELECT COUNT(*) FROM llm_spend_authorization_revision "
+        "WHERE pricing_version = 'development'").fetchone()
+    assert envelopes == (0,), "and no dev envelope was minted around the spent approval"

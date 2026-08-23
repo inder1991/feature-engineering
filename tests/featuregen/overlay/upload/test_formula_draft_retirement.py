@@ -1109,3 +1109,103 @@ def test_C1_a_SIBLING_bindings_exhaustion_never_bumps_THIS_bindings_ordinal(db):
         "SELECT COUNT(*) FROM formula_draft_regeneration_exception "
         "WHERE target_formula_identity_hash = %s", (identity,)).fetchone()
     assert total == (2,), "no third row — one decision, one paid regeneration per binding"
+
+
+def test_DEAD_TICKET_an_exhausted_ceiling_refuses_BEFORE_the_coupon_is_consumed(db):
+    """Task 7 review item 1 — round-3's dead-ticket shape at the ORIGINAL door: with the
+    approved ceiling spent to zero, the request must refuse (typed) BEFORE consuming the naming
+    coupon and BEFORE minting a draft that dies at the dispatch seam. And the refusal must be
+    remediable: a fresh cost-confirmed approval makes the same request mint."""
+    import pytest
+
+    from featuregen.overlay.upload.formula_draft_store import DraftCeilingExhausted
+    from featuregen.overlay.upload.llm_spend import authorize_spend, reserve_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-dead")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-dead",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+
+    def _approve(spend_id):
+        return approve_regeneration_exception(
+            db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+            strategy_identity_hash="sih-llm", actor_subject="user:owner",
+            llm_spend_authorization_id=spend_id, expires_at="2026-12-31T00:00:00Z",
+            scope_key=scope)
+
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-dead",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-31T00:00:00Z")
+    (coupon,), _ = _approve(spend)
+    now = db.execute("SELECT now()").fetchone()[0]
+    reserve_spend(db, spend_authorization_id=spend, calls=5, tokens=1000, cost="1.00", now=now)
+
+    with pytest.raises(DraftCeilingExhausted, match="cannot dispatch"):
+        _request_again(db, draft_id="fd-dead-retry", option_id="opt-fd-dead",
+                       provider_contract_hash="sha256:llm", strategy_identity_hash="sih-llm")
+    consumed, drafts = db.execute(
+        "SELECT (SELECT uses_consumed FROM formula_draft_regeneration_exception "
+        "        WHERE exception_id = %s), "
+        "       (SELECT COUNT(*) FROM formula_draft WHERE formula_identity_hash = %s)",
+        (coupon, identity)).fetchone()
+    assert consumed == 0, "the refusal did NOT burn the naming coupon"
+    assert drafts == 1, "only the FAILED history row — no dead ticket was minted"
+
+    fresh = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-dead-2",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2026-12-30T00:00:00Z")
+    (fresh_coupon,), _ = _approve(fresh)
+    # In-test both approvals share one frozen transaction now(); real acts are separate
+    # transactions, so the later one carries the later approved_at the DESC pick rides on.
+    db.execute("UPDATE formula_draft_regeneration_exception "
+               "SET approved_at = approved_at + interval '1 second' "
+               "WHERE exception_id = %s", (fresh_coupon,))
+    minted, created = _request_again(db, draft_id="fd-dead-retry2", option_id="opt-fd-dead",
+                                     provider_contract_hash="sha256:llm",
+                                     strategy_identity_hash="sih-llm")
+    assert created is True and minted == "fd-dead-retry2", \
+        "a fresh cost-confirmed approval is the remedy, and it works"
+
+
+def test_an_EXPIRED_authorization_is_not_a_dead_ticket_the_mint_rides_the_envelope(db):
+    """The guard's None path, pinned: when the approval's authorization has EXPIRED, the
+    preference locator returns None and the service rides its bounded development envelope —
+    the mint CAN complete, so the store must NOT refuse. Exhaustion refuses; expiry falls
+    through to the envelope. (Expired-AND-exhausted is unconstructible through the public
+    API — `reserve_spend` refuses expired authorizations — so expiry alone is the pin.)"""
+    from featuregen.overlay.upload.llm_spend import authorize_spend
+    from featuregen.overlay.upload.retirement_scope import (
+        approve_regeneration_exception,
+        retirement_scope_key,
+    )
+
+    identity = _failed_draft(db, "fd-exp")
+    scope = retirement_scope_key(
+        considered_revision_id="crev-r", option_id="opt-fd-exp",
+        planning_request_hash="h1", catalog_snapshot_hash="h2", definition_revision="")
+    spend = authorize_spend(
+        db, action="AUTHOR_FORMULA", actor_subject="user:owner", job_identity="job-exp",
+        member_identities=[identity], provider_contract_hash="sha256:llm", max_calls=5,
+        max_tokens=1000, currency="USD", max_cost="1.00", pricing_version="p@1",
+        expires_at="2020-01-01T00:00:00Z")
+    (coupon,), _ = approve_regeneration_exception(
+        db, target_formula_identity_hash=identity, provider_contract_hash="sha256:llm",
+        strategy_identity_hash="sih-llm", actor_subject="user:owner",
+        llm_spend_authorization_id=spend, expires_at="2026-12-31T00:00:00Z", scope_key=scope)
+
+    minted, created = _request_again(db, draft_id="fd-exp-retry", option_id="opt-fd-exp",
+                                     provider_contract_hash="sha256:llm",
+                                     strategy_identity_hash="sih-llm")
+    assert created is True, "expired is the envelope's case, not the dead-ticket refusal's"
+    consumed = db.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception "
+        "WHERE exception_id = %s", (coupon,)).fetchone()
+    assert consumed == (1,), "the coupon still authorizes THIS mint and is consumed by it"

@@ -22,6 +22,7 @@ from typing import Any
 
 from featuregen.canonical import jcs_sha256
 from featuregen.overlay.upload.formula_draft_store import (
+    DraftCeilingExhausted,
     DraftNotAnAnswer,
     DraftRetired,
     request_draft,
@@ -463,23 +464,20 @@ def request_draft_for_candidate(
         # authorization across however many withdrawals it binds — never double-reserved,
         # because reservation happens per physical call against this ONE id on the plan row.
         from featuregen.overlay.upload.formula_draft_store import formula_identity
+        from featuregen.overlay.upload.retirement_scope import approved_ceiling_for
 
-        approved = conn.execute(
-            "SELECT llm_spend_authorization_id FROM formula_draft_regeneration_exception e "
-            "  JOIN llm_spend_authorization_revision a "
-            "    ON a.spend_authorization_id = e.llm_spend_authorization_id "
-            " WHERE e.target_formula_identity_hash = %s AND e.provider_contract_hash = %s "
-            "   AND e.strategy_identity_hash = %s AND a.expires_at > now() "
-            " ORDER BY e.approved_at DESC LIMIT 1",
-            (formula_identity(
+        approved = approved_ceiling_for(
+            conn,
+            target_formula_identity_hash=formula_identity(
                 considered_revision_id=candidate.considered_revision_id, option_id=option_id,
                 planning_request_hash=candidate.planning_request_hash,
                 catalog_snapshot_hash=candidate.catalog_snapshot_hash,
                 authoring_config_hash=config_hash,
                 definition_revision=candidate.definition_revision),
-             provider_contract, decision.strategy_identity_hash)).fetchone()
+            provider_contract_hash=provider_contract,
+            strategy_identity_hash=decision.strategy_identity_hash)
         if approved is not None:
-            spend_authorization_id = approved[0]
+            spend_authorization_id = approved
     if decision.strategy is FormulaStrategy.LLM_AUTHORED and spend_authorization_id is None:
         if not mint_development_envelope:
             # ▲ THE JOB PATH REFUSES, NEVER SUBSTITUTES (Task 5 review 4b): a coordinator member
@@ -511,6 +509,13 @@ def request_draft_for_candidate(
         raise RetiredAtRequest(str(exc), candidate=candidate, config_hash=config_hash) from exc
     except DraftNotAnAnswer as exc:
         raise NotAnAnswerAtRequest(str(exc)) from exc
+    except DraftCeilingExhausted as exc:
+        # ▲ The SAME family as COST_AUTHORIZATION_MISSING, one condition later: there the job's
+        # ceiling expired before the gate; here the approved ceiling is spent to zero. Both are
+        # cost-authorization refusals, so both ride the AuthoringRefused arm every caller
+        # already has — the route's 409 (code = first blocker) and the coordinator's member
+        # refusal — and the store guarantees the naming coupon was NOT consumed.
+        raise AuthoringRefused(("COST_AUTHORIZATION_EXHAUSTED",)) from exc
 
     if created:
         # ▲ THE PLAN, PERSISTED IN THE SAME TRANSACTION AS THE DRAFT AND ITS QUEUE MESSAGE. The
