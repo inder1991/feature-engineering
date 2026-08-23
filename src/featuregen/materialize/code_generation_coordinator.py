@@ -123,7 +123,11 @@ def _plan_formulas(conn, job: CodeGenJobV1) -> None:
             result = request_draft_for_candidate(
                 conn, revision_id=member.considered_revision_id, option_id=member.option_id,
                 formula_draft_id=mint_id("fd"), requested_by=job.requested_by, now=_now(conn),
-                spend_authorization_id=spend_authorization_id)
+                spend_authorization_id=spend_authorization_id,
+                # 4b: the job's ceiling was cost-CONFIRMED at the write; its absence here means
+                # it expired — refuse (COST_AUTHORIZATION_MISSING), never substitute a dev
+                # envelope for what a person approved.
+                mint_development_envelope=False)
         except RetiredAtRequest:
             update_member(conn, job.job_id, member.position, state=MemberStateV1.BLOCKED,
                           blockers=["FORMULA_DRAFT_RETIRED"])
@@ -503,8 +507,10 @@ def member_authoring_plans(conn, request: "CodeGenJobRequestV1") -> list[dict[st
         if decision.strategy in (FormulaStrategy.NON_FORMULA, FormulaStrategy.MODEL_WORKFLOW):
             blockers = blockers or ["CONCEPTUAL_PATTERN_NOT_AUTHORABLE"]
 
-        # The retirement check, at PLAN time — the same identity composition the write path uses,
-        # so the plan refuses exactly what the request would refuse.
+        # ▲ The candidate-level refusal facts, from the ONE builder the write path's DECISION also
+        # consults (`candidate_governance_blockers` — Task 5 review 4a): the plan previews
+        # exactly what the decision will refuse, because they read the same composition. The
+        # first cut computed these inline here and never showed them to the decision.
         provider_contract = (current_author_contract_hash()
                             if decision.strategy is FormulaStrategy.LLM_AUTHORED else None)
         config_payload: dict[str, Any] = {
@@ -514,47 +520,19 @@ def member_authoring_plans(conn, request: "CodeGenJobRequestV1") -> list[dict[st
         }
         if provider_contract is not None:
             config_payload["provider_contract_hash"] = provider_contract
-        from featuregen.overlay.upload.formula_draft_store import formula_identity
+        from featuregen.overlay.upload.formula_draft_service import (
+            candidate_governance_blockers,
+        )
 
-        scope_key = retirement_scope_key(
-            considered_revision_id=candidate.considered_revision_id, option_id=option_id,
-            planning_request_hash=candidate.planning_request_hash,
-            catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-            definition_revision=candidate.definition_revision)
-        identity_hash = formula_identity(
-            considered_revision_id=candidate.considered_revision_id, option_id=option_id,
-            planning_request_hash=candidate.planning_request_hash,
-            catalog_snapshot_hash=candidate.catalog_snapshot_hash,
-            authoring_config_hash=jcs_sha256(config_payload),
-            definition_revision=candidate.definition_revision)
-        if tombstone_covering(conn, scope_key=scope_key,
-                              formula_identity_hash=identity_hash) is not None:
-            blockers.append("FORMULA_DRAFT_RETIRED")
-
-        # The state-aware legacy rule (§11.1.2): only a READY, unretired V1 draft is a fact here —
-        # it holds an answer the platform already bought, so re-buying under V2 needs an approved
-        # regeneration exception. FAILED/BLOCKED legacy drafts bought nothing and say nothing.
-        legacy_ready = conn.execute(
-            "SELECT 1 FROM formula_draft_authoring_identity i "
-            "  JOIN formula_draft d ON d.formula_draft_id = i.formula_draft_id "
-            " WHERE i.identity_version = 1 AND i.retirement_scope_key = %s "
-            "   AND d.state = 'READY' LIMIT 1", (scope_key,)).fetchone()
-        if legacy_ready is not None and decision.strategy is FormulaStrategy.LLM_AUTHORED:
-            # ▲ Through the ONE exception reader — its bindings are the point: an exception
-            # authorizes one exact identity under one provider contract and one strategy. The
-            # first cut hand-rolled this query against a column that does not exist
-            # (`consumed_at`; the real ledger is uses_consumed/max_uses) — found by the run-spine
-            # session mapping the frozen SHA, and exactly why a second composition of a governed
-            # read is banned (§8.3, applied to reads).
-            from featuregen.overlay.upload.retirement_scope import valid_exception_for
-
-            exception = valid_exception_for(
-                conn, target_formula_identity_hash=identity_hash,
-                provider_contract_hash=provider_contract,
-                strategy_identity_hash=decision.strategy_identity_hash,
-                now=conn.execute("SELECT now()").fetchone()[0])
-            if exception is None:
-                blockers.append("LEGACY_REGENERATION_NOT_APPROVED")
+        blockers.extend(candidate_governance_blockers(
+            conn, candidate=candidate, option_id=option_id, strategy=decision.strategy,
+            strategy_identity_hash=decision.strategy_identity_hash,
+            provider_contract_hash=provider_contract, config_hash=jcs_sha256(config_payload),
+            scope_key=retirement_scope_key(
+                considered_revision_id=candidate.considered_revision_id, option_id=option_id,
+                planning_request_hash=candidate.planning_request_hash,
+                catalog_snapshot_hash=candidate.catalog_snapshot_hash,
+                definition_revision=candidate.definition_revision)))
 
         plans.append({
             "position": position,

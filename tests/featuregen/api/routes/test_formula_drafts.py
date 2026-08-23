@@ -480,8 +480,9 @@ def test_EVERY_DRAFT_IS_DECIDED_AND_CEILINGED_in_its_one_transaction(client, con
         "SELECT max_calls, pricing_version, actor_subject "
         "FROM llm_spend_authorization_revision WHERE spend_authorization_id = %s",
         (plan[1],)).fetchone()
-    assert envelope == (5, "development", "user:sam"), \
-        "bounded, marked development, and it names WHO — the §0.1.0 posture"
+    assert envelope == (45, "development", "user:sam"), \
+        "sized from the PER-DRAFT bound (8 turns × 5 + critic's 5 — review C-1), marked " \
+        "development, and it names WHO — the §0.1.0 posture"
 
 
 def test_the_dev_envelope_is_ONE_ceiling_per_draft_config_not_one_per_click(client, conn,
@@ -494,3 +495,45 @@ def test_the_dev_envelope_is_ONE_ceiling_per_draft_config_not_one_per_click(clie
         "SELECT COUNT(*) FROM llm_spend_authorization_revision "
         "WHERE pricing_version = 'development'").fetchone()
     assert count == (1,), "a double-click neither re-decides the spend nor stacks ceilings"
+
+
+def test_A_RETIRED_CANDIDATE_IS_REFUSED_BY_THE_DECISION_before_the_money_guard(
+        client, conn, engineer_headers):
+    """Task 5 review 4a: the decision receives the candidate's REAL facts, so a candidate-wide
+    tombstone refuses HERE — typed 409 through AuthoringRefused, nothing decided as allowed,
+    nothing enqueued — not three layers later when the INSERT loses."""
+    import json as _json
+
+    _revision(conn, revision_id="crev-ret5", snapshot_id="snap-ret5")
+    # A prior draft for this candidate — its identity-bearing fields taken from the SAME frozen
+    # candidate the service will compute, so the tombstone's scope key matches the request's —
+    # retired CANDIDATE-WIDE through the store's own writer.
+    from featuregen.overlay.upload.formula_draft_service import frozen_candidate
+    from featuregen.overlay.upload.retirement_scope import RetirementScope, record_tombstone
+
+    candidate = frozen_candidate(conn, "crev-ret5", "opt-a")
+    conn.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
+        "definition_revision, formula_identity_hash, state, blockers, requested_by, "
+        "requested_at) VALUES ('fd-ret5', %s, 'opt-a', %s, %s, 'cfg-old', %s, 'ident-ret5', "
+        "'BLOCKED', %s::jsonb, 'user:sam', '2026-08-01T00:00:00Z')",
+        (candidate.considered_revision_id, candidate.planning_request_hash,
+         candidate.catalog_snapshot_hash, candidate.definition_revision,
+         _json.dumps([{"code": "X", "reason": "r"}])))
+    record_tombstone(conn, formula_draft_id="fd-ret5",
+                     scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+                     reason="superseded", retired_by="user:owner")
+
+    response = client.post(DRAFT_PATH.format(rev="crev-ret5", opt="opt-a"),
+                           headers=engineer_headers)
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "FORMULA_DRAFT_RETIRED"
+    assert "FORMULA_DRAFT_RETIRED" in detail["blockers"]
+    # And the refusal is the DECISION's, recorded as refused — never a decided-allowed act.
+    refused = conn.execute(
+        "SELECT allowed FROM action_decision_revision WHERE action = 'AUTHOR_FORMULA' "
+        "ORDER BY decided_at DESC LIMIT 1").fetchone()
+    assert refused == (False,)

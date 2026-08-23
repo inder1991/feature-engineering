@@ -587,6 +587,12 @@ def _recheck_authoring_decision(conn, draft_id: str) -> None:
     because absence must never read as permission. A draft with NO plan row predates the
     strategy contract entirely and keeps its documented legacy path. Drift is a REFUSAL a person
     re-requests, never a re-decision.
+
+    ▲ HONESTY NOTE (Task 5 review): today's three pins are all recomputed from APPEND-ONLY rows,
+    so `ACTION_DECISION_DRIFTED` has no live signal — it fires only on a decided-in divergence
+    (a decision recorded against different facts than the plan row carries). That is the check's
+    current value: not drift-over-time, but decision/plan DISAGREEMENT. A future mutable pin
+    (e.g. a revocable contract) inherits the drift semantics without new machinery.
     """
     from featuregen.materialize.action_decision import DecisionDrift, DecisionMissing, recheck
     from featuregen.overlay.upload.formula_draft_service import authoring_evidence_pins

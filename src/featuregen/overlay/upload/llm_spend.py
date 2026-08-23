@@ -62,6 +62,12 @@ def authorize_spend(
     ``expires_at`` is required by the schema, not defaulted here: an approval granted inside a
     triage window must not still authorize a spend three months later, and a default would pick a
     number nobody agreed to.
+
+    ▲ And it is INSIDE the idempotency identity: an approval for a different validity window is a
+    DIFFERENT approval. It used to be outside, which made every ceiling a LIFETIME budget per
+    (actor, subject, contract) — once expired, a re-mint returned the same expired row for ever
+    and the subject became permanently unauthorable. Found by the run-spine session's Task 5
+    review, probed with two calls differing only in expiry.
     """
     import json
 
@@ -71,6 +77,7 @@ def authorize_spend(
         "member_identities": members, "provider_contract_hash": provider_contract_hash,
         "max_calls": max_calls, "max_tokens": max_tokens, "currency": currency,
         "max_cost": str(max_cost), "pricing_version": pricing_version,
+        "expires_at": str(expires_at),
     })
     authorization_id = f"sa-{idempotency[:32]}"
     conn.execute(

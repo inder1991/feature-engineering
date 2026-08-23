@@ -225,13 +225,26 @@ def request_code_generation(
     from featuregen.materialize.code_generation_coordinator import (
         CodeGenMembersRefused,
         CodeGenRequestInvalid,
+        SelectionUnavailable,
         SpendApprovalRequired,
         request_code_generation_job,
     )
+    from featuregen.overlay.upload.formula_draft_service import CandidateUnavailable
 
     try:
         job_id, created = request_code_generation_job(
             conn, _service_request(body), actor_subject=identity.subject)
+    except SelectionUnavailable as exc:
+        # ▲ The Task 5 review's adapter regression: these two escaped the WRITE route as 500s
+        # while the plan route mapped them — same refusals, same statuses, both routes.
+        raise HTTPException(
+            status_code=404 if exc.kind == "unknown_selection" else 409,
+            detail=exc.detail) from exc
+    except CandidateUnavailable as exc:
+        raise HTTPException(
+            status_code={"unknown_revision": 404,
+                         "option_not_in_revision": 422}.get(exc.kind, 409),
+            detail=exc.detail) from exc
     except CodeGenRequestInvalid as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except CodeGenMembersRefused as exc:
