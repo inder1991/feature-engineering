@@ -183,10 +183,30 @@ def record_tombstone(
             "ON CONFLICT (scope, coverage_identity_hash) DO NOTHING",
             (tombstone_id, str(scope), scope_key, exact, coverage, formula_draft_id, reason,
              detail, replacement_draft_id, retired_by))
+        # ▲ READ BACK AND COMPARE — never return the caller's arguments as though they were the
+        # record. `ON CONFLICT DO NOTHING` reports a disagreeing second retirement as success, so
+        # the second operator's decision would vanish while they were told it took effect, and the
+        # returned TombstoneV1 would describe a row recording NONE of it. This is the exact defect
+        # `RetirementDisagreement` fixed on the legacy path, and the new path must not reintroduce
+        # it. Idempotency — the SAME act repeated — remains silently fine.
+        stored = conn.execute(
+            "SELECT tombstone_id, reason, replacement_draft_id, formula_draft_id, retired_by "
+            "FROM formula_draft_retirement_tombstone "
+            "WHERE scope = %s AND coverage_identity_hash = %s",
+            (str(scope), coverage)).fetchone()
+    if (stored[1], stored[2]) != (reason, replacement_draft_id):
+        from featuregen.overlay.upload.formula_draft_store import RetirementDisagreement
+
+        raise RetirementDisagreement(
+            f"this candidate is already withdrawn at scope {scope} by {stored[4]} "
+            f"(reason {stored[1]!r}, replacement {stored[2]!r}), and this retirement says "
+            f"reason {reason!r}, replacement {replacement_draft_id!r}. The recorded decision "
+            f"stands; a second decision that disagrees must supersede it explicitly, never "
+            f"overwrite it silently")
     return TombstoneV1(
-        tombstone_id=tombstone_id, scope=scope, retirement_scope_key=scope_key,
-        exact_formula_identity_hash=exact, reason=reason,
-        replacement_draft_id=replacement_draft_id)
+        tombstone_id=stored[0], scope=scope, retirement_scope_key=scope_key,
+        exact_formula_identity_hash=exact, reason=stored[1],
+        replacement_draft_id=stored[2])
 
 
 def tombstone_covering(

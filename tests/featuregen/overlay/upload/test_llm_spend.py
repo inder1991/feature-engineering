@@ -164,3 +164,40 @@ def test_A_SETTLEMENT_CANNOT_BE_REWRITTEN(db):
     with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         db.execute("UPDATE llm_spend_settlement SET actual_cost = 0 WHERE reservation_id = %s",
                    (reservation,))
+
+
+def test_EXPIRY_IS_COMPARED_AS_INSTANTS_not_as_strings(db):
+    """▲ Workflow finding W1: the expiry check was `str(expires_at) <= str(now)` — a tz-aware
+    datetime rendered in the SESSION timezone with a space separator, lexically compared to an ISO
+    string with 'T'. On the same calendar date the space (0x20) sorts before 'T' (0x54), so a
+    perfectly valid authorization expiring LATER TODAY was refused as expired — and under a
+    positive-offset session timezone the mirror case let an EXPIRED authorization spend real money.
+    The existing tests only used dates differing in the first ten characters, where lexical order
+    coincidentally matches instant order."""
+    auth = _authorize(db, expires="2026-08-23T12:00:00Z")   # valid for twelve more hours
+
+    reservation = reserve_spend(
+        db, spend_authorization_id=auth, calls=1, tokens=1_000, cost="0.10",
+        now="2026-08-23T00:00:00Z")
+
+    assert reservation
+    # And one minute AFTER expiry, same calendar date, it refuses.
+    with pytest.raises(SpendExhausted, match="expired"):
+        reserve_spend(db, spend_authorization_id=auth, calls=1, tokens=1_000, cost="0.10",
+                      now="2026-08-23T12:01:00Z")
+
+
+def test_A_RESERVATION_CANNOT_BE_EDITED_OR_DELETED(db):
+    """▲ Workflow finding W2: the ledger trigger's own error text claimed reservations are
+    append-only, but the trigger was attached only to settlements. A mutable reservation IS the
+    overspend: shrink its expires_at while the call is in flight and the worst-case amount frees for
+    a concurrent worker — two calls under one ceiling, with no record."""
+    import psycopg
+
+    auth = _authorize(db)
+    reservation = reserve_spend(
+        db, spend_authorization_id=auth, calls=1, tokens=1_000, cost="0.10", now=NOW)
+
+    with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        db.execute("UPDATE llm_spend_reservation SET expires_at = now() "
+                   "WHERE reservation_id = %s", (reservation,))

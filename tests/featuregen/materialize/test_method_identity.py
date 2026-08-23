@@ -195,3 +195,49 @@ def test_EXPECTATION_GENERATION_IS_DELIBERATELY_ABSENT(db):
         db, authoring_run_id=RUN, authoring_method=REVIEWED_RECIPE_BLUEPRINT)
 
     assert "expectation_generation" not in identity.payload
+
+
+def test_RECORDING_A_DIVERGENT_IDENTITY_REFUSES_rather_than_keeping_the_old_one_silently(db):
+    """▲ Workflow finding W7: DO NOTHING alone was first-writer-wins-silently. After a version bump
+    the sealing act would proceed believing its freshly derived identity was recorded, while
+    certificate matching for ever evaluated a hash that act never produced — and the append-only
+    guard makes the divergence permanent. Insert-or-VERIFY, like the migration ledger's checksum."""
+    from featuregen.materialize.method_identity import (
+        MethodIdentityConflict,
+        MethodIdentityV1,
+        record_method_identity,
+    )
+
+    from tests.featuregen.overlay.upload.test_build_set_store import ENV, _approval, _set
+
+    build_set, _ = _set(db, revision_id="bs-mi", members=("sel-mi-a",), target="trr-mi")
+    approval = _approval(db, build_set, ENV)
+    db.execute(
+        "INSERT INTO sealed_artifact_v2 (artifact_id, generation_authorization_revision_id, "
+        "environment_id, logical_group_name, compilation_identity_hash, group_plan_hash, "
+        "project_digest, subgraph_satisfied, triggered_requirements, subgraph_findings, sealed_at) "
+        "VALUES ('art-mi', %s, %s, 'customer_txn_features', 'c','g','sha256:d',true,"
+        "'[]'::jsonb,'[]'::jsonb,'t')", (approval, ENV))
+    db.execute(
+        "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
+        "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "
+        "formula_identity_hash, state, requested_by, requested_at) VALUES "
+        "('fd-mi','crev-1','opt-mi','h','h','h','r','ident-mi','REQUESTED','user:s','t') "
+        "ON CONFLICT DO NOTHING")
+    db.execute(
+        "INSERT INTO formula_authoring_run (authoring_run_id, intent_hash, versions, actor) "
+        "VALUES ('far-mi-rec','ih','{}'::jsonb,'{}'::jsonb) ON CONFLICT DO NOTHING")
+    db.execute(
+        "INSERT INTO sealed_artifact_member_provenance (artifact_id, member_name, "
+        "selection_revision_id, formula_draft_id, authoring_run_id, formula_content_hash, "
+        "authoring_method, authoring_evidence_hash) VALUES "
+        "('art-mi','m1','sel-mi','fd-mi','far-mi-rec','fch','LLM_AUTHORED', repeat('e', 64))")
+
+    first = MethodIdentityV1(authoring_method="LLM_AUTHORED", payload={"v": 1})
+    record_method_identity(db, "art-mi", "m1", first)
+    record_method_identity(db, "art-mi", "m1", first)          # identical: idempotent, no error
+
+    with pytest.raises(MethodIdentityConflict, match="already records"):
+        record_method_identity(
+            db, "art-mi", "m1",
+            MethodIdentityV1(authoring_method="LLM_AUTHORED", payload={"v": 2}))

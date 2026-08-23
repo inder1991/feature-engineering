@@ -592,3 +592,36 @@ acts have callers on the new table.
 **Still owed on step 2:** the relational selection→formula binding (1101), method identity (1102),
 retirement rework (1103), the strategy contract (1104), spend authorization (1105) — and B1's full
 fix, whose bounded re-attempt binds to 1105.
+
+---
+
+# Fourth pass — an adversarial workflow over the day's own modules
+
+The seven modules written during steps 2–3 had zero independent review — everything else on this
+branch has had three passes. A 16-agent adversarial workflow (4 grouped finders → 1 refuting
+verifier per finding, high effort) reviewed them: **12 findings, 7 confirmed, 5 refuted** — and the
+refutations were sound, each naming the exact code that makes the scenario unreachable.
+
+## The seven confirmed, all fixed same-day
+
+| # | Sev | Where | The defect |
+|---|---|---|---|
+| **W1** | blocker | `llm_spend.py` | the expiry check compared `str(expires_at) <= str(now)` — a session-TZ datetime with a space separator against an ISO string with `'T'`. Same calendar date: a valid authorization refused (0x20 < 0x54). Positive-offset session TZ: **an expired authorization spends real money — the money guard failing OPEN**. Every other time comparison in the module already ran in SQL; only this one was Python-side. Fixed: compared in Postgres |
+| **W2** | major | migration 1105 | the ledger trigger's own error text claimed reservations are append-only — **but the trigger was attached only to settlements**. A mutable reservation IS the overspend: shrink its `expires_at` mid-flight and the worst-case amount frees for a concurrent worker. Fixed: trigger attached |
+| **W3** | blocker | `retirement_scope.py` | `record_tombstone` wrote only the 1103 table while the advance fence read only the LEGACY one — so a tombstone stopped future *requests* while every **in-flight draft kept spending to READY**. Fixed: the fence recomputes the scope key from the draft's frozen identity columns, so a candidate-wide withdrawal stops sibling configurations too, and an EXACT one stops only its own |
+| **W4** | blocker | `formula_draft_store.py` | the regeneration exception binds the EXACT identity being re-requested — and 1090's unique index covered every row, so the terminal FAILED draft occupied the slot for ever and the authorized INSERT **lost unconditionally**. Worse: consumption preceded the refusal, so the operator presenting the approved exception had one use burned per click while being told to obtain the thing they were holding. Fixed: **migration 1107** narrows the guard to answers (`WHERE state NOT IN ('FAILED','CANCELLED')` — a failed draft bought nothing), the INSERT names the partial predicate, the exception is located first and consumed only in the transaction that mints |
+| **W5** | moderate | `retirement_scope.py` | a disagreeing second retirement was silently discarded while its operator was told it took effect, and the returned tombstone described a row recording none of it — the exact defect `RetirementDisagreement` fixed on the legacy path, reintroduced. Fixed: read-back-and-compare |
+| **W6** | major | `action_decision.py` | `decide()` with a missing/mismatched authorization leaked a bare `ForeignKeyViolation` (1106's composite FK makes the refused decision UNWRITABLE) while `ask()` returned clean typed blockers — an ask/decide divergence. Fixed: typed `AuthorizationUnusable` before the INSERT |
+| **W7** | moderate | `method_identity.py` | `ON CONFLICT DO NOTHING` was first-writer-wins-silently on an append-only evidence table: after a version bump, sealing proceeds believing its derived identity was recorded while certificate matching for ever evaluates a hash that act never produced. Fixed: insert-or-VERIFY, the ledger's own checksum discipline |
+
+## What this pass teaches
+
+▲ **The worst defects were in the paths my own tests could not reach.** W4's existing test used a
+*different* identity — because the same-identity case was structurally impossible, the test
+accommodated the defect instead of exposing it. W1's tests used dates differing in the first ten
+characters, where lexical order coincidentally matches instant order. **A test written by the code's
+author inherits the author's blind spot**; the adversarial pass exists because of exactly that.
+
+▲ **And the refuted five are as valuable as the confirmed seven** — each refutation cited the
+specific guard (an idempotency key, a single production entry point, a DB-side read) that makes the
+scenario unreachable, which is the documentation of WHY those guards must stay.

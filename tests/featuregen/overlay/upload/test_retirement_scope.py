@@ -296,3 +296,133 @@ def test_A_BLOCKED_DRAFT_IS_STILL_AN_ANSWER(db):
 
     draft_id, created = _request(db, draft_id="fd-ret-2")
     assert (draft_id, created) == ("fd-ret-1", False)
+
+
+def test_A_DISAGREEING_SECOND_RETIREMENT_IS_REFUSED_not_silently_discarded(db):
+    """▲ Workflow finding W5: every draft of one candidate collides on the candidate-wide coverage
+    key, the INSERT was DO NOTHING, and the function returned a TombstoneV1 built from the CALLER's
+    arguments — so operator 2's 'PII leak' vanished while they were told it took effect, and the
+    audit trail said 'wrong window' for ever. The exact defect RetirementDisagreement fixed on the
+    legacy path, reintroduced by the new one."""
+    from featuregen.overlay.upload.formula_draft_store import RetirementDisagreement
+
+    _request(db)
+    _request(db, draft_id="fd-ret-2", config="cfg-2")
+    record_tombstone(
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        reason="wrong window", retired_by="user:ops")
+
+    with pytest.raises(RetirementDisagreement, match="wrong window"):
+        record_tombstone(
+            db, formula_draft_id="fd-ret-2",
+            scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+            reason="PII leak", retired_by="user:two")
+
+
+def test_THE_RETURNED_TOMBSTONE_IS_THE_STORED_ROW_not_the_arguments(db):
+    """Idempotency stays silent — but what comes back is what the table says, so a caller can never
+    hold a tombstone the store does not."""
+    _request(db)
+    first = record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
+                             reason="withdrawn", retired_by="user:ops")
+    again = record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
+                             reason="withdrawn", retired_by="user:someone-else")
+
+    assert again.tombstone_id == first.tombstone_id
+    assert again.reason == "withdrawn"
+
+
+def test_A_TOMBSTONE_STOPS_AN_IN_FLIGHT_DRAFT_at_its_next_step(db):
+    """▲ Workflow finding W3, the second retirement blocker: the advance fence read only the LEGACY
+    retirement table, so a tombstone stopped future requests while every IN-FLIGHT draft of the
+    candidate kept spending to READY — retirement failing open for exactly the drafts most worth
+    stopping. The fence now recomputes the scope key from the draft's own frozen identity columns,
+    so a candidate-wide withdrawal stops OTHER configurations' in-flight drafts too."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    _request(db)                                               # fd-ret-1, cfg-1
+    _request(db, draft_id="fd-ret-2", config="cfg-2")          # in flight, other configuration
+    advance(db, "fd-ret-2", DraftStateV1.AUTHORING)
+
+    record_tombstone(
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        reason="withdrawn mid-flight", retired_by="user:ops")
+
+    with pytest.raises(DraftRetired, match="withdrawn by tombstone"):
+        advance(db, "fd-ret-2", DraftStateV1.CRITIC_REVIEW)
+
+
+def test_AN_EXACT_TOMBSTONE_STOPS_ONLY_ITS_OWN_DRAFT_in_flight(db):
+    """The scope discipline, applied at the fence: an EXACT withdrawal must not stop a sibling
+    configuration that nobody withdrew."""
+    from featuregen.overlay.upload.formula_draft_store import DraftStateV1, advance
+
+    _request(db)
+    _request(db, draft_id="fd-ret-2", config="cfg-2")
+    advance(db, "fd-ret-2", DraftStateV1.AUTHORING)
+
+    record_tombstone(db, formula_draft_id="fd-ret-1", scope=RetirementScope.EXACT_DRAFT,
+                     reason="withdrawn", retired_by="user:ops")
+
+    assert advance(db, "fd-ret-2", DraftStateV1.CRITIC_REVIEW) is DraftStateV1.CRITIC_REVIEW
+    with pytest.raises(DraftRetired):
+        advance(db, "fd-ret-1", DraftStateV1.AUTHORING)
+
+
+# ══ THE REGENERATION THAT WAS STRUCTURALLY IMPOSSIBLE ══════════════════════════════════════════
+def test_AN_APPROVED_EXCEPTION_REGENERATES_THE_EXACT_FAILED_IDENTITY(db):
+    """▲ Workflow finding W4, the deepest one. The exception binds the EXACT identity being
+    re-requested — but 1090's unique index covered every row, so the terminal FAILED draft occupied
+    the slot for ever and the authorized INSERT lost unconditionally. The operator presenting the
+    approved exception had one use burned per click while being told to obtain the thing they were
+    holding. Since 1107 a failure holds no slot: history stays, the remedy is REACHABLE."""
+    _request(db)
+    db.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'provider outage' "
+               "WHERE formula_draft_id = 'fd-ret-1'")
+    # A TOMBSTONE-LESS exception — a failure is not a withdrawal, so there is nothing to override —
+    # bound to the SAME identity that failed.
+    _exception(db, None, target=_identity())
+
+    draft_id, created = _request(
+        db, draft_id="fd-ret-regen", provider_contract_hash="pc-1",
+        strategy_identity_hash="st-1", now="2026-08-23T00:00:00Z")
+
+    assert (draft_id, created) == ("fd-ret-regen", True)
+    # History SURVIVES: the failed row is still there, still FAILED, still readable.
+    assert db.execute(
+        "SELECT state FROM formula_draft WHERE formula_draft_id = 'fd-ret-1'").fetchone()[0] == "FAILED"
+    # And the exception is spent — exactly once, by the transaction that minted.
+    assert db.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception").fetchone()[0] == 1
+
+
+def test_A_REFUSAL_NEVER_CONSUMES_THE_EXCEPTION(db):
+    """▲ The consume-then-refuse half of W4: consumption used to precede the refusal decision, so a
+    caller that caught the typed refusal and committed burned one use per click — and at max_uses
+    the message silently degraded. Consumption now happens only in the transaction that mints."""
+    _request(db)
+    tombstone = record_tombstone(
+        db, formula_draft_id="fd-ret-1", scope=RetirementScope.CANDIDATE_ACROSS_CONFIGURATIONS,
+        reason="withdrawn", retired_by="user:ops")
+    # An exception that does NOT match this request's binding facts (different strategy), so the
+    # request is refused — and the exception must remain whole.
+    _exception(db, tombstone.tombstone_id, target=_identity(config="cfg-2"), strategy="st-other")
+
+    with pytest.raises(DraftRetired):
+        _request(db, draft_id="fd-ret-2", config="cfg-2",
+                 provider_contract_hash="pc-1", strategy_identity_hash="st-1",
+                 now="2026-08-23T00:00:00Z")
+
+    assert db.execute(
+        "SELECT uses_consumed FROM formula_draft_regeneration_exception").fetchone()[0] == 0
+
+
+def test_A_FAILED_IDENTITY_WITHOUT_AN_EXCEPTION_STILL_REFUSES_by_name(db):
+    """The bounded half of §11.1.2's ruling: the re-attempt exists AND it is bounded — by the
+    exception's max_uses, which is the same mechanism that bounds the money."""
+    _request(db)
+    db.execute("UPDATE formula_draft SET state = 'FAILED', failure_reason = 'x' "
+               "WHERE formula_draft_id = 'fd-ret-1'")
+
+    with pytest.raises(DraftNotAnAnswer, match="approved regeneration exception"):
+        _request(db, draft_id="fd-ret-2")

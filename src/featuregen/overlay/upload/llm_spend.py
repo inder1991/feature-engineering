@@ -135,14 +135,23 @@ def reserve_spend(
             refusal, never a quietly smaller call — truncating the work to fit the budget produces a
             result nobody can tell apart from a complete one.
     """
+    # ▲ THE EXPIRY COMPARISON HAPPENS IN POSTGRES, and this is a correction with a lesson. An
+    # earlier version compared `str(expires_at) <= str(now)` — a tz-aware datetime rendered in the
+    # SESSION timezone with a space separator, against an ISO string with 'T'. On the same calendar
+    # date the space sorts before 'T', so a valid authorization expiring later today was refused —
+    # and under a positive-offset session timezone the mirror case let an EXPIRED one spend real
+    # money: the money guard failing OPEN. Every OTHER time comparison in this module already ran in
+    # SQL; only the Python-side one was broken. Timestamps are compared where they are typed.
     locked = conn.execute(
-        "SELECT expires_at FROM llm_spend_authorization_revision "
-        "WHERE spend_authorization_id = %s FOR UPDATE", (spend_authorization_id,)).fetchone()
+        "SELECT expires_at, expires_at <= %s::timestamptz "
+        "FROM llm_spend_authorization_revision "
+        "WHERE spend_authorization_id = %s FOR UPDATE",
+        (now, spend_authorization_id)).fetchone()
     if locked is None:
         raise SpendExhausted(
             f"no spend authorization {spend_authorization_id!r}: no authorization means no "
             f"provider call")
-    if str(locked[0]) <= str(now):
+    if locked[1]:
         raise SpendExhausted(
             f"spend authorization {spend_authorization_id} expired at {locked[0]}. An approval "
             f"granted in a triage window does not authorize work months later")

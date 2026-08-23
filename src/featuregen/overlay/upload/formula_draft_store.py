@@ -405,36 +405,75 @@ def _request_draft_locked(
     consume_exception, tombstone_covering, valid_exception_for,
 ) -> tuple[str, bool]:
     """The request itself, with the retirement scope's lock already held."""
+    # ── WHO MUST PRESENT AN EXCEPTION, decided BEFORE anything is spent or written ──────────────
+    # ▲ LOCATED first, CONSUMED last — workflow finding W4. An earlier ordering consumed the
+    # exception and THEN hit refusals, so a transactional caller that caught the typed refusal and
+    # later committed burned one use per click — and after max_uses the message silently degraded
+    # from the failure explanation to "already withdrawn". Refusals must never consume; only the
+    # transaction that actually MINTS the replacement does, after its INSERT.
+    exception_id = None
+    if provider_contract_hash and strategy_identity_hash:
+        exception_id = valid_exception_for(
+            conn, target_formula_identity_hash=identity,
+            provider_contract_hash=provider_contract_hash,
+            strategy_identity_hash=strategy_identity_hash,
+            now=now or _now(conn))
+
     tombstone = tombstone_covering(
         conn, scope_key=scope_key, formula_identity_hash=identity)
     if tombstone is not None:
-        exception_id = None
-        if provider_contract_hash and strategy_identity_hash:
-            exception_id = valid_exception_for(
-                conn, target_formula_identity_hash=identity,
-                provider_contract_hash=provider_contract_hash,
-                strategy_identity_hash=strategy_identity_hash,
-                now=now or _now(conn))
-        # ▲ CONSUMED IN THIS TRANSACTION, alongside the INSERT it authorises. An exception checked
-        # and not consumed is a coupon that regenerates itself every time somebody clicks.
-        if exception_id is None or not consume_exception(conn, exception_id):
+        if exception_id is None:
             raise DraftRetired(
                 f"formula identity {identity} is withdrawn by tombstone "
                 f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason})"
                 f"{'' if tombstone.replacement_draft_id is None else f', replaced by {tombstone.replacement_draft_id}'}"
                 f". A new draft id does not change the identity — either use the replacement, or "
                 f"obtain an approved regeneration exception for this exact identity")
+    else:
+        # ▲ A TERMINAL FAILURE holds no slot (migration 1107) but still gates the re-spend. The
+        # bounded re-attempt §11.1.2 permits is bounded BY THE EXCEPTION's max_uses — `formula_draft`
+        # has no attempts column, and a mutable counter on an append-only table would be the wrong
+        # fix. Without an exception the refusal below names exactly what to obtain, and since 1107
+        # that remedy is REACHABLE: the failed row keeps its history and stops holding the identity.
+        failed = conn.execute(
+            "SELECT formula_draft_id, state FROM formula_draft "
+            "WHERE formula_identity_hash = %s AND state IN ('FAILED', 'CANCELLED') "
+            "ORDER BY updated_at DESC LIMIT 1", (identity,)).fetchone()
+        if failed is not None and exception_id is None:
+            live = conn.execute(
+                "SELECT 1 FROM formula_draft WHERE formula_identity_hash = %s "
+                "AND state NOT IN ('FAILED', 'CANCELLED')", (identity,)).fetchone()
+            if live is None:
+                raise DraftNotAnAnswer(
+                    f"formula identity {identity} belongs to draft {failed[0]}, which is "
+                    f"{failed[1]}. That is not an answer this platform bought — it is a failure it "
+                    f"recorded — so returning it as an existing draft would report a purchase that "
+                    f"never happened. Re-attempting needs an approved regeneration exception for "
+                    f"this exact identity")
 
     inserted = conn.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
         "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, "
         "definition_revision, formula_identity_hash, state, requested_by, requested_at) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
-        "ON CONFLICT (formula_identity_hash) DO NOTHING RETURNING formula_draft_id",
+        # ▲ The arbiter is 1107's PARTIAL index, and the predicate must be spelled or Postgres
+        # cannot infer it. A FAILED/CANCELLED row is history, not an occupant — the conflict this
+        # guard watches for is with an ANSWER or a purchase in flight.
+        "ON CONFLICT (formula_identity_hash) WHERE state NOT IN ('FAILED', 'CANCELLED') "
+        "DO NOTHING RETURNING formula_draft_id",
         (formula_draft_id, considered_revision_id, option_id, planning_request_hash,
          catalog_snapshot_hash, authoring_config_hash, definition_revision, identity,
          DraftStateV1.REQUESTED.value, requested_by, requested_at)).fetchone()
     if inserted is not None:
+        # ▲ CONSUMED HERE — in the same transaction as the mint it authorizes, after the INSERT
+        # won. An exception checked and not consumed is a coupon that regenerates itself; one
+        # consumed before the refusal decision burns uses on refusals. Zero rows back means a
+        # concurrent consumer exhausted it first, and the whole transaction — this INSERT included —
+        # aborts rather than minting an unapproved draft.
+        if exception_id is not None and not consume_exception(conn, exception_id):
+            raise DraftRetired(
+                f"the regeneration exception for formula identity {identity} was exhausted by a "
+                f"concurrent request: max_uses is spent, and this draft is not minted")
         return inserted[0], True
 
     existing = conn.execute(
@@ -444,7 +483,11 @@ def _request_draft_locked(
         # tombstone (a step-2 backfill, EMPTY on today's measurement) a request must keep seeing
         # them. The tombstone check above is the new guard, not a replacement for this one.
         "  LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
-        " WHERE d.formula_identity_hash = %s", (identity,)).fetchone()
+        # ▲ The LIVE-or-answer row. Since 1107 a FAILED row no longer holds the slot, so an INSERT
+        # can only lose to a row the guard actually covers — and reading a failure here would
+        # resurrect the pre-1107 wedge one query later.
+        " WHERE d.formula_identity_hash = %s AND d.state NOT IN ('FAILED', 'CANCELLED')",
+        (identity,)).fetchone()
     if existing is None:                                   # pragma: no cover — see below
         # ▲ NOT REACHABLE, AND NOT ASSUMED. `ON CONFLICT DO NOTHING` returning nothing means the row
         # exists, and `formula_draft` forbids DELETE — but `None` here would raise `TypeError` where
@@ -463,25 +506,8 @@ def _request_draft_locked(
             f"A new draft id does not change the identity — something identity-bearing must "
             f"differ, or this request is asking for the very thing that was retired")
 
-    # ▲ A FAILED DRAFT IS NOT A BOUGHT ANSWER, and returning it as one is the wedge this raises on.
-    #
-    # `FAILED` and `CANCELLED` are TERMINAL — their transition sets are literally empty — so a
-    # candidate reaching one could never be authored again: this returned the dead draft with
-    # `created=False`, the route enqueued nothing because it enqueues only `if created`, and the
-    # only escape was moving an identity-bearing input, which `_authoring_config_hash` cannot do
-    # because it is a constant. All seven drafts on the live cluster are terminal, and two say in
-    # their own failure text that the fault was the platform's and "not a problem with the
-    # candidate".
-    #
-    # The money guard asks *"have we already BOUGHT this answer?"* — and a technical failure bought
-    # nothing. `READY` and `BLOCKED` ARE answers (one succeeded; one is a verdict about the
-    # candidate) and are returned unchanged, as is a live draft, which is the double-click answer.
-    if DraftStateV1(state) in _NOT_AN_ANSWER:
-        raise DraftNotAnAnswer(
-            f"formula identity {identity} belongs to draft {draft_id}, which is {state}. That is "
-            f"not an answer this platform bought — it is a failure it recorded — so returning it "
-            f"as an existing draft would report a purchase that never happened. Re-attempting "
-            f"needs an approved regeneration exception for this exact identity")
+    # The pre-insert gate owns the failure states now: since 1107 they hold no slot, so an INSERT
+    # cannot lose to one and this branch only ever sees an answer or a purchase in flight.
     return draft_id, False
 
 
@@ -529,7 +555,10 @@ def _advance_locked(
 ) -> DraftStateV1:
     """The transition itself, with the draft's lock already held."""
     row = conn.execute(
-        "SELECT d.state, r.reason FROM formula_draft d "
+        "SELECT d.state, r.reason, d.considered_revision_id, d.option_id, "
+        "       d.planning_request_hash, d.catalog_snapshot_hash, d.definition_revision, "
+        "       d.formula_identity_hash "
+        "FROM formula_draft d "
         "LEFT JOIN formula_draft_retirement r ON r.formula_draft_id = d.formula_draft_id "
         "WHERE d.formula_draft_id = %s", (formula_draft_id,)).fetchone()
     if row is None:
@@ -543,6 +572,32 @@ def _advance_locked(
             f"formula draft {formula_draft_id} was retired ({row[1]}) and must not advance to "
             f"{to.value}: continuing would spend against a draft somebody already withdrew, and "
             f"could end in a READY formula nobody wants")
+
+    # ▲ AND THE TOMBSTONE REACHES THE SAME FENCE — workflow finding W3. `record_tombstone` writes
+    # only the 1103 table, and this fence used to read only the legacy one — so withdrawing a
+    # candidate through the NEW mechanism stopped future REQUESTS while every IN-FLIGHT draft of
+    # that candidate kept spending to READY: retirement failing open for exactly the drafts most
+    # worth stopping. The scope key is recomputed from the draft's own frozen identity columns, so
+    # a candidate-wide tombstone stops every configuration's in-flight drafts, not just the one it
+    # was recorded against.
+    from featuregen.overlay.upload.retirement_scope import (
+        retirement_scope_key,
+        tombstone_covering,
+    )
+
+    tombstone = tombstone_covering(
+        conn,
+        scope_key=retirement_scope_key(
+            considered_revision_id=row[2], option_id=row[3], planning_request_hash=row[4],
+            catalog_snapshot_hash=row[5], definition_revision=row[6]),
+        formula_identity_hash=row[7])
+    if tombstone is not None:
+        raise DraftRetired(
+            f"formula draft {formula_draft_id} is withdrawn by tombstone "
+            f"{tombstone.tombstone_id} at scope {tombstone.scope} ({tombstone.reason}) and must "
+            f"not advance to {to.value}: continuing would spend against a candidate somebody "
+            f"already withdrew"
+            f"{'' if tombstone.replacement_draft_id is None else f'; use {tombstone.replacement_draft_id}'}")
 
     current = DraftStateV1(row[0])
     permitted = _NEXT[current] | (frozenset() if current.is_terminal else _FROM_ANYWHERE)

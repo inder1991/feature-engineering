@@ -198,3 +198,20 @@ def test_A_DECISION_CANNOT_BE_EDITED(db):
     with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
         db.execute("UPDATE action_decision_revision SET allowed = false WHERE decision_id = %s",
                    (decision_id,))
+
+
+def test_DECIDING_AGAINST_AN_UNUSABLE_AUTHORIZATION_REFUSES_TYPED_and_records_nothing(db):
+    """▲ Workflow finding W6: this used to surface as a bare ForeignKeyViolation out of the INSERT —
+    an ungoverned crash that also aborted the caller's transaction (which, on the route, carries the
+    queue enqueue) — while ask() with identical inputs returned clean typed blockers. The refusal is
+    UNRECORDABLE by the schema's own composite FK, so the type says that instead of the driver."""
+    from featuregen.materialize.action_decision import AuthorizationUnusable
+
+    with pytest.raises(AuthorizationUnusable, match="cannot carry a decision"):
+        decide(db, _request(), authorization_id="auth-nobody-issued")
+    assert db.execute("SELECT count(*) FROM action_decision_revision").fetchone()[0] == 0
+
+    # And a REAL authorization for a DIFFERENT act is equally unusable — the mismatch case.
+    other = _authorized(db, action=ActionV1.AUTHOR_FORMULA)
+    with pytest.raises(AuthorizationUnusable):
+        decide(db, _request(ActionV1.GENERATE_PREVIEW), authorization_id=other)

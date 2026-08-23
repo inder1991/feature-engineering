@@ -2494,6 +2494,18 @@ nothing.** So step 4 of the order splits by state:
 | `REQUESTED` / in flight | return it, queue nothing. Today's double-click answer, unchanged |
 | ▲ `FAILED` / `CANCELLED` | **not an answer.** Permit a bounded re-attempt under an explicit spend authorization (§11.2), recorded as an attempt — so a poisoned identity is recoverable **without pretending the failure did not happen** |
 
+▲ **IMPLEMENTED IN FULL, 2026-08-23 — and the adversarial pass found the design above was itself
+unimplementable as first built (W4).** The exception binds the EXACT identity being re-requested,
+and 1090's unique index covered every row — so the terminal FAILED draft held the slot for ever and
+the authorized INSERT lost unconditionally: the remedy `DraftNotAnAnswer` names was structurally
+unreachable, and consumption preceding the refusal burned one use per click while refusing. Three
+parts, landed together: **migration 1107** narrows the guard to answers (`WHERE state NOT IN
+('FAILED','CANCELLED')`), the INSERT names the partial predicate (Postgres cannot infer the arbiter
+otherwise), and the exception is **located before any decision and consumed only in the transaction
+that mints** — refusals never consume. The failed row keeps its history; it just stops holding the
+slot. The bounded re-attempt is bounded by the exception's `max_uses`, which is the same mechanism
+that bounds the money.
+
 ▲ **"Exactly one" needs somewhere to count, and `formula_draft` has NO attempts column (C7).** Do not
 add a mutable counter to an append-only table: **bind the re-attempt to the spend authorization's
 `max_uses` / `uses_consumed`** (§11.2), which already enforces one-time consumption in the same
@@ -2994,7 +3006,8 @@ still follow step order.**
 | 1104 | **child §3.1, §3.3 / parent §0.1.4** | ▲ **DONE** — `formula_draft_authoring_plan`, **MOVED from step 4 to step 2** (P0-2), with database CHECKs that a reviewed plan names its blueprint at generation **v2** and carries **no** provider contract, and that an LLM plan names its contract and **cannot claim a reviewed blueprint**. Plus `overlay/upload/formula_strategy.py` — the PURE selector. ▲ **`authoring_subject_revision` is NOT a separate table (C4)**: its five fields are exactly `retirement_scope_key`, so `AUTHOR_FORMULA`'s `resource_identity_hash` IS that key — one tuple, three uses | **2** |
 | 1105 | **parent §11.2** | ▲ **DONE** — `llm_spend_authorization_revision` (immutable, idempotent, with `pricing_version` pinned) + `llm_spend_reservation` and `llm_spend_settlement` as append-only events + **the CONTRACT half of 1103's expand**: `formula_draft_regeneration_exception.llm_spend_authorization_id` gains its FK and its `NOT NULL`, which is what makes "regeneration is an approved, cost-confirmed act" true rather than intended | 2 |
 | 1106 | **parent §7.1 / §0.1.2** | ▲ `action_decision_revision` + ▲ **the NOT NULL `action_decision_revision_id` columns and composite FKs on every request/attempt table** (R6) | 3 |
-| 1107 | **child §3.4** | `authoring_work_item` origin/strategy split — ▲ **empty (0 rows, §0.3), so the old constraint is replaced directly** | 4 |
+| 1107 | **parent §11.1.2** | ▲ **DONE — TAKEN by the money-guard scope fix** (adversarial finding W4): 1090's unique index narrowed to `WHERE state NOT IN ('FAILED','CANCELLED')`, because a failed draft bought nothing and must not hold the identity slot — without this, the regeneration exception's remedy was structurally unreachable. A NEW file: 1090 is applied live and immutable | 2 |
+| 1108b→ | — | ▲ **RESERVATIONS SHIFT BY ONE from here**: work-item split (was 1107) → **1108**, method override (was 1108) → **1109**, and so on. Re-verify the ledger at write time, as this table already instructs | — |
 | 1108 | **parent §11.3** | ▲ `formula_method_override_revision` | 4 |
 | 1109 | **child §3.5 / parent §0.1.3** | `code_generation_job` + `_member` + `_event` + ▲ **`code_generation_job_action` — one authorization and decision PER ACTION** (R7) | 5 |
 | 1110 | **parent §9.0** | ▲ `verification_request` lease/fence columns + the sandbox output revision identity | **6** |

@@ -55,6 +55,18 @@ class DecisionMissing(RuntimeError):
     """This act carries no request-time decision — a queue bypass by definition."""
 
 
+class AuthorizationUnusable(RuntimeError):
+    """The named authorization cannot carry a decision for THIS act, so none can be recorded.
+
+    ▲ Distinct from a refused DECISION, and the distinction is structural: 1106's composite foreign
+    key requires the decision's (action, resource, authorization) triple to exist in the
+    authorization table, so a decision citing a missing or mismatched authorization is UNWRITABLE —
+    recording the refusal is not an option the schema offers. Without this type, the caller got a
+    bare ForeignKeyViolation out of the INSERT: an ungoverned crash where `ask()` with identical
+    inputs returns clean typed blockers — a direct ask/decide divergence.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class MemberVerdictV1:
     member_name: str
@@ -165,6 +177,18 @@ def decide(
             f"decision names an authorization and none can be issued for this act")
 
     decision = _fold(conn, request, authorization_id=authorization_id)
+    # ▲ REFUSE TYPED before the INSERT the schema would refuse anyway. These blockers mean no
+    # authorization row matches the (action, resource, authorization) triple — so the composite FK
+    # makes the refused decision UNWRITABLE, and proceeding would surface as a ForeignKeyViolation
+    # that also aborts the caller's transaction (which, on the route, carries the queue enqueue).
+    unusable = {"ACTION_AUTHORIZATION_MISSING", "ACTION_AUTHORIZATION_NOT_FOR_THIS_ACT"}
+    if unusable & set(decision.blockers):
+        raise AuthorizationUnusable(
+            f"authorization {authorization_id!r} cannot carry a decision for "
+            f"{request.action} on {request.resource_identity_hash!r}: "
+            f"{sorted(unusable & set(decision.blockers))}. Ask() answers this question without "
+            f"recording; a decision cannot be recorded against an authorization that does not "
+            f"cover the act")
     decision_id = jcs_sha256({
         "action": str(request.action),
         "resource_identity_hash": request.resource_identity_hash,

@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS llm_spend_reservation (
     spend_authorization_id  text NOT NULL REFERENCES llm_spend_authorization_revision,
 
     -- The dispatch this reservation is for, so "what did this job actually spend" is a join rather
-    -- than an estimate. Nullable only until the dispatch ref is minted, in the same transaction.
+    -- than an estimate. ▲ Nullable means "reserved before the dispatch ref existed" — it is set AT
+    -- INSERT or never, because the table is append-only (below) and an UPDATE would be refused.
     dispatch_ref            text,
 
     reserved_calls          integer NOT NULL CHECK (reserved_calls > 0),
@@ -109,6 +110,16 @@ $$ LANGUAGE plpgsql;
 DROP TRIGGER IF EXISTS llm_spend_settlement_no_change ON llm_spend_settlement;
 CREATE TRIGGER llm_spend_settlement_no_change
     BEFORE UPDATE OR DELETE ON llm_spend_settlement
+    FOR EACH ROW EXECUTE FUNCTION llm_spend_ledger_write_once();
+
+-- ▲ AND THE RESERVATION, which an earlier version omitted while its shared trigger text claimed
+-- otherwise. A mutable reservation IS the overspend: shrink its `expires_at` while the provider
+-- call is in flight and `_committed` frees the worst-case amount for a concurrent worker — two
+-- calls under one ceiling, with no record. The budget recovers from a crash by ARITHMETIC (an
+-- expired unsettled row stops counting), never by a write, so nothing here ever needs updating.
+DROP TRIGGER IF EXISTS llm_spend_reservation_no_change ON llm_spend_reservation;
+CREATE TRIGGER llm_spend_reservation_no_change
+    BEFORE UPDATE OR DELETE ON llm_spend_reservation
     FOR EACH ROW EXECUTE FUNCTION llm_spend_ledger_write_once();
 
 -- ── 1103's exception now BINDS its money ────────────────────────────────────────────────────────

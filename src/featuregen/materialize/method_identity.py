@@ -30,6 +30,7 @@ from featuregen.materialize.authoring_provenance import (
 
 __all__ = [
     "METHOD_IDENTITY_VERSION",
+    "MethodIdentityConflict",
     "MethodIdentityUndecidable",
     "MethodIdentityV1",
     "derive_method_identity",
@@ -47,6 +48,16 @@ _CRITIC_ROLE = "formula.critic"
 
 class MethodIdentityUndecidable(RuntimeError):
     """The run's evidence cannot name one exact method identity, so no certificate can match it."""
+
+
+class MethodIdentityConflict(RuntimeError):
+    """The store already holds a DIFFERENT identity for this member, and it cannot be corrected.
+
+    1102 is append-only, so first-writer-wins-silently would mean a sealing act proceeds believing
+    the identity it just derived was recorded, while certificate matching for ever evaluates a hash
+    that act never produced. A conflicting write on an append-only evidence table is a refusal,
+    never a shrug.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,3 +230,17 @@ def record_method_identity(
         "VALUES (%s, %s, %s, %s, %s::jsonb) ON CONFLICT (artifact_id, member_name) DO NOTHING",
         (artifact_id, member_name, identity.authoring_method, identity.method_identity_hash,
          json.dumps(identity.payload, sort_keys=True)))
+    # ▲ INSERT-OR-VERIFY. "Idempotent" means the stored row IS this row — DO NOTHING alone is
+    # first-writer-wins-silently, which after a METHOD_IDENTITY_VERSION bump would leave a sealing
+    # act believing its freshly derived identity was recorded while the store keeps the old one,
+    # and the append-only guard makes the divergence permanent. Same discipline as the ledger's
+    # checksum check: skip only what is provably identical.
+    stored = conn.execute(
+        "SELECT method_identity_hash FROM sealed_artifact_member_method_identity "
+        "WHERE artifact_id = %s AND member_name = %s", (artifact_id, member_name)).fetchone()
+    if stored[0] != identity.method_identity_hash:
+        raise MethodIdentityConflict(
+            f"member {member_name!r} of artifact {artifact_id!r} already records method identity "
+            f"{stored[0]}, and this act derived {identity.method_identity_hash}. The table is "
+            f"append-only, so the stored identity cannot be corrected — the artifact must be "
+            f"re-sealed rather than this divergence ignored")
