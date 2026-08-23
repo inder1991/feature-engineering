@@ -1,5 +1,21 @@
 # Run Spine Actionable — Stage I Implementation Plan (invocation substrate + AUTHOR_FORMULA)
 
+> ▲ **NO-GO — DO NOT EXECUTE (owner review, 2026-08-23).** Ten P0 blockers stand against this
+> revision; the verdicts and the corrected 13-step sequence are recorded in the owner's review and
+> the session ledger. Headline corrections a revision must fold: authoring input sealing + atomic
+> output binding + legacy-route adapter move INTO Stage I (the spec's §13 ordering is binding);
+> the client names a server-minted subject id, never raw identity facts; Task 4 targets a 1104
+> schema that does not exist (candidate_origin/formula_strategy/strategy_identity_hash — spend
+> binding is unresolved architecture); strategy is RESOLVED, never a constant; 1117 needs the
+> composite invocation FK, action CHECK, subject/link append-only triggers, link→candidate
+> agreement, and totality; gesture/outcome split (START vs CREATED/ATTACHED_EXISTING) with the
+> guard purpose-independent; idempotency compares the stored request_content_hash over the FULL
+> server-resolved request (409 IDEMPOTENCY_CONFLICT); 1106's decision identity must cover the
+> whole payload and a read-only preflight must exist; spend reserves at AuditingClient.call
+> (the physical seam), settles after egress, reconciles expired reservations against dispatch
+> outcomes; PRE_SPINE runs are not actionable. Substrate remediation (1104–1106) precedes any
+> plan revision.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** The first run-centric trigger — a person opens `#/runs/{id}` and starts formula authoring for chosen candidates, through one governed invocation that binds authorization, decision and spend before any outbox row, with the run's attempt history derived, never stored twice.
