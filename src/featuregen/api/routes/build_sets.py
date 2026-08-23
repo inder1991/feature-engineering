@@ -73,6 +73,7 @@ from featuregen.overlay.upload.build_set_store import (
     record_build_set,
     request_generation,
 )
+from featuregen.runs.pin import PRE_PIN_REASON_CODE, pin_exists
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.queue import QueueIdempotencyConflict
 
@@ -82,6 +83,10 @@ def require_generation_enabled() -> None:
 
     The same function object the worker stage calls, over the same truthy set — a route that
     re-implemented the check would 404 for a deployment whose worker was happily draining.
+
+    ▲ And the same function object `runs.projection._generate_preview_stage` calls, for the same
+    reason in the other direction: the rail marks `GENERATE_PREVIEW` UNAVAILABLE
+    (`GENERATION_DISABLED`) exactly when this dependency would 404 it. One switch, three readers.
     """
     if not generation_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
@@ -90,6 +95,34 @@ def require_generation_enabled() -> None:
 router = APIRouter(dependencies=[Depends(require_generation_enabled)])
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
+
+
+def _refuse_pre_pin(conn: psycopg.Connection) -> None:
+    """Spec §7 [R3.1]: while the 1101 binding table is absent, every build set written closes the
+    zero-row NOT NULL branch — so declaration is withheld, server-side.
+
+    **Self-retiring by design.** There is no flag and nothing to remember to remove: the moment
+    migration 1101 applies, `to_regclass` returns the relation and this refusal disappears with zero
+    code change. It is a guard whose whole purpose is to stop being reachable.
+
+    Called FIRST in both producers, ahead of every validation and lookup, because the thing being
+    protected is the WRITE and a guard placed after one has already done the damage.
+
+    ▲ Same fact AND the same code string as the run rail's `GENERATE_PREVIEW` entry — the one it
+    reports once its own switch check has passed, since a switched-off deployment has no entrance to
+    describe. The sharing is now MECHANICAL rather than remembered: both the probe and the string
+    come from `runs.pin`, so the two cannot drift apart. The rail tells a person the entrance is
+    shut; this is the entrance shutting. What is NOT shared is this refusal — the 409 and its
+    operator sentence are built here, because the rail's audience is a person watching a run and
+    this one's is a caller who just tried to write.
+    """
+    if not pin_exists(conn):
+        raise HTTPException(status_code=409, detail={
+            "code": PRE_PIN_REASON_CODE,
+            "message": "build-set declaration is withheld until the selection→formula binding "
+                       "(migration 1101) exists — a build set written before the pin would force "
+                       "a nullable column and a backfill of exactly the rows the pin constrains",
+        })
 
 
 def _now(conn: psycopg.Connection) -> str:
@@ -147,6 +180,7 @@ def declare_build_set(
     existing set with `created: false`, because minting a second identical set would split its
     attempts across two roots and make "how did this build go" a question with two answers.
     """
+    _refuse_pre_pin(conn)
     try:
         try:
             declaration = decode_declaration(body.declaration)
@@ -207,6 +241,7 @@ def request_build(
     composite foreign key would then refuse the write with a message about keys rather than about
     permission.
     """
+    _refuse_pre_pin(conn)
     authorization = load_generation_authorization(
         conn, body.generation_authorization_revision_id)
     if authorization is None:

@@ -51,6 +51,35 @@ def unique(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
+class _Candidate:
+    """The three ids the considered revision a draft names cannot exist without.
+
+    `contract_considered_revision` requires an intent and a generation run of its own (1021, 1027),
+    so "give the draft a real candidate" is three rows, not one. Kept together so `_erase` deletes
+    exactly the three this fixture created.
+    """
+
+    def __init__(self, considered_revision_id: str) -> None:
+        self.considered_revision_id = considered_revision_id
+        self.intent_id = f"{considered_revision_id}-int"
+        self.generation_run_id = f"{considered_revision_id}-run"
+
+
+def _seed_candidate(conn, candidate: _Candidate) -> None:
+    conn.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES (%s, 'h', 'hypothesis')", (candidate.intent_id,))
+    conn.execute(
+        "INSERT INTO feature_generation_run (generation_run_id, intent_id, actor, flags) "
+        "VALUES (%s, %s, '{\"subject\": \"durable-evidence\"}'::jsonb, '{}')",
+        (candidate.generation_run_id, candidate.intent_id))
+    conn.execute(
+        "INSERT INTO contract_considered_revision (considered_revision_id, intent_id, "
+        "generation_run_id, considered_json, considered_content_hash, canonicalization_version) "
+        "VALUES (%s, %s, %s, '{}'::jsonb, 'cch', 'v1')",
+        (candidate.considered_revision_id, candidate.intent_id, candidate.generation_run_id))
+
+
 @contextlib.contextmanager
 def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, facts_ref: str,
                    progress_callback=None, tool_first: dict | None = None,
@@ -66,14 +95,21 @@ def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, fa
     """
     run_id = run_id or unique("far-durable")
     message_id = unique("durable-evidence")
+    candidate = _Candidate(unique("crv")) if draft_id is not None else None
 
     with psycopg.connect(dsn, autocommit=True) as setup:
         if draft_id is not None:
+            # ▲ A REAL CANDIDATE, because migration 1116 makes `considered_revision_id` a foreign
+            # key: the draft below can no longer name a revision nobody minted. Three rows is the
+            # whole chain the revision itself requires, and `_erase` removes all three — these are
+            # COMMITTED into the shared test database, so leaving them would leak.
+            _seed_candidate(setup, candidate)
             # A REAL draft row, because `_sync_from_trace` reads one. Without it the callback
             # returns at `draft is None` and would report "retirement stopped the loop" from a
             # code path that never looked at a retirement.
             request_draft(
-                setup, formula_draft_id=draft_id, considered_revision_id=unique("crv"),
+                setup, formula_draft_id=draft_id,
+                considered_revision_id=candidate.considered_revision_id,
                 option_id="opt-1", planning_request_hash=unique("prh"),
                 catalog_snapshot_hash=unique("csh"), authoring_config_hash=unique("ach"),
                 definition_revision="1", requested_by="durable-evidence",
@@ -124,7 +160,7 @@ def durable_v3_run(dsn: str, monkeypatch, *, raw: dict, intent, allowed_refs, fa
                 f"expected the run to raise {expect.__name__}; it completed instead: {outcome!r}")
         yield run_id, outcome
     finally:
-        _erase(dsn, run_id, queue_id, draft_id, eval_run_id)
+        _erase(dsn, run_id, queue_id, draft_id, eval_run_id, candidate=candidate)
 
 
 def _script_two_turns(client, dsn, intent, raw, tool_call, allowed_refs) -> None:
@@ -182,6 +218,9 @@ _APPEND_ONLY = (
     ("recipe_formula_eval_run", "recipe_formula_eval_run_no_mutation"),
     ("formula_draft_retirement", "formula_draft_retirement_no_change"),
     ("formula_draft", "formula_draft_no_identity_edit"),
+    # The candidate the draft names (1116's foreign key). Write-once too, so removing the revision
+    # this fixture minted needs its guard down exactly like every other row here.
+    ("contract_considered_revision", "contract_considered_revision_no_mutation"),
     ("formula_authoring_trace_event", "formula_authoring_event_no_mutation"),
     ("formula_authoring_run", "formula_authoring_run_no_mutation"),
     ("llm_dispatch_subject", "llm_dispatch_subject_no_mutation"),
@@ -192,7 +231,7 @@ _APPEND_ONLY = (
 
 
 def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None,
-           eval_run_id: str | None = None) -> None:
+           eval_run_id: str | None = None, candidate: _Candidate | None = None) -> None:
     """Remove exactly what this run wrote — ALL OF IT IN ONE TRANSACTION, or none of it.
 
     ▲ **THE GUARDS MUST NEVER BE LEFT OFF.** An earlier version disabled the append-only triggers on
@@ -242,6 +281,17 @@ def _erase(dsn: str, run_id: str, queue_id: int, draft_id: str | None = None,
                     "DELETE FROM formula_draft_retirement WHERE formula_draft_id = %s", (draft_id,))
                 cleanup.execute(
                     "DELETE FROM formula_draft WHERE formula_draft_id = %s", (draft_id,))
+            if candidate is not None:
+                # After the draft, which references the revision — and then in reference order:
+                # the revision names the run, and the run names the intent.
+                cleanup.execute(
+                    "DELETE FROM contract_considered_revision WHERE considered_revision_id = %s",
+                    (candidate.considered_revision_id,))
+                cleanup.execute(
+                    "DELETE FROM feature_generation_run WHERE generation_run_id = %s",
+                    (candidate.generation_run_id,))
+                cleanup.execute(
+                    "DELETE FROM contract_intent WHERE intent_id = %s", (candidate.intent_id,))
             _erase_hook()
 
             # FLUSH DEFERRED CONSTRAINT TRIGGERS FIRST. The deletes above leave pending FK trigger

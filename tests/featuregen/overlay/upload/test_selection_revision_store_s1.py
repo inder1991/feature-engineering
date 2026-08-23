@@ -10,6 +10,7 @@ reading a leakage gate ran against is gone the moment anyone re-reads.
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.overlay.upload.selection_revision_store import (
     current_target_reading,
@@ -29,6 +30,15 @@ from featuregen.overlay.upload.selection_revisions import (
 
 CHURN = "hdfc::public.txns.churned"
 ATTRITED = "hdfc::public.txns.attrited"
+CONSIDERED = "cons-1"
+
+
+@pytest.fixture(autouse=True)
+def _considered_revision_exists(db):
+    """Migration 1116 makes `feature_selection_revision.considered_revision_id` a real foreign key,
+    so the one revision every selection in this file names has to exist. Seeding only — the Gate-3
+    tests assert on the selection rows, never on the chain behind them."""
+    seed_run_chain(db, run_id="srs1", considered_revision_id=CONSIDERED)
 
 
 def _prediction(ref: str = CHURN) -> PredictionTargetV1:
@@ -218,7 +228,7 @@ def test_a_migrated_legacy_reading_becomes_the_CURRENT_one(db):
 def _selection(revision_id: str, reading_id: str = "trr-1", option: str = "opt-1"):
     return FeatureSelectionRevisionV1(
         revision_id=revision_id, target_reading_revision_id=reading_id,
-        considered_revision_id="cons-1", option_id=option, decision_id="dec-1",
+        considered_revision_id=CONSIDERED, option_id=option, decision_id="dec-1",
         planning_request_hash="sha256:plan", binding_plan_hash="sha256:binding")
 
 

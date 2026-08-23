@@ -20,6 +20,7 @@ from tests.featuregen.materialize.crosswalk_fixtures import (
     bind_ready_formulas,
     build_set_declaration,
 )
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.materialize.build_set_declaration import encode_declaration
 
@@ -55,6 +56,9 @@ def _seed(conn, *, environment="hdfc-local", group="customer_txn_features",
     from featuregen.overlay.upload.build_set_store import record_build_set
     from featuregen.overlay.upload.selection_revisions import TargetModeV1
 
+    # Migration 1116 makes `feature_selection_revision.considered_revision_id` a real foreign key,
+    # so `crev-bs` has to exist. Seeding only, and uncommitted like everything else here.
+    seed_run_chain(conn, run_id="bsapi", considered_revision_id="crev-bs")
     conn.execute(
         "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode, redacted_hypothesis) "
         "VALUES ('int-bs','h','hypothesis','h') ON CONFLICT DO NOTHING")

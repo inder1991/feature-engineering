@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.overlay.upload.selection_formula_binding import (
     BindingDisagreement,
@@ -15,8 +16,16 @@ from featuregen.overlay.upload.selection_formula_binding import (
 )
 
 
+def _considered(conn, considered_revision_id: str) -> None:
+    """Migration 1116 makes `considered_revision_id` a real foreign key on BOTH tables seeded here,
+    so whichever revision a helper names has to exist. Seeding only — no assertion depends on it."""
+    seed_run_chain(conn, run_id=f"sfb-{considered_revision_id}",
+                   considered_revision_id=considered_revision_id)
+
+
 def _selection(conn, revision_id="sel-1", *, option_id="opt-a", considered="crev-1",
                planning="sha256:asked", binding_plan="sha256:plan") -> str:
+    _considered(conn, considered)
     conn.execute(
         "INSERT INTO target_reading_revision (revision_id, intent_id, mode, content_hash) "
         "VALUES ('trr-b','int-b','exploration','h') ON CONFLICT DO NOTHING")
@@ -31,6 +40,7 @@ def _selection(conn, revision_id="sel-1", *, option_id="opt-a", considered="crev
 
 def _draft(conn, draft_id="fd-1", *, option_id="opt-a", considered="crev-1",
            planning="sha256:asked", state="READY", content="sha256:formula") -> str:
+    _considered(conn, considered)
     conn.execute(
         "INSERT INTO formula_draft (formula_draft_id, considered_revision_id, option_id, "
         "planning_request_hash, catalog_snapshot_hash, authoring_config_hash, definition_revision, "

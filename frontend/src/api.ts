@@ -4416,3 +4416,92 @@ export function getPublicationStatus(
   })
   return request(`/feature-execution/publications?${query}`)
 }
+
+// ---------------------------------------------------------------------------
+// Feature run spine (read-only). The server DERIVES every field below from the
+// stores that already hold the evidence — there is no run-lifecycle table and
+// no write endpoint, so this client has reads only, by design.
+// ---------------------------------------------------------------------------
+
+export interface FeatureRunSummary {
+  generation_run_id: string
+  display_name: string | null
+  // True when the run predates the identity spine, so it has no run_identity row. It is an
+  // honest gap in the record, never a failure of the run.
+  pre_spine: boolean
+  owner_subject: string | null
+  created_at: string
+}
+
+export interface FeatureRunGroup {
+  // Grouping happens WITHIN a page, so one intent's runs can open two groups (or split across a
+  // page boundary) and a null intent_id is the "no intent" bucket, not a shared intent.
+  intent_id: string | null
+  hypothesis: string | null
+  runs: FeatureRunSummary[]
+}
+
+export interface FeatureRunList {
+  groups: FeatureRunGroup[]
+  // Opaque keyset cursor minted by the server; null means this was the last page.
+  next_cursor: string | null
+}
+
+export interface RunRailStage {
+  stage: string
+  state: string
+  // Why a stage is UNAVAILABLE — a socket whose machinery does not exist yet. NOT_STARTED (a
+  // stage that could actually run) carries none.
+  reason_code: string | null
+}
+
+export interface RunAuthoringRow {
+  formula_draft_id: string
+  option_id: string
+  // Two axes, never one field: state/rail_state is the immutable historical outcome, eligibility
+  // is derived at read time from the retirement row.
+  state: string
+  rail_state: string
+  eligibility: 'current' | 'withdrawn'
+  retirement_reason: string | null
+}
+
+export interface FeatureRunDetail {
+  generation_run_id: string
+  pre_spine: boolean
+  owner_subject: string | null
+  display_name: string | null
+  description: string | null
+  intent: { intent_id: string; hypothesis: string } | null
+  identity: {
+    run_identity_hash: string
+    considered_revision_id: string
+    metadata_snapshot_id: string
+  } | null
+  milestones: {
+    choose_candidates: {
+      option_id: string
+      considered_revision_id: string
+      chosen_at: string
+    }[]
+    // Nothing can write a binding in the foundation, so this is always empty today.
+    bind_selections: unknown[]
+  }
+  authoring: RunAuthoringRow[]
+  rail: RunRailStage[]
+}
+
+export function listFeatureRuns(cursor?: string): Promise<FeatureRunList> {
+  // The cursor is `${created_at}|${generation_run_id}` — `:`, `+` and `|` all mean something else
+  // in a query string, so the opaque value is encoded whole; a cursor that reaches the route
+  // mangled is a 422, not a silently different page. The parameter is omitted entirely for the
+  // first page rather than sent empty.
+  const q = cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''
+  return request(`/feature-runs${q}`)
+}
+
+export function getFeatureRunDetail(runId: string): Promise<FeatureRunDetail> {
+  // 404 covers both absence and denial on this route, deliberately — a 403 would confirm the id
+  // exists. The client must not try to tell them apart.
+  return request(`/feature-runs/${encodeURIComponent(runId)}`)
+}

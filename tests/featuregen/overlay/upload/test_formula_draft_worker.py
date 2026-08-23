@@ -15,6 +15,7 @@ Every test here is about a rule that costs money or credibility when it breaks:
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.overlay.upload.formula_draft_store import (
     DraftStateV1,
@@ -43,6 +44,10 @@ HANDLER = "formula_draft.author.v1"
 
 
 def _request(db, draft_id="fd-1"):
+    # Migration 1116 makes `considered_revision_id` a real foreign key. `seed_run_chain` inserts
+    # ON CONFLICT DO NOTHING, so the tests below that mint their OWN `crev-1` — carrying the exact
+    # `considered_json` they are about — keep it; this only covers the ones that never needed one.
+    seed_run_chain(db, run_id="fdw", considered_revision_id="crev-1")
     return request_draft(
         db, formula_draft_id=draft_id, considered_revision_id="crev-1", option_id="opt-a",
         planning_request_hash="sha256:asked", catalog_snapshot_hash="sha256:catalog",

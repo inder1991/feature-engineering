@@ -17,6 +17,7 @@ from tests.featuregen.materialize.crosswalk_fixtures import (
     bind_ready_formulas,
     build_set_declaration,
 )
+from tests.featuregen.runs._chain import seed_run_chain
 
 from featuregen.overlay.upload.build_set_store import (
     GenerationStatusV1,
@@ -80,6 +81,9 @@ def _target(conn, revision_id: str = "trr-1") -> str:
 
 
 def _selection(conn, revision_id: str, target: str = "trr-1") -> str:
+    # Migration 1116 makes `considered_revision_id` a real foreign key, so `crev-1` has to exist.
+    # Seeding only — every assertion below is about build sets, not about the chain behind them.
+    seed_run_chain(conn, run_id="bss", considered_revision_id="crev-1")
     conn.execute(
         "INSERT INTO feature_selection_revision (revision_id, target_reading_revision_id, "
         "considered_revision_id, option_id, decision_id, planning_request_hash, binding_plan_hash, "
