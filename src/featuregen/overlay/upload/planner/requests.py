@@ -118,12 +118,19 @@ def planning_probe(request: FeaturePlanningRequestV1) -> Template:
 def plan_planning_request(conn, *, request: FeaturePlanningRequestV1,
                           target_entity: str | None, scope, roles=(), now,
                           compile_ctx=None, budget=None):
-    """One entry for every origin: project, then run the UNCHANGED planner pipeline."""
+    """One entry for every origin: project, then run the UNCHANGED planner pipeline.
+
+    S1A-2: the probe carries the request's OWN operand metadata, so the planner resolves needs from
+    that contract rather than from the legacy `RESOLVED_NEED_METADATA` registry — 106 legacy
+    template ids collide with V2 recipe ids, and a colliding id would otherwise override the
+    request's declarations with a same-named legacy template's (37 of 317 recipes measurably).
+    """
     from featuregen.overlay.upload.planner.plan import plan_bindings
 
     return plan_bindings(conn, template=planning_probe(request),
                          target_entity=target_entity, scope=scope, roles=roles, now=now,
-                         compile_ctx=compile_ctx, budget=budget)
+                         compile_ctx=compile_ctx, budget=budget,
+                         metadata_resolution_mode="request_contract")
 
 
 __all__ = ["plan_planning_request", "planning_probe"]

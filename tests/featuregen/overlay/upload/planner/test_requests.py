@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
+from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.feature_planning_contracts import (
@@ -12,10 +15,20 @@ from featuregen.overlay.upload.feature_planning_contracts import (
     planning_request_from_user_definition,
 )
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.need_metadata import (
+    RESOLVED_NEED_METADATA,
+    ResolvedNeedMetadataV1,
+)
+from featuregen.overlay.upload.planner import candidates as candidates_module
+from featuregen.overlay.upload.planner.candidates import discover_ingredient_candidates
 from featuregen.overlay.upload.planner.contracts import PlanResolutionStatus
+from featuregen.overlay.upload.planner.declarations import recipe_content_hash
+from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.requests import plan_planning_request, planning_probe
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
+from featuregen.overlay.upload.recipe_grounding_context import canonical_recipe_v2_hash
 from featuregen.overlay.upload.recipe_registry_v2 import v2_recipe_by_id
+from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 _NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 RECIPE = v2_recipe_by_id("customer_activity_recency")
@@ -182,3 +195,96 @@ def test_no_authorized_catalog_stays_not_applicable_for_requests_too(db):
         db, request=planning_request_from_recipe(RECIPE), target_entity="customer",
         scope=scope, roles=(), now=_NOW)
     assert result.result_status is PlanResolutionStatus.not_applicable
+
+
+# ── S1A-2: the identity-neutral registry bypass ────────────────────────────────────────────────
+# `discover_ingredient_candidates` resolves each need's binding metadata out of
+# RESOLVED_NEED_METADATA, keyed on `template.id`. 106 ids in the legacy template corpus collide
+# with V2 recipe ids, so a probe projected from a V2 recipe silently inherits the LEGACY
+# template's resolved metadata (measured: 37 of 317 V2 recipes are shadowed). The discriminator
+# has to be a planner ARGUMENT, never a `Template` field — `recipe_grounding_context` enumerates
+# Template's fields dynamically, so a new field would move every legacy template's canonical hash.
+
+_COLLIDING_ID = "inflow_outflow_ratio"     # one of the 106 shared ids; `direction` is a shared role
+
+# An entry no honest derivation could ever produce, so a match proves the registry was consulted.
+_POISON = ResolvedNeedMetadataV1(
+    role="direction", concept="debit_credit_indicator",
+    allowed_source_grains=("__sentinel_grain__",),
+    join_role=JoinRole.SOURCE_ENTITY_KEY,    # absurd: a debit/credit flag is not an entity key
+    temporal_role=TemporalRole.AS_OF_TIME,   # absurd: the flag carries no time at all
+    grain_source="explicit_recipe", join_role_source="explicit_recipe",
+    temporal_role_source="explicit_recipe")
+
+
+def _direction_catalog(db, source: str) -> None:
+    """The smallest catalog that yields a candidate for `direction`, the ONE need role the legacy
+    `inflow_outflow_ratio` template and the V2 recipe of the same id share."""
+    catalog = [
+        (CanonicalRow(source, "postings", "txn_id", "integer", is_grain=True,
+                      entity="Transaction"), "transaction_id"),
+        (CanonicalRow(source, "postings", "dr_cr", "text"), "debit_credit_indicator"),
+    ]
+    build_graph(db, source, [r for r, _ in catalog],
+                concepts={content_hash(r): c for r, c in catalog})
+
+
+def test_probe_operand_metadata_is_never_shadowed_by_the_legacy_registry(db, monkeypatch):
+    """106 V2 ids collide with legacy template ids. In request_contract mode the resolved-need
+    registry must not override a probe's own declared operand metadata; in legacy mode the same
+    poisoned entry MUST still be consumed (existing behavior preserved)."""
+    _direction_catalog(db, "core")
+    # RESOLVED_NEED_METADATA is a MappingProxyType (immutable), and `candidates` binds the name at
+    # import — so the poison goes on the CONSUMER's module attribute, not via setitem.
+    monkeypatch.setattr(candidates_module, "RESOLVED_NEED_METADATA",
+                        dict(RESOLVED_NEED_METADATA) | {_COLLIDING_ID: (_POISON,)})
+
+    probe = planning_probe(planning_request_from_recipe(v2_recipe_by_id(_COLLIDING_ID)))
+    legacy = next(t for t in ALL_TEMPLATES if t.id == _COLLIDING_ID)
+    assert probe.id == legacy.id                      # the collision itself, not a contrivance
+
+    def direction(template, **kw):
+        # required_grains / join_role / temporal_role on the candidate ARE the resolved need's
+        # three fields verbatim — the narrowest surface that reflects the registry read.
+        return discover_ingredient_candidates(
+            db, template, "core", roles=(), **kw).candidates["direction"]
+
+    clean = direction(probe, metadata_resolution_mode="request_contract")
+    assert clean, "fixture must yield at least one debit_credit_indicator candidate"
+    assert {c.required_grains for c in clean} == {("transaction",)}   # the probe's OWN declaration
+    assert {c.join_role for c in clean} == {""}                      # V2 declares neither role...
+    assert {c.temporal_role for c in clean} == {""}                  # ...so the probe carries none
+
+    # the SAME probe under the default mode still eats the sentinel — the mode is what changed,
+    # not the template (so this can never be passing for an unrelated reason).
+    assert {c.required_grains for c in direction(probe)} == {("__sentinel_grain__",)}
+
+    poisoned = direction(legacy)                      # legacy template, default mode: UNCHANGED
+    assert poisoned
+    assert {c.required_grains for c in poisoned} == {("__sentinel_grain__",)}
+    assert {c.join_role for c in poisoned} == {"source_entity_key"}
+    assert {c.temporal_role for c in poisoned} == {"as_of_time"}
+
+
+def test_plan_bindings_rejects_an_unknown_resolution_mode():
+    """The pair is CLOSED: a typo must fail loudly, never degrade silently to the shadowing
+    default. Validation is the first thing `plan_bindings` does, so conn/scope are never touched
+    — passing None for both is the proof, and a later move of the check fails this test."""
+    with pytest.raises(ValueError) as excinfo:
+        plan_bindings(None, template=planning_probe(planning_request_from_recipe(RECIPE)),
+                      target_entity=None, scope=None, now=_NOW,
+                      metadata_resolution_mode="typo")
+    message = str(excinfo.value)
+    assert "typo" in message
+    assert "legacy_registry" in message and "request_contract" in message
+
+
+def test_the_registry_bypass_is_identity_neutral():
+    """The literals below were computed on the PRE-change checkout (commit 219d8360, clean tree).
+    They pin the two canonicalizations a new `Template`/`Need` field would have moved: the legacy
+    recipe content hash and the V2 canonical recipe hash. Recomputing both sides with the same
+    post-change code would only prove self-agreement — these are the before-values, pasted."""
+    assert ALL_TEMPLATES[0].id == "balance_trend"
+    assert recipe_content_hash(ALL_TEMPLATES[0]) == "rh_4bc9a3f80f885743"
+    assert canonical_recipe_v2_hash(v2_recipe_by_id("posted_debit_amount")) == (
+        "37b37069833163063a90c88a77ec2615107392a281bcb3906fbdc47d2c467b34")

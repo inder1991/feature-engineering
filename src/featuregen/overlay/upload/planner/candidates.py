@@ -7,7 +7,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.catalog_realizations import object_grain, table_of
-from featuregen.overlay.upload.need_metadata import RESOLVED_NEED_METADATA
+from featuregen.overlay.upload.need_metadata import (
+    RESOLVED_NEED_METADATA,
+    ResolvedNeedMetadataV1,
+)
 from featuregen.overlay.upload.planner.contracts import (
     MAX_CANDIDATE_COLUMNS_PER_NEED_PER_CATALOG,
     BindingQuality,
@@ -38,13 +41,27 @@ def _quality(col: _Col, concept: str, grain_ok: bool) -> BindingQuality:
 
 def discover_ingredient_candidates(conn, template: Template, catalog_source: str,
                                    *, roles: Iterable[str] = (),
-                                   columns: list[_Col] | None = None) -> CandidateDiscoveryV1:
+                                   columns: list[_Col] | None = None,
+                                   metadata_resolution_mode: str = "legacy_registry",
+                                   ) -> CandidateDiscoveryV1:
     # 3B.4 F5: when a frozen column snapshot is supplied (from the compiler context), discover over
     # EXACTLY those columns so the planner_input_hash covers the same data the selection consumed — a
     # fresh _load_columns under READ COMMITTED could differ. build_compiler_context loads via the
     # identical `_load_columns(conn, src, roles)`, so passing its snapshot is behaviour-neutral.
     cols = columns if columns is not None else _load_columns(conn, catalog_source, roles)
-    resolved = {r.role: r for r in RESOLVED_NEED_METADATA.get(template.id, ())}
+    # S1A-2: RESOLVED_NEED_METADATA is keyed on `template.id`, and 106 ids in the legacy template
+    # corpus COLLIDE with V2 recipe ids — so a probe projected from a V2 recipe silently inherits
+    # the legacy template's resolved needs, overriding its own declared allowed_source_grains /
+    # join_role / temporal_role wherever a need role is shared (measured: 37 of the 317 V2 recipes
+    # are shadowed this way). "request_contract" bypasses the registry entirely and trusts the
+    # request's own contract, which is the only metadata a non-recipe origin HAS.
+    # The discriminator is an ARGUMENT and never a `Template`/`Need` field (V7):
+    # `recipe_grounding_context` enumerates Template's fields dynamically
+    # (`_TEMPLATE_FIELDS = frozenset(field.name for field in fields(Template))`), so a new field
+    # would move every legacy template's canonical hash and invalidate sealed identities.
+    resolved: dict[str, ResolvedNeedMetadataV1] = (
+        {} if metadata_resolution_mode == "request_contract"
+        else {r.role: r for r in RESOLVED_NEED_METADATA.get(template.id, ())})
     out: dict[str, tuple[IngredientCandidateV1, ...]] = {}
     truncated = False
     total = 0

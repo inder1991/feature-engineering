@@ -60,6 +60,14 @@ from featuregen.overlay.upload.taxonomy.entity_registry import GRAPH_VERSION
 from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
 from featuregen.overlay.upload.templates import Template, ground_template
 
+# S1A-2 — the CLOSED pair of per-need metadata resolution modes. "legacy_registry" is the historical
+# behaviour every pre-existing caller keeps by default (RESOLVED_NEED_METADATA looked up on
+# `template.id`); "request_contract" makes the planner trust the probe's OWN declared operand
+# metadata, which the origin-neutral planning-request seam needs because 106 legacy template ids
+# collide with V2 recipe ids. The pair is closed so a typo fails loudly instead of degrading
+# silently back to the shadowing default.
+METADATA_RESOLUTION_MODES: tuple[str, ...] = ("legacy_registry", "request_contract")
+
 
 def _envelope(conn, scope: CatalogScopeV1, recipe_id: str,
               target_entity: str | None) -> PlannerReplayEnvelopeV1:
@@ -107,7 +115,14 @@ def _differential(conn, template, plans, scope, roles, now) -> GroundTemplateDif
 def plan_bindings(conn, *, template: Template, target_entity: str | None, scope: CatalogScopeV1,
                   roles: Iterable[str] = (), now: datetime,
                   compile_ctx: CompilerContext | None = None,
-                  budget: CompileBudget | None = None) -> BindingPlanningResultV1:
+                  budget: CompileBudget | None = None,
+                  metadata_resolution_mode: str = "legacy_registry") -> BindingPlanningResultV1:
+    # FIRST, before conn or scope is touched: an unrecognised mode is a caller defect, and a silent
+    # fallback to the default would be the very shadowing this argument exists to stop.
+    if metadata_resolution_mode not in METADATA_RESOLUTION_MODES:
+        raise ValueError(
+            f"metadata_resolution_mode {metadata_resolution_mode!r} is not one of "
+            f"{METADATA_RESOLUTION_MODES}")
     roles = tuple(roles)
     envelope = _envelope(conn, scope, template.id, target_entity)
     if not scope.authorized_catalog_sources:
@@ -122,7 +137,8 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
         # planner_input_hash covers the same data the selection consumed (else a fresh read could differ).
         frozen_cols = (list(compile_ctx.columns_by_catalog[src].values())
                        if compile_ctx is not None and src in compile_ctx.columns_by_catalog else None)
-        disc = discover_ingredient_candidates(conn, template, src, roles=roles, columns=frozen_cols)
+        disc = discover_ingredient_candidates(conn, template, src, roles=roles, columns=frozen_cols,
+                                              metadata_resolution_mode=metadata_resolution_mode)
         cols_trunc |= disc.candidate_columns_truncated
         total_cols += disc.total_candidate_columns_considered
         en = enumerate_single_catalog_plans(template, src, target_entity, disc)
