@@ -789,22 +789,30 @@ def fold_governed_binding_plan(idea: FeatureIdea) -> dict | None:
     governed plan to freeze, and an empty dict would read as one that authorizes nothing.
 
     Raises:
-        ValueError: a ``derives_pairs`` ref with fewer than three dotted components. The planner's
-            read sets are COLUMN-level; a table-level ref would mis-split (``"transactions.acct"``
-            → ``schema="transactions", table="acct"`` with the column silently lost) into a
+        ValueError: a ref with fewer than three dotted components, from EITHER source this fold
+            qualifies — ``derives_pairs`` (the read set) or ``input_role_bindings`` (the role map).
+            The two are separate projections of the plan (the read set comes from
+            ``physical_read_set``, the bindings from ``ingredient_bindings``) and neither is
+            guaranteed to be a subset of the other, so checking only one would leave the other
+            able to mis-split. A table-level ref would mis-split (``"transactions.acct"`` →
+            ``schema="transactions", table="acct"`` with the column silently lost) into a
             well-formed qualified ref naming a different object. That is an upstream defect, and it
             must name itself rather than be attributed.
     """
     env = idea.plan_envelope
     if env is None:
         return None
-    for _catalog, ref in idea.derives_pairs:
+    # ONE pre-pass over BOTH sources, before any key is built: the fold is all-or-nothing, so a
+    # partially-built plan dict can never escape past a refusal.
+    checked = [("read set", ref) for _catalog, ref in idea.derives_pairs]
+    checked += [(f"role {b.role!r}", b.ref[1]) for b in idea.input_role_bindings if b.ref]
+    for source, ref in checked:
         if len(ref.split(".")) < 3:
             raise ValueError(
-                f"governed read-set ref {ref!r} has fewer than three dotted components: the "
-                f"planner's read sets are column-level (schema.table.column), and a table-level "
-                f"ref reaching this fold would mis-split into a qualified ref naming a different "
-                f"object")
+                f"governed {source} ref {ref!r} has fewer than three dotted components: the "
+                f"planner's read sets and role bindings are column-level (schema.table.column), "
+                f"and a table-level ref reaching this fold would mis-split into a qualified ref "
+                f"naming a different object")
     return {
         "plan_kind": "governed_cross_catalog",
         "catalog_sources": sorted(set(env.catalog_sources)),

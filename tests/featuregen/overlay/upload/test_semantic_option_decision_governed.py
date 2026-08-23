@@ -140,16 +140,31 @@ def test_the_fold_is_none_without_a_plan_envelope(db):
     assert fold_governed_binding_plan(idea) is None
 
 
-def test_the_fold_refuses_a_TABLE_level_read_set_entry(db):
+def test_the_fold_refuses_a_TABLE_level_ref_from_EITHER_source(db):
     """A two-component ref would mis-split into a bogus qualified ref rather than fail: the
-    planner's read sets are column-level, so a table-level entry reaching here is an upstream
-    defect and must NAME itself instead of being silently attributed."""
+    planner's refs are column-level, so a table-level one reaching here is an upstream defect and
+    must NAME itself instead of being silently attributed.
+
+    BOTH sources are checked, because they are two separate projections of the plan — the read set
+    comes from ``physical_read_set``, the role map from ``ingredient_bindings`` — and neither is
+    guaranteed to be a subset of the other. A pre-pass over only the read set would leave the role
+    map able to mis-split."""
     _two_catalogs(db)
-    idea = dataclasses.replace(_recipe_option(db).idea,
-                               derives_pairs=(("ops", "transactions.account_id"),))
-    with pytest.raises(ValueError) as excinfo:
-        fold_governed_binding_plan(idea)
-    assert "transactions.account_id" in str(excinfo.value)
+    idea = _recipe_option(db).idea
+
+    with pytest.raises(ValueError) as read_set:
+        fold_governed_binding_plan(dataclasses.replace(
+            idea, derives_pairs=(("ops", "transactions.account_id"),)))
+    assert "transactions.account_id" in str(read_set.value)
+    assert "read set" in str(read_set.value)
+
+    # the role map alone, with a perfectly good read set beside it
+    bad = dataclasses.replace(idea.input_role_bindings[0], ref=("ops", "transactions.account_id"))
+    with pytest.raises(ValueError) as role_map:
+        fold_governed_binding_plan(dataclasses.replace(
+            idea, input_role_bindings=(bad, *idea.input_role_bindings[1:])))
+    assert "transactions.account_id" in str(role_map.value)
+    assert f"role {bad.role!r}" in str(role_map.value)
 
 
 # ── 2. the facts: key-for-key with the candidate contract ────────────────────────────────────

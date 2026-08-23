@@ -294,6 +294,56 @@ def test_a_confirmed_UOA_that_GENUINELY_moved_still_drifts_the_option(
     assert R.ACTIVATION_STATE_DRIFTED in codes, codes
 
 
+def test_an_option_served_BEFORE_a_UOA_was_confirmed_now_drifts_INTENDED(
+        client, admin_headers, db, work_items):
+    """**A DELIBERATE BEHAVIOUR CHANGE, pinned here so it can never be mistaken for a regression.**
+
+    Before B5 this route passed no ``intent_id``, so the assembler fell back to
+    ``uoa_now = frozen_uoa is None`` and an option carrying NO confirmed unit of analysis passed
+    the UOA rule unconditionally — whatever the intent had confirmed since. With the intent
+    supplied the rule is EQUALITY, so this population changes answer: generation 1 runs under an
+    intent with no confirmed UOA, generation 2 confirms one, and generation 1's options now block
+    with ``ACTIVATION_STATE_DRIFTED`` where they previously passed.
+
+    **That is the intended answer, and the pre-B5 asymmetry was the bug.** The
+    ``create_contract`` ladder has always passed ``intent_id`` on draft/confirm and has therefore
+    always blocked exactly this population; only the materialization ladder answered differently
+    about the same option, which is the kind of split-brain a two-layer activation policy exists to
+    prevent. An option generated before the human confirmed a unit of analysis genuinely answers a
+    question the intent no longer asks, and ``regenerate from the current considered set`` — the
+    blocker's own next step — is the honest move.
+
+    The companion control below proves this is a comparison and not a new blanket refusal:
+    absence against absence stays free."""
+    revision_id, option_id = _freeze_option(db, REVIEWED, key="uoa-none-then")   # uoa=None
+    _later_uoa_confirmation(db, intent_id="intent-uoa-none-then", key="uoa-none-later",
+                            uoa="customer")
+
+    response = _post(client, admin_headers, work_items,
+                     considered_revision_id=revision_id, option_id=option_id)
+    assert response.status_code == 409, response.text
+    named = {b["code"]: b["next_step"] for b in response.json()["detail"]["blockers"]}
+    assert R.ACTIVATION_STATE_DRIFTED in named, named
+    assert "regenerate" in named[R.ACTIVATION_STATE_DRIFTED]
+
+
+def test_an_intent_that_NEVER_confirmed_a_UOA_still_costs_an_option_nothing(
+        client, admin_headers, db, work_items):
+    """The companion control: absence against absence AGREES, and nothing blocks.
+
+    The unit-of-analysis confirmation is optional by design, so an intent that never made one must
+    not be a materialization refusal — and the test above must be measuring a COMPARISON rather
+    than a blanket "no frozen UOA is now fatal". Same fixture, same route, one difference: nobody
+    ever confirmed a unit of analysis under this intent."""
+    revision_id, option_id = _freeze_option(db, REVIEWED, key="uoa-never")       # uoa=None
+
+    response = _post(client, admin_headers, work_items,
+                     considered_revision_id=revision_id, option_id=option_id)
+    assert response.status_code == 409, response.text          # other rungs still block it
+    codes = {b["code"] for b in response.json()["detail"]["blockers"]}
+    assert R.ACTIVATION_STATE_DRIFTED not in codes, codes
+
+
 def test_the_route_resolves_the_intent_from_the_revision_it_was_given(db):
     """The lookup itself, against the real table. ``None`` for a revision nobody recorded — the
     honest answer, and the one the assembler already fails closed on."""

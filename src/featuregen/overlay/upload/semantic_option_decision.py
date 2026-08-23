@@ -809,8 +809,25 @@ def assemble_current_activation_state(conn, *, frozen: FrozenOptionFactsV1,
             execution_evaluated = False
             execution_now = False
 
-    # B10 item 4 — the UOA re-read. Absence is FREE both ways (the confirmation is
-    # optional); a frozen UOA the caller cannot re-verify fails closed like everything else.
+    # B10 item 4 — the UOA re-read, and the rule is EQUALITY, not "absence is free".
+    #
+    # An earlier revision of this comment said "absence is FREE both ways", which is true of only
+    # ONE of the three shapes and misleading about the other two. What the code does, and means:
+    #
+    #   * absence vs absence — the intent has never confirmed a unit of analysis and this card was
+    #     served without one: they AGREE, and nothing blocks. The confirmation is optional by
+    #     design (2026-08-13 steer) and an intent that never made one may still materialize.
+    #   * a value vs the SAME value — agreement, nothing blocks.
+    #   * absence vs a LATER confirmation (and any two different values) — DRIFT. The human
+    #     confirmed a unit of analysis after this card was served, so the card answers a question
+    #     the intent no longer asks. That is a regenerate, not a pass. It is the same answer the
+    #     create_contract ladder has always given (draft/confirm have always passed `intent_id`);
+    #     the materialization ladder passed none until S1A-5b, which is why it used to answer
+    #     differently about the same option.
+    #
+    # `intent_id is None` (a caller with no intent to compare against) and a read that RAISES both
+    # fall back to `frozen_uoa is None` — unverifiable, so an option carrying a frozen UOA fails
+    # closed and one carrying none is not blocked on a comparison nobody could make.
     def _norm(value):                         # human vocabulary: case never means drift
         return value.strip().casefold() if value else None
 
